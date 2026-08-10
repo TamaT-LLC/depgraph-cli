@@ -39,11 +39,11 @@ use depgraph_mcp_tools::{
     AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
     AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
     ContractBuildError, ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult,
-    OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize, PaginationContext,
-    PortableTerminalOutputContract, RepositoryRelativePath, ResponseMappingError, SnapshotId,
-    SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS, ToolCatalog,
-    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    IdempotencyKey, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES,
+    MappedToolResult, OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize,
+    PaginationContext, PortableTerminalOutputContract, RepositoryRelativePath,
+    ResponseMappingError, SnapshotId, SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
+    ToolCatalog, project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
     project_dependencies_page_cancellable, project_impact_response_cancellable,
     project_unresolved_page_cancellable,
 };
@@ -193,11 +193,25 @@ struct OperationArguments {
 struct ScanSubmitArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
-    idempotency_key: String,
+    idempotency_key: IdempotencyKey,
     #[serde(default)]
     strict: bool,
     #[serde(default)]
     no_cache: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeImportSubmitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    trace: Option<String>,
+    #[serde(default)]
+    trace_file: Option<RepositoryRelativePath>,
+    #[serde(default)]
+    snapshot: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -808,6 +822,7 @@ fn project_graph_export(
     )
 }
 
+#[derive(Debug)]
 enum ToolExecutionFailure {
     Service(DepgraphServiceError),
     Agent(AgentError),
@@ -1080,7 +1095,7 @@ impl ServerHandler for DepgraphMcpServer {
                 None,
             ));
         }
-        if tool == "scan_submit" {
+        if matches!(tool.as_str(), "scan_submit" | "runtime_trace_import_submit") {
             let tasks_negotiated = EFFECTIVE_PROTOCOL_VERSION
                 .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
                 .unwrap_or(false)
@@ -1090,6 +1105,7 @@ impl ServerHandler for DepgraphMcpServer {
             let arguments = request.arguments.unwrap_or_default();
             let operation_config = self.operation_config.clone();
             let repository_id = self.repository_id.clone();
+            let submit_tool = tool.clone();
             let cancellation = CancellationToken::new();
             let request_cancellation = context.ct;
             if request_cancellation.is_cancelled() {
@@ -1105,7 +1121,21 @@ impl ServerHandler for DepgraphMcpServer {
             let execution = self
                 .runtime
                 .execute_blocking(RuntimeClass::Submit, cancellation, move |cancellation| {
-                    execute_scan_submit(&operation_config, &repository_id, arguments, &cancellation)
+                    match submit_tool.as_str() {
+                        "scan_submit" => execute_scan_submit(
+                            &operation_config,
+                            &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        "runtime_trace_import_submit" => execute_runtime_import_submit(
+                            &operation_config,
+                            &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        _ => unreachable!("durable submit branch is closed"),
+                    }
                 })
                 .await;
             cancellation_bridge.abort();
@@ -1496,6 +1526,321 @@ fn execute_scan_submit(
         ));
     }
 
+    let normalized_input = serde_json::json!({
+        "no_cache": arguments.no_cache,
+        "strict": arguments.strict,
+    });
+    submit_durable_operation(
+        config,
+        OperationKind::ScanSubmit,
+        &normalized_input,
+        &arguments.idempotency_key,
+        cancellation,
+    )
+}
+
+fn execute_runtime_import_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<RuntimeImportSubmitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+
+    let requested_locator =
+        SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let trace_file = arguments.trace_file.map(TryInto::try_into).transpose()?;
+    let source = depgraph_core::service::RuntimeTraceSourceRequest {
+        trace: arguments.trace,
+        trace_file,
+    };
+    let service = DepgraphService::new(config.clone());
+    // This entire source boundary is mutation-free. In particular, an existing
+    // older journal cannot be opened (and migrated) by malformed, secret-bearing,
+    // oversized, or unconfined trace input.
+    let prevalidated = service.prevalidate_runtime_trace_source(&source, cancellation)?;
+
+    // Only a valid raw trace may inspect an existing binding before resolving a
+    // dynamic current selector.
+    let existing_input =
+        existing_runtime_import_submission_input(config, &arguments.idempotency_key)?;
+
+    // Authenticate a known replay completely against the migration-compatible
+    // read-only store. A conflicting valid request must not gain authority to
+    // migrate the evidence store merely by reusing an existing key.
+    if let Some(existing_input) = existing_input.as_ref() {
+        prepare_runtime_import_replay_candidate_read_only(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &requested_locator,
+            existing_input,
+            cancellation,
+        )?;
+    }
+
+    // The complete existing runtime-validation boundary still runs before a
+    // new journal submission. Replays pin default/current to the immutable
+    // snapshot retained by the original operation, while explicit selectors
+    // continue to resolve and must reproduce that same binding.
+    let normalized_input = prepare_runtime_import_submission_input(
+        &service,
+        &source,
+        prevalidated.clone(),
+        &requested_locator,
+        existing_input.as_ref(),
+        RuntimeBindingResolution::Requested,
+        cancellation,
+    )?;
+    submit_runtime_import_with_conflict_recovery(
+        RuntimeImportSubmissionContext {
+            config,
+            service: &service,
+            source: &source,
+            initial_prevalidation: &prevalidated,
+            requested_locator: &requested_locator,
+            idempotency_key: &arguments.idempotency_key,
+            cancellation,
+        },
+        normalized_input,
+        |input| {
+            submit_durable_operation(
+                config,
+                OperationKind::RuntimeTraceImportSubmit,
+                input,
+                &arguments.idempotency_key,
+                cancellation,
+            )
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeBindingResolution {
+    Requested,
+    RetainedStable,
+}
+
+fn existing_runtime_import_submission_input(
+    config: &DepgraphServiceConfig,
+    idempotency_key: &IdempotencyKey,
+) -> Result<Option<serde_json::Value>, ToolExecutionFailure> {
+    let now_ms = system_now_ms()?;
+    OperationManager::existing_submission_binding_read_only(
+        config,
+        OperationKind::RuntimeTraceImportSubmit,
+        idempotency_key.as_str().as_bytes(),
+        now_ms,
+    )
+    .map_err(|error| ToolExecutionFailure::Journal {
+        error,
+        operation_id: None,
+    })
+    .map(|binding| binding.map(|binding| binding.normalized_input().value().clone()))
+}
+
+fn retained_runtime_snapshot_locator(
+    input: &serde_json::Value,
+) -> Result<SnapshotLocator, ToolExecutionFailure> {
+    let snapshot_id = input
+        .get("snapshot_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolExecutionFailure::Journal {
+            error: JournalError::IntegrityFailure,
+            operation_id: None,
+        })?;
+    match SnapshotLocator::parse(snapshot_id) {
+        Ok(SnapshotLocator::StableId(snapshot_id)) => Ok(SnapshotLocator::StableId(snapshot_id)),
+        _ => Err(ToolExecutionFailure::Journal {
+            error: JournalError::IntegrityFailure,
+            operation_id: None,
+        }),
+    }
+}
+
+fn prepare_runtime_import_submission_input(
+    service: &DepgraphService,
+    source: &depgraph_core::service::RuntimeTraceSourceRequest,
+    mut prevalidated: depgraph_core::service::RuntimeTraceSourcePrevalidation,
+    requested_locator: &SnapshotLocator,
+    existing_input: Option<&serde_json::Value>,
+    binding_resolution: RuntimeBindingResolution,
+    cancellation: &CancellationToken,
+) -> Result<serde_json::Value, ToolExecutionFailure> {
+    // Reopen after every journal inspection. Stable file reads reject identity
+    // changes during the read, and this comparison rejects content drift from
+    // the request's original raw prevalidation.
+    if source.trace_file.is_some() {
+        prevalidated =
+            service.revalidate_runtime_trace_source(source, &prevalidated, cancellation)?;
+    }
+    let locator = match (binding_resolution, requested_locator, existing_input) {
+        (RuntimeBindingResolution::RetainedStable, _, Some(input))
+        | (RuntimeBindingResolution::Requested, SnapshotLocator::Current, Some(input)) => {
+            retained_runtime_snapshot_locator(input)?
+        }
+        (RuntimeBindingResolution::RetainedStable, _, None) => {
+            return Err(ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                operation_id: None,
+            });
+        }
+        (RuntimeBindingResolution::Requested, locator, _) => locator.clone(),
+    };
+    let prepared = service.prepare_runtime_import_prevalidated(
+        prevalidated,
+        &ServiceSnapshotSelector::Locator(locator),
+        source.trace_file.clone(),
+        cancellation,
+    )?;
+    match existing_input {
+        Some(existing_input) => {
+            runtime_import_replay_input(prepared.durable_input(), existing_input)
+        }
+        None => Ok(prepared.durable_input()),
+    }
+}
+
+fn prepare_runtime_import_replay_candidate_read_only(
+    service: &DepgraphService,
+    source: &depgraph_core::service::RuntimeTraceSourceRequest,
+    mut prevalidated: depgraph_core::service::RuntimeTraceSourcePrevalidation,
+    requested_locator: &SnapshotLocator,
+    existing_input: &serde_json::Value,
+    cancellation: &CancellationToken,
+) -> Result<serde_json::Value, ToolExecutionFailure> {
+    if source.trace_file.is_some() {
+        prevalidated =
+            service.revalidate_runtime_trace_source(source, &prevalidated, cancellation)?;
+    }
+    let locator = if matches!(requested_locator, SnapshotLocator::Current) {
+        retained_runtime_snapshot_locator(existing_input)?
+    } else {
+        requested_locator.clone()
+    };
+    let binding = service.prepare_runtime_import_durable_binding_prevalidated(
+        prevalidated,
+        &ServiceSnapshotSelector::Locator(locator),
+        source.trace_file.clone(),
+        cancellation,
+    )?;
+    runtime_import_replay_input(binding.durable_input(), existing_input)
+}
+
+fn runtime_import_replay_input(
+    mut candidate: serde_json::Value,
+    existing_input: &serde_json::Value,
+) -> Result<serde_json::Value, ToolExecutionFailure> {
+    // Journals created by the initial Issue #313 implementation did not retain
+    // session_id or runtime_trace_digest. Revalidate every retained identity,
+    // then submit their exact old normalized input unchanged.
+    if existing_input.get("session_id").is_none()
+        && let Some(object) = candidate.as_object_mut()
+    {
+        object.remove("session_id");
+        object.remove("runtime_trace_digest");
+    }
+    if &candidate != existing_input {
+        return Err(ToolExecutionFailure::Journal {
+            error: JournalError::IdempotencyConflict,
+            operation_id: None,
+        });
+    }
+    Ok(existing_input.clone())
+}
+
+struct RuntimeImportSubmissionContext<'a> {
+    config: &'a DepgraphServiceConfig,
+    service: &'a DepgraphService,
+    source: &'a depgraph_core::service::RuntimeTraceSourceRequest,
+    initial_prevalidation: &'a depgraph_core::service::RuntimeTraceSourcePrevalidation,
+    requested_locator: &'a SnapshotLocator,
+    idempotency_key: &'a IdempotencyKey,
+    cancellation: &'a CancellationToken,
+}
+
+fn submit_runtime_import_with_conflict_recovery(
+    context: RuntimeImportSubmissionContext<'_>,
+    normalized_input: serde_json::Value,
+    mut submit: impl FnMut(&serde_json::Value) -> Result<OperationHandle, ToolExecutionFailure>,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let conflict = match submit(&normalized_input) {
+        Ok(handle) => return Ok(handle),
+        Err(
+            failure @ ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            },
+        ) => failure,
+        Err(failure) => return Err(failure),
+    };
+
+    // A concurrent submit may establish the key after this request's first
+    // lookup. Re-fetch that binding and re-open the original trace. Only a
+    // dynamic current selector may adopt the winner's retained stable snapshot;
+    // explicit selectors must resolve as requested and pass the same exact
+    // durable-input comparison as ordinary replays.
+    let Some(existing_input) =
+        existing_runtime_import_submission_input(context.config, context.idempotency_key)?
+    else {
+        return Err(conflict);
+    };
+    let binding_resolution = if matches!(context.requested_locator, SnapshotLocator::Current) {
+        RuntimeBindingResolution::RetainedStable
+    } else {
+        RuntimeBindingResolution::Requested
+    };
+    let replay_input = prepare_runtime_import_submission_input(
+        context.service,
+        context.source,
+        context.initial_prevalidation.clone(),
+        context.requested_locator,
+        Some(&existing_input),
+        binding_resolution,
+        context.cancellation,
+    )?;
+    let handle = submit(&replay_input)?;
+    if handle.created() {
+        return Err(ToolExecutionFailure::Journal {
+            error: JournalError::IntegrityFailure,
+            operation_id: Some(handle.operation_id().clone()),
+        });
+    }
+    Ok(handle)
+}
+
+fn submit_durable_operation(
+    config: &DepgraphServiceConfig,
+    kind: OperationKind,
+    normalized_input: &serde_json::Value,
+    idempotency_key: &IdempotencyKey,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let now_ms = system_now_ms()?;
+    let deadline_ms = now_ms
+        .checked_add(SCAN_EXECUTION_DEADLINE_MS)
+        .ok_or_else(|| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let request = SubmitRequest::new(
+        config,
+        kind,
+        normalized_input,
+        idempotency_key.as_str().as_bytes(),
+        deadline_ms,
+    )
+    .map_err(|error| ToolExecutionFailure::Journal {
+        error,
+        operation_id: None,
+    })?;
     // Resolve and validate the executable before the durable commit. Once the
     // record and handoff are visible, launch failure is reported without ever
     // returning an accepted handle for work that was not handed to a runner.
@@ -1503,25 +1848,6 @@ fn execute_scan_submit(
         .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
     let startup = RunnerStartupConfig::new(config.clone())
         .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
-    let now_ms = system_now_ms()?;
-    let deadline_ms = now_ms
-        .checked_add(SCAN_EXECUTION_DEADLINE_MS)
-        .ok_or_else(|| ToolExecutionFailure::Agent(internal_agent_error()))?;
-    let normalized_input = serde_json::json!({
-        "no_cache": arguments.no_cache,
-        "strict": arguments.strict,
-    });
-    let request = SubmitRequest::new(
-        config,
-        OperationKind::ScanSubmit,
-        &normalized_input,
-        arguments.idempotency_key.as_bytes(),
-        deadline_ms,
-    )
-    .map_err(|error| ToolExecutionFailure::Journal {
-        error,
-        operation_id: None,
-    })?;
     let mut manager =
         OperationManager::open(config).map_err(|error| ToolExecutionFailure::Journal {
             error,
@@ -3216,10 +3542,13 @@ mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
 
     use super::*;
     use depgraph_operation::OperationJournal;
+    use depgraph_store::Store;
+    use serde_json::json;
 
     fn operation_test_config(root: &Path) -> DepgraphServiceConfig {
         let repository = root.join("repository");
@@ -3235,6 +3564,1019 @@ mod tests {
             DepgraphServiceLimits::default(),
         )
         .unwrap()
+    }
+
+    fn seed_runtime_submit_store(config: &DepgraphServiceConfig) -> String {
+        let coverage = json!({
+            "profiles":1,
+            "files_discovered":0,
+            "files_analyzed":0,
+            "files_skipped":0,
+            "dependency_sites":0,
+            "resolved":0,
+            "candidates":0,
+            "external":0,
+            "unresolved":0,
+            "unsupported_syntax":0,
+            "project_code_executed":false,
+            "completeness":["syntax-complete"],
+            "reasons":[]
+        });
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,
+                "protocol_version":"1.0",
+                "scan_id":"runtime-submit-base",
+                "adapter":"fixture",
+                "adapter_version":"1.0",
+                "seq":seq
+            })
+        };
+        let mut store = Store::open(config.store_path()).unwrap();
+        store
+            .start_scan_with_revision(
+                "runtime-submit-base",
+                config.canonical_root(),
+                false,
+                Some("runtime-submit-revision"),
+            )
+            .unwrap();
+        let mut started = common("scan_started", 1);
+        started["root"] = json!(config.canonical_root());
+        started["project_code_executed"] = json!(false);
+        started["safe_mode"] = json!(true);
+        store.ingest_event(&started).unwrap();
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"profile:runtime-submit",
+            "language":"runtime-fixture",
+            "features":[],
+            "environment":{},
+            "properties":{}
+        });
+        store.ingest_event(&profile).unwrap();
+        let mut workspace = common("node_upsert", 3);
+        workspace["node"] = json!({
+            "id":"workspace:runtime-submit",
+            "kind":"workspace",
+            "locator":"repo://runtime-submit",
+            "display_name":"runtime-submit",
+            "properties":{
+                "path":"workspace",
+                "repository_identity":"workspace:runtime-submit"
+            }
+        });
+        store.ingest_event(&workspace).unwrap();
+        let mut profile_completed = common("profile_completed", 4);
+        profile_completed["profile_id"] = json!("profile:runtime-submit");
+        profile_completed["coverage"] = coverage.clone();
+        store.ingest_event(&profile_completed).unwrap();
+        let mut completed = common("scan_completed", 5);
+        completed["coverage"] = coverage;
+        store.ingest_event(&completed).unwrap();
+        store
+            .finish_scan("runtime-submit-base", "completed", None, true)
+            .unwrap();
+        store.current_snapshot_id().unwrap().unwrap()
+    }
+
+    fn runtime_submit_trace(source_session_id: &str) -> String {
+        json!({
+            "schema_version":"1.0",
+            "repository":{
+                "identity":"workspace:runtime-submit",
+                "revision":"runtime-submit-revision"
+            },
+            "session":{
+                "id":source_session_id,
+                "started_at":"2026-08-09T00:00:00Z",
+                "ended_at":"2026-08-09T00:00:01Z",
+                "profile":{"language":"runtime-fixture","features":[]},
+                "environment":{"name":"test"},
+                "redaction":{"redacted_value_count":0}
+            },
+            "events":[{
+                "sequence":1,
+                "timestamp":"2026-08-09T00:00:00Z",
+                "dependency_kind":"imports",
+                "source":{"kind":"node","node_id":"workspace:runtime-submit"},
+                "target":{"kind":"external","namespace":"fixture","name":"dependency"},
+                "count":1
+            }]
+        })
+        .to_string()
+    }
+
+    fn maximum_expanding_runtime_submit_trace(source_session_id: &str) -> String {
+        let events = (1_u64..=4_903)
+            .map(|sequence| {
+                json!({
+                    "sequence":sequence,
+                    "timestamp":"2026-08-09T00:00:00Z",
+                    "dependency_kind":"imports",
+                    "source":{"kind":"node","node_id":"workspace:runtime-submit"},
+                    "target":{"kind":"external","namespace":"fixture","name":"dependency"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut trace = json!({
+            "schema_version":"1.0",
+            "repository":{
+                "identity":"workspace:runtime-submit",
+                "revision":"runtime-submit-revision"
+            },
+            "session":{
+                "id":source_session_id,
+                "started_at":"2026-08-09T00:00:00Z",
+                "profile":{"language":"runtime-fixture"},
+                "environment":{"name":"test"}
+            },
+            "events":events
+        })
+        .to_string();
+        let maximum = depgraph_core::service::DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES;
+        assert!(trace.len() <= maximum);
+        assert!(maximum - trace.len() < 512);
+        trace.push_str(&" ".repeat(maximum - trace.len()));
+        trace
+    }
+
+    fn submit_runtime_test_operation(
+        config: &DepgraphServiceConfig,
+        input: &serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<OperationHandle, ToolExecutionFailure> {
+        let now_ms = system_now_ms()?;
+        let request = SubmitRequest::new(
+            config,
+            OperationKind::RuntimeTraceImportSubmit,
+            input,
+            idempotency_key.as_bytes(),
+            now_ms + SCAN_EXECUTION_DEADLINE_MS,
+        )
+        .map_err(|error| ToolExecutionFailure::Journal {
+            error,
+            operation_id: None,
+        })?;
+        OperationManager::open(config)
+            .and_then(|mut manager| manager.submit(&request, now_ms))
+            .map_err(|error| ToolExecutionFailure::Journal {
+                error,
+                operation_id: None,
+            })
+    }
+
+    fn downgrade_runtime_submit_store_to_v15(config: &DepgraphServiceConfig) {
+        let connection = rusqlite::Connection::open(config.store_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;
+                 DROP TABLE scan_operation_staging;
+                 DROP TABLE runtime_import_operation_owners;
+                 PRAGMA user_version=15;
+                 VACUUM;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_default_current_runtime_submit_recovers_the_original_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let base_snapshot_id = seed_runtime_submit_store(&config);
+        let trace = runtime_submit_trace("concurrent-default-current");
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(trace.clone()),
+            trace_file: None,
+        };
+        let requested_locator = SnapshotLocator::Current;
+        let idempotency_key = IdempotencyKey::parse("concurrent-default-current").unwrap();
+        let cancellation = CancellationToken::new();
+        let service = DepgraphService::new(config.clone());
+        let winner_prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        assert!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .is_none()
+        );
+        let winner_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            winner_prevalidated,
+            &requested_locator,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(winner_input["snapshot_id"], base_snapshot_id);
+
+        let (loser_missed, wait_for_loser_miss) = mpsc::sync_channel(0);
+        let (current_advanced, wait_for_current_advance) = mpsc::sync_channel(0);
+        let loser_config = config.clone();
+        let loser_source = source.clone();
+        let loser_idempotency_key = idempotency_key.clone();
+        let loser = std::thread::spawn(move || {
+            let service = DepgraphService::new(loser_config.clone());
+            let cancellation = CancellationToken::new();
+            let prevalidated = service
+                .prevalidate_runtime_trace_source(&loser_source, &cancellation)
+                .unwrap();
+            assert!(
+                existing_runtime_import_submission_input(&loser_config, &loser_idempotency_key,)
+                    .unwrap()
+                    .is_none()
+            );
+            loser_missed.send(()).unwrap();
+            let advanced_snapshot_id = wait_for_current_advance.recv().unwrap();
+            let initial_input = prepare_runtime_import_submission_input(
+                &service,
+                &loser_source,
+                prevalidated.clone(),
+                &SnapshotLocator::Current,
+                None,
+                RuntimeBindingResolution::Requested,
+                &cancellation,
+            )
+            .unwrap();
+            assert_eq!(initial_input["snapshot_id"], advanced_snapshot_id);
+            let mut submit_attempts = 0;
+            let handle = match submit_runtime_import_with_conflict_recovery(
+                RuntimeImportSubmissionContext {
+                    config: &loser_config,
+                    service: &service,
+                    source: &loser_source,
+                    initial_prevalidation: &prevalidated,
+                    requested_locator: &SnapshotLocator::Current,
+                    idempotency_key: &loser_idempotency_key,
+                    cancellation: &cancellation,
+                },
+                initial_input,
+                |input| {
+                    submit_attempts += 1;
+                    submit_runtime_test_operation(
+                        &loser_config,
+                        input,
+                        "concurrent-default-current",
+                    )
+                },
+            ) {
+                Ok(handle) => handle,
+                Err(_) => panic!("lost-race recovery rejected the exact original request"),
+            };
+            assert_eq!(submit_attempts, 2);
+            handle
+        });
+
+        wait_for_loser_miss.recv().unwrap();
+        let winner =
+            submit_runtime_test_operation(&config, &winner_input, "concurrent-default-current")
+                .unwrap();
+        assert!(winner.created());
+        let advanced = service
+            .runtime_import(
+                &RuntimeValidateRequest {
+                    trace: Some(trace),
+                    trace_file: None,
+                    snapshot: ServiceSnapshotSelector::Locator(SnapshotLocator::StableId(
+                        base_snapshot_id.clone(),
+                    )),
+                },
+                &cancellation,
+            )
+            .unwrap();
+        assert_ne!(advanced.completed_snapshot_id().as_str(), base_snapshot_id);
+        current_advanced
+            .send(advanced.completed_snapshot_id().as_str().to_owned())
+            .unwrap();
+
+        let replay = loser.join().unwrap();
+        assert!(!replay.created());
+        assert_eq!(replay.operation_id(), winner.operation_id());
+        let established = existing_runtime_import_submission_input(&config, &idempotency_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(established, winner_input);
+
+        let mut old_journal_input = winner_input.clone();
+        old_journal_input
+            .as_object_mut()
+            .unwrap()
+            .remove("session_id");
+        old_journal_input
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_trace_digest");
+        assert_eq!(
+            runtime_import_replay_input(winner_input, &old_journal_input).unwrap(),
+            old_journal_input
+        );
+    }
+
+    #[test]
+    fn concurrent_explicit_name_runtime_submit_keeps_the_requested_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let snapshot_a = seed_runtime_submit_store(&config);
+        let trace = runtime_submit_trace("concurrent-explicit-name");
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(trace.clone()),
+            trace_file: None,
+        };
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let snapshot_b = service
+            .runtime_import(
+                &RuntimeValidateRequest {
+                    trace: Some(trace),
+                    trace_file: None,
+                    snapshot: ServiceSnapshotSelector::Locator(SnapshotLocator::StableId(
+                        snapshot_a.clone(),
+                    )),
+                },
+                &cancellation,
+            )
+            .unwrap()
+            .completed_snapshot_id()
+            .as_str()
+            .to_owned();
+        service
+            .snapshot_name_create(
+                &SnapshotNameCreateRequest::new(
+                    "runtime-snapshot-b",
+                    SnapshotLocator::StableId(snapshot_b.clone()),
+                ),
+                &cancellation,
+            )
+            .unwrap();
+
+        let idempotency_key = IdempotencyKey::parse("concurrent-explicit-name").unwrap();
+        assert!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .is_none()
+        );
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let requested_locator = SnapshotLocator::parse("runtime-snapshot-b").unwrap();
+        let loser_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &requested_locator,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(loser_input["snapshot_id"], snapshot_b);
+        let winner_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &SnapshotLocator::StableId(snapshot_a.clone()),
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(winner_input["snapshot_id"], snapshot_a);
+        submit_runtime_test_operation(&config, &winner_input, "concurrent-explicit-name").unwrap();
+
+        let mut submit_attempts = 0;
+        let rejected = submit_runtime_import_with_conflict_recovery(
+            RuntimeImportSubmissionContext {
+                config: &config,
+                service: &service,
+                source: &source,
+                initial_prevalidation: &prevalidated,
+                requested_locator: &requested_locator,
+                idempotency_key: &idempotency_key,
+                cancellation: &cancellation,
+            },
+            loser_input,
+            |input| {
+                submit_attempts += 1;
+                submit_runtime_test_operation(&config, input, "concurrent-explicit-name")
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            })
+        ));
+        assert_eq!(submit_attempts, 1);
+        assert_eq!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .unwrap(),
+            winner_input
+        );
+    }
+
+    #[test]
+    fn concurrent_explicit_stable_runtime_submit_replays_the_same_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let snapshot_a = seed_runtime_submit_store(&config);
+        let trace = runtime_submit_trace("concurrent-explicit-stable");
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(trace.clone()),
+            trace_file: None,
+        };
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let snapshot_b = service
+            .runtime_import(
+                &RuntimeValidateRequest {
+                    trace: Some(trace),
+                    trace_file: None,
+                    snapshot: ServiceSnapshotSelector::Locator(SnapshotLocator::StableId(
+                        snapshot_a.clone(),
+                    )),
+                },
+                &cancellation,
+            )
+            .unwrap()
+            .completed_snapshot_id()
+            .as_str()
+            .to_owned();
+        assert_ne!(snapshot_a, snapshot_b);
+
+        let idempotency_key = IdempotencyKey::parse("concurrent-explicit-stable").unwrap();
+        assert!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .is_none()
+        );
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let requested_locator = SnapshotLocator::StableId(snapshot_a.clone());
+        let input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &requested_locator,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        let winner =
+            submit_runtime_test_operation(&config, &input, "concurrent-explicit-stable").unwrap();
+        assert!(winner.created());
+
+        let mut submit_attempts = 0;
+        let replay = submit_runtime_import_with_conflict_recovery(
+            RuntimeImportSubmissionContext {
+                config: &config,
+                service: &service,
+                source: &source,
+                initial_prevalidation: &prevalidated,
+                requested_locator: &requested_locator,
+                idempotency_key: &idempotency_key,
+                cancellation: &cancellation,
+            },
+            input.clone(),
+            |candidate| {
+                submit_attempts += 1;
+                if submit_attempts == 1 {
+                    return Err(ToolExecutionFailure::Journal {
+                        error: JournalError::IdempotencyConflict,
+                        operation_id: None,
+                    });
+                }
+                submit_runtime_test_operation(&config, candidate, "concurrent-explicit-stable")
+            },
+        )
+        .unwrap();
+        assert_eq!(submit_attempts, 2);
+        assert!(!replay.created());
+        assert_eq!(replay.operation_id(), winner.operation_id());
+        assert_eq!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn runtime_submit_conflict_recovery_rejects_mismatched_trace() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let base_snapshot_id = seed_runtime_submit_store(&config);
+        let original_trace = runtime_submit_trace("conflict-original");
+        let original_source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(original_trace.clone()),
+            trace_file: None,
+        };
+        let service = DepgraphService::new(config.clone());
+        let idempotency_key = IdempotencyKey::parse("mismatched-trace").unwrap();
+        let cancellation = CancellationToken::new();
+        let original_prevalidated = service
+            .prevalidate_runtime_trace_source(&original_source, &cancellation)
+            .unwrap();
+        let original_input = prepare_runtime_import_submission_input(
+            &service,
+            &original_source,
+            original_prevalidated,
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        submit_runtime_test_operation(&config, &original_input, "mismatched-trace").unwrap();
+        service
+            .runtime_import(
+                &RuntimeValidateRequest {
+                    trace: Some(original_trace),
+                    trace_file: None,
+                    snapshot: ServiceSnapshotSelector::Locator(SnapshotLocator::StableId(
+                        base_snapshot_id,
+                    )),
+                },
+                &cancellation,
+            )
+            .unwrap();
+
+        let mismatched_source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(runtime_submit_trace("conflict-mismatch")),
+            trace_file: None,
+        };
+        let mismatched_prevalidated = service
+            .prevalidate_runtime_trace_source(&mismatched_source, &cancellation)
+            .unwrap();
+        let mismatched_input = prepare_runtime_import_submission_input(
+            &service,
+            &mismatched_source,
+            mismatched_prevalidated.clone(),
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        let mut submit_attempts = 0;
+        let rejected = submit_runtime_import_with_conflict_recovery(
+            RuntimeImportSubmissionContext {
+                config: &config,
+                service: &service,
+                source: &mismatched_source,
+                initial_prevalidation: &mismatched_prevalidated,
+                requested_locator: &SnapshotLocator::Current,
+                idempotency_key: &idempotency_key,
+                cancellation: &cancellation,
+            },
+            mismatched_input,
+            |input| {
+                submit_attempts += 1;
+                submit_runtime_test_operation(&config, input, "mismatched-trace")
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            })
+        ));
+        assert_eq!(submit_attempts, 1);
+        assert_eq!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .unwrap(),
+            original_input
+        );
+    }
+
+    #[test]
+    fn runtime_submit_conflict_recovery_rejects_file_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let base_snapshot_id = seed_runtime_submit_store(&config);
+        let trace_path = config.canonical_root().join("runtime.json");
+        let original_trace = runtime_submit_trace("file-drift-original");
+        std::fs::write(&trace_path, &original_trace).unwrap();
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: None,
+            trace_file: Some(
+                depgraph_core::service::RepositoryRelativePath::parse("runtime.json").unwrap(),
+            ),
+        };
+        let service = DepgraphService::new(config.clone());
+        let idempotency_key = IdempotencyKey::parse("file-drift").unwrap();
+        let cancellation = CancellationToken::new();
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let original_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        submit_runtime_test_operation(&config, &original_input, "file-drift").unwrap();
+        service
+            .runtime_import(
+                &RuntimeValidateRequest {
+                    trace: Some(original_trace),
+                    trace_file: None,
+                    snapshot: ServiceSnapshotSelector::Locator(SnapshotLocator::StableId(
+                        base_snapshot_id,
+                    )),
+                },
+                &cancellation,
+            )
+            .unwrap();
+        let initial_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        std::fs::write(&trace_path, runtime_submit_trace("file-drift-changed")).unwrap();
+
+        let mut submit_attempts = 0;
+        let rejected = submit_runtime_import_with_conflict_recovery(
+            RuntimeImportSubmissionContext {
+                config: &config,
+                service: &service,
+                source: &source,
+                initial_prevalidation: &prevalidated,
+                requested_locator: &SnapshotLocator::Current,
+                idempotency_key: &idempotency_key,
+                cancellation: &cancellation,
+            },
+            initial_input,
+            |input| {
+                submit_attempts += 1;
+                submit_runtime_test_operation(&config, input, "file-drift")
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Conflict
+            ))
+        ));
+        assert_eq!(submit_attempts, 1);
+        assert_eq!(
+            existing_runtime_import_submission_input(&config, &idempotency_key)
+                .unwrap()
+                .unwrap(),
+            original_input
+        );
+    }
+
+    #[test]
+    fn valid_runtime_trace_drift_cannot_create_a_journal_or_migrate_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        seed_runtime_submit_store(&config);
+        let trace_path = config.canonical_root().join("runtime.json");
+        std::fs::write(&trace_path, runtime_submit_trace("drift-before-open")).unwrap();
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: None,
+            trace_file: Some(
+                depgraph_core::service::RepositoryRelativePath::parse("runtime.json").unwrap(),
+            ),
+        };
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let connection = rusqlite::Connection::open(config.store_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 DROP TABLE scan_operation_staging;
+                 DROP TABLE runtime_import_operation_owners;
+                 PRAGMA user_version=15;
+                 VACUUM;",
+            )
+            .unwrap();
+        drop(connection);
+        let before_store = std::fs::read(config.store_path()).unwrap();
+        let key = IdempotencyKey::parse("drift-before-open").unwrap();
+        assert!(
+            existing_runtime_import_submission_input(&config, &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !depgraph_operation::operation_journal_path(&config)
+                .as_path()
+                .exists()
+        );
+
+        std::fs::write(&trace_path, runtime_submit_trace("drift-after-open")).unwrap();
+        assert!(matches!(
+            prepare_runtime_import_submission_input(
+                &service,
+                &source,
+                prevalidated,
+                &SnapshotLocator::Current,
+                None,
+                RuntimeBindingResolution::Requested,
+                &cancellation,
+            ),
+            Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Conflict
+            ))
+        ));
+
+        assert!(
+            !depgraph_operation::operation_journal_path(&config)
+                .as_path()
+                .exists()
+        );
+        assert_eq!(std::fs::read(config.store_path()).unwrap(), before_store);
+        assert_eq!(
+            rusqlite::Connection::open_with_flags(
+                config.store_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+            15
+        );
+    }
+
+    #[test]
+    fn conflicting_valid_v15_runtime_replay_is_rejected_before_store_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        seed_runtime_submit_store(&config);
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let original_source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(runtime_submit_trace("v15-original-replay")),
+            trace_file: None,
+        };
+        let original_prevalidated = service
+            .prevalidate_runtime_trace_source(&original_source, &cancellation)
+            .unwrap();
+        let original_input = prepare_runtime_import_submission_input(
+            &service,
+            &original_source,
+            original_prevalidated,
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        submit_runtime_test_operation(&config, &original_input, "v15-conflicting-replay").unwrap();
+        downgrade_runtime_submit_store_to_v15(&config);
+        let before_bytes = std::fs::read(config.store_path()).unwrap();
+        let before_rows = rusqlite::Connection::open_with_flags(
+            config.store_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM completed_snapshots),
+                    (SELECT COUNT(*) FROM runtime_sessions),
+                    (SELECT COUNT(*) FROM snapshot_sources)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+        let existing_input = existing_runtime_import_submission_input(
+            &config,
+            &IdempotencyKey::parse("v15-conflicting-replay").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let conflicting_source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(runtime_submit_trace("v15-conflicting-replay")),
+            trace_file: None,
+        };
+        let conflicting_prevalidated = service
+            .prevalidate_runtime_trace_source(&conflicting_source, &cancellation)
+            .unwrap();
+
+        assert!(matches!(
+            prepare_runtime_import_replay_candidate_read_only(
+                &service,
+                &conflicting_source,
+                conflicting_prevalidated,
+                &SnapshotLocator::Current,
+                &existing_input,
+                &cancellation,
+            ),
+            Err(ToolExecutionFailure::Journal {
+                error: JournalError::IdempotencyConflict,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(config.store_path()).unwrap(), before_bytes);
+        let connection = rusqlite::Connection::open_with_flags(
+            config.store_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            15
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM completed_snapshots),
+                            (SELECT COUNT(*) FROM runtime_sessions),
+                            (SELECT COUNT(*) FROM snapshot_sources)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, u64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            before_rows
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                      WHERE name IN ('runtime_import_operation_owners',
+                                     'scan_operation_staging')",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn exact_v15_runtime_replay_migrates_and_reuses_the_journal_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        seed_runtime_submit_store(&config);
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(runtime_submit_trace("v15-exact-replay")),
+            trace_file: None,
+        };
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let original_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        let original =
+            submit_runtime_test_operation(&config, &original_input, "v15-exact-replay").unwrap();
+        downgrade_runtime_submit_store_to_v15(&config);
+        let existing_input = existing_runtime_import_submission_input(
+            &config,
+            &IdempotencyKey::parse("v15-exact-replay").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let candidate = prepare_runtime_import_replay_candidate_read_only(
+            &service,
+            &source,
+            prevalidated.clone(),
+            &SnapshotLocator::Current,
+            &existing_input,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(candidate, original_input);
+        assert_eq!(
+            rusqlite::Connection::open(config.store_path())
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            15
+        );
+
+        let replay_input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated,
+            &SnapshotLocator::Current,
+            Some(&existing_input),
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        let replay =
+            submit_runtime_test_operation(&config, &replay_input, "v15-exact-replay").unwrap();
+        assert!(!replay.created());
+        assert_eq!(replay.operation_id(), original.operation_id());
+        assert_eq!(
+            rusqlite::Connection::open(config.store_path())
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            depgraph_store::STORE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn maximum_inline_runtime_trace_normalization_fits_the_operation_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        seed_runtime_submit_store(&config);
+        let trace = maximum_expanding_runtime_submit_trace("maximum-inline-normalization");
+        assert_eq!(
+            trace.len(),
+            depgraph_core::service::DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES
+        );
+        let source = depgraph_core::service::RuntimeTraceSourceRequest {
+            trace: Some(trace),
+            trace_file: None,
+        };
+        let service = DepgraphService::new(config.clone());
+        let cancellation = CancellationToken::new();
+        let prevalidated = service
+            .prevalidate_runtime_trace_source(&source, &cancellation)
+            .unwrap();
+        let connection = rusqlite::Connection::open(config.store_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 DROP TABLE scan_operation_staging;
+                 DROP TABLE runtime_import_operation_owners;
+                 PRAGMA user_version=15;
+                 VACUUM;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let input = prepare_runtime_import_submission_input(
+            &service,
+            &source,
+            prevalidated,
+            &SnapshotLocator::Current,
+            None,
+            RuntimeBindingResolution::Requested,
+            &cancellation,
+        )
+        .unwrap();
+        let normalized_bytes = depgraph_mcp_tools::canonical_json_bytes(&input)
+            .unwrap()
+            .len();
+        assert!(normalized_bytes > 1024 * 1024);
+        assert!(normalized_bytes <= depgraph_operation::MAX_OPERATION_INPUT_BYTES);
+        let request = SubmitRequest::new(
+            &config,
+            OperationKind::RuntimeTraceImportSubmit,
+            &input,
+            b"maximum-inline-normalization",
+            system_now_ms().unwrap() + SCAN_EXECUTION_DEADLINE_MS,
+        )
+        .unwrap();
+        assert_eq!(request.normalized_input().as_str().len(), normalized_bytes);
+        assert_eq!(
+            rusqlite::Connection::open(config.store_path())
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            17
+        );
     }
 
     #[test]

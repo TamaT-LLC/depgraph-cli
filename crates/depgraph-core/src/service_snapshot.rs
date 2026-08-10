@@ -122,13 +122,34 @@ impl DepgraphService {
         scan_id: &str,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        self.start_snapshot_request_for_scan_with_schema(scan_id, cancellation, false)
+    }
+
+    pub(crate) fn start_snapshot_request_for_scan_before_migration(
+        &self,
+        scan_id: &str,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        self.start_snapshot_request_for_scan_with_schema(scan_id, cancellation, true)
+    }
+
+    fn start_snapshot_request_for_scan_with_schema(
+        &self,
+        scan_id: &str,
+        cancellation: &CancellationToken,
+        migration_compatible: bool,
+    ) -> DepgraphServiceResult<SnapshotReadRequest> {
         if scan_id.is_empty() || scan_id.len() > 256 || scan_id.chars().any(char::is_control) {
             return Err(DepgraphServiceError::InvalidInput);
         }
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        let mut read_store = self.read_store_factory().open()?;
+        let mut read_store = if migration_compatible {
+            self.read_store_factory().open_for_migration()?
+        } else {
+            self.read_store_factory().open()?
+        };
         let cancellation_check = cancellation.clone();
         let resolved = read_store.store().interruptible_read(
             move || cancellation_check.is_cancelled(),
@@ -166,11 +187,32 @@ impl DepgraphService {
         locator: &SnapshotLocator,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        self.start_snapshot_request_at_with_schema(locator, cancellation, false)
+    }
+
+    pub(crate) fn start_snapshot_request_at_before_migration(
+        &self,
+        locator: &SnapshotLocator,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        self.start_snapshot_request_at_with_schema(locator, cancellation, true)
+    }
+
+    fn start_snapshot_request_at_with_schema(
+        &self,
+        locator: &SnapshotLocator,
+        cancellation: &CancellationToken,
+        migration_compatible: bool,
+    ) -> DepgraphServiceResult<SnapshotReadRequest> {
         validate_locator(locator)?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        let mut read_store = self.read_store_factory().open()?;
+        let mut read_store = if migration_compatible {
+            self.read_store_factory().open_for_migration()?
+        } else {
+            self.read_store_factory().open()?
+        };
         let cancellation_check = cancellation.clone();
         let resolved = read_store.store().interruptible_read(
             move || cancellation_check.is_cancelled(),

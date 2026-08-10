@@ -10,9 +10,9 @@ use depgraph_mcp_tools::{
     AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep,
     AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
     AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation, AgentResolutionStatus,
-    AgentResourceLimit, AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
-    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
     MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
@@ -207,6 +207,32 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
         .unwrap()
         .remove("snapshot_id");
     assert!(scan.deserialize(snapshotless_scan).is_err());
+
+    let runtime_outcome: AgentRuntimeOutcome = serde_json::from_value(json!({
+        "import_id":"runtime-import:fixture",
+        "session_id":"runtime-session:fixture",
+        "snapshot_id":SNAPSHOT_ID,
+        "status":"completed",
+        "deduplicated":false
+    }))
+    .unwrap();
+    let runtime_envelope =
+        SuccessEnvelope::new(parse("repo-1"), Some(parse(SNAPSHOT_ID)), runtime_outcome);
+    let runtime =
+        PortableTerminalOutputContract::for_originating_tool("runtime_trace_import_submit")
+            .unwrap();
+    assert!(
+        runtime
+            .deserialize(serde_json::to_value(&runtime_envelope).unwrap())
+            .is_ok()
+    );
+    let mut mismatched_runtime = serde_json::to_value(&runtime_envelope).unwrap();
+    mismatched_runtime["snapshot_id"] = json!(format!("snapshot:sha256:{}", "b".repeat(64)));
+    assert!(runtime.deserialize(mismatched_runtime).is_err());
+    assert!(
+        scan.deserialize(serde_json::to_value(runtime_envelope).unwrap())
+            .is_err()
+    );
 
     let mut mismatched_envelope = value;
     mismatched_envelope["snapshot_id"] = json!(SNAPSHOT_ID);

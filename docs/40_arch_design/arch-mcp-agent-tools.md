@@ -33,6 +33,7 @@ additive extensionとして採用するかを決定する。
 | Graph analysis tools | `graph_impact_get`, `graph_cycles_list`, `graph_unresolved_list` | Issue #303 implemented through shared bounded read services |
 | Bounded query/runtime validation | `graph_query`, `runtime_trace_validate` | Issue #304 implemented through prevalidated read-only services |
 | Snapshot artifacts | `snapshot_diff_get`, `policy_evaluate`, `graph_export` | Issue #305 implemented through pinned, bounded shared artifact services |
+| Runtime store-write | `runtime_trace_import_submit` | Issue #313 implemented through prevalidated durable operation and atomic runtime-snapshot promotion |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -84,6 +85,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#303` | reverse impact、cycles、unresolved sitesを共有serviceとMCPへ接続する | current-only changed set、cache-independent canonical impact、closed cycle/unresolved DTO、全phaseのbounds/cancellation、snapshot/input-bound cursor、CLI/MCP/process/schema parityで固定する |
 | `#304` | bounded queryとruntime validationを共有serviceとMCPへ接続する | pre-store input/output admission、confined file input、pinned read-only snapshot、closed query/runtime DTO、input-bound cursor、CLI/MCP parity、redaction/immutability/process/schema testで固定する |
 | `#305` | snapshot diff、policy evaluation、bounded inline graph exportを共有serviceとMCPへ接続する | request開始時のcompleted snapshot pin、canonical policy digest、closed diff/policy/export DTO、inline byte/node/edge bounds、typed `export_file` remediation、CLI/MCP/schema/catalog parityで固定する |
+| `#313` | runtime trace importを共有store-write serviceとdurable MCP operationへ接続する | existing validation/matching/delta boundary、writer lock、deferred completion intent、atomic runtime snapshot promotion、closed `AgentRuntimeOutcome`、idempotency/cancel/restart recoveryで固定する |
 
 ## Upstream and API evidence
 
@@ -507,6 +509,31 @@ Issue [#312](https://github.com/TamaT-LLC/depgraph-cli/issues/312)はCLI固有�
 | namingはcompleted-only、immutable、writer serialized | service missing/partial/duplicate/lock testsとMCP duplicate-name process test |
 | store-write capabilityなしではdiscover/call不可 | catalog capability filterとread-only MCP process test |
 | repository validation | Rust 1.93.1 format、workspace Clippy `-D warnings`、focused suites、`cargo xtask test` |
+
+## Issue #313 runtime import store-write evidence
+
+Issue [#313](https://github.com/TamaT-LLC/depgraph-cli/issues/313)は既存のruntime trace validation、snapshot matching、runtime session delta生成、store unionを共有`DepgraphService`のstore-write use caseへまとめ、`runtime_trace_import_submit`をdurable operation runnerへ接続する。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Pre-journal validation | inline `trace`またはrepository-relative `trace_file`のexactly-oneだけを受理する。既存`runtime_trace_validate`と同じbyte/event/string/nesting/credential/parse制約、handle-relative no-follow regular-file read、confinement、stable identity checkをmutation-free source prevalidationとしてoperation journal openより先に完了する。raw traceがvalidになって初めてexisting idempotency bindingを参照し、default/current replayをoriginal immutable snapshotへpinしてsnapshot matchingと`RuntimeSessionDelta`生成を行う。したがって旧journalが存在してもinvalid traceによるschema migrationは起きない |
+| Durable input identity | journalはinline traceのcanonical parsed value、またはconfined file locatorを保持し、いずれもvalidated trace digestと開始時に解決したimmutable base snapshot IDへbindする。operation inputの16 MiB上限は、1 MiB raw inline上限 + 100,000 eventそれぞれのdefault/timestamp正規化増分128 bytes + session固定増分512 bytes + binding envelope 1 KiBという保守的なclosed bound（13,850,112 bytes）を包含する。`trace_file`はjournal参照後にも再度stable readしてprevalidation時のexact normalized valueと一致させ、runnerも同じ境界で再読し、digestまたはsnapshot identityのdriftをstore mutation前にfail closedとする |
+| Shared promotion | CLI、runner、restart recoveryは同じ`DepgraphService` runtime import methodを呼ぶ。serviceだけが`Read + StoreWrite`、store writer lock、base snapshot integrity、runtime delta union、`Store::import_runtime_session`またはdeferred staging/finalizationを所有する |
+| Cancellation linearization | runnerはvalidated runtime deltaをstagingに保持したままcurrent promotionをdeferする。store schema v16の`runtime_import_operation_owners(import_id, operation_id)`をstaging transaction（deterministic replay/dedupを含む）でdurable化する。cancel/deadline cleanupは当該operation ownerだけを同一store transactionでreleaseし、ownerがゼロになったstaging import/sessionだけを削除する。completed import/snapshotは削除せず、owner evidenceのないv15以前のstagingはfail-safeに保持する |
+| Crash recovery | completion intentはclosed terminal payloadを先にdurable化する。intent commit後のrunner停止は次runnerがwork claimより先にruntime import/session/prospective snapshot identityを再検証し、staging promotionまたは既に完了したpromotionをidempotentにfinalizeする。promotion transactionは全owner referenceを消去するためcompleted importにstale ownershipを残さない。別idempotency keyが同じdeterministic stageを共有していても、一方のcleanupはcommitted intentを持つ他方のrecovery evidenceを破棄できない |
+| Closed parity result | `AgentRuntimeOutcome`はruntime import ID、runtime session ID、completed snapshot ID、closed `completed` / `partial` status、deduplication flagだけを持つ。CLI JSON domain resultとMCP terminal success envelopeは同じservice outcomeからこのDTOを構築し、envelope snapshot IDとの一致をterminal contractで再検証する |
+| Capability and artifacts | `runtime_trace_import_submit`はstore-write profileだけにdiscover/call可能で、idempotency key、exactly-one trace input、optional completed snapshot selectorだけをadvertiseする。catalog、shared schema、terminal result unionとdigest fixtureはcanonical generatorで固定する |
+
+### Issue #313 acceptance mapping
+
+| Acceptance criterion | Evidence |
+| --- | --- |
+| invalid traceはjournal/store mutation前にtyped failure | missing-store service test、inline/file credential-shaped MCP process test、既存v2 journalのbyte/row/schema/user_versionとstore invariant不変 assertion |
+| valid traceだけが新しいimmutable completed snapshotへatomic union | immediate/deferred service tests、runtime store transaction tests、MCP terminal/current snapshot process assertion |
+| cancel/failureはpartial/currentを公開しない | deferred service cancellation、runner completion-window cancellation、malformed/digest drift failure test、二operation共有stageのowner barrier/recovery test |
+| CLIとMCP terminal outcome parity | shared `AgentRuntimeOutcome` conversion、CLI runtime import regression、MCP terminal closed-contract test |
+| idempotencyとrestart recovery | same-key same-operation process assertion、completion-intent promotion recovery unit/integration test |
+| repository validation | Rust 1.93.1 format、focused core/store/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

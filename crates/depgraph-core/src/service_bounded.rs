@@ -8,7 +8,7 @@ use depgraph_protocol::stable_id_from_value;
 
 use crate::{
     BoundedQueryExecutionOptions, BoundedQueryLimits, BoundedQueryPlan, BoundedQueryResult,
-    CancellationToken, MAX_QUERY_BYTES, QueryDiagnostic, TypedProjection, TypedQuery,
+    CancellationToken, MAX_QUERY_BYTES, QueryDiagnostic, RuntimeTrace, TypedProjection, TypedQuery,
     ValidatedRuntimeTrace, execute_bounded_query_with_options, match_runtime_trace,
     parse_and_type_check_bounded_query, plan_bounded_query_with_limits, read_bounded_query_file,
     read_runtime_trace,
@@ -95,10 +95,64 @@ pub struct RuntimeValidateRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct RuntimeTraceSourceRequest {
+    pub trace: Option<String>,
+    pub trace_file: Option<RepositoryRelativePath>,
+}
+
+impl RuntimeValidateRequest {
+    #[must_use]
+    pub fn source(&self) -> RuntimeTraceSourceRequest {
+        RuntimeTraceSourceRequest {
+            trace: self.trace.clone(),
+            trace_file: self.trace_file.clone(),
+        }
+    }
+}
+
+/// Opaque, normalized result of validating an untrusted runtime trace source.
+/// Producing this value never opens either the graph store or operation journal.
+#[derive(Clone, Debug)]
+pub struct RuntimeTraceSourcePrevalidation {
+    input_digest: String,
+    normalized_trace: serde_json::Value,
+    trace: RuntimeTrace,
+}
+
+impl RuntimeTraceSourcePrevalidation {
+    /// Digest of the bounded, parsed, and normalized source document. This is
+    /// safe to compare with a durable journal binding before any store is
+    /// opened or migrated.
+    #[must_use]
+    pub fn input_digest(&self) -> &str {
+        &self.input_digest
+    }
+
+    /// Verify the retained identities that can be proven from the normalized
+    /// source alone. The runtime trace digest is bound into the deterministic
+    /// session identity together with the collector's source session ID.
+    #[must_use]
+    pub fn matches_retained_runtime_identity(
+        &self,
+        session_id: &str,
+        runtime_trace_digest: &str,
+    ) -> bool {
+        stable_id_from_value(
+            "runtime-session",
+            &serde_json::json!({
+                "source_session_id": self.trace.session.id,
+                "trace_digest": runtime_trace_digest,
+            }),
+        ) == session_id
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct RuntimeValidateServiceResult {
     resolved_snapshot_id: ResolvedSnapshotId,
     scan_id: String,
     input_digest: String,
+    normalized_trace: serde_json::Value,
     trace: ValidatedRuntimeTrace,
 }
 
@@ -119,6 +173,11 @@ impl RuntimeValidateServiceResult {
     }
 
     #[must_use]
+    pub const fn normalized_trace(&self) -> &serde_json::Value {
+        &self.normalized_trace
+    }
+
+    #[must_use]
     pub const fn trace(&self) -> &ValidatedRuntimeTrace {
         &self.trace
     }
@@ -126,6 +185,14 @@ impl RuntimeValidateServiceResult {
     #[must_use]
     pub fn into_trace(self) -> ValidatedRuntimeTrace {
         self.trace
+    }
+
+    pub(crate) fn semantically_matches(&self, other: &Self) -> bool {
+        self.resolved_snapshot_id == other.resolved_snapshot_id
+            && self.scan_id == other.scan_id
+            && self.input_digest == other.input_digest
+            && self.normalized_trace == other.normalized_trace
+            && self.trace == other.trace
     }
 }
 
@@ -158,7 +225,7 @@ impl DepgraphService {
         limits.serialized_output_bytes = service_output_limit;
 
         let mut snapshot_request =
-            self.start_service_snapshot_request(&request.snapshot, cancellation)?;
+            self.start_service_snapshot_request(&request.snapshot, cancellation, false)?;
         let resolved_snapshot_id = snapshot_request.snapshot_id().clone();
         let snapshot =
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
@@ -207,6 +274,20 @@ impl DepgraphService {
         request: &RuntimeValidateRequest,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<RuntimeValidateServiceResult> {
+        let prevalidated =
+            self.prevalidate_runtime_trace_source(&request.source(), cancellation)?;
+        self.runtime_validate_prevalidated(prevalidated, &request.snapshot, cancellation)
+    }
+
+    /// Validate only the bounded, untrusted trace source. This includes the
+    /// exactly-one source rule, inline/file size limits, confined stable file
+    /// reads, JSON/type/secret checks, and trace-contract normalization. It
+    /// deliberately performs no snapshot or journal access.
+    pub fn prevalidate_runtime_trace_source(
+        &self,
+        request: &RuntimeTraceSourceRequest,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<RuntimeTraceSourcePrevalidation> {
         check_cancellation(cancellation)?;
         let bytes = self.read_runtime_input(request, cancellation)?;
         let trace = read_runtime_trace(Cursor::new(bytes))
@@ -216,8 +297,106 @@ impl DepgraphService {
             serde_json::to_value(&trace).map_err(|_| DepgraphServiceError::Internal)?;
         let input_digest = stable_id_from_value("runtime-validation-input", &input_value);
 
+        Ok(RuntimeTraceSourcePrevalidation {
+            input_digest,
+            normalized_trace: input_value,
+            trace,
+        })
+    }
+
+    /// Validate an already-retained normalized runtime trace under a caller's
+    /// explicit durable-input bound. This path deliberately does not reapply
+    /// the public inline transport limit, and rejects any value that is not
+    /// already the exact normalized form produced by full trace validation.
+    pub fn prevalidate_retained_normalized_runtime_trace(
+        &self,
+        normalized_trace: &serde_json::Value,
+        max_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<RuntimeTraceSourcePrevalidation> {
+        check_cancellation(cancellation)?;
+        let bytes =
+            serde_json::to_vec(normalized_trace).map_err(|_| DepgraphServiceError::Internal)?;
+        if bytes.len() > max_retained_bytes {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
+        let trace = read_runtime_trace(Cursor::new(bytes))
+            .map_err(|source| runtime_input_error(source, cancellation))?;
+        check_cancellation(cancellation)?;
+        let observed_normalized_trace =
+            serde_json::to_value(&trace).map_err(|_| DepgraphServiceError::Internal)?;
+        if observed_normalized_trace != *normalized_trace {
+            return Err(cancellation_priority(
+                DepgraphServiceError::Integrity,
+                cancellation,
+            ));
+        }
+        let input_digest =
+            stable_id_from_value("runtime-validation-input", &observed_normalized_trace);
+        Ok(RuntimeTraceSourcePrevalidation {
+            input_digest,
+            normalized_trace: observed_normalized_trace,
+            trace,
+        })
+    }
+
+    /// Repeat source validation and require byte-semantically identical
+    /// normalized input. MCP uses this after inspecting an existing journal
+    /// binding so a trace file cannot drift across the pre-journal boundary.
+    pub fn revalidate_runtime_trace_source(
+        &self,
+        request: &RuntimeTraceSourceRequest,
+        expected: &RuntimeTraceSourcePrevalidation,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<RuntimeTraceSourcePrevalidation> {
+        let observed = self.prevalidate_runtime_trace_source(request, cancellation)?;
+        if observed.input_digest != expected.input_digest
+            || observed.normalized_trace != expected.normalized_trace
+            || observed.trace != expected.trace
+        {
+            return Err(cancellation_priority(
+                DepgraphServiceError::Conflict,
+                cancellation,
+            ));
+        }
+        Ok(observed)
+    }
+
+    /// Match a previously source-validated trace against one pinned snapshot.
+    pub fn runtime_validate_prevalidated(
+        &self,
+        prevalidated: RuntimeTraceSourcePrevalidation,
+        snapshot: &ServiceSnapshotSelector,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<RuntimeValidateServiceResult> {
+        self.runtime_validate_prevalidated_with_schema(prevalidated, snapshot, cancellation, false)
+    }
+
+    pub(crate) fn runtime_validate_prevalidated_before_migration(
+        &self,
+        prevalidated: RuntimeTraceSourcePrevalidation,
+        snapshot: &ServiceSnapshotSelector,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<RuntimeValidateServiceResult> {
+        self.runtime_validate_prevalidated_with_schema(prevalidated, snapshot, cancellation, true)
+    }
+
+    fn runtime_validate_prevalidated_with_schema(
+        &self,
+        prevalidated: RuntimeTraceSourcePrevalidation,
+        snapshot: &ServiceSnapshotSelector,
+        cancellation: &CancellationToken,
+        migration_compatible: bool,
+    ) -> DepgraphServiceResult<RuntimeValidateServiceResult> {
+        check_cancellation(cancellation)?;
+        let RuntimeTraceSourcePrevalidation {
+            input_digest,
+            normalized_trace,
+            trace,
+        } = prevalidated;
+
         let mut snapshot_request =
-            self.start_service_snapshot_request(&request.snapshot, cancellation)?;
+            self.start_service_snapshot_request(snapshot, cancellation, migration_compatible)?;
         let resolved_snapshot_id = snapshot_request.snapshot_id().clone();
         let snapshot =
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
@@ -233,6 +412,7 @@ impl DepgraphService {
             resolved_snapshot_id,
             scan_id,
             input_digest,
+            normalized_trace,
             trace,
         })
     }
@@ -264,7 +444,7 @@ impl DepgraphService {
 
     fn read_runtime_input(
         &self,
-        request: &RuntimeValidateRequest,
+        request: &RuntimeTraceSourceRequest,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<Vec<u8>> {
         match (&request.trace, &request.trace_file) {
@@ -290,10 +470,17 @@ impl DepgraphService {
         &self,
         selector: &ServiceSnapshotSelector,
         cancellation: &CancellationToken,
+        migration_compatible: bool,
     ) -> DepgraphServiceResult<SnapshotReadRequest> {
         match selector {
+            ServiceSnapshotSelector::Locator(locator) if migration_compatible => {
+                self.start_snapshot_request_at_before_migration(locator, cancellation)
+            }
             ServiceSnapshotSelector::Locator(locator) => {
                 self.start_snapshot_request_at_cancellable(locator, cancellation)
+            }
+            ServiceSnapshotSelector::ScanId(scan_id) if migration_compatible => {
+                self.start_snapshot_request_for_scan_before_migration(scan_id, cancellation)
             }
             ServiceSnapshotSelector::ScanId(scan_id) => {
                 self.start_snapshot_request_for_scan(scan_id, cancellation)

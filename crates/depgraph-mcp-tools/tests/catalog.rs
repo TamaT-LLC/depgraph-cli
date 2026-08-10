@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
 use depgraph_mcp_tools::{
-    ALL_CLI_ACTIONS, AgentNamedSnapshot, CapabilityProfile, CliAction, OperationAccepted,
-    OperationBehavior, OperationId, SuccessEnvelope, ToolAuthorization, ToolCatalog,
+    ALL_CLI_ACTIONS, AgentNamedSnapshot, CapabilityProfile, CliAction, IdempotencyKey,
+    MAX_IDEMPOTENCY_KEY_CHARS, OperationAccepted, OperationBehavior, OperationId, SuccessEnvelope,
+    ToolAuthorization, ToolCatalog,
 };
 
 use serde_json::Value;
@@ -77,6 +78,28 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
     assert_eq!(catalog.tools().len(), 32);
+}
+
+#[test]
+fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
+    let capabilities =
+        DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])
+            .unwrap();
+    let catalog = ToolCatalog::for_capabilities(&capabilities).unwrap();
+    for tool_name in ["scan_submit", "runtime_trace_import_submit"] {
+        let schema =
+            &catalog.tool(tool_name).unwrap().input_schema()["properties"]["idempotency_key"];
+        assert_eq!(schema["minLength"], 1);
+        assert_eq!(schema["maxLength"], MAX_IDEMPOTENCY_KEY_CHARS);
+        assert_eq!(schema["pattern"], r"^[^\u0000-\u001f\u007f-\u009f]+$");
+    }
+
+    assert!(IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS)).is_ok());
+    assert!(IdempotencyKey::parse("界".repeat(MAX_IDEMPOTENCY_KEY_CHARS)).is_ok());
+    assert!(IdempotencyKey::parse("").is_err());
+    assert!(IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)).is_err());
+    assert!(IdempotencyKey::parse("has\u{0000}control").is_err());
+    assert!(IdempotencyKey::parse("has\u{0085}control").is_err());
 }
 
 #[test]
@@ -739,9 +762,39 @@ fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered()
     );
     assert!(validator.is_valid(&serde_json::to_value(envelope).unwrap()));
 
+    let runtime = catalog.tool("runtime_trace_import_submit").unwrap();
+    assert_eq!(
+        runtime.input_schema()["required"],
+        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+    );
+    let runtime_input = Value::Object(runtime.input_schema().clone());
+    let runtime_validator = jsonschema::draft202012::new(&runtime_input).unwrap();
+    let common = serde_json::json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"runtime-import"
+    });
+    for valid in [
+        serde_json::json!({"trace":"{}"}),
+        serde_json::json!({"trace_file":"traces/runtime.json"}),
+    ] {
+        let mut input = common.clone();
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(valid.as_object().unwrap().clone());
+        assert!(runtime_validator.is_valid(&input));
+    }
+    assert!(!runtime_validator.is_valid(&common));
+    let mut both = common;
+    both["trace"] = serde_json::json!("{}");
+    both["trace_file"] = serde_json::json!("traces/runtime.json");
+    assert!(!runtime_validator.is_valid(&both));
+
     let read_only = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
     assert!(read_only.tool("scan_submit").is_none());
     assert!(read_only.tool("snapshot_name_create").is_none());
+    assert!(read_only.tool("runtime_trace_import_submit").is_none());
 }
 
 #[test]

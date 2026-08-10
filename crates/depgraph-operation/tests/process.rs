@@ -13,8 +13,7 @@ use depgraph_core::{
 use depgraph_mcp_tools::LogicalRepositoryId;
 use depgraph_operation::{
     OPERATION_RUNNER_STARTUP_CONTRACT, OperationJournal, OperationKind, OperationOutcome,
-    OperationRunnerLauncher, RunnerStartupConfig, SubmitRequest, UNSUPPORTED_OPERATION_ERROR_JSON,
-    operation_journal_path,
+    OperationRunnerLauncher, RunnerStartupConfig, SubmitRequest, operation_journal_path,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -203,7 +202,8 @@ fn accepted_operation_survives_stdin_eof_and_launcher_process_exit() {
         let journal = OperationJournal::open(&config).unwrap();
         match journal.result(&repository, &operation_id, now_ms()) {
             Ok(OperationOutcome::Failed(error)) => {
-                assert_eq!(error.as_str(), UNSUPPORTED_OPERATION_ERROR_JSON);
+                let error: serde_json::Value = serde_json::from_str(error.as_str()).unwrap();
+                assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
                 break;
             }
             Err(depgraph_operation::JournalError::OperationNotReady) => {}
@@ -370,7 +370,8 @@ fn two_runner_processes_claim_one_record_only_once() {
         .unwrap()
     {
         OperationOutcome::Failed(error) => {
-            assert_eq!(error.as_str(), UNSUPPORTED_OPERATION_ERROR_JSON);
+            let error: serde_json::Value = serde_json::from_str(error.as_str()).unwrap();
+            assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
         }
         other => panic!("unexpected two-runner outcome: {other:?}"),
     }

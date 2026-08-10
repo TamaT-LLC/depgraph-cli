@@ -1274,12 +1274,13 @@ fn node_reference_collector_trace_passes_runtime_validate_and_import() {
 
     let import = Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
             "runtime",
             "import",
-            trace.to_str().unwrap(),
+            "runtime-collector.json",
             "--json",
         ])
         .output()
@@ -1328,6 +1329,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     seed_runtime_trace_snapshot(&store_path, root.path());
     let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../depgraph-core/tests/fixtures/runtime-trace-v1.golden.json");
+    fs::copy(&trace, root.path().join("runtime-trace.json")).unwrap();
     let base_snapshot_id = depgraph_store::Store::open(&store_path)
         .unwrap()
         .current_snapshot_id()
@@ -1337,12 +1339,13 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     let import = || {
         Command::cargo_bin("depgraph")
             .unwrap()
+            .current_dir(root.path())
             .args([
                 "--store",
                 store_path.to_str().unwrap(),
                 "runtime",
                 "import",
-                trace.to_str().unwrap(),
+                "runtime-trace.json",
                 "--json",
             ])
             .output()
@@ -1446,7 +1449,20 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     );
     drop(store);
 
-    let second = import();
+    let second = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "import",
+            "--trace",
+        ])
+        .arg(fs::read_to_string(&trace).unwrap())
+        .arg("--json")
+        .output()
+        .unwrap();
     assert!(
         second.status.success(),
         "{}",
@@ -1472,7 +1488,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     {
         event["timestamp"] = json!(format!("2026-07-23T01:00:0{}Z", index + 1));
     }
-    let second_trace_path = cache.path().join("runtime-session-002.json");
+    let second_trace_path = root.path().join("runtime-session-002.json");
     fs::write(
         &second_trace_path,
         serde_json::to_vec_pretty(&second_trace).unwrap(),
@@ -1480,12 +1496,13 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     .unwrap();
     let second_import = Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
             "runtime",
             "import",
-            second_trace_path.to_str().unwrap(),
+            "runtime-session-002.json",
             "--json",
         ])
         .output()
@@ -1752,14 +1769,16 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
         .unwrap();
     let malformed = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../depgraph-core/tests/fixtures/runtime-trace-v1.malformed.json");
+    fs::copy(&malformed, root.path().join("runtime-malformed.json")).unwrap();
     Command::cargo_bin("depgraph")
         .unwrap()
+        .current_dir(root.path())
         .args([
             "--store",
             store_path.to_str().unwrap(),
             "runtime",
             "import",
-            malformed.to_str().unwrap(),
+            "runtime-malformed.json",
         ])
         .assert()
         .failure();
@@ -2791,7 +2810,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 15"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 17"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 2"))
         .stdout(predicate::str::contains(
             "\"impact_query_cache_contract_version\": 1",
