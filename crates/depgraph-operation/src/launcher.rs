@@ -573,7 +573,15 @@ fn copy_safe_daemon_environment(
     command: &mut Command,
     root: &Path,
 ) -> Result<(), RunnerLaunchError> {
-    let raw_path = std::env::var_os("PATH").ok_or(RunnerLaunchError::EnvironmentPolicy)?;
+    copy_safe_daemon_environment_with(command, root, |key| std::env::var_os(key))
+}
+
+fn copy_safe_daemon_environment_with(
+    command: &mut Command,
+    root: &Path,
+    mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), RunnerLaunchError> {
+    let raw_path = environment("PATH").ok_or(RunnerLaunchError::EnvironmentPolicy)?;
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut safe_paths = Vec::new();
     for path in std::env::split_paths(&raw_path) {
@@ -607,8 +615,11 @@ fn copy_safe_daemon_environment(
         "GOROOT",
         "GOPATH",
         "GOMODCACHE",
+        "DEPGRAPH_RUST_WORKER",
+        "DEPGRAPH_GO_WORKER",
+        "DEPGRAPH_WEB_WORKER",
     ] {
-        let Some(value) = std::env::var_os(key) else {
+        let Some(value) = environment(key) else {
             continue;
         };
         let path = PathBuf::from(&value);
@@ -621,7 +632,7 @@ fn copy_safe_daemon_environment(
         }
     }
     for key in ["LANG", "LC_ALL"] {
-        if let Some(value) = std::env::var_os(key) {
+        if let Some(value) = environment(key) {
             command.env(key, value);
         }
     }
@@ -809,6 +820,64 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_daemon_environment_preserves_only_explicit_worker_overrides() {
+        use std::collections::BTreeMap;
+        use std::ffi::{OsStr, OsString};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let safe_bin = temporary.path().join("safe-bin");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&safe_bin).unwrap();
+        let rust_worker = temporary.path().join("rust-worker");
+        let go_worker = temporary.path().join("go-worker");
+        let web_worker = temporary.path().join("web-worker");
+        for worker in [&rust_worker, &go_worker, &web_worker] {
+            write_test_executable(worker);
+        }
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), safe_bin.into_os_string()),
+            (
+                OsString::from("DEPGRAPH_RUST_WORKER"),
+                rust_worker.into_os_string(),
+            ),
+            (
+                OsString::from("DEPGRAPH_GO_WORKER"),
+                go_worker.into_os_string(),
+            ),
+            (
+                OsString::from("DEPGRAPH_WEB_WORKER"),
+                web_worker.into_os_string(),
+            ),
+            (
+                OsString::from("DEPGRAPH_SECRET"),
+                OsString::from("must-not-cross-boundary"),
+            ),
+        ]);
+        let mut command = Command::new("/usr/bin/true");
+        command.env_clear();
+
+        copy_safe_daemon_environment_with(&mut command, &repository, |key| {
+            environment.get(OsStr::new(key)).cloned()
+        })
+        .unwrap();
+
+        let copied = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.unwrap().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        for key in [
+            "DEPGRAPH_RUST_WORKER",
+            "DEPGRAPH_GO_WORKER",
+            "DEPGRAPH_WEB_WORKER",
+        ] {
+            assert!(copied.contains_key(OsStr::new(key)));
+        }
+        assert!(!copied.contains_key(OsStr::new("DEPGRAPH_SECRET")));
     }
 
     #[cfg(unix)]
