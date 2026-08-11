@@ -1099,7 +1099,14 @@ async fn lifecycle_daemon_stop_is_idempotent_only_after_stopped_cleanup_and_lock
             "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
         }))?,
     )?;
-    std::fs::write(&stop_path, b"stale request")?;
+    std::fs::write(
+        &stop_path,
+        serde_json::to_vec(&json!({
+            "schema_version": "depgraph-daemon-stop-request-v1",
+            "root": root.canonicalize()?,
+            "started_at": "2026-08-06T00:00:00Z"
+        }))?,
+    )?;
 
     let status = service
         .daemon_stop_cancellable(&CancellationToken::new())
@@ -1161,12 +1168,14 @@ async fn lifecycle_daemon_start_releases_locks_after_post_acquisition_control_er
     std::fs::create_dir(&stop_path)?;
     let service = daemon_control_service(&root, &store_path)?;
 
-    assert!(matches!(
-        service
-            .daemon_start_foreground_cancellable(false, &CancellationToken::new())
-            .await,
-        Err(DepgraphServiceError::Integrity)
-    ));
+    let malformed_stop_error = service
+        .daemon_start_foreground_cancellable(false, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(malformed_stop_error, DepgraphServiceError::Integrity),
+        "unexpected malformed stop-path error: {malformed_stop_error:?}"
+    );
 
     std::fs::remove_dir(&stop_path)?;
     let cancellation = CancellationToken::new();

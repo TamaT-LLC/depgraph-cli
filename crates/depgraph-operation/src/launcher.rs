@@ -1067,6 +1067,9 @@ int main(int argc, char **argv) {{
                 | "GOMODCACHE"
                 | "LANG"
                 | "LC_ALL"
+                | "DEPGRAPH_RUST_WORKER"
+                | "DEPGRAPH_GO_WORKER"
+                | "DEPGRAPH_WEB_WORKER"
         )));
         assert!(!root.path().join("depgraph-shell-parsed").exists());
         assert!(!root.path().join("executable-shell-parsed").exists());

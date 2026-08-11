@@ -12,7 +12,7 @@ use depgraph_store::{
     DiagnosticSummaryRecord, FileCoverageRecord, FileCoverageSummaryRecord, PhaseCoverageRecord,
     ProfileAxisConflictRecord, ProfileMatrixEntryRecord, ProfileMatrixRecord, ProfileRecord,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CancellationToken, CompilerPackAvailabilityHealth, CompilerPreciseHealth,
@@ -33,6 +33,15 @@ use crate::service::{
 
 const MAX_DOCTOR_ITEMS: usize = 1_024;
 const MAX_DOCTOR_FILE_COVERAGE_ITEMS: usize = 1_000_000;
+const DAEMON_STOP_REQUEST_SCHEMA_VERSION: &str = "depgraph-daemon-stop-request-v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStopRequest {
+    schema_version: String,
+    root: String,
+    started_at: String,
+}
 
 /// Bounded profile-plan input. An explicit document and an explicit file are mutually exclusive,
 /// and either explicit source is mutually exclusive with an automatic profile budget.
@@ -497,10 +506,13 @@ impl DepgraphService {
         .map_err(|_| DepgraphServiceError::Conflict)?;
         let stop_path = daemon_stop_path(self.config().store_path());
         let status_path = status_path(self.config().store_path());
+        let running = handle.status();
+        let generation = running.started_at.clone();
         let mut status = handle.subscribe();
-        let mut lifecycle_error = remove_daemon_control_file(&stop_path).err();
+        let mut lifecycle_error =
+            remove_mismatched_daemon_stop_request(&stop_path, &running.root, &generation).err();
         if lifecycle_error.is_none() {
-            if let Err(error) = write_daemon_status(&status_path, &handle.status()) {
+            if let Err(error) = write_daemon_status(&status_path, &running) {
                 lifecycle_error = Some(error);
             } else {
                 on_running();
@@ -518,7 +530,7 @@ impl DepgraphService {
                             }
                         }
                         _ = stop_poll.tick() => {
-                            match daemon_control_file_exists(&stop_path) {
+                            match daemon_stop_requested_for(&stop_path, &running.root, &generation) {
                                 Ok(true) => break,
                                 Ok(false) => {}
                                 Err(error) => {
@@ -573,7 +585,7 @@ impl DepgraphService {
         if !daemon_lock_is_held(self.config().store_path())? {
             return Err(DepgraphServiceError::Conflict);
         }
-        write_daemon_stop_request(&stop_path)?;
+        write_daemon_stop_request(self, cancellation, &status_path, &stop_path, &initial)?;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut poll = tokio::time::interval(Duration::from_millis(100));
@@ -587,6 +599,14 @@ impl DepgraphService {
                 _ = poll.tick() => {
                     let status = read_daemon_status(self, &status_path, cancellation)?;
                     let lock_held = daemon_lock_is_held(self.config().store_path())?;
+                    if status.started_at != initial.started_at {
+                        remove_matching_daemon_stop_request(
+                            &stop_path,
+                            &initial.root,
+                            &initial.started_at,
+                        )?;
+                        return Err(DepgraphServiceError::Conflict);
+                    }
                     if status.phase == DaemonPhase::Stopped {
                         if lock_held || daemon_control_file_exists(&stop_path)? {
                             continue;
@@ -1508,7 +1528,7 @@ fn finish_already_stopped_daemon_stop(
     if current.phase != DaemonPhase::Stopped {
         return Err(DepgraphServiceError::Conflict);
     }
-    remove_daemon_control_file(stop_path)?;
+    remove_matching_daemon_stop_request(stop_path, &current.root, &current.started_at)?;
     check_cancellation(cancellation)?;
     Ok(current)
 }
@@ -1524,7 +1544,7 @@ fn finish_daemon_shutdown(
         return Err(DepgraphServiceError::Conflict);
     };
     write_daemon_status(status_path, stopped)?;
-    remove_daemon_control_file(stop_path)
+    remove_matching_daemon_stop_request(stop_path, &stopped.root, &stopped.started_at)
 }
 
 fn repair_unlocked_daemon_stop(
@@ -1582,30 +1602,167 @@ fn daemon_control_file_exists(path: &Path) -> DepgraphServiceResult<bool> {
     }
 }
 
-fn write_daemon_stop_request(path: &Path) -> DepgraphServiceResult<()> {
-    if daemon_control_file_exists(path)? {
-        return Ok(());
+fn write_daemon_stop_request(
+    service: &DepgraphService,
+    cancellation: &CancellationToken,
+    status_path: &Path,
+    path: &Path,
+    observed: &DaemonStatus,
+) -> DepgraphServiceResult<()> {
+    let _writer_lock = acquire_daemon_stop_writer_lock(path, cancellation)?;
+    let current = read_daemon_status(service, status_path, cancellation)?;
+    if current.started_at != observed.started_at || current.phase == DaemonPhase::Stopped {
+        return Err(DepgraphServiceError::Conflict);
     }
+    write_daemon_stop_record(
+        path,
+        &DaemonStopRequest {
+            schema_version: DAEMON_STOP_REQUEST_SCHEMA_VERSION.to_owned(),
+            root: current.root,
+            started_at: current.started_at,
+        },
+    )
+}
+
+fn daemon_stop_requested_for(
+    path: &Path,
+    root: &str,
+    started_at: &str,
+) -> DepgraphServiceResult<bool> {
+    let Some(request) = read_daemon_stop_request(path)? else {
+        return Ok(false);
+    };
+    Ok(request.root == root && request.started_at == started_at)
+}
+
+fn read_daemon_stop_request(path: &Path) -> DepgraphServiceResult<Option<DaemonStopRequest>> {
+    let file = match open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(DepgraphServiceError::NotFound) => return Ok(None),
+        Err(_) => return Err(DepgraphServiceError::Integrity),
+    };
+    let request: DaemonStopRequest =
+        serde_json::from_reader(file).map_err(|_| DepgraphServiceError::Integrity)?;
+    if request.schema_version != DAEMON_STOP_REQUEST_SCHEMA_VERSION {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    Ok(Some(request))
+}
+
+fn remove_mismatched_daemon_stop_request(
+    path: &Path,
+    root: &str,
+    started_at: &str,
+) -> DepgraphServiceResult<()> {
+    let _writer_lock = acquire_daemon_stop_writer_lock_blocking(path)?;
+    match read_daemon_stop_request(path)? {
+        Some(request) if request.root != root || request.started_at != started_at => {
+            remove_daemon_control_file(path)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn remove_matching_daemon_stop_request(
+    path: &Path,
+    root: &str,
+    started_at: &str,
+) -> DepgraphServiceResult<()> {
+    let _writer_lock = acquire_daemon_stop_writer_lock_blocking(path)?;
+    match read_daemon_stop_request(path)? {
+        Some(request) if request.root == root && request.started_at == started_at => {
+            remove_daemon_control_file(path)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn acquire_daemon_stop_writer_lock(
+    stop_path: &Path,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<File> {
+    let file = open_daemon_stop_writer_lock(stop_path)?;
+    loop {
+        check_cancellation(cancellation)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err(DepgraphServiceError::Integrity);
+            }
+        }
+    }
+}
+
+fn acquire_daemon_stop_writer_lock_blocking(stop_path: &Path) -> DepgraphServiceResult<File> {
+    let file = open_daemon_stop_writer_lock(stop_path)?;
+    file.lock().map_err(|_| DepgraphServiceError::Integrity)?;
+    Ok(file)
+}
+
+fn open_daemon_stop_writer_lock(stop_path: &Path) -> DepgraphServiceResult<File> {
+    let lock_path = with_daemon_path_suffix(stop_path, ".lock");
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if daemon_control_file_exists(path)? {
-                return Ok(());
-            }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(lock_path)
+        .map_err(|_| DepgraphServiceError::Integrity)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| DepgraphServiceError::Integrity)?;
+    if !metadata.is_file() {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
             return Err(DepgraphServiceError::Integrity);
         }
-        Err(_) => return Err(DepgraphServiceError::Internal),
-    };
-    file.write_all(b"stop\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|_| DepgraphServiceError::Internal)
+    }
+    Ok(file)
+}
+
+fn write_daemon_stop_record(path: &Path, request: &DaemonStopRequest) -> DepgraphServiceResult<()> {
+    let temporary = with_daemon_path_suffix(
+        path,
+        &format!(".tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
+    );
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| DepgraphServiceError::Internal)?;
+        serde_json::to_writer(&mut file, request).map_err(|_| DepgraphServiceError::Integrity)?;
+        file.write_all(b"\n")
+            .and_then(|()| file.sync_all())
+            .map_err(|_| DepgraphServiceError::Internal)?;
+        drop(file);
+        #[cfg(windows)]
+        remove_daemon_control_file(path)?;
+        std::fs::rename(&temporary, path).map_err(|_| DepgraphServiceError::Internal)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn remove_daemon_control_file(path: &Path) -> DepgraphServiceResult<()> {
@@ -1862,7 +2019,15 @@ mod tests {
             recovered_attempts: depgraph_store::InterruptedAttemptRecovery::default(),
         };
         write_daemon_status(&status_path(&store), &active).unwrap();
-        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+        write_daemon_stop_record(
+            &daemon_stop_path(&store),
+            &DaemonStopRequest {
+                schema_version: DAEMON_STOP_REQUEST_SCHEMA_VERSION.to_owned(),
+                root: active.root.clone(),
+                started_at: active.started_at.clone(),
+            },
+        )
+        .unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1902,7 +2067,19 @@ mod tests {
             )
             .unwrap(),
         );
-        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+        write_daemon_stop_record(
+            &daemon_stop_path(&store),
+            &DaemonStopRequest {
+                schema_version: DAEMON_STOP_REQUEST_SCHEMA_VERSION.to_owned(),
+                root: service
+                    .config()
+                    .canonical_root()
+                    .to_string_lossy()
+                    .into_owned(),
+                started_at: "2026-08-11T00:00:00.000Z".to_owned(),
+            },
+        )
+        .unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1967,7 +2144,15 @@ mod tests {
         current.phase = DaemonPhase::Idle;
         current.stopped_at = None;
         write_daemon_status(&status_path(&store), &current).unwrap();
-        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+        write_daemon_stop_record(
+            &daemon_stop_path(&store),
+            &DaemonStopRequest {
+                schema_version: DAEMON_STOP_REQUEST_SCHEMA_VERSION.to_owned(),
+                root: current.root.clone(),
+                started_at: current.started_at.clone(),
+            },
+        )
+        .unwrap();
 
         let result = finish_already_stopped_daemon_stop(
             &service,
@@ -1978,6 +2163,65 @@ mod tests {
 
         assert!(matches!(result, Err(DepgraphServiceError::Conflict)));
         assert!(daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
+    }
+
+    #[test]
+    fn issue_315_old_stop_cannot_target_new_daemon_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).unwrap();
+        let store = temporary.path().join("graph.sqlite");
+        let service = DepgraphService::new(
+            crate::service::DepgraphServiceConfig::new(
+                &root,
+                &store,
+                crate::service::DepgraphCapabilitySet::try_new([
+                    DepgraphCapability::Read,
+                    DepgraphCapability::StoreWrite,
+                    DepgraphCapability::DaemonControl,
+                ])
+                .unwrap(),
+                crate::service::DepgraphServiceLimits::default(),
+            )
+            .unwrap(),
+        );
+        let old = DaemonStatus {
+            schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+            root: service
+                .config()
+                .canonical_root()
+                .to_string_lossy()
+                .into_owned(),
+            phase: DaemonPhase::Idle,
+            started_at: "2026-08-11T00:00:00.000Z".to_owned(),
+            stopped_at: None,
+            debounce_milliseconds: 250,
+            pending_change_count: 0,
+            active_attempt_id: None,
+            last_completed_attempt: None,
+            last_failed_attempt: None,
+            last_cancelled_attempt: None,
+            last_watcher_error: None,
+            recovered_attempts: depgraph_store::InterruptedAttemptRecovery::default(),
+        };
+        let mut new = old.clone();
+        new.started_at = "2026-08-11T00:00:01.000Z".to_owned();
+
+        // Deterministic release -> new-owner publication -> delayed old stop
+        // write. The writer must re-read the generation after serializing with
+        // other stop writers and reject the stale observation without creating
+        // a request that the new daemon could consume.
+        write_daemon_status(&status_path(&store), &new).unwrap();
+        let result = write_daemon_stop_request(
+            &service,
+            &CancellationToken::new(),
+            &status_path(&store),
+            &daemon_stop_path(&store),
+            &old,
+        );
+
+        assert!(matches!(result, Err(DepgraphServiceError::Conflict)));
+        assert!(!daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
     }
 
     #[test]
@@ -2027,7 +2271,15 @@ mod tests {
         // lifecycle fence and publishes `Idle` before old-owner finalization.
         lock.lock().unwrap();
         write_daemon_status(&status_path(&store), &running).unwrap();
-        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+        write_daemon_stop_record(
+            &daemon_stop_path(&store),
+            &DaemonStopRequest {
+                schema_version: DAEMON_STOP_REQUEST_SCHEMA_VERSION.to_owned(),
+                root: running.root.clone(),
+                started_at: running.started_at.clone(),
+            },
+        )
+        .unwrap();
 
         let result = finish_daemon_shutdown(
             &service,
