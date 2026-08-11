@@ -1535,7 +1535,32 @@ fn repair_unlocked_daemon_stop(
     check_cancellation(cancellation)?;
     let status_path = status_path(service.config().store_path());
     let stop_path = daemon_stop_path(service.config().store_path());
-    let mut status = read_daemon_status(service, &status_path, cancellation)?;
+    let mut status = match read_daemon_status(service, &status_path, cancellation) {
+        Ok(status) => status,
+        Err(DepgraphServiceError::NotFound) => {
+            let stopped_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            DaemonStatus {
+                schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+                root: service
+                    .config()
+                    .canonical_root()
+                    .to_string_lossy()
+                    .into_owned(),
+                phase: DaemonPhase::Stopped,
+                started_at: stopped_at.clone(),
+                stopped_at: Some(stopped_at),
+                debounce_milliseconds: 250,
+                pending_change_count: 0,
+                active_attempt_id: None,
+                last_completed_attempt: None,
+                last_failed_attempt: None,
+                last_cancelled_attempt: None,
+                last_watcher_error: None,
+                recovered_attempts: depgraph_store::InterruptedAttemptRecovery::default(),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     status.phase = DaemonPhase::Stopped;
     status
         .stopped_at
@@ -1851,6 +1876,44 @@ mod tests {
         assert!(recovered.stopped_at.is_some());
         assert_eq!(recovered.pending_change_count, 0);
         assert!(recovered.active_attempt_id.is_none());
+        assert!(!daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
+        let published =
+            read_daemon_status(&service, &status_path(&store), &CancellationToken::new()).unwrap();
+        assert_eq!(published.phase, DaemonPhase::Stopped);
+    }
+
+    #[test]
+    fn issue_315_stop_completion_recovery_rebuilds_missing_status() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).unwrap();
+        let store = temporary.path().join("graph.sqlite");
+        let service = DepgraphService::new(
+            crate::service::DepgraphServiceConfig::new(
+                &root,
+                &store,
+                crate::service::DepgraphCapabilitySet::try_new([
+                    DepgraphCapability::Read,
+                    DepgraphCapability::StoreWrite,
+                    DepgraphCapability::DaemonControl,
+                ])
+                .unwrap(),
+                crate::service::DepgraphServiceLimits::default(),
+            )
+            .unwrap(),
+        );
+        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let recovered = runtime
+            .block_on(service.recover_daemon_stop_completion_cancellable(&CancellationToken::new()))
+            .unwrap();
+
+        assert_eq!(recovered.phase, DaemonPhase::Stopped);
+        assert!(recovered.stopped_at.is_some());
         assert!(!daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
         let published =
             read_daemon_status(&service, &status_path(&store), &CancellationToken::new()).unwrap();
