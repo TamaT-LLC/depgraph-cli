@@ -2009,8 +2009,9 @@ impl ScanOperationDispatcher {
             return DispatchOutcome::Cancelled;
         }
         let service = DepgraphService::new(self.config.clone());
-        if let Err(error) = service.daemon_running_cancellable(control.cancellation_token()) {
-            return self.failed_service(&error);
+        match service.daemon_running_cancellable(control.cancellation_token()) {
+            Ok(_) | Err(DepgraphServiceError::Conflict) => {}
+            Err(error) => return self.failed_service(&error),
         }
         if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
             return DispatchOutcome::Cancelled;
@@ -3187,6 +3188,56 @@ mod tests {
         .unwrap();
         assert_eq!(settled_replay, RunnerReport::default());
         assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn issue_315_daemon_stop_submission_repairs_stale_unlocked_status() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let operation_id = manager
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStop,
+                    &json!({}),
+                    b"issue-315-stale-daemon-stop-submission",
+                    submitted_at_ms + 60_000,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        drop(manager);
+        write_stale_running_daemon_status(&config);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let report = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            OperationJournal::open(&config)
+                .unwrap()
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Completed(_)
+        ));
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("graph.sqlite.daemon-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["phase"], "stopped");
     }
 
     #[test]

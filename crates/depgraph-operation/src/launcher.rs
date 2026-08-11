@@ -573,12 +573,16 @@ fn copy_safe_daemon_environment(
     command: &mut Command,
     root: &Path,
 ) -> Result<(), RunnerLaunchError> {
-    copy_safe_daemon_environment_with(command, root, |key| std::env::var_os(key))
+    let current_directory = std::env::current_dir().map_err(RunnerLaunchError::Launch)?;
+    copy_safe_daemon_environment_with(command, root, &current_directory, |key| {
+        std::env::var_os(key)
+    })
 }
 
 fn copy_safe_daemon_environment_with(
     command: &mut Command,
     root: &Path,
+    current_directory: &Path,
     mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
 ) -> Result<(), RunnerLaunchError> {
     let raw_path = environment("PATH").ok_or(RunnerLaunchError::EnvironmentPolicy)?;
@@ -615,9 +619,6 @@ fn copy_safe_daemon_environment_with(
         "GOROOT",
         "GOPATH",
         "GOMODCACHE",
-        "DEPGRAPH_RUST_WORKER",
-        "DEPGRAPH_GO_WORKER",
-        "DEPGRAPH_WEB_WORKER",
     ] {
         let Some(value) = environment(key) else {
             continue;
@@ -630,6 +631,28 @@ fn copy_safe_daemon_environment_with(
         {
             command.env(key, value);
         }
+    }
+    for key in [
+        "DEPGRAPH_RUST_WORKER",
+        "DEPGRAPH_GO_WORKER",
+        "DEPGRAPH_WEB_WORKER",
+    ] {
+        let Some(value) = environment(key) else {
+            continue;
+        };
+        let path = PathBuf::from(value);
+        let candidate = if path.is_absolute() {
+            path
+        } else {
+            current_directory.join(path)
+        };
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|_| RunnerLaunchError::EnvironmentPolicy)?;
+        if !canonical.is_file() || canonical.starts_with(&canonical_root) {
+            return Err(RunnerLaunchError::EnvironmentPolicy);
+        }
+        command.env(key, canonical);
     }
     for key in ["LANG", "LC_ALL"] {
         if let Some(value) = environment(key) {
@@ -843,7 +866,7 @@ mod tests {
             (OsString::from("PATH"), safe_bin.into_os_string()),
             (
                 OsString::from("DEPGRAPH_RUST_WORKER"),
-                rust_worker.into_os_string(),
+                OsString::from("rust-worker"),
             ),
             (
                 OsString::from("DEPGRAPH_GO_WORKER"),
@@ -861,7 +884,7 @@ mod tests {
         let mut command = Command::new("/usr/bin/true");
         command.env_clear();
 
-        copy_safe_daemon_environment_with(&mut command, &repository, |key| {
+        copy_safe_daemon_environment_with(&mut command, &repository, temporary.path(), |key| {
             environment.get(OsStr::new(key)).cloned()
         })
         .unwrap();
@@ -877,7 +900,41 @@ mod tests {
         ] {
             assert!(copied.contains_key(OsStr::new(key)));
         }
+        assert_eq!(
+            copied.get(OsStr::new("DEPGRAPH_RUST_WORKER")),
+            Some(&rust_worker.canonicalize().unwrap().into_os_string())
+        );
         assert!(!copied.contains_key(OsStr::new("DEPGRAPH_SECRET")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_invalid_worker_override_fails_closed_at_daemon_boundary() {
+        use std::collections::BTreeMap;
+        use std::ffi::{OsStr, OsString};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let safe_bin = temporary.path().join("safe-bin");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&safe_bin).unwrap();
+        write_test_executable(&repository.join("project-worker"));
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), safe_bin.into_os_string()),
+            (
+                OsString::from("DEPGRAPH_RUST_WORKER"),
+                OsString::from("repository/project-worker"),
+            ),
+        ]);
+        let mut command = Command::new("/usr/bin/true");
+        command.env_clear();
+
+        assert!(matches!(
+            copy_safe_daemon_environment_with(&mut command, &repository, temporary.path(), |key| {
+                environment.get(OsStr::new(key)).cloned()
+            },),
+            Err(RunnerLaunchError::EnvironmentPolicy)
+        ));
     }
 
     #[cfg(unix)]
