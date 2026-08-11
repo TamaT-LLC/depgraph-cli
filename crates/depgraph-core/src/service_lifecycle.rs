@@ -537,23 +537,11 @@ impl DepgraphService {
             .await
             .map_err(|_| DepgraphServiceError::Internal);
         if let Ok(stopped) = &stopped {
-            if let Err(error) = write_daemon_status(&status_path, stopped) {
+            if let Err(error) = finish_daemon_shutdown(self, stopped, &status_path, &stop_path) {
                 lifecycle_error.get_or_insert(error);
             }
         } else {
             lifecycle_error.get_or_insert(DepgraphServiceError::Internal);
-        }
-        if let Err(error) = remove_daemon_control_file(&stop_path) {
-            lifecycle_error.get_or_insert(error);
-        }
-        match daemon_lock_is_held(self.config().store_path()) {
-            Ok(false) => {}
-            Ok(true) => {
-                lifecycle_error.get_or_insert(DepgraphServiceError::Integrity);
-            }
-            Err(error) => {
-                lifecycle_error.get_or_insert(error);
-            }
         }
         if let Some(error) = lifecycle_error {
             return Err(error);
@@ -1525,6 +1513,20 @@ fn finish_already_stopped_daemon_stop(
     Ok(current)
 }
 
+fn finish_daemon_shutdown(
+    service: &DepgraphService,
+    stopped: &DaemonStatus,
+    status_path: &Path,
+    stop_path: &Path,
+) -> DepgraphServiceResult<()> {
+    let Some(_lifecycle_lock) = try_acquire_daemon_lifecycle_lock(service.config().store_path())?
+    else {
+        return Err(DepgraphServiceError::Conflict);
+    };
+    write_daemon_status(status_path, stopped)?;
+    remove_daemon_control_file(stop_path)
+}
+
 fn repair_unlocked_daemon_stop(
     service: &DepgraphService,
     cancellation: &CancellationToken,
@@ -1913,6 +1915,69 @@ mod tests {
 
         assert!(matches!(result, Err(DepgraphServiceError::Conflict)));
         assert!(daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
+    }
+
+    #[test]
+    fn issue_315_old_shutdown_cannot_overwrite_new_daemon_status() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).unwrap();
+        let store = temporary.path().join("graph.sqlite");
+        let service = DepgraphService::new(
+            crate::service::DepgraphServiceConfig::new(
+                &root,
+                &store,
+                crate::service::DepgraphCapabilitySet::try_new([
+                    DepgraphCapability::Read,
+                    DepgraphCapability::StoreWrite,
+                    DepgraphCapability::DaemonControl,
+                ])
+                .unwrap(),
+                crate::service::DepgraphServiceLimits::default(),
+            )
+            .unwrap(),
+        );
+        let stopped = DaemonStatus {
+            schema_version: DAEMON_STATUS_SCHEMA_VERSION.to_owned(),
+            root: service
+                .config()
+                .canonical_root()
+                .to_string_lossy()
+                .into_owned(),
+            phase: DaemonPhase::Stopped,
+            started_at: "2026-08-11T00:00:00.000Z".to_owned(),
+            stopped_at: Some("2026-08-11T00:01:00.000Z".to_owned()),
+            debounce_milliseconds: 250,
+            pending_change_count: 0,
+            active_attempt_id: None,
+            last_completed_attempt: None,
+            last_failed_attempt: None,
+            last_cancelled_attempt: None,
+            last_watcher_error: None,
+            recovered_attempts: depgraph_store::InterruptedAttemptRecovery::default(),
+        };
+        let mut running = stopped.clone();
+        running.phase = DaemonPhase::Idle;
+        running.stopped_at = None;
+        let lock = File::create(daemon_lock_path(&store)).unwrap();
+        // The old daemon task released its lock; a concurrent start wins the
+        // lifecycle fence and publishes `Idle` before old-owner finalization.
+        lock.lock().unwrap();
+        write_daemon_status(&status_path(&store), &running).unwrap();
+        write_daemon_stop_request(&daemon_stop_path(&store)).unwrap();
+
+        let result = finish_daemon_shutdown(
+            &service,
+            &stopped,
+            &status_path(&store),
+            &daemon_stop_path(&store),
+        );
+
+        assert!(matches!(result, Err(DepgraphServiceError::Conflict)));
+        assert!(daemon_control_file_exists(&daemon_stop_path(&store)).unwrap());
+        let published =
+            read_daemon_status(&service, &status_path(&store), &CancellationToken::new()).unwrap();
+        assert_eq!(published.phase, DaemonPhase::Idle);
     }
 
     #[test]
