@@ -18,8 +18,8 @@ use depgraph_mcp_tools::{
     ErrorEnvelope, LogicalRepositoryId, SuccessEnvelope,
 };
 use depgraph_operation::{
-    CanonicalJson, LeaseOwner, OperationJournal, OperationKind, OperationManager, SubmitRequest,
-    operation_journal_path,
+    CanonicalJson, JOURNAL_SCHEMA_VERSION, LeaseOwner, OperationJournal, OperationKind,
+    OperationManager, SubmitRequest, operation_journal_path,
 };
 use depgraph_store::Store;
 use rusqlite::Connection;
@@ -1159,6 +1159,8 @@ fn operation_journal_schema_rows_and_version(path: &Path) -> JournalSchemaState 
 }
 
 fn downgrade_operation_journal_to_genuine_legacy(path: &Path, version: i64) {
+    const V4_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
+    const V5_KINDS: &str = "'scan_submit', 'runtime_trace_import_submit', 'export_file', 'daemon_start_submit', 'daemon_stop', 'resolve_build_submit'";
     assert!(matches!(version, 2 | 3));
     let connection = Connection::open(path).unwrap();
     connection
@@ -1181,16 +1183,25 @@ fn downgrade_operation_journal_to_genuine_legacy(path: &Path, version: i64) {
             |row| row.get(0),
         )
         .unwrap();
-    let legacy_operations_sql = operations_sql.replace(
+    let tombstones_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='operation_tombstones'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_operations_sql = operations_sql.replace(V5_KINDS, V4_KINDS).replace(
         "typeof(input_json) = 'text' AND octet_length(input_json) <= 16777216",
         "typeof(input_json) = 'text' AND octet_length(input_json) <= 1048576",
     );
-    let legacy_handoffs_sql = handoffs_sql.replace(
+    let legacy_handoffs_sql = handoffs_sql.replace(V5_KINDS, V4_KINDS).replace(
         "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 16777216",
         "typeof(payload_json) = 'text' AND octet_length(payload_json) <= 1048576",
     );
+    let legacy_tombstones_sql = tombstones_sql.replace(V5_KINDS, V4_KINDS);
     assert_ne!(legacy_operations_sql, operations_sql);
     assert_ne!(legacy_handoffs_sql, handoffs_sql);
+    assert_ne!(legacy_tombstones_sql, tombstones_sql);
     connection
         .execute_batch("PRAGMA writable_schema=ON;")
         .unwrap();
@@ -1205,6 +1216,13 @@ fn downgrade_operation_journal_to_genuine_legacy(path: &Path, version: i64) {
             "UPDATE sqlite_schema SET sql=?1
               WHERE type='table' AND name='runner_handoffs'",
             [&legacy_handoffs_sql],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET sql=?1
+              WHERE type='table' AND name='operation_tombstones'",
+            [&legacy_tombstones_sql],
         )
         .unwrap();
     connection
@@ -3874,6 +3892,317 @@ fn issue_311_tasks_request_cancellation_prevents_mutation_and_server_recovers() 
 }
 
 #[test]
+fn issue_314_repository_init_stdio_uses_the_shared_fixed_root_service() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+
+    let mut mcp =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let response = mcp.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"repository_init","arguments":{
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "force":false
+        }}
+    }));
+    mcp.finish();
+
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "result":{"output_path":".depgraph.toml"}
+        })
+    );
+    assert!(root.join(".depgraph.toml").is_file());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+}
+
+#[test]
+fn issue_314_export_file_stdio_is_durable_and_returns_only_the_closed_outcome() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    let snapshot_id = seed_issue_300_store(&store_path, &root);
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-314-export-file",
+        "output_path":"artifacts/graph.json",
+        "overwrite":false,
+        "format":"json",
+        "snapshot":snapshot_id
+    });
+
+    let mut submit =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut submit, 1, "2026-07-28", true);
+    let accepted = submit.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"export_file","arguments":arguments}
+    }));
+    let task_id = accepted["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("export_file was not accepted as a task: {accepted}"))
+        .to_owned();
+    submit.finish();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let terminal = loop {
+        let mut reconnected =
+            InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+        initialize_tasks_mcp(&mut reconnected, 10, "2026-07-28", true);
+        let status = reconnected.request(json!({
+            "jsonrpc":"2.0","id":11,"method":"tasks/get",
+            "params":{"taskId":task_id}
+        }));
+        reconnected.finish();
+        if status["result"]["status"] == "completed" {
+            break status;
+        }
+        assert_ne!(status["result"]["status"], "failed", "{status}");
+        assert_ne!(status["result"]["status"], "cancelled", "{status}");
+        assert!(
+            Instant::now() < deadline,
+            "export_file did not complete: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let bytes = fs::read(root.join("artifacts/graph.json")).unwrap();
+    let outcome = &terminal["result"]["result"]["structuredContent"]["result"];
+    assert_eq!(outcome["output_path"], "artifacts/graph.json");
+    assert_eq!(outcome["format"], "json");
+    assert_eq!(outcome["output_bytes"], bytes.len() as u64);
+    assert_eq!(
+        outcome["content_sha256"],
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(outcome.as_object().unwrap().len(), 4);
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["snapshot_id"],
+        snapshot_id
+    );
+    assert!(
+        fs::read_dir(root.join("artifacts"))
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() == "graph.json")
+    );
+}
+
+#[test]
+fn issue_314_export_file_without_tasks_returns_the_portable_operation_handle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    let snapshot_id = seed_issue_300_store(&store_path, &root);
+    let mut mcp =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_interactive_mcp(&mut mcp, 1);
+
+    let accepted = interactive_tool_call(
+        &mut mcp,
+        2,
+        "export_file",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-314-portable-handle",
+            "output_path":"artifacts/portable.json",
+            "overwrite":false,
+            "format":"json",
+            "snapshot":snapshot_id
+        }),
+    );
+    mcp.finish();
+
+    assert!(
+        accepted["structuredContent"]["operation_id"].is_string(),
+        "{accepted}"
+    );
+    assert_eq!(accepted["structuredContent"]["status"], "queued");
+    assert_eq!(
+        accepted["structuredContent"]["recovery"],
+        json!({
+            "status":"operation_get",
+            "result":"operation_result",
+            "cancel":"operation_cancel"
+        })
+    );
+}
+
+#[test]
+fn issue_314_export_file_exact_current_replay_retains_the_original_snapshot_binding() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-314-current-replay",
+        "output_path":"artifacts/current.json",
+        "overwrite":false,
+        "format":"json",
+        "snapshot":"current"
+    });
+
+    let mut first =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut first, 1, "2026-07-28", true);
+    let accepted = first.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"export_file","arguments":arguments}
+    }));
+    let original_task_id = accepted["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("export_file was not accepted as a task: {accepted}"))
+        .to_owned();
+    first.finish();
+
+    seed_issue_302_store(&store_path, &root);
+
+    let mut replay =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut replay, 10, "2026-07-28", true);
+    let replayed = replay.request(json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"export_file","arguments":arguments}
+    }));
+    replay.finish();
+
+    assert_eq!(
+        replayed["result"]["taskId"], original_task_id,
+        "exact current replay must return the original operation: {replayed}"
+    );
+}
+
+#[test]
+fn issue_314_export_file_named_replay_rejects_a_different_resolved_snapshot() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let initial_arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-314-named-replay",
+        "output_path":"artifacts/named.json",
+        "overwrite":false,
+        "format":"json",
+        "snapshot":"alpha"
+    });
+
+    let mut first =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut first, 1, "2026-07-28", true);
+    let accepted = first.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"export_file","arguments":initial_arguments}
+    }));
+    assert!(accepted["result"]["taskId"].is_string(), "{accepted}");
+    first.finish();
+
+    seed_issue_302_store(&store_path, &root);
+    let conflicting_arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-314-named-replay",
+        "output_path":"artifacts/named.json",
+        "overwrite":false,
+        "format":"json",
+        "snapshot":"baseline"
+    });
+    let mut replay =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut replay, 10, "2026-07-28", true);
+    let rejected = replay.request(json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"export_file","arguments":conflicting_arguments}
+    }));
+    replay.finish();
+
+    assert_eq!(
+        rejected["result"]["structuredContent"]["error"]["code"], "IDEMPOTENCY_CONFLICT",
+        "named selectors resolving to different snapshots must not share a binding: {rejected}"
+    );
+}
+
+#[test]
+fn issue_314_export_file_conflicting_replay_is_mutation_free() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir_all(root.join("artifacts")).unwrap();
+    let snapshot_id = seed_issue_300_store(&store_path, &root);
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-314-conflicting-replay",
+        "output_path":"artifacts/original.json",
+        "overwrite":false,
+        "format":"json",
+        "snapshot":snapshot_id
+    });
+
+    let mut first =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut first, 1, "2026-07-28", true);
+    let accepted = first.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"export_file","arguments":arguments}
+    }));
+    assert!(accepted["result"]["taskId"].is_string(), "{accepted}");
+    first.finish();
+
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ],
+    );
+    let operation_count = || {
+        Connection::open(operation_journal_path(&config))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(operation_count(), 1);
+    let mut conflicting_arguments = arguments;
+    conflicting_arguments["output_path"] = json!("artifacts/conflicting.json");
+
+    let mut conflicting =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["repository-write"]);
+    initialize_tasks_mcp(&mut conflicting, 10, "2026-07-28", true);
+    let rejected = conflicting.request(json!({
+        "jsonrpc":"2.0","id":11,"method":"tools/call",
+        "params":{"name":"export_file","arguments":conflicting_arguments}
+    }));
+    conflicting.finish();
+
+    assert_eq!(
+        rejected["result"]["structuredContent"]["error"]["code"], "IDEMPOTENCY_CONFLICT",
+        "{rejected}"
+    );
+    assert_eq!(operation_count(), 1);
+    assert!(!root.join("artifacts/conflicting.json").exists());
+}
+
+#[test]
 fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_closed() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -4192,10 +4521,16 @@ fn issue_313_v2_runtime_replay_migrates_only_after_complete_prevalidation() {
             "snapshot":base_snapshot_id
         }),
     );
-    assert!(replayed["structuredContent"]["operation_id"].is_string());
+    assert!(
+        replayed["structuredContent"]["operation_id"].is_string(),
+        "unexpected replay response: {replayed}"
+    );
     valid.finish();
 
-    assert_eq!(sqlite_user_version(journal_path.as_path()), 4);
+    assert_eq!(
+        sqlite_user_version(journal_path.as_path()),
+        JOURNAL_SCHEMA_VERSION
+    );
     assert_eq!(sqlite_user_version(&store_path), 17);
 }
 
@@ -4268,9 +4603,12 @@ fn issue_313_valid_new_runtime_submit_migrates_genuine_v3_after_absence_lookup()
             "snapshot":base_snapshot_id
         }),
     );
-    assert!(accepted["structuredContent"]["operation_id"].is_string());
+    assert!(
+        accepted["structuredContent"]["operation_id"].is_string(),
+        "unexpected submit response: {accepted}"
+    );
     submit.finish();
-    assert_eq!(sqlite_user_version(&journal_path), 4);
+    assert_eq!(sqlite_user_version(&journal_path), JOURNAL_SCHEMA_VERSION);
     assert_eq!(sqlite_user_version(&store_path), 17);
 }
 
@@ -4489,9 +4827,10 @@ fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
         "--capability",
         "project-exec",
     ]);
-    let full = tools_list(full_command, 32);
+    let full = tools_list(full_command, 33);
     assert!(full.contains(&"scan_submit".to_owned()));
     assert!(full.contains(&"repository_init".to_owned()));
+    assert!(full.contains(&"export_file".to_owned()));
     assert!(full.contains(&"daemon_start_submit".to_owned()));
     assert!(full.contains(&"resolve_build_submit".to_owned()));
 }

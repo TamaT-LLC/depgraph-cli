@@ -34,6 +34,7 @@ additive extensionとして採用するかを決定する。
 | Bounded query/runtime validation | `graph_query`, `runtime_trace_validate` | Issue #304 implemented through prevalidated read-only services |
 | Snapshot artifacts | `snapshot_diff_get`, `policy_evaluate`, `graph_export` | Issue #305 implemented through pinned, bounded shared artifact services |
 | Runtime store-write | `runtime_trace_import_submit` | Issue #313 implemented through prevalidated durable operation and atomic runtime-snapshot promotion |
+| Repository write | `repository_init`, `export_file` | Issue #314 implemented through fixed-root/no-follow service writes and durable atomic file publication |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -86,6 +87,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#304` | bounded queryとruntime validationを共有serviceとMCPへ接続する | pre-store input/output admission、confined file input、pinned read-only snapshot、closed query/runtime DTO、input-bound cursor、CLI/MCP parity、redaction/immutability/process/schema testで固定する |
 | `#305` | snapshot diff、policy evaluation、bounded inline graph exportを共有serviceとMCPへ接続する | request開始時のcompleted snapshot pin、canonical policy digest、closed diff/policy/export DTO、inline byte/node/edge bounds、typed `export_file` remediation、CLI/MCP/schema/catalog parityで固定する |
 | `#313` | runtime trace importを共有store-write serviceとdurable MCP operationへ接続する | existing validation/matching/delta boundary、writer lock、deferred completion intent、atomic runtime snapshot promotion、closed `AgentRuntimeOutcome`、idempotency/cancel/restart recoveryで固定する |
+| `#314` | fixed-root initとrepository-relative file exportを共有repository-write serviceとdurable MCP operationへ接続する | root seal、portable relative path、handle-relative no-follow traversal、same-directory staged fsync/atomic publication、destination precondition、graph store・operation journal・SQLite sidecar・runner purge lockのprotected-state拒否、no-follow/delete-share制約付きrunner guard、closed `AgentExportOutcome`、capability gating、idempotency/cancel/restart recoveryで固定する |
 
 ## Upstream and API evidence
 
@@ -169,6 +171,11 @@ durable toolをsubmitするとき、serverは応答前に次を一つのtransact
 `taskId == operation_id`を必須とし、二つのIDを結ぶmutable mappingは作らない。
 同じrepository、tool、capability、normalized input、idempotency keyのretryは同じ
 recordとIDを返す。keyを異なるinputへ再利用した場合は`IDEMPOTENCY_CONFLICT`で拒否する。
+status/result/idempotency lookup、submit、cancelのfuture-record検証に使うwall clockは、
+SQLite read snapshotまたは`IMMEDIATE` mutation transactionを確定した後にsampleする。
+これによりrequest開始後の正当なrunner更新をfuture corruptionと誤認しない一方、clock取得に
+失敗した場合はrequest開始時のsampleへfallbackしてfail closedとし、future-record検証自体は
+無効化しない。
 
 ### Baseline tools
 
@@ -534,6 +541,41 @@ Issue [#313](https://github.com/TamaT-LLC/depgraph-cli/issues/313)は既存のru
 | CLIとMCP terminal outcome parity | shared `AgentRuntimeOutcome` conversion、CLI runtime import regression、MCP terminal closed-contract test |
 | idempotencyとrestart recovery | same-key same-operation process assertion、completion-intent promotion recovery unit/integration test |
 | repository validation | Rust 1.93.1 format、focused core/store/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #314 repository-write evidence
+
+Issue [#314](https://github.com/TamaT-LLC/depgraph-cli/issues/314)はfixed repository rootの
+初期化とrepository-relative graph file exportを共有`DepgraphService`へ移し、
+`repository_init`をimmediate tool、`export_file`を常時durable operationとして公開する。
+Issue本文に残る旧`FR-005/008/009/010/011`、`NFR-008`、`AC-013`参照は現在の
+[Requirement traceability](#requirement-traceability)表と一致しない。本実装は現在存在する
+`FR-010`（durable handle）、`NFR-001`（bounds/cancel）、`NFR-003`（restart recovery）、
+`NFR-005`（host-private情報の非公開）、`AC-014`（baseline/Tasks recovery）、
+`AC-015`（CLI/MCP shared-service parity）および`#314`行へ対応付ける。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Fixed-root init | public requestは`force`だけを持ち、root/path selectorを持たない。serviceはsealed root直下の固定`.depgraph.toml`だけをsame-directory stageへ書き、content sync後にno-replaceまたはregular-file overwriteでatomic publicationする。symlink、Windows reparse point、directory等のnon-regular targetは`force`でも置換しない |
+| Portable confinement | `RepositoryRelativePath`はabsolute、empty、`.`/`..`、backslash/prefix、NTFS stream、Win32 trailing alias、reserved device、component/total byte超過を拒否する。Unixはretained directory FD + `openat`/`fstatat`/`linkat`/`renameat`、Windowsはretained directory handle + `NtCreateFile`/`SetFileInformationByHandle`を使い、全parent/final componentをno-followで検証する。root identity driftはpublication前にfail closedとなる。graph store parentがconfig時に存在する場合はそのobject identityをsealし、generic createとatomic publicationの実parent handle identity + Unicode/case-equivalent protected leaf名を照合するため、lexical validation後のdirectory renameでもstore・journal・SQLite sidecar・runner purge lockへ書けない。repository内parentがconfig時に未作成ならprotected leaf namespaceをfail closedで予約する |
+| Atomic export | contentはdestinationと同じdirectoryのprivate stageへ全体生成し、file sync後にexplicit no-replace/overwrite policyでatomic publishする。Unixはopened random-stage inodeとpathname entryをpublication直前・直後に照合し、foreign replacementを成功として採用しない。foreign entryは削除せず、overwrite exchange後に検出した場合はoriginal destinationをidentity-bound exchange-backする。cleanupも検証済みの元stage pathnameを直接unlinkせず、128-bit random quarantine名へatomic no-replace moveしてからidentityを再判定し、foreign swapは元名へ戻すかquarantineに保持する。parent directoryもsyncし、writer/cancel/publication failureはowned random stageだけを除去して既存destinationを維持する。CLIのcompleted raw-compatible outputとfailed/partial legacy projectionもpublicationだけは同じservice境界を通る |
+| Durable ownership | `export_file` normalized inputは開始時のstable snapshot ID、format/filter/bounds、portable output path、overwrite policy、private destination preconditionをcanonical/bounded journal inputへ固定する。stage名はoperation IDとoutput pathから決定的に導出するがpublic resultへ出さず、`.depgraph-export-<64 lowercase hex>` namespaceとそのcase aliasは全public repository outputで予約する。同じoperationのexact stageだけをlength/SHA-256一致でadopt/removeし、foreign stageは保持してintegrity failureとする |
+| Completion and recovery | runnerはstage完成後にもcancel/deadline/leaseをpollし、成功decisionをcompletion intentへ先にcommitしてからpublishする。decision前のcancel/expiry cleanupはowned exact stageだけを消す。decision後のrestartはexact stageまたは既にpublished済みのexact digestを認識する。成功decision後のpublication/precondition failureはsuccessをfailureへ書き換えたりowned stageを捨てたりせず、intentとstageをretryableに保持してordered runnerをfail closedで停止する。destinationを元のpreconditionへ修復した後だけ同じintentを再試行できる。recovery/cancelを含む全lifecycle entry pointはshortcutより前にgraph store・operation journal・SQLite sidecar・runner purge lockとaliasを再拒否し、recovery evidenceのzero byte・oversize・non-canonical digestをpublish前に拒否する。overwrite recoveryは開始時のregular-file identity/length/content digestが一致する場合だけfinalizeし、外部変更されたdestinationを保持してfail closedにする |
+| Closed terminal result | `AgentExportOutcome`はrepository-relative `output_path`、closed `format`、positive `output_bytes`、lowercase SHA-256だけを持つ。constructor/Deserializer/schemaは全fieldを再検証し、absolute/temp path、raw graph、host metadata、arbitrary property、unknown fieldを受理しない。portable terminal success unionへclosed branchとして登録する |
+| MCP and capabilities | `repository_init`と`export_file`は`Read + RepositoryWrite` profileだけにdiscover/call可能である。init handlerは共有serviceを直接呼ぶ。export handlerはdynamic `current`を初回だけstable IDへ解決し、same-key replayではjournalのoriginal bindingを再利用する。explicit stable IDとnamed selectorのconflict recoveryはrequested selectorが今回解決したstable snapshot IDとwinner bindingのIDを完全一致させ、異なるsnapshotへ同じkeyを再利用した場合はmutation-free `IDEMPOTENCY_CONFLICT`とする。`current`だけはconcurrent winnerのstable snapshot bindingを採用できるが、destination preconditionを含む他のnormalized inputはexact match必須である。baseline operation handleとnegotiated MCP Tasksは同じoperation ID/journal/runnerを使う |
+| Deterministic artifacts | exact catalog、shared JSON Schema、terminal contract sampleとSHA-256 fixtureはcanonical generatorで更新する。shared schema rootはfixed-path `AgentRepositoryInitOutcome`とそのclosed success envelopeも公開する。real stdio process testはtools/list、immediate init、durable export、digest/bytes、reconnect/current replay、capability filteringを実server/runner processで検証する |
+
+### Issue #314 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| fixed root以外をinitできず、forceもsymlink/reparse/non-regularを置換しない | core fixed-path/conflict/symlink/nonregular tests、Windows reparse/no-follow tests、repository_init stdio process testとcatalog input closure |
+| export pathはrepository-relativeかつno-follow | path scalar rejection corpus、Unix parent/final symlink tests、root identity race tests、Windows handle-relative compile/runtime tests、CLI outside-root tests |
+| no-replace/overwriteともpartialを公開しない | writer/publication failure injection、destination canary、same-directory artifact count、file/parent syncを検証するcore tests |
+| cancel/deadline/lease/crashはowned stageだけを処理する | deferred cancellation、foreign/exact deterministic stage、expired operation cleanup、completion-intent restart、destination-precondition recovery tests |
+| same-key replayとconflictがmutation-free | `current` advance後もdestination preconditionがexactなreplayだけ同じtask ID、`current`でdestination preconditionが異なる場合とnamed selector A/Bが異なるstable snapshotへ解決された場合はtyped conflict、changed normalized inputでtyped conflict、journal/source/destination invariant process assertions |
+| terminal outputがclosedでdigest/bytesと一致する | `AgentExportOutcome` constructor/Serde/schema tests、portable result union、real exported bytesのSHA-256/length process assertion |
+| capability/catalog/schema/CLI/MCP parity | repository-write catalog filter、no-root init schema、shared-service CLI security/parity、real stdio handlers、catalog/schema/contract checked-in golden exact tests |
+| repository validation | Rust 1.93.1 focused core/operation/CLI/MCP tests、Windows cross-check、`cargo fmt`、affected Clippy `-D warnings`。authoritative full gateはparent validationで実行する |
 
 ## Issue #292 acceptance mapping
 

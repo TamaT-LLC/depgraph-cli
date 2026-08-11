@@ -2,12 +2,17 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{self, Read, Seek, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
 use crate::service::{
-    DepgraphCapability, DepgraphService, DepgraphServiceError, DepgraphServiceErrorCategory,
-    DepgraphServiceResult,
+    DepgraphCapability, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceError,
+    DepgraphServiceErrorCategory, DepgraphServiceResult, OPERATION_JOURNAL_SUFFIX,
+    RUNNER_PURGE_LOCK_SUFFIX,
 };
 
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 4_096;
@@ -131,6 +136,250 @@ impl std::str::FromStr for RepositoryRelativePath {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepositoryInitRequest {
+    force: bool,
+}
+
+impl RepositoryInitRequest {
+    #[must_use]
+    pub const fn new(force: bool) -> Self {
+        Self { force }
+    }
+
+    #[must_use]
+    pub const fn force(self) -> bool {
+        self.force
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryInitResult {
+    output_path: RepositoryRelativePath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryOverwritePolicy {
+    NoReplace,
+    Overwrite,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepositoryOutputPrecondition {
+    Missing,
+    Regular {
+        identity_sha256: String,
+        output_bytes: u64,
+        content_sha256: String,
+    },
+}
+
+impl RepositoryOutputPrecondition {
+    fn validate(&self) -> DepgraphServiceResult<()> {
+        match self {
+            Self::Missing => Ok(()),
+            Self::Regular {
+                identity_sha256,
+                content_sha256,
+                ..
+            } if is_lower_sha256(identity_sha256) && is_lower_sha256(content_sha256) => Ok(()),
+            Self::Regular { .. } => Err(DepgraphServiceError::Integrity),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportFileRequest {
+    graph: crate::service::GraphExportRequest,
+    output_path: RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    raw_compatible: bool,
+    destination_precondition: Option<RepositoryOutputPrecondition>,
+}
+
+impl ExportFileRequest {
+    #[must_use]
+    pub const fn new(
+        graph: crate::service::GraphExportRequest,
+        output_path: RepositoryRelativePath,
+        overwrite: RepositoryOverwritePolicy,
+    ) -> Self {
+        Self {
+            graph,
+            output_path,
+            overwrite,
+            raw_compatible: false,
+            destination_precondition: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw_compatible(
+        graph: crate::service::GraphExportRequest,
+        output_path: RepositoryRelativePath,
+        overwrite: RepositoryOverwritePolicy,
+    ) -> Self {
+        Self {
+            graph,
+            output_path,
+            overwrite,
+            raw_compatible: true,
+            destination_precondition: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_destination_precondition(
+        mut self,
+        destination_precondition: RepositoryOutputPrecondition,
+    ) -> Self {
+        self.destination_precondition = Some(destination_precondition);
+        self
+    }
+
+    #[must_use]
+    pub const fn graph(&self) -> &crate::service::GraphExportRequest {
+        &self.graph
+    }
+
+    #[must_use]
+    pub const fn output_path(&self) -> &RepositoryRelativePath {
+        &self.output_path
+    }
+
+    #[must_use]
+    pub const fn overwrite(&self) -> RepositoryOverwritePolicy {
+        self.overwrite
+    }
+
+    #[must_use]
+    pub const fn destination_precondition(&self) -> Option<&RepositoryOutputPrecondition> {
+        self.destination_precondition.as_ref()
+    }
+
+    pub(crate) const fn is_raw_compatible(&self) -> bool {
+        self.raw_compatible
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportFileResult {
+    output_path: RepositoryRelativePath,
+    format: crate::service::GraphExportFormat,
+    output_bytes: u64,
+    content_sha256: String,
+}
+
+#[derive(Clone)]
+pub struct DeferredExportFileCompletion {
+    service: DepgraphService,
+    staging_path: RepositoryRelativePath,
+    result: ExportFileResult,
+    snapshot_id: String,
+    overwrite: RepositoryOverwritePolicy,
+    destination_precondition: RepositoryOutputPrecondition,
+}
+
+pub struct DeferredExportFileRecovery<'a> {
+    pub operation_id: &'a str,
+    pub output_path: &'a RepositoryRelativePath,
+    pub overwrite: RepositoryOverwritePolicy,
+    pub format: crate::service::GraphExportFormat,
+    pub output_bytes: u64,
+    pub content_sha256: &'a str,
+    pub destination_precondition: Option<&'a RepositoryOutputPrecondition>,
+}
+
+impl DeferredExportFileCompletion {
+    #[must_use]
+    pub const fn result(&self) -> &ExportFileResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn destination_precondition(&self) -> &RepositoryOutputPrecondition {
+        &self.destination_precondition
+    }
+
+    pub fn cancel(self) -> DepgraphServiceResult<()> {
+        remove_staged_export_if_owned(&self.service, &self.staging_path, &self.result)
+    }
+
+    pub fn promote(self) -> DepgraphServiceResult<()> {
+        let mut staging = open_repository_input(&self.service, &self.staging_path)?;
+        let capacity = usize::try_from(self.result.output_bytes)
+            .map_err(|_| DepgraphServiceError::Integrity)?;
+        if capacity > self.service.config().limits().max_output_bytes() {
+            return Err(DepgraphServiceError::Integrity);
+        }
+        let mut content = Vec::with_capacity(capacity);
+        let bounded_bytes = self
+            .result
+            .output_bytes
+            .checked_add(1)
+            .ok_or(DepgraphServiceError::ResourceExhausted)?;
+        Read::take(&mut staging, bounded_bytes)
+            .read_to_end(&mut content)
+            .map_err(map_filesystem_error)?;
+        if content.len() != capacity
+            || hex::encode(Sha256::digest(&content)) != self.result.content_sha256
+        {
+            return Err(RepositoryFileError::BoundaryViolation.into());
+        }
+        drop(staging);
+        verify_repository_output_precondition(
+            &self.service,
+            &self.result.output_path,
+            &self.destination_precondition,
+            &crate::CancellationToken::new(),
+        )?;
+        write_repository_file_atomically(
+            &self.service,
+            &self.result.output_path,
+            self.overwrite,
+            Some(&self.destination_precondition),
+            &crate::CancellationToken::new(),
+            |file| file.write_all(&content).map_err(map_filesystem_error),
+        )?;
+        remove_staged_export(&self.service, &self.staging_path, &self.result)
+    }
+}
+
+impl ExportFileResult {
+    #[must_use]
+    pub const fn output_path(&self) -> &RepositoryRelativePath {
+        &self.output_path
+    }
+
+    #[must_use]
+    pub const fn format(&self) -> crate::service::GraphExportFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub const fn output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+
+    #[must_use]
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+}
+
+impl RepositoryInitResult {
+    #[must_use]
+    pub const fn output_path(&self) -> &RepositoryRelativePath {
+        &self.output_path
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RepositoryPathSelector {
     path: RepositoryRelativePath,
@@ -208,7 +457,7 @@ impl Seek for OpenedRepositoryFile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryFileIdentity {
     namespace: u64,
     object: u64,
@@ -224,6 +473,347 @@ impl RepositoryFileIdentity {
 }
 
 impl DepgraphService {
+    pub fn recover_deferred_export_file_completion(
+        &self,
+        recovery: &DeferredExportFileRecovery<'_>,
+    ) -> DepgraphServiceResult<()> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        validate_repository_output_not_protected(self, recovery.output_path)?;
+        if recovery.output_bytes == 0 {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        if recovery.output_bytes > self.config().limits().max_output_bytes() as u64 {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
+        if !is_lower_sha256(recovery.content_sha256) {
+            return Err(DepgraphServiceError::Integrity);
+        }
+        let result = ExportFileResult {
+            output_path: recovery.output_path.clone(),
+            format: recovery.format,
+            output_bytes: recovery.output_bytes,
+            content_sha256: recovery.content_sha256.to_owned(),
+        };
+        let staging_path = export_staging_path(recovery.output_path, recovery.operation_id)?;
+        validate_repository_output_not_persistent_state(self, &staging_path)?;
+        let destination_precondition = match recovery.destination_precondition {
+            Some(precondition) => {
+                precondition.validate()?;
+                precondition.clone()
+            }
+            None if recovery.overwrite == RepositoryOverwritePolicy::NoReplace => {
+                RepositoryOutputPrecondition::Missing
+            }
+            None => return Err(DepgraphServiceError::Integrity),
+        };
+        match repository_file_matches(self, recovery.output_path, &result) {
+            Ok(true) => remove_staged_export_if_owned(self, &staging_path, &result),
+            Ok(false) if recovery.overwrite == RepositoryOverwritePolicy::Overwrite => {
+                DeferredExportFileCompletion {
+                    service: self.clone(),
+                    staging_path,
+                    result,
+                    snapshot_id: String::new(),
+                    overwrite: recovery.overwrite,
+                    destination_precondition,
+                }
+                .promote()
+            }
+            Ok(false) => Err(DepgraphServiceError::Integrity),
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::NotFound,
+            }) => DeferredExportFileCompletion {
+                service: self.clone(),
+                staging_path,
+                result,
+                snapshot_id: String::new(),
+                overwrite: recovery.overwrite,
+                destination_precondition,
+            }
+            .promote(),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn export_file_deferred_for_operation(
+        &self,
+        request: &ExportFileRequest,
+        operation_id: &str,
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<DeferredExportFileCompletion> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        validate_repository_output_not_protected(self, request.output_path())?;
+        let staging_path = export_staging_path(request.output_path(), operation_id)?;
+        validate_repository_output_not_persistent_state(self, &staging_path)?;
+        let destination_precondition = match request.destination_precondition() {
+            Some(precondition) => {
+                precondition.validate()?;
+                verify_repository_output_precondition(
+                    self,
+                    request.output_path(),
+                    precondition,
+                    cancellation,
+                )?;
+                precondition.clone()
+            }
+            None => repository_output_precondition(self, request.output_path(), cancellation)?,
+        };
+        if request.overwrite() == RepositoryOverwritePolicy::NoReplace
+            && destination_precondition != RepositoryOutputPrecondition::Missing
+        {
+            return Err(RepositoryFileError::AlreadyExists.into());
+        }
+        let rendered = if request.is_raw_compatible() {
+            self.graph_export_raw_compatible(request.graph(), cancellation)?
+        } else {
+            self.graph_export(request.graph(), cancellation)?
+        };
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let result = ExportFileResult {
+            output_path: request.output_path().clone(),
+            format: rendered.format,
+            output_bytes: rendered.output_bytes,
+            content_sha256: rendered.content_sha256,
+        };
+        let mut staging = match create_repository_output(self, &staging_path) {
+            Ok(staging) => staging,
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::AlreadyExists,
+            }) => {
+                return match repository_file_matches(self, &staging_path, &result) {
+                    Ok(true) => Ok(DeferredExportFileCompletion {
+                        service: self.clone(),
+                        staging_path,
+                        result,
+                        snapshot_id: rendered.snapshot_id,
+                        overwrite: request.overwrite(),
+                        destination_precondition,
+                    }),
+                    Ok(false) => Err(DepgraphServiceError::Integrity),
+                    Err(error) => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = staging
+            .write_all(rendered.content.as_bytes())
+            .map_err(map_filesystem_error)
+            .and_then(|()| {
+                staging
+                    .sync_all()
+                    .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+            })
+        {
+            drop(staging);
+            let _ = remove_repository_entry(self, &staging_path);
+            return Err(error);
+        }
+        drop(staging);
+        sync_repository_parent(self, &staging_path)?;
+        if cancellation.is_cancelled() {
+            remove_staged_export(self, &staging_path, &result)?;
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        Ok(DeferredExportFileCompletion {
+            service: self.clone(),
+            staging_path,
+            result,
+            snapshot_id: rendered.snapshot_id,
+            overwrite: request.overwrite(),
+            destination_precondition,
+        })
+    }
+
+    pub fn cancel_deferred_export_file_for_operation(
+        &self,
+        request: &ExportFileRequest,
+        operation_id: &str,
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<()> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        validate_repository_output_not_protected(self, request.output_path())?;
+        let staging_path = export_staging_path(request.output_path(), operation_id)?;
+        validate_repository_output_not_persistent_state(self, &staging_path)?;
+        match open_repository_input(self, &staging_path) {
+            Ok(staging) => drop(staging),
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::NotFound,
+            }) => return Ok(()),
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::BoundaryViolation,
+            }) => return Ok(()),
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::NotRegular,
+            }) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let rendered = if request.is_raw_compatible() {
+            self.graph_export_raw_compatible(request.graph(), cancellation)
+        } else {
+            self.graph_export(request.graph(), cancellation)
+        }?;
+        let result = ExportFileResult {
+            output_path: request.output_path().clone(),
+            format: rendered.format,
+            output_bytes: rendered.output_bytes,
+            content_sha256: rendered.content_sha256,
+        };
+        remove_staged_export_if_owned(self, &staging_path, &result)
+    }
+
+    pub fn export_file(
+        &self,
+        request: &ExportFileRequest,
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<ExportFileResult> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        validate_repository_output_not_protected(self, request.output_path())?;
+        let destination_precondition = match request.destination_precondition() {
+            Some(precondition) => {
+                precondition.validate()?;
+                verify_repository_output_precondition(
+                    self,
+                    request.output_path(),
+                    precondition,
+                    cancellation,
+                )?;
+                precondition.clone()
+            }
+            None => repository_output_precondition(self, request.output_path(), cancellation)?,
+        };
+        if request.overwrite() == RepositoryOverwritePolicy::NoReplace
+            && destination_precondition != RepositoryOutputPrecondition::Missing
+        {
+            return Err(RepositoryFileError::AlreadyExists.into());
+        }
+        let rendered = if request.is_raw_compatible() {
+            self.graph_export_raw_compatible(request.graph(), cancellation)?
+        } else {
+            self.graph_export(request.graph(), cancellation)?
+        };
+        self.execute_mutating(ExportFilePublicationUseCase {
+            service: self,
+            output_path: request.output_path(),
+            overwrite: request.overwrite(),
+            content: rendered.content.as_bytes(),
+            destination_precondition: Some(&destination_precondition),
+            cancellation,
+        })?;
+        Ok(ExportFileResult {
+            output_path: request.output_path().clone(),
+            format: rendered.format,
+            output_bytes: rendered.output_bytes,
+            content_sha256: rendered.content_sha256,
+        })
+    }
+
+    pub fn export_rendered_file(
+        &self,
+        output_path: &RepositoryRelativePath,
+        overwrite: RepositoryOverwritePolicy,
+        format: crate::service::GraphExportFormat,
+        content: &[u8],
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<ExportFileResult> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        if content.is_empty() {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        validate_repository_output_not_protected(self, output_path)?;
+        if content.len() > self.config().limits().max_output_bytes() {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
+        self.execute_mutating(ExportFilePublicationUseCase {
+            service: self,
+            output_path,
+            overwrite,
+            content,
+            destination_precondition: None,
+            cancellation,
+        })?;
+        Ok(ExportFileResult {
+            output_path: output_path.clone(),
+            format,
+            output_bytes: u64::try_from(content.len())
+                .map_err(|_| DepgraphServiceError::ResourceExhausted)?,
+            content_sha256: hex::encode(Sha256::digest(content)),
+        })
+    }
+
+    pub fn repository_output_precondition(
+        &self,
+        path: &RepositoryRelativePath,
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+        if !self
+            .config()
+            .capabilities()
+            .contains(DepgraphCapability::RepositoryWrite)
+        {
+            return Err(DepgraphServiceError::CapabilityDenied {
+                required: DepgraphCapability::RepositoryWrite,
+            });
+        }
+        repository_output_precondition(self, path, cancellation)
+    }
+
+    pub fn repository_init(
+        &self,
+        request: &RepositoryInitRequest,
+        cancellation: &crate::CancellationToken,
+    ) -> DepgraphServiceResult<RepositoryInitResult> {
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        self.execute_mutating(RepositoryInitUseCase {
+            service: self,
+            request: *request,
+            cancellation,
+        })
+    }
+
     pub fn normalize_repository_path(
         &self,
         path: impl AsRef<str>,
@@ -271,11 +861,1659 @@ impl DepgraphService {
                 required: DepgraphCapability::RepositoryWrite,
             });
         }
+        validate_repository_output_not_protected(self, &path)?;
         let file = create_repository_output(self, &path)?;
         Ok(OpenedRepositoryFile {
             relative_path: path,
             file,
         })
+    }
+}
+
+struct ExportFilePublicationUseCase<'a> {
+    service: &'a DepgraphService,
+    output_path: &'a RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    content: &'a [u8],
+    destination_precondition: Option<&'a RepositoryOutputPrecondition>,
+    cancellation: &'a crate::CancellationToken,
+}
+
+impl DepgraphMutatingUseCase for ExportFilePublicationUseCase<'_> {
+    type Output = ();
+
+    const KIND: DepgraphMutatingUseCaseKind = DepgraphMutatingUseCaseKind::Repository;
+
+    fn execute(
+        self,
+        _context: &mut DepgraphMutatingContext<'_>,
+    ) -> DepgraphServiceResult<Self::Output> {
+        let destination_precondition = match self.destination_precondition {
+            Some(precondition) => precondition.clone(),
+            None => {
+                repository_output_precondition(self.service, self.output_path, self.cancellation)?
+            }
+        };
+        write_repository_file_atomically(
+            self.service,
+            self.output_path,
+            self.overwrite,
+            Some(&destination_precondition),
+            self.cancellation,
+            |file| file.write_all(self.content).map_err(map_filesystem_error),
+        )
+    }
+}
+
+struct RepositoryInitUseCase<'a> {
+    service: &'a DepgraphService,
+    request: RepositoryInitRequest,
+    cancellation: &'a crate::CancellationToken,
+}
+
+impl DepgraphMutatingUseCase for RepositoryInitUseCase<'_> {
+    type Output = RepositoryInitResult;
+
+    const KIND: DepgraphMutatingUseCaseKind = DepgraphMutatingUseCaseKind::Repository;
+
+    fn execute(
+        self,
+        _context: &mut DepgraphMutatingContext<'_>,
+    ) -> DepgraphServiceResult<Self::Output> {
+        let path = RepositoryRelativePath::parse(crate::config::CONFIG_FILE)?;
+        let contents =
+            crate::config::Config::render_default().map_err(|_| DepgraphServiceError::Internal)?;
+        let destination_precondition =
+            repository_output_precondition(self.service, &path, self.cancellation)?;
+        write_repository_file_atomically(
+            self.service,
+            &path,
+            if self.request.force {
+                RepositoryOverwritePolicy::Overwrite
+            } else {
+                RepositoryOverwritePolicy::NoReplace
+            },
+            Some(&destination_precondition),
+            self.cancellation,
+            |file| {
+                file.write_all(contents.as_bytes())
+                    .map_err(map_filesystem_error)
+            },
+        )?;
+        Ok(RepositoryInitResult { output_path: path })
+    }
+}
+
+fn write_repository_file_atomically(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    validate_repository_output_not_protected(service, path)?;
+    write_repository_file_atomically_platform(
+        service,
+        path,
+        overwrite,
+        expected_precondition,
+        cancellation,
+        write_contents,
+    )
+}
+
+fn validate_repository_output_not_protected(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    validate_repository_output_not_persistent_state(service, path)?;
+    if is_reserved_export_staging_path(path) {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    Ok(())
+}
+
+fn is_reserved_export_staging_path(path: &RepositoryRelativePath) -> bool {
+    let name = path.as_str().rsplit('/').next().unwrap_or_default();
+    const PREFIX: &[u8] = b".depgraph-export-";
+    let bytes = name.as_bytes();
+    if bytes.len() != PREFIX.len() + 64 || !bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    bytes[PREFIX.len()..]
+        .iter()
+        .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_repository_output_not_persistent_state(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    let output = service.config().canonical_root().join(path.as_str());
+    for protected in protected_repository_state_paths(service) {
+        if repository_paths_equal(&output, &protected)? {
+            return Err(DepgraphServiceError::Integrity);
+        }
+    }
+    Ok(())
+}
+
+fn protected_repository_state_paths(service: &DepgraphService) -> Vec<PathBuf> {
+    let store = service.config().store_path().to_path_buf();
+    let mut journal = store.as_os_str().to_os_string();
+    journal.push(OPERATION_JOURNAL_SUFFIX);
+    let journal = PathBuf::from(journal);
+    let mut runner_purge_lock = journal.as_os_str().to_os_string();
+    runner_purge_lock.push(RUNNER_PURGE_LOCK_SUFFIX);
+    let mut paths = vec![
+        store.clone(),
+        journal.clone(),
+        PathBuf::from(runner_purge_lock),
+    ];
+    for protected in [store, journal] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = protected.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            paths.push(PathBuf::from(sidecar));
+        }
+    }
+    paths
+}
+
+#[cfg(any(unix, windows))]
+fn validate_opened_repository_output_not_persistent_state(
+    service: &DepgraphService,
+    parent: &File,
+    final_name: &OsStr,
+) -> DepgraphServiceResult<()> {
+    let protected_parent = service
+        .config()
+        .store_path()
+        .parent()
+        .ok_or(DepgraphServiceError::Integrity)?;
+    let protects_this_parent = match service.config().store_parent_identity() {
+        Some(expected_identity) => identity_from_file(parent)? == *expected_identity,
+        None => protected_parent.starts_with(service.config().canonical_root()),
+    };
+    if !protects_this_parent {
+        return Ok(());
+    }
+    for protected in protected_repository_state_paths(service) {
+        let protected_name = protected
+            .file_name()
+            .ok_or(DepgraphServiceError::Integrity)?;
+        if repository_output_names_equal(final_name, protected_name)? {
+            return Err(DepgraphServiceError::Integrity);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repository_output_names_equal(left: &OsStr, right: &OsStr) -> DepgraphServiceResult<bool> {
+    Ok(repository_file_names_equivalent(left, right))
+}
+
+#[cfg(windows)]
+fn repository_output_names_equal(left: &OsStr, right: &OsStr) -> DepgraphServiceResult<bool> {
+    repository_paths_equal(Path::new(left), Path::new(right))
+}
+
+#[cfg(unix)]
+fn repository_paths_equal(left: &Path, right: &Path) -> DepgraphServiceResult<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if left == right {
+        return Ok(true);
+    }
+    let metadata = |path: &Path| -> DepgraphServiceResult<Option<fs::Metadata>> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(RepositoryFileError::Unavailable { source }.into()),
+        }
+    };
+    let left_metadata = metadata(left)?;
+    let right_metadata = metadata(right)?;
+    if matches!(
+        (&left_metadata, &right_metadata),
+        (Some(left), Some(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+    ) {
+        return Ok(true);
+    }
+
+    let (Some(left_parent), Some(right_parent), Some(left_name), Some(right_name)) = (
+        left.parent(),
+        right.parent(),
+        left.file_name(),
+        right.file_name(),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(left_parent), Some(right_parent)) = (metadata(left_parent)?, metadata(right_parent)?)
+    else {
+        return Ok(false);
+    };
+    Ok(left_parent.dev() == right_parent.dev()
+        && left_parent.ino() == right_parent.ino()
+        && repository_file_names_equivalent(left_name, right_name))
+}
+
+#[cfg(unix)]
+fn repository_file_names_equivalent(left: &OsStr, right: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => caseless::canonical_caseless_match_str(left, right),
+        _ => left.as_bytes().eq_ignore_ascii_case(right.as_bytes()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn repository_paths_equal(left: &Path, right: &Path) -> DepgraphServiceResult<bool> {
+    Ok(left == right)
+}
+
+#[cfg(windows)]
+fn repository_paths_equal(left: &Path, right: &Path) -> DepgraphServiceResult<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    let left_len = i32::try_from(left.len()).map_err(|_| DepgraphServiceError::Integrity)?;
+    let right_len = i32::try_from(right.len()).map_err(|_| DepgraphServiceError::Integrity)?;
+    // SAFETY: both pointers remain valid for their explicit UTF-16 lengths.
+    let ordering =
+        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    if ordering == 0 {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    Ok(ordering == CSTR_EQUAL)
+}
+
+fn export_staging_path(
+    output_path: &RepositoryRelativePath,
+    operation_id: &str,
+) -> DepgraphServiceResult<RepositoryRelativePath> {
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(DepgraphServiceError::InvalidInput);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"depgraph-export-staging-v1\0");
+    digest.update(operation_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(output_path.as_str().as_bytes());
+    let staging_name = format!(".depgraph-export-{}", hex::encode(digest.finalize()));
+    let staging_path = output_path
+        .as_str()
+        .rsplit_once('/')
+        .map_or(staging_name.clone(), |(parent, _)| {
+            format!("{parent}/{staging_name}")
+        });
+    RepositoryRelativePath::parse(staging_path)
+}
+
+fn remove_staged_export(
+    service: &DepgraphService,
+    staging_path: &RepositoryRelativePath,
+    result: &ExportFileResult,
+) -> DepgraphServiceResult<()> {
+    remove_staged_export_after_validation(service, staging_path, result, || {})
+}
+
+fn remove_staged_export_if_owned(
+    service: &DepgraphService,
+    staging_path: &RepositoryRelativePath,
+    result: &ExportFileResult,
+) -> DepgraphServiceResult<()> {
+    match remove_staged_export(service, staging_path, result) {
+        Ok(())
+        | Err(DepgraphServiceError::RepositoryFile {
+            reason:
+                RepositoryFileError::NotFound
+                | RepositoryFileError::BoundaryViolation
+                | RepositoryFileError::NotRegular,
+        })
+        | Err(DepgraphServiceError::Integrity) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_staged_export_after_validation(
+    service: &DepgraphService,
+    staging_path: &RepositoryRelativePath,
+    result: &ExportFileResult,
+    after_validation: impl FnOnce(),
+) -> DepgraphServiceResult<()> {
+    let mut staging = open_repository_input(service, staging_path)?;
+    let expected_identity = identity_from_file(&staging)?;
+    let metadata = staging.metadata().map_err(map_filesystem_error)?;
+    if metadata.len() != result.output_bytes {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    let digest = hash_exact_bounded(
+        &mut staging,
+        result.output_bytes,
+        service.config().limits().max_output_bytes(),
+        &crate::CancellationToken::new(),
+    )?;
+    if digest.as_deref() != Some(result.content_sha256.as_str()) {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    after_validation();
+    drop(staging);
+    remove_repository_entry_if_identity(service, staging_path, &expected_identity)?;
+    sync_repository_parent(service, staging_path)
+}
+
+fn repository_file_matches(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    result: &ExportFileResult,
+) -> DepgraphServiceResult<bool> {
+    let mut file = open_repository_input(service, path)?;
+    if file.metadata().map_err(map_filesystem_error)?.len() != result.output_bytes {
+        return Ok(false);
+    }
+    Ok(hash_exact_bounded(
+        &mut file,
+        result.output_bytes,
+        service.config().limits().max_output_bytes(),
+        &crate::CancellationToken::new(),
+    )?
+    .as_deref()
+        == Some(result.content_sha256.as_str()))
+}
+
+fn hash_exact_bounded(
+    reader: &mut impl Read,
+    expected_bytes: u64,
+    maximum_bytes: usize,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<Option<String>> {
+    let maximum_bytes =
+        u64::try_from(maximum_bytes).map_err(|_| DepgraphServiceError::ResourceExhausted)?;
+    if expected_bytes > maximum_bytes {
+        return Err(DepgraphServiceError::ResourceExhausted);
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut remaining = expected_bytes;
+    while remaining != 0 {
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| DepgraphServiceError::ResourceExhausted)?;
+        let read = reader
+            .read(&mut buffer[..requested])
+            .map_err(map_filesystem_error)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        remaining -= u64::try_from(read).map_err(|_| DepgraphServiceError::Integrity)?;
+        digest.update(&buffer[..read]);
+    }
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra).map_err(map_filesystem_error)? != 0 {
+        return Ok(None);
+    }
+    Ok(Some(hex::encode(digest.finalize())))
+}
+
+fn repository_output_precondition(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    validate_repository_output_not_protected(service, path)?;
+    let first = match repository_regular_file_precondition(service, path, cancellation) {
+        Ok(precondition) => precondition,
+        Err(DepgraphServiceError::RepositoryFile {
+            reason: RepositoryFileError::NotFound,
+        }) => return Ok(RepositoryOutputPrecondition::Missing),
+        Err(error) => return Err(error),
+    };
+    let second = repository_regular_file_precondition(service, path, cancellation)?;
+    if first == second {
+        Ok(first)
+    } else {
+        Err(DepgraphServiceError::Integrity)
+    }
+}
+
+fn repository_regular_file_precondition(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    let mut file = open_repository_input(service, path)?;
+    repository_regular_file_precondition_from_file(service, path, &mut file, cancellation)
+}
+
+fn repository_regular_file_precondition_from_file(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    file: &mut File,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    repository_regular_file_precondition_from_file_after_metadata(
+        service,
+        path,
+        file,
+        cancellation,
+        || {},
+    )
+}
+
+#[cfg(test)]
+fn repository_regular_file_precondition_from_file_after_metadata_for_test(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    file: &mut File,
+    cancellation: &crate::CancellationToken,
+    after_metadata: impl FnOnce(),
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    repository_regular_file_precondition_from_file_after_metadata(
+        service,
+        path,
+        file,
+        cancellation,
+        after_metadata,
+    )
+}
+
+fn repository_regular_file_precondition_from_file_after_metadata(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    file: &mut File,
+    cancellation: &crate::CancellationToken,
+    after_metadata: impl FnOnce(),
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    let identity = identity_from_file(file)?;
+    let metadata = file.metadata().map_err(map_filesystem_error)?;
+    if !metadata.is_file() {
+        return Err(RepositoryFileError::NotRegular.into());
+    }
+    let output_bytes = metadata.len();
+    let maximum = u64::try_from(service.config().limits().max_output_bytes())
+        .map_err(|_| DepgraphServiceError::ResourceExhausted)?;
+    if output_bytes > maximum {
+        return Err(DepgraphServiceError::ResourceExhausted);
+    }
+    after_metadata();
+    file.rewind().map_err(map_filesystem_error)?;
+    let content_digest = hash_exact_bounded(
+        file,
+        output_bytes,
+        service.config().limits().max_output_bytes(),
+        cancellation,
+    )?
+    .ok_or(DepgraphServiceError::Integrity)?;
+    if file.metadata().map_err(map_filesystem_error)?.len() != output_bytes
+        || identity_from_file(file)? != identity
+    {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    let mut identity_digest = Sha256::new();
+    identity_digest.update(b"depgraph-repository-output-identity-v1\0");
+    identity_digest.update(service.config().root_identity().opaque_bytes());
+    identity_digest.update(identity.opaque_bytes());
+    identity_digest.update(b"\0");
+    identity_digest.update(path.as_str().as_bytes());
+    Ok(RepositoryOutputPrecondition::Regular {
+        identity_sha256: hex::encode(identity_digest.finalize()),
+        output_bytes,
+        content_sha256: content_digest,
+    })
+}
+
+fn verify_repository_output_precondition(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    expected: &RepositoryOutputPrecondition,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<()> {
+    expected.validate()?;
+    if repository_output_precondition(service, path, cancellation)? == *expected {
+        Ok(())
+    } else {
+        Err(DepgraphServiceError::Integrity)
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(unix)]
+fn remove_repository_entry(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    let (parent, final_name) = open_unix_repository_parent(service, path)?;
+    classify_unix_publication_target(&parent, final_name, RepositoryOverwritePolicy::Overwrite)?;
+    unlink_unix_at(&parent, final_name)
+}
+
+#[cfg(unix)]
+fn remove_repository_entry_if_identity(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    expected_identity: &RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    let (parent, final_name) = open_unix_repository_parent(service, path)?;
+    match classify_unix_publication_target(
+        &parent,
+        final_name,
+        RepositoryOverwritePolicy::Overwrite,
+    )? {
+        UnixPublicationTarget::Regular { identity, .. } if identity == *expected_identity => {
+            unlink_unix_at(&parent, final_name)
+        }
+        UnixPublicationTarget::Missing | UnixPublicationTarget::Regular { .. } => {
+            Err(DepgraphServiceError::Integrity)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_repository_parent(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    let (parent, _) = open_unix_repository_parent(service, path)?;
+    parent
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+}
+
+#[cfg(windows)]
+fn remove_repository_entry(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_OPEN,
+        Win32::Storage::FileSystem::{
+            DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            SYNCHRONIZE,
+        },
+    };
+
+    let traversal = open_windows_parent(service, path, false, || {})?;
+    validate_windows_directories(&traversal.directories)?;
+    let file = open_windows_at(
+        traversal.parent(),
+        traversal.final_name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        Some(false),
+    )?;
+    validate_opened_windows_regular_file(&file)?;
+    delete_windows_file_handle(&file)?;
+    drop(file);
+    validate_windows_directories(&traversal.directories)
+}
+
+#[cfg(windows)]
+fn remove_repository_entry_if_identity(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    expected_identity: &RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_OPEN,
+        Win32::Storage::FileSystem::{
+            DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            SYNCHRONIZE,
+        },
+    };
+
+    let traversal = open_windows_parent(service, path, false, || {})?;
+    validate_windows_directories(&traversal.directories)?;
+    let file = open_windows_at(
+        traversal.parent(),
+        traversal.final_name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        Some(false),
+    )?;
+    validate_opened_windows_regular_file(&file)?;
+    if identity_from_file(&file)? != *expected_identity {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    delete_windows_file_handle(&file)?;
+    drop(file);
+    validate_windows_directories(&traversal.directories)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_repository_entry(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    if !service.config().repository_root_seal().matches_live_root() {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    let candidate = path.join_to(service.config().canonical_root());
+    let metadata = fs::symlink_metadata(&candidate).map_err(map_filesystem_error)?;
+    if metadata.file_type().is_symlink() {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    if !metadata.is_file() {
+        return Err(RepositoryFileError::NotRegular.into());
+    }
+    fs::remove_file(candidate).map_err(map_filesystem_error)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_repository_entry_if_identity(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    expected_identity: &RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    let file = open_repository_input(service, path)?;
+    if identity_from_file(&file)? != *expected_identity {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    drop(file);
+    remove_repository_entry(service, path)
+}
+
+#[cfg(not(unix))]
+fn sync_repository_parent(
+    _service: &DepgraphService,
+    _path: &RepositoryRelativePath,
+) -> DepgraphServiceResult<()> {
+    Ok(())
+}
+
+#[cfg(any(test, not(unix)))]
+fn publication_policy_without_atomic_exchange(
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+) -> DepgraphServiceResult<RepositoryOverwritePolicy> {
+    // A check followed by unconditional replacement cannot bind a regular target's
+    // content precondition to publication. Missing targets remain safe through the
+    // platform's atomic no-replace primitive; existing targets fail closed.
+    match (overwrite, expected_precondition) {
+        (_, Some(RepositoryOutputPrecondition::Missing)) => {
+            Ok(RepositoryOverwritePolicy::NoReplace)
+        }
+        (
+            RepositoryOverwritePolicy::Overwrite,
+            Some(RepositoryOutputPrecondition::Regular { .. }),
+        ) => Err(DepgraphServiceError::Integrity),
+        (RepositoryOverwritePolicy::Overwrite, None) => Err(DepgraphServiceError::Integrity),
+        _ => Ok(overwrite),
+    }
+}
+
+#[cfg(any(test, windows))]
+const WINDOWS_FILE_SHARE_READ_ACCESS: u32 = 0x0000_0001;
+#[cfg(test)]
+const WINDOWS_FILE_SHARE_WRITE_ACCESS: u32 = 0x0000_0002;
+#[cfg(any(test, windows))]
+const WINDOWS_FILE_SHARE_DELETE_ACCESS: u32 = 0x0000_0004;
+
+#[cfg(any(test, windows))]
+const fn windows_staging_share_access() -> u32 {
+    WINDOWS_FILE_SHARE_READ_ACCESS | WINDOWS_FILE_SHARE_DELETE_ACCESS
+}
+
+#[cfg(unix)]
+struct UnixAtomicWriteHooks<BeforePrecondition, AfterClassification, BeforeRollback> {
+    before_precondition: BeforePrecondition,
+    after_classification: AfterClassification,
+    before_rollback: BeforeRollback,
+}
+
+#[cfg(unix)]
+fn write_repository_file_atomically_platform(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    write_repository_file_atomically_platform_unix(
+        service,
+        path,
+        overwrite,
+        expected_precondition,
+        cancellation,
+        write_contents,
+        UnixAtomicWriteHooks {
+            before_precondition: || {},
+            after_classification: || {},
+            before_rollback: || {},
+        },
+    )
+}
+
+#[cfg(all(test, unix))]
+fn write_repository_file_atomically_platform_before_precondition_for_test(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    cancellation: &crate::CancellationToken,
+    expected_precondition: &RepositoryOutputPrecondition,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+    before_classification: impl FnOnce(),
+) -> DepgraphServiceResult<()> {
+    write_repository_file_atomically_platform_unix(
+        service,
+        path,
+        overwrite,
+        Some(expected_precondition),
+        cancellation,
+        write_contents,
+        UnixAtomicWriteHooks {
+            before_precondition: before_classification,
+            after_classification: || {},
+            before_rollback: || {},
+        },
+    )
+}
+
+#[cfg(all(test, unix))]
+fn write_repository_file_atomically_platform_after_classification_for_test(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+    after_classification: impl FnOnce(),
+) -> DepgraphServiceResult<()> {
+    let expected_precondition = repository_output_precondition(service, path, cancellation)?;
+    write_repository_file_atomically_platform_unix(
+        service,
+        path,
+        overwrite,
+        Some(&expected_precondition),
+        cancellation,
+        write_contents,
+        UnixAtomicWriteHooks {
+            before_precondition: || {},
+            after_classification,
+            before_rollback: || {},
+        },
+    )
+}
+
+#[cfg(unix)]
+fn write_repository_file_atomically_platform_unix<
+    BeforePrecondition,
+    AfterClassification,
+    BeforeRollback,
+>(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+    hooks: UnixAtomicWriteHooks<BeforePrecondition, AfterClassification, BeforeRollback>,
+) -> DepgraphServiceResult<()>
+where
+    BeforePrecondition: FnOnce(),
+    AfterClassification: FnOnce(),
+    BeforeRollback: FnOnce(),
+{
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd as _, FromRawFd as _},
+        os::unix::ffi::OsStrExt as _,
+    };
+
+    let UnixAtomicWriteHooks {
+        before_precondition,
+        after_classification,
+        before_rollback,
+    } = hooks;
+    let (parent, final_name) = open_unix_repository_parent(service, path)?;
+    let staging_name = format!(".depgraph-stage-{}", uuid::Uuid::new_v4().simple());
+    let staging_name = OsStr::new(&staging_name);
+    let descriptor = open_unix_descriptor(
+        &parent,
+        staging_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        Some(0o600),
+    )?;
+    // SAFETY: descriptor is newly owned after a successful openat call.
+    let mut staging = unsafe { File::from_raw_fd(descriptor) };
+    let staging_identity = identity_from_file(&staging)?;
+    if let Err(error) = write_contents(&mut staging) {
+        let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    if let Err(source) = staging.sync_all() {
+        let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        return Err(RepositoryFileError::Unavailable { source }.into());
+    }
+    if cancellation.is_cancelled() {
+        let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        return Err(DepgraphServiceError::Cancelled);
+    }
+
+    before_precondition();
+    if let Some(expected_precondition) = expected_precondition
+        && let Err(error) = verify_repository_output_precondition(
+            service,
+            path,
+            expected_precondition,
+            cancellation,
+        )
+    {
+        let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        return Err(error);
+    }
+    let classified = match classify_unix_publication_target(&parent, final_name, overwrite) {
+        Ok(classified) => classified,
+        Err(error) => {
+            let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+            return Err(error);
+        }
+    };
+    after_classification();
+    validate_unix_staging_path_identity(&parent, staging_name, staging_identity)?;
+    let staging_c = CString::new(staging_name.as_bytes())
+        .map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let destination =
+        CString::new(final_name.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    match classified {
+        UnixPublicationTarget::Missing => {
+            // SAFETY: both names are NUL-terminated and the retained directory
+            // handle confines the hard-link publication to this exact parent.
+            let publication = unsafe {
+                libc::linkat(
+                    parent.as_raw_fd(),
+                    staging_c.as_ptr(),
+                    parent.as_raw_fd(),
+                    destination.as_ptr(),
+                    0,
+                )
+            };
+            if publication != 0 {
+                let source = io::Error::last_os_error();
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                if source.kind() == io::ErrorKind::AlreadyExists {
+                    return match classify_unix_publication_target(
+                        &parent,
+                        final_name,
+                        RepositoryOverwritePolicy::Overwrite,
+                    ) {
+                        Ok(_) if overwrite == RepositoryOverwritePolicy::NoReplace => {
+                            Err(RepositoryFileError::AlreadyExists.into())
+                        }
+                        Ok(_) => Err(DepgraphServiceError::Integrity),
+                        Err(error) => Err(error),
+                    };
+                }
+                return Err(RepositoryFileError::Unavailable { source }.into());
+            }
+            let published_identity =
+                unix_entry_identity(&parent, final_name)?.ok_or(DepgraphServiceError::Integrity)?;
+            if published_identity != staging_identity {
+                quarantine_unix_entry(&parent, final_name, published_identity)?;
+                return Err(DepgraphServiceError::Integrity);
+            }
+            let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+        }
+        UnixPublicationTarget::Regular {
+            identity: expected_identity,
+            mode: expected_mode,
+        } => {
+            let destination_still_matches = matches!(
+                classify_unix_publication_target(
+                    &parent,
+                    final_name,
+                    RepositoryOverwritePolicy::Overwrite,
+                ),
+                Ok(UnixPublicationTarget::Regular { identity, mode })
+                    if identity == expected_identity && mode == expected_mode
+            );
+            if !destination_still_matches {
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                return Err(DepgraphServiceError::Integrity);
+            }
+            // Preserve access permission bits from the exact destination snapshot.
+            // SAFETY: staging owns a live descriptor and expected_mode is bounded
+            // to the portable access-bit mask captured by fstatat.
+            if unsafe { libc::fchmod(staging.as_raw_fd(), expected_mode) } != 0 {
+                let source = io::Error::last_os_error();
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                return Err(RepositoryFileError::Unavailable { source }.into());
+            }
+            if let Err(source) = staging.sync_all() {
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                return Err(RepositoryFileError::Unavailable { source }.into());
+            }
+            if cancellation.is_cancelled() {
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                return Err(DepgraphServiceError::Cancelled);
+            }
+            validate_unix_staging_path_identity(&parent, staging_name, staging_identity)?;
+            let replacement_identity = staging_identity;
+            if let Err(error) = exchange_unix_at(&parent, staging_name, final_name) {
+                let _ = remove_owned_unix_staging(&parent, staging_name, staging_identity);
+                return Err(error);
+            }
+            let published_identity =
+                unix_entry_identity(&parent, final_name)?.ok_or(DepgraphServiceError::Integrity)?;
+            if published_identity != replacement_identity {
+                restore_unix_exchange_preserving_displaced(
+                    &parent,
+                    staging_name,
+                    final_name,
+                    expected_identity,
+                    published_identity,
+                )?;
+                return Err(DepgraphServiceError::Integrity);
+            }
+            let publication_check = match classify_unix_publication_target(
+                &parent,
+                staging_name,
+                RepositoryOverwritePolicy::Overwrite,
+            ) {
+                Ok(UnixPublicationTarget::Regular { identity, mode })
+                    if identity == expected_identity && mode == expected_mode =>
+                {
+                    if let Some(expected_precondition) = expected_precondition {
+                        match repository_output_precondition_unix_at(
+                            service,
+                            &parent,
+                            staging_name,
+                            path,
+                            cancellation,
+                        ) {
+                            Ok(observed) if observed == *expected_precondition => Ok(()),
+                            Ok(_) => Err(DepgraphServiceError::Integrity),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(UnixPublicationTarget::Missing | UnixPublicationTarget::Regular { .. }) => {
+                    Err(DepgraphServiceError::Integrity)
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = publication_check {
+                before_rollback();
+                restore_unix_exchange(
+                    &parent,
+                    staging_name,
+                    final_name,
+                    expected_identity,
+                    expected_mode,
+                    replacement_identity,
+                )?;
+                return Err(error);
+            }
+            let _ = remove_owned_unix_staging(&parent, staging_name, expected_identity);
+        }
+    }
+    parent
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repository_output_precondition_unix_at(
+    service: &DepgraphService,
+    parent: &File,
+    name: &OsStr,
+    original_path: &RepositoryRelativePath,
+    cancellation: &crate::CancellationToken,
+) -> DepgraphServiceResult<RepositoryOutputPrecondition> {
+    use std::os::fd::FromRawFd as _;
+
+    let descriptor = open_unix_descriptor(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        None,
+    )?;
+    // SAFETY: descriptor is newly owned after a successful openat call.
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    let first = repository_regular_file_precondition_from_file(
+        service,
+        original_path,
+        &mut file,
+        cancellation,
+    )?;
+    let second = repository_regular_file_precondition_from_file(
+        service,
+        original_path,
+        &mut file,
+        cancellation,
+    )?;
+    if first == second {
+        Ok(first)
+    } else {
+        Err(DepgraphServiceError::Integrity)
+    }
+}
+
+#[cfg(unix)]
+fn restore_unix_exchange(
+    parent: &File,
+    staging_name: &OsStr,
+    final_name: &OsStr,
+    expected_original_identity: RepositoryFileIdentity,
+    expected_mode: libc::mode_t,
+    expected_replacement_identity: RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    let staging_matches = matches!(
+        classify_unix_publication_target(
+            parent,
+            staging_name,
+            RepositoryOverwritePolicy::Overwrite,
+        )?,
+        UnixPublicationTarget::Regular { identity, mode }
+            if identity == expected_original_identity && mode == expected_mode
+    );
+    let final_matches = matches!(
+        classify_unix_publication_target(
+            parent,
+            final_name,
+            RepositoryOverwritePolicy::Overwrite,
+        )?,
+        UnixPublicationTarget::Regular { identity, mode }
+            if identity == expected_replacement_identity && mode == expected_mode
+    );
+    if !staging_matches || !final_matches {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    exchange_unix_at(parent, staging_name, final_name)?;
+    let restored_final_matches = matches!(
+        classify_unix_publication_target(
+            parent,
+            final_name,
+            RepositoryOverwritePolicy::Overwrite,
+        )?,
+        UnixPublicationTarget::Regular { identity, mode }
+            if identity == expected_original_identity && mode == expected_mode
+    );
+    let displaced_replacement_matches = matches!(
+        classify_unix_publication_target(
+            parent,
+            staging_name,
+            RepositoryOverwritePolicy::Overwrite,
+        )?,
+        UnixPublicationTarget::Regular { identity, mode }
+            if identity == expected_replacement_identity && mode == expected_mode
+    );
+    if !restored_final_matches || !displaced_replacement_matches {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    remove_owned_unix_staging(parent, staging_name, expected_replacement_identity)?;
+    parent
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+}
+
+#[cfg(unix)]
+fn restore_unix_exchange_preserving_displaced(
+    parent: &File,
+    staging_name: &OsStr,
+    final_name: &OsStr,
+    expected_original_identity: RepositoryFileIdentity,
+    expected_displaced_identity: RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    if unix_entry_identity(parent, staging_name)? != Some(expected_original_identity)
+        || unix_entry_identity(parent, final_name)? != Some(expected_displaced_identity)
+    {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    exchange_unix_at(parent, staging_name, final_name)?;
+    if unix_entry_identity(parent, final_name)? != Some(expected_original_identity)
+        || unix_entry_identity(parent, staging_name)? != Some(expected_displaced_identity)
+    {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    parent
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+}
+
+#[cfg(unix)]
+fn exchange_unix_at(parent: &File, first: &OsStr, second: &OsStr) -> DepgraphServiceResult<()> {
+    use std::{ffi::CString, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    let first = CString::new(first.as_bytes())
+        .map_err(|_| DepgraphServiceError::from(RepositoryFileError::BoundaryViolation))?;
+    let second = CString::new(second.as_bytes())
+        .map_err(|_| DepgraphServiceError::from(RepositoryFileError::BoundaryViolation))?;
+    #[cfg(target_os = "macos")]
+    // SAFETY: both names are NUL-terminated and both directory descriptors
+    // remain open for the atomic exchange call.
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            first.as_ptr(),
+            parent.as_raw_fd(),
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: syscall arguments follow renameat2(2); names and retained parent
+    // descriptors remain valid, and RENAME_EXCHANGE preserves both entries.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            first.as_ptr(),
+            parent.as_raw_fd(),
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        ) as libc::c_int
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    let result = -1;
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(RepositoryFileError::Unavailable {
+            source: io::Error::last_os_error(),
+        }
+        .into())
+    }
+}
+
+#[cfg(unix)]
+fn open_unix_repository_parent<'a>(
+    service: &DepgraphService,
+    path: &'a RepositoryRelativePath,
+) -> DepgraphServiceResult<(File, &'a OsStr)> {
+    let mut parent = open_unix_root(service.config().canonical_root())?;
+    if identity_from_file(&parent)? != *service.config().root_identity() {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    let components = path.components().collect::<Vec<_>>();
+    for component in &components[..components.len() - 1] {
+        parent = open_unix_at(&parent, OsStr::new(component), true)?;
+    }
+    let final_name = OsStr::new(
+        components
+            .last()
+            .copied()
+            .expect("validated path has a component"),
+    );
+    validate_opened_repository_output_not_persistent_state(service, &parent, final_name)?;
+    Ok((parent, final_name))
+}
+
+#[cfg(unix)]
+enum UnixPublicationTarget {
+    Missing,
+    Regular {
+        identity: RepositoryFileIdentity,
+        mode: libc::mode_t,
+    },
+}
+
+#[cfg(unix)]
+fn rename_unix_at_no_replace(
+    parent: &File,
+    source: &OsStr,
+    destination: &OsStr,
+) -> DepgraphServiceResult<()> {
+    use std::{ffi::CString, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| DepgraphServiceError::from(RepositoryFileError::BoundaryViolation))?;
+    let destination = CString::new(destination.as_bytes())
+        .map_err(|_| DepgraphServiceError::from(RepositoryFileError::BoundaryViolation))?;
+    #[cfg(target_os = "macos")]
+    // SAFETY: both names are NUL-terminated, the retained parent remains open,
+    // and RENAME_EXCL guarantees that the private quarantine is not replaced.
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: syscall arguments follow renameat2(2); RENAME_NOREPLACE keeps
+    // both source and any unexpectedly existing destination intact on failure.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        ) as libc::c_int
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    let result = -1;
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(RepositoryFileError::Unavailable {
+            source: io::Error::last_os_error(),
+        }
+        .into())
+    }
+}
+
+#[cfg(unix)]
+fn unix_stat_device_namespace(metadata: &libc::stat) -> DepgraphServiceResult<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        Ok(metadata.st_dev)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        u64::try_from(metadata.st_dev).map_err(|_| DepgraphServiceError::Integrity)
+    }
+}
+
+#[cfg(unix)]
+fn classify_unix_publication_target(
+    parent: &File,
+    name: &OsStr,
+    overwrite: RepositoryOverwritePolicy,
+) -> DepgraphServiceResult<UnixPublicationTarget> {
+    use std::{ffi::CString, mem::MaybeUninit, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    let name = CString::new(name.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let mut metadata = MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: parent remains open, name is NUL-terminated, and metadata points
+    // to writable storage. AT_SYMLINK_NOFOLLOW inspects the directory entry.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        return if source.kind() == io::ErrorKind::NotFound {
+            Ok(UnixPublicationTarget::Missing)
+        } else {
+            Err(RepositoryFileError::Unavailable { source }.into())
+        };
+    }
+    // SAFETY: a successful fstatat call initialized the complete structure.
+    let metadata = unsafe { metadata.assume_init() };
+    match metadata.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => Err(RepositoryFileError::BoundaryViolation.into()),
+        libc::S_IFREG if overwrite == RepositoryOverwritePolicy::Overwrite => {
+            Ok(UnixPublicationTarget::Regular {
+                identity: RepositoryFileIdentity {
+                    namespace: unix_stat_device_namespace(&metadata)?,
+                    object: metadata.st_ino,
+                },
+                mode: metadata.st_mode & 0o777,
+            })
+        }
+        libc::S_IFREG => Err(RepositoryFileError::AlreadyExists.into()),
+        _ => Err(RepositoryFileError::NotRegular.into()),
+    }
+}
+
+#[cfg(unix)]
+fn unlink_unix_at(parent: &File, name: &OsStr) -> DepgraphServiceResult<()> {
+    use std::{ffi::CString, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    let name = CString::new(name.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    // SAFETY: parent remains open and name is NUL-terminated. No flags means
+    // only the named non-directory entry is removed.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(RepositoryFileError::Unavailable {
+            source: io::Error::last_os_error(),
+        }
+        .into())
+    }
+}
+
+#[cfg(unix)]
+fn unix_entry_identity(
+    parent: &File,
+    name: &OsStr,
+) -> DepgraphServiceResult<Option<RepositoryFileIdentity>> {
+    use std::{ffi::CString, mem::MaybeUninit, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    let name = CString::new(name.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let mut metadata = MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: parent remains open, name is NUL-terminated, and metadata points
+    // to writable storage. AT_SYMLINK_NOFOLLOW binds identity to the entry.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        return if source.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(RepositoryFileError::Unavailable { source }.into())
+        };
+    }
+    // SAFETY: a successful fstatat call initialized the complete structure.
+    let metadata = unsafe { metadata.assume_init() };
+    Ok(Some(RepositoryFileIdentity {
+        namespace: unix_stat_device_namespace(&metadata)?,
+        object: metadata.st_ino,
+    }))
+}
+
+#[cfg(unix)]
+fn validate_unix_staging_path_identity(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    match classify_unix_publication_target(
+        parent,
+        staging_name,
+        RepositoryOverwritePolicy::Overwrite,
+    ) {
+        Ok(UnixPublicationTarget::Regular { identity, .. }) if identity == expected_identity => {
+            Ok(())
+        }
+        Ok(UnixPublicationTarget::Missing | UnixPublicationTarget::Regular { .. }) | Err(_) => {
+            Err(DepgraphServiceError::Integrity)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn remove_owned_unix_staging(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    remove_owned_unix_staging_with_hook(parent, staging_name, expected_identity, || {})
+}
+
+#[cfg(all(test, unix))]
+fn remove_owned_unix_staging_after_identity_for_test(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+    after_identity: impl FnOnce(),
+) -> DepgraphServiceResult<()> {
+    remove_owned_unix_staging_with_hook(parent, staging_name, expected_identity, after_identity)
+}
+
+#[cfg(unix)]
+fn remove_owned_unix_staging_with_hook(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+    after_identity: impl FnOnce(),
+) -> DepgraphServiceResult<()> {
+    match unix_entry_identity(parent, staging_name)? {
+        Some(identity) if identity == expected_identity => {
+            after_identity();
+            let quarantine_name = format!(".depgraph-cleanup-{}", uuid::Uuid::new_v4().simple());
+            let quarantine_name = OsStr::new(&quarantine_name);
+            rename_unix_at_no_replace(parent, staging_name, quarantine_name)?;
+            match unix_entry_identity(parent, quarantine_name)? {
+                Some(identity) if identity == expected_identity => {
+                    unlink_unix_at(parent, quarantine_name)?;
+                    parent
+                        .sync_all()
+                        .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+                }
+                Some(_) => {
+                    // The original pathname was swapped after validation. Moving
+                    // it first preserves the foreign entry; restore its name when
+                    // still available, otherwise leave it quarantined.
+                    let _ = rename_unix_at_no_replace(parent, quarantine_name, staging_name);
+                    let _ = parent.sync_all();
+                    Err(DepgraphServiceError::Integrity)
+                }
+                None => Err(DepgraphServiceError::Integrity),
+            }
+        }
+        None => Ok(()),
+        Some(_) => Err(DepgraphServiceError::Integrity),
+    }
+}
+
+#[cfg(unix)]
+fn quarantine_unix_entry(
+    parent: &File,
+    name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+) -> DepgraphServiceResult<()> {
+    use std::{ffi::CString, os::fd::AsRawFd as _, os::unix::ffi::OsStrExt as _};
+
+    if unix_entry_identity(parent, name)? != Some(expected_identity) {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    let quarantine = format!(".depgraph-rejected-{}", uuid::Uuid::new_v4().simple());
+    let source =
+        CString::new(name.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let quarantine_c =
+        CString::new(quarantine.as_bytes()).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    // SAFETY: both names are NUL-terminated and the retained directory handle
+    // confines the atomic rename to this exact parent.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            quarantine_c.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(RepositoryFileError::Unavailable {
+            source: io::Error::last_os_error(),
+        }
+        .into());
+    }
+    if unix_entry_identity(parent, OsStr::new(&quarantine))? != Some(expected_identity) {
+        return Err(DepgraphServiceError::Integrity);
+    }
+    parent
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+}
+
+#[cfg(windows)]
+fn write_repository_file_atomically_platform(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_CREATE,
+        Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE},
+    };
+
+    let traversal = open_windows_parent(service, path, true, || {})?;
+    validate_windows_directories(&traversal.directories)?;
+    let staging_name = format!(".depgraph-stage-{}", uuid::Uuid::new_v4().simple());
+    let mut staging = open_windows_at(
+        traversal.parent(),
+        OsStr::new(&staging_name),
+        FILE_GENERIC_WRITE | DELETE,
+        windows_staging_share_access(),
+        FILE_CREATE,
+        Some(false),
+    )?;
+    validate_opened_windows_regular_file(&staging)?;
+    if let Err(error) = write_contents(&mut staging) {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    if let Err(source) = staging.sync_all() {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(RepositoryFileError::Unavailable { source }.into());
+    }
+    if cancellation.is_cancelled() {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    let publication_policy =
+        match publication_policy_without_atomic_exchange(overwrite, expected_precondition) {
+            Ok(policy) => policy,
+            Err(error) => {
+                let _ = delete_windows_file_handle(&staging);
+                return Err(error);
+            }
+        };
+    if let Some(expected_precondition) = expected_precondition
+        && let Err(error) = verify_repository_output_precondition(
+            service,
+            path,
+            expected_precondition,
+            cancellation,
+        )
+    {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(error);
+    }
+    if let Err(error) = classify_windows_publication_target(
+        traversal.parent(),
+        traversal.final_name,
+        publication_policy,
+    ) {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(error);
+    }
+    validate_windows_directories(&traversal.directories)?;
+    if let Err(error) = rename_windows_file_handle(
+        &staging,
+        traversal.parent(),
+        traversal.final_name,
+        publication_policy == RepositoryOverwritePolicy::Overwrite,
+    ) {
+        let _ = delete_windows_file_handle(&staging);
+        return Err(error);
+    }
+    validate_windows_directories(&traversal.directories)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_repository_file_atomically_platform(
+    service: &DepgraphService,
+    path: &RepositoryRelativePath,
+    overwrite: RepositoryOverwritePolicy,
+    expected_precondition: Option<&RepositoryOutputPrecondition>,
+    cancellation: &crate::CancellationToken,
+    write_contents: impl FnOnce(&mut File) -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    if !service.config().repository_root_seal().matches_live_root() {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    let mut destination = service.config().canonical_root().to_path_buf();
+    destination.extend(path.components());
+    let parent = destination
+        .parent()
+        .ok_or(RepositoryFileError::BoundaryViolation)?;
+    let canonical_parent = fs::canonicalize(parent).map_err(map_filesystem_error)?;
+    if canonical_parent != parent
+        || !canonical_parent.starts_with(service.config().canonical_root())
+    {
+        return Err(RepositoryFileError::BoundaryViolation.into());
+    }
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RepositoryFileError::BoundaryViolation.into());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(RepositoryFileError::NotRegular.into());
+        }
+        Ok(_) if overwrite == RepositoryOverwritePolicy::NoReplace => {
+            return Err(RepositoryFileError::AlreadyExists.into());
+        }
+        Ok(_) | Err(_) => {}
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".depgraph-stage-")
+        .tempfile_in(parent)
+        .map_err(|source| RepositoryFileError::Unavailable { source })?;
+    write_contents(temporary.as_file_mut())?;
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|source| RepositoryFileError::Unavailable { source })?;
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    let publication_policy =
+        publication_policy_without_atomic_exchange(overwrite, expected_precondition)?;
+    if let Some(expected_precondition) = expected_precondition {
+        verify_repository_output_precondition(service, path, expected_precondition, cancellation)?;
+    }
+    match publication_policy {
+        RepositoryOverwritePolicy::NoReplace => temporary
+            .persist_noclobber(destination)
+            .map(|_| ())
+            .map_err(|error| {
+                RepositoryFileError::Unavailable {
+                    source: error.error,
+                }
+                .into()
+            }),
+        RepositoryOverwritePolicy::Overwrite => {
+            temporary.persist(destination).map(|_| ()).map_err(|error| {
+                RepositoryFileError::Unavailable {
+                    source: error.error,
+                }
+                .into()
+            })
+        }
     }
 }
 
@@ -511,6 +2749,7 @@ fn open_unix_repository_output_after_root(
         parent = open_unix_at(&parent, OsStr::new(component), true)?;
     }
     let final_name = OsStr::new(components.last().expect("validated path has a component"));
+    validate_opened_repository_output_not_persistent_state(service, &parent, final_name)?;
     let descriptor = match open_unix_descriptor(
         &parent,
         final_name,
@@ -768,6 +3007,15 @@ fn open_windows_parent<'a>(
         .last()
         .copied()
         .expect("validated path has a component");
+    if create_output {
+        validate_opened_repository_output_not_persistent_state(
+            service,
+            directories
+                .last()
+                .expect("a traversal always retains its parent handle"),
+            OsStr::new(final_name),
+        )?;
+    }
     Ok(WindowsTraversal {
         directories,
         final_name: OsStr::new(final_name),
@@ -980,6 +3228,130 @@ fn validate_opened_windows_regular_file(file: &File) -> DepgraphServiceResult<()
 }
 
 #[cfg(windows)]
+fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+    use std::{mem, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: file retains ownership of the live handle for the call and the
+    // pointer/size describe one initialized FILE_DISPOSITION_INFO value.
+    let success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            u32::try_from(mem::size_of::<FILE_DISPOSITION_INFO>())
+                .expect("FILE_DISPOSITION_INFO size fits in u32"),
+        )
+    };
+    if success == 0 {
+        Err(RepositoryFileError::Unavailable {
+            source: io::Error::last_os_error(),
+        }
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn rename_windows_file_handle(
+    file: &File,
+    parent: &File,
+    destination: &OsStr,
+    replace_if_exists: bool,
+) -> DepgraphServiceResult<()> {
+    use std::{
+        mem,
+        os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
+        ptr,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let encoded_name = destination.encode_wide().collect::<Vec<_>>();
+    let name_bytes = encoded_name
+        .len()
+        .checked_mul(mem::size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or(RepositoryFileError::BoundaryViolation)?;
+    let buffer_size = mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes as usize)
+        .ok_or(RepositoryFileError::BoundaryViolation)?;
+    let word_count = buffer_size
+        .checked_add(mem::size_of::<usize>() - 1)
+        .ok_or(RepositoryFileError::BoundaryViolation)?
+        / mem::size_of::<usize>();
+    let mut storage = vec![0_usize; word_count];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: storage is pointer-aligned and large enough for the fixed header
+    // plus every encoded destination code unit. All pointers remain valid for
+    // SetFileInformationByHandle, which does not retain them.
+    let success = unsafe {
+        (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+        (*information).RootDirectory = parent.as_raw_handle();
+        (*information).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            encoded_name.as_ptr(),
+            ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            encoded_name.len(),
+        );
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
+        )
+    };
+    if success != 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if source.kind() == io::ErrorKind::AlreadyExists {
+        return classify_windows_existing_output(parent, destination).map(|_| ());
+    }
+    Err(RepositoryFileError::Unavailable { source }.into())
+}
+
+#[cfg(windows)]
+fn classify_windows_publication_target(
+    parent: &File,
+    name: &OsStr,
+    overwrite: RepositoryOverwritePolicy,
+) -> DepgraphServiceResult<()> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_OPEN,
+        Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        },
+    };
+
+    let existing = match open_windows_at(
+        parent,
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        None,
+    ) {
+        Ok(existing) => existing,
+        Err(DepgraphServiceError::RepositoryFile {
+            reason: RepositoryFileError::NotFound,
+        }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_opened_windows_regular_file(&existing)?;
+    if overwrite == RepositoryOverwritePolicy::Overwrite {
+        Ok(())
+    } else {
+        Err(RepositoryFileError::AlreadyExists.into())
+    }
+}
+
+#[cfg(windows)]
 fn classify_windows_existing_output(parent: &File, name: &OsStr) -> DepgraphServiceResult<File> {
     use std::os::windows::fs::MetadataExt as _;
     use windows_sys::{
@@ -1095,7 +3467,13 @@ fn identity_from_metadata(metadata: &fs::Metadata) -> RepositoryFileIdentity {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Read as _, path::Path};
+    use std::{
+        io::{Read as _, Seek as _},
+        path::Path,
+    };
+
+    #[cfg(unix)]
+    use std::{cell::RefCell, path::PathBuf};
 
     use super::*;
     use crate::service::{DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits};
@@ -1130,6 +3508,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_repository_file_name_comparison_is_unicode_canonical_caseless() {
+        assert!(repository_file_names_equivalent(
+            OsStr::new("Gráph.db-wal"),
+            OsStr::new("GRÁPH.DB-wal")
+        ));
+        assert!(repository_file_names_equivalent(
+            OsStr::new("Gráph.db-wal"),
+            OsStr::new("Gra\u{301}ph.db-wal")
+        ));
+        assert!(!repository_file_names_equivalent(
+            OsStr::new("graph.db-wal"),
+            OsStr::new("graph.db-shm")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_handle_relative_input_stays_with_root_across_enclosing_ancestor_swap() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let enclosing = temporary.path().join("enclosing");
@@ -1159,6 +3554,83 @@ mod tests {
             fs::read(root.join("nested/input.txt")).expect("replacement input remains readable"),
             b"replacement"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_public_output_rejects_protected_parent_directory_rename_race() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let protected_parent = root.join(".depgraph");
+        let safe_parent = root.join("artifacts");
+        let moved_safe_parent = root.join("artifacts-safe");
+        fs::create_dir_all(&protected_parent).expect("protected parent is created");
+        fs::create_dir_all(&safe_parent).expect("safe parent is created");
+        let store_path = protected_parent.join("graph.db");
+        fs::write(&store_path, b"store-canary").expect("store canary is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let service = DepgraphService::new(
+            DepgraphServiceConfig::new(
+                &root,
+                &store_path,
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid"),
+        );
+        let path = RepositoryRelativePath::parse("artifacts/graph.db-wal")
+            .expect("test path is repository-relative");
+        validate_repository_output_not_protected(&service, &path)
+            .expect("lexical path is safe before the race");
+        let safe_control = RepositoryRelativePath::parse("artifacts/graph.db-shm")
+            .expect("control path is repository-relative");
+        drop(
+            create_repository_output(&service, &safe_control)
+                .expect("a protected leaf name remains valid under a distinct parent identity"),
+        );
+        fs::remove_file(root.join(safe_control.as_str())).expect("control output is removed");
+
+        let result = open_unix_repository_output_after_root(&service, &path, || {
+            fs::rename(&safe_parent, &moved_safe_parent).expect("safe parent can move aside");
+            fs::rename(&protected_parent, &safe_parent)
+                .expect("protected parent can move under the safe name");
+        });
+        fs::rename(&safe_parent, &protected_parent).expect("protected parent is restored");
+        fs::rename(&moved_safe_parent, &safe_parent).expect("safe parent is restored");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(
+            fs::read(&store_path).expect("store canary remains readable"),
+            b"store-canary"
+        );
+        assert!(!protected_parent.join("graph.db-wal").exists());
+
+        fs::rename(&safe_parent, &moved_safe_parent).expect("safe parent can move aside again");
+        fs::rename(&protected_parent, &safe_parent)
+            .expect("protected parent can move under the safe name again");
+        let atomic_result = write_repository_file_atomically(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::NoReplace,
+            None,
+            &crate::CancellationToken::new(),
+            |file| {
+                file.write_all(b"must-not-publish")
+                    .map_err(|source| RepositoryFileError::Unavailable { source })?;
+                Ok(())
+            },
+        );
+        fs::rename(&safe_parent, &protected_parent).expect("protected parent is restored again");
+        fs::rename(&moved_safe_parent, &safe_parent).expect("safe parent is restored again");
+
+        let error = atomic_result.unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert!(!protected_parent.join("graph.db-wal").exists());
     }
 
     #[cfg(windows)]
@@ -1225,5 +3697,635 @@ mod tests {
             b"original output"
         );
         assert!(!root.join("nested/output.txt").exists());
+    }
+
+    #[test]
+    fn atomic_repository_write_keeps_existing_destination_when_writer_fails() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        fs::write(root.join("output.txt"), b"existing-canary").expect("existing output is created");
+        let service = {
+            let capabilities = DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::RepositoryWrite,
+            ])
+            .expect("test capabilities are valid");
+            let config = DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid");
+            DepgraphService::new(config)
+        };
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+
+        let error = write_repository_file_atomically(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            None,
+            &crate::CancellationToken::new(),
+            |file| {
+                file.write_all(b"partial")
+                    .map_err(|source| RepositoryFileError::Unavailable { source })?;
+                Err(DepgraphServiceError::Internal)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Internal);
+        assert_eq!(
+            fs::read(root.join("output.txt")).expect("existing output remains readable"),
+            b"existing-canary"
+        );
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("repository remains readable")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn non_exchange_publication_never_uses_unconditional_durable_overwrite() {
+        assert_eq!(
+            publication_policy_without_atomic_exchange(
+                RepositoryOverwritePolicy::Overwrite,
+                Some(&RepositoryOutputPrecondition::Missing),
+            )
+            .unwrap(),
+            RepositoryOverwritePolicy::NoReplace
+        );
+        assert!(matches!(
+            publication_policy_without_atomic_exchange(
+                RepositoryOverwritePolicy::Overwrite,
+                Some(&RepositoryOutputPrecondition::Regular {
+                    identity_sha256: "0".repeat(64),
+                    output_bytes: 1,
+                    content_sha256: "1".repeat(64),
+                }),
+            ),
+            Err(DepgraphServiceError::Integrity)
+        ));
+        assert!(matches!(
+            publication_policy_without_atomic_exchange(RepositoryOverwritePolicy::Overwrite, None,),
+            Err(DepgraphServiceError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn windows_publication_stage_never_allows_shared_write_access() {
+        assert_eq!(
+            windows_staging_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
+            0
+        );
+    }
+
+    #[test]
+    fn repository_precondition_hashing_stops_after_expected_size_plus_one() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"x").expect("initial output is created");
+        let service = {
+            let capabilities = DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::RepositoryWrite,
+            ])
+            .expect("test capabilities are valid");
+            let config = DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid");
+            DepgraphService::new(config)
+        };
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let mut file = open_repository_input(&service, &path).expect("output is opened safely");
+
+        let error = repository_regular_file_precondition_from_file_after_metadata_for_test(
+            &service,
+            &path,
+            &mut file,
+            &crate::CancellationToken::new(),
+            || {
+                let replacement = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&output)
+                    .expect("same output can grow");
+                replacement
+                    .set_len(1024 * 1024)
+                    .expect("same output can grow after metadata");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert!(
+            file.stream_position().expect("position is available") <= 2,
+            "bounded verification must read at most expected bytes plus one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_random_stage_cleanup_preserves_a_swap_after_identity_validation() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path();
+        let staging_name = OsStr::new(".depgraph-stage-owned");
+        let staging = root.join(staging_name);
+        let displaced = root.join("displaced-owned-stage");
+        fs::write(&staging, b"owned-stage").expect("owned staging is created");
+        let owned = File::open(&staging).expect("owned staging is opened");
+        let owned_identity = identity_from_file(&owned).expect("owned identity is available");
+        let parent = File::open(root).expect("parent directory is opened");
+
+        let error = remove_owned_unix_staging_after_identity_for_test(
+            &parent,
+            staging_name,
+            owned_identity,
+            || {
+                fs::rename(&staging, &displaced).expect("owned stage can be displaced");
+                fs::write(&staging, b"foreign-stage").expect("foreign stage is installed");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&staging).unwrap(), b"foreign-stage");
+        assert_eq!(fs::read(&displaced).unwrap(), b"owned-stage");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_export_cleanup_rejects_a_post_validation_regular_file_swap() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(root.join("artifacts")).expect("artifact directory is created");
+        fs::create_dir_all(&cache).expect("cache directory is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let config = DepgraphServiceConfig::new(
+            &root,
+            cache.join("graph.db"),
+            capabilities,
+            DepgraphServiceLimits::default(),
+        )
+        .expect("test service configuration is valid");
+        let service = DepgraphService::new(config);
+        let staging_path = RepositoryRelativePath::parse("artifacts/.depgraph-export-owned")
+            .expect("test path is repository-relative");
+        let staging = root.join(staging_path.as_str());
+        let displaced = root.join("artifacts/displaced-owned");
+        fs::write(&staging, b"owned-stage").expect("owned staging is created");
+        let result = ExportFileResult {
+            output_path: RepositoryRelativePath::parse("artifacts/output.json")
+                .expect("output path is repository-relative"),
+            format: crate::service::GraphExportFormat::Json,
+            output_bytes: 11,
+            content_sha256: hex::encode(Sha256::digest(b"owned-stage")),
+        };
+
+        let error = remove_staged_export_after_validation(&service, &staging_path, &result, || {
+            fs::rename(&staging, &displaced).expect("owned stage can be displaced");
+            fs::write(&staging, b"foreign-stage").expect("foreign stage is installed");
+        })
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&staging).unwrap(), b"foreign-stage");
+        assert_eq!(fs::read(&displaced).unwrap(), b"owned-stage");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_publication_rejects_a_replaced_staging_path() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let service = DepgraphService::new(
+            DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid"),
+        );
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let displaced = root.join("displaced-owned-stage");
+        let foreign_stage = RefCell::new(None::<PathBuf>);
+
+        let error = write_repository_file_atomically_platform_after_classification_for_test(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::NoReplace,
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"owned-stage").map_err(map_filesystem_error),
+            || {
+                let stage = fs::read_dir(&root)
+                    .expect("repository is readable")
+                    .map(|entry| entry.expect("entry is readable").path())
+                    .find(|entry| {
+                        entry.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(".depgraph-stage-")
+                        })
+                    })
+                    .expect("owned random stage exists");
+                fs::rename(&stage, &displaced).expect("owned stage can be displaced");
+                fs::write(&stage, b"foreign-stage").expect("foreign stage is installed");
+                *foreign_stage.borrow_mut() = Some(stage);
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert!(!root.join(path.as_str()).exists());
+        assert_eq!(fs::read(&displaced).unwrap(), b"owned-stage");
+        assert_eq!(
+            fs::read(
+                foreign_stage
+                    .borrow()
+                    .as_ref()
+                    .expect("foreign stage path was recorded")
+            )
+            .unwrap(),
+            b"foreign-stage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_overwrite_rejects_a_replaced_staging_path() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"original-destination").expect("destination is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let service = DepgraphService::new(
+            DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid"),
+        );
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let displaced = root.join("displaced-owned-stage");
+        let foreign_stage = RefCell::new(None::<PathBuf>);
+
+        let error = write_repository_file_atomically_platform_after_classification_for_test(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"owned-stage").map_err(map_filesystem_error),
+            || {
+                let stage = fs::read_dir(&root)
+                    .expect("repository is readable")
+                    .map(|entry| entry.expect("entry is readable").path())
+                    .find(|entry| {
+                        entry.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(".depgraph-stage-")
+                        })
+                    })
+                    .expect("owned random stage exists");
+                fs::rename(&stage, &displaced).expect("owned stage can be displaced");
+                fs::write(&stage, b"foreign-stage").expect("foreign stage is installed");
+                *foreign_stage.borrow_mut() = Some(stage);
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&output).unwrap(), b"original-destination");
+        assert_eq!(fs::read(&displaced).unwrap(), b"owned-stage");
+        assert_eq!(
+            fs::read(
+                foreign_stage
+                    .borrow()
+                    .as_ref()
+                    .expect("foreign stage path was recorded")
+            )
+            .unwrap(),
+            b"foreign-stage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_atomic_overwrite_rechecks_content_precondition_after_staging() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"expected-content").expect("existing output is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let config = DepgraphServiceConfig::new(
+            &root,
+            cache.join("graph.db"),
+            capabilities,
+            DepgraphServiceLimits::default(),
+        )
+        .expect("test service configuration is valid");
+        let service = DepgraphService::new(config);
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let precondition =
+            repository_output_precondition(&service, &path, &crate::CancellationToken::new())
+                .expect("existing destination precondition is captured");
+
+        let error = write_repository_file_atomically_platform_before_precondition_for_test(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            &crate::CancellationToken::new(),
+            &precondition,
+            |file| file.write_all(b"replacement").map_err(map_filesystem_error),
+            || {
+                fs::write(&output, b"concurrent-content")
+                    .expect("concurrent destination update succeeds");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&output).unwrap(), b"concurrent-content");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_atomic_overwrite_restores_content_drift_at_publication_boundary() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"expected-content").expect("existing output is created");
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::RepositoryWrite,
+        ])
+        .expect("test capabilities are valid");
+        let config = DepgraphServiceConfig::new(
+            &root,
+            cache.join("graph.db"),
+            capabilities,
+            DepgraphServiceLimits::default(),
+        )
+        .expect("test service configuration is valid");
+        let service = DepgraphService::new(config);
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let precondition =
+            repository_output_precondition(&service, &path, &crate::CancellationToken::new())
+                .expect("existing destination precondition is captured");
+
+        let error = write_repository_file_atomically_platform_unix(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            Some(&precondition),
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"replacement").map_err(map_filesystem_error),
+            UnixAtomicWriteHooks {
+                before_precondition: || {},
+                after_classification: || {
+                    fs::write(&output, b"concurrent-content")
+                        .expect("concurrent destination update succeeds");
+                },
+                before_rollback: || {},
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&output).unwrap(), b"concurrent-content");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_atomic_overwrite_rejects_same_inode_content_drift_at_publication() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"original-content").expect("existing output is created");
+        let service = {
+            let capabilities = DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::RepositoryWrite,
+            ])
+            .expect("test capabilities are valid");
+            let config = DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid");
+            DepgraphService::new(config)
+        };
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+
+        let error = write_repository_file_atomically_platform_after_classification_for_test(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"replacement").map_err(map_filesystem_error),
+            || {
+                fs::write(&output, b"concurrent-data")
+                    .expect("same-inode destination update succeeds");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&output).unwrap(), b"concurrent-data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_unix_rollback_never_exchanges_a_foreign_replacement_into_destination() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let output = root.join("output.txt");
+        fs::write(&output, b"original-content").expect("existing output is created");
+        let service = {
+            let capabilities = DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::RepositoryWrite,
+            ])
+            .expect("test capabilities are valid");
+            let config = DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid");
+            DepgraphService::new(config)
+        };
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+        let precondition =
+            repository_output_precondition(&service, &path, &crate::CancellationToken::new())
+                .expect("destination precondition is captured");
+        let foreign_stage = RefCell::new(None::<PathBuf>);
+
+        let error = write_repository_file_atomically_platform_unix(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            Some(&precondition),
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"replacement").map_err(map_filesystem_error),
+            UnixAtomicWriteHooks {
+                before_precondition: || {},
+                after_classification: || {
+                    fs::write(&output, b"concurrent-data")
+                        .expect("same-inode destination update succeeds");
+                },
+                before_rollback: || {
+                    let staging = fs::read_dir(&root)
+                        .expect("repository is readable")
+                        .map(|entry| entry.expect("entry is readable").path())
+                        .find(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with(".depgraph-stage-"))
+                        })
+                        .expect("rollback staging exists");
+                    fs::rename(&staging, root.join("displaced-original"))
+                        .expect("validated old destination can be displaced");
+                    fs::write(&staging, b"foreign-canary")
+                        .expect("foreign staging replacement is installed");
+                    *foreign_stage.borrow_mut() = Some(staging);
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert_eq!(fs::read(&output).unwrap(), b"replacement");
+        let foreign_stage = foreign_stage
+            .into_inner()
+            .expect("foreign staging path was captured");
+        assert_eq!(fs::read(foreign_stage).unwrap(), b"foreign-canary");
+        assert_eq!(
+            fs::read(root.join("displaced-original")).unwrap(),
+            b"concurrent-data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_overwrite_restores_and_rejects_a_post_classification_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let cache = temporary.path().join("cache");
+        let outside = temporary.path().join("outside.txt");
+        fs::create_dir_all(&root).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        fs::write(root.join("output.txt"), b"existing-canary").expect("existing output is created");
+        fs::write(&outside, b"outside-canary").expect("outside canary is created");
+        let service = {
+            let capabilities = DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::RepositoryWrite,
+            ])
+            .expect("test capabilities are valid");
+            let config = DepgraphServiceConfig::new(
+                &root,
+                cache.join("graph.db"),
+                capabilities,
+                DepgraphServiceLimits::default(),
+            )
+            .expect("test service configuration is valid");
+            DepgraphService::new(config)
+        };
+        let path =
+            RepositoryRelativePath::parse("output.txt").expect("test path is repository-relative");
+
+        let error = write_repository_file_atomically_platform_after_classification_for_test(
+            &service,
+            &path,
+            RepositoryOverwritePolicy::Overwrite,
+            &crate::CancellationToken::new(),
+            |file| file.write_all(b"replacement").map_err(map_filesystem_error),
+            || {
+                fs::rename(root.join("output.txt"), root.join("displaced.txt"))
+                    .expect("classified destination can be displaced");
+                symlink(&outside, root.join("output.txt"))
+                    .expect("symlink race candidate is installed");
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+        assert!(
+            root.join("output.txt")
+                .symlink_metadata()
+                .expect("raced symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside-canary");
+        assert_eq!(
+            fs::read(root.join("displaced.txt")).unwrap(),
+            b"existing-canary"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
     }
 }

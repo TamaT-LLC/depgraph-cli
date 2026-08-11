@@ -1134,6 +1134,9 @@ fn status_path(store: &Path) -> PathBuf {
 }
 
 fn open_regular_file_no_follow(path: &Path) -> DepgraphServiceResult<File> {
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt as _;
+
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1143,7 +1146,7 @@ fn open_regular_file_no_follow(path: &Path) -> DepgraphServiceResult<File> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }

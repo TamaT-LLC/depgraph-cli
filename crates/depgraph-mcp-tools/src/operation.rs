@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
-    AgentDaemonStatus, AgentRuntimeOutcome, AgentScanOutcome, ContractBuildError, ContractVersion,
-    LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
+    AgentDaemonStatus, AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome,
+    ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
 };
 
 /// Closed terminal output contracts registered for durable submit tools.
@@ -20,6 +20,7 @@ use crate::{
 pub enum PortableTerminalOutputContract {
     ScanSubmit,
     RuntimeTraceImportSubmit,
+    ExportFile,
     DaemonStartSubmit,
     DaemonStop,
 }
@@ -30,6 +31,7 @@ impl PortableTerminalOutputContract {
         match tool_name {
             "scan_submit" => Some(Self::ScanSubmit),
             "runtime_trace_import_submit" => Some(Self::RuntimeTraceImportSubmit),
+            "export_file" => Some(Self::ExportFile),
             "daemon_start_submit" => Some(Self::DaemonStartSubmit),
             "daemon_stop" => Some(Self::DaemonStop),
             _ => None,
@@ -65,6 +67,16 @@ impl PortableTerminalOutputContract {
                     PortableTerminalOutputEnvelope::RuntimeImport(Box::new(envelope)),
                 ))
             }
+            Self::ExportFile => {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentExportOutcome>>(value)
+                    .map_err(|_| PortableTerminalOutputError)?;
+                if envelope.snapshot_id().is_none() {
+                    return Err(PortableTerminalOutputError);
+                }
+                Ok(PortableTerminalOutput(
+                    PortableTerminalOutputEnvelope::ExportFile(Box::new(envelope)),
+                ))
+            }
             Self::DaemonStartSubmit | Self::DaemonStop => {
                 let envelope = serde_json::from_value::<SuccessEnvelope<AgentDaemonStatus>>(value)
                     .map_err(|_| PortableTerminalOutputError)?;
@@ -90,6 +102,7 @@ pub struct PortableTerminalOutput(PortableTerminalOutputEnvelope);
 enum PortableTerminalOutputEnvelope {
     Scan(Box<SuccessEnvelope<AgentScanOutcome>>),
     RuntimeImport(Box<SuccessEnvelope<AgentRuntimeOutcome>>),
+    ExportFile(Box<SuccessEnvelope<AgentExportOutcome>>),
     DaemonStatus(Box<SuccessEnvelope<AgentDaemonStatus>>),
 }
 
@@ -113,6 +126,7 @@ impl PortableTerminalOutput {
         match &self.0 {
             PortableTerminalOutputEnvelope::Scan(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::RuntimeImport(envelope) => envelope.repository_id(),
+            PortableTerminalOutputEnvelope::ExportFile(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::DaemonStatus(envelope) => envelope.repository_id(),
         }
     }

@@ -43,9 +43,11 @@ pub use crate::service_limits::{
     MAX_IMPACT_MATERIALIZED_PATH_STEPS, MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
 };
 pub use crate::service_repository::{
+    DeferredExportFileCompletion, DeferredExportFileRecovery, ExportFileRequest, ExportFileResult,
     MAX_REPOSITORY_PATH_BYTES, MAX_REPOSITORY_PATH_COMPONENT_BYTES, MAX_REPOSITORY_PATH_COMPONENTS,
-    OpenedRepositoryFile, RepositoryFileError, RepositoryPathError, RepositoryPathSelector,
-    RepositoryRelativePath,
+    OpenedRepositoryFile, RepositoryFileError, RepositoryInitRequest, RepositoryInitResult,
+    RepositoryOutputPrecondition, RepositoryOverwritePolicy, RepositoryPathError,
+    RepositoryPathSelector, RepositoryRelativePath,
 };
 pub use crate::service_snapshot::{ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest};
 pub use crate::service_store_write::{
@@ -61,6 +63,10 @@ pub const DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SERVICE_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_SERVICE_PAGE_ITEMS: usize = 100;
 pub const DEFAULT_SERVICE_MAX_PAGE_ITEMS: usize = 1_000;
+/// Suffix appended to the graph-store path for the durable operation journal.
+pub const OPERATION_JOURNAL_SUFFIX: &str = ".operations.sqlite";
+/// Suffix appended to the operation-journal path for the runner purge guard.
+pub const RUNNER_PURGE_LOCK_SUFFIX: &str = ".runner-purge-lock";
 
 pub type DepgraphServiceResult<T> = Result<T, DepgraphServiceError>;
 
@@ -276,6 +282,7 @@ pub struct DepgraphServiceConfig {
     logical_repository_id: String,
     root_identity: crate::service_repository::RepositoryFileIdentity,
     store_path: PathBuf,
+    store_parent_identity: Option<crate::service_repository::RepositoryFileIdentity>,
     capabilities: DepgraphCapabilitySet,
     limits: DepgraphServiceLimits,
 }
@@ -308,7 +315,7 @@ impl RepositoryRootSeal {
         digest.update(root_identity.opaque_bytes());
         Self {
             canonical_root: canonical_root.to_path_buf(),
-            root_identity: root_identity.clone(),
+            root_identity: *root_identity,
             binding_digest: digest.finalize().into(),
         }
     }
@@ -339,11 +346,13 @@ impl DepgraphServiceConfig {
         let (canonical_root, root_identity) = canonical_repository_root(root.as_ref())?;
         let logical_repository_id = logical_repository_id(&canonical_root);
         let store_path = fixed_store_path(store_path.as_ref())?;
+        let store_parent_identity = store_parent_identity(&store_path)?;
         Ok(Self {
             canonical_root,
             logical_repository_id,
             root_identity,
             store_path,
+            store_parent_identity,
             capabilities,
             limits,
         })
@@ -369,6 +378,12 @@ impl DepgraphServiceConfig {
     #[must_use]
     pub fn store_path(&self) -> &Path {
         &self.store_path
+    }
+
+    pub(crate) const fn store_parent_identity(
+        &self,
+    ) -> Option<&crate::service_repository::RepositoryFileIdentity> {
+        self.store_parent_identity.as_ref()
     }
 
     #[must_use]
@@ -495,6 +510,32 @@ fn fixed_store_path(path: &Path) -> DepgraphServiceResult<PathBuf> {
                     DepgraphServiceConfigurationError::StorePathUnavailable { source }.into(),
                 );
             }
+        }
+    }
+}
+
+fn store_parent_identity(
+    store_path: &Path,
+) -> DepgraphServiceResult<Option<crate::service_repository::RepositoryFileIdentity>> {
+    let parent = store_path
+        .parent()
+        .ok_or(DepgraphServiceConfigurationError::StorePathInvalid)?;
+    match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {
+            crate::service_repository::repository_root_identity(parent)
+                .map(Some)
+                .map_err(|error| {
+                    DepgraphServiceError::from(
+                        DepgraphServiceConfigurationError::StorePathUnavailable {
+                            source: io::Error::other(error),
+                        },
+                    )
+                })
+        }
+        Ok(_) => Err(DepgraphServiceConfigurationError::StorePathAncestorNotDirectory.into()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => {
+            Err(DepgraphServiceConfigurationError::StorePathUnavailable { source }.into())
         }
     }
 }

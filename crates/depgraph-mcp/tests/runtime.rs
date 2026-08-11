@@ -287,6 +287,57 @@ async fn deadline_cancels_service_work_and_never_publishes_late_success() {
     assert!(observed.load(Ordering::Acquire));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutation_cancellation_settles_the_worker_outcome() {
+    let runtime = RuntimeController::new(
+        RuntimeConfig::default().with_submit_rate(RateLimit::per_hour(600, 10)),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let execution = tokio::spawn({
+        let runtime = runtime.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            runtime
+                .execute_mutation_blocking(cancellation, move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, ()>("committed")
+                })
+                .await
+        }
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    cancellation.cancel();
+    release_tx.send(()).unwrap();
+
+    assert_eq!(execution.await.unwrap().unwrap(), Ok("committed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutation_deadline_settles_the_worker_outcome() {
+    let runtime = RuntimeController::new(
+        RuntimeConfig::default()
+            .with_submit_deadline(Duration::from_millis(20))
+            .with_submit_rate(RateLimit::per_hour(600, 10)),
+    )
+    .unwrap();
+
+    let execution = runtime
+        .execute_mutation_blocking(CancellationToken::new(), move |cancellation| {
+            while !cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            Ok::<_, ()>("committed")
+        })
+        .await;
+
+    assert_eq!(execution.unwrap(), Ok("committed"));
+}
+
 #[tokio::test]
 async fn deadline_keeps_capacity_reserved_until_blocking_work_stops() {
     let runtime = RuntimeController::new(

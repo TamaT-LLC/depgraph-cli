@@ -5,11 +5,12 @@ use depgraph_mcp_tools::{
     AgentCondition, AgentContext, AgentCorrelationDifference, AgentCorrelationStatus,
     AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentGraphExportResponse,
-    AgentImpact, AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep,
-    AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
-    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation, AgentResolutionStatus,
+    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
+    AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
+    AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
+    AgentPolicyApiChange, AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision,
+    AgentQueryRow, AgentRemediation, AgentRepositoryInitOutcome, AgentResolutionStatus,
     AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome,
     AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
     AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
@@ -241,6 +242,118 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
     unknown_field["result"]["raw_journal_payload"] = json!(true);
     assert!(daemon.deserialize(unknown_field).is_err());
     assert!(daemon.deserialize(json!({"arbitrary": true})).is_err());
+}
+
+#[test]
+fn agent_export_outcome_revalidates_its_closed_public_shape() {
+    let digest = "a".repeat(64);
+    let outcome = AgentExportOutcome::new(
+        "artifacts/graph.json",
+        AgentGraphExportFormat::Json,
+        42,
+        &digest,
+    )
+    .expect("representative file export outcome is valid");
+    assert_eq!(
+        serde_json::to_value(&outcome).unwrap(),
+        json!({
+            "output_path": "artifacts/graph.json",
+            "format": "json",
+            "output_bytes": 42,
+            "content_sha256": digest,
+        })
+    );
+
+    assert!(
+        AgentExportOutcome::new(
+            "/private/graph.json",
+            AgentGraphExportFormat::Json,
+            42,
+            "a".repeat(64),
+        )
+        .is_err()
+    );
+    assert!(
+        AgentExportOutcome::new(
+            "graph.json",
+            AgentGraphExportFormat::Json,
+            0,
+            "a".repeat(64),
+        )
+        .is_err()
+    );
+    assert!(
+        AgentExportOutcome::new(
+            "graph.json",
+            AgentGraphExportFormat::Json,
+            42,
+            "A".repeat(64),
+        )
+        .is_err()
+    );
+    for invalid in [
+        json!({"output_path":"../graph.json","format":"json","output_bytes":42,"content_sha256":"a".repeat(64)}),
+        json!({"output_path":"graph.json","format":"yaml","output_bytes":42,"content_sha256":"a".repeat(64)}),
+        json!({"output_path":"graph.json","format":"json","output_bytes":42,"content_sha256":"a".repeat(64),"temporary_path":"/private/stage"}),
+    ] {
+        assert!(serde_json::from_value::<AgentExportOutcome>(invalid).is_err());
+    }
+}
+
+#[test]
+fn repository_write_outcome_schemas_match_runtime_invariants() {
+    let init = serde_json::to_value(schemars::schema_for!(AgentRepositoryInitOutcome)).unwrap();
+    assert_eq!(
+        init["properties"]["output_path"]["const"],
+        json!(".depgraph.toml")
+    );
+
+    let export = serde_json::to_value(schemars::schema_for!(AgentExportOutcome)).unwrap();
+    assert_eq!(export["properties"]["output_bytes"]["minimum"], json!(1));
+}
+
+#[test]
+fn export_file_terminal_output_is_bound_to_its_closed_originating_contract() {
+    let outcome = AgentExportOutcome::new(
+        "artifacts/graph.json",
+        AgentGraphExportFormat::Json,
+        42,
+        "a".repeat(64),
+    )
+    .unwrap();
+    let envelope = SuccessEnvelope::new(parse("repo-1"), Some(parse(SNAPSHOT_ID)), outcome);
+    let contract = PortableTerminalOutputContract::for_originating_tool("export_file")
+        .expect("export_file has a closed terminal contract");
+
+    assert!(
+        contract
+            .deserialize(serde_json::to_value(&envelope).unwrap())
+            .is_ok()
+    );
+    let mut snapshotless = serde_json::to_value(&envelope).unwrap();
+    snapshotless.as_object_mut().unwrap().remove("snapshot_id");
+    assert!(contract.deserialize(snapshotless).is_err());
+    let mut extra = serde_json::to_value(envelope).unwrap();
+    extra["result"]["content"] = json!("raw graph must stay private");
+    assert!(contract.deserialize(extra).is_err());
+}
+
+#[test]
+fn repository_init_outcome_contains_only_the_fixed_relative_config_path() {
+    let outcome = AgentRepositoryInitOutcome::new(".depgraph.toml").unwrap();
+    assert_eq!(
+        serde_json::to_value(&outcome).unwrap(),
+        json!({"output_path": ".depgraph.toml"})
+    );
+    assert!(AgentRepositoryInitOutcome::new("nested/.depgraph.toml").is_err());
+    assert!(AgentRepositoryInitOutcome::new("/private/.depgraph.toml").is_err());
+    assert!(
+        serde_json::from_value::<AgentRepositoryInitOutcome>(json!({
+            "output_path": ".depgraph.toml",
+            "root": "/private/repository"
+        }))
+        .is_err()
+    );
 }
 
 fn context() -> AgentContext {

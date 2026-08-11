@@ -8632,7 +8632,11 @@ process.stdout.write(JSON.stringify({
     }
 
     let graphml_path = verify_root.join("milestone4.graphml");
+    let graphml_argument = graphml_path
+        .strip_prefix(verify_root)
+        .context("packaged GraphML export path is outside the verification root")?;
     let file = Command::new(executable)
+        .current_dir(verify_root)
         .arg("--store")
         .arg(store)
         .args([
@@ -8645,7 +8649,7 @@ process.stdout.write(JSON.stringify({
             "milestone4-packaged-session",
             "--output",
         ])
-        .arg(&graphml_path)
+        .arg(graphml_argument)
         .output()?;
     if !file.status.success()
         || !file.stdout.is_empty()

@@ -824,6 +824,52 @@ impl DepgraphService {
         Ok(result)
     }
 
+    pub(crate) fn graph_export_raw_compatible(
+        &self,
+        request: &GraphExportRequest,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<GraphExportResult> {
+        check_cancelled(cancellation)?;
+        let mut snapshot_request =
+            self.start_snapshot_request_at_cancellable(request.snapshot(), cancellation)?;
+        let snapshot_id = snapshot_request.snapshot_id().as_str().to_owned();
+        let snapshot =
+            crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
+        let filtered = filter_snapshot(&snapshot, request.filter());
+        let selected = select_export_graph(filtered, request, cancellation)?;
+        if selected.nodes.len() > request.max_nodes() || selected.edges.len() > request.max_edges()
+        {
+            return Err(cancelled_or(
+                DepgraphServiceError::ResourceExhausted,
+                cancellation,
+            ));
+        }
+        let format = match request.format() {
+            GraphExportFormat::Json => crate::ExportFormat::Json,
+            GraphExportFormat::Dot => crate::ExportFormat::Dot,
+            GraphExportFormat::Mermaid => crate::ExportFormat::Mermaid,
+            GraphExportFormat::Graphml => crate::ExportFormat::Graphml,
+        };
+        let content = crate::export_filtered(&selected, format, &GraphQueryFilter::default())
+            .map_err(|_| DepgraphServiceError::Internal)?;
+        check_cancelled(cancellation)?;
+        let maximum = self.config().limits().max_output_bytes();
+        if content.len() > maximum {
+            return Err(DepgraphServiceError::InlineExportTooLarge { maximum });
+        }
+        Ok(GraphExportResult {
+            schema_version: GRAPH_EXPORT_SERVICE_SCHEMA_VERSION.to_owned(),
+            snapshot_id,
+            format: request.format(),
+            media_type: request.format().media_type().to_owned(),
+            output_bytes: content.len() as u64,
+            node_count: selected.nodes.len() as u64,
+            edge_count: selected.edges.len() as u64,
+            content_sha256: hex::encode(Sha256::digest(content.as_bytes())),
+            content,
+        })
+    }
+
     fn load_snapshot_pair(
         &self,
         from: &SnapshotLocator,

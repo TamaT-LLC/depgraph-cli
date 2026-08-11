@@ -34,6 +34,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "daemon_start_submit",
     "daemon_stop",
     "doctor_get",
+    "export_file",
     "get_context",
     "graph_cycles_list",
     "graph_dependencies_list",
@@ -77,16 +78,13 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
-    assert_eq!(catalog.tools().len(), 32);
+    assert_eq!(catalog.tools().len(), 33);
 }
 
 #[test]
 fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
-    let capabilities =
-        DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])
-            .unwrap();
-    let catalog = ToolCatalog::for_capabilities(&capabilities).unwrap();
-    for tool_name in ["scan_submit", "runtime_trace_import_submit"] {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    for tool_name in ["scan_submit", "runtime_trace_import_submit", "export_file"] {
         let schema =
             &catalog.tool(tool_name).unwrap().input_schema()["properties"]["idempotency_key"];
         assert_eq!(schema["minLength"], 1);
@@ -100,6 +98,70 @@ fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
     assert!(IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)).is_err());
     assert!(IdempotencyKey::parse("has\u{0000}control").is_err());
     assert!(IdempotencyKey::parse("has\u{0085}control").is_err());
+}
+
+#[test]
+fn repository_write_catalog_exposes_only_fixed_root_init_and_durable_export_file() {
+    let read_only = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    assert!(read_only.tool("repository_init").is_none());
+    assert!(read_only.tool("export_file").is_none());
+
+    let capabilities = DepgraphCapabilitySet::try_new([
+        DepgraphCapability::Read,
+        DepgraphCapability::RepositoryWrite,
+    ])
+    .unwrap();
+    let catalog = ToolCatalog::for_capabilities(&capabilities).unwrap();
+    let init = catalog.tool("repository_init").unwrap();
+    let mut init_fields = init.input_schema()["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    init_fields.sort_unstable();
+    assert_eq!(init_fields, ["contract_version", "force", "repository_id"]);
+    assert_eq!(init.operation_behavior(), OperationBehavior::Immediate);
+    assert_eq!(
+        success_output_schema(init.output_schema())["properties"]["result"]["$ref"],
+        "#/$defs/AgentRepositoryInitOutcome"
+    );
+
+    let export = catalog.tool("export_file").unwrap();
+    let mut export_fields = export.input_schema()["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    export_fields.sort_unstable();
+    assert_eq!(
+        export_fields,
+        [
+            "contract_version",
+            "format",
+            "idempotency_key",
+            "max_edges",
+            "max_nodes",
+            "output_path",
+            "overwrite",
+            "repository_id",
+            "selector",
+            "snapshot",
+        ]
+    );
+    assert_eq!(
+        export.operation_behavior(),
+        OperationBehavior::AlwaysCreatesDurableOperation
+    );
+    let export_output = Value::Object(export.output_schema().clone()).to_string();
+    assert!(export_output.contains("operation_accepted"));
+    let operation_result = catalog.tool("operation_result").unwrap();
+    assert!(
+        Value::Object(operation_result.output_schema().clone())
+            .to_string()
+            .contains("AgentExportOutcome")
+    );
 }
 
 #[test]

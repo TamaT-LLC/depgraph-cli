@@ -369,12 +369,19 @@ impl Runner<'_> {
 
     fn export_json(&self, store: &Path) -> Result<Value> {
         let output_path = store.with_extension("export.json");
+        let repository_root = store
+            .parent()
+            .context("Go semantic export store has no repository root")?;
+        let output_argument = output_path
+            .strip_prefix(repository_root)
+            .context("Go semantic export path is outside the repository root")?;
         let mut command = self.command();
         command
+            .current_dir(repository_root)
             .arg("--store")
             .arg(store)
             .args(["export", "--format", "json", "--output"])
-            .arg(&output_path);
+            .arg(output_argument);
         checked_output(&mut command, "export the graph as json")?;
         let bytes = std::fs::read(&output_path)
             .with_context(|| format!("read JSON export {}", output_path.display()))?;
