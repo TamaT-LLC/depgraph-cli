@@ -650,7 +650,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "daemon_start_submit",
         "Start the repository daemon with store-write and daemon-control consent.",
-        ["strict"],
+        ["idempotency_key", "strict"],
         [CliAction::DaemonStart],
         DAEMON_CONTROL,
         ToolAuthorization::FixedCapabilities,
@@ -659,7 +659,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "daemon_stop",
         "Stop the repository daemon with store-write and daemon-control consent.",
-        [],
+        ["idempotency_key"],
         [CliAction::DaemonStop],
         DAEMON_CONTROL,
         ToolAuthorization::FixedCapabilities,
@@ -1107,7 +1107,9 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "graph_path_get" | "snapshot_diff_get" | "policy_evaluate" => &["from", "to"],
         "graph_export" => &["format"],
         "operation_get" | "operation_result" | "operation_cancel" => &["operation_id"],
-        "scan_submit" | "runtime_trace_import_submit" => &["idempotency_key"],
+        "scan_submit" | "runtime_trace_import_submit" | "daemon_start_submit" | "daemon_stop" => {
+            &["idempotency_key"]
+        }
         "export_file" => &["idempotency_key", "output_path", "format"],
         "snapshot_name_create" => &["name"],
         _ => &[],

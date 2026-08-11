@@ -259,6 +259,71 @@ pub struct AgentDaemonStatus {
     recovered_attempts: AgentRecoveredAttempts,
 }
 
+/// Closed, path-free terminal decision for a durable daemon control operation.
+/// Full lifecycle status remains available only through `daemon_get`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDaemonControlOutcome {
+    action: AgentDaemonControlAction,
+    phase: AgentDaemonControlPhase,
+}
+
+impl AgentDaemonControlOutcome {
+    #[must_use]
+    pub const fn running() -> Self {
+        Self {
+            action: AgentDaemonControlAction::Start,
+            phase: AgentDaemonControlPhase::Running,
+        }
+    }
+
+    #[must_use]
+    pub const fn stopped() -> Self {
+        Self {
+            action: AgentDaemonControlAction::Stop,
+            phase: AgentDaemonControlPhase::Stopped,
+        }
+    }
+
+    #[must_use]
+    pub const fn action(self) -> AgentDaemonControlAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> AgentDaemonControlPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        matches!(
+            (self.action, self.phase),
+            (
+                AgentDaemonControlAction::Start,
+                AgentDaemonControlPhase::Running
+            ) | (
+                AgentDaemonControlAction::Stop,
+                AgentDaemonControlPhase::Stopped
+            )
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDaemonControlAction {
+    Start,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDaemonControlPhase {
+    Running,
+    Stopped,
+}
+
 fn deserialize_daemon_changes<'de, D>(deserializer: D) -> Result<Vec<AgentDaemonChange>, D::Error>
 where
     D: Deserializer<'de>,

@@ -17,15 +17,16 @@ use depgraph_core::{
     },
 };
 use depgraph_mcp_tools::{
-    AgentError, AgentErrorCode, AgentExportOutcome, AgentGraphExportFormat, AgentRemediation,
+    AgentDaemonControlAction, AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentError,
+    AgentErrorCode, AgentExportOutcome, AgentGraphExportFormat, AgentRemediation,
     AgentRuntimeOutcome, AgentRuntimeStatus, AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId,
     OperationId, SnapshotId, SuccessEnvelope,
 };
 
 use crate::{
-    CanonicalInput, CanonicalJson, CompletionDecision, CompletionIntent, JournalDigest,
-    JournalError, LeaseOwner, MAX_OPERATION_INPUT_BYTES, OperationJournal, OperationKind,
-    OperationStatus,
+    CanonicalInput, CanonicalJson, CompletionDecision, CompletionIntent, DaemonExecutableLauncher,
+    JournalDigest, JournalError, LeaseOwner, MAX_OPERATION_INPUT_BYTES, OperationJournal,
+    OperationKind, OperationStatus, RunnerLaunchError,
 };
 
 pub const UNSUPPORTED_OPERATION_ERROR_JSON: &str = r#"{"code":"OPERATION_EXECUTION_UNSUPPORTED"}"#;
@@ -75,6 +76,8 @@ pub enum RunnerError {
     EntropyUnavailable,
     #[error("operation runner service finalization failed")]
     Service(#[from] DepgraphServiceError),
+    #[error("operation runner daemon launch failed")]
+    DaemonLaunch(#[from] RunnerLaunchError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +131,7 @@ pub enum DeferredOperationCompletion {
     Scan(Box<DeferredScanCompletion>),
     RuntimeImport(Box<DeferredRuntimeImportCompletion>),
     ExportFile(Box<DeferredExportFileCompletion>),
+    Daemon(Box<DeferredDaemonCompletion>),
 }
 
 impl DeferredOperationCompletion {
@@ -144,6 +148,7 @@ impl DeferredOperationCompletion {
             Self::Scan(completion) => completion.promote().map(|_| ()).map_err(Into::into),
             Self::RuntimeImport(completion) => completion.promote().map(|_| ()).map_err(Into::into),
             Self::ExportFile(completion) => completion.promote().map_err(Into::into),
+            Self::Daemon(completion) => completion.promote(),
         }
     }
 
@@ -158,8 +163,202 @@ impl DeferredOperationCompletion {
                 .map(Some)
                 .map_err(Into::into),
             Self::ExportFile(completion) => completion.cancel().map(|()| None).map_err(Into::into),
+            Self::Daemon(completion) => completion.cancel().map(|()| None),
         }
     }
+}
+
+pub struct DeferredDaemonCompletion {
+    config: DepgraphServiceConfig,
+    action: DeferredDaemonAction,
+}
+
+#[cfg(test)]
+type TestDaemonStartPromoter =
+    Arc<dyn Fn(&DepgraphServiceConfig, bool) -> Result<(), RunnerError> + Send + Sync>;
+
+enum DeferredDaemonAction {
+    Start {
+        strict: bool,
+        launcher: Option<DaemonExecutableLauncher>,
+        #[cfg(test)]
+        promoter: Option<TestDaemonStartPromoter>,
+    },
+    Stop,
+}
+
+impl DeferredDaemonCompletion {
+    fn start(
+        config: DepgraphServiceConfig,
+        strict: bool,
+        launcher: Option<DaemonExecutableLauncher>,
+    ) -> Self {
+        Self {
+            config,
+            action: DeferredDaemonAction::Start {
+                strict,
+                launcher,
+                #[cfg(test)]
+                promoter: None,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn with_daemon_start_promoter_for_test(mut self, promoter: TestDaemonStartPromoter) -> Self {
+        let DeferredDaemonAction::Start {
+            promoter: configured,
+            ..
+        } = &mut self.action
+        else {
+            panic!("daemon start promoter can only be bound to start completion");
+        };
+        *configured = Some(promoter);
+        self
+    }
+
+    fn stop(config: DepgraphServiceConfig) -> Self {
+        Self {
+            config,
+            action: DeferredDaemonAction::Stop,
+        }
+    }
+
+    fn promote(self) -> Result<(), RunnerError> {
+        match self.action {
+            DeferredDaemonAction::Start {
+                strict,
+                launcher,
+                #[cfg(test)]
+                promoter,
+            } => {
+                #[cfg(test)]
+                if let Some(promoter) = promoter {
+                    return promoter(&self.config, strict);
+                }
+                promote_daemon_start(&self.config, strict, launcher)
+            }
+            DeferredDaemonAction::Stop => promote_daemon_stop(&self.config),
+        }
+    }
+
+    fn cancel(self) -> Result<(), RunnerError> {
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for DeferredDaemonCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredDaemonCompletion")
+            .field("action", &"closed")
+            .finish()
+    }
+}
+
+fn promote_daemon_start(
+    config: &DepgraphServiceConfig,
+    strict: bool,
+    launcher: Option<DaemonExecutableLauncher>,
+) -> Result<(), RunnerError> {
+    let service = DepgraphService::new(config.clone());
+    let cancellation = CancellationToken::new();
+    match service.daemon_running_cancellable(&cancellation) {
+        Ok(true) => return Ok(()),
+        Ok(false) | Err(DepgraphServiceError::NotFound) | Err(DepgraphServiceError::Conflict) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let launcher = launcher.ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?;
+    let startup = RunnerStartupConfig::new(config.clone())?;
+    let mut child = launcher.launch(&startup, strict)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut child_exit_observed_at = None;
+    loop {
+        let now = std::time::Instant::now();
+        let child_exited = child.has_exited()?;
+        match classify_daemon_start_poll(
+            service.daemon_running_cancellable(&cancellation),
+            child_exited,
+            &mut child_exit_observed_at,
+            now,
+            deadline,
+        ) {
+            DaemonStartPoll::Running => {
+                child.detach();
+                return Ok(());
+            }
+            DaemonStartPoll::Waiting => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            DaemonStartPoll::ChildExited => {
+                return Err(RunnerError::Service(DepgraphServiceError::Internal));
+            }
+            DaemonStartPoll::Exhausted => {
+                child.terminate_and_reap()?;
+                return Err(RunnerError::Service(
+                    DepgraphServiceError::ResourceExhausted,
+                ));
+            }
+            DaemonStartPoll::Failed(error) => {
+                child.terminate_and_reap()?;
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+const DAEMON_START_EXIT_GRACE: Duration = Duration::from_millis(750);
+
+#[derive(Debug)]
+enum DaemonStartPoll {
+    Running,
+    Waiting,
+    ChildExited,
+    Exhausted,
+    Failed(DepgraphServiceError),
+}
+
+fn classify_daemon_start_poll(
+    status: Result<bool, DepgraphServiceError>,
+    child_exited: bool,
+    child_exit_observed_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> DaemonStartPoll {
+    match status {
+        Ok(true) => DaemonStartPoll::Running,
+        Ok(false) | Err(DepgraphServiceError::NotFound) | Err(DepgraphServiceError::Conflict) => {
+            if child_exited {
+                let observed_at = child_exit_observed_at.get_or_insert(now);
+                if now.duration_since(*observed_at) >= DAEMON_START_EXIT_GRACE {
+                    return DaemonStartPoll::ChildExited;
+                }
+            }
+            if now < deadline {
+                DaemonStartPoll::Waiting
+            } else {
+                match status {
+                    Ok(false) | Err(DepgraphServiceError::NotFound) => DaemonStartPoll::Exhausted,
+                    Err(error) => DaemonStartPoll::Failed(error),
+                    Ok(true) => unreachable!("running status returned above"),
+                }
+            }
+        }
+        Err(error) => DaemonStartPoll::Failed(error),
+    }
+}
+
+fn promote_daemon_stop(config: &DepgraphServiceConfig) -> Result<(), RunnerError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| RunnerError::Service(DepgraphServiceError::Internal))?;
+    let service = DepgraphService::new(config.clone());
+    let cancellation = CancellationToken::new();
+    runtime
+        .block_on(service.recover_daemon_stop_completion_cancellable(&cancellation))
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1277,6 +1476,8 @@ pub struct ScanOperationDispatcher {
     config: DepgraphServiceConfig,
     #[cfg(test)]
     runtime_dispatch_barrier: Option<Arc<RuntimeDispatchBarrier>>,
+    #[cfg(test)]
+    daemon_start_promoter: Option<TestDaemonStartPromoter>,
 }
 
 #[cfg(test)]
@@ -1324,6 +1525,17 @@ struct ExportFileInput {
     #[serde(default)]
     destination_precondition: Option<RepositoryOutputPrecondition>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStartInput {
+    #[serde(default)]
+    strict: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStopInput {}
 
 impl RuntimeImportInput {
     fn retained_runtime_identity(&self) -> Result<Option<(String, String)>, ()> {
@@ -1394,6 +1606,8 @@ impl ScanOperationDispatcher {
             config,
             #[cfg(test)]
             runtime_dispatch_barrier: None,
+            #[cfg(test)]
+            daemon_start_promoter: None,
         }
     }
 
@@ -1408,6 +1622,49 @@ impl ScanOperationDispatcher {
             release: Mutex::new(release),
         }));
         self
+    }
+
+    #[cfg(test)]
+    fn with_daemon_start_promoter_for_test(mut self, promoter: TestDaemonStartPromoter) -> Self {
+        self.daemon_start_promoter = Some(promoter);
+        self
+    }
+
+    fn resolve_daemon_start_launcher(
+        &self,
+    ) -> Result<Option<DaemonExecutableLauncher>, RunnerLaunchError> {
+        #[cfg(test)]
+        if self.daemon_start_promoter.is_some() {
+            return Ok(None);
+        }
+        DaemonExecutableLauncher::resolve().map(Some)
+    }
+
+    fn daemon_start_completion(
+        &self,
+        strict: bool,
+        launcher: Option<DaemonExecutableLauncher>,
+    ) -> DeferredDaemonCompletion {
+        let completion = DeferredDaemonCompletion::start(self.config.clone(), strict, launcher);
+        #[cfg(test)]
+        if let Some(promoter) = &self.daemon_start_promoter {
+            return completion.with_daemon_start_promoter_for_test(Arc::clone(promoter));
+        }
+        completion
+    }
+
+    fn launcher_for_daemon_start(
+        &self,
+        service: &DepgraphService,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<DaemonExecutableLauncher>, RunnerError> {
+        match service.daemon_running_cancellable(cancellation) {
+            Ok(true) => Ok(None),
+            Ok(false) | Err(DepgraphServiceError::NotFound | DepgraphServiceError::Conflict) => {
+                Ok(self.resolve_daemon_start_launcher()?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn dispatch_scan(
@@ -1707,6 +1964,69 @@ impl ScanOperationDispatcher {
         }
     }
 
+    fn dispatch_daemon_start(
+        &self,
+        work: &RunnerWork,
+        control: &mut ExecutionControl<'_>,
+    ) -> DispatchOutcome {
+        let input = match serde_json::from_str::<DaemonStartInput>(work.input().as_str()) {
+            Ok(input) => input,
+            Err(_) => return self.failed(AgentErrorCode::InvalidArgument),
+        };
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        let service = DepgraphService::new(self.config.clone());
+        let launcher = match self.launcher_for_daemon_start(&service, control.cancellation_token())
+        {
+            Ok(launcher) => launcher,
+            Err(RunnerError::Service(error)) => return self.failed_service(&error),
+            Err(_) => return self.failed(AgentErrorCode::Internal),
+        };
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        match self.completed_daemon_output(AgentDaemonControlOutcome::running()) {
+            Ok(result) => DispatchOutcome::CompletionPending {
+                result,
+                completion: DeferredOperationCompletion::Daemon(Box::new(
+                    self.daemon_start_completion(input.strict, launcher),
+                )),
+            },
+            Err(error) => DispatchOutcome::Failed(error),
+        }
+    }
+
+    fn dispatch_daemon_stop(
+        &self,
+        work: &RunnerWork,
+        control: &mut ExecutionControl<'_>,
+    ) -> DispatchOutcome {
+        if serde_json::from_str::<DaemonStopInput>(work.input().as_str()).is_err() {
+            return self.failed(AgentErrorCode::InvalidArgument);
+        }
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        let service = DepgraphService::new(self.config.clone());
+        match service.daemon_running_cancellable(control.cancellation_token()) {
+            Ok(_) | Err(DepgraphServiceError::Conflict) => {}
+            Err(error) => return self.failed_service(&error),
+        }
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        match self.completed_daemon_output(AgentDaemonControlOutcome::stopped()) {
+            Ok(result) => DispatchOutcome::CompletionPending {
+                result,
+                completion: DeferredOperationCompletion::Daemon(Box::new(
+                    DeferredDaemonCompletion::stop(self.config.clone()),
+                )),
+            },
+            Err(error) => DispatchOutcome::Failed(error),
+        }
+    }
+
     fn completed_output(
         &self,
         result: &depgraph_core::service::ScanServiceOutcome,
@@ -1774,6 +2094,19 @@ impl ScanOperationDispatcher {
                 outcome,
             ))
             .expect("closed export output serializes"),
+        )
+        .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
+    }
+
+    fn completed_daemon_output(
+        &self,
+        outcome: AgentDaemonControlOutcome,
+    ) -> Result<CanonicalJson, CanonicalJson> {
+        let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(repository_id, None, outcome))
+                .expect("closed daemon control output serializes"),
         )
         .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
     }
@@ -1880,6 +2213,8 @@ impl OperationDispatcher for ScanOperationDispatcher {
             OperationKind::ScanSubmit => self.dispatch_scan(work, control),
             OperationKind::RuntimeTraceImportSubmit => self.dispatch_runtime_import(work, control),
             OperationKind::ExportFile => self.dispatch_export_file(work, control),
+            OperationKind::DaemonStartSubmit => self.dispatch_daemon_start(work, control),
+            OperationKind::DaemonStop => self.dispatch_daemon_stop(work, control),
             _ => UnsupportedOperationDispatcher.dispatch(work, control),
         }
     }
@@ -1888,6 +2223,53 @@ impl OperationDispatcher for ScanOperationDispatcher {
         &mut self,
         intent: &CompletionIntent,
     ) -> Result<CompletionRecovery, RunnerError> {
+        if matches!(
+            intent.kind(),
+            OperationKind::DaemonStartSubmit | OperationKind::DaemonStop
+        ) {
+            let envelope = serde_json::from_value::<SuccessEnvelope<AgentDaemonControlOutcome>>(
+                intent.result().value().clone(),
+            )
+            .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
+                .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+            if envelope.repository_id() != &repository_id
+                || envelope.snapshot_id().is_some()
+                || !envelope.result().is_valid()
+            {
+                return Err(RunnerError::Journal(JournalError::IntegrityFailure));
+            }
+            let completion = match intent.kind() {
+                OperationKind::DaemonStartSubmit => {
+                    let input = serde_json::from_str::<DaemonStartInput>(
+                        intent.normalized_input().as_str(),
+                    )
+                    .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+                    if envelope.result().action() != AgentDaemonControlAction::Start
+                        || envelope.result().phase() != AgentDaemonControlPhase::Running
+                    {
+                        return Err(RunnerError::Journal(JournalError::IntegrityFailure));
+                    }
+                    let service = DepgraphService::new(self.config.clone());
+                    let launcher =
+                        self.launcher_for_daemon_start(&service, &CancellationToken::new())?;
+                    self.daemon_start_completion(input.strict, launcher)
+                }
+                OperationKind::DaemonStop => {
+                    serde_json::from_str::<DaemonStopInput>(intent.normalized_input().as_str())
+                        .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+                    if envelope.result().action() != AgentDaemonControlAction::Stop
+                        || envelope.result().phase() != AgentDaemonControlPhase::Stopped
+                    {
+                        return Err(RunnerError::Journal(JournalError::IntegrityFailure));
+                    }
+                    DeferredDaemonCompletion::stop(self.config.clone())
+                }
+                _ => unreachable!("daemon recovery branch is closed"),
+            };
+            completion.promote()?;
+            return Ok(CompletionRecovery::Finalized);
+        }
         if intent.kind() == OperationKind::ExportFile {
             let input = serde_json::from_str::<ExportFileInput>(intent.normalized_input().as_str())
                 .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
@@ -2051,6 +2433,23 @@ impl OperationDispatcher for ScanOperationDispatcher {
         {
             return Ok(Some(false));
         }
+        if self
+            .config
+            .capabilities()
+            .contains(DepgraphCapability::DaemonControl)
+        {
+            match DepgraphService::new(self.config.clone())
+                .daemon_running_cancellable(&CancellationToken::new())
+            {
+                // A live daemon owns the store writer lock. Legacy scan
+                // reconciliation cannot make progress, but daemon stop/control
+                // claims must remain runnable under that ownership.
+                Ok(true) => return Ok(Some(false)),
+                Ok(false)
+                | Err(DepgraphServiceError::NotFound | DepgraphServiceError::Conflict) => {}
+                Err(error) => return Err(RunnerError::Service(error)),
+            }
+        }
         match DepgraphService::new(self.config.clone()).reconcile_legacy_scan_operation_staging() {
             Ok(more_work) => Ok(Some(more_work)),
             Err(DepgraphServiceError::StoreWriterConflict) => Ok(None),
@@ -2120,9 +2519,9 @@ fn system_now_ms() -> Result<i64, RunnerError> {
 mod tests {
     use std::{
         cell::Cell,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
-            Arc,
+            Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -2135,7 +2534,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{CapabilitySet, OperationOutcome, SubmitRequest, TERMINAL_RETENTION_MS};
+    use crate::{
+        CapabilitySet, OperationManager, OperationOutcome, SubmitRequest, TERMINAL_RETENTION_MS,
+    };
 
     const NOW: i64 = 1_800_000_000_000;
 
@@ -2153,6 +2554,111 @@ mod tests {
             DepgraphServiceLimits::default(),
         )
         .unwrap()
+    }
+
+    fn daemon_config(root: &Path) -> DepgraphServiceConfig {
+        let repository = root.join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        DepgraphServiceConfig::new(
+            repository,
+            root.join("graph.sqlite"),
+            DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::StoreWrite,
+                DepgraphCapability::DaemonControl,
+            ])
+            .unwrap(),
+            DepgraphServiceLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn write_stale_running_daemon_status(config: &DepgraphServiceConfig) {
+        let mut status_path = config.store_path().as_os_str().to_os_string();
+        status_path.push(".daemon-status.json");
+        std::fs::write(
+            PathBuf::from(status_path),
+            serde_json::to_vec(&json!({
+                "schema_version": depgraph_core::DAEMON_STATUS_SCHEMA_VERSION,
+                "root": config.canonical_root(),
+                "phase": "idle",
+                "started_at": "2026-08-11T00:00:00.000Z",
+                "stopped_at": null,
+                "debounce_milliseconds": 250,
+                "pending_change_count": 0,
+                "active_attempt_id": null,
+                "last_completed_attempt": null,
+                "last_failed_attempt": null,
+                "last_cancelled_attempt": null,
+                "last_watcher_error": null,
+                "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn daemon_start_result(config: &DepgraphServiceConfig) -> CanonicalJson {
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(
+                repository_id,
+                None,
+                AgentDaemonControlOutcome::running(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn daemon_stop_result(config: &DepgraphServiceConfig) -> CanonicalJson {
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(
+                repository_id,
+                None,
+                AgentDaemonControlOutcome::stopped(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_daemon_start_fails_closed_when_child_exits_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let launcher =
+            DaemonExecutableLauncher::for_test_executable(Path::new("/usr/bin/false")).unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(matches!(
+            promote_daemon_start(&config, false, Some(launcher)),
+            Err(RunnerError::Service(DepgraphServiceError::Internal))
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "early daemon exit must not consume the 30-second publication timeout"
+        );
+    }
+
+    fn counting_daemon_dispatcher(
+        config: DepgraphServiceConfig,
+        expected_strict: bool,
+        launches: Arc<AtomicUsize>,
+    ) -> ScanOperationDispatcher {
+        let expected_root = config.canonical_root().to_path_buf();
+        let expected_store = config.store_path().to_path_buf();
+        ScanOperationDispatcher::new(config).with_daemon_start_promoter_for_test(Arc::new(
+            move |observed, strict| {
+                assert_eq!(observed.canonical_root(), expected_root);
+                assert_eq!(observed.store_path(), expected_store);
+                assert_eq!(strict, expected_strict);
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
     }
 
     #[test]
@@ -2501,6 +3007,414 @@ mod tests {
             control.checkpoint().unwrap(),
             ExecutionCheckpoint::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn issue_315_restarted_runner_recovers_daemon_start_completion_intent_once() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let deadline_ms = submitted_at_ms + 60_000;
+        let mut journal = OperationJournal::open(&config).unwrap();
+        let operation_id = journal
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStartSubmit,
+                    &json!({"strict": true}),
+                    b"issue-315-daemon-completion-recovery",
+                    deadline_ms,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        let crashed_lease = b"issue-315-crashed-daemon-lease";
+        journal
+            .acquire_lease(
+                &repository,
+                &operation_id,
+                &LeaseOwner::parse("issue-315-crashed-daemon-owner").unwrap(),
+                crashed_lease,
+                submitted_at_ms + 1,
+                deadline_ms,
+            )
+            .unwrap();
+        let expected_result = daemon_start_result(&config);
+        assert_eq!(
+            journal
+                .commit_completion_intent(
+                    &repository,
+                    &operation_id,
+                    crashed_lease,
+                    expected_result.clone(),
+                    submitted_at_ms + 2,
+                )
+                .unwrap(),
+            CompletionDecision::Committed
+        );
+        drop(journal);
+        write_stale_running_daemon_status(&config);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let recovered = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), true, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+
+        assert_eq!(recovered.claimed(), 0);
+        assert_eq!(recovered.completed(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let journal = OperationJournal::open(&config).unwrap();
+        assert_eq!(
+            journal
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Completed(expected_result)
+        );
+        assert!(
+            journal
+                .next_completion_intent(&repository, system_now_ms().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(journal);
+
+        let settled_replay = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config, true, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+        assert_eq!(settled_replay, RunnerReport::default());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn issue_315_restarted_runner_repairs_and_finalizes_daemon_stop_intent_once() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let deadline_ms = submitted_at_ms + 60_000;
+        let mut journal = OperationJournal::open(&config).unwrap();
+        let operation_id = journal
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStop,
+                    &json!({}),
+                    b"issue-315-daemon-stop-completion-recovery",
+                    deadline_ms,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        let crashed_lease = b"issue-315-crashed-daemon-stop-lease";
+        journal
+            .acquire_lease(
+                &repository,
+                &operation_id,
+                &LeaseOwner::parse("issue-315-crashed-daemon-stop-owner").unwrap(),
+                crashed_lease,
+                submitted_at_ms + 1,
+                deadline_ms,
+            )
+            .unwrap();
+        let expected_result = daemon_stop_result(&config);
+        assert_eq!(
+            journal
+                .commit_completion_intent(
+                    &repository,
+                    &operation_id,
+                    crashed_lease,
+                    expected_result.clone(),
+                    submitted_at_ms + 2,
+                )
+                .unwrap(),
+            CompletionDecision::Committed
+        );
+        drop(journal);
+        write_stale_running_daemon_status(&config);
+        let mut stop_path = config.store_path().as_os_str().to_os_string();
+        stop_path.push(".daemon-stop");
+        std::fs::write(PathBuf::from(&stop_path), b"stop\n").unwrap();
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let recovered = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+
+        assert_eq!(recovered.claimed(), 0);
+        assert_eq!(recovered.completed(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let journal = OperationJournal::open(&config).unwrap();
+        assert_eq!(
+            journal
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Completed(expected_result)
+        );
+        assert!(
+            journal
+                .next_completion_intent(&repository, system_now_ms().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(journal);
+        assert!(!PathBuf::from(stop_path).exists());
+        let mut status_path = config.store_path().as_os_str().to_os_string();
+        status_path.push(".daemon-status.json");
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(PathBuf::from(status_path)).unwrap()).unwrap();
+        assert_eq!(status["phase"], "stopped");
+
+        let settled_replay = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config, false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+        assert_eq!(settled_replay, RunnerReport::default());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn issue_315_daemon_stop_submission_repairs_stale_unlocked_status() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let operation_id = manager
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStop,
+                    &json!({}),
+                    b"issue-315-stale-daemon-stop-submission",
+                    submitted_at_ms + 60_000,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        drop(manager);
+        write_stale_running_daemon_status(&config);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let report = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            OperationJournal::open(&config)
+                .unwrap()
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Completed(_)
+        ));
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("graph.sqlite.daemon-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["phase"], "stopped");
+    }
+
+    #[test]
+    fn issue_315_daemon_cancellation_before_completion_decision_never_launches_and_settles() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let operation_id = manager
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStartSubmit,
+                    &json!({"strict": false}),
+                    b"issue-315-cancel-before-daemon-launch",
+                    submitted_at_ms + 60_000,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        drop(manager);
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let (decision_ready, wait_for_decision) = mpsc::sync_channel(0);
+        let (release_decision, decision_release) = mpsc::sync_channel(0);
+        let runner = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), false, Arc::clone(&launches)),
+        )
+        .with_completion_decision_barrier_for_test(decision_ready, decision_release);
+        let runner_thread = std::thread::spawn(move || runner.run_until_idle());
+
+        wait_for_decision
+            .recv_timeout(Duration::from_secs(5))
+            .expect("daemon completion reaches the durable decision boundary");
+        let mut manager = OperationManager::open(&config).unwrap();
+        manager
+            .cancel(&operation_id, system_now_ms().unwrap())
+            .unwrap();
+        release_decision.send(()).unwrap();
+
+        let report = runner_thread.join().unwrap().unwrap();
+        assert_eq!(report.completed(), 0);
+        assert_eq!(report.cancelled(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            OperationJournal::open(&config)
+                .unwrap()
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Cancelled
+        );
+        assert!(!root.path().join("graph.sqlite.daemon-status.json").exists());
+        assert!(!root.path().join("graph.sqlite.daemon-lock").exists());
+    }
+
+    #[test]
+    fn issue_315_competing_start_exit_waits_for_winner_status() {
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        let mut exit_observed_at = None;
+
+        assert!(matches!(
+            classify_daemon_start_poll(Ok(false), true, &mut exit_observed_at, started, deadline,),
+            DaemonStartPoll::Waiting
+        ));
+        assert_eq!(exit_observed_at, Some(started));
+        assert!(matches!(
+            classify_daemon_start_poll(
+                Ok(true),
+                true,
+                &mut exit_observed_at,
+                started + DAEMON_START_EXIT_GRACE,
+                deadline,
+            ),
+            DaemonStartPoll::Running
+        ));
+        assert!(matches!(
+            classify_daemon_start_poll(
+                Ok(false),
+                true,
+                &mut exit_observed_at,
+                started + DAEMON_START_EXIT_GRACE,
+                deadline,
+            ),
+            DaemonStartPoll::ChildExited
+        ));
+    }
+
+    #[test]
+    fn issue_315_concurrent_daemon_requests_have_one_owner_one_launch_and_closed_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        OperationJournal::open(&config).unwrap();
+        let submit_barrier = Arc::new(Barrier::new(3));
+        let mut submitters = Vec::new();
+        for _ in 0..2 {
+            let config = config.clone();
+            let barrier = Arc::clone(&submit_barrier);
+            submitters.push(std::thread::spawn(move || {
+                barrier.wait();
+                OperationManager::open(&config)
+                    .unwrap()
+                    .submit(
+                        &SubmitRequest::new(
+                            &config,
+                            OperationKind::DaemonStartSubmit,
+                            &json!({"strict": false}),
+                            b"issue-315-simultaneous-daemon-start",
+                            submitted_at_ms + 60_000,
+                        )
+                        .unwrap(),
+                        submitted_at_ms,
+                    )
+                    .unwrap()
+            }));
+        }
+        submit_barrier.wait();
+        let handles = submitters
+            .into_iter()
+            .map(|submitter| submitter.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(handles.iter().filter(|handle| handle.created()).count(), 1);
+        assert_eq!(handles[0].operation_id(), handles[1].operation_id());
+        let operation_id = handles[0].operation_id().clone();
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let runner_barrier = Arc::new(Barrier::new(3));
+        let mut runners = Vec::new();
+        for _ in 0..2 {
+            let config = config.clone();
+            let launches = Arc::clone(&launches);
+            let barrier = Arc::clone(&runner_barrier);
+            runners.push(std::thread::spawn(move || {
+                let runner = OperationRunner::new(
+                    RunnerStartupConfig::new(config.clone()).unwrap(),
+                    counting_daemon_dispatcher(config, false, launches),
+                );
+                barrier.wait();
+                runner.run_until_idle().unwrap()
+            }));
+        }
+        runner_barrier.wait();
+        let reports = runners
+            .into_iter()
+            .map(|runner| runner.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reports.iter().map(|report| report.claimed()).sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            reports.iter().map(|report| report.completed()).sum::<u64>(),
+            1
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        match OperationJournal::open(&config)
+            .unwrap()
+            .result(&repository, &operation_id, system_now_ms().unwrap())
+            .unwrap()
+        {
+            OperationOutcome::Completed(result) => {
+                assert_eq!(result, daemon_start_result(&config));
+                assert_eq!(
+                    result.value()["result"],
+                    json!({"action":"start", "phase":"running"})
+                );
+            }
+            other => panic!("concurrent daemon request did not settle closed: {other:?}"),
+        }
     }
 
     struct BlockingDispatcher {

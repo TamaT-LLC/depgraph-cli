@@ -13,6 +13,7 @@ use crate::RunnerStartupConfig;
 
 pub const OPERATION_RUNNER_STARTUP_CONTRACT: &str = "depgraph-operation-runner-v1";
 const RUNNER_BASENAME: &str = "depgraph-operation-runner";
+const CORE_BASENAME: &str = "depgraph";
 const MAX_VERIFIED_RELEASE_RUNNER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_VERIFIED_DEVELOPMENT_RUNNER_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RELEASE_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -29,6 +30,8 @@ pub enum RunnerLaunchError {
     Resolution,
     #[error("operation runner release verification failed")]
     ReleaseVerification,
+    #[error("operation runner environment policy failed")]
+    EnvironmentPolicy,
     #[error("operation runner launch failed")]
     Launch(#[source] std::io::Error),
 }
@@ -50,6 +53,12 @@ impl std::fmt::Debug for VerifiedRunnerExecutable {
 
 #[derive(Clone, Debug)]
 pub struct OperationRunnerLauncher {
+    executable: VerifiedRunnerExecutable,
+    policy: RunnerResolutionPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct DaemonExecutableLauncher {
     executable: VerifiedRunnerExecutable,
     policy: RunnerResolutionPolicy,
 }
@@ -93,6 +102,7 @@ impl OperationRunnerLauncher {
                 .arg("--capability")
                 .arg(capability_argument(capability));
         }
+        copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
         configure_detached_process(&mut command);
         let mut child = command.spawn().map_err(RunnerLaunchError::Launch)?;
         let process_id = child.id();
@@ -104,6 +114,56 @@ impl OperationRunnerLauncher {
                 let _ = child.wait();
             });
         Ok(LaunchedOperationRunner { process_id })
+    }
+}
+
+impl DaemonExecutableLauncher {
+    #[cfg(test)]
+    pub(crate) fn for_test_executable(path: &Path) -> Result<Self, RunnerLaunchError> {
+        let executable =
+            verify_runner_file(path, None).map_err(|_| RunnerLaunchError::Resolution)?;
+        Ok(Self {
+            executable,
+            policy: RunnerResolutionPolicy::DevelopmentSibling,
+        })
+    }
+
+    pub fn resolve() -> Result<Self, RunnerLaunchError> {
+        let current = std::env::current_exe().map_err(RunnerLaunchError::Launch)?;
+        resolve_daemon_for_executable(&current)
+    }
+
+    pub fn launch(
+        &self,
+        startup: &RunnerStartupConfig,
+        strict: bool,
+    ) -> Result<LaunchedDaemonProcess, RunnerLaunchError> {
+        self.executable.revalidate(self.policy)?;
+        let mut command = Command::new(&self.executable.path);
+        command
+            .arg("--store")
+            .arg(startup.service_config().store_path())
+            .arg("daemon")
+            .arg("start")
+            .arg(startup.service_config().canonical_root())
+            .arg("--json")
+            .current_dir(
+                self.executable
+                    .path
+                    .parent()
+                    .ok_or(RunnerLaunchError::Resolution)?,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_clear();
+        if strict {
+            command.arg("--strict");
+        }
+        copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
+        configure_detached_process(&mut command);
+        let child = command.spawn().map_err(RunnerLaunchError::Launch)?;
+        Ok(LaunchedDaemonProcess { child: Some(child) })
     }
 }
 
@@ -125,6 +185,72 @@ impl VerifiedRunnerExecutable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LaunchedOperationRunner {
     process_id: u32,
+}
+
+pub struct LaunchedDaemonProcess {
+    child: Option<std::process::Child>,
+}
+
+impl std::fmt::Debug for LaunchedDaemonProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchedDaemonProcess")
+            .field("state", &"owned")
+            .finish()
+    }
+}
+
+impl LaunchedDaemonProcess {
+    /// Observe an early child exit without exposing its status or launch
+    /// details. Once reaped, clear ownership so Drop cannot signal a reused
+    /// process identifier.
+    pub fn has_exited(&mut self) -> Result<bool, RunnerLaunchError> {
+        let Some(child) = &mut self.child else {
+            return Ok(true);
+        };
+        if child
+            .try_wait()
+            .map_err(RunnerLaunchError::Launch)?
+            .is_some()
+        {
+            self.child = None;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Transfer ownership to a bounded reaper after running publication has
+    /// made the daemon independently recoverable through status/control files.
+    pub fn detach(mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("depgraph-daemon-reaper".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+
+    /// Stop the entire launched process group and reap the direct child while
+    /// it is still owned by the operation promotion.
+    pub fn terminate_and_reap(mut self) -> Result<(), RunnerLaunchError> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        terminate_process_tree(&mut child);
+        child.wait().map_err(RunnerLaunchError::Launch)?;
+        Ok(())
+    }
+}
+
+impl Drop for LaunchedDaemonProcess {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            terminate_process_tree(child);
+            let _ = child.wait();
+        }
+    }
 }
 
 impl LaunchedOperationRunner {
@@ -160,6 +286,30 @@ fn resolve_for_executable(
     })
 }
 
+fn resolve_daemon_for_executable(
+    current_executable: &Path,
+) -> Result<DaemonExecutableLauncher, RunnerLaunchError> {
+    let current_executable = current_executable
+        .canonicalize()
+        .map_err(|_| RunnerLaunchError::Resolution)?;
+    let executable_dir = current_executable
+        .parent()
+        .ok_or(RunnerLaunchError::Resolution)?;
+    if let Some(manifest) = release_manifest_path(executable_dir) {
+        return Ok(DaemonExecutableLauncher {
+            executable: verified_release_core(&manifest)?,
+            policy: RunnerResolutionPolicy::ReleaseManifest,
+        });
+    }
+    if looks_like_packaged_layout(executable_dir) {
+        return Err(RunnerLaunchError::ReleaseVerification);
+    }
+    Ok(DaemonExecutableLauncher {
+        executable: development_executable(executable_dir, CORE_BASENAME)?,
+        policy: RunnerResolutionPolicy::DevelopmentSibling,
+    })
+}
+
 fn release_manifest_path(executable_dir: &Path) -> Option<PathBuf> {
     [
         executable_dir.join("release-manifest.json"),
@@ -177,7 +327,14 @@ fn looks_like_packaged_layout(executable_dir: &Path) -> bool {
 #[derive(Deserialize)]
 struct ReleaseManifestProjection {
     release_version: String,
+    core: ReleaseCoreArtifact,
     operation_runner: ReleaseRunnerArtifact,
+}
+
+#[derive(Deserialize)]
+struct ReleaseCoreArtifact {
+    path: String,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -233,10 +390,73 @@ fn verified_release_runner(
         .map_err(|_| RunnerLaunchError::ReleaseVerification)
 }
 
+fn verified_release_core(
+    manifest_path: &Path,
+) -> Result<VerifiedRunnerExecutable, RunnerLaunchError> {
+    let (release_root, manifest) = read_release_manifest(manifest_path)?;
+    let expected_path = format!("bin/{}", executable_name(CORE_BASENAME));
+    if manifest.release_version != env!("CARGO_PKG_VERSION")
+        || manifest.core.path != expected_path
+        || !valid_release_digest(&manifest.core.sha256)
+    {
+        return Err(RunnerLaunchError::ReleaseVerification);
+    }
+    reject_symlink_components(&release_root, &manifest.core.path)?;
+    verify_runner_file(
+        &release_root.join(&manifest.core.path),
+        Some(&manifest.core.sha256),
+    )
+    .map_err(|_| RunnerLaunchError::ReleaseVerification)
+}
+
+fn read_release_manifest(
+    manifest_path: &Path,
+) -> Result<(PathBuf, ReleaseManifestProjection), RunnerLaunchError> {
+    let metadata = std::fs::symlink_metadata(manifest_path)
+        .map_err(|_| RunnerLaunchError::ReleaseVerification)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_RELEASE_MANIFEST_BYTES
+    {
+        return Err(RunnerLaunchError::ReleaseVerification);
+    }
+    let release_root = manifest_path
+        .parent()
+        .ok_or(RunnerLaunchError::ReleaseVerification)?;
+    let root_metadata = std::fs::symlink_metadata(release_root)
+        .map_err(|_| RunnerLaunchError::ReleaseVerification)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(RunnerLaunchError::ReleaseVerification);
+    }
+    let release_root = release_root
+        .canonicalize()
+        .map_err(|_| RunnerLaunchError::ReleaseVerification)?;
+    let manifest = serde_json::from_slice(
+        &std::fs::read(manifest_path).map_err(|_| RunnerLaunchError::ReleaseVerification)?,
+    )
+    .map_err(|_| RunnerLaunchError::ReleaseVerification)?;
+    Ok((release_root, manifest))
+}
+
+fn valid_release_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn development_runner(
     executable_dir: &Path,
 ) -> Result<VerifiedRunnerExecutable, RunnerLaunchError> {
-    let file_name = executable_name(RUNNER_BASENAME);
+    development_executable(executable_dir, RUNNER_BASENAME)
+}
+
+fn development_executable(
+    executable_dir: &Path,
+    basename: &str,
+) -> Result<VerifiedRunnerExecutable, RunnerLaunchError> {
+    let file_name = executable_name(basename);
     let mut candidates = vec![executable_dir.join(&file_name)];
     if executable_dir
         .file_name()
@@ -249,6 +469,36 @@ fn development_runner(
         .into_iter()
         .find_map(|candidate| verify_runner_file(&candidate, None).ok())
         .ok_or(RunnerLaunchError::Resolution)
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let process_group = i32::try_from(child.id()).ok().and_then(i32::checked_neg);
+    if let Some(process_group) = process_group {
+        // The child was launched as a fresh process group. SIGINT follows the
+        // foreground CLI's normal graceful shutdown path.
+        unsafe {
+            libc::kill(process_group, libc::SIGINT);
+        }
+    }
+    for _ in 0..100 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    } else {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn verify_runner_file(
@@ -319,6 +569,99 @@ fn reject_symlink_components(release_root: &Path, declared: &str) -> Result<(), 
     Ok(())
 }
 
+fn copy_safe_daemon_environment(
+    command: &mut Command,
+    root: &Path,
+) -> Result<(), RunnerLaunchError> {
+    let current_directory = std::env::current_dir().map_err(RunnerLaunchError::Launch)?;
+    copy_safe_daemon_environment_with(command, root, &current_directory, |key| {
+        std::env::var_os(key)
+    })
+}
+
+fn copy_safe_daemon_environment_with(
+    command: &mut Command,
+    root: &Path,
+    current_directory: &Path,
+    mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), RunnerLaunchError> {
+    let raw_path = environment("PATH").ok_or(RunnerLaunchError::EnvironmentPolicy)?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut safe_paths = Vec::new();
+    for path in std::env::split_paths(&raw_path) {
+        if !path.is_absolute() {
+            continue;
+        }
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        if !path.is_dir() || path.starts_with(&canonical_root) || safe_paths.contains(&path) {
+            continue;
+        }
+        safe_paths.push(path);
+    }
+    if safe_paths.is_empty() {
+        return Err(RunnerLaunchError::EnvironmentPolicy);
+    }
+    let safe_path =
+        std::env::join_paths(safe_paths).map_err(|_| RunnerLaunchError::EnvironmentPolicy)?;
+    command.env("PATH", safe_path);
+
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SystemRoot",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOROOT",
+        "GOPATH",
+        "GOMODCACHE",
+    ] {
+        let Some(value) = environment(key) else {
+            continue;
+        };
+        let path = PathBuf::from(&value);
+        if path.is_absolute()
+            && path
+                .canonicalize()
+                .is_ok_and(|canonical| !canonical.starts_with(&canonical_root))
+        {
+            command.env(key, value);
+        }
+    }
+    for key in [
+        "DEPGRAPH_RUST_WORKER",
+        "DEPGRAPH_GO_WORKER",
+        "DEPGRAPH_WEB_WORKER",
+    ] {
+        let Some(value) = environment(key) else {
+            continue;
+        };
+        let path = PathBuf::from(value);
+        let candidate = if path.is_absolute() {
+            path
+        } else {
+            current_directory.join(path)
+        };
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|_| RunnerLaunchError::EnvironmentPolicy)?;
+        if !canonical.is_file() || canonical.starts_with(&canonical_root) {
+            return Err(RunnerLaunchError::EnvironmentPolicy);
+        }
+        command.env(key, canonical);
+    }
+    for key in ["LANG", "LC_ALL"] {
+        if let Some(value) = environment(key) {
+            command.env(key, value);
+        }
+    }
+    Ok(())
+}
+
 const fn capability_argument(capability: DepgraphCapability) -> &'static str {
     match capability {
         DepgraphCapability::Read => "read",
@@ -377,6 +720,7 @@ fn executable_name(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use depgraph_core::{DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits};
 
     fn write_test_executable(path: &Path) {
         std::fs::write(path, b"test runner fixture").unwrap();
@@ -426,6 +770,10 @@ mod tests {
         write_test_executable(&runner);
         let manifest = serde_json::json!({
             "release_version": env!("CARGO_PKG_VERSION"),
+            "core": {
+                "path": format!("bin/{}", executable_name(CORE_BASENAME)),
+                "sha256": sha256(&current),
+            },
             "operation_runner": {
                 "version": env!("CARGO_PKG_VERSION"),
                 "path": format!("libexec/{}", executable_name(RUNNER_BASENAME)),
@@ -477,5 +825,253 @@ mod tests {
             resolve_for_executable(&current),
             Err(RunnerLaunchError::Resolution)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_daemon_process_reports_early_exit_without_waiting() {
+        let child = Command::new("/usr/bin/false").spawn().unwrap();
+        let mut process = LaunchedDaemonProcess { child: Some(child) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if process.has_exited().unwrap() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited daemon child was not observed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_daemon_environment_preserves_only_explicit_worker_overrides() {
+        use std::collections::BTreeMap;
+        use std::ffi::{OsStr, OsString};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let safe_bin = temporary.path().join("safe-bin");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&safe_bin).unwrap();
+        let rust_worker = temporary.path().join("rust-worker");
+        let go_worker = temporary.path().join("go-worker");
+        let web_worker = temporary.path().join("web-worker");
+        for worker in [&rust_worker, &go_worker, &web_worker] {
+            write_test_executable(worker);
+        }
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), safe_bin.into_os_string()),
+            (
+                OsString::from("DEPGRAPH_RUST_WORKER"),
+                OsString::from("rust-worker"),
+            ),
+            (
+                OsString::from("DEPGRAPH_GO_WORKER"),
+                go_worker.into_os_string(),
+            ),
+            (
+                OsString::from("DEPGRAPH_WEB_WORKER"),
+                web_worker.into_os_string(),
+            ),
+            (
+                OsString::from("DEPGRAPH_SECRET"),
+                OsString::from("must-not-cross-boundary"),
+            ),
+        ]);
+        let mut command = Command::new("/usr/bin/true");
+        command.env_clear();
+
+        copy_safe_daemon_environment_with(&mut command, &repository, temporary.path(), |key| {
+            environment.get(OsStr::new(key)).cloned()
+        })
+        .unwrap();
+
+        let copied = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.unwrap().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        for key in [
+            "DEPGRAPH_RUST_WORKER",
+            "DEPGRAPH_GO_WORKER",
+            "DEPGRAPH_WEB_WORKER",
+        ] {
+            assert!(copied.contains_key(OsStr::new(key)));
+        }
+        assert_eq!(
+            copied.get(OsStr::new("DEPGRAPH_RUST_WORKER")),
+            Some(&rust_worker.canonicalize().unwrap().into_os_string())
+        );
+        assert!(!copied.contains_key(OsStr::new("DEPGRAPH_SECRET")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_invalid_worker_override_fails_closed_at_daemon_boundary() {
+        use std::collections::BTreeMap;
+        use std::ffi::{OsStr, OsString};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let safe_bin = temporary.path().join("safe-bin");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&safe_bin).unwrap();
+        write_test_executable(&repository.join("project-worker"));
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), safe_bin.into_os_string()),
+            (
+                OsString::from("DEPGRAPH_RUST_WORKER"),
+                OsString::from("repository/project-worker"),
+            ),
+        ]);
+        let mut command = Command::new("/usr/bin/true");
+        command.env_clear();
+
+        assert!(matches!(
+            copy_safe_daemon_environment_with(&mut command, &repository, temporary.path(), |key| {
+                environment.get(OsStr::new(key)).cloned()
+            },),
+            Err(RunnerLaunchError::EnvironmentPolicy)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_315_daemon_launcher_spawns_exact_absolute_program_argv_and_allowlisted_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root
+            .path()
+            .join("repository; touch depgraph-shell-parsed; #");
+        std::fs::create_dir(&repository).unwrap();
+        let store = root.path().join("graph store.sqlite");
+        let config = DepgraphServiceConfig::new(
+            repository,
+            store,
+            DepgraphCapabilitySet::try_new([
+                DepgraphCapability::Read,
+                DepgraphCapability::StoreWrite,
+                DepgraphCapability::DaemonControl,
+            ])
+            .unwrap(),
+            DepgraphServiceLimits::default(),
+        )
+        .unwrap();
+        let startup = RunnerStartupConfig::new(config.clone()).unwrap();
+        let capture = root.path().join("daemon-launch.txt");
+        let fake = root
+            .path()
+            .join("daemon executable; touch executable-shell-parsed; #");
+        let capture_literal = serde_json::to_string(capture.to_str().unwrap()).unwrap();
+        let source = root.path().join("fake-daemon.c");
+        std::fs::write(
+            &source,
+            format!(
+                r#"#include <stdio.h>
+#include <unistd.h>
+
+extern char **environ;
+
+int main(int argc, char **argv) {{
+    FILE *output = fopen({capture_literal}, "w");
+    if (output == NULL) return 2;
+    fprintf(output, "argc=%d\n", argc);
+    for (int index = 0; index < argc; index++) fprintf(output, "arg=%s\n", argv[index]);
+    for (char **entry = environ; *entry != NULL; entry++) fprintf(output, "env=%s\n", *entry);
+    char cwd[4096];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) return 3;
+    fprintf(output, "cwd=%s\n", cwd);
+    return fclose(output) == 0 ? 0 : 4;
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let compiler = if cfg!(target_os = "macos") {
+            "/usr/bin/clang"
+        } else {
+            "/usr/bin/cc"
+        };
+        let compiled = Command::new(compiler)
+            .arg(&source)
+            .arg("-o")
+            .arg(&fake)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "native fake compiler failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let executable = verify_runner_file(&fake, None).unwrap();
+        let exact_executable = executable.path.clone();
+        assert!(exact_executable.is_absolute());
+        let launcher = DaemonExecutableLauncher {
+            executable,
+            policy: RunnerResolutionPolicy::DevelopmentSibling,
+        };
+
+        let process = launcher.launch(&startup, true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !capture.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            capture.is_file(),
+            "fake daemon did not record its invocation"
+        );
+        process.terminate_and_reap().unwrap();
+
+        let observed = std::fs::read_to_string(&capture).unwrap();
+        let expected = [
+            "argc=8".to_owned(),
+            format!("arg={}", exact_executable.display()),
+            "arg=--store".to_owned(),
+            format!("arg={}", config.store_path().display()),
+            "arg=daemon".to_owned(),
+            "arg=start".to_owned(),
+            format!("arg={}", config.canonical_root().display()),
+            "arg=--json".to_owned(),
+            "arg=--strict".to_owned(),
+            format!("cwd={}", exact_executable.parent().unwrap().display()),
+        ]
+        .join("\n")
+            + "\n";
+        let observed_arguments = observed
+            .lines()
+            .filter(|line| !line.starts_with("env="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(observed_arguments, expected);
+        let observed_environment = observed
+            .lines()
+            .filter_map(|line| line.strip_prefix("env="))
+            .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+            .collect::<Vec<_>>();
+        assert!(observed_environment.contains(&"PATH"));
+        assert!(observed_environment.iter().all(|key| matches!(
+            *key,
+            "PATH"
+                | "HOME"
+                | "USERPROFILE"
+                | "TMPDIR"
+                | "TEMP"
+                | "TMP"
+                | "SystemRoot"
+                | "CARGO_HOME"
+                | "RUSTUP_HOME"
+                | "GOROOT"
+                | "GOPATH"
+                | "GOMODCACHE"
+                | "LANG"
+                | "LC_ALL"
+                | "DEPGRAPH_RUST_WORKER"
+                | "DEPGRAPH_GO_WORKER"
+                | "DEPGRAPH_WEB_WORKER"
+        )));
+        assert!(!root.path().join("depgraph-shell-parsed").exists());
+        assert!(!root.path().join("executable-shell-parsed").exists());
     }
 }

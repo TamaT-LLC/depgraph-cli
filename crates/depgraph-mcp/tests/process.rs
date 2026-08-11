@@ -14,7 +14,7 @@ use depgraph_core::{
     compiler_pack_host_target, read_compiler_pack_requirement, verify_compiler_pack,
 };
 use depgraph_mcp_tools::{
-    AgentDaemonStatus, AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation,
+    AgentDaemonControlOutcome, AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation,
     ErrorEnvelope, LogicalRepositoryId, SuccessEnvelope,
 };
 use depgraph_operation::{
@@ -1265,20 +1265,8 @@ fn downgrade_issue_313_store_to_v15(path: &Path) {
     assert!(Store::open_read_only(path).is_err());
 }
 
-fn issue_310_daemon_status() -> AgentDaemonStatus {
-    serde_json::from_value(json!({
-        "schema_version": "depgraph-daemon-v1",
-        "phase": "stopped",
-        "started_at": "2026-08-08T00:00:00.000Z",
-        "stopped_at": "2026-08-08T00:00:01.000Z",
-        "debounce_milliseconds": 0,
-        "pending_change_count": 0,
-        "recovered_attempts": {
-            "scan_attempt_ids": [],
-            "build_attempt_ids": []
-        }
-    }))
-    .unwrap()
+fn issue_315_daemon_stop_outcome() -> AgentDaemonControlOutcome {
+    AgentDaemonControlOutcome::stopped()
 }
 
 fn seed_issue_300_bulk_rows(store_path: &Path, root: &Path) -> String {
@@ -3665,7 +3653,8 @@ fn issue_311_tasks_reconnect_result_idempotency_and_authorized_cancel_conform() 
             submitted_at_ms + 60_000,
         )
         .unwrap();
-    let envelope = SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+    let envelope =
+        SuccessEnvelope::new(repository_id.clone(), None, issue_315_daemon_stop_outcome());
     journal
         .complete(
             &repository_id,
@@ -4836,6 +4825,262 @@ fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
 }
 
 #[test]
+fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
+    struct DaemonCleanup {
+        root: PathBuf,
+        store: PathBuf,
+        armed: bool,
+    }
+
+    impl Drop for DaemonCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+            let mut child = Command::new(binary.get_program())
+                .args(binary.get_args())
+                .args([
+                    "--store",
+                    self.store.to_str().unwrap(),
+                    "daemon",
+                    "stop",
+                    self.root.to_str().unwrap(),
+                    "--json",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            if child
+                .wait_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_none()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn task_until_terminal(root: &Path, store: &Path, task_id: &str, request_id: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut mcp = InteractiveMcp::start_with_capabilities(
+                root,
+                store,
+                &["store-write", "daemon-control"],
+            );
+            initialize_tasks_mcp(&mut mcp, request_id, "2026-07-28", true);
+            let status = mcp.request(json!({
+                "jsonrpc":"2.0","id":request_id + 1,"method":"tasks/get",
+                "params":{"taskId":task_id}
+            }));
+            mcp.finish();
+            if status["result"]["status"] == "completed" {
+                return status;
+            }
+            assert_ne!(status["result"]["status"], "failed", "{status}");
+            assert_ne!(status["result"]["status"], "cancelled", "{status}");
+            assert!(
+                Instant::now() < deadline,
+                "daemon operation did not settle: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    let mut cleanup = DaemonCleanup {
+        root: root.clone(),
+        store: store_path.clone(),
+        armed: false,
+    };
+
+    let store_write_tools = {
+        let mut command = command(&root, &store_path, requirement().path());
+        command.args(["--capability", "store-write"]);
+        tools_list(command, 28)
+    };
+    assert!(!store_write_tools.contains(&"daemon_start_submit".to_owned()));
+    assert!(!store_write_tools.contains(&"daemon_stop".to_owned()));
+
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-315-start",
+        "strict":false
+    });
+    let mut submit = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "daemon-control"],
+    );
+    initialize_tasks_mcp(&mut submit, 1, "2026-07-28", true);
+    let accepted = submit.request(json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"daemon_start_submit","arguments":arguments}
+    }));
+    let start_id = accepted["result"]["taskId"].as_str().unwrap().to_owned();
+    submit.finish();
+    cleanup.armed = true;
+
+    let started = task_until_terminal(&root, &store_path, &start_id, 10);
+    let started_result = &started["result"]["result"]["structuredContent"];
+    assert_eq!(
+        started_result["result"],
+        json!({"action":"start", "phase":"running"})
+    );
+    let encoded = started_result.to_string();
+    for forbidden in [
+        "pid",
+        "executable",
+        "status_path",
+        "stop_path",
+        "argv",
+        "env",
+        "logs",
+        root.to_str().unwrap(),
+        store_path.to_str().unwrap(),
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "leaked {forbidden}: {encoded}"
+        );
+    }
+
+    let mut replay = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "daemon-control"],
+    );
+    initialize_tasks_mcp(&mut replay, 20, "2026-07-28", true);
+    let replayed = replay.request(json!({
+        "jsonrpc":"2.0","id":21,"method":"tools/call",
+        "params":{"name":"daemon_start_submit","arguments":arguments}
+    }));
+    replay.finish();
+    assert_eq!(replayed["result"]["taskId"], start_id);
+
+    let mut stop = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "daemon-control"],
+    );
+    initialize_tasks_mcp(&mut stop, 30, "2026-07-28", true);
+    let accepted_stop = stop.request(json!({
+        "jsonrpc":"2.0","id":31,"method":"tools/call",
+        "params":{"name":"daemon_stop","arguments":{
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-315-stop"
+        }}
+    }));
+    let stop_id = accepted_stop["result"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    stop.finish();
+    let stopped = task_until_terminal(&root, &store_path, &stop_id, 40);
+    assert_eq!(
+        stopped["result"]["result"]["structuredContent"]["result"],
+        json!({"action":"stop", "phase":"stopped"})
+    );
+    assert!(!PathBuf::from(format!("{}.daemon-stop", store_path.display())).exists());
+    cleanup.armed = false;
+}
+
+#[test]
+fn issue_315_insufficient_capability_process_cannot_cancel_or_retry_daemon_operation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    fs::create_dir(&root).unwrap();
+    let privileged_config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ],
+    );
+    let submitted_at_ms = process_now_ms();
+    let arguments = json!({
+        "contract_version":"depgraph-mcp-tools-v1",
+        "repository_id":"repository",
+        "idempotency_key":"issue-315-denied-daemon-retry",
+        "strict":false
+    });
+    let mut manager = OperationManager::open(&privileged_config).unwrap();
+    let operation_id = manager
+        .submit(
+            &SubmitRequest::new(
+                &privileged_config,
+                OperationKind::DaemonStartSubmit,
+                &json!({"strict":false}),
+                b"issue-315-denied-daemon-retry",
+                submitted_at_ms + 60_000,
+            )
+            .unwrap(),
+            submitted_at_ms,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(manager);
+    let before = operation_journal_state_digest(&privileged_config);
+
+    let mut insufficient =
+        InteractiveMcp::start_with_capabilities(&root, &store_path, &["store-write"]);
+    initialize_interactive_mcp(&mut insufficient, 1);
+    let denied_cancel = interactive_tool_call(
+        &mut insufficient,
+        2,
+        "operation_cancel",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "operation_id":operation_id
+        }),
+    );
+    assert_eq!(denied_cancel["isError"], true);
+    assert_eq!(
+        denied_cancel["structuredContent"]["error"]["code"],
+        "CAPABILITY_DENIED"
+    );
+    assert_eq!(operation_journal_state_digest(&privileged_config), before);
+
+    let denied_retry = insufficient.request(json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"daemon_start_submit","arguments":arguments}
+    }));
+    assert_eq!(denied_retry["error"]["code"], -32602);
+    assert_eq!(operation_journal_state_digest(&privileged_config), before);
+
+    let still_queued = interactive_tool_call(
+        &mut insufficient,
+        4,
+        "operation_get",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "operation_id":operation_id
+        }),
+    );
+    assert_eq!(still_queued["isError"], false);
+    assert_eq!(
+        still_queued["structuredContent"]["result"]["status"],
+        "queued"
+    );
+    insufficient.finish();
+    assert!(!daemon_status_path(&store_path).exists());
+}
+
+#[test]
 fn issue_310_operation_baseline_recovers_across_processes_and_reauthorizes_cancel() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -4980,7 +5225,7 @@ fn issue_310_operation_baseline_recovers_across_processes_and_reauthorizes_cance
         )
         .unwrap();
     let mismatched_envelope =
-        SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+        SuccessEnvelope::new(repository_id.clone(), None, issue_315_daemon_stop_outcome());
     journal
         .complete(
             &repository_id,
@@ -5143,7 +5388,7 @@ fn issue_310_operation_baseline_recovers_across_processes_and_reauthorizes_cance
 
     let terminal_at_ms = submitted_at_ms + 7;
     let terminal_envelope =
-        SuccessEnvelope::new(repository_id.clone(), None, issue_310_daemon_status());
+        SuccessEnvelope::new(repository_id.clone(), None, issue_315_daemon_stop_outcome());
     let mut journal = OperationJournal::open(&full_config).unwrap();
     journal
         .acquire_lease(
