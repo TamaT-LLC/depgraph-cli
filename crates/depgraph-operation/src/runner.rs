@@ -272,33 +272,79 @@ fn promote_daemon_start(
     let startup = RunnerStartupConfig::new(config.clone())?;
     let mut child = launcher.launch(&startup, strict)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut child_exit_observed_at = None;
     loop {
-        if child.has_exited()? {
-            return Err(RunnerError::Service(DepgraphServiceError::Internal));
-        }
-        match service.daemon_running_cancellable(&cancellation) {
-            Ok(true) => {
+        let now = std::time::Instant::now();
+        let child_exited = child.has_exited()?;
+        match classify_daemon_start_poll(
+            service.daemon_running_cancellable(&cancellation),
+            child_exited,
+            &mut child_exit_observed_at,
+            now,
+            deadline,
+        ) {
+            DaemonStartPoll::Running => {
                 child.detach();
                 return Ok(());
             }
-            Ok(false)
-            | Err(DepgraphServiceError::NotFound)
-            | Err(DepgraphServiceError::Conflict)
-                if std::time::Instant::now() < deadline =>
-            {
+            DaemonStartPoll::Waiting => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Ok(false) | Err(DepgraphServiceError::NotFound) => {
+            DaemonStartPoll::ChildExited => {
+                return Err(RunnerError::Service(DepgraphServiceError::Internal));
+            }
+            DaemonStartPoll::Exhausted => {
                 child.terminate_and_reap()?;
                 return Err(RunnerError::Service(
                     DepgraphServiceError::ResourceExhausted,
                 ));
             }
-            Err(error) => {
+            DaemonStartPoll::Failed(error) => {
                 child.terminate_and_reap()?;
                 return Err(error.into());
             }
         }
+    }
+}
+
+const DAEMON_START_EXIT_GRACE: Duration = Duration::from_millis(750);
+
+#[derive(Debug)]
+enum DaemonStartPoll {
+    Running,
+    Waiting,
+    ChildExited,
+    Exhausted,
+    Failed(DepgraphServiceError),
+}
+
+fn classify_daemon_start_poll(
+    status: Result<bool, DepgraphServiceError>,
+    child_exited: bool,
+    child_exit_observed_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> DaemonStartPoll {
+    match status {
+        Ok(true) => DaemonStartPoll::Running,
+        Ok(false) | Err(DepgraphServiceError::NotFound) | Err(DepgraphServiceError::Conflict) => {
+            if child_exited {
+                let observed_at = child_exit_observed_at.get_or_insert(now);
+                if now.duration_since(*observed_at) >= DAEMON_START_EXIT_GRACE {
+                    return DaemonStartPoll::ChildExited;
+                }
+            }
+            if now < deadline {
+                DaemonStartPoll::Waiting
+            } else {
+                match status {
+                    Ok(false) | Err(DepgraphServiceError::NotFound) => DaemonStartPoll::Exhausted,
+                    Err(error) => DaemonStartPoll::Failed(error),
+                    Ok(true) => unreachable!("running status returned above"),
+                }
+            }
+        }
+        Err(error) => DaemonStartPoll::Failed(error),
     }
 }
 
@@ -3091,6 +3137,39 @@ mod tests {
         );
         assert!(!root.path().join("graph.sqlite.daemon-status.json").exists());
         assert!(!root.path().join("graph.sqlite.daemon-lock").exists());
+    }
+
+    #[test]
+    fn issue_315_competing_start_exit_waits_for_winner_status() {
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        let mut exit_observed_at = None;
+
+        assert!(matches!(
+            classify_daemon_start_poll(Ok(false), true, &mut exit_observed_at, started, deadline,),
+            DaemonStartPoll::Waiting
+        ));
+        assert_eq!(exit_observed_at, Some(started));
+        assert!(matches!(
+            classify_daemon_start_poll(
+                Ok(true),
+                true,
+                &mut exit_observed_at,
+                started + DAEMON_START_EXIT_GRACE,
+                deadline,
+            ),
+            DaemonStartPoll::Running
+        ));
+        assert!(matches!(
+            classify_daemon_start_poll(
+                Ok(false),
+                true,
+                &mut exit_observed_at,
+                started + DAEMON_START_EXIT_GRACE,
+                deadline,
+            ),
+            DaemonStartPoll::ChildExited
+        ));
     }
 
     #[test]
