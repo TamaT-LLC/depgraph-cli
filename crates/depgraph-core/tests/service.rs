@@ -49,6 +49,23 @@ fn repository_write_service(
     Ok(DepgraphService::new(config))
 }
 
+fn daemon_control_service(
+    root: &Path,
+    store_path: &Path,
+) -> Result<DepgraphService, DepgraphServiceError> {
+    let config = DepgraphServiceConfig::new(
+        root,
+        store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ])?,
+        DepgraphServiceLimits::default(),
+    )?;
+    Ok(DepgraphService::new(config))
+}
+
 fn seed_completed_snapshot(
     store: &mut Store,
     root: &Path,
@@ -1048,6 +1065,143 @@ fn lifecycle_daemon_status_reads_only_the_bounded_status_file() -> Result<()> {
     let actual = service.daemon_status_cancellable(&CancellationToken::new())?;
     assert_eq!(serde_json::to_value(actual)?, status);
     assert_eq!(std::fs::read(&status_path)?, original);
+    assert!(!store_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_daemon_stop_is_idempotent_only_after_stopped_cleanup_and_lock_release()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("never-opened.sqlite");
+    std::fs::create_dir_all(&root)?;
+    let service = daemon_control_service(&root, &store_path)?;
+    let status_path = temporary
+        .path()
+        .join("never-opened.sqlite.daemon-status.json");
+    let stop_path = temporary.path().join("never-opened.sqlite.daemon-stop");
+    std::fs::write(
+        &status_path,
+        serde_json::to_vec(&json!({
+            "schema_version": "daemon-status-v1",
+            "root": root.canonicalize()?,
+            "phase": "stopped",
+            "started_at": "2026-08-06T00:00:00Z",
+            "stopped_at": "2026-08-06T00:00:01Z",
+            "debounce_milliseconds": 100,
+            "pending_change_count": 0,
+            "active_attempt_id": null,
+            "last_completed_attempt": null,
+            "last_failed_attempt": null,
+            "last_cancelled_attempt": null,
+            "last_watcher_error": null,
+            "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+        }))?,
+    )?;
+    std::fs::write(&stop_path, b"stale request")?;
+
+    let status = service
+        .daemon_stop_cancellable(&CancellationToken::new())
+        .await?;
+
+    assert_eq!(status.phase, depgraph_core::DaemonPhase::Stopped);
+    assert!(!stop_path.exists());
+    assert!(!store_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_daemon_start_recovers_an_active_status_left_by_a_crashed_owner() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    std::fs::create_dir_all(&root)?;
+    let service = daemon_control_service(&root, &store_path)?;
+    std::fs::write(
+        temporary.path().join("graph.sqlite.daemon-status.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": "daemon-status-v1",
+            "root": root.canonicalize()?,
+            "phase": "idle",
+            "started_at": "2026-08-11T00:00:00Z",
+            "stopped_at": null,
+            "debounce_milliseconds": 100,
+            "pending_change_count": 0,
+            "active_attempt_id": null,
+            "last_completed_attempt": null,
+            "last_failed_attempt": null,
+            "last_cancelled_attempt": null,
+            "last_watcher_error": null,
+            "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+        }))?,
+    )?;
+
+    let cancellation = CancellationToken::new();
+    let stop = cancellation.clone();
+    let stopped = service
+        .daemon_start_foreground_with_running_cancellable(false, &cancellation, move || {
+            stop.cancel();
+        })
+        .await?;
+
+    assert_eq!(stopped.phase, depgraph_core::DaemonPhase::Stopped);
+    assert!(!service.daemon_running_cancellable(&CancellationToken::new())?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_daemon_start_releases_locks_after_post_acquisition_control_error() -> Result<()>
+{
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    let stop_path = temporary.path().join("graph.sqlite.daemon-stop");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir(&stop_path)?;
+    let service = daemon_control_service(&root, &store_path)?;
+
+    assert!(matches!(
+        service
+            .daemon_start_foreground_cancellable(false, &CancellationToken::new())
+            .await,
+        Err(DepgraphServiceError::Integrity)
+    ));
+
+    std::fs::remove_dir(&stop_path)?;
+    let cancellation = CancellationToken::new();
+    let stop = cancellation.clone();
+    let stopped = service
+        .daemon_start_foreground_with_running_cancellable(false, &cancellation, move || {
+            stop.cancel();
+        })
+        .await?;
+    assert_eq!(stopped.phase, depgraph_core::DaemonPhase::Stopped);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_daemon_control_rejects_store_write_only_without_mutation() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("missing.sqlite");
+    std::fs::create_dir_all(&root)?;
+    let config = DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])?,
+        DepgraphServiceLimits::default(),
+    )?;
+    let service = DepgraphService::new(config);
+
+    assert!(matches!(
+        service
+            .daemon_stop_cancellable(&CancellationToken::new())
+            .await,
+        Err(DepgraphServiceError::CapabilityDenied {
+            required: DepgraphCapability::DaemonControl
+        })
+    ));
     assert!(!store_path.exists());
     Ok(())
 }

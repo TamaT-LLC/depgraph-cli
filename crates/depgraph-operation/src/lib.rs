@@ -11,8 +11,9 @@ mod runner;
 
 pub use depgraph_core::service::{OPERATION_JOURNAL_SUFFIX, RUNNER_PURGE_LOCK_SUFFIX};
 pub use launcher::{
-    LaunchedOperationRunner, OPERATION_RUNNER_STARTUP_CONTRACT, OperationRunnerLauncher,
-    RunnerLaunchError, RunnerResolutionPolicy,
+    DaemonExecutableLauncher, LaunchedDaemonProcess, LaunchedOperationRunner,
+    OPERATION_RUNNER_STARTUP_CONTRACT, OperationRunnerLauncher, RunnerLaunchError,
+    RunnerResolutionPolicy,
 };
 pub use runner::{
     CompletionRecovery, DeferredOperationCompletion, DispatchOutcome, ExecutionCheckpoint,

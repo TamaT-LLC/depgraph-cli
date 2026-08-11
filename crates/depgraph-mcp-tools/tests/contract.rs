@@ -167,7 +167,32 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
 
     let daemon =
         PortableTerminalOutputContract::for_originating_tool("daemon_start_submit").unwrap();
-    assert!(daemon.deserialize(value.clone()).is_ok());
+    let daemon_start = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repo-1",
+        "result": {"action": "start", "phase": "running"}
+    });
+    assert!(daemon.deserialize(daemon_start).is_ok());
+    assert!(daemon.deserialize(value.clone()).is_err());
+    let daemon_stop = PortableTerminalOutputContract::for_originating_tool("daemon_stop").unwrap();
+    assert!(
+        daemon_stop
+            .deserialize(json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repo-1",
+                "result": {"action": "stop", "phase": "stopped"}
+            }))
+            .is_ok()
+    );
+    assert!(
+        daemon_stop
+            .deserialize(json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repo-1",
+                "result": {"action": "start", "phase": "running"}
+            }))
+            .is_err()
+    );
     let scan = PortableTerminalOutputContract::for_originating_tool("scan_submit").unwrap();
     let scan_outcome: AgentScanOutcome = serde_json::from_value(json!({
         "scan_id": "scan:fixture",

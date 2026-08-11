@@ -35,6 +35,7 @@ additive extensionとして採用するかを決定する。
 | Snapshot artifacts | `snapshot_diff_get`, `policy_evaluate`, `graph_export` | Issue #305 implemented through pinned, bounded shared artifact services |
 | Runtime store-write | `runtime_trace_import_submit` | Issue #313 implemented through prevalidated durable operation and atomic runtime-snapshot promotion |
 | Repository write | `repository_init`, `export_file` | Issue #314 implemented through fixed-root/no-follow service writes and durable atomic file publication |
+| Daemon control | `daemon_start_submit`, `daemon_stop` | Issue #315 implemented through shared lifecycle services and durable verified-process orchestration |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -88,6 +89,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#305` | snapshot diff、policy evaluation、bounded inline graph exportを共有serviceとMCPへ接続する | request開始時のcompleted snapshot pin、canonical policy digest、closed diff/policy/export DTO、inline byte/node/edge bounds、typed `export_file` remediation、CLI/MCP/schema/catalog parityで固定する |
 | `#313` | runtime trace importを共有store-write serviceとdurable MCP operationへ接続する | existing validation/matching/delta boundary、writer lock、deferred completion intent、atomic runtime snapshot promotion、closed `AgentRuntimeOutcome`、idempotency/cancel/restart recoveryで固定する |
 | `#314` | fixed-root initとrepository-relative file exportを共有repository-write serviceとdurable MCP operationへ接続する | root seal、portable relative path、handle-relative no-follow traversal、same-directory staged fsync/atomic publication、destination precondition、graph store・operation journal・SQLite sidecar・runner purge lockのprotected-state拒否、no-follow/delete-share制約付きrunner guard、closed `AgentExportOutcome`、capability gating、idempotency/cancel/restart recoveryで固定する |
+| `#315` | daemon start/stopを共有serviceとdurable MCP operationへ接続する | `Read + StoreWrite + DaemonControl`の閉じたprofile、verified sibling executableのshellなし起動、running/stopped publication後のcompletion intent promotion、closed `AgentDaemonControlOutcome`、idempotency/cancel/restart recoveryで固定する |
 
 ## Upstream and API evidence
 
@@ -576,6 +578,37 @@ Issue本文に残る旧`FR-005/008/009/010/011`、`NFR-008`、`AC-013`参照は�
 | terminal outputがclosedでdigest/bytesと一致する | `AgentExportOutcome` constructor/Serde/schema tests、portable result union、real exported bytesのSHA-256/length process assertion |
 | capability/catalog/schema/CLI/MCP parity | repository-write catalog filter、no-root init schema、shared-service CLI security/parity、real stdio handlers、catalog/schema/contract checked-in golden exact tests |
 | repository validation | Rust 1.93.1 focused core/operation/CLI/MCP tests、Windows cross-check、`cargo fmt`、affected Clippy `-D warnings`。authoritative full gateはparent validationで実行する |
+
+## Issue #315 daemon-control evidence
+
+Issue [#315](https://github.com/TamaT-LLC/depgraph-cli/issues/315)はdaemon start/stop orchestrationを
+共有`DepgraphService`へ移し、`daemon_start_submit`と`daemon_stop`をdurable operationとして公開する。
+Issue本文に残る旧`FR-005/008/009/010`、`NFR-008`、`AC-003/013/014/018`参照は現在の
+[Requirement traceability](#requirement-traceability)表と一致しない。本実装は現在存在する
+`FR-009`（status境界）、`FR-010`（durable handle）、`NFR-001`（bounds/cancel）、
+`NFR-003`（restart recovery）、`NFR-005`（host-private情報の非公開）、
+`AC-011`（status-file-only read）、`AC-014`（baseline/Tasks recovery）、
+`AC-015`（CLI/MCP shared-service parity）および`#315`行へ対応付ける。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Shared lifecycle service | CLI、runner、MCPは`DepgraphService`のforeground start、running-state verification、stop request、cleanup waitを共有する。startは二つのlifecycle lock取得後のrunning status publicationを境界とし、stopはstopped status、stop-control removal、lock releaseがすべて一致した後だけ成功する。既にstoppedかつcleanup済みのstopだけがidempotent successである |
+| Verified process launch | runnerはcurrent executableから固定されたsibling `depgraph`だけをcanonicalizeして受理し、regular executable identityを保持する。shell、PATH lookup、repository-local executable、arbitrary argument/environmentは使わず、stdioを閉じた新process groupとして起動する。running publication前のexit・deadline・contradictory statusはchild process treeをterminate/reapして失敗する |
+| Durable completion and recovery | start/stopのclosed terminal decisionをcompletion intentへ先にcommitし、startはverified childのrunning publication、stopはcleanup完了をpromotion boundaryとする。runner restartは同じnormalized inputとclosed outcomeを再検証してpromotionを再実行する。decision前のcancel/deadlineはside effect前に停止し、decision後はcommitted decisionをretryableに保持する |
+| Capability closure | daemon toolsとoperation kindは`Read + StoreWrite + DaemonControl`を要求する。`DaemonControl`だけ、または`StoreWrite`だけのserver設定は起動時に拒否し、catalog、submit、runner handoff、retry、cancelの各境界で同じrequired-capability digestを再認可する |
+| Closed result | `AgentDaemonControlOutcome`は`action`と`phase`だけを持つclosed unionであり、PID、absolute executable/root、status/control/lock path、command、environmentを含まない。constructor、Deserializer、shared schema、portable terminal contractがunknown fieldとaction/phase不整合を拒否する |
+| Deterministic evidence | exact catalog、shared JSON Schema、portable terminal contract sampleとdigest fixtureをcanonical generatorで更新する。real stdio process testはstore-write-only filtering、start replay、server reconnect、running result、stop cleanup、result redactionを実MCP/runner/CLI processで検証する |
+
+### Issue #315 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| asymmetric capability設定をserver起動時に拒否 | MCP startup capability-closure process tests、catalog profile tests、operation required-capability matrix |
+| startはrunning、stopはcleanup後にterminal | core lifecycle tests、verified launcher/production dispatcher tests、real stdio start/stop process test |
+| PID、absolute executable、raw status pathを返さない | closed outcome constructor/Serde/schema/contract tests、real process result redaction assertion |
+| 不足capabilityでretry/cancelできない | journal/manager capability-digest reauthorization tests、MCP downgraded-server process tests |
+| idempotency、restart recovery、cancel、concurrent request | same-key real process replay、completion-intent recovery、operation cancellation、daemon lifecycle lock/concurrent-start tests |
+| repository validation | Rust 1.93.1 format、focused core/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

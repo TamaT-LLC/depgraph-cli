@@ -84,7 +84,13 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
 #[test]
 fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
     let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
-    for tool_name in ["scan_submit", "runtime_trace_import_submit", "export_file"] {
+    for tool_name in [
+        "scan_submit",
+        "runtime_trace_import_submit",
+        "export_file",
+        "daemon_start_submit",
+        "daemon_stop",
+    ] {
         let schema =
             &catalog.tool(tool_name).unwrap().input_schema()["properties"]["idempotency_key"];
         assert_eq!(schema["minLength"], 1);
@@ -98,6 +104,45 @@ fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
     assert!(IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)).is_err());
     assert!(IdempotencyKey::parse("has\u{0000}control").is_err());
     assert!(IdempotencyKey::parse("has\u{0085}control").is_err());
+}
+
+#[test]
+fn daemon_control_inputs_require_a_bounded_idempotency_key_and_remain_closed() {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    let start = catalog.tool("daemon_start_submit").unwrap();
+    let stop = catalog.tool("daemon_stop").unwrap();
+
+    assert_eq!(
+        start.input_schema()["required"],
+        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+    );
+    assert_eq!(
+        stop.input_schema()["required"],
+        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+    );
+    assert_eq!(
+        start.input_schema()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "contract_version",
+            "repository_id",
+            "idempotency_key",
+            "strict"
+        ]
+    );
+    assert_eq!(
+        stop.input_schema()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["contract_version", "repository_id", "idempotency_key"]
+    );
 }
 
 #[test]
@@ -570,22 +615,15 @@ fn operation_baseline_tools_advertise_their_exact_closed_outputs() {
         "contract_version": "depgraph-mcp-tools-v1",
         "repository_id": "repository",
         "result": {
-            "schema_version": "depgraph-daemon-v1",
-            "phase": "stopped",
-            "started_at": "2026-08-08T00:00:00.000Z",
-            "stopped_at": "2026-08-08T00:00:01.000Z",
-            "debounce_milliseconds": 0,
-            "pending_change_count": 0,
-            "recovered_attempts": {
-                "scan_attempt_ids": [],
-                "build_attempt_ids": []
-            }
+            "action": "stop",
+            "phase": "stopped"
         }
     });
     let result_tool = catalog.tool("operation_result").unwrap();
     let result_output = Value::Object(result_tool.output_schema().clone());
     let encoded = result_output.to_string();
-    assert!(encoded.contains("AgentDaemonStatus"), "{encoded}");
+    assert!(encoded.contains("AgentDaemonControlOutcome"), "{encoded}");
+    assert!(!encoded.contains("AgentDaemonStatus"), "{encoded}");
     assert!(!encoded.contains("AgentOperation\""), "{encoded}");
     assert!(!encoded.contains("\"result\":true"), "{encoded}");
     let validator = jsonschema::draft202012::new(&result_output).unwrap();

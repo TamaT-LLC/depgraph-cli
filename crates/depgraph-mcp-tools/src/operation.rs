@@ -5,8 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
-    AgentDaemonStatus, AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome,
-    ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
+    AgentDaemonControlAction, AgentDaemonControlOutcome, AgentDaemonControlPhase,
+    AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome, ContractBuildError, ContractVersion,
+    LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
 };
 
 /// Closed terminal output contracts registered for durable submit tools.
@@ -78,13 +79,28 @@ impl PortableTerminalOutputContract {
                 ))
             }
             Self::DaemonStartSubmit | Self::DaemonStop => {
-                let envelope = serde_json::from_value::<SuccessEnvelope<AgentDaemonStatus>>(value)
-                    .map_err(|_| PortableTerminalOutputError)?;
-                if envelope.snapshot_id().is_some() {
+                let envelope =
+                    serde_json::from_value::<SuccessEnvelope<AgentDaemonControlOutcome>>(value)
+                        .map_err(|_| PortableTerminalOutputError)?;
+                let expected = match self {
+                    Self::DaemonStartSubmit => (
+                        AgentDaemonControlAction::Start,
+                        AgentDaemonControlPhase::Running,
+                    ),
+                    Self::DaemonStop => (
+                        AgentDaemonControlAction::Stop,
+                        AgentDaemonControlPhase::Stopped,
+                    ),
+                    _ => unreachable!("daemon contract branch is closed"),
+                };
+                if envelope.snapshot_id().is_some()
+                    || !envelope.result().is_valid()
+                    || (envelope.result().action(), envelope.result().phase()) != expected
+                {
                     return Err(PortableTerminalOutputError);
                 }
                 Ok(PortableTerminalOutput(
-                    PortableTerminalOutputEnvelope::DaemonStatus(Box::new(envelope)),
+                    PortableTerminalOutputEnvelope::DaemonControl(Box::new(envelope)),
                 ))
             }
         }
@@ -103,7 +119,7 @@ enum PortableTerminalOutputEnvelope {
     Scan(Box<SuccessEnvelope<AgentScanOutcome>>),
     RuntimeImport(Box<SuccessEnvelope<AgentRuntimeOutcome>>),
     ExportFile(Box<SuccessEnvelope<AgentExportOutcome>>),
-    DaemonStatus(Box<SuccessEnvelope<AgentDaemonStatus>>),
+    DaemonControl(Box<SuccessEnvelope<AgentDaemonControlOutcome>>),
 }
 
 impl JsonSchema for PortableTerminalOutput {
@@ -127,7 +143,7 @@ impl PortableTerminalOutput {
             PortableTerminalOutputEnvelope::Scan(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::RuntimeImport(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::ExportFile(envelope) => envelope.repository_id(),
-            PortableTerminalOutputEnvelope::DaemonStatus(envelope) => envelope.repository_id(),
+            PortableTerminalOutputEnvelope::DaemonControl(envelope) => envelope.repository_id(),
         }
     }
 }

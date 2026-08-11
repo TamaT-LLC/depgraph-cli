@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     AgentChangedSince, AgentCompletedSnapshot, AgentContext, AgentCorrelationDifference,
     AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
-    AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence,
-    AgentGraphExportResponse, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
+    AgentDaemonControlOutcome, AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor,
+    AgentEdge, AgentEvidence, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse,
+    AgentPathStep, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
     AgentRepositoryInitOutcome, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
     AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
     AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
@@ -54,6 +54,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentCompletedSnapshot>>(),
             generator.subschema_for::<SuccessEnvelope<AgentProfilePlan>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDaemonStatus>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentDaemonControlOutcome>>(),
             generator.subschema_for::<SuccessEnvelope<AgentScanOutcome>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDoctor>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDependenciesResponse>>(),
@@ -109,6 +110,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentGraphExportResponse>(),
             generator.subschema_for::<AgentOperation>(),
             generator.subschema_for::<AgentScanOutcome>(),
+            generator.subschema_for::<AgentDaemonControlOutcome>(),
             generator.subschema_for::<AgentSnapshot>(),
         ];
         json_schema!({

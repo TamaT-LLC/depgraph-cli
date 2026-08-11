@@ -204,6 +204,24 @@ struct ScanSubmitArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DaemonStartSubmitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    strict: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStopArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: IdempotencyKey,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepositoryInitArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
@@ -1123,7 +1141,11 @@ impl ServerHandler for DepgraphMcpServer {
         }
         if matches!(
             tool.as_str(),
-            "scan_submit" | "runtime_trace_import_submit" | "export_file"
+            "scan_submit"
+                | "runtime_trace_import_submit"
+                | "export_file"
+                | "daemon_start_submit"
+                | "daemon_stop"
         ) {
             let tasks_negotiated = EFFECTIVE_PROTOCOL_VERSION
                 .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
@@ -1164,6 +1186,18 @@ impl ServerHandler for DepgraphMcpServer {
                             &cancellation,
                         ),
                         "export_file" => execute_export_file_submit(
+                            &operation_config,
+                            &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        "daemon_start_submit" => execute_daemon_start_submit(
+                            &operation_config,
+                            &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        "daemon_stop" => execute_daemon_stop_submit(
                             &operation_config,
                             &repository_id,
                             arguments,
@@ -1324,6 +1358,8 @@ fn tool_uses_mutation_settlement(tool: &str) -> bool {
         "scan_submit"
             | "runtime_trace_import_submit"
             | "export_file"
+            | "daemon_start_submit"
+            | "daemon_stop"
             | "operation_cancel"
             | "snapshot_name_create"
             | "repository_init"
@@ -1595,6 +1631,58 @@ fn execute_scan_submit(
         config,
         OperationKind::ScanSubmit,
         &normalized_input,
+        &arguments.idempotency_key,
+        cancellation,
+    )
+}
+
+fn execute_daemon_start_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<DaemonStartSubmitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+    submit_durable_operation(
+        config,
+        OperationKind::DaemonStartSubmit,
+        &serde_json::json!({"strict": arguments.strict}),
+        &arguments.idempotency_key,
+        cancellation,
+    )
+}
+
+fn execute_daemon_stop_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<DaemonStopArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+    submit_durable_operation(
+        config,
+        OperationKind::DaemonStop,
+        &serde_json::json!({}),
         &arguments.idempotency_key,
         cancellation,
     )

@@ -44,8 +44,9 @@ pub use dto::{
     project_bounded_query_rows, project_bounded_query_rows_cancellable,
 };
 pub use lifecycle::{
-    AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonPhase,
-    AgentDaemonStatus, AgentDaemonTrace, AgentDoctor, AgentProfilePlan, AgentRecoveredAttempts,
+    AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonControlAction,
+    AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentDaemonPhase, AgentDaemonStatus,
+    AgentDaemonTrace, AgentDoctor, AgentProfilePlan, AgentRecoveredAttempts,
 };
 pub use operation::{
     AcceptedOperationStatus, AcceptedTaskStatus, AgentOperation, AgentOperationProgress,

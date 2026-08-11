@@ -45,6 +45,7 @@ fn config(root: &Path) -> DepgraphServiceConfig {
             DepgraphCapability::Read,
             DepgraphCapability::StoreWrite,
             DepgraphCapability::RepositoryWrite,
+            DepgraphCapability::DaemonControl,
             DepgraphCapability::ProjectExec,
         ])
         .unwrap(),
@@ -296,6 +297,167 @@ fn production_scan_dispatcher_executes_safe_scan_and_persists_closed_terminal_ou
         }
         other => panic!("unexpected scan outcome: {other:?}"),
     }
+}
+
+#[test]
+fn production_dispatcher_completes_idempotent_daemon_stop_with_closed_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let repository = repository(&config);
+    let status_path = root.path().join("graph.sqlite.daemon-status.json");
+    std::fs::write(
+        status_path,
+        serde_json::to_vec(&json!({
+            "schema_version": "daemon-status-v1",
+            "root": config.canonical_root(),
+            "phase": "stopped",
+            "started_at": "2026-08-11T00:00:00Z",
+            "stopped_at": "2026-08-11T00:00:01Z",
+            "debounce_milliseconds": 100,
+            "pending_change_count": 0,
+            "active_attempt_id": null,
+            "last_completed_attempt": null,
+            "last_failed_attempt": null,
+            "last_cancelled_attempt": null,
+            "last_watcher_error": null,
+            "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let now = now_ms() - 1_000;
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let operation_id = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::DaemonStop,
+                &json!({}),
+                b"daemon-stop-already-stopped",
+                now + 60_000,
+            )
+            .unwrap(),
+            now,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+
+    OperationRunner::new(
+        RunnerStartupConfig::new(config.clone()).unwrap(),
+        ScanOperationDispatcher::new(config.clone()),
+    )
+    .run_until_idle()
+    .unwrap();
+
+    match OperationJournal::open(&config)
+        .unwrap()
+        .result(&repository, &operation_id, now_ms())
+        .unwrap()
+    {
+        OperationOutcome::Completed(output) => {
+            let value: serde_json::Value = serde_json::from_str(output.as_str()).unwrap();
+            assert_eq!(value["result"], json!({"action":"stop", "phase":"stopped"}));
+            assert!(value["snapshot_id"].is_null());
+            assert!(
+                !value
+                    .to_string()
+                    .contains(config.canonical_root().to_str().unwrap())
+            );
+        }
+        other => panic!("unexpected daemon stop outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn production_dispatcher_launches_one_verified_daemon_and_then_stops_it() {
+    struct StopMarker {
+        path: std::path::PathBuf,
+        armed: bool,
+    }
+    impl Drop for StopMarker {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::fs::write(&self.path, b"stop\n");
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let mut stop_marker = StopMarker {
+        path: std::path::PathBuf::from(format!("{}.daemon-stop", config.store_path().display())),
+        armed: false,
+    };
+    let repository = repository(&config);
+    let now = now_ms() - 1_000;
+    let mut journal = OperationJournal::open(&config).unwrap();
+    let start_id = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::DaemonStartSubmit,
+                &json!({"strict":false}),
+                b"daemon-start-real",
+                now + 60_000,
+            )
+            .unwrap(),
+            now,
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+
+    OperationRunner::new(
+        RunnerStartupConfig::new(config.clone()).unwrap(),
+        ScanOperationDispatcher::new(config.clone()),
+    )
+    .run_until_idle()
+    .unwrap();
+    stop_marker.armed = true;
+
+    let mut journal = OperationJournal::open(&config).unwrap();
+    match journal.result(&repository, &start_id, now_ms()).unwrap() {
+        OperationOutcome::Completed(output) => {
+            let value: serde_json::Value = serde_json::from_str(output.as_str()).unwrap();
+            assert_eq!(
+                value["result"],
+                json!({"action":"start", "phase":"running"})
+            );
+        }
+        other => panic!("unexpected daemon start outcome: {other:?}"),
+    }
+    let stop_id = journal
+        .submit(
+            &SubmitRequest::new(
+                &config,
+                OperationKind::DaemonStop,
+                &json!({}),
+                b"daemon-stop-real",
+                now_ms() + 60_000,
+            )
+            .unwrap(),
+            now_ms(),
+        )
+        .unwrap()
+        .operation_id()
+        .clone();
+    drop(journal);
+    OperationRunner::new(
+        RunnerStartupConfig::new(config.clone()).unwrap(),
+        ScanOperationDispatcher::new(config.clone()),
+    )
+    .run_until_idle()
+    .unwrap();
+    assert!(matches!(
+        OperationJournal::open(&config)
+            .unwrap()
+            .result(&repository, &stop_id, now_ms())
+            .unwrap(),
+        OperationOutcome::Completed(_)
+    ));
+    stop_marker.armed = false;
 }
 
 #[test]
