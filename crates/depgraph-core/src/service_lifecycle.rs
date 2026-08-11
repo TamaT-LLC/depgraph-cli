@@ -508,9 +508,15 @@ impl DepgraphService {
         let status_path = status_path(self.config().store_path());
         let running = handle.status();
         let generation = running.started_at.clone();
+        let maximum_control_bytes = self.config().limits().max_output_bytes();
         let mut status = handle.subscribe();
-        let mut lifecycle_error =
-            remove_mismatched_daemon_stop_request(&stop_path, &running.root, &generation).err();
+        let mut lifecycle_error = remove_mismatched_daemon_stop_request(
+            &stop_path,
+            &running.root,
+            &generation,
+            maximum_control_bytes,
+        )
+        .err();
         if lifecycle_error.is_none() {
             if let Err(error) = write_daemon_status(&status_path, &running) {
                 lifecycle_error = Some(error);
@@ -530,7 +536,12 @@ impl DepgraphService {
                             }
                         }
                         _ = stop_poll.tick() => {
-                            match daemon_stop_requested_for(&stop_path, &running.root, &generation) {
+                            match daemon_stop_requested_for(
+                                &stop_path,
+                                &running.root,
+                                &generation,
+                                maximum_control_bytes,
+                            ) {
                                 Ok(true) => break,
                                 Ok(false) => {}
                                 Err(error) => {
@@ -604,6 +615,7 @@ impl DepgraphService {
                             &stop_path,
                             &initial.root,
                             &initial.started_at,
+                            self.config().limits().max_output_bytes(),
                         )?;
                         return Err(DepgraphServiceError::Conflict);
                     }
@@ -1528,7 +1540,12 @@ fn finish_already_stopped_daemon_stop(
     if current.phase != DaemonPhase::Stopped {
         return Err(DepgraphServiceError::Conflict);
     }
-    remove_matching_daemon_stop_request(stop_path, &current.root, &current.started_at)?;
+    remove_matching_daemon_stop_request(
+        stop_path,
+        &current.root,
+        &current.started_at,
+        service.config().limits().max_output_bytes(),
+    )?;
     check_cancellation(cancellation)?;
     Ok(current)
 }
@@ -1544,7 +1561,12 @@ fn finish_daemon_shutdown(
         return Err(DepgraphServiceError::Conflict);
     };
     write_daemon_status(status_path, stopped)?;
-    remove_matching_daemon_stop_request(stop_path, &stopped.root, &stopped.started_at)
+    remove_matching_daemon_stop_request(
+        stop_path,
+        &stopped.root,
+        &stopped.started_at,
+        service.config().limits().max_output_bytes(),
+    )
 }
 
 fn repair_unlocked_daemon_stop(
@@ -1628,21 +1650,26 @@ fn daemon_stop_requested_for(
     path: &Path,
     root: &str,
     started_at: &str,
+    maximum_bytes: usize,
 ) -> DepgraphServiceResult<bool> {
-    let Some(request) = read_daemon_stop_request(path)? else {
+    let Some(request) = read_daemon_stop_request(path, maximum_bytes)? else {
         return Ok(false);
     };
     Ok(request.root == root && request.started_at == started_at)
 }
 
-fn read_daemon_stop_request(path: &Path) -> DepgraphServiceResult<Option<DaemonStopRequest>> {
-    let file = match open_regular_file_no_follow(path) {
+fn read_daemon_stop_request(
+    path: &Path,
+    maximum_bytes: usize,
+) -> DepgraphServiceResult<Option<DaemonStopRequest>> {
+    let mut file = match open_regular_file_no_follow(path) {
         Ok(file) => file,
         Err(DepgraphServiceError::NotFound) => return Ok(None),
         Err(_) => return Err(DepgraphServiceError::Integrity),
     };
+    let bytes = read_bounded(&mut file, maximum_bytes)?;
     let request: DaemonStopRequest =
-        serde_json::from_reader(file).map_err(|_| DepgraphServiceError::Integrity)?;
+        serde_json::from_slice(&bytes).map_err(|_| DepgraphServiceError::Integrity)?;
     if request.schema_version != DAEMON_STOP_REQUEST_SCHEMA_VERSION {
         return Err(DepgraphServiceError::Integrity);
     }
@@ -1653,9 +1680,10 @@ fn remove_mismatched_daemon_stop_request(
     path: &Path,
     root: &str,
     started_at: &str,
+    maximum_bytes: usize,
 ) -> DepgraphServiceResult<()> {
     let _writer_lock = acquire_daemon_stop_writer_lock_blocking(path)?;
-    match read_daemon_stop_request(path)? {
+    match read_daemon_stop_request(path, maximum_bytes)? {
         Some(request) if request.root != root || request.started_at != started_at => {
             remove_daemon_control_file(path)
         }
@@ -1667,9 +1695,10 @@ fn remove_matching_daemon_stop_request(
     path: &Path,
     root: &str,
     started_at: &str,
+    maximum_bytes: usize,
 ) -> DepgraphServiceResult<()> {
     let _writer_lock = acquire_daemon_stop_writer_lock_blocking(path)?;
-    match read_daemon_stop_request(path)? {
+    match read_daemon_stop_request(path, maximum_bytes)? {
         Some(request) if request.root == root && request.started_at == started_at => {
             remove_daemon_control_file(path)
         }

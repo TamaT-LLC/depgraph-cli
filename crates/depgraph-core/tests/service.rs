@@ -1190,6 +1190,53 @@ async fn lifecycle_daemon_start_releases_locks_after_post_acquisition_control_er
 }
 
 #[tokio::test]
+async fn lifecycle_daemon_stop_request_enforces_configured_output_bound() -> Result<()> {
+    const MAXIMUM_OUTPUT_BYTES: usize = 4 * 1024;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("graph.sqlite");
+    let stop_path = temporary.path().join("graph.sqlite.daemon-stop");
+    std::fs::create_dir_all(&root)?;
+    let config = DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::DaemonControl,
+        ])?,
+        DepgraphServiceLimits::try_new(
+            DEPGRAPH_SERVICE_LIMITS_VERSION,
+            1024 * 1024,
+            MAXIMUM_OUTPUT_BYTES,
+            100,
+            1_000,
+        )?,
+    )?;
+    let service = DepgraphService::new(config);
+    std::fs::write(&stop_path, vec![b'x'; MAXIMUM_OUTPUT_BYTES + 1])?;
+
+    assert!(matches!(
+        service
+            .daemon_start_foreground_cancellable(false, &CancellationToken::new())
+            .await,
+        Err(DepgraphServiceError::ResourceExhausted)
+    ));
+
+    std::fs::remove_file(&stop_path)?;
+    let cancellation = CancellationToken::new();
+    let stop = cancellation.clone();
+    let stopped = service
+        .daemon_start_foreground_with_running_cancellable(false, &cancellation, move || {
+            stop.cancel();
+        })
+        .await?;
+    assert_eq!(stopped.phase, depgraph_core::DaemonPhase::Stopped);
+    Ok(())
+}
+
+#[tokio::test]
 async fn lifecycle_daemon_control_rejects_store_write_only_without_mutation() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("repository");
