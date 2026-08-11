@@ -1607,6 +1607,20 @@ impl ScanOperationDispatcher {
         completion
     }
 
+    fn launcher_for_daemon_start(
+        &self,
+        service: &DepgraphService,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<DaemonExecutableLauncher>, RunnerError> {
+        match service.daemon_running_cancellable(cancellation) {
+            Ok(true) => Ok(None),
+            Ok(false) | Err(DepgraphServiceError::NotFound | DepgraphServiceError::Conflict) => {
+                Ok(self.resolve_daemon_start_launcher()?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn dispatch_scan(
         &self,
         work: &RunnerWork,
@@ -1917,15 +1931,11 @@ impl ScanOperationDispatcher {
             return DispatchOutcome::Cancelled;
         }
         let service = DepgraphService::new(self.config.clone());
-        let launcher = match service.daemon_running_cancellable(control.cancellation_token()) {
-            Ok(true) => None,
-            Ok(false) | Err(DepgraphServiceError::NotFound) => {
-                match self.resolve_daemon_start_launcher() {
-                    Ok(launcher) => launcher,
-                    Err(_) => return self.failed(AgentErrorCode::Internal),
-                }
-            }
-            Err(error) => return self.failed_service(&error),
+        let launcher = match self.launcher_for_daemon_start(&service, control.cancellation_token())
+        {
+            Ok(launcher) => launcher,
+            Err(RunnerError::Service(error)) => return self.failed_service(&error),
+            Err(_) => return self.failed(AgentErrorCode::Internal),
         };
         if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
             return DispatchOutcome::Cancelled;
@@ -2195,13 +2205,7 @@ impl OperationDispatcher for ScanOperationDispatcher {
                     }
                     let service = DepgraphService::new(self.config.clone());
                     let launcher =
-                        match service.daemon_running_cancellable(&CancellationToken::new()) {
-                            Ok(true) => None,
-                            Ok(false) | Err(DepgraphServiceError::NotFound) => {
-                                self.resolve_daemon_start_launcher()?
-                            }
-                            Err(error) => return Err(error.into()),
-                        };
+                        self.launcher_for_daemon_start(&service, &CancellationToken::new())?;
                     self.daemon_start_completion(input.strict, launcher)
                 }
                 OperationKind::DaemonStop => {
@@ -2394,7 +2398,8 @@ impl OperationDispatcher for ScanOperationDispatcher {
                 // reconciliation cannot make progress, but daemon stop/control
                 // claims must remain runnable under that ownership.
                 Ok(true) => return Ok(Some(false)),
-                Ok(false) | Err(DepgraphServiceError::NotFound) => {}
+                Ok(false)
+                | Err(DepgraphServiceError::NotFound | DepgraphServiceError::Conflict) => {}
                 Err(error) => return Err(RunnerError::Service(error)),
             }
         }
@@ -2467,7 +2472,7 @@ fn system_now_ms() -> Result<i64, RunnerError> {
 mod tests {
     use std::{
         cell::Cell,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -2519,6 +2524,31 @@ mod tests {
             DepgraphServiceLimits::default(),
         )
         .unwrap()
+    }
+
+    fn write_stale_running_daemon_status(config: &DepgraphServiceConfig) {
+        let mut status_path = config.store_path().as_os_str().to_os_string();
+        status_path.push(".daemon-status.json");
+        std::fs::write(
+            PathBuf::from(status_path),
+            serde_json::to_vec(&json!({
+                "schema_version": depgraph_core::DAEMON_STATUS_SCHEMA_VERSION,
+                "root": config.canonical_root(),
+                "phase": "idle",
+                "started_at": "2026-08-11T00:00:00.000Z",
+                "stopped_at": null,
+                "debounce_milliseconds": 250,
+                "pending_change_count": 0,
+                "active_attempt_id": null,
+                "last_completed_attempt": null,
+                "last_failed_attempt": null,
+                "last_cancelled_attempt": null,
+                "last_watcher_error": null,
+                "recovered_attempts": {"scan_attempt_ids": [], "build_attempt_ids": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     fn daemon_start_result(config: &DepgraphServiceConfig) -> CanonicalJson {
@@ -2967,6 +2997,7 @@ mod tests {
             CompletionDecision::Committed
         );
         drop(journal);
+        write_stale_running_daemon_status(&config);
 
         let launches = Arc::new(AtomicUsize::new(0));
         let recovered = OperationRunner::new(

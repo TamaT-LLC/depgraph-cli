@@ -30,6 +30,8 @@ pub enum RunnerLaunchError {
     Resolution,
     #[error("operation runner release verification failed")]
     ReleaseVerification,
+    #[error("operation runner environment policy failed")]
+    EnvironmentPolicy,
     #[error("operation runner launch failed")]
     Launch(#[source] std::io::Error),
 }
@@ -100,6 +102,7 @@ impl OperationRunnerLauncher {
                 .arg("--capability")
                 .arg(capability_argument(capability));
         }
+        copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
         configure_detached_process(&mut command);
         let mut child = command.spawn().map_err(RunnerLaunchError::Launch)?;
         let process_id = child.id();
@@ -157,6 +160,7 @@ impl DaemonExecutableLauncher {
         if strict {
             command.arg("--strict");
         }
+        copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
         configure_detached_process(&mut command);
         let child = command.spawn().map_err(RunnerLaunchError::Launch)?;
         Ok(LaunchedDaemonProcess { child: Some(child) })
@@ -565,6 +569,65 @@ fn reject_symlink_components(release_root: &Path, declared: &str) -> Result<(), 
     Ok(())
 }
 
+fn copy_safe_daemon_environment(
+    command: &mut Command,
+    root: &Path,
+) -> Result<(), RunnerLaunchError> {
+    let raw_path = std::env::var_os("PATH").ok_or(RunnerLaunchError::EnvironmentPolicy)?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut safe_paths = Vec::new();
+    for path in std::env::split_paths(&raw_path) {
+        if !path.is_absolute() {
+            continue;
+        }
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        if !path.is_dir() || path.starts_with(&canonical_root) || safe_paths.contains(&path) {
+            continue;
+        }
+        safe_paths.push(path);
+    }
+    if safe_paths.is_empty() {
+        return Err(RunnerLaunchError::EnvironmentPolicy);
+    }
+    let safe_path =
+        std::env::join_paths(safe_paths).map_err(|_| RunnerLaunchError::EnvironmentPolicy)?;
+    command.env("PATH", safe_path);
+
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SystemRoot",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOROOT",
+        "GOPATH",
+        "GOMODCACHE",
+    ] {
+        let Some(value) = std::env::var_os(key) else {
+            continue;
+        };
+        let path = PathBuf::from(&value);
+        if path.is_absolute()
+            && path
+                .canonicalize()
+                .is_ok_and(|canonical| !canonical.starts_with(&canonical_root))
+        {
+            command.env(key, value);
+        }
+    }
+    for key in ["LANG", "LC_ALL"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    Ok(())
+}
+
 const fn capability_argument(capability: DepgraphCapability) -> &'static str {
     match capability {
         DepgraphCapability::Read => "read",
@@ -750,7 +813,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn issue_315_daemon_launcher_spawns_exact_absolute_program_argv_and_empty_environment() {
+    fn issue_315_daemon_launcher_spawns_exact_absolute_program_argv_and_allowlisted_environment() {
         let root = tempfile::tempdir().unwrap();
         let repository = root
             .path()
@@ -824,10 +887,8 @@ int main(int argc, char **argv) {{
         };
 
         let process = launcher.launch(&startup, true).unwrap();
-        for _ in 0..100 {
-            if capture.is_file() {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !capture.is_file() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
@@ -851,8 +912,36 @@ int main(int argc, char **argv) {{
         ]
         .join("\n")
             + "\n";
-        assert_eq!(observed, expected);
-        assert!(!observed.lines().any(|line| line.starts_with("env=")));
+        let observed_arguments = observed
+            .lines()
+            .filter(|line| !line.starts_with("env="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(observed_arguments, expected);
+        let observed_environment = observed
+            .lines()
+            .filter_map(|line| line.strip_prefix("env="))
+            .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+            .collect::<Vec<_>>();
+        assert!(observed_environment.contains(&"PATH"));
+        assert!(observed_environment.iter().all(|key| matches!(
+            *key,
+            "PATH"
+                | "HOME"
+                | "USERPROFILE"
+                | "TMPDIR"
+                | "TEMP"
+                | "TMP"
+                | "SystemRoot"
+                | "CARGO_HOME"
+                | "RUSTUP_HOME"
+                | "GOROOT"
+                | "GOPATH"
+                | "GOMODCACHE"
+                | "LANG"
+                | "LC_ALL"
+        )));
         assert!(!root.path().join("depgraph-shell-parsed").exists());
         assert!(!root.path().join("executable-shell-parsed").exists());
     }
