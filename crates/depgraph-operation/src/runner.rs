@@ -356,7 +356,7 @@ fn promote_daemon_stop(config: &DepgraphServiceConfig) -> Result<(), RunnerError
     let service = DepgraphService::new(config.clone());
     let cancellation = CancellationToken::new();
     runtime
-        .block_on(service.daemon_stop_cancellable(&cancellation))
+        .block_on(service.recover_daemon_stop_completion_cancellable(&cancellation))
         .map(|_| ())
         .map_err(Into::into)
 }
@@ -2610,6 +2610,19 @@ mod tests {
         .unwrap()
     }
 
+    fn daemon_stop_result(config: &DepgraphServiceConfig) -> CanonicalJson {
+        let repository_id = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(
+                repository_id,
+                None,
+                AgentDaemonControlOutcome::stopped(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn issue_315_daemon_start_fails_closed_when_child_exits_before_publication() {
@@ -3079,6 +3092,101 @@ mod tests {
         .unwrap();
         assert_eq!(settled_replay, RunnerReport::default());
         assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn issue_315_restarted_runner_repairs_and_finalizes_daemon_stop_intent_once() {
+        let root = tempfile::tempdir().unwrap();
+        let config = daemon_config(root.path());
+        let repository = LogicalRepositoryId::parse(config.logical_repository_id()).unwrap();
+        let submitted_at_ms = system_now_ms().unwrap();
+        let deadline_ms = submitted_at_ms + 60_000;
+        let mut journal = OperationJournal::open(&config).unwrap();
+        let operation_id = journal
+            .submit(
+                &SubmitRequest::new(
+                    &config,
+                    OperationKind::DaemonStop,
+                    &json!({}),
+                    b"issue-315-daemon-stop-completion-recovery",
+                    deadline_ms,
+                )
+                .unwrap(),
+                submitted_at_ms,
+            )
+            .unwrap()
+            .operation_id()
+            .clone();
+        let crashed_lease = b"issue-315-crashed-daemon-stop-lease";
+        journal
+            .acquire_lease(
+                &repository,
+                &operation_id,
+                &LeaseOwner::parse("issue-315-crashed-daemon-stop-owner").unwrap(),
+                crashed_lease,
+                submitted_at_ms + 1,
+                deadline_ms,
+            )
+            .unwrap();
+        let expected_result = daemon_stop_result(&config);
+        assert_eq!(
+            journal
+                .commit_completion_intent(
+                    &repository,
+                    &operation_id,
+                    crashed_lease,
+                    expected_result.clone(),
+                    submitted_at_ms + 2,
+                )
+                .unwrap(),
+            CompletionDecision::Committed
+        );
+        drop(journal);
+        write_stale_running_daemon_status(&config);
+        let mut stop_path = config.store_path().as_os_str().to_os_string();
+        stop_path.push(".daemon-stop");
+        std::fs::write(PathBuf::from(&stop_path), b"stop\n").unwrap();
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let recovered = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config.clone(), false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+
+        assert_eq!(recovered.claimed(), 0);
+        assert_eq!(recovered.completed(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let journal = OperationJournal::open(&config).unwrap();
+        assert_eq!(
+            journal
+                .result(&repository, &operation_id, system_now_ms().unwrap())
+                .unwrap(),
+            OperationOutcome::Completed(expected_result)
+        );
+        assert!(
+            journal
+                .next_completion_intent(&repository, system_now_ms().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(journal);
+        assert!(!PathBuf::from(stop_path).exists());
+        let mut status_path = config.store_path().as_os_str().to_os_string();
+        status_path.push(".daemon-status.json");
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(PathBuf::from(status_path)).unwrap()).unwrap();
+        assert_eq!(status["phase"], "stopped");
+
+        let settled_replay = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            counting_daemon_dispatcher(config, false, Arc::clone(&launches)),
+        )
+        .run_until_idle()
+        .unwrap();
+        assert_eq!(settled_replay, RunnerReport::default());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 
     #[test]
