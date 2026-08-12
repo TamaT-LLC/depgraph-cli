@@ -19,6 +19,7 @@
 ## 運用手順
 
 - [GitHub Actionsを使ったリリース手順](../50_test/release-procedure.md)
+- [MCP Agent host operations](../50_test/mcp-agent-host-operations.md)
 
 ## 統計
 
@@ -51,6 +52,7 @@
 
 ## 更新履歴
 
+- 2026-08-12: MCP Agent hostのcapability、確認、reconnect、timeout、upgrade運用手順を追加
 - 2026-08-05: `PROJ-ARC-002` のMCP Tasks decisionを追加し、`Q-002`をResolvedへ更新
 - 2026-08-02: GitHub Actionsを使ったリリース手順を追加
 - 2026-07-25: `PROJ-ARC-001-ADR-006` を追加

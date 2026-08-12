@@ -1244,6 +1244,10 @@ fn is_lower_hex_len(value: &str, length: usize) -> bool {
 fn verify_project_metadata(root: &Path) -> Result<()> {
     verify_github_actions_security(root)?;
     verify_mcp_tasks_architecture_decision(root)?;
+    mcp_package_smoke::verify_documentation(root, VERSION)?;
+    let mcp_operations_path = "docs/50_test/mcp-agent-host-operations.md";
+    let mcp_operations = fs::read_to_string(root.join(mcp_operations_path))?;
+    verify_local_markdown_links(root, mcp_operations_path, &mcp_operations)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
         .lines()
@@ -1818,6 +1822,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-cross-language-adapter-contract.md",
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
+        "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.4.0-rc.6.md",
         "docs/releases/v0.4.0-rc.3.md",
@@ -6526,6 +6531,7 @@ fn verify_archive(
     #[cfg(unix)]
     verify_release_static_prelaunch_fails_closed(&extracted)?;
     let mcp_smoke = mcp_package_smoke::verify(
+        &workspace_root(),
         &extracted,
         &release_manifest.target,
         &archive_sha256,

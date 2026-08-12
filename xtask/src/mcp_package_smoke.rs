@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs,
     io::{BufRead as _, BufReader, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -31,6 +32,11 @@ const OPERATION_DEADLINE: Duration = Duration::from_secs(60);
 const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
 const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
+const DOCUMENTATION_PATH: &str = "docs/50_test/mcp-agent-host-operations.md";
+const DOCUMENTATION_MARKER_PREFIX: &str = "<!-- depgraph-mcp-package-smoke:";
+const DOCUMENTED_ROOT: &str = "/absolute/path/to/repository";
+const DOCUMENTED_STORE: &str = "/absolute/path/to/state/depgraph.sqlite";
+const DOCUMENTED_REQUIREMENT: &str = "/absolute/path/to/compiler-pack-requirement.json";
 const PROTOCOL_REVISIONS: &[&str] = &["2025-11-25", "2026-07-28"];
 const READ_CAPABILITIES: &[DepgraphCapability] = &[DepgraphCapability::Read];
 const STORE_WRITE_CAPABILITIES: &[DepgraphCapability] =
@@ -72,6 +78,11 @@ const CAPABILITY_PROFILES: &[(&str, &[DepgraphCapability])] = &[
         ],
     ),
 ];
+
+#[derive(Clone, Debug)]
+struct DocumentedLaunchProfile {
+    arguments: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -149,7 +160,149 @@ impl McpPackageSmokeReport {
     }
 }
 
+pub fn verify_documentation(workspace: &Path, release_version: &str) -> Result<()> {
+    documented_launch_profiles(workspace, release_version).map(drop)
+}
+
+fn documented_launch_profiles(
+    workspace: &Path,
+    release_version: &str,
+) -> Result<BTreeMap<String, DocumentedLaunchProfile>> {
+    let readme = fs::read_to_string(workspace.join("README.md"))?;
+    let runbook = fs::read_to_string(workspace.join(DOCUMENTATION_PATH))?;
+    let marker_count = readme.matches(DOCUMENTATION_MARKER_PREFIX).count()
+        + runbook.matches(DOCUMENTATION_MARKER_PREFIX).count();
+    if marker_count != CAPABILITY_PROFILES.len() + 1 {
+        bail!(
+            "packaged MCP documentation must contain one command and exactly six profile markers"
+        );
+    }
+
+    let expected_command = [
+        format!("/absolute/path/to/depgraph-{release_version}-<target>/bin/depgraph-mcp \\"),
+        format!("  --root {DOCUMENTED_ROOT} \\"),
+        format!("  --store {DOCUMENTED_STORE} \\"),
+        "  --capability read \\".to_owned(),
+        format!("  --compiler-pack-requirement {DOCUMENTED_REQUIREMENT} \\"),
+        "  --log-level warn".to_owned(),
+    ]
+    .join("\n");
+    let command = marked_code_block(&readme, "command", "sh")?;
+    if command != expected_command {
+        bail!("README packaged MCP command example differs from the read-only launch contract");
+    }
+    let command_arguments = documented_command_arguments(command)?;
+
+    let mut profiles = BTreeMap::new();
+    for (name, capabilities) in CAPABILITY_PROFILES.iter().copied() {
+        let document = if name == "read" { &readme } else { &runbook };
+        let block = marked_code_block(document, name, "json")?;
+        let actual: Value = serde_json::from_str(block)
+            .with_context(|| format!("packaged MCP {name} documentation is not valid JSON"))?;
+        let arguments = expected_documented_arguments(capabilities);
+        let expected = json!({
+            "mcpServers": {
+                "depgraph": {
+                    "command": format!(
+                        "/absolute/path/to/depgraph-{release_version}-<target>/bin/depgraph-mcp"
+                    ),
+                    "args": arguments
+                }
+            }
+        });
+        if actual != expected {
+            bail!("packaged MCP {name} documentation differs from its exact capability profile");
+        }
+        let arguments = actual["mcpServers"]["depgraph"]["args"]
+            .as_array()
+            .context("packaged MCP documentation has no argument array")?
+            .iter()
+            .map(|argument| {
+                argument
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .context("packaged MCP documentation contains a non-string argument")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if name == "read" && arguments != command_arguments {
+            bail!("README packaged MCP command and Agent host entry use different arguments");
+        }
+        let launch_arguments = if name == "read" {
+            command_arguments.clone()
+        } else {
+            arguments
+        };
+        if profiles
+            .insert(
+                name.to_owned(),
+                DocumentedLaunchProfile {
+                    arguments: launch_arguments,
+                },
+            )
+            .is_some()
+        {
+            bail!("packaged MCP documentation contains duplicate profile {name}");
+        }
+    }
+    Ok(profiles)
+}
+
+fn documented_command_arguments(command: &str) -> Result<Vec<String>> {
+    let lines = command.lines().collect::<Vec<_>>();
+    if lines.len() < 2 {
+        bail!("README packaged MCP command has no arguments");
+    }
+    let mut arguments = Vec::new();
+    for (index, line) in lines.iter().enumerate().skip(1) {
+        let line = line.trim();
+        let line = if index + 1 == lines.len() {
+            line
+        } else {
+            line.strip_suffix(" \\")
+                .context("README packaged MCP command has a malformed continuation")?
+        };
+        arguments.extend(line.split_ascii_whitespace().map(ToOwned::to_owned));
+    }
+    Ok(arguments)
+}
+
+fn marked_code_block<'a>(document: &'a str, name: &str, language: &str) -> Result<&'a str> {
+    let marker = format!("{DOCUMENTATION_MARKER_PREFIX}{name} -->");
+    if document.matches(&marker).count() != 1 {
+        bail!("packaged MCP documentation marker {name} must appear exactly once");
+    }
+    let opening = format!("{marker}\n```{language}\n");
+    let (_, after) = document.split_once(&opening).with_context(|| {
+        format!("packaged MCP documentation marker {name} has no {language} fence")
+    })?;
+    let (block, _) = after.split_once("\n```\n").with_context(|| {
+        format!("packaged MCP documentation marker {name} has no closing fence")
+    })?;
+    Ok(block)
+}
+
+fn expected_documented_arguments(capabilities: &[DepgraphCapability]) -> Vec<String> {
+    let mut arguments = vec![
+        "--root".to_owned(),
+        DOCUMENTED_ROOT.to_owned(),
+        "--store".to_owned(),
+        DOCUMENTED_STORE.to_owned(),
+    ];
+    for capability in capabilities {
+        arguments.push("--capability".to_owned());
+        arguments.push(capability_cli_name(*capability).to_owned());
+    }
+    arguments.extend([
+        "--compiler-pack-requirement".to_owned(),
+        DOCUMENTED_REQUIREMENT.to_owned(),
+        "--log-level".to_owned(),
+        "warn".to_owned(),
+    ]);
+    arguments
+}
+
 pub fn verify(
+    workspace: &Path,
     extracted: &Path,
     target: &str,
     archive_sha256: &str,
@@ -162,6 +315,7 @@ pub fn verify(
     if !lowercase_sha256(archive_sha256) {
         bail!("packaged MCP smoke received a malformed archive digest");
     }
+    let documented_profiles = documented_launch_profiles(workspace, release_version)?;
 
     let temporary = tempfile::tempdir()?;
     let requirement = create_compiler_pack_requirement(temporary.path(), release_version)?;
@@ -177,7 +331,9 @@ pub fn verify(
         &read_root,
         &read_store,
         &requirement,
-        READ_CAPABILITIES,
+        documented_profiles
+            .get("read")
+            .context("packaged MCP documentation has no read profile")?,
     )?;
     let legacy_initialize = legacy.initialize(1, PROTOCOL_REVISIONS[0], false)?;
     initialization_sha256.insert(
@@ -202,7 +358,9 @@ pub fn verify(
             &read_root,
             &read_store,
             &requirement,
-            capabilities,
+            documented_profiles.get(profile_name).with_context(|| {
+                format!("packaged MCP documentation has no {profile_name} profile")
+            })?,
         )?;
         let initialize = mcp.initialize(10 + (index as u64 * 10), PROTOCOL_REVISIONS[1], false)?;
         if profile_name == "read" {
@@ -270,7 +428,12 @@ pub fn verify(
         "profile_catalog_sha256":profile_catalog_sha256
     }));
 
-    let durable = verify_durable_scan(extracted, temporary.path(), &requirement)?;
+    let durable = verify_durable_scan(
+        extracted,
+        temporary.path(),
+        &requirement,
+        &documented_profiles,
+    )?;
     let tool_schema_sha256 = sha256_file(&extracted.join(TOOL_SCHEMA_PATH))?;
     let report = McpPackageSmokeReport {
         schema_version: MCP_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
@@ -405,6 +568,7 @@ fn verify_durable_scan(
     extracted: &Path,
     temporary: &Path,
     requirement: &Path,
+    documented_profiles: &BTreeMap<String, DocumentedLaunchProfile>,
 ) -> Result<DurableScanEvidence> {
     let root = temporary.join("operation-fixture/repository");
     let store = temporary.join("operation-fixture/graph.sqlite");
@@ -418,7 +582,9 @@ fn verify_durable_scan(
         &root,
         &store,
         requirement,
-        STORE_WRITE_CAPABILITIES,
+        documented_profiles
+            .get("store-write")
+            .context("packaged MCP documentation has no store-write profile")?,
     )?;
     submit.initialize(100, PROTOCOL_REVISIONS[1], true)?;
     let started = Instant::now();
@@ -452,7 +618,9 @@ fn verify_durable_scan(
         &root,
         &store,
         requirement,
-        STORE_WRITE_CAPABILITIES,
+        documented_profiles
+            .get("store-write")
+            .context("packaged MCP documentation has no store-write profile")?,
     )?;
     reconnected.initialize(110, PROTOCOL_REVISIONS[1], true)?;
     let deadline = Instant::now() + OPERATION_DEADLINE;
@@ -505,8 +673,15 @@ fn verify_durable_scan(
     }
     reconnected.finish()?;
 
-    let mut read_only =
-        PackagedMcp::start(extracted, &root, &store, requirement, READ_CAPABILITIES)?;
+    let mut read_only = PackagedMcp::start(
+        extracted,
+        &root,
+        &store,
+        requirement,
+        documented_profiles
+            .get("read")
+            .context("packaged MCP documentation has no read profile")?,
+    )?;
     read_only.initialize(120, PROTOCOL_REVISIONS[1], false)?;
     let denied = read_only.call_tool(
         121,
@@ -763,26 +938,21 @@ impl PackagedMcp {
         root: &Path,
         store: &Path,
         requirement: &Path,
-        capabilities: &[DepgraphCapability],
+        documented_profile: &DocumentedLaunchProfile,
     ) -> Result<Self> {
         let executable = extracted.join("bin").join(executable_name("depgraph-mcp"));
         let mut command = Command::new(&executable);
         command
             .current_dir(extracted)
-            .arg("--root")
-            .arg(root)
-            .arg("--store")
-            .arg(store)
-            .arg("--compiler-pack-requirement")
-            .arg(requirement)
+            .args(render_documented_arguments(
+                documented_profile,
+                root,
+                store,
+                requirement,
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for capability in capabilities {
-            command
-                .arg("--capability")
-                .arg(capability_cli_name(*capability));
-        }
         for variable in [
             "DEPGRAPH_RUST_WORKER",
             "DEPGRAPH_GO_WORKER",
@@ -963,6 +1133,24 @@ impl PackagedMcp {
     }
 }
 
+fn render_documented_arguments(
+    profile: &DocumentedLaunchProfile,
+    root: &Path,
+    store: &Path,
+    requirement: &Path,
+) -> Vec<OsString> {
+    profile
+        .arguments
+        .iter()
+        .map(|argument| match argument.as_str() {
+            DOCUMENTED_ROOT => root.as_os_str().to_owned(),
+            DOCUMENTED_STORE => store.as_os_str().to_owned(),
+            DOCUMENTED_REQUIREMENT => requirement.as_os_str().to_owned(),
+            _ => OsString::from(argument),
+        })
+        .collect()
+}
+
 impl Drop for PackagedMcp {
     fn drop(&mut self) {
         if self.finished {
@@ -1127,6 +1315,40 @@ fn lowercase_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_host_documentation_profiles_are_exact_and_read_only_by_default() -> Result<()> {
+        verify_documentation(&crate::workspace_root(), crate::VERSION)
+    }
+
+    #[test]
+    fn agent_host_documentation_rejects_privileged_default_and_duplicate_markers() -> Result<()> {
+        let workspace = crate::workspace_root();
+        let temporary = tempfile::tempdir()?;
+        fs::create_dir_all(temporary.path().join("docs/50_test"))?;
+        let readme = fs::read_to_string(workspace.join("README.md"))?;
+        let runbook = fs::read_to_string(workspace.join(DOCUMENTATION_PATH))?;
+        fs::write(
+            temporary.path().join("README.md"),
+            readme.replacen(
+                "\"--capability\", \"read\",",
+                "\"--capability\", \"store-write\",",
+                1,
+            ),
+        )?;
+        fs::write(temporary.path().join(DOCUMENTATION_PATH), &runbook)?;
+        assert!(verify_documentation(temporary.path(), crate::VERSION).is_err());
+
+        fs::write(temporary.path().join("README.md"), &readme)?;
+        fs::write(
+            temporary.path().join(DOCUMENTATION_PATH),
+            format!(
+                "{runbook}\n<!-- depgraph-mcp-package-smoke:store-write -->\n```json\n{{}}\n```\n"
+            ),
+        )?;
+        assert!(verify_documentation(temporary.path(), crate::VERSION).is_err());
+        Ok(())
+    }
 
     #[test]
     fn profile_catalog_digests_are_closed_and_sorted() -> Result<()> {
