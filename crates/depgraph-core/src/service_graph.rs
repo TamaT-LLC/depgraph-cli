@@ -20,8 +20,8 @@ use crate::{
         traversal_page_items, traverse_bounded_filtered_cancellable,
     },
     service::{
-        DepgraphService, DepgraphServiceError, DepgraphServiceResult, ResolvedSnapshotId,
-        SnapshotReadRequest,
+        DepgraphService, DepgraphServiceError, DepgraphServiceResult, RepositoryPathSelector,
+        ResolvedSnapshotId, SnapshotReadRequest,
     },
     service_limits::{
         MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS,
@@ -1290,6 +1290,9 @@ fn validate_selector(selector: &str) -> DepgraphServiceResult<()> {
     {
         return Err(DepgraphServiceError::InvalidInput);
     }
+    if selector.starts_with("path:") {
+        RepositoryPathSelector::parse(selector)?;
+    }
     Ok(())
 }
 
@@ -1606,6 +1609,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn issue_317_path_selectors_use_the_portable_repository_path_contract() {
+        for selector in [
+            "path:src/lib.rs",
+            "path:generated/not-present.rs",
+            "id:path:src/lib.rs",
+            "symbol:crate::module",
+        ] {
+            validate_selector(selector)
+                .unwrap_or_else(|error| panic!("valid selector {selector:?}: {error:?}"));
+        }
+
+        for selector in [
+            "path:",
+            "path:/etc/passwd",
+            "path:../outside.rs",
+            "path:src/../../outside.rs",
+            r"path:C:\Windows\win.ini",
+            "path:C:/Windows/win.ini",
+            r"path:\\server\share\secret.rs",
+            "path:nested/file.rs:private",
+            "path:nested/CON.rs",
+            "path:nested/file.rs.",
+        ] {
+            assert!(
+                matches!(
+                    validate_selector(selector),
+                    Err(DepgraphServiceError::InvalidRepositoryPath { .. })
+                ),
+                "portable path selector accepted {selector:?}"
+            );
+        }
+    }
 
     #[test]
     fn changed_set_preprocessing_errors_map_to_resource_exhausted_with_cancellation_precedence() {

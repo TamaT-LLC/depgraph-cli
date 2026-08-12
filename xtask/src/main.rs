@@ -1423,6 +1423,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "process isolation: enforced",
         "`rust-compiler-invocation-child-signalled`",
         "`repeated_promotion_is_byte_stable_and_failure_rolls_back`",
+        "`mcp_security_matrix`",
+        "| MCP security matrix |",
         "The hostile gate fails if",
     ] {
         if !rust_compiler_hostile.contains(required) {
@@ -1432,6 +1434,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     for required in [
         "compiler-precise-hostile-e2e-v1",
         "enforced_hostile_boundary_denies_parent_secret_network_and_private_paths",
+        "cargo test --offline -p depgraph-mcp --test process --locked issue_317_",
+        "mcp-cli-capability-path-cancel-recovery-security-matrix",
+        "mcp_security_matrix",
         "unsafe[[:space:]]*\\{",
         "previous_completed_build_layer_preserved",
     ] {
@@ -1918,6 +1923,10 @@ open_questions: 0\n\
         "## Issue #316 resolve-build project-exec evidence",
         "`source_non_mutation_guaranteed=true`",
         "### Issue #316 acceptance mapping",
+        "| `#317` | 全CLI mapping、capability、path confinement、operation recovery、hostile project executionを横断検証する |",
+        "## Issue #317 cross-cutting security E2E evidence",
+        "baseline-only assertionには置き換えず",
+        "### Issue #317 acceptance mapping",
         "## Issue #292 acceptance mapping",
     ] {
         if !decision.contains(required) {
