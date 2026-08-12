@@ -47,6 +47,8 @@ use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
 pub const JOURNAL_SCHEMA_VERSION: i64 = 5;
+/// Portable durable-operation record and recovery contract shipped to Agent hosts.
+pub const OPERATION_CONTRACT_VERSION: &str = "depgraph-operation-v1";
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION: i64 = 3;

@@ -50,6 +50,31 @@ const CROSS_LANGUAGE_SBOM_PACKAGE_NAME: &str = "depgraph-cross-language-contract
 const CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID: &str = "release:polyglot";
 const CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
+const MCP_SERVER_NAME: &str = "depgraph-mcp";
+const MCP_SDK_NAME: &str = "rmcp";
+const MCP_SDK_VERSION: &str = "3.1.0";
+const MCP_MACROS_VERSION: &str = "3.1.2";
+const MCP_PROTOCOL_REVISION: &str = "2026-07-28";
+const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
+const MCP_OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
+const MCP_TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
+const MCP_TOOL_SCHEMA_BYTES: &[u8] =
+    include_bytes!("../../schemas/depgraph-mcp-tools-v1.schema.json");
+const MCP_APACHE_NOTICE: &str = "Apache-2.0 notice: rmcp 3.1.0 and rmcp-macros 3.1.2 are licensed under Apache-2.0; the complete Apache License 2.0 text is packaged as LICENSE-APACHE.";
+const MCP_SERVER_DIRECT_DEPENDENCIES: &[&str] = &[
+    "anyhow",
+    "chrono",
+    "clap",
+    "depgraph-core",
+    "depgraph-mcp-tools",
+    "depgraph-operation",
+    "rmcp",
+    "serde",
+    "serde_json",
+    "tokio",
+    "tracing",
+    "tracing-subscriber",
+];
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
     ("LICENSE-MIT", include_bytes!("../../LICENSE-MIT")),
@@ -63,6 +88,7 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
 ];
 const RELEASE_CARGO_BUILD_TARGETS: &[(&str, Option<&str>, Option<&str>)] = &[
     ("depgraph-cli", Some("depgraph"), Some("packaged")),
+    ("depgraph-mcp", Some("depgraph-mcp"), None),
     (
         "depgraph-operation",
         Some("depgraph-operation-runner"),
@@ -245,8 +271,10 @@ struct ReleaseManifest {
     license_expression: String,
     project_licenses: Vec<Artifact>,
     core: Artifact,
+    mcp_server: McpServerArtifact,
     operation_runner: OperationRunnerArtifact,
     schema: Artifact,
+    mcp_tool_schema: VersionedArtifact,
     query_fixture: Artifact,
     cross_language_fixture: Artifact,
     cross_language_schemas: Vec<Artifact>,
@@ -265,8 +293,31 @@ struct Artifact {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedArtifact {
+    contract_version: String,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct McpServerArtifact {
+    version: String,
+    path: String,
+    sha256: String,
+    sdk_name: String,
+    sdk_version: String,
+    protocol_revision: String,
+    tool_contract_version: String,
+    operation_contract_version: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OperationRunnerArtifact {
     version: String,
+    operation_contract_version: String,
     path: String,
     sha256: String,
 }
@@ -466,7 +517,15 @@ struct TargetVerificationReport {
     archive_sha256: String,
     release_manifest_sha256: String,
     sbom_sha256: String,
+    third_party_licenses_sha256: String,
     project_licenses: BTreeMap<String, String>,
+    mcp_server_sha256: String,
+    operation_runner_sha256: String,
+    mcp_tool_schema_sha256: String,
+    mcp_sdk_version: String,
+    mcp_protocol_revision: String,
+    mcp_tool_contract_version: String,
+    mcp_operation_contract_version: String,
     runtime_collector_sha256: String,
     rust_sysroot_sha256: String,
     framework_build_artifacts: BTreeMap<String, String>,
@@ -1326,6 +1385,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
         "depgraph runtime validate --file runtime-trace.json --json",
+        "Every archive includes the\nnative MCP server, durable operation runner, and versioned Agent tool/operation\nschema.",
+        "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
     ] {
         if !readme.contains(required) {
             bail!("README release metadata is missing {required:?}");
@@ -1927,6 +1988,11 @@ open_questions: 0\n\
         "## Issue #317 cross-cutting security E2E evidence",
         "baseline-only assertionには置き換えず",
         "### Issue #317 acceptance mapping",
+        "| `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める |",
+        "## Issue #318 five-target MCP release closure",
+        "`rmcp 3.1.0`とprotocol revision `2026-07-28`",
+        "stable gate schema 8の`mcp-five-target` check",
+        "### Issue #318 acceptance mapping",
         "## Issue #292 acceptance mapping",
     ] {
         if !decision.contains(required) {
@@ -2318,6 +2384,10 @@ fn package() -> Result<()> {
         &staging.join("bin").join(executable_name("depgraph")),
     )?;
     copy(
+        &release_dir.join(executable_name(MCP_SERVER_NAME)),
+        &staging.join("bin").join(executable_name(MCP_SERVER_NAME)),
+    )?;
+    copy(
         &release_dir.join(executable_name("depgraph-rust-worker")),
         &staging
             .join("libexec")
@@ -2359,6 +2429,11 @@ fn package() -> Result<()> {
         &staging.join("schemas/depgraph-protocol-v1.schema.json"),
     )?;
     let schema_path = staging.join("schemas/depgraph-protocol-v1.schema.json");
+    copy_lf_normalized_text(
+        Path::new(MCP_TOOL_SCHEMA_PATH),
+        &staging.join(MCP_TOOL_SCHEMA_PATH),
+    )?;
+    let mcp_tool_schema_path = staging.join(MCP_TOOL_SCHEMA_PATH);
     let query_fixture_path = staging.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
     copy_lf_normalized_text(
         Path::new(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
@@ -2409,6 +2484,7 @@ fn package() -> Result<()> {
         )?,
     ];
     let core_path = staging.join("bin").join(executable_name("depgraph"));
+    let mcp_server_path = staging.join("bin").join(executable_name(MCP_SERVER_NAME));
     let operation_runner_path = staging
         .join("libexec")
         .join(executable_name("depgraph-operation-runner"));
@@ -2424,10 +2500,16 @@ fn package() -> Result<()> {
             path: relative_slash(&staging, &core_path)?,
             sha256: sha256_file(&core_path)?,
         },
+        mcp_server: mcp_server_artifact(&mcp_server_path, &staging)?,
         operation_runner: operation_runner_artifact(&operation_runner_path, &staging)?,
         schema: Artifact {
             path: relative_slash(&staging, &schema_path)?,
             sha256: sha256_file(&schema_path)?,
+        },
+        mcp_tool_schema: VersionedArtifact {
+            contract_version: MCP_TOOL_CONTRACT_VERSION.to_owned(),
+            path: relative_slash(&staging, &mcp_tool_schema_path)?,
+            sha256: sha256_file(&mcp_tool_schema_path)?,
         },
         query_fixture: Artifact {
             path: relative_slash(&staging, &query_fixture_path)?,
@@ -2719,8 +2801,27 @@ fn operation_runner_artifact(path: &Path, staging: &Path) -> Result<OperationRun
     }
     Ok(OperationRunnerArtifact {
         version: VERSION.to_owned(),
+        operation_contract_version: MCP_OPERATION_CONTRACT_VERSION.to_owned(),
         path: relative_slash(staging, path)?,
         sha256: sha256_file(path)?,
+    })
+}
+
+fn mcp_server_artifact(path: &Path, staging: &Path) -> Result<McpServerArtifact> {
+    let output = Command::new(path).arg("--version").output()?;
+    let expected = format!("{MCP_SERVER_NAME} {VERSION}");
+    if !output.status.success() || String::from_utf8(output.stdout)?.trim() != expected {
+        bail!("MCP server version handshake failed");
+    }
+    Ok(McpServerArtifact {
+        version: VERSION.to_owned(),
+        path: relative_slash(staging, path)?,
+        sha256: sha256_file(path)?,
+        sdk_name: MCP_SDK_NAME.to_owned(),
+        sdk_version: MCP_SDK_VERSION.to_owned(),
+        protocol_revision: MCP_PROTOCOL_REVISION.to_owned(),
+        tool_contract_version: MCP_TOOL_CONTRACT_VERSION.to_owned(),
+        operation_contract_version: MCP_OPERATION_CONTRACT_VERSION.to_owned(),
     })
 }
 
@@ -2858,10 +2959,11 @@ fn third_party_licenses(target: &str) -> Result<String> {
         depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
         depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION,
     ));
+    notices.push(MCP_APACHE_NOTICE.to_owned());
     let notices = notices.join("\n");
     let rust_notice = rust_sysroot_license_notice();
     let mut output = format!(
-        "depgraph third-party license inventory\nGenerated from the Rust and Go runtime dependency graphs, the pinned Rust standard-library source tree, and the Web bundle/runtime artifact inventory.\n{notices}\n{rust_notice}\n{SBOM_SCOPE}\n\n{}\n",
+        "depgraph third-party license inventory\nGenerated from every shipped Rust executable (including the MCP server and durable operation runner), the Go runtime dependency graph, the pinned Rust standard-library source tree, and the Web bundle/runtime artifact inventory.\n{notices}\n{rust_notice}\n{SBOM_SCOPE}\n\n{}\n",
         entries.join("\n")
     );
     for (label, content) in web_legal_documents()? {
@@ -3497,6 +3599,7 @@ fn dependency_inventory(target: &str) -> Result<Vec<DependencyPackage>> {
         "depgraph-cli/packaged",
     ])?;
     verify_rust_analyzer_dependencies(&cargo)?;
+    verify_mcp_dependencies(&cargo)?;
     let mut packages = cargo_runtime_packages(&cargo)?;
 
     let go_output = Command::new("go")
@@ -3715,6 +3818,130 @@ fn verify_rust_analyzer_dependencies(metadata: &Value) -> Result<()> {
     Ok(())
 }
 
+fn verify_mcp_dependencies(metadata: &Value) -> Result<()> {
+    let packages = metadata["packages"]
+        .as_array()
+        .context("cargo metadata has no package inventory")?;
+    let mcp_servers = packages
+        .iter()
+        .filter(|package| package["name"] == "depgraph-mcp" && package["source"].is_null())
+        .collect::<Vec<_>>();
+    if mcp_servers.len() != 1 {
+        bail!(
+            "cargo metadata must contain exactly one local depgraph-mcp package, found {}",
+            mcp_servers.len()
+        );
+    }
+    let direct_dependencies = mcp_servers[0]["dependencies"]
+        .as_array()
+        .context("depgraph-mcp has no dependency inventory")?;
+    let actual_direct_dependencies = direct_dependencies
+        .iter()
+        .filter(|dependency| dependency["kind"].is_null())
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_direct_dependencies = MCP_SERVER_DIRECT_DEPENDENCIES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_direct_dependencies != expected_direct_dependencies {
+        bail!(
+            "depgraph-mcp direct dependency set must be exactly {expected_direct_dependencies:?}, found {actual_direct_dependencies:?}"
+        );
+    }
+    let rmcp_dependency = direct_dependencies
+        .iter()
+        .filter(|dependency| dependency["name"] == MCP_SDK_NAME)
+        .collect::<Vec<_>>();
+    if rmcp_dependency.len() != 1 {
+        bail!(
+            "depgraph-mcp must declare exactly one direct {MCP_SDK_NAME} dependency, found {}",
+            rmcp_dependency.len()
+        );
+    }
+    let rmcp_dependency = rmcp_dependency[0];
+    let features = rmcp_dependency["features"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if rmcp_dependency["req"] != format!("={MCP_SDK_VERSION}")
+        || !rmcp_dependency["kind"].is_null()
+        || !rmcp_dependency["rename"].is_null()
+        || rmcp_dependency["optional"] != Value::Bool(false)
+        || rmcp_dependency["uses_default_features"] != Value::Bool(false)
+        || features != BTreeSet::from(["macros", "server", "transport-io"])
+        || !rmcp_dependency["target"].is_null()
+        || !rmcp_dependency["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("registry+"))
+    {
+        bail!(
+            "depgraph-mcp must pin {MCP_SDK_NAME} ={MCP_SDK_VERSION} with exactly macros, server, and transport-io"
+        );
+    }
+
+    for (name, version) in [
+        (MCP_SDK_NAME, MCP_SDK_VERSION),
+        ("rmcp-macros", MCP_MACROS_VERSION),
+    ] {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0]["version"] != version
+            || matches[0]["license"] != "Apache-2.0"
+            || !matches[0]["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("registry+"))
+        {
+            bail!("resolved {name} package must be registry version {version} licensed Apache-2.0");
+        }
+    }
+
+    let rmcp_id = packages
+        .iter()
+        .find(|package| package["name"] == MCP_SDK_NAME)
+        .and_then(|package| package["id"].as_str())
+        .context("resolved rmcp package has no ID")?;
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .context("cargo metadata has no resolved dependency graph")?;
+    let rmcp_node = nodes
+        .iter()
+        .find(|node| node["id"] == rmcp_id)
+        .context("cargo metadata resolve graph has no rmcp node")?;
+    let resolved_features = rmcp_node["features"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if !["macros", "server", "transport-io"]
+        .iter()
+        .all(|feature| resolved_features.contains(feature))
+    {
+        bail!("resolved rmcp feature set omits the packaged MCP compatibility features");
+    }
+    let packages_by_id = packages
+        .iter()
+        .filter_map(|package| Some((package["id"].as_str()?, package["name"].as_str()?)))
+        .collect::<BTreeMap<_, _>>();
+    if !rmcp_node["deps"].as_array().is_some_and(|dependencies| {
+        dependencies.iter().any(|dependency| {
+            dependency["pkg"]
+                .as_str()
+                .and_then(|id| packages_by_id.get(id))
+                .is_some_and(|name| *name == "rmcp-macros")
+        })
+    }) {
+        bail!("resolved rmcp runtime closure is missing rmcp-macros");
+    }
+    Ok(())
+}
+
 fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyPackage>> {
     let packages = metadata["packages"]
         .as_array()
@@ -3733,7 +3960,12 @@ fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyPackage>> {
 
     // Every Rust executable shipped in the release archive must be a root so
     // its runtime-only dependencies are represented in licenses and the SBOM.
-    let root_names = ["depgraph-cli", "depgraph-rust-worker", "depgraph-operation"];
+    let root_names = [
+        "depgraph-cli",
+        "depgraph-rust-worker",
+        "depgraph-mcp",
+        "depgraph-operation",
+    ];
     let mut pending = VecDeque::new();
     for root_name in root_names {
         let roots = packages
@@ -4466,6 +4698,23 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     }
     if targets
         .iter()
+        .map(|target| {
+            (
+                target.mcp_tool_schema_sha256.as_str(),
+                target.mcp_sdk_version.as_str(),
+                target.mcp_protocol_revision.as_str(),
+                target.mcp_tool_contract_version.as_str(),
+                target.mcp_operation_contract_version.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        bail!("release targets do not share one MCP schema and compatibility unit");
+    }
+    if targets
+        .iter()
         .map(|target| &target.framework_build_artifacts)
         .collect::<BTreeSet<_>>()
         .len()
@@ -4496,7 +4745,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 7,
+            schema_version: 8,
             release_version: VERSION.to_owned(),
             tag: release_tag()?,
             protocol_version: "1.0".to_owned(),
@@ -4890,15 +5139,38 @@ fn evaluate_stable_release_gate(
                         })
                         .collect::<BTreeMap<_, _>>()
         });
+    let mcp_release_target_gate = release.targets.len() == RELEASE_TARGETS.len()
+        && release.targets.iter().all(|target| {
+            [
+                target.mcp_server_sha256.as_str(),
+                target.operation_runner_sha256.as_str(),
+                target.mcp_tool_schema_sha256.as_str(),
+                target.sbom_sha256.as_str(),
+                target.third_party_licenses_sha256.as_str(),
+            ]
+            .iter()
+            .all(|digest| lowercase_sha256(digest))
+                && target.mcp_sdk_version == MCP_SDK_VERSION
+                && target.mcp_protocol_revision == MCP_PROTOCOL_REVISION
+                && target.mcp_tool_contract_version == MCP_TOOL_CONTRACT_VERSION
+                && target.mcp_operation_contract_version == MCP_OPERATION_CONTRACT_VERSION
+        })
+        && release
+            .targets
+            .iter()
+            .map(|target| target.mcp_tool_schema_sha256.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == 1;
 
     let checks = vec![
         StableReleaseGateCheck {
             id: "release-identity".to_owned(),
-            passed: release.schema_version == 7
+            passed: release.schema_version == 8
                 && release.release_version == STABLE_RELEASE_VERSION
                 && supported_release_tag(&release.tag),
             evidence:
-                "release-verification.json schema 7 and an exact stable or canonical rc tag"
+                "release-verification.json schema 8 and an exact stable or canonical rc tag"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -4936,6 +5208,11 @@ fn evaluate_stable_release_gate(
             evidence:
                 "five native archives, checksums, manifests, SBOMs, licenses, and attestations"
                     .to_owned(),
+        },
+        StableReleaseGateCheck {
+            id: "mcp-five-target".to_owned(),
+            passed: mcp_release_target_gate,
+            evidence: "five native archives attest the MCP server, durable operation runner, versioned tool/operation schema, rmcp SDK, and MCP protocol revision".to_owned(),
         },
         StableReleaseGateCheck {
             id: "performance-budget".to_owned(),
@@ -5119,6 +5396,7 @@ fn verify_published_release_tree(
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
+        MCP_TOOL_SCHEMA_PATH,
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
         depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
@@ -5160,11 +5438,38 @@ fn verify_published_release_tree(
     if !expected_target.contains("windows") && !is_executable(&core)? {
         bail!("published release core is not executable");
     }
+    let expected_mcp_server = format!(
+        "bin/{}",
+        executable_name_for_target(MCP_SERVER_NAME, expected_target)
+    );
+    if manifest.mcp_server.version != VERSION
+        || manifest.mcp_server.path != expected_mcp_server
+        || manifest.mcp_server.sdk_name != MCP_SDK_NAME
+        || manifest.mcp_server.sdk_version != MCP_SDK_VERSION
+        || manifest.mcp_server.protocol_revision != MCP_PROTOCOL_REVISION
+        || manifest.mcp_server.tool_contract_version != MCP_TOOL_CONTRACT_VERSION
+        || manifest.mcp_server.operation_contract_version != MCP_OPERATION_CONTRACT_VERSION
+        || !artifact_paths.insert(manifest.mcp_server.path.as_str())
+    {
+        bail!("published release MCP server compatibility unit is incompatible or duplicated");
+    }
+    let mcp_server = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.mcp_server.path.clone(),
+            sha256: manifest.mcp_server.sha256.clone(),
+        },
+        "MCP server",
+    )?;
+    if !expected_target.contains("windows") && !is_executable(&mcp_server)? {
+        bail!("published release MCP server is not executable");
+    }
     let expected_operation_runner = format!(
         "libexec/{}",
         executable_name_for_target("depgraph-operation-runner", expected_target)
     );
     if manifest.operation_runner.version != VERSION
+        || manifest.operation_runner.operation_contract_version != MCP_OPERATION_CONTRACT_VERSION
         || manifest.operation_runner.path != expected_operation_runner
         || !artifact_paths.insert(manifest.operation_runner.path.as_str())
     {
@@ -5186,6 +5491,21 @@ fn verify_published_release_tree(
     }
     artifact_paths.insert(manifest.schema.path.as_str());
     verify_release_artifact(extracted, &manifest.schema, "schema")?;
+    if manifest.mcp_tool_schema.contract_version != MCP_TOOL_CONTRACT_VERSION
+        || manifest.mcp_tool_schema.path != MCP_TOOL_SCHEMA_PATH
+        || !artifact_paths.insert(manifest.mcp_tool_schema.path.as_str())
+    {
+        bail!("published release MCP tool schema compatibility unit is incompatible or duplicated");
+    }
+    let mcp_tool_schema = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.mcp_tool_schema.path.clone(),
+            sha256: manifest.mcp_tool_schema.sha256.clone(),
+        },
+        "MCP tool schema",
+    )?;
+    verify_mcp_tool_schema_bytes(&mcp_tool_schema, "published release")?;
     if manifest.query_fixture.path != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH {
         bail!("published release query fixture path does not match the query contract");
     }
@@ -5500,6 +5820,8 @@ fn verify_published_release_tree(
         "ra_ap_ide_db",
         "ra_ap_syntax",
         "ra_ap_vfs",
+        "rmcp",
+        "rmcp-macros",
         "salsa",
     ] {
         if !package_names.contains(required) {
@@ -5520,7 +5842,8 @@ fn verify_published_release_tree(
     {
         bail!("published release SBOM must contain one target TypeScript compiler");
     }
-    let third_party = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    let third_party_path = extracted.join("THIRD_PARTY_LICENSES.txt");
+    let third_party = fs::read_to_string(&third_party_path)?;
     if !third_party.starts_with("depgraph third-party license inventory\n")
         || !third_party.contains(&format!(
             "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
@@ -5536,6 +5859,7 @@ fn verify_published_release_tree(
             depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_CONTRACT_VERSION,
         ))
         || !third_party.contains(&rust_sysroot_license_notice())
+        || !third_party.lines().any(|line| line == MCP_APACHE_NOTICE)
         || PROJECT_LICENSES.iter().any(|(_, project_text)| {
             third_party
                 .as_bytes()
@@ -5544,6 +5868,27 @@ fn verify_published_release_tree(
         })
     {
         bail!("published third-party license inventory is missing or mixes project licenses");
+    }
+    for (name, version) in [
+        (MCP_SDK_NAME, MCP_SDK_VERSION),
+        ("rmcp-macros", MCP_MACROS_VERSION),
+    ] {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0]["versionInfo"] != version
+            || matches[0]["licenseDeclared"] != "Apache-2.0"
+        {
+            bail!(
+                "published release SBOM must contain exactly one cargo:{name} {version} licensed Apache-2.0"
+            );
+        }
+        let expected = format!("cargo:{name} {version} — Apache-2.0");
+        if !third_party.lines().any(|line| line == expected) {
+            bail!("published third-party license inventory is missing {expected}");
+        }
     }
     for (path, version) in depgraph_core::framework_build_capability_contract()
         .into_iter()
@@ -5582,7 +5927,15 @@ fn verify_published_release_tree(
         archive_sha256,
         release_manifest_sha256: sha256_file(&manifest_path)?,
         sbom_sha256: sha256_file(&sbom_path)?,
+        third_party_licenses_sha256: sha256_file(&third_party_path)?,
         project_licenses: verified_licenses,
+        mcp_server_sha256: manifest.mcp_server.sha256.clone(),
+        operation_runner_sha256: manifest.operation_runner.sha256.clone(),
+        mcp_tool_schema_sha256: manifest.mcp_tool_schema.sha256.clone(),
+        mcp_sdk_version: manifest.mcp_server.sdk_version.clone(),
+        mcp_protocol_revision: manifest.mcp_server.protocol_revision.clone(),
+        mcp_tool_contract_version: manifest.mcp_server.tool_contract_version.clone(),
+        mcp_operation_contract_version: manifest.mcp_server.operation_contract_version.clone(),
         runtime_collector_sha256,
         rust_sysroot_sha256,
         framework_build_artifacts,
@@ -6100,6 +6453,9 @@ fn verify_archive(
     #[cfg(unix)]
     verify_release_static_prelaunch_fails_closed(&extracted)?;
     let store = verify_root.join("gate.db");
+    // Doctor is intentionally read-only and must not create or migrate a store.
+    // Seed the package-smoke fixture explicitly before exercising that boundary.
+    drop(depgraph_store::Store::open(&store)?);
     let doctor = Command::new(&executable)
         .arg("--store")
         .arg(&store)
@@ -6126,20 +6482,13 @@ fn verify_archive(
             })
     });
     let release = &doctor["release"];
-    let runtime_healthy = release["runtime_integrity"]
-        .as_object()
-        .is_some_and(|artifacts| {
-            !artifacts.is_empty() && artifacts.values().all(|integrity| integrity == "verified")
-        });
     if doctor["protocol_version"] != "1.0"
         || release["core_integrity"] != "verified"
         || release["schema_integrity"] != "verified"
         || release["compatibility_integrity"] != "verified"
-        || release["compatibility"] != serde_json::to_value(release_compatibility())?
-        || !runtime_healthy
         || !workers_healthy
     {
-        bail!("packaged doctor did not verify all workers: {doctor}");
+        bail!("packaged doctor did not verify the public release and worker health: {doctor}");
     }
 
     let fixture = Path::new("workers/web/test/fixtures/polyglot").canonicalize()?;
@@ -7053,6 +7402,42 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         .sha256 = sha256_file(&worker_path)?;
 
     let verification = (|| -> Result<()> {
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&baseline)?)?;
+        for (scenario, path) in [
+            (
+                "MCP server",
+                extracted.join("bin").join(executable_name(MCP_SERVER_NAME)),
+            ),
+            ("MCP tool schema", extracted.join(MCP_TOOL_SCHEMA_PATH)),
+        ] {
+            let original_artifact = fs::read(&path)?;
+            for tampered in [false, true] {
+                if marker.exists() {
+                    fs::remove_file(&marker)?;
+                }
+                if tampered {
+                    fs::write(&path, b"tampered MCP release artifact")?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+                let result = verify_release_metadata(extracted);
+                fs::write(&path, &original_artifact)?;
+                if scenario == "MCP server" {
+                    restore_executable_permissions(&path)?;
+                }
+                if marker.exists() {
+                    bail!(
+                        "{scenario} mutation launched the Rust worker before static release validation"
+                    );
+                }
+                if result.is_ok() {
+                    bail!(
+                        "static release validation accepted {} {scenario}",
+                        if tampered { "tampered" } else { "missing" }
+                    );
+                }
+            }
+        }
         let mut cases = Vec::new();
 
         let mut manifest = baseline.clone();
@@ -7062,6 +7447,40 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         let mut manifest = baseline.clone();
         manifest.schema = manifest.core.clone();
         cases.push(("schema path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_server.path = manifest.core.path.clone();
+        manifest.mcp_server.sha256 = manifest.core.sha256.clone();
+        cases.push(("MCP server path mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_server.sdk_version = "3.2.0".to_owned();
+        cases.push(("MCP SDK version mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_server.protocol_revision = "2025-11-25".to_owned();
+        cases.push(("MCP protocol revision mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_server.tool_contract_version = "depgraph-mcp-tools-v2".to_owned();
+        cases.push(("MCP tool contract mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_server.operation_contract_version = "depgraph-operation-v2".to_owned();
+        cases.push(("MCP operation contract mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.operation_runner.operation_contract_version = "depgraph-operation-v2".to_owned();
+        cases.push(("operation runner contract mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_tool_schema.contract_version = "depgraph-mcp-tools-v2".to_owned();
+        cases.push(("MCP tool schema contract mismatch", manifest));
+
+        let mut manifest = baseline.clone();
+        manifest.mcp_tool_schema.path = manifest.schema.path.clone();
+        manifest.mcp_tool_schema.sha256 = manifest.schema.sha256.clone();
+        cases.push(("MCP tool schema path mismatch", manifest));
 
         let mut manifest = baseline.clone();
         manifest.query_fixture = manifest.schema.clone();
@@ -11407,6 +11826,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "THIRD_PARTY_LICENSES.txt",
         "sbom.spdx.json",
         "schemas/depgraph-protocol-v1.schema.json",
+        MCP_TOOL_SCHEMA_PATH,
         depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH,
         depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH,
     ] {
@@ -11515,9 +11935,32 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if core != expected_core || !is_executable(&core)? {
         bail!("release manifest core must be the packaged executable");
     }
+    let expected_mcp_server_path = format!("bin/{}", executable_name(MCP_SERVER_NAME));
+    if manifest.mcp_server.version != VERSION
+        || manifest.mcp_server.path != expected_mcp_server_path
+        || manifest.mcp_server.sdk_name != MCP_SDK_NAME
+        || manifest.mcp_server.sdk_version != MCP_SDK_VERSION
+        || manifest.mcp_server.protocol_revision != MCP_PROTOCOL_REVISION
+        || manifest.mcp_server.tool_contract_version != MCP_TOOL_CONTRACT_VERSION
+        || manifest.mcp_server.operation_contract_version != MCP_OPERATION_CONTRACT_VERSION
+    {
+        bail!("release manifest MCP server compatibility unit is incompatible");
+    }
+    let mcp_server = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.mcp_server.path.clone(),
+            sha256: manifest.mcp_server.sha256.clone(),
+        },
+        "MCP server",
+    )?;
+    if !is_executable(&mcp_server)? {
+        bail!("release manifest MCP server must be executable");
+    }
     let expected_operation_runner_path =
         format!("libexec/{}", executable_name("depgraph-operation-runner"));
     if manifest.operation_runner.version != VERSION
+        || manifest.operation_runner.operation_contract_version != MCP_OPERATION_CONTRACT_VERSION
         || manifest.operation_runner.path != expected_operation_runner_path
     {
         bail!("release manifest operation runner metadata is incompatible");
@@ -11537,6 +11980,20 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         bail!("release manifest schema path does not match the packaged protocol schema");
     }
     verify_release_artifact(extracted, &manifest.schema, "schema")?;
+    if manifest.mcp_tool_schema.contract_version != MCP_TOOL_CONTRACT_VERSION
+        || manifest.mcp_tool_schema.path != MCP_TOOL_SCHEMA_PATH
+    {
+        bail!("release manifest MCP tool schema compatibility unit is incompatible");
+    }
+    let mcp_tool_schema = verify_release_artifact(
+        extracted,
+        &Artifact {
+            path: manifest.mcp_tool_schema.path.clone(),
+            sha256: manifest.mcp_tool_schema.sha256.clone(),
+        },
+        "MCP tool schema",
+    )?;
+    verify_mcp_tool_schema_bytes(&mcp_tool_schema, "release manifest")?;
     let expected_runtime_paths = WEB_RUNTIME_ARTIFACTS
         .iter()
         .map(|name| format!("libexec/{name}"))
@@ -11782,6 +12239,8 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "ra_ap_ide_db",
         "ra_ap_syntax",
         "ra_ap_vfs",
+        "rmcp",
+        "rmcp-macros",
         "rusqlite",
         "salsa",
         "salsa-macro-rules",
@@ -11893,6 +12352,33 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     )) {
         bail!("license inventory is missing the cross-language project license notice");
     }
+    if !license_inventory
+        .lines()
+        .any(|line| line == MCP_APACHE_NOTICE)
+    {
+        bail!("license inventory is missing the rmcp Apache-2.0 notice");
+    }
+    for (name, version) in [
+        (MCP_SDK_NAME, MCP_SDK_VERSION),
+        ("rmcp-macros", MCP_MACROS_VERSION),
+    ] {
+        let matches = packages
+            .iter()
+            .filter(|package| package["name"] == name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0]["versionInfo"] != version
+            || matches[0]["licenseDeclared"] != "Apache-2.0"
+        {
+            bail!(
+                "release SBOM must contain exactly one cargo:{name} {version} licensed Apache-2.0"
+            );
+        }
+        let expected = format!("cargo:{name} {version} — Apache-2.0");
+        if !license_inventory.lines().any(|line| line == expected) {
+            bail!("third-party license inventory is missing {expected}");
+        }
+    }
     for (name, version, license) in [
         ("@astrojs/compiler", "4.0.0", "MIT"),
         ("typescript", TYPESCRIPT_VERSION, "Apache-2.0"),
@@ -12001,6 +12487,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         )?,
         "release",
     )?;
+    verify_packaged_mcp_handshake(extracted, &manifest.mcp_server)?;
     let rust_worker = manifest
         .workers
         .iter()
@@ -12028,6 +12515,19 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             .context("release manifest Web worker has no semantic compatibility unit")?,
     )?;
     Ok(manifest)
+}
+
+fn verify_packaged_mcp_handshake(extracted: &Path, server: &McpServerArtifact) -> Result<()> {
+    let server_path = verified_release_path(extracted, &server.path, "MCP server")?;
+    let output = Command::new(&server_path).arg("--version").output()?;
+    let expected = format!("{MCP_SERVER_NAME} {}", server.version);
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || String::from_utf8(output.stdout)?.trim() != expected
+    {
+        bail!("packaged MCP server version handshake failed");
+    }
+    Ok(())
 }
 
 fn verify_packaged_rust_handshake(
@@ -12129,6 +12629,15 @@ fn verify_release_artifact(
         );
     }
     Ok(path)
+}
+
+fn verify_mcp_tool_schema_bytes(path: &Path, context: &str) -> Result<()> {
+    if fs::read(path)? != MCP_TOOL_SCHEMA_BYTES {
+        bail!(
+            "{context} MCP tool schema differs from the compiled {MCP_TOOL_CONTRACT_VERSION} contract"
+        );
+    }
+    Ok(())
 }
 
 fn verified_release_path(extracted: &Path, declared: &str, description: &str) -> Result<PathBuf> {
@@ -12515,23 +13024,25 @@ mod tests {
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
-        PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS, RELEASE_TARGETS,
-        RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
+        MCP_OPERATION_CONTRACT_VERSION, MCP_PROTOCOL_REVISION, MCP_SDK_VERSION,
+        MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
+        RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleaseVerificationReport, STABLE_BENCHMARK_METRICS, STABLE_RELEASE_BASELINE_COMMIT,
         STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
         StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
         WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_runtime_packages,
-        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
-        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
-        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
-        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
-        rust_backend_from_handshake, rustc_source_identity, stable_release_baseline_digest,
-        target_native_smoke_expectation, validate_bounded_query_package_smoke,
-        validate_cross_language_package_smoke, verify_checksum_sidecar,
-        verify_cross_language_package_smoke, verify_github_actions_security,
-        verify_local_markdown_links, verify_mcp_tasks_architecture_decision,
-        verify_packaged_cross_language, verify_pinned_rust_sysroot_digest, verify_project_metadata,
+        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_metadata,
+        cargo_runtime_packages, compiler_pack_identity_binding, create_tar_archive,
+        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
+        extract_archive, github_settings_verify, has_windows_executable_extension,
+        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
+        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
+        stable_release_baseline_digest, target_native_smoke_expectation,
+        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
+        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_github_actions_security, verify_local_markdown_links, verify_mcp_dependencies,
+        verify_mcp_tasks_architecture_decision, verify_packaged_cross_language,
+        verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
         verify_rust_analyzer_dependencies, verify_rust_backend, verify_security_disclosure_dry_run,
         verify_stable_release_source_guard, verify_web_semantic_attestation,
@@ -13104,7 +13615,15 @@ jobs:
             archive_sha256: "a".repeat(64),
             release_manifest_sha256: "b".repeat(64),
             sbom_sha256: "c".repeat(64),
+            third_party_licenses_sha256: "d".repeat(64),
             project_licenses: BTreeMap::new(),
+            mcp_server_sha256: "0".repeat(64),
+            operation_runner_sha256: "1".repeat(64),
+            mcp_tool_schema_sha256: "2".repeat(64),
+            mcp_sdk_version: MCP_SDK_VERSION.to_owned(),
+            mcp_protocol_revision: MCP_PROTOCOL_REVISION.to_owned(),
+            mcp_tool_contract_version: MCP_TOOL_CONTRACT_VERSION.to_owned(),
+            mcp_operation_contract_version: MCP_OPERATION_CONTRACT_VERSION.to_owned(),
             runtime_collector_sha256: "d".repeat(64),
             rust_sysroot_sha256: "e".repeat(64),
             framework_build_artifacts: BTreeMap::new(),
@@ -13134,7 +13653,7 @@ jobs:
                 .collect(),
         };
         let mut release = ReleaseVerificationReport {
-            schema_version: 7,
+            schema_version: 8,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -13287,6 +13806,27 @@ jobs:
         missing_target.targets.pop();
         assert_eq!(
             evaluate(&missing_target, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut mcp_sdk_drift = release.clone();
+        mcp_sdk_drift.targets[0].mcp_sdk_version = "3.2.0".to_owned();
+        assert_eq!(
+            evaluate(&mcp_sdk_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut mcp_schema_drift = release.clone();
+        mcp_schema_drift.targets[0].mcp_tool_schema_sha256 = "f".repeat(64);
+        assert_eq!(
+            evaluate(&mcp_schema_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut malformed_mcp_binary_digest = release.clone();
+        malformed_mcp_binary_digest.targets[0].mcp_server_sha256 = "not-a-digest".to_owned();
+        assert_eq!(
+            evaluate(&malformed_mcp_binary_digest, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
@@ -13489,6 +14029,7 @@ jobs:
             RELEASE_CARGO_BUILD_TARGETS,
             [
                 ("depgraph-cli", Some("depgraph"), Some("packaged")),
+                ("depgraph-mcp", Some("depgraph-mcp"), None),
                 (
                     "depgraph-operation",
                     Some("depgraph-operation-runner"),
@@ -14041,11 +14582,13 @@ jobs:
             "packages": [
                 {"id":"cli","name":"depgraph-cli","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"worker","name":"depgraph-rust-worker","version":"0.1.0","source":null,"license":"MIT"},
+                {"id":"mcp","name":"depgraph-mcp","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"operation","name":"depgraph-operation","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"internal","name":"depgraph-core","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"xtask","name":"xtask","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"runtime","name":"runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"runner-runtime","name":"runner-runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
+                {"id":"mcp-runtime","name":"mcp-runtime-crate","version":"1.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"build","name":"bundled-source-build","version":"2.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"dev","name":"test-only","version":"3.0.0","source":"registry+test","license":"MIT"},
                 {"id":"spdx","name":"spdx","version":"4.0.0","source":"registry+test","license":"MIT"}
@@ -14057,11 +14600,13 @@ jobs:
                     {"pkg":"dev","dep_kinds":[{"kind":"dev"}]}
                 ]},
                 {"id":"worker","deps":[{"pkg":"runtime","dep_kinds":[{"kind":null}]}]},
+                {"id":"mcp","deps":[{"pkg":"mcp-runtime","dep_kinds":[{"kind":null}]}]},
                 {"id":"operation","deps":[{"pkg":"runner-runtime","dep_kinds":[{"kind":null}]}]},
                 {"id":"internal","deps":[{"pkg":"build","dep_kinds":[{"kind":"build"}]}]},
                 {"id":"xtask","deps":[{"pkg":"spdx","dep_kinds":[{"kind":null}]}]},
                 {"id":"runtime","deps":[]},
                 {"id":"runner-runtime","deps":[]},
+                {"id":"mcp-runtime","deps":[]},
                 {"id":"build","deps":[]},
                 {"id":"dev","deps":[]},
                 {"id":"spdx","deps":[]}
@@ -14075,9 +14620,45 @@ jobs:
             names,
             std::collections::BTreeSet::from([
                 "runner-runtime-crate".to_owned(),
+                "mcp-runtime-crate".to_owned(),
                 "runtime-crate".to_owned(),
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_sdk_dependency_contract_is_locked_and_version_drift_closed() -> Result<()> {
+        let metadata = cargo_metadata(&["--features", "depgraph-cli/packaged"])?;
+        verify_mcp_dependencies(&metadata)?;
+
+        let mut version_drift = metadata.clone();
+        version_drift["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|package| package["name"] == "rmcp")
+            .unwrap()["version"] = json!("3.2.0");
+        assert!(verify_mcp_dependencies(&version_drift).is_err());
+
+        let mut missing_macros = metadata.clone();
+        missing_macros["packages"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|package| package["name"] != "rmcp-macros");
+        assert!(verify_mcp_dependencies(&missing_macros).is_err());
+
+        let mut direct_dependency_drift = metadata;
+        direct_dependency_drift["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|package| package["name"] == "depgraph-mcp")
+            .unwrap()["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|dependency| dependency["name"] != "rmcp");
+        assert!(verify_mcp_dependencies(&direct_dependency_drift).is_err());
         Ok(())
     }
 

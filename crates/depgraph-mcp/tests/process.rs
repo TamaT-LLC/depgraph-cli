@@ -3495,6 +3495,22 @@ fn issue_300_handler_maps_oversized_utf8_query_to_a_typed_error() {
 }
 
 #[test]
+fn version_handshake_is_fixed_and_requires_no_repository_configuration() {
+    let binary = AssertCommand::cargo_bin("depgraph-mcp").unwrap();
+    let output = Command::new(binary.get_program())
+        .args(binary.get_args())
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("depgraph-mcp {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn startup_parse_failure_is_redacted_and_stdout_is_empty() {
     let binary = AssertCommand::cargo_bin("depgraph-mcp").unwrap();
     let output = Command::new(binary.get_program())
