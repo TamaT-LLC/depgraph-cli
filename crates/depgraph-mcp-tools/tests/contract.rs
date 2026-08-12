@@ -297,6 +297,10 @@ fn resolve_build_outcome_requires_explicit_host_risk_and_enforced_guarantees() {
     let outcome: AgentBuildOutcome = serde_json::from_value(valid.clone()).unwrap();
     assert!(outcome.project_code_executed());
     assert!(!outcome.source_non_mutation_guaranteed());
+    assert_eq!(
+        outcome.snapshot_id().map(SnapshotId::as_str),
+        Some(SNAPSHOT_ID)
+    );
     assert!(outcome.host_risk().human_confirmation_required());
     assert!(outcome.host_risk().acknowledgement_is_not_authorization());
 
@@ -306,6 +310,17 @@ fn resolve_build_outcome_requires_explicit_host_risk_and_enforced_guarantees() {
     assert!(
         contract
             .deserialize(serde_json::to_value(&envelope).unwrap())
+            .is_ok()
+    );
+
+    let mut audit_only_value = valid.clone();
+    audit_only_value["snapshot_id"] = serde_json::Value::Null;
+    let audit_only: AgentBuildOutcome = serde_json::from_value(audit_only_value).unwrap();
+    assert!(audit_only.snapshot_id().is_none());
+    let audit_only_envelope = SuccessEnvelope::new(parse("repo-1"), None, audit_only);
+    assert!(
+        contract
+            .deserialize(serde_json::to_value(&audit_only_envelope).unwrap())
             .is_ok()
     );
 
@@ -329,6 +344,12 @@ fn resolve_build_outcome_requires_explicit_host_risk_and_enforced_guarantees() {
     let mut missing_best_effort_diagnostic = valid;
     missing_best_effort_diagnostic["mutation_diagnostics"] = json!([]);
     assert!(serde_json::from_value::<AgentBuildOutcome>(missing_best_effort_diagnostic).is_err());
+
+    let mut snapshotless_cache_reuse = serde_json::to_value(build_outcome()).unwrap();
+    snapshotless_cache_reuse["project_execution"] = json!("cache_reused");
+    snapshotless_cache_reuse["project_code_executed"] = json!(false);
+    snapshotless_cache_reuse["snapshot_id"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<AgentBuildOutcome>(snapshotless_cache_reuse).is_err());
 }
 
 #[test]

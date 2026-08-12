@@ -123,6 +123,13 @@ fn issue_316_shared_schema_closes_build_outcome_and_host_risk() {
         definitions["AgentBuildOutcome"]["properties"]["mutation_diagnostics"]["maxItems"],
         depgraph_mcp_tools::MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS
     );
+    assert!(
+        definitions["AgentBuildOutcome"]["properties"]["snapshot_id"]["anyOf"]
+            .as_array()
+            .expect("build snapshot ID is nullable")
+            .iter()
+            .any(|branch| branch["type"] == "null")
+    );
     assert_eq!(
         definitions["AgentBuildHostRisk"]["required"],
         json!([

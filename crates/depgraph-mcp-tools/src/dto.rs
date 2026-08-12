@@ -936,7 +936,7 @@ pub struct AgentBuildOutcome {
     source_non_mutation_guaranteed: bool,
     #[schemars(length(max = MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS))]
     mutation_diagnostics: Vec<AgentBuildMutationDiagnostic>,
-    snapshot_id: SnapshotId,
+    snapshot_id: Option<SnapshotId>,
     host_risk: AgentBuildHostRisk,
 }
 
@@ -977,8 +977,8 @@ impl AgentBuildOutcome {
     }
 
     #[must_use]
-    pub const fn snapshot_id(&self) -> &SnapshotId {
-        &self.snapshot_id
+    pub fn snapshot_id(&self) -> Option<&SnapshotId> {
+        self.snapshot_id.as_ref()
     }
 
     #[must_use]
@@ -994,6 +994,8 @@ impl AgentBuildOutcome {
                 && self.isolation_strength != AgentBuildIsolationStrength::Enforced)
             || (self.project_execution == AgentProjectExecution::CacheReused
                 && self.project_code_executed)
+            || (self.project_execution == AgentProjectExecution::CacheReused
+                && self.snapshot_id.is_none())
             || (self.isolation_strength == AgentBuildIsolationStrength::BestEffort
                 && !self.mutation_diagnostics.contains(
                     &AgentBuildMutationDiagnostic::BestEffortIsolationDoesNotPreventSourceMutation,
@@ -1016,7 +1018,7 @@ struct AgentBuildOutcomeWire {
     network_isolation: AgentBuildNetworkIsolation,
     source_non_mutation_guaranteed: bool,
     mutation_diagnostics: Vec<AgentBuildMutationDiagnostic>,
-    snapshot_id: SnapshotId,
+    snapshot_id: Option<SnapshotId>,
     host_risk: AgentBuildHostRisk,
 }
 
@@ -1098,11 +1100,10 @@ impl TryFrom<&depgraph_core::service::ResolveBuildServiceOutcome> for AgentBuild
             network_isolation,
             source_non_mutation_guaranteed: audit.source_mutation.non_mutation_guaranteed,
             mutation_diagnostics,
-            snapshot_id: parse_agent_value(
-                source
-                    .completed_snapshot_id()
-                    .ok_or(ContractBuildError::AgentDtoValue)?,
-            )?,
+            snapshot_id: source
+                .completed_snapshot_id()
+                .map(parse_agent_value)
+                .transpose()?,
             host_risk: AgentBuildHostRisk {
                 human_confirmation_required: true,
                 acknowledgement_is_not_authorization: true,

@@ -1735,8 +1735,6 @@ fn execute_resolve_build_submit(
     let requirement = read_compiler_pack_requirement(compiler_pack_requirement)
         .and_then(|requirement| verify_compiler_pack(&requirement).map(|pack| (requirement, pack)))
         .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
-    let service = DepgraphService::new(config.clone());
-    service.resolve_snapshot_id_cancellable(&SnapshotLocator::Current, cancellation)?;
     let normalized_input = serde_json::json!({
         "acknowledgement": true,
         "compiler_pack_manifest_sha256": requirement.1.attestation.manifest_sha256,

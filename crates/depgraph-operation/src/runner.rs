@@ -2114,13 +2114,6 @@ impl ScanOperationDispatcher {
         if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
             return DispatchOutcome::Cancelled;
         }
-        let service = DepgraphService::new(self.config.clone());
-        let cancellation = CancellationToken::new();
-        if let Err(error) =
-            service.resolve_snapshot_id_cancellable(&SnapshotLocator::Current, &cancellation)
-        {
-            return self.failed_service(&error);
-        }
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2128,6 +2121,8 @@ impl ScanOperationDispatcher {
             Ok(runtime) => runtime,
             Err(_) => return self.failed(AgentErrorCode::Internal),
         };
+        let service = DepgraphService::new(self.config.clone());
+        let cancellation = CancellationToken::new();
         let request = ResolveBuildRequest::new(true, true, Some(requirement));
         let execution = service.resolve_build_cancellable(&request, &cancellation);
         tokio::pin!(execution);
@@ -2266,16 +2261,12 @@ impl ScanOperationDispatcher {
     ) -> Result<CanonicalJson, CanonicalJson> {
         let outcome = AgentBuildOutcome::try_from(source)
             .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
-        let snapshot_id = outcome.snapshot_id().clone();
+        let snapshot_id = outcome.snapshot_id().cloned();
         let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
             .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
         CanonicalJson::new(
-            serde_json::to_value(SuccessEnvelope::new(
-                repository_id,
-                Some(snapshot_id),
-                outcome,
-            ))
-            .expect("closed build output serializes"),
+            serde_json::to_value(SuccessEnvelope::new(repository_id, snapshot_id, outcome))
+                .expect("closed build output serializes"),
         )
         .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
     }

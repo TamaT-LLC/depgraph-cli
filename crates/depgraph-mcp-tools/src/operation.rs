@@ -108,7 +108,7 @@ impl PortableTerminalOutputContract {
             Self::ResolveBuildSubmit => {
                 let envelope = serde_json::from_value::<SuccessEnvelope<AgentBuildOutcome>>(value)
                     .map_err(|_| PortableTerminalOutputError)?;
-                if envelope.snapshot_id() != Some(envelope.result().snapshot_id()) {
+                if envelope.snapshot_id() != envelope.result().snapshot_id() {
                     return Err(PortableTerminalOutputError);
                 }
                 Ok(PortableTerminalOutput(
