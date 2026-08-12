@@ -10,6 +10,8 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../crates/depgraph-core" }
+depgraph-mcp-tools = { path = "../crates/depgraph-mcp-tools" }
+depgraph-operation = { path = "../crates/depgraph-operation" }
 depgraph-protocol = { path = "../crates/depgraph-protocol" }
 depgraph-store = { path = "../crates/depgraph-store" }
 flate2 = "1.1"

@@ -86,6 +86,13 @@ gh release view "$release_tag"
 ```
 
 Releaseはquality、benchmark、hostile E2E、通常archive、compiler pack、aggregate reportを検証する。
+通常archiveの各5 targetには`bin/depgraph-mcp`（Windowsは`.exe`）、
+`libexec/depgraph-operation-runner`（Windowsは`.exe`）、
+`schemas/depgraph-mcp-tools-v1.schema.json`が含まれる。`release-manifest.json`は
+両binaryとschemaのSHA-256、tool/operation contract、`rmcp 3.1.0`、MCP revision
+`2026-07-28`をattestし、SBOMとthird-party inventoryはrmcp dependency closureと
+Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-target` checkは、
+欠損、改変、version drift、target間schema driftを拒否する。
 すべてのgateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 

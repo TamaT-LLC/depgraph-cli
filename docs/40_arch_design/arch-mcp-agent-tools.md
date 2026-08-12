@@ -94,6 +94,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#315` | daemon start/stopを共有serviceとdurable MCP operationへ接続する | `Read + StoreWrite + DaemonControl`の閉じたprofile、verified sibling executableのshellなし起動、running/stopped publication後のcompletion intent promotion、closed `AgentDaemonControlOutcome`、idempotency/cancel/restart recoveryで固定する |
 | `#316` | resolve buildを共有project-exec serviceとdurable MCP operationへ接続する | `Read + StoreWrite + ProjectExec`の閉じたprofile、`acknowledgement=true`、起動時に再検証したcompiler-pack requirement、staged/neutral supervised execution、source postflight、closed `AgentBuildOutcome`、lease喪失後の非再実行で固定する |
 | `#317` | 全CLI mapping、capability、path confinement、operation recovery、hostile project executionを横断検証する | real clap leafとcatalog actionのone-to-one検証、全static profileの実`tools/list` exact matrix、全durable kindのdenied cancel不変性、portable path/symlink/reparse/credential/forged-operation corpus、Tasks/baseline reconnect既存E2E、およびLinux hostile gateのsource/external canary digestで固定する |
+| `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める | `depgraph-mcp`とrunnerのnative binary、`depgraph-mcp-tools-v1` schema、rmcp compatibility unit、SPDX/license/Apache notice、archive digest、aggregate attestationをfail-closed verifierで固定する |
 
 ## Upstream and API evidence
 
@@ -671,6 +672,34 @@ baseline-only assertionには置き換えず、Tasksとportable baselineの両re
 | 全file input/outputと`path:` selector confinement | combined stdio lexical/symlink/prompt corpus、core portable path unit、Unix symlinkとWindows reparse service tests |
 | disconnect/restartとhostile invariant | scan/import/export/daemon/buildの既存idempotency/reconnect/runner suites、Tasks/baseline matrix、dedicated namespace hostile source/external canary assertions |
 | repository validation | issue-317 focused suites、compiler-precise hostile gate、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #318 five-target MCP release closure
+
+Issue [#318](https://github.com/TamaT-LLC/depgraph-cli/issues/318)は、MCP serverとdurable
+operation runnerを既存の5 target native archiveへ追加し、runtime binary、versioned
+schema、SDK/protocol metadata、SBOM、license、aggregate attestationを一つのrelease
+compatibility unitとして閉じる。Issue本文の旧`NFR-007`と`AC-012`は現在の
+[Requirement traceability](#requirement-traceability)表に存在しないため、本節のrelease
+closureとfail-closed acceptance evidenceへ対応付ける。
+
+| Release boundary | Frozen behavior and evidence |
+| --- | --- |
+| Native artifact closure | 全targetで`depgraph-mcp`を`bin/`、`depgraph-operation-runner`を`libexec/`へ配置する。両binaryはworkspace release versionを報告し、manifestは各archive内の実bytesのlowercase SHA-256を保持する。target違いのnative binary digest同一性は要求せず、各targetのchecksum bindingを要求する |
+| Tool/operation contract | `schemas/depgraph-mcp-tools-v1.schema.json`をLF-normalized bytesで配布し、tool contract `depgraph-mcp-tools-v1`とportable operation contract `depgraph-operation-v1`をMCP server、runner、schema metadataで相互に固定する。この単一schema catalogはoperation handle、recovery tools、Tasks additive result、全terminal operation outcomeを含む |
+| SDK/protocol compatibility | MCP server manifestはSDK `rmcp 3.1.0`とprotocol revision `2026-07-28`をexact valueでattestする。Cargo metadata gateはserverのdirect dependency set、`rmcp =3.1.0`のdefault-off `macros/server/transport-io` features、lockfileで解決した`rmcp-macros 3.1.2`を検証し、version/feature/dependency driftを拒否する |
+| SPDX and legal closure | shipped Rust executableのruntime reachability rootへMCP serverを追加し、rmcp、rmcp-macros、server direct dependencyとtransitive closureをSPDX 2.3 SBOMおよびthird-party inventoryへ含める。両rmcp packageはApache-2.0としてexactに記録し、専用noticeはarchive rootの完全な`LICENSE-APACHE`を参照する |
+| Aggregate attestation | target reportはMCP server、runner、schema digestとSDK/protocol/tool/operation versionを保持する。5 target aggregateは共通schema digestと互換性metadataの一致を要求し、stable gate schema 8の`mcp-five-target` checkが全digest形式とexact versionを再検証する |
+| Fail-closed verification | archive required-file gate、manifest closed deserialization、path confinement、regular/executable bit、actual digest、local binary handshake、locked SBOM/license regenerationを順に検証する。MCP binary/schemaの欠損・改変、SDK/protocol/tool/operation version drift、schema path/contract driftはworker process開始前に拒否する |
+
+### Issue #318 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| 5 targetすべてに二binaryとversioned schema | release build matrix、exact archive paths、required-file/manifest checks、target report digest fields |
+| manifest checksumとarchive bytesが一致 | `verify_release_artifact`によるMCP server、runner、schema SHA-256再計算とnative executable check |
+| rmcp closure、license、Apache notice | Cargo runtime-root traversal、locked SBOM exact regeneration、rmcp/rmcp-macros exact package assertions、`LICENSE-APACHE` source equality、dedicated notice |
+| 欠損・改変・version driftを拒否 | static prelaunch mutation corpus、closed manifest type、Cargo metadata drift unit、aggregate schema-8 MCP gate |
+| repository validation | Rust 1.93.1 format、focused xtask/MCP/operation tests、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

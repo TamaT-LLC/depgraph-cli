@@ -131,7 +131,11 @@ impl From<LogLevel> for tracing::level_filters::LevelFilter {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "depgraph-mcp", about = "depgraph MCP server over stdio")]
+#[command(
+    name = "depgraph-mcp",
+    version,
+    about = "depgraph MCP server over stdio"
+)]
 struct Args {
     /// Existing repository directory to analyze.
     #[arg(long)]
@@ -3959,6 +3963,13 @@ async fn main() -> ExitCode {
     let stderr = BoundedStderr::new();
     let args = match Args::try_parse() {
         Ok(args) => args,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion => {
+            let version = format!("depgraph-mcp {}\n", env!("CARGO_PKG_VERSION"));
+            if io::stdout().write_all(version.as_bytes()).is_err() {
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::SUCCESS;
+        }
         Err(_) => {
             stderr.write_message(STARTUP_ERROR);
             return ExitCode::FAILURE;
