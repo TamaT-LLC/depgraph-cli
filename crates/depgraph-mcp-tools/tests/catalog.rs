@@ -90,6 +90,7 @@ fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
         "export_file",
         "daemon_start_submit",
         "daemon_stop",
+        "resolve_build_submit",
     ] {
         let schema =
             &catalog.tool(tool_name).unwrap().input_schema()["properties"]["idempotency_key"];
@@ -104,6 +105,56 @@ fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
     assert!(IdempotencyKey::parse("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)).is_err());
     assert!(IdempotencyKey::parse("has\u{0000}control").is_err());
     assert!(IdempotencyKey::parse("has\u{0085}control").is_err());
+}
+
+#[test]
+fn resolve_build_requires_acknowledgement_exact_mode_and_project_exec_authority() {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    let build = catalog.tool("resolve_build_submit").unwrap();
+    assert_eq!(
+        build.input_schema()["required"],
+        serde_json::json!([
+            "contract_version",
+            "repository_id",
+            "idempotency_key",
+            "acknowledgement",
+            "rust_compiler_precise"
+        ])
+    );
+    assert_eq!(
+        build.required_capabilities(),
+        &[
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::ProjectExec,
+        ]
+    );
+    assert_eq!(
+        build.input_schema()["properties"]["acknowledgement"]["type"],
+        "boolean"
+    );
+    let acknowledgement_description =
+        build.input_schema()["properties"]["acknowledgement"]["description"]
+            .as_str()
+            .unwrap();
+    assert!(acknowledgement_description.contains("must be true"));
+    assert!(acknowledgement_description.contains("does not grant authorization"));
+
+    let input = Value::Object(build.input_schema().clone());
+    let validator = jsonschema::draft202012::new(&input).unwrap();
+    let valid = serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "idempotency_key": "build-1",
+        "acknowledgement": true,
+        "rust_compiler_precise": true
+    });
+    assert!(validator.is_valid(&valid));
+    for missing in ["acknowledgement", "rust_compiler_precise"] {
+        let mut invalid = valid.clone();
+        invalid.as_object_mut().unwrap().remove(missing);
+        assert!(!validator.is_valid(&invalid));
+    }
 }
 
 #[test]

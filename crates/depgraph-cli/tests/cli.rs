@@ -3396,6 +3396,88 @@ fn consented_build_mode_runs_project_code_only_in_the_supervised_staging_area() 
         .stderr(predicate::str::contains("does not exist"));
 }
 
+#[test]
+fn best_effort_build_detects_original_source_mutation_and_rejects_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    let mutation = root.path().join("SOURCE_MUTATED_BY_BUILD");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='source-mutation-fixture'\nversion='0.1.0'\nedition='2024'\nbuild='build.rs'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"source-mutation-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        root.path().join("build.rs"),
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"mutated\").unwrap(); }}\n",
+            mutation
+        ),
+    )
+    .unwrap();
+    seed_safe_rust_scan(&store_path, root.path(), "Cargo.toml");
+    let original_snapshot_id = depgraph_store::Store::open(&store_path)
+        .unwrap()
+        .current_snapshot_id()
+        .unwrap()
+        .unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::contains("status: SecurityFailed"))
+        .stdout(predicate::str::contains("project code executed: true"))
+        .stdout(predicate::str::contains(
+            "source non-mutation guaranteed: false",
+        ))
+        .stdout(predicate::str::contains(
+            "diagnostic: project-source-mutation-detected",
+        ));
+
+    assert!(
+        mutation.exists(),
+        "the fixture did not mutate the original source"
+    );
+    let store = depgraph_store::Store::open(&store_path).unwrap();
+    assert_eq!(
+        store.current_snapshot_id().unwrap().as_deref(),
+        Some(original_snapshot_id.as_str())
+    );
+    assert_eq!(store.cache_entry_counts().unwrap().build, 0);
+    let audit = store.latest_build_audit().unwrap().unwrap();
+    assert_eq!(audit.audit["outcome"], "security_failed");
+    assert_eq!(audit.audit["isolation"], "best-effort");
+    assert_eq!(audit.audit["source_mutation"]["status"], "changed");
+    assert_eq!(
+        audit.audit["source_mutation"]["diagnostic"],
+        "source_tree_changed"
+    );
+    assert_eq!(
+        audit.audit["source_mutation"]["non_mutation_guaranteed"],
+        false
+    );
+    assert_eq!(
+        store.build_attempt(&audit.run_id).unwrap().unwrap().status,
+        "security_failed"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
@@ -3408,7 +3490,7 @@ fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let store_path = cache.path().join("graph.db");
-    let ready = root.path().join("BUILD_READY");
+    let ready = cache.path().join("BUILD_READY");
     fs::write(
         root.path().join("Cargo.toml"),
         "[package]\nname='cancel-fixture'\nversion='0.1.0'\nedition='2024'\n",

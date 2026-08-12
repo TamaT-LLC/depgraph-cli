@@ -58,6 +58,17 @@ fn repository(config: &DepgraphServiceConfig) -> LogicalRepositoryId {
     LogicalRepositoryId::parse(config.logical_repository_id()).unwrap()
 }
 
+#[test]
+fn project_exec_startup_rejects_an_unverified_compiler_pack_requirement() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let missing = root.path().join("missing-compiler-pack-requirement.json");
+    assert!(matches!(
+        RunnerStartupConfig::new_with_compiler_pack_requirement(config, missing),
+        Err(depgraph_operation::RunnerError::InvalidStartupAuthority)
+    ));
+}
+
 #[derive(Clone)]
 struct CountingDispatcher {
     calls: Arc<AtomicUsize>,

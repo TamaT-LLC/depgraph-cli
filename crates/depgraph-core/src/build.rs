@@ -800,6 +800,56 @@ impl BuildIsolation {
     }
 }
 
+/// Postflight result for the immutable project-source boundary.
+///
+/// An unchanged digest is only a guarantee when the child was also confined by
+/// an enforced supervisor boundary. On best-effort hosts it is evidence of no
+/// detected mutation, not proof that mutation was impossible.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSourceMutationStatus {
+    Unchanged,
+    Changed,
+    PostflightFailed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSourceMutationDiagnostic {
+    SourceTreeChanged,
+    SourcePostflightUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildSourceMutationAudit {
+    pub status: BuildSourceMutationStatus,
+    pub non_mutation_guaranteed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<BuildSourceMutationDiagnostic>,
+}
+
+impl BuildSourceMutationAudit {
+    fn from_postflight(isolation: BuildIsolation, before: &str, after: Result<String>) -> Self {
+        match after {
+            Ok(after) if after == before => Self {
+                status: BuildSourceMutationStatus::Unchanged,
+                non_mutation_guaranteed: isolation == BuildIsolation::EnforcedLinuxNamespace,
+                diagnostic: None,
+            },
+            Ok(_) => Self {
+                status: BuildSourceMutationStatus::Changed,
+                non_mutation_guaranteed: false,
+                diagnostic: Some(BuildSourceMutationDiagnostic::SourceTreeChanged),
+            },
+            Err(_) => Self {
+                status: BuildSourceMutationStatus::PostflightFailed,
+                non_mutation_guaranteed: false,
+                diagnostic: Some(BuildSourceMutationDiagnostic::SourcePostflightUnavailable),
+            },
+        }
+    }
+}
+
 const fn compiler_precise_isolation() -> BuildIsolation {
     if cfg!(target_os = "linux") {
         BuildIsolation::EnforcedLinuxNamespace
@@ -838,6 +888,8 @@ pub struct BuildAudit {
     pub stderr_limit_bytes: usize,
     pub network_policy: String,
     pub network_isolation: NetworkIsolation,
+    pub isolation: BuildIsolation,
+    pub source_mutation: BuildSourceMutationAudit,
     pub isolation_diagnostic: Option<String>,
     pub started_at: String,
     pub finished_at: String,
@@ -892,6 +944,7 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
+    let source_preflight_digest = fingerprint_build_source(&source_root)?.0;
     let compiler_precise_stage = matches!(
         plan.adapter.as_str(),
         COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
@@ -1327,6 +1380,27 @@ where
     } else {
         None
     };
+    let source_mutation = BuildSourceMutationAudit::from_postflight(
+        plan.isolation,
+        &source_preflight_digest,
+        fingerprint_build_source(&source_root).map(|fingerprints| fingerprints.0),
+    );
+    if source_mutation.status != BuildSourceMutationStatus::Unchanged {
+        outcome = BuildOutcomeKind::SecurityFailed;
+        diagnostic_code = Some(
+            match source_mutation.status {
+                BuildSourceMutationStatus::Changed => "project-source-mutation-detected",
+                BuildSourceMutationStatus::PostflightFailed => "project-source-postflight-failed",
+                BuildSourceMutationStatus::Unchanged => unreachable!("handled by outer condition"),
+            }
+            .to_owned(),
+        );
+        rust_cargo_unit_graph = None;
+        rust_compiler_invocation_ledger = None;
+        rust_compiler_mir_ledger = None;
+        rust_observation = None;
+        web_observation = None;
+    }
     let finished_wall = Utc::now();
     let audit = BuildAudit {
         schema_version: BUILD_SUPERVISOR_VERSION.to_owned(),
@@ -1350,6 +1424,8 @@ where
         stderr_limit_bytes: plan.stderr_limit_bytes,
         network_policy: "deny".to_owned(),
         network_isolation,
+        isolation: plan.isolation,
+        source_mutation,
         isolation_diagnostic,
         started_at: started_wall.to_rfc3339_opts(SecondsFormat::Millis, true),
         finished_at: finished_wall.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -3259,9 +3335,10 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
     #[tokio::test]
     async fn timeout_and_cancel_stop_descendants() -> Result<()> {
         let root = tempfile::tempdir()?;
+        let markers = tempfile::tempdir()?;
         let escaped_marker =
-            serde_json::to_string(&root.path().join("DESCENDANT_SURVIVED").to_string_lossy())?;
-        let ready_marker = root.path().join("CANCELLATION_READY");
+            serde_json::to_string(&markers.path().join("DESCENDANT_SURVIVED").to_string_lossy())?;
+        let ready_marker = markers.path().join("CANCELLATION_READY");
         let escaped_ready = serde_json::to_string(&ready_marker.to_string_lossy())?;
         let descendant = format!(
             "setTimeout(() => require('node:fs').writeFileSync({escaped_marker}, 'unsafe'), 1500); setInterval(() => {{}}, 1000);"
@@ -3304,7 +3381,7 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             Some("build-cancelled")
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(!root.path().join("DESCENDANT_SURVIVED").exists());
+        assert!(!markers.path().join("DESCENDANT_SURVIVED").exists());
         Ok(())
     }
 

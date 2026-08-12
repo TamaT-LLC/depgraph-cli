@@ -31,6 +31,7 @@ pub use crate::service_bounded::{
     RuntimeTraceSourcePrevalidation, RuntimeTraceSourceRequest, RuntimeValidateRequest,
     RuntimeValidateServiceResult, ServiceSnapshotSelector,
 };
+pub use crate::service_build::{ResolveBuildRequest, ResolveBuildServiceOutcome};
 pub use crate::service_graph::{
     CyclesRequest, CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection,
     ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
@@ -757,6 +758,11 @@ pub enum DepgraphServiceError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("project execution failed: {source}")]
+    ProjectExecution {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("policy input is invalid")]
     PolicyInput,
     #[error("requested service resource was not found")]
@@ -807,6 +813,7 @@ impl DepgraphServiceError {
             | Self::BoundedQueryInput { .. }
             | Self::RuntimeTraceInput { .. }
             | Self::PolicyInput => DepgraphServiceErrorCategory::Input,
+            Self::ProjectExecution { .. } => DepgraphServiceErrorCategory::Integrity,
             Self::RepositoryFile { reason } => reason.category(),
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict | Self::StoreWriterConflict => DepgraphServiceErrorCategory::Conflict,
@@ -839,6 +846,10 @@ impl DepgraphServiceError {
 
     pub fn graph_query(source: anyhow::Error) -> Self {
         Self::GraphQuery { source }
+    }
+
+    pub fn project_execution(source: anyhow::Error) -> Self {
+        Self::ProjectExecution { source }
     }
 }
 

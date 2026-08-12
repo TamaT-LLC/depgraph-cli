@@ -7,7 +7,7 @@ status: Active
 upstream: [PROJ-ARC-001]
 downstream: []
 owner: TakehiroT
-updated: 2026-08-07
+updated: 2026-08-12
 open_questions: 0
 ---
 
@@ -36,6 +36,7 @@ additive extensionとして採用するかを決定する。
 | Runtime store-write | `runtime_trace_import_submit` | Issue #313 implemented through prevalidated durable operation and atomic runtime-snapshot promotion |
 | Repository write | `repository_init`, `export_file` | Issue #314 implemented through fixed-root/no-follow service writes and durable atomic file publication |
 | Daemon control | `daemon_start_submit`, `daemon_stop` | Issue #315 implemented through shared lifecycle services and durable verified-process orchestration |
+| Project execution | `resolve_build_submit` | Issue #316 implemented through the shared build service, verified compiler-pack startup authority, and the existing supervised staging boundary |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -90,6 +91,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#313` | runtime trace importを共有store-write serviceとdurable MCP operationへ接続する | existing validation/matching/delta boundary、writer lock、deferred completion intent、atomic runtime snapshot promotion、closed `AgentRuntimeOutcome`、idempotency/cancel/restart recoveryで固定する |
 | `#314` | fixed-root initとrepository-relative file exportを共有repository-write serviceとdurable MCP operationへ接続する | root seal、portable relative path、handle-relative no-follow traversal、same-directory staged fsync/atomic publication、destination precondition、graph store・operation journal・SQLite sidecar・runner purge lockのprotected-state拒否、no-follow/delete-share制約付きrunner guard、closed `AgentExportOutcome`、capability gating、idempotency/cancel/restart recoveryで固定する |
 | `#315` | daemon start/stopを共有serviceとdurable MCP operationへ接続する | `Read + StoreWrite + DaemonControl`の閉じたprofile、verified sibling executableのshellなし起動、running/stopped publication後のcompletion intent promotion、closed `AgentDaemonControlOutcome`、idempotency/cancel/restart recoveryで固定する |
+| `#316` | resolve buildを共有project-exec serviceとdurable MCP operationへ接続する | `Read + StoreWrite + ProjectExec`の閉じたprofile、`acknowledgement=true`、起動時に再検証したcompiler-pack requirement、staged/neutral supervised execution、source postflight、closed `AgentBuildOutcome`、lease喪失後の非再実行で固定する |
 
 ## Upstream and API evidence
 
@@ -608,6 +610,36 @@ Issue本文に残る旧`FR-005/008/009/010`、`NFR-008`、`AC-003/013/014/018`�
 | PID、absolute executable、raw status pathを返さない | closed outcome constructor/Serde/schema/contract tests、real process result redaction assertion |
 | 不足capabilityでretry/cancelできない | journal/manager capability-digest reauthorization tests、MCP downgraded-server process tests |
 | idempotency、restart recovery、cancel、concurrent request | same-key real process replay、completion-intent recovery、operation cancellation、daemon lifecycle lock/concurrent-start tests |
+| repository validation | Rust 1.93.1 format、focused core/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #316 resolve-build project-exec evidence
+
+Issue [#316](https://github.com/TamaT-LLC/depgraph-cli/issues/316)は既存の
+`resolve --build` orchestrationを共有`DepgraphService`へ移し、
+`resolve_build_submit`をdurable operation runnerへ接続する。Issue本文に残る旧要件IDは
+現在の[Requirement traceability](#requirement-traceability)表と一致しない。本実装は
+`FR-010`（durable handle）、`NFR-001`（bounds/cancel）、`NFR-003`（restart recovery）、
+`NFR-005`（host-private情報の非公開）、`AC-014`（baseline/Tasks recovery）、
+`AC-015`（CLI/MCP shared-service parity）および`#316`行へ対応付ける。
+
+| Boundary | Frozen behavior and evidence |
+| --- | --- |
+| Shared project-exec service | CLIとoperation runnerは同じ`DepgraphService::resolve_build_cancellable`を呼ぶ。serviceは`Read + StoreWrite + ProjectExec`をStore open、tool probe、staging、child creationより前に検査し、`acknowledgement=false`を同じpre-mutation位置で拒否する。acknowledgementは既に行われた判断の記録であり、capabilityもAgent hostの独立した人間確認も付与・代替しない |
+| Startup compiler authority | MCP serverはbounded regular compiler-pack requirementを起動時に読み、pack manifest・host・target・release checksum bindingを検証する。launcherはそのcanonical requirement pathだけをverified sibling runnerへ渡し、runnerは起動時に再読・再検証する。journalにはabsolute pathではなく検証済みmanifest SHA-256だけを保持し、dispatch直前にもstartup authorityと一致させる |
+| Supervised execution | runnerは既存supervisorのstaged workspace、`env_clear`後のallowlist、run-owned output/cache/home/temp、process-tree termination、timeout、cooperative cancellationを使用する。build auditとattemptはStore writer lock内で一度だけ記録し、completed evidenceだけをbase snapshotへatomic promotionする。cancelled/failed/security-failed buildはcurrent snapshotとbuild cacheを更新しない |
+| Source mutation boundary | supervisorは実行前後にadmitted original source treeをfingerprintする。postflightの一致に加えて`EnforcedLinuxNamespace`が報告された場合だけ`source_non_mutation_guaranteed=true`である。best-effort hostは一致しても保証せず、`best_effort_isolation_does_not_prevent_source_mutation`を公開diagnosticへ必ず含める。変更検出またはpostflight不能は`security_failed`となり、typed auditへ`source_tree_changed`または`source_postflight_unavailable`を記録してevidence/cacheを破棄する |
+| Closed Agent outcome | `AgentBuildOutcome`はbuild ID、closed status、executed/cache-reused、project-code execution、isolation/network strength、source guarantee、最大4件のtyped mutation diagnostics、存在する場合のcompleted snapshot ID、closed host-risk flagsだけを公開する。base scanがないaudit-only buildではoutcomeとenvelopeのsnapshot IDをともに`null`とする。absolute root、command、environment、raw child stream、compiler-pack path、journal inputは公開しない。Deserializerは人間確認責任とacknowledgement非認可をtrueに固定し、best-effortで保証をclaimするpayloadを拒否する |
+| Durable failure semantics | project-exec operationがleaseを喪失した場合、journalは外部実行状態を証明できないterminal failureへ進め、handoffをreclaimせず自動再実行しない。request cancel/deadline/lease lossはrunner checkpointから同じservice cancellation tokenへ伝播し、child process treeの終了後だけoperationをcancelledにする |
+
+### Issue #316 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| user拒否、capability不足、acknowledgement=falseでchildを開始しない | CLI consent regression、core missing-capability/false-ack marker test、MCP false-ack missing-store/journal stdio test |
+| acknowledgementがstartup capabilityまたは人間確認を代替しない | capability closure、required tool schema、runner startup compiler-pack verification、`AgentBuildHostRisk` semantic validation tests |
+| source非変更保証はenforced + successful postflightだけ | supervisor source fingerprint audit、DTO guarantee invariant、schema/Serde tests |
+| best-effort違反はtyped audit、lease喪失後は非再実行 | original-source mutation build-script CLI test、security-failed attempt/cache/snapshot assertions、journal/runner lost-lease terminal tests |
+| staged/neutral/process-tree/timeout/cancel/atomic attempt | existing build supervisor hostile/cancellation tests、shared service regression、operation runner checkpoints |
 | repository validation | Rust 1.93.1 format、focused core/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping

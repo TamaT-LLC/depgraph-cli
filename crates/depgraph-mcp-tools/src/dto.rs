@@ -28,6 +28,7 @@ pub const MAX_AGENT_QUERY_TEXT_BYTES: usize = depgraph_core::MAX_QUERY_BYTES;
 pub const MAX_AGENT_QUERY_VALUES: usize = depgraph_core::MAX_QUERY_PROJECTIONS;
 pub const MAX_AGENT_ARTIFACT_ITEMS: usize = depgraph_core::service::MAX_SHARED_ARTIFACT_ITEMS;
 pub const MAX_AGENT_CHANGED_FIELDS: usize = 256;
+pub const MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS: usize = 4;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -849,6 +850,271 @@ impl TryFrom<&depgraph_core::service::ScanServiceOutcome> for AgentScanOutcome {
             cache,
             AgentCoverage::try_from(&outcome.coverage)?,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBuildStatus {
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+    SecurityFailed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProjectExecution {
+    Executed,
+    CacheReused,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBuildIsolationStrength {
+    BestEffort,
+    Enforced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBuildNetworkIsolation {
+    BestEffort,
+    Enforced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBuildMutationDiagnostic {
+    BestEffortIsolationDoesNotPreventSourceMutation,
+    SourceTreeChanged,
+    SourcePostflightUnavailable,
+}
+
+/// Agent-host responsibilities that an acknowledgement cannot replace.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBuildHostRisk {
+    human_confirmation_required: bool,
+    acknowledgement_is_not_authorization: bool,
+    source_mutation_possible: bool,
+    network_access_possible: bool,
+}
+
+impl AgentBuildHostRisk {
+    #[must_use]
+    pub const fn human_confirmation_required(self) -> bool {
+        self.human_confirmation_required
+    }
+
+    #[must_use]
+    pub const fn acknowledgement_is_not_authorization(self) -> bool {
+        self.acknowledgement_is_not_authorization
+    }
+
+    #[must_use]
+    pub const fn source_mutation_possible(self) -> bool {
+        self.source_mutation_possible
+    }
+
+    #[must_use]
+    pub const fn network_access_possible(self) -> bool {
+        self.network_access_possible
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBuildOutcome {
+    build_id: AgentId,
+    status: AgentBuildStatus,
+    project_execution: AgentProjectExecution,
+    project_code_executed: bool,
+    isolation_strength: AgentBuildIsolationStrength,
+    network_isolation: AgentBuildNetworkIsolation,
+    source_non_mutation_guaranteed: bool,
+    #[schemars(length(max = MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS))]
+    mutation_diagnostics: Vec<AgentBuildMutationDiagnostic>,
+    snapshot_id: Option<SnapshotId>,
+    host_risk: AgentBuildHostRisk,
+}
+
+impl AgentBuildOutcome {
+    #[must_use]
+    pub const fn build_id(&self) -> &AgentId {
+        &self.build_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentBuildStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn project_execution(&self) -> AgentProjectExecution {
+        self.project_execution
+    }
+
+    #[must_use]
+    pub const fn project_code_executed(&self) -> bool {
+        self.project_code_executed
+    }
+
+    #[must_use]
+    pub const fn isolation_strength(&self) -> AgentBuildIsolationStrength {
+        self.isolation_strength
+    }
+
+    #[must_use]
+    pub const fn source_non_mutation_guaranteed(&self) -> bool {
+        self.source_non_mutation_guaranteed
+    }
+
+    #[must_use]
+    pub fn mutation_diagnostics(&self) -> &[AgentBuildMutationDiagnostic] {
+        &self.mutation_diagnostics
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> Option<&SnapshotId> {
+        self.snapshot_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn host_risk(&self) -> AgentBuildHostRisk {
+        self.host_risk
+    }
+
+    fn validate(&self) -> Result<(), ContractBuildError> {
+        if self.mutation_diagnostics.len() > MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS
+            || !self.host_risk.human_confirmation_required
+            || !self.host_risk.acknowledgement_is_not_authorization
+            || (self.source_non_mutation_guaranteed
+                && self.isolation_strength != AgentBuildIsolationStrength::Enforced)
+            || (self.project_execution == AgentProjectExecution::CacheReused
+                && self.project_code_executed)
+            || (self.project_execution == AgentProjectExecution::CacheReused
+                && self.snapshot_id.is_none())
+            || (self.isolation_strength == AgentBuildIsolationStrength::BestEffort
+                && !self.mutation_diagnostics.contains(
+                    &AgentBuildMutationDiagnostic::BestEffortIsolationDoesNotPreventSourceMutation,
+                ))
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentBuildOutcomeWire {
+    build_id: AgentId,
+    status: AgentBuildStatus,
+    project_execution: AgentProjectExecution,
+    project_code_executed: bool,
+    isolation_strength: AgentBuildIsolationStrength,
+    network_isolation: AgentBuildNetworkIsolation,
+    source_non_mutation_guaranteed: bool,
+    mutation_diagnostics: Vec<AgentBuildMutationDiagnostic>,
+    snapshot_id: Option<SnapshotId>,
+    host_risk: AgentBuildHostRisk,
+}
+
+impl<'de> Deserialize<'de> for AgentBuildOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentBuildOutcomeWire::deserialize(deserializer)?;
+        let outcome = Self {
+            build_id: wire.build_id,
+            status: wire.status,
+            project_execution: wire.project_execution,
+            project_code_executed: wire.project_code_executed,
+            isolation_strength: wire.isolation_strength,
+            network_isolation: wire.network_isolation,
+            source_non_mutation_guaranteed: wire.source_non_mutation_guaranteed,
+            mutation_diagnostics: wire.mutation_diagnostics,
+            snapshot_id: wire.snapshot_id,
+            host_risk: wire.host_risk,
+        };
+        outcome.validate().map_err(D::Error::custom)?;
+        Ok(outcome)
+    }
+}
+
+impl TryFrom<&depgraph_core::service::ResolveBuildServiceOutcome> for AgentBuildOutcome {
+    type Error = ContractBuildError;
+
+    fn try_from(
+        source: &depgraph_core::service::ResolveBuildServiceOutcome,
+    ) -> Result<Self, Self::Error> {
+        let execution = source.execution();
+        let audit = &execution.audit;
+        let status = match audit.outcome {
+            depgraph_core::BuildOutcomeKind::Completed => AgentBuildStatus::Completed,
+            depgraph_core::BuildOutcomeKind::Failed => AgentBuildStatus::Failed,
+            depgraph_core::BuildOutcomeKind::TimedOut => AgentBuildStatus::TimedOut,
+            depgraph_core::BuildOutcomeKind::Cancelled => AgentBuildStatus::Cancelled,
+            depgraph_core::BuildOutcomeKind::SecurityFailed => AgentBuildStatus::SecurityFailed,
+        };
+        let project_execution = if source.cache_reused() {
+            AgentProjectExecution::CacheReused
+        } else {
+            AgentProjectExecution::Executed
+        };
+        let isolation_strength = match audit.isolation {
+            depgraph_core::BuildIsolation::BestEffort => AgentBuildIsolationStrength::BestEffort,
+            depgraph_core::BuildIsolation::EnforcedLinuxNamespace => {
+                AgentBuildIsolationStrength::Enforced
+            }
+        };
+        let network_isolation = match audit.network_isolation {
+            depgraph_core::NetworkIsolation::BestEffort => AgentBuildNetworkIsolation::BestEffort,
+            depgraph_core::NetworkIsolation::Enforced => AgentBuildNetworkIsolation::Enforced,
+        };
+        let mut mutation_diagnostics = Vec::with_capacity(2);
+        if isolation_strength == AgentBuildIsolationStrength::BestEffort {
+            mutation_diagnostics.push(
+                AgentBuildMutationDiagnostic::BestEffortIsolationDoesNotPreventSourceMutation,
+            );
+        }
+        if let Some(diagnostic) = audit.source_mutation.diagnostic {
+            mutation_diagnostics.push(match diagnostic {
+                depgraph_core::BuildSourceMutationDiagnostic::SourceTreeChanged => {
+                    AgentBuildMutationDiagnostic::SourceTreeChanged
+                }
+                depgraph_core::BuildSourceMutationDiagnostic::SourcePostflightUnavailable => {
+                    AgentBuildMutationDiagnostic::SourcePostflightUnavailable
+                }
+            });
+        }
+        let outcome = Self {
+            build_id: parse_agent_value(&audit.run_id)?,
+            status,
+            project_execution,
+            project_code_executed: execution.project_code_executed,
+            isolation_strength,
+            network_isolation,
+            source_non_mutation_guaranteed: audit.source_mutation.non_mutation_guaranteed,
+            mutation_diagnostics,
+            snapshot_id: source
+                .completed_snapshot_id()
+                .map(parse_agent_value)
+                .transpose()?,
+            host_risk: AgentBuildHostRisk {
+                human_confirmation_required: true,
+                acknowledgement_is_not_authorization: true,
+                source_mutation_possible: isolation_strength
+                    == AgentBuildIsolationStrength::BestEffort,
+                network_access_possible: network_isolation
+                    == AgentBuildNetworkIsolation::BestEffort,
+            },
+        };
+        outcome.validate()?;
+        Ok(outcome)
     }
 }
 

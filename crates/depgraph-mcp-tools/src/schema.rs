@@ -5,17 +5,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentChangedSince, AgentCompletedSnapshot, AgentContext, AgentCorrelationDifference,
-    AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
-    AgentDaemonControlOutcome, AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor,
-    AgentEdge, AgentEvidence, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
-    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse,
-    AgentPathStep, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
-    AgentRepositoryInitOutcome, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
-    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
-    SuccessEnvelope, TaskAccepted,
+    AgentBuildOutcome, AgentChangedSince, AgentCompletedSnapshot, AgentContext,
+    AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot,
+    AgentCycle, AgentCycleLevel, AgentDaemonControlOutcome, AgentDaemonStatus,
+    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
+    AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentOperation, AgentPathResponse, AgentPathStep, AgentPolicyEvaluationResponse,
+    AgentProfilePlan, AgentQueryRow, AgentQueryValue, AgentRepositoryInitOutcome,
+    AgentRuntimeOutcome, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentScanOutcome,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest,
+    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
+    PortableTerminalOutput, SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -55,6 +55,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<SuccessEnvelope<AgentProfilePlan>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDaemonStatus>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDaemonControlOutcome>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentBuildOutcome>>(),
             generator.subschema_for::<SuccessEnvelope<AgentScanOutcome>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDoctor>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDependenciesResponse>>(),
@@ -111,6 +112,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentOperation>(),
             generator.subschema_for::<AgentScanOutcome>(),
             generator.subschema_for::<AgentDaemonControlOutcome>(),
+            generator.subschema_for::<AgentBuildOutcome>(),
             generator.subschema_for::<AgentSnapshot>(),
         ];
         json_schema!({

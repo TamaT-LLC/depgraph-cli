@@ -4825,6 +4825,60 @@ fn tools_list_is_profile_filtered_static_sorted_and_repeatable() {
 }
 
 #[test]
+fn issue_316_resolve_build_rejects_false_acknowledgement_before_store_or_journal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("must-not-exist.sqlite");
+    fs::create_dir(&root).unwrap();
+    let config = operation_service_config(
+        &root,
+        &store_path,
+        [
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::ProjectExec,
+        ],
+    );
+    let journal_path = operation_journal_path(&config);
+    assert!(!store_path.exists());
+    assert!(!journal_path.as_path().exists());
+
+    let mut mcp = InteractiveMcp::start_with_capabilities(
+        &root,
+        &store_path,
+        &["store-write", "project-exec"],
+    );
+    initialize_interactive_mcp(&mut mcp, 1);
+    let rejected = interactive_tool_call(
+        &mut mcp,
+        2,
+        "resolve_build_submit",
+        json!({
+            "contract_version":"depgraph-mcp-tools-v1",
+            "repository_id":"repository",
+            "idempotency_key":"issue-316-false-acknowledgement",
+            "acknowledgement":false,
+            "rust_compiler_precise":true
+        }),
+    );
+    mcp.finish();
+
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    assert_eq!(
+        rejected["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    assert!(
+        !store_path.exists(),
+        "false acknowledgement created the Store"
+    );
+    assert!(
+        !journal_path.as_path().exists(),
+        "false acknowledgement created the journal"
+    );
+}
+
+#[test]
 fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
     struct DaemonCleanup {
         root: PathBuf,

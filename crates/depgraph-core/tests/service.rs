@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Result;
+use depgraph_core::service::ResolveBuildRequest;
 use depgraph_core::service::{
     CurrentSnapshotAvailability, DEPGRAPH_SERVICE_LIMITS_VERSION, DepgraphCapability,
     DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
@@ -1395,5 +1396,69 @@ fn lifecycle_doctor_projects_only_allowlisted_redacted_agent_data() -> Result<()
     assert!(latest["profiles"][0].get("properties").is_none());
     assert!(latest["diagnostics"][0].get("message").is_none());
     assert!(latest["diagnostics"][0].get("properties").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_build_rejects_missing_authority_or_acknowledgement_before_mutation() -> Result<()>
+{
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("must-not-exist.sqlite");
+    let marker = temporary.path().join("project-child-ran");
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='authority-fixture'\nversion='0.1.0'\nedition='2024'\nbuild='build.rs'\n",
+    )?;
+    std::fs::write(root.join("Cargo.lock"), "version = 4\n")?;
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+    std::fs::write(
+        root.join("build.rs"),
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"ran\").unwrap(); }}\n",
+            marker
+        ),
+    )?;
+
+    let insufficient = DepgraphService::new(DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([DepgraphCapability::Read, DepgraphCapability::StoreWrite])?,
+        DepgraphServiceLimits::default(),
+    )?);
+    assert!(matches!(
+        insufficient
+            .resolve_build_cancellable(
+                &ResolveBuildRequest::new(true, false, None),
+                &CancellationToken::new(),
+            )
+            .await,
+        Err(DepgraphServiceError::CapabilityDenied {
+            required: DepgraphCapability::ProjectExec
+        })
+    ));
+
+    let authorized = DepgraphService::new(DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::ProjectExec,
+        ])?,
+        DepgraphServiceLimits::default(),
+    )?);
+    assert!(matches!(
+        authorized
+            .resolve_build_cancellable(
+                &ResolveBuildRequest::new(false, false, None),
+                &CancellationToken::new(),
+            )
+            .await,
+        Err(DepgraphServiceError::InvalidInput)
+    ));
+    assert!(!marker.exists(), "a rejected request launched project code");
+    assert!(!store_path.exists(), "a rejected request created the Store");
     Ok(())
 }

@@ -48,6 +48,7 @@ pub mod service;
 mod service_agent;
 mod service_artifacts;
 mod service_bounded;
+mod service_build;
 mod service_graph;
 mod service_lifecycle;
 mod service_limits;
@@ -108,6 +109,7 @@ pub use build::{
     ASTRO_BUILD_CAPABILITY, ASTRO_BUILD_OBSERVATION_SCHEMA, ASTRO_BUILD_OBSERVER,
     ASTRO_BUILD_OBSERVER_VERSION, BUILD_SUPERVISOR_VERSION, BuildAudit, BuildExecutionOutcome,
     BuildExecutionPlan, BuildExecutionRequest, BuildIsolation, BuildOutcomeKind,
+    BuildSourceMutationAudit, BuildSourceMutationDiagnostic, BuildSourceMutationStatus,
     NEXT_BUILD_CAPABILITY, NEXT_BUILD_OBSERVATION_SCHEMA, NEXT_BUILD_OBSERVER,
     NEXT_BUILD_OBSERVER_VERSION, NetworkIsolation, TANSTACK_ROUTER_BUILD_CAPABILITY,
     TANSTACK_ROUTER_BUILD_OBSERVATION_SCHEMA, TANSTACK_ROUTER_BUILD_OBSERVER,

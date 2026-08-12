@@ -1822,6 +1822,12 @@ mod tests {
             stderr_limit_bytes: 1024,
             network_policy: "deny".to_owned(),
             network_isolation: NetworkIsolation::BestEffort,
+            isolation: crate::BuildIsolation::BestEffort,
+            source_mutation: crate::BuildSourceMutationAudit {
+                status: crate::BuildSourceMutationStatus::Unchanged,
+                non_mutation_guaranteed: false,
+                diagnostic: None,
+            },
             isolation_diagnostic: Some("fixture".to_owned()),
             started_at: "2026-07-22T00:00:00.000Z".to_owned(),
             finished_at: "2026-07-22T00:00:01.000Z".to_owned(),
