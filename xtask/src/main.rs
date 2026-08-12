@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 mod compiler_pack_release;
 mod go_semantic_e2e;
+mod mcp_package_smoke;
 mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -526,6 +527,15 @@ struct TargetVerificationReport {
     mcp_protocol_revision: String,
     mcp_tool_contract_version: String,
     mcp_operation_contract_version: String,
+    mcp_smoke_sha256: String,
+    mcp_smoke_tool_schema_sha256: String,
+    mcp_smoke_discovery_sha256: String,
+    mcp_smoke_fixture_result_sha256: String,
+    mcp_smoke_submit_deadline_ms: u64,
+    mcp_smoke_submit_elapsed_ms: u64,
+    mcp_smoke_recovered_after_eof: bool,
+    mcp_smoke_stdin_eof_clean_exit: bool,
+    mcp_smoke_stdout_json_rpc_only: bool,
     runtime_collector_sha256: String,
     rust_sysroot_sha256: String,
     framework_build_artifacts: BTreeMap<String, String>,
@@ -575,6 +585,8 @@ struct PublishedSmokeReports<'a> {
     query_sha256: String,
     cross_language: &'a CrossLanguagePackageSmokeReport,
     cross_language_sha256: String,
+    mcp: &'a mcp_package_smoke::McpPackageSmokeReport,
+    mcp_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1991,8 +2003,14 @@ open_questions: 0\n\
         "| `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める |",
         "## Issue #318 five-target MCP release closure",
         "`rmcp 3.1.0`とprotocol revision `2026-07-28`",
-        "stable gate schema 8の`mcp-five-target` check",
+        "stable gate schema 9の`mcp-five-target` check",
         "### Issue #318 acceptance mapping",
+        "| `#319` | 抽出済みarchiveのMCP stdio smokeと5 target digest gateを追加する |",
+        "## Issue #319 packaged MCP smoke and digest gate",
+        "`mcp-package-smoke-v1`",
+        "handle受領を2,000 ms未満",
+        "stdin close後5,000 ms以内",
+        "### Issue #319 acceptance mapping",
         "## Issue #292 acceptance mapping",
     ] {
         if !decision.contains(required) {
@@ -2575,7 +2593,7 @@ fn package() -> Result<()> {
     )?;
 
     let archive = create_archive(dist, &name)?;
-    let (query_smoke, cross_language_smoke) = verify_archive(&archive, &name)?;
+    let (query_smoke, cross_language_smoke, mcp_smoke) = verify_archive(&archive, &name)?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
@@ -2583,6 +2601,10 @@ fn package() -> Result<()> {
     fs::write(
         dist.join(format!("{name}.cross-language-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&cross_language_smoke)?),
+    )?;
+    fs::write(
+        dist.join(format!("{name}.mcp-smoke.json")),
+        format!("{}\n", serde_json::to_string_pretty(&mcp_smoke)?),
     )?;
     let checksum = sha256_file(&archive)?;
     fs::write(
@@ -4606,6 +4628,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
                 format!("{archive}.sha256"),
                 format!("depgraph-{VERSION}-{target}.query-smoke.json"),
                 format!("depgraph-{VERSION}-{target}.cross-language-smoke.json"),
+                format!("depgraph-{VERSION}-{target}.mcp-smoke.json"),
             ]
         })
         .collect::<BTreeSet<_>>();
@@ -4630,6 +4653,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     }
 
     let mut targets = Vec::new();
+    let mut mcp_smoke_identities = BTreeSet::new();
     for (target, extension) in &selected_targets {
         let archive_name = format!("depgraph-{VERSION}-{target}.{extension}");
         let archive = directory.join(&archive_name);
@@ -4665,6 +4689,13 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
             target,
             &archive_sha256,
         )?;
+        let mcp_smoke_path = directory.join(format!("depgraph-{VERSION}-{target}.mcp-smoke.json"));
+        let mcp_smoke_bytes = fs::read(&mcp_smoke_path)?;
+        let mcp_smoke: mcp_package_smoke::McpPackageSmokeReport =
+            serde_json::from_slice(&mcp_smoke_bytes)
+                .context("packaged MCP smoke report has an invalid schema")?;
+        mcp_package_smoke::validate(&mcp_smoke, target, &archive_sha256, VERSION)?;
+        mcp_smoke_identities.insert(mcp_smoke.cross_target_identity());
         targets.push(verify_published_release_tree(
             &extracted,
             target,
@@ -4675,8 +4706,15 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
                 query_sha256: hex::encode(Sha256::digest(&query_smoke_bytes)),
                 cross_language: &cross_language_smoke,
                 cross_language_sha256: hex::encode(Sha256::digest(&cross_language_smoke_bytes)),
+                mcp: &mcp_smoke,
+                mcp_sha256: hex::encode(Sha256::digest(&mcp_smoke_bytes)),
             },
         )?);
+    }
+    if mcp_smoke_identities.len() != 1 {
+        bail!(
+            "release targets do not attest identical packaged MCP discovery, fixture, recovery, and transport contracts"
+        );
     }
     if targets
         .iter()
@@ -4745,7 +4783,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     fs::write(
         directory.join("release-verification.json"),
         serde_json::to_vec_pretty(&ReleaseVerificationReport {
-            schema_version: 8,
+            schema_version: 9,
             release_version: VERSION.to_owned(),
             tag: release_tag()?,
             protocol_version: "1.0".to_owned(),
@@ -5145,6 +5183,10 @@ fn evaluate_stable_release_gate(
                 target.mcp_server_sha256.as_str(),
                 target.operation_runner_sha256.as_str(),
                 target.mcp_tool_schema_sha256.as_str(),
+                target.mcp_smoke_sha256.as_str(),
+                target.mcp_smoke_tool_schema_sha256.as_str(),
+                target.mcp_smoke_discovery_sha256.as_str(),
+                target.mcp_smoke_fixture_result_sha256.as_str(),
                 target.sbom_sha256.as_str(),
                 target.third_party_licenses_sha256.as_str(),
             ]
@@ -5154,6 +5196,12 @@ fn evaluate_stable_release_gate(
                 && target.mcp_protocol_revision == MCP_PROTOCOL_REVISION
                 && target.mcp_tool_contract_version == MCP_TOOL_CONTRACT_VERSION
                 && target.mcp_operation_contract_version == MCP_OPERATION_CONTRACT_VERSION
+                && target.mcp_smoke_tool_schema_sha256 == target.mcp_tool_schema_sha256
+                && target.mcp_smoke_submit_deadline_ms == mcp_package_smoke::SUBMIT_DEADLINE_MS
+                && target.mcp_smoke_submit_elapsed_ms < target.mcp_smoke_submit_deadline_ms
+                && target.mcp_smoke_recovered_after_eof
+                && target.mcp_smoke_stdin_eof_clean_exit
+                && target.mcp_smoke_stdout_json_rpc_only
         })
         && release
             .targets
@@ -5161,16 +5209,28 @@ fn evaluate_stable_release_gate(
             .map(|target| target.mcp_tool_schema_sha256.as_str())
             .collect::<BTreeSet<_>>()
             .len()
+            == 1
+        && release
+            .targets
+            .iter()
+            .map(|target| {
+                (
+                    target.mcp_smoke_discovery_sha256.as_str(),
+                    target.mcp_smoke_fixture_result_sha256.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
             == 1;
 
     let checks = vec![
         StableReleaseGateCheck {
             id: "release-identity".to_owned(),
-            passed: release.schema_version == 8
+            passed: release.schema_version == 9
                 && release.release_version == STABLE_RELEASE_VERSION
                 && supported_release_tag(&release.tag),
             evidence:
-                "release-verification.json schema 8 and an exact stable or canonical rc tag"
+                "release-verification.json schema 9 and an exact stable or canonical rc tag"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -5212,7 +5272,7 @@ fn evaluate_stable_release_gate(
         StableReleaseGateCheck {
             id: "mcp-five-target".to_owned(),
             passed: mcp_release_target_gate,
-            evidence: "five native archives attest the MCP server, durable operation runner, versioned tool/operation schema, rmcp SDK, and MCP protocol revision".to_owned(),
+            evidence: "five native archives attest identical packaged MCP discovery/fixture digests, bounded durable safe-scan submit with post-EOF recovery, clean stdin EOF, JSON-RPC-only stdout, server/runner binaries, and versioned compatibility metadata".to_owned(),
         },
         StableReleaseGateCheck {
             id: "performance-budget".to_owned(),
@@ -5506,6 +5566,9 @@ fn verify_published_release_tree(
         "MCP tool schema",
     )?;
     verify_mcp_tool_schema_bytes(&mcp_tool_schema, "published release")?;
+    if smoke.mcp.tool_schema_sha256 != manifest.mcp_tool_schema.sha256 {
+        bail!("published MCP smoke schema digest differs from the extracted release manifest");
+    }
     if manifest.query_fixture.path != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH {
         bail!("published release query fixture path does not match the query contract");
     }
@@ -5936,6 +5999,15 @@ fn verify_published_release_tree(
         mcp_protocol_revision: manifest.mcp_server.protocol_revision.clone(),
         mcp_tool_contract_version: manifest.mcp_server.tool_contract_version.clone(),
         mcp_operation_contract_version: manifest.mcp_server.operation_contract_version.clone(),
+        mcp_smoke_sha256: smoke.mcp_sha256,
+        mcp_smoke_tool_schema_sha256: smoke.mcp.tool_schema_sha256.clone(),
+        mcp_smoke_discovery_sha256: smoke.mcp.discovery_sha256.clone(),
+        mcp_smoke_fixture_result_sha256: smoke.mcp.fixture_result_sha256.clone(),
+        mcp_smoke_submit_deadline_ms: smoke.mcp.safe_scan_submit_deadline_ms,
+        mcp_smoke_submit_elapsed_ms: smoke.mcp.safe_scan_submit_elapsed_ms,
+        mcp_smoke_recovered_after_eof: smoke.mcp.safe_scan_recovered_after_eof,
+        mcp_smoke_stdin_eof_clean_exit: smoke.mcp.stdin_eof_clean_exit,
+        mcp_smoke_stdout_json_rpc_only: smoke.mcp.stdout_json_rpc_only,
         runtime_collector_sha256,
         rust_sysroot_sha256,
         framework_build_artifacts,
@@ -6420,6 +6492,7 @@ fn verify_archive(
 ) -> Result<(
     BoundedQueryPackageSmokeReport,
     CrossLanguagePackageSmokeReport,
+    mcp_package_smoke::McpPackageSmokeReport,
 )> {
     let archive_sha256 = sha256_file(archive)?;
     let verify_root = std::env::temp_dir().join(format!(
@@ -6452,6 +6525,12 @@ fn verify_archive(
     }
     #[cfg(unix)]
     verify_release_static_prelaunch_fails_closed(&extracted)?;
+    let mcp_smoke = mcp_package_smoke::verify(
+        &extracted,
+        &release_manifest.target,
+        &archive_sha256,
+        VERSION,
+    )?;
     let store = verify_root.join("gate.db");
     // Doctor is intentionally read-only and must not create or migrate a store.
     // Seed the package-smoke fixture explicitly before exercising that boundary.
@@ -6578,7 +6657,7 @@ fn verify_archive(
     let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
     verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
     fs::remove_dir_all(verify_root)?;
-    Ok((query_smoke, cross_language_smoke))
+    Ok((query_smoke, cross_language_smoke, mcp_smoke))
 }
 
 fn verify_packaged_build_evidence(
@@ -13624,6 +13703,15 @@ jobs:
             mcp_protocol_revision: MCP_PROTOCOL_REVISION.to_owned(),
             mcp_tool_contract_version: MCP_TOOL_CONTRACT_VERSION.to_owned(),
             mcp_operation_contract_version: MCP_OPERATION_CONTRACT_VERSION.to_owned(),
+            mcp_smoke_sha256: "3".repeat(64),
+            mcp_smoke_tool_schema_sha256: "2".repeat(64),
+            mcp_smoke_discovery_sha256: "4".repeat(64),
+            mcp_smoke_fixture_result_sha256: "5".repeat(64),
+            mcp_smoke_submit_deadline_ms: super::mcp_package_smoke::SUBMIT_DEADLINE_MS,
+            mcp_smoke_submit_elapsed_ms: 1,
+            mcp_smoke_recovered_after_eof: true,
+            mcp_smoke_stdin_eof_clean_exit: true,
+            mcp_smoke_stdout_json_rpc_only: true,
             runtime_collector_sha256: "d".repeat(64),
             rust_sysroot_sha256: "e".repeat(64),
             framework_build_artifacts: BTreeMap::new(),
@@ -13653,7 +13741,7 @@ jobs:
                 .collect(),
         };
         let mut release = ReleaseVerificationReport {
-            schema_version: 8,
+            schema_version: 9,
             release_version: STABLE_RELEASE_VERSION.to_owned(),
             tag: format!("v{STABLE_RELEASE_VERSION}"),
             protocol_version: "1.0".to_owned(),
@@ -13827,6 +13915,28 @@ jobs:
         malformed_mcp_binary_digest.targets[0].mcp_server_sha256 = "not-a-digest".to_owned();
         assert_eq!(
             evaluate(&malformed_mcp_binary_digest, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut mcp_discovery_drift = release.clone();
+        mcp_discovery_drift.targets[0].mcp_smoke_discovery_sha256 = "6".repeat(64);
+        assert_eq!(
+            evaluate(&mcp_discovery_drift, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut mcp_submit_timeout = release.clone();
+        mcp_submit_timeout.targets[0].mcp_smoke_submit_elapsed_ms =
+            super::mcp_package_smoke::SUBMIT_DEADLINE_MS + 1;
+        assert_eq!(
+            evaluate(&mcp_submit_timeout, &benchmark).decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut mcp_transport_drift = release.clone();
+        mcp_transport_drift.targets[0].mcp_smoke_stdout_json_rpc_only = false;
+        assert_eq!(
+            evaluate(&mcp_transport_drift, &benchmark).decision,
             StableReleaseDecision::Reject
         );
 
