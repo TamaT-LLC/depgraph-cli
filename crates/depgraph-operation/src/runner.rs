@@ -2114,6 +2114,13 @@ impl ScanOperationDispatcher {
         if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
             return DispatchOutcome::Cancelled;
         }
+        let service = DepgraphService::new(self.config.clone());
+        let cancellation = CancellationToken::new();
+        if let Err(error) =
+            service.resolve_snapshot_id_cancellable(&SnapshotLocator::Current, &cancellation)
+        {
+            return self.failed_service(&error);
+        }
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2121,8 +2128,6 @@ impl ScanOperationDispatcher {
             Ok(runtime) => runtime,
             Err(_) => return self.failed(AgentErrorCode::Internal),
         };
-        let service = DepgraphService::new(self.config.clone());
-        let cancellation = CancellationToken::new();
         let request = ResolveBuildRequest::new(true, true, Some(requirement));
         let execution = service.resolve_build_cancellable(&request, &cancellation);
         tokio::pin!(execution);
