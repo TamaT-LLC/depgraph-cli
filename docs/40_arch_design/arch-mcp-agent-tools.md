@@ -38,6 +38,7 @@ additive extensionとして採用するかを決定する。
 | Daemon control | `daemon_start_submit`, `daemon_stop` | Issue #315 implemented through shared lifecycle services and durable verified-process orchestration |
 | Project execution | `resolve_build_submit` | Issue #316 implemented through the shared build service, verified compiler-pack startup authority, and the existing supervised staging boundary |
 | Cross-cutting security E2E | CLI/catalog, capability, path, operation recovery, hostile project execution | Issue #317 implemented through the live stdio profile/path/cancel corpus and the dedicated Linux hostile gate |
+| Agent host operations | read-only default, privileged profiles, confirmation, recovery, upgrade/rollback | Issue #320 documented in README and the package-smoked operations runbook |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -96,6 +97,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#317` | 全CLI mapping、capability、path confinement、operation recovery、hostile project executionを横断検証する | real clap leafとcatalog actionのone-to-one検証、全static profileの実`tools/list` exact matrix、全durable kindのdenied cancel不変性、portable path/symlink/reparse/credential/forged-operation corpus、Tasks/baseline reconnect既存E2E、およびLinux hostile gateのsource/external canary digestで固定する |
 | `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める | `depgraph-mcp`とrunnerのnative binary、`depgraph-mcp-tools-v1` schema、rmcp compatibility unit、SPDX/license/Apache notice、archive digest、aggregate attestationをfail-closed verifierで固定する |
 | `#319` | 抽出済みarchiveのMCP stdio smokeと5 target digest gateを追加する | legacy/modern initialize、profile別catalog、固定graph result、safe scan submit/EOF recovery、cancel認可、clean EOF/stdout purityをnative jobで実行し、共通digestをaggregate gateで固定する |
+| `#320` | Agent host設定、権限、timeout、reconnect、upgrade policyを運用文書へ固定する | READMEのpackaged read-only default、全privileged profileのcomplete host entry、人間確認/acknowledgement/isolationの責任分離、baseline/Tasks recovery、deadline/TTL/idempotency、whole-package upgrade/byte-consistent rollbackをdocumentation parserと抽出archive smokeで固定する |
 
 ## Upstream and API evidence
 
@@ -730,6 +732,35 @@ aggregate jobはforeign target binaryを実行せず、各native jobが署名し
 | stdin close正常終了、stdoutはJSON-RPCのみ | bounded child shutdown、exit/stderr/consumed stdout byte assertions |
 | 欠損・改変・target混在を拒否 | closed sidecar deserialize、archive/target/version/schema digest binding、aggregate mutation/unit tests |
 | repository validation | native extracted-package execution、focused xtask tests、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #320 Agent host operations policy
+
+Issue [#320](https://github.com/TamaT-LLC/depgraph-cli/issues/320)は、実装済みの
+authorization、durable operation、project execution、release compatibility境界を
+Agent host operatorが再現できる手順へまとめる。normativeなtool/DTO behaviorは前節までの
+versioned contractであり、[operations runbook](../50_test/mcp-agent-host-operations.md)は
+その安全な設定・運用projectionである。
+
+| Operations boundary | Frozen policy and evidence |
+| --- | --- |
+| Default and trust tuple | READMEの唯一のdefault entryはpackaged binaryに`read`だけを渡す。canonical root、root専用absolute store、compiler-pack requirement、同一archiveのserver/runner/schema/manifest/workerをoperator-approved tupleとし、複数profileのaccidental fallbackを禁止する |
+| Privileged profiles | store-write、repository-write、daemon-control、project-exec、fullをcomplete host entryで示す。daemon/project-execはstore-write dependencyを含み、各entryのexact argument vectorをdocumentation parserがcompiled six-profile matrixと比較する |
+| Human decision | host human confirmation、server-side static capability authorization、requestの`acknowledgement=true`、verified compiler-pack authorityを別gateとして説明する。acknowledgementは既決定の記録で、前二者を付与・代替しない。source保証はenforced isolationとsuccessful postflightの積だけで、best-effort claimを昇格しない |
+| Operation lifecycle | modern Tasksの`taskId == operation_id`とlegacy/baseline fallback、1,000 ms poll、`OPERATION_NOT_READY`、stdio EOF後のsame tuple reconnect、same-key retry、capability-preserving cancel、terminal no-opを一つの手順にする |
+| Time and retention | read 30秒、submit 2秒はstdio request budget、durable execution deadlineは1時間と区別する。clientはreturned deadline/retentionを優先し、terminal recordの最低7日保持とpurge後30日tombstoneによるduplicate suppressionを説明する |
+| Upgrade and rollback | release/protocol/tool/operation/store/journal compatibility tupleを記録し、operation/daemon quiescence、store+journal+WAL/SHMのbyte-consistent backup、whole archive upgrade、read-only preflight、matching old archiveとfull backupによるrollbackを要求する。mixed-version tree、older binaryでのmigrated DB open、table単位copyを禁止する |
+| Documentation smoke | `cargo xtask test`はmarkerの欠損/重複、privileged default、command/config driftを拒否する。native package gateは文書から得たexact argsへtemporary canonical pathを代入し、抽出済み`depgraph-mcp`で全profile catalog、protocol、durable reconnect/cancel、stdio purityを再実行する |
+
+### Issue #320 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| defaultからmutation/project executionが有効にならない | README read-only marker、compiled capability closureとのexact parser comparison、read profileのlive catalog |
+| 人間確認、authorization、acknowledgementの差 | runbookのfour-gate project-exec policy、Issue #316 DTO invariantとhostile E2Eへの対応付け |
+| reconnect、not-ready、cancel、TTLを再現可能 | numbered operation procedure、Tasks/baseline ID identity、returned timing fields、retention/tombstone policy、troubleshooting table |
+| command/config例をpackaged binaryで検証 | marker-bound README command/defaultと五privileged entries、native extracted-package MCP smokeのdocument-derived argv |
+| upgrade/rollback/troubleshooting | compatibility tuple、quiesce/backup/read-only canary/whole-package rollback手順、typed symptom matrix |
+| repository validation | documentation parser mutation tests、native packaged smoke、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

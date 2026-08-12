@@ -193,34 +193,35 @@ depgraph export --format graphml --output graph.graphml
 
 ### MCP stdio server (experimental)
 
-`depgraph-mcp` is a separate MCP stdio process. It requires an existing
-repository root, an explicit absolute store-file path, at least one explicit
-capability grant, and a validated compiler-pack requirement file. Its stdout is
-reserved exclusively for newline-delimited MCP JSON-RPC messages; bounded
-diagnostics and logs go to stderr. The current server supports MCP lifecycle
-initialization; tool registration will follow in later releases.
+`depgraph-mcp` is the packaged native MCP stdio server. Its safe default is the
+`read` capability: no store mutation, repository write, daemon control, or
+project-code execution is enabled. It requires an existing fixed repository
+root, an explicit absolute store-file path, and the validated compiler-pack
+requirement published for the host. Replace the placeholders below with canonical
+absolute paths; Agent hosts must not rely on shell or environment expansion.
 
+<!-- depgraph-mcp-package-smoke:command -->
 ```sh
-cargo run -p depgraph-mcp -- \
-  --root /path/to/repository \
-  --store /absolute/path/to/depgraph.sqlite \
+/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp \
+  --root /absolute/path/to/repository \
+  --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
   --compiler-pack-requirement /absolute/path/to/compiler-pack-requirement.json \
   --log-level warn
 ```
 
-For an MCP client that launches local stdio servers, configure the executable
-and arguments equivalently (after building it with `cargo build -p
-depgraph-mcp`):
+The equivalent Agent host entry is read-only. This is the configuration to copy
+unless an operator has approved a narrower privileged use case.
 
+<!-- depgraph-mcp-package-smoke:read -->
 ```json
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
       "args": [
-        "--root", "/path/to/repository",
-        "--store", "/absolute/path/to/depgraph.sqlite",
+        "--root", "/absolute/path/to/repository",
+        "--store", "/absolute/path/to/state/depgraph.sqlite",
         "--capability", "read",
         "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json",
         "--log-level", "warn"
@@ -230,9 +231,32 @@ depgraph-mcp`):
 }
 ```
 
-Repeat `--capability` to grant additional operations. Accepted values are
-`read`, `store-write`, `repository-write`, `daemon-control`, and `project-exec`;
-dependency-invalid combinations fail closed during startup.
+The fixed root and store form a trust boundary: use a separate private store per
+repository, keep it outside the repository when possible, and launch the MCP
+server, sibling operation runner, schema, manifest, and workers from one
+checksum-verified release archive. stdout is reserved for newline-delimited MCP
+JSON-RPC; bounded diagnostics go to stderr.
+
+Privileged profiles are explicit replacements for the read-only entry, not a
+runtime elevation mechanism. Complete Agent host examples for `store-write`,
+`repository-write`, `daemon-control`, `project-exec`, and `full`, together with
+human-confirmation rules, durable polling/reconnect/cancel, timeout and TTL
+values, upgrade/rollback steps, and troubleshooting, are in the
+[MCP Agent host operations runbook](docs/50_test/mcp-agent-host-operations.md).
+In particular, `acknowledgement: true` on `resolve_build_submit` only records an
+independent host decision; it does not grant `project-exec` or replace human
+confirmation. Only enforced isolation plus a successful source postflight can
+claim source non-mutation; best-effort isolation cannot.
+
+Modern protocol `2026-07-28` can negotiate MCP Tasks. Its `taskId` is the same
+durable ID exposed by `operation_get`, `operation_result`, and
+`operation_cancel`; legacy `2025-11-25` and Tasks-unaware hosts use those
+portable tools directly. stdio disconnect does not cancel work. Reconnect with
+the same root, store, capability profile, and compiler-pack requirement, then
+poll the saved ID. Read calls have a 30-second budget, durable submission has a
+2-second handle-return budget, and an accepted operation has a one-hour
+execution deadline. Follow the returned `pollIntervalMs`,
+`execution_deadline_ms`, and `retain_until_ms` rather than guessing locally.
 
 Inbound MCP JSON messages are limited to 1 MiB before JSON deserialization;
 the server fails closed when that bound is exceeded. The requirement file must
