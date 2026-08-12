@@ -77,12 +77,21 @@ stage-specific reason codes:
 - `compiler-pack-postflight-failed`;
 - `build-child-failed`, `build-child-signalled`, `build-timeout`,
   `build-cancelled`, `build-output-limit`, or
-  `build-output-security-policy`.
+  `build-output-security-policy`;
+- `project-source-mutation-detected` or `project-source-postflight-failed`.
 
 Every non-completed outcome clears the validated unit graph, invocation ledger,
 typed-MIR ledger, converted graph, and output digest before store promotion.
 The run-owned directory is deleted after process-tree termination. A retry uses
 a new empty run root.
+
+The source postflight audit is separate from the staged-workspace digest. It
+reports `source_non_mutation_guaranteed: true` only when the supervisor selected
+the enforced Linux namespace and the original admitted source fingerprint is
+unchanged after child-tree termination. On best-effort hosts an unchanged
+fingerprint is detection evidence only, never a non-mutation guarantee; a
+detected change is retained as a typed security-failed audit and is never
+promoted or cached.
 
 ## Unsafe and internal API inventory
 

@@ -1877,7 +1877,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-07\n\
+updated: 2026-08-12\n\
 open_questions: 0\n\
 ---\n";
 
@@ -1914,6 +1914,10 @@ open_questions: 0\n\
         "| Cancel authorization |",
         "| `Q-002` | **Resolved** | Option Aを採用する。",
         "`open_questions`は`0`である。",
+        "| `#316` | resolve buildを共有project-exec serviceとdurable MCP operationへ接続する |",
+        "## Issue #316 resolve-build project-exec evidence",
+        "`source_non_mutation_guaranteed=true`",
+        "### Issue #316 acceptance mapping",
         "## Issue #292 acceptance mapping",
     ] {
         if !decision.contains(required) {
@@ -5987,6 +5991,12 @@ fn cross_language_ffi_outcome(
             stderr_limit_bytes: 1_024,
             network_policy: "deny".to_owned(),
             network_isolation: depgraph_core::NetworkIsolation::Enforced,
+            isolation: depgraph_core::BuildIsolation::EnforcedLinuxNamespace,
+            source_mutation: depgraph_core::BuildSourceMutationAudit {
+                status: depgraph_core::BuildSourceMutationStatus::Unchanged,
+                non_mutation_guaranteed: true,
+                diagnostic: None,
+            },
             isolation_diagnostic: None,
             started_at: "2026-07-26T00:00:00Z".to_owned(),
             finished_at: "2026-07-26T00:00:01Z".to_owned(),

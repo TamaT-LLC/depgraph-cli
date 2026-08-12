@@ -1,19 +1,20 @@
 use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
-    AcceptedOperationStatus, AgentCapability, AgentChangedSince, AgentCompletedSnapshot,
-    AgentCondition, AgentContext, AgentCorrelationDifference, AgentCorrelationStatus,
-    AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentError, AgentErrorCategory,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
-    AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
-    AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
-    AgentPolicyApiChange, AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision,
-    AgentQueryRow, AgentRemediation, AgentRepositoryInitOutcome, AgentResolutionStatus,
-    AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome,
-    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
-    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AcceptedOperationStatus, AgentBuildOutcome, AgentCapability, AgentChangedSince,
+    AgentCompletedSnapshot, AgentCondition, AgentContext, AgentCorrelationDifference,
+    AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
+    AgentDaemonStatus, AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentError,
+    AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind,
+    AgentExportOutcome, AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact,
+    AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase,
+    AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
+    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation,
+    AgentRepositoryInitOutcome, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
+    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
     MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
@@ -149,6 +150,27 @@ fn completed_snapshot() -> AgentCompletedSnapshot {
     .expect("representative completed snapshot")
 }
 
+fn build_outcome() -> AgentBuildOutcome {
+    serde_json::from_value(json!({
+        "build_id": "build:fixture",
+        "status": "completed",
+        "project_execution": "executed",
+        "project_code_executed": true,
+        "isolation_strength": "best_effort",
+        "network_isolation": "best_effort",
+        "source_non_mutation_guaranteed": false,
+        "mutation_diagnostics": ["best_effort_isolation_does_not_prevent_source_mutation"],
+        "snapshot_id": SNAPSHOT_ID,
+        "host_risk": {
+            "human_confirmation_required": true,
+            "acknowledgement_is_not_authorization": true,
+            "source_mutation_possible": true,
+            "network_access_possible": true
+        }
+    }))
+    .expect("representative build outcome")
+}
+
 #[test]
 fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contract() {
     let repository_id: LogicalRepositoryId = parse("repo-1");
@@ -267,6 +289,46 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
     unknown_field["result"]["raw_journal_payload"] = json!(true);
     assert!(daemon.deserialize(unknown_field).is_err());
     assert!(daemon.deserialize(json!({"arbitrary": true})).is_err());
+}
+
+#[test]
+fn resolve_build_outcome_requires_explicit_host_risk_and_enforced_guarantees() {
+    let valid = serde_json::to_value(build_outcome()).unwrap();
+    let outcome: AgentBuildOutcome = serde_json::from_value(valid.clone()).unwrap();
+    assert!(outcome.project_code_executed());
+    assert!(!outcome.source_non_mutation_guaranteed());
+    assert!(outcome.host_risk().human_confirmation_required());
+    assert!(outcome.host_risk().acknowledgement_is_not_authorization());
+
+    let contract = PortableTerminalOutputContract::for_originating_tool("resolve_build_submit")
+        .expect("resolve_build_submit has a closed terminal contract");
+    let envelope = SuccessEnvelope::new(parse("repo-1"), Some(parse(SNAPSHOT_ID)), outcome);
+    assert!(
+        contract
+            .deserialize(serde_json::to_value(&envelope).unwrap())
+            .is_ok()
+    );
+
+    let mut mismatched_snapshot = serde_json::to_value(&envelope).unwrap();
+    mismatched_snapshot["snapshot_id"] = json!(format!("snapshot:sha256:{}", "b".repeat(64)));
+    assert!(contract.deserialize(mismatched_snapshot).is_err());
+
+    let mut false_confirmation = valid.clone();
+    false_confirmation["host_risk"]["human_confirmation_required"] = json!(false);
+    assert!(serde_json::from_value::<AgentBuildOutcome>(false_confirmation).is_err());
+
+    let mut acknowledgement_as_authority = valid.clone();
+    acknowledgement_as_authority["host_risk"]["acknowledgement_is_not_authorization"] =
+        json!(false);
+    assert!(serde_json::from_value::<AgentBuildOutcome>(acknowledgement_as_authority).is_err());
+
+    let mut false_guarantee = valid.clone();
+    false_guarantee["source_non_mutation_guaranteed"] = json!(true);
+    assert!(serde_json::from_value::<AgentBuildOutcome>(false_guarantee).is_err());
+
+    let mut missing_best_effort_diagnostic = valid;
+    missing_best_effort_diagnostic["mutation_diagnostics"] = json!([]);
+    assert!(serde_json::from_value::<AgentBuildOutcome>(missing_best_effort_diagnostic).is_err());
 }
 
 #[test]
@@ -1600,6 +1662,7 @@ fn contract_samples() -> Value {
             1,
             Page::new(vec![edge()], 1, true, None).expect("sample dependency page"),
         ).expect("sample dependency response"),
+        "agent_build_outcome": build_outcome(),
         "agent_edge": edge(),
         "agent_evidence": evidence(),
         "agent_impact": impact(),

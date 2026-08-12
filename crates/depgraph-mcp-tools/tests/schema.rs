@@ -89,7 +89,7 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
             .as_array()
             .expect("terminal output is a closed union")
             .len(),
-        4
+        5
     );
     let terminal_schema = terminal_output.to_string();
     assert!(!terminal_schema.contains("AgentOperation"));
@@ -109,6 +109,29 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
     assert!(terminal_branches.contains("AgentScanOutcome"));
     assert!(terminal_branches.contains("AgentRuntimeOutcome"));
     assert!(terminal_branches.contains("AgentExportOutcome"));
+    assert!(terminal_branches.contains("AgentBuildOutcome"));
+}
+
+#[test]
+fn issue_316_shared_schema_closes_build_outcome_and_host_risk() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in ["AgentBuildOutcome", "AgentBuildHostRisk"] {
+        assert_eq!(definitions[definition]["additionalProperties"], false);
+    }
+    assert_eq!(
+        definitions["AgentBuildOutcome"]["properties"]["mutation_diagnostics"]["maxItems"],
+        depgraph_mcp_tools::MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS
+    );
+    assert_eq!(
+        definitions["AgentBuildHostRisk"]["required"],
+        json!([
+            "human_confirmation_required",
+            "acknowledgement_is_not_authorization",
+            "source_mutation_possible",
+            "network_access_possible"
+        ])
+    );
 }
 
 #[test]
@@ -716,7 +739,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 156, "review newly added object schemas explicitly");
+    assert_eq!(objects, 159, "review newly added object schemas explicitly");
 }
 
 #[test]

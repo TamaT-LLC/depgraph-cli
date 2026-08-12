@@ -5,22 +5,22 @@ use std::{
 };
 
 use depgraph_core::{
-    CancellationToken, DepgraphCapability, DepgraphService, DepgraphServiceConfig,
-    DepgraphServiceError, GraphQueryFilter, ScanCacheMode,
+    CancellationToken, CompilerPackRequirement, DepgraphCapability, DepgraphService,
+    DepgraphServiceConfig, DepgraphServiceError, GraphQueryFilter, ScanCacheMode,
     service::{
         DeferredExportFileCompletion, DeferredExportFileRecovery, DeferredRuntimeImportCompletion,
         DeferredRuntimeImportRecovery, DeferredRuntimeImportServiceOutcome, DeferredScanCompletion,
         DeferredScanRecovery, DeferredScanServiceOutcome, ExportFileRequest, GraphExportFormat,
         GraphExportRequest, RepositoryOutputPrecondition, RepositoryOverwritePolicy,
-        RepositoryRelativePath, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
-        SnapshotLocator,
+        RepositoryRelativePath, ResolveBuildRequest, RuntimeValidateRequest, ScanRequest,
+        ServiceSnapshotSelector, SnapshotLocator,
     },
 };
 use depgraph_mcp_tools::{
-    AgentDaemonControlAction, AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentError,
-    AgentErrorCode, AgentExportOutcome, AgentGraphExportFormat, AgentRemediation,
-    AgentRuntimeOutcome, AgentRuntimeStatus, AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId,
-    OperationId, SnapshotId, SuccessEnvelope,
+    AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
+    AgentDaemonControlPhase, AgentError, AgentErrorCode, AgentExportOutcome,
+    AgentGraphExportFormat, AgentRemediation, AgentRuntimeOutcome, AgentRuntimeStatus,
+    AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId, OperationId, SnapshotId, SuccessEnvelope,
 };
 
 use crate::{
@@ -39,11 +39,40 @@ const DEFAULT_RENEWAL_MARGIN_MS: i64 = 6_000;
 #[derive(Clone)]
 pub struct RunnerStartupConfig {
     service: DepgraphServiceConfig,
+    compiler_pack_requirement: Option<CompilerPackRequirement>,
+    compiler_pack_requirement_path: Option<std::path::PathBuf>,
 }
 
 impl RunnerStartupConfig {
     pub fn new(service: DepgraphServiceConfig) -> Result<Self, RunnerError> {
-        let startup = Self { service };
+        let startup = Self {
+            service,
+            compiler_pack_requirement: None,
+            compiler_pack_requirement_path: None,
+        };
+        OperationJournal::open(&startup.service)?;
+        Ok(startup)
+    }
+
+    pub fn new_with_compiler_pack_requirement(
+        service: DepgraphServiceConfig,
+        requirement_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, RunnerError> {
+        let requirement_path = requirement_path.as_ref();
+        let requirement = depgraph_core::read_compiler_pack_requirement(requirement_path)
+            .and_then(|requirement| {
+                depgraph_core::verify_compiler_pack(&requirement)?;
+                Ok(requirement)
+            })
+            .map_err(|_| RunnerError::InvalidStartupAuthority)?;
+        let requirement_path = requirement_path
+            .canonicalize()
+            .map_err(|_| RunnerError::InvalidStartupAuthority)?;
+        let startup = Self {
+            service,
+            compiler_pack_requirement: Some(requirement),
+            compiler_pack_requirement_path: Some(requirement_path),
+        };
         OperationJournal::open(&startup.service)?;
         Ok(startup)
     }
@@ -51,6 +80,16 @@ impl RunnerStartupConfig {
     #[must_use]
     pub const fn service_config(&self) -> &DepgraphServiceConfig {
         &self.service
+    }
+
+    #[must_use]
+    pub const fn compiler_pack_requirement(&self) -> Option<&CompilerPackRequirement> {
+        self.compiler_pack_requirement.as_ref()
+    }
+
+    #[must_use]
+    pub fn compiler_pack_requirement_path(&self) -> Option<&std::path::Path> {
+        self.compiler_pack_requirement_path.as_deref()
     }
 }
 
@@ -1474,6 +1513,7 @@ impl OperationDispatcher for UnsupportedOperationDispatcher {
 #[derive(Clone)]
 pub struct ScanOperationDispatcher {
     config: DepgraphServiceConfig,
+    compiler_pack_requirement: Option<CompilerPackRequirement>,
     #[cfg(test)]
     runtime_dispatch_barrier: Option<Arc<RuntimeDispatchBarrier>>,
     #[cfg(test)]
@@ -1536,6 +1576,14 @@ struct DaemonStartInput {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonStopInput {}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveBuildInput {
+    acknowledgement: bool,
+    rust_compiler_precise: bool,
+    compiler_pack_manifest_sha256: String,
+}
 
 impl RuntimeImportInput {
     fn retained_runtime_identity(&self) -> Result<Option<(String, String)>, ()> {
@@ -1604,6 +1652,19 @@ impl ScanOperationDispatcher {
     pub const fn new(config: DepgraphServiceConfig) -> Self {
         Self {
             config,
+            compiler_pack_requirement: None,
+            #[cfg(test)]
+            runtime_dispatch_barrier: None,
+            #[cfg(test)]
+            daemon_start_promoter: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_startup(startup: &RunnerStartupConfig) -> Self {
+        Self {
+            config: startup.service_config().clone(),
+            compiler_pack_requirement: startup.compiler_pack_requirement().cloned(),
             #[cfg(test)]
             runtime_dispatch_barrier: None,
             #[cfg(test)]
@@ -2027,6 +2088,89 @@ impl ScanOperationDispatcher {
         }
     }
 
+    fn dispatch_resolve_build(
+        &self,
+        work: &RunnerWork,
+        control: &mut ExecutionControl<'_>,
+    ) -> DispatchOutcome {
+        let input = match serde_json::from_str::<ResolveBuildInput>(work.input().as_str()) {
+            Ok(input) => input,
+            Err(_) => return self.failed(AgentErrorCode::InvalidArgument),
+        };
+        if !input.acknowledgement || !input.rust_compiler_precise {
+            return self.failed(AgentErrorCode::InvalidArgument);
+        }
+        let requirement = match self.compiler_pack_requirement.as_ref() {
+            Some(requirement) => requirement.clone(),
+            None => return self.failed(AgentErrorCode::CapabilityDenied),
+        };
+        let pack = match depgraph_core::verify_compiler_pack(&requirement) {
+            Ok(pack) => pack,
+            Err(_) => return self.failed(AgentErrorCode::IntegrityFailure),
+        };
+        if pack.attestation.manifest_sha256 != input.compiler_pack_manifest_sha256 {
+            return self.failed(AgentErrorCode::IntegrityFailure);
+        }
+        if !matches!(control.checkpoint(), Ok(ExecutionCheckpoint::Continue)) {
+            return DispatchOutcome::Cancelled;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return self.failed(AgentErrorCode::Internal),
+        };
+        let service = DepgraphService::new(self.config.clone());
+        let cancellation = CancellationToken::new();
+        let request = ResolveBuildRequest::new(true, true, Some(requirement));
+        let execution = service.resolve_build_cancellable(&request, &cancellation);
+        tokio::pin!(execution);
+        let mut forced_cancel = false;
+        let result = runtime.block_on(async {
+            let mut checkpoints = tokio::time::interval(Duration::from_millis(25));
+            checkpoints.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = checkpoints.tick() => {
+                        match control.checkpoint() {
+                            Ok(ExecutionCheckpoint::Continue) => {}
+                            Ok(
+                                ExecutionCheckpoint::CancellationRequested
+                                | ExecutionCheckpoint::DeadlineExceeded
+                                | ExecutionCheckpoint::LeaseLost,
+                            )
+                            | Err(_) => {
+                                forced_cancel = true;
+                                cancellation.cancel();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        if forced_cancel {
+            return DispatchOutcome::Cancelled;
+        }
+        match result {
+            Ok(outcome)
+                if matches!(
+                    outcome.audit().outcome,
+                    depgraph_core::BuildOutcomeKind::Cancelled
+                ) =>
+            {
+                DispatchOutcome::Cancelled
+            }
+            Ok(outcome) => match self.completed_build_output(&outcome) {
+                Ok(result) => DispatchOutcome::Completed(result),
+                Err(error) => DispatchOutcome::Failed(error),
+            },
+            Err(DepgraphServiceError::Cancelled) => DispatchOutcome::Cancelled,
+            Err(error) => self.failed_service(&error),
+        }
+    }
+
     fn completed_output(
         &self,
         result: &depgraph_core::service::ScanServiceOutcome,
@@ -2107,6 +2251,26 @@ impl ScanOperationDispatcher {
         CanonicalJson::new(
             serde_json::to_value(SuccessEnvelope::new(repository_id, None, outcome))
                 .expect("closed daemon control output serializes"),
+        )
+        .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
+    }
+
+    fn completed_build_output(
+        &self,
+        source: &depgraph_core::service::ResolveBuildServiceOutcome,
+    ) -> Result<CanonicalJson, CanonicalJson> {
+        let outcome = AgentBuildOutcome::try_from(source)
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        let snapshot_id = outcome.snapshot_id().clone();
+        let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
+        CanonicalJson::new(
+            serde_json::to_value(SuccessEnvelope::new(
+                repository_id,
+                Some(snapshot_id),
+                outcome,
+            ))
+            .expect("closed build output serializes"),
         )
         .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
     }
@@ -2215,7 +2379,7 @@ impl OperationDispatcher for ScanOperationDispatcher {
             OperationKind::ExportFile => self.dispatch_export_file(work, control),
             OperationKind::DaemonStartSubmit => self.dispatch_daemon_start(work, control),
             OperationKind::DaemonStop => self.dispatch_daemon_stop(work, control),
-            _ => UnsupportedOperationDispatcher.dispatch(work, control),
+            OperationKind::ResolveBuildSubmit => self.dispatch_resolve_build(work, control),
         }
     }
 

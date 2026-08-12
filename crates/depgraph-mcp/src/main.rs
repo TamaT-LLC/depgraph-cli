@@ -222,6 +222,16 @@ struct DaemonStopArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ResolveBuildSubmitArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    idempotency_key: IdempotencyKey,
+    acknowledgement: bool,
+    rust_compiler_precise: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepositoryInitArguments {
     contract_version: ContractVersion,
     repository_id: LogicalRepositoryId,
@@ -1146,6 +1156,7 @@ impl ServerHandler for DepgraphMcpServer {
                 | "export_file"
                 | "daemon_start_submit"
                 | "daemon_stop"
+                | "resolve_build_submit"
         ) {
             let tasks_negotiated = EFFECTIVE_PROTOCOL_VERSION
                 .try_with(|version| *version == ProtocolVersion::V_2026_07_28)
@@ -1156,6 +1167,7 @@ impl ServerHandler for DepgraphMcpServer {
             let arguments = request.arguments.unwrap_or_default();
             let operation_config = self.operation_config.clone();
             let repository_id = self.repository_id.clone();
+            let compiler_pack_requirement = self.compiler_pack_requirement.clone();
             let submit_tool = tool.clone();
             let cancellation = CancellationToken::new();
             let request_cancellation = context.ct;
@@ -1200,6 +1212,13 @@ impl ServerHandler for DepgraphMcpServer {
                         "daemon_stop" => execute_daemon_stop_submit(
                             &operation_config,
                             &repository_id,
+                            arguments,
+                            &cancellation,
+                        ),
+                        "resolve_build_submit" => execute_resolve_build_submit(
+                            &operation_config,
+                            &repository_id,
+                            &compiler_pack_requirement,
                             arguments,
                             &cancellation,
                         ),
@@ -1688,6 +1707,51 @@ fn execute_daemon_stop_submit(
     )
 }
 
+fn execute_resolve_build_submit(
+    config: &DepgraphServiceConfig,
+    repository_id: &LogicalRepositoryId,
+    compiler_pack_requirement: &Path,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    let arguments = decode_arguments::<ResolveBuildSubmitArguments>(arguments)?;
+    authorize_repository(
+        arguments.contract_version,
+        &arguments.repository_id,
+        repository_id,
+    )?;
+    // False acknowledgement and non-exact modes fail before journal, store
+    // mutation, runner resolution, probes, or project child creation.
+    if !arguments.acknowledgement || !arguments.rust_compiler_precise {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    if cancellation.is_cancelled() {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::Cancelled,
+        ));
+    }
+    let requirement = read_compiler_pack_requirement(compiler_pack_requirement)
+        .and_then(|requirement| verify_compiler_pack(&requirement).map(|pack| (requirement, pack)))
+        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+    let service = DepgraphService::new(config.clone());
+    service.resolve_snapshot_id_cancellable(&SnapshotLocator::Current, cancellation)?;
+    let normalized_input = serde_json::json!({
+        "acknowledgement": true,
+        "compiler_pack_manifest_sha256": requirement.1.attestation.manifest_sha256,
+        "rust_compiler_precise": true,
+    });
+    submit_durable_operation_with_compiler_pack(
+        config,
+        OperationKind::ResolveBuildSubmit,
+        &normalized_input,
+        &arguments.idempotency_key,
+        compiler_pack_requirement,
+        cancellation,
+    )
+}
+
 fn execute_export_file_submit(
     config: &DepgraphServiceConfig,
     repository_id: &LogicalRepositoryId,
@@ -2152,6 +2216,42 @@ fn submit_durable_operation(
     idempotency_key: &IdempotencyKey,
     cancellation: &CancellationToken,
 ) -> Result<OperationHandle, ToolExecutionFailure> {
+    submit_durable_operation_with_optional_compiler_pack(
+        config,
+        kind,
+        normalized_input,
+        idempotency_key,
+        None,
+        cancellation,
+    )
+}
+
+fn submit_durable_operation_with_compiler_pack(
+    config: &DepgraphServiceConfig,
+    kind: OperationKind,
+    normalized_input: &serde_json::Value,
+    idempotency_key: &IdempotencyKey,
+    compiler_pack_requirement: &Path,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
+    submit_durable_operation_with_optional_compiler_pack(
+        config,
+        kind,
+        normalized_input,
+        idempotency_key,
+        Some(compiler_pack_requirement),
+        cancellation,
+    )
+}
+
+fn submit_durable_operation_with_optional_compiler_pack(
+    config: &DepgraphServiceConfig,
+    kind: OperationKind,
+    normalized_input: &serde_json::Value,
+    idempotency_key: &IdempotencyKey,
+    compiler_pack_requirement: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> Result<OperationHandle, ToolExecutionFailure> {
     let now_ms = system_now_ms()?;
     let deadline_ms = now_ms
         .checked_add(SCAN_EXECUTION_DEADLINE_MS)
@@ -2172,8 +2272,11 @@ fn submit_durable_operation(
     // returning an accepted handle for work that was not handed to a runner.
     let launcher = OperationRunnerLauncher::resolve()
         .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
-    let startup = RunnerStartupConfig::new(config.clone())
-        .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let startup = match compiler_pack_requirement {
+        Some(path) => RunnerStartupConfig::new_with_compiler_pack_requirement(config.clone(), path),
+        None => RunnerStartupConfig::new(config.clone()),
+    }
+    .map_err(|_| ToolExecutionFailure::Agent(internal_agent_error()))?;
     let mut manager =
         OperationManager::open(config).map_err(|error| ToolExecutionFailure::Journal {
             error,

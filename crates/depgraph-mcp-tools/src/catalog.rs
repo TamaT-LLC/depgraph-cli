@@ -667,8 +667,12 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "resolve_build_submit",
-        "Execute the approved project build resolver and persist evidence.",
-        ["rust_compiler_precise"],
+        "Execute the approved project build resolver after the Agent host independently confirms project-code risk; acknowledgement records the decision but does not authorize it.",
+        [
+            "idempotency_key",
+            "acknowledgement",
+            "rust_compiler_precise"
+        ],
         [CliAction::ResolveBuild],
         PROJECT_EXEC,
         ToolAuthorization::FixedCapabilities,
@@ -1045,6 +1049,10 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         | "transitive" => {
             json!({"type": "boolean"})
         }
+        "acknowledgement" => json!({
+            "type": "boolean",
+            "description": "must be true after independent Agent-host human confirmation; it does not grant authorization or capabilities, or replace that confirmation."
+        }),
         "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
         "depth" => json!({"type": "integer", "minimum": 0}),
         "limit" | "max_depth" | "max_paths" => {
@@ -1110,6 +1118,11 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "scan_submit" | "runtime_trace_import_submit" | "daemon_start_submit" | "daemon_stop" => {
             &["idempotency_key"]
         }
+        "resolve_build_submit" => &[
+            "idempotency_key",
+            "acknowledgement",
+            "rust_compiler_precise",
+        ],
         "export_file" => &["idempotency_key", "output_path", "format"],
         "snapshot_name_create" => &["name"],
         _ => &[],

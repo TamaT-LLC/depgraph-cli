@@ -1588,6 +1588,12 @@ mod tests {
             stderr_limit_bytes: 1024,
             network_policy: "deny".to_owned(),
             network_isolation: NetworkIsolation::Enforced,
+            isolation: crate::BuildIsolation::EnforcedLinuxNamespace,
+            source_mutation: crate::BuildSourceMutationAudit {
+                status: crate::BuildSourceMutationStatus::Unchanged,
+                non_mutation_guaranteed: true,
+                diagnostic: None,
+            },
             isolation_diagnostic: None,
             started_at: "2026-07-29T00:00:00.000Z".to_owned(),
             finished_at: "2026-07-29T00:00:01.000Z".to_owned(),

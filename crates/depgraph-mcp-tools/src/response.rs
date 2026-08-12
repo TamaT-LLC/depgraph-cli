@@ -384,9 +384,9 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
         DepgraphServiceError::ReadStoreUnavailable { .. }
         | DepgraphServiceError::MutatingStoreUnavailable { .. }
         | DepgraphServiceError::StoreOperation { .. } => internal_error(true),
-        DepgraphServiceError::ProfilePlanSecurity { .. } | DepgraphServiceError::Integrity => {
-            integrity_error()
-        }
+        DepgraphServiceError::ProfilePlanSecurity { .. }
+        | DepgraphServiceError::ProjectExecution { .. }
+        | DepgraphServiceError::Integrity => integrity_error(),
         DepgraphServiceError::Internal => internal_error(true),
     }
 }

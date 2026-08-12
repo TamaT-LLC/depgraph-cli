@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
-    AgentDaemonControlAction, AgentDaemonControlOutcome, AgentDaemonControlPhase,
-    AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome, ContractBuildError, ContractVersion,
-    LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
+    AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
+    AgentDaemonControlPhase, AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome,
+    ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
 };
 
 /// Closed terminal output contracts registered for durable submit tools.
@@ -24,6 +24,7 @@ pub enum PortableTerminalOutputContract {
     ExportFile,
     DaemonStartSubmit,
     DaemonStop,
+    ResolveBuildSubmit,
 }
 
 impl PortableTerminalOutputContract {
@@ -35,6 +36,7 @@ impl PortableTerminalOutputContract {
             "export_file" => Some(Self::ExportFile),
             "daemon_start_submit" => Some(Self::DaemonStartSubmit),
             "daemon_stop" => Some(Self::DaemonStop),
+            "resolve_build_submit" => Some(Self::ResolveBuildSubmit),
             _ => None,
         }
     }
@@ -103,6 +105,16 @@ impl PortableTerminalOutputContract {
                     PortableTerminalOutputEnvelope::DaemonControl(Box::new(envelope)),
                 ))
             }
+            Self::ResolveBuildSubmit => {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentBuildOutcome>>(value)
+                    .map_err(|_| PortableTerminalOutputError)?;
+                if envelope.snapshot_id() != Some(envelope.result().snapshot_id()) {
+                    return Err(PortableTerminalOutputError);
+                }
+                Ok(PortableTerminalOutput(
+                    PortableTerminalOutputEnvelope::Build(Box::new(envelope)),
+                ))
+            }
         }
     }
 }
@@ -120,6 +132,7 @@ enum PortableTerminalOutputEnvelope {
     RuntimeImport(Box<SuccessEnvelope<AgentRuntimeOutcome>>),
     ExportFile(Box<SuccessEnvelope<AgentExportOutcome>>),
     DaemonControl(Box<SuccessEnvelope<AgentDaemonControlOutcome>>),
+    Build(Box<SuccessEnvelope<AgentBuildOutcome>>),
 }
 
 impl JsonSchema for PortableTerminalOutput {
@@ -144,6 +157,7 @@ impl PortableTerminalOutput {
             PortableTerminalOutputEnvelope::RuntimeImport(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::ExportFile(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::DaemonControl(envelope) => envelope.repository_id(),
+            PortableTerminalOutputEnvelope::Build(envelope) => envelope.repository_id(),
         }
     }
 }

@@ -102,6 +102,9 @@ impl OperationRunnerLauncher {
                 .arg("--capability")
                 .arg(capability_argument(capability));
         }
+        if let Some(requirement) = startup.compiler_pack_requirement_path() {
+            command.arg("--compiler-pack-requirement").arg(requirement);
+        }
         copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
         configure_detached_process(&mut command);
         let mut child = command.spawn().map_err(RunnerLaunchError::Launch)?;

@@ -51,6 +51,9 @@ struct Args {
 
     #[arg(long, required = true)]
     capability: Vec<CapabilityArg>,
+
+    #[arg(long)]
+    compiler_pack_requirement: Option<PathBuf>,
 }
 
 fn startup(args: Args) -> Result<RunnerStartupConfig, ()> {
@@ -71,7 +74,11 @@ fn startup(args: Args) -> Result<RunnerStartupConfig, ()> {
         DepgraphServiceLimits::default(),
     )
     .map_err(|_| ())?;
-    RunnerStartupConfig::new(config).map_err(|_| ())
+    match args.compiler_pack_requirement {
+        Some(path) => RunnerStartupConfig::new_with_compiler_pack_requirement(config, path),
+        None => RunnerStartupConfig::new(config),
+    }
+    .map_err(|_| ())
 }
 
 fn main() -> ExitCode {
@@ -79,7 +86,7 @@ fn main() -> ExitCode {
         eprintln!("{STARTUP_FAILURE}");
         return ExitCode::FAILURE;
     };
-    let dispatcher = ScanOperationDispatcher::new(startup.service_config().clone());
+    let dispatcher = ScanOperationDispatcher::from_startup(&startup);
     match OperationRunner::new(startup, dispatcher).run_until_idle() {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => {
