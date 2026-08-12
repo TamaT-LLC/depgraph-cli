@@ -160,6 +160,7 @@ jobs:
             dist/*.sha256
             dist/*.query-smoke.json
             dist/*.cross-language-smoke.json
+            dist/*.mcp-smoke.json
           if-no-files-found: error
 
   verify-assets:

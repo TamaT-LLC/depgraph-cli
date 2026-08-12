@@ -95,6 +95,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#316` | resolve buildを共有project-exec serviceとdurable MCP operationへ接続する | `Read + StoreWrite + ProjectExec`の閉じたprofile、`acknowledgement=true`、起動時に再検証したcompiler-pack requirement、staged/neutral supervised execution、source postflight、closed `AgentBuildOutcome`、lease喪失後の非再実行で固定する |
 | `#317` | 全CLI mapping、capability、path confinement、operation recovery、hostile project executionを横断検証する | real clap leafとcatalog actionのone-to-one検証、全static profileの実`tools/list` exact matrix、全durable kindのdenied cancel不変性、portable path/symlink/reparse/credential/forged-operation corpus、Tasks/baseline reconnect既存E2E、およびLinux hostile gateのsource/external canary digestで固定する |
 | `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める | `depgraph-mcp`とrunnerのnative binary、`depgraph-mcp-tools-v1` schema、rmcp compatibility unit、SPDX/license/Apache notice、archive digest、aggregate attestationをfail-closed verifierで固定する |
+| `#319` | 抽出済みarchiveのMCP stdio smokeと5 target digest gateを追加する | legacy/modern initialize、profile別catalog、固定graph result、safe scan submit/EOF recovery、cancel認可、clean EOF/stdout purityをnative jobで実行し、共通digestをaggregate gateで固定する |
 
 ## Upstream and API evidence
 
@@ -688,7 +689,7 @@ closureとfail-closed acceptance evidenceへ対応付ける。
 | Tool/operation contract | `schemas/depgraph-mcp-tools-v1.schema.json`をLF-normalized bytesで配布し、tool contract `depgraph-mcp-tools-v1`とportable operation contract `depgraph-operation-v1`をMCP server、runner、schema metadataで相互に固定する。この単一schema catalogはoperation handle、recovery tools、Tasks additive result、全terminal operation outcomeを含む |
 | SDK/protocol compatibility | MCP server manifestはSDK `rmcp 3.1.0`とprotocol revision `2026-07-28`をexact valueでattestする。Cargo metadata gateはserverのdirect dependency set、`rmcp =3.1.0`のdefault-off `macros/server/transport-io` features、lockfileで解決した`rmcp-macros 3.1.2`を検証し、version/feature/dependency driftを拒否する |
 | SPDX and legal closure | shipped Rust executableのruntime reachability rootへMCP serverを追加し、rmcp、rmcp-macros、server direct dependencyとtransitive closureをSPDX 2.3 SBOMおよびthird-party inventoryへ含める。両rmcp packageはApache-2.0としてexactに記録し、専用noticeはarchive rootの完全な`LICENSE-APACHE`を参照する |
-| Aggregate attestation | target reportはMCP server、runner、schema digestとSDK/protocol/tool/operation versionを保持する。5 target aggregateは共通schema digestと互換性metadataの一致を要求し、stable gate schema 8の`mcp-five-target` checkが全digest形式とexact versionを再検証する |
+| Aggregate attestation | target reportはMCP server、runner、schema digestとSDK/protocol/tool/operation versionを保持する。5 target aggregateは共通schema digestと互換性metadataの一致を要求し、stable gate schema 9の`mcp-five-target` checkが全digest形式とexact versionを再検証する |
 | Fail-closed verification | archive required-file gate、manifest closed deserialization、path confinement、regular/executable bit、actual digest、local binary handshake、locked SBOM/license regenerationを順に検証する。MCP binary/schemaの欠損・改変、SDK/protocol/tool/operation version drift、schema path/contract driftはworker process開始前に拒否する |
 
 ### Issue #318 acceptance mapping
@@ -698,8 +699,37 @@ closureとfail-closed acceptance evidenceへ対応付ける。
 | 5 targetすべてに二binaryとversioned schema | release build matrix、exact archive paths、required-file/manifest checks、target report digest fields |
 | manifest checksumとarchive bytesが一致 | `verify_release_artifact`によるMCP server、runner、schema SHA-256再計算とnative executable check |
 | rmcp closure、license、Apache notice | Cargo runtime-root traversal、locked SBOM exact regeneration、rmcp/rmcp-macros exact package assertions、`LICENSE-APACHE` source equality、dedicated notice |
-| 欠損・改変・version driftを拒否 | static prelaunch mutation corpus、closed manifest type、Cargo metadata drift unit、aggregate schema-8 MCP gate |
+| 欠損・改変・version driftを拒否 | static prelaunch mutation corpus、closed manifest type、Cargo metadata drift unit、aggregate schema-9 MCP gate |
 | repository validation | Rust 1.93.1 format、focused xtask/MCP/operation tests、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #319 packaged MCP smoke and digest gate
+
+Issue [#319](https://github.com/TamaT-LLC/depgraph-cli/issues/319)は、各native package jobが
+checkout内のbuild artifactではなく抽出済みarchiveだけを実行対象としてMCP stdio互換性を
+検証し、target固有のarchive bindingとtarget非依存のcanonical result identityを分離する。
+aggregate jobはforeign target binaryを実行せず、各native jobが署名したsidecarを閉じたschemaで
+再検証する。
+
+| Smoke boundary | Frozen behavior and evidence |
+| --- | --- |
+| Extracted runtime | archive checksum計算とstatic prelaunch検証後、抽出rootの`bin/depgraph-mcp`だけを起動する。operation runnerは同じrootのmanifest解決で起動し、checkout側のMCP/runner executableやworker overrideを使用しない |
+| Protocol and discovery | legacy `2025-11-25`とmodern `2026-07-28`を初期化し、legacy ping、`tools/list`、read/store-write/repository-write/daemon-control/project-exec/full profileのexact input/output schemaをcompiled `ToolCatalog`と比較する。initialize responseとprofile catalogをcanonical SHA-256へ束ねる |
+| Fixed read fixture | fixed revision、profile、二node、一edge、per-file ledgerを持つimmutable Store fixtureへ`get_context`と`graph_dependencies_list`を実行する。timestamp/host pathを除くclosed DTO projectionと依存結果のcanonical digestをsidecarへ記録する |
+| Durable safe scan | fresh repositoryでTasks対応`scan_submit`を呼び、handle受領を2,000 ms未満とする。stdin EOFでserverが正常終了した後、別serverが同じtaskを回収し、safe scan completed DTOとportable `operation_result`が一致することを検証する。read-only `operation_cancel`は`CAPABILITY_DENIED`でsource bytesを変更しない |
+| Transport closure | 各serverはstdin close後5,000 ms以内にexit code 0で終了し、stderrは空、stdoutの全byteはrequest IDへ対応するline-delimited JSON-RPC responseだけでなければ失敗する |
+| Five-target aggregate | `{release-name}.mcp-smoke.json`はclosed `mcp-package-smoke-v1` schema、target/archive/version binding、compiled profile digest、timing/recovery/transport invariantを再検証する。5 targetのschema、protocol/profile discovery、fixture result、recovery identityはexact一致を要求し、target名、archive digest、実測submit時間だけを一致対象から除く |
+| Stable release gate | `release-verification.json` schema 9はsidecar digestとMCP schema/discovery/fixture digest、submit deadline/elapsed、post-EOF recovery、clean EOF、stdout purityをtarget reportへ保持する。`mcp-five-target` checkは全targetのdigest形式と共通identityを再検証する |
+
+### Issue #319 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| 5 targetで抽出archiveのMCP stdio smoke | release native matrix内の`cargo xtask package`、archive checksumにbindした`mcp-package-smoke-v1` sidecar |
+| schema/fixture canonical digestが全target同一 | compiled exact catalog比較、fixed Store fixture DTO validation、aggregate cross-target identity set |
+| safe scan handleが2秒未満、server EOF後に結果回収 | submit elapsed/deadline fields、server shutdown後のTasks reconnect、portable terminal result parity |
+| stdin close正常終了、stdoutはJSON-RPCのみ | bounded child shutdown、exit/stderr/consumed stdout byte assertions |
+| 欠損・改変・target混在を拒否 | closed sidecar deserialize、archive/target/version/schema digest binding、aggregate mutation/unit tests |
+| repository validation | native extracted-package execution、focused xtask tests、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 
