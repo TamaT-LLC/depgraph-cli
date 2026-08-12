@@ -37,6 +37,7 @@ additive extensionとして採用するかを決定する。
 | Repository write | `repository_init`, `export_file` | Issue #314 implemented through fixed-root/no-follow service writes and durable atomic file publication |
 | Daemon control | `daemon_start_submit`, `daemon_stop` | Issue #315 implemented through shared lifecycle services and durable verified-process orchestration |
 | Project execution | `resolve_build_submit` | Issue #316 implemented through the shared build service, verified compiler-pack startup authority, and the existing supervised staging boundary |
+| Cross-cutting security E2E | CLI/catalog, capability, path, operation recovery, hostile project execution | Issue #317 implemented through the live stdio profile/path/cancel corpus and the dedicated Linux hostile gate |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -92,6 +93,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#314` | fixed-root initとrepository-relative file exportを共有repository-write serviceとdurable MCP operationへ接続する | root seal、portable relative path、handle-relative no-follow traversal、same-directory staged fsync/atomic publication、destination precondition、graph store・operation journal・SQLite sidecar・runner purge lockのprotected-state拒否、no-follow/delete-share制約付きrunner guard、closed `AgentExportOutcome`、capability gating、idempotency/cancel/restart recoveryで固定する |
 | `#315` | daemon start/stopを共有serviceとdurable MCP operationへ接続する | `Read + StoreWrite + DaemonControl`の閉じたprofile、verified sibling executableのshellなし起動、running/stopped publication後のcompletion intent promotion、closed `AgentDaemonControlOutcome`、idempotency/cancel/restart recoveryで固定する |
 | `#316` | resolve buildを共有project-exec serviceとdurable MCP operationへ接続する | `Read + StoreWrite + ProjectExec`の閉じたprofile、`acknowledgement=true`、起動時に再検証したcompiler-pack requirement、staged/neutral supervised execution、source postflight、closed `AgentBuildOutcome`、lease喪失後の非再実行で固定する |
+| `#317` | 全CLI mapping、capability、path confinement、operation recovery、hostile project executionを横断検証する | real clap leafとcatalog actionのone-to-one検証、全static profileの実`tools/list` exact matrix、全durable kindのdenied cancel不変性、portable path/symlink/reparse/credential/forged-operation corpus、Tasks/baseline reconnect既存E2E、およびLinux hostile gateのsource/external canary digestで固定する |
 
 ## Upstream and API evidence
 
@@ -641,6 +643,34 @@ Issue [#316](https://github.com/TamaT-LLC/depgraph-cli/issues/316)は既存の
 | best-effort違反はtyped audit、lease喪失後は非再実行 | original-source mutation build-script CLI test、security-failed attempt/cache/snapshot assertions、journal/runner lost-lease terminal tests |
 | staged/neutral/process-tree/timeout/cancel/atomic attempt | existing build supervisor hostile/cancellation tests、shared service regression、operation runner checkpoints |
 | repository validation | Rust 1.93.1 format、focused core/operation/CLI/MCP suites、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #317 cross-cutting security E2E evidence
+
+Issue [#317](https://github.com/TamaT-LLC/depgraph-cli/issues/317)は、個別toolの
+実装testを置換せず、CLI、live stdio MCP、operation journal/runner、Linux namespace
+hostile gateを一つの閉じたsecurity matrixとして横断検証する。Q-002はOption Aで確定済みのため、
+baseline-only assertionには置き換えず、Tasksとportable baselineの両reconnect経路を要求する。
+
+| Matrix boundary | Frozen behavior and evidence |
+| --- | --- |
+| CLI command coverage | 実`clap` parserで23個のleaf commandを最小有効argvから構築し、exhaustive `catalog_action_for_command`へ通す。`ALL_CLI_ACTIONS`とexact一致し、full static catalogで各actionがちょうど一toolへ対応する。新しいleafまたはcatalog actionの未対応・重複はtestまたはcompile-time exhaustive matchで失敗する |
+| Static capability discovery | read、store-write、repository-write、daemon-control、project-exec、fullの六profileで実serverの`tools/list`を二回取得し、sorted exact tool名/schemaを比較する。privileged effect toolは必要capabilityのないcatalogへ現れず、名前を直接指定してもargument decode、store、journal、runner、source accessより前にJSON-RPC invalid paramsとなる |
+| Cancel and journal integrity | `OperationKind::ALL`の六kindを同じdurable journalへ作成し、read-only serverからの`operation_cancel`が全件`CAPABILITY_DENIED`となること、operation/handoff/tombstoneのcanonical digestとqueued statusが不変であることを確認する。kindを別の有効値へ書き換えたforged recordはget/cancelとも`INTEGRITY_FAILURE`で、repair、claim、executionを行わない |
+| Portable path corpus | profile/query/runtime file input、runtime import、repository export output、`path:` selectorを同じPOSIX/Windows相当lexical corpusへ通す。absolute、parent escape、drive prefix、UNC、ADS、device alias、trailing dot/spaceを拒否し、valid/nonexistent symbolic path selectorはfilesystemをdereferenceしない。Unix symlink parent/finalとWindows reparse counterpartはno-follow境界で拒否し、outside destinationを変更しない |
+| Prompt and credential handling | query、runtime trace、profile documentのprompt/credential-shaped hostile valueはtyped errorで拒否し、public response、stderr、journalへ反射しない。undiscoverable effectへの同様のpayloadはhandler lookupより先へ進まない |
+| Disconnect and recovery | scan、runtime import、export、daemon、resolve-buildの既存real-process/idempotency/restart/cancel test、およびmodern Tasks/legacy baseline reconnect matrixをauthoritative evidenceとして再実行する。server EOFはdurable workを所有せず、same keyは同じID、terminal resultは同じclosed DTOを返す |
+| Hostile project execution | dedicated Ubuntu bubblewrap gateは四つのproject-exec gate（static capability、host human confirmation responsibility、acknowledgement、verified compiler-pack authority）、enforced/best-effort claim差、child process-tree termination、original source fingerprint、parent store/private/network canaryを検証する。enforced runのsuccess/timeout後にoriginal digestとexternal canary bytesを再比較する |
+| Canonical evidence | `compiler-precise-hostile-e2e-v1` reportの`mcp_security_matrix`は23 CLI actions、六capability profiles、六durable operation kinds、五path boundary、denied cancel/forged operation/source/external canaryのbooleanだけを記録する。host path、input、credential、child streamは含めない |
+
+### Issue #317 acceptance mapping
+
+| Current acceptance area | Evidence |
+| --- | --- |
+| 全CLI action mappingとeffect discovery gating | real clap/catalog one-to-one unit、全profile live `tools/list` exact process matrix、undiscoverable direct-call pre-state rejection |
+| read-only・不足capability cancel不変性 | six-kind cancel process matrix、既存daemon partial-capability test、journal/handoff digestとsource/store不変 assertion |
+| 全file input/outputと`path:` selector confinement | combined stdio lexical/symlink/prompt corpus、core portable path unit、Unix symlinkとWindows reparse service tests |
+| disconnect/restartとhostile invariant | scan/import/export/daemon/buildの既存idempotency/reconnect/runner suites、Tasks/baseline matrix、dedicated namespace hostile source/external canary assertions |
+| repository validation | issue-317 focused suites、compiler-precise hostile gate、workspace Clippy `-D warnings`、`cargo xtask test` |
 
 ## Issue #292 acceptance mapping
 

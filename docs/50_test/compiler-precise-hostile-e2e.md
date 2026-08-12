@@ -10,7 +10,8 @@
 
 CI path filter: on pull requests the job reports the required check name but
 runs the expensive hostile steps only when related paths change (`Cargo.toml` /
-`Cargo.lock`, compiler crates, hostile scripts/docs, or `.github/workflows/ci.yml`).
+`Cargo.lock`, compiler, CLI, MCP, operation, and store crates, hostile
+scripts/docs, or `.github/workflows/ci.yml`).
 `main` push and `workflow_dispatch` always run the full gate; unrelated PRs skip
 heavy steps and still succeed.
 
@@ -56,12 +57,15 @@ to host execution.
 | Failure | Supervisor and compiler validators cover Cargo/rustc nonzero exit, signal/crash, ICE/panic-shaped child failure, protocol/schema drift, timeout, cancellation, disk/output limits, missing terminal records, incomplete MIR, and descendant reap. |
 | Rollback | `repeated_promotion_is_byte_stable_and_failure_rolls_back` and `completed_build_delta_unions_layers_without_overwriting_base_and_failed_delta_is_discarded` compare the completed snapshot and build layer before and after rejected promotion. No failure publishes a partial delta. |
 | Safe invariant | Safe-scan CLI tests keep Cargo, rustc, wrappers, project hooks, repository PATH entries, and `NODE_OPTIONS` dormant. Adding an armed `.depgraph/compiler-pack` canary leaves exported graph bytes and syntax/semantic cache keys unchanged. Compiler-pack inputs are used only by the explicit three-part `resolve --build --allow-project-code --rust-compiler-precise` consent path. |
+| MCP security matrix | Issue #317 tests parse every real clap leaf and require one static catalog mapping, compare exact live `tools/list` results for read/store-write/repository-write/daemon-control/project-exec/full profiles, deny direct calls to undiscoverable effects before store or journal access, and deny cancel for all six durable operation kinds without changing operation or handoff rows. The file/path corpus covers POSIX escape, Windows prefix/UNC/ADS/device aliases, symlink parents/finals, prompt/credential-shaped inputs, and forged operation kinds. |
 
 The CI artifact `compiler-precise-hostile-<commit>` contains the canonical JSON
 report. It binds the source revision, bubblewrap version and SHA-256, enforced
 boundary properties, exercised fixture groups, accepted reason-code inventory,
-rollback result, and reviewed internal API inventory. It contains no raw child
-stream, environment value, source path, store path, or secret.
+rollback result, the closed `mcp_security_matrix`, and reviewed internal API
+inventory. The MCP matrix records only fixed action/profile/operation/path
+inventories and boolean invariant outcomes. It contains no raw child stream,
+environment value, source path, store path, prompt, credential, or secret.
 
 ## Failure reasons and cleanup
 

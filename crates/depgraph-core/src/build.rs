@@ -3523,9 +3523,18 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         let mut benign = node_plan(vec!["benign-hostile-boundary.sh".to_owned()]);
         benign.program = "bash".to_owned();
         benign.isolation = BuildIsolation::EnforcedLinuxNamespace;
+        let benign_source_digest = fingerprint_build_source(&project)?.0;
         let outcome = supervise_build(&project, &benign).await?;
         assert_eq!(outcome.audit.outcome, BuildOutcomeKind::Completed);
         assert_eq!(outcome.audit.network_isolation, NetworkIsolation::Enforced);
+        assert_eq!(
+            outcome.audit.source_mutation.status,
+            BuildSourceMutationStatus::Unchanged
+        );
+        assert!(outcome.audit.source_mutation.non_mutation_guaranteed);
+        assert_eq!(fingerprint_build_source(&project)?.0, benign_source_digest);
+        assert_eq!(fs::read(&private_file)?, parent_secret.as_bytes());
+        assert_eq!(fs::read(&store_file)?, parent_secret.as_bytes());
         assert!(outcome.project_code_executed);
         assert!(listener.accept().is_err());
         let audit = serde_json::to_string(&outcome.audit)?;
@@ -3545,6 +3554,7 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         armed.program = "bash".to_owned();
         armed.isolation = BuildIsolation::EnforcedLinuxNamespace;
         armed.timeout_seconds = 1;
+        let armed_source_digest = fingerprint_build_source(&project)?.0;
         let timed_out = supervise_build(&project, &armed).await?;
         assert_eq!(timed_out.audit.outcome, BuildOutcomeKind::TimedOut);
         assert_eq!(
@@ -3555,6 +3565,14 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             timed_out.audit.diagnostic_code.as_deref(),
             Some("build-timeout")
         );
+        assert_eq!(
+            timed_out.audit.source_mutation.status,
+            BuildSourceMutationStatus::Unchanged
+        );
+        assert!(timed_out.audit.source_mutation.non_mutation_guaranteed);
+        assert_eq!(fingerprint_build_source(&project)?.0, armed_source_digest);
+        assert_eq!(fs::read(&private_file)?, parent_secret.as_bytes());
+        assert_eq!(fs::read(&store_file)?, parent_secret.as_bytes());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!descendant_marker.exists());
         let escaped_descendant = fs::read_dir("/proc")?.filter_map(Result::ok).any(|entry| {

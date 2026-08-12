@@ -2701,11 +2701,113 @@ fn print_evidence(evidence: &[depgraph_store::EvidenceRecord], indent: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        error_exit_code, inspect_runtime_trace_input, require_build_consent,
-        require_compiler_precise_consent, requires_build_attempt, runtime_trace_metadata_error,
-        write_file_atomically,
+        Cli, catalog_action_for_command, error_exit_code, inspect_runtime_trace_input,
+        require_build_consent, require_compiler_precise_consent, requires_build_attempt,
+        runtime_trace_metadata_error, write_file_atomically,
     };
-    use depgraph_core::BuildOutcomeKind;
+    use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
+    use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
+
+    #[test]
+    fn issue_317_every_real_clap_leaf_maps_once_to_the_static_mcp_catalog() {
+        let cases: &[(&[&str], CliAction)] = &[
+            (&["depgraph", "init"], CliAction::Init),
+            (&["depgraph", "scan"], CliAction::Scan),
+            (&["depgraph", "profiles", "plan"], CliAction::ProfilesPlan),
+            (&["depgraph", "daemon", "start"], CliAction::DaemonStart),
+            (&["depgraph", "daemon", "status"], CliAction::DaemonStatus),
+            (&["depgraph", "daemon", "stop"], CliAction::DaemonStop),
+            (&["depgraph", "resolve", "--build"], CliAction::ResolveBuild),
+            (&["depgraph", "doctor"], CliAction::Doctor),
+            (&["depgraph", "deps", "id:fixture"], CliAction::Deps),
+            (
+                &["depgraph", "dependents", "id:fixture"],
+                CliAction::Dependents,
+            ),
+            (&["depgraph", "why", "id:from", "id:to"], CliAction::Why),
+            (&["depgraph", "impact", "id:fixture"], CliAction::Impact),
+            (&["depgraph", "cycles"], CliAction::Cycles),
+            (&["depgraph", "unresolved"], CliAction::Unresolved),
+            (
+                &[
+                    "depgraph",
+                    "query",
+                    "--query",
+                    "MATCH (node) RETURN node.id LIMIT 1",
+                ],
+                CliAction::Query,
+            ),
+            (
+                &["depgraph", "runtime", "validate", "--trace", "{}"],
+                CliAction::RuntimeValidate,
+            ),
+            (
+                &["depgraph", "runtime", "import", "--trace", "{}"],
+                CliAction::RuntimeImport,
+            ),
+            (
+                &["depgraph", "snapshot", "create", "baseline"],
+                CliAction::SnapshotCreate,
+            ),
+            (&["depgraph", "snapshot", "list"], CliAction::SnapshotList),
+            (
+                &["depgraph", "snapshot", "show", "current"],
+                CliAction::SnapshotShow,
+            ),
+            (
+                &["depgraph", "diff", "baseline", "current"],
+                CliAction::Diff,
+            ),
+            (
+                &["depgraph", "policy", "baseline", "current"],
+                CliAction::Policy,
+            ),
+            (
+                &["depgraph", "export", "--format", "json"],
+                CliAction::Export,
+            ),
+        ];
+
+        let mut parsed_actions = cases
+            .iter()
+            .map(|(arguments, expected)| {
+                let parsed = <Cli as clap::Parser>::try_parse_from(*arguments)
+                    .unwrap_or_else(|error| panic!("failed to parse {arguments:?}: {error}"));
+                let action = catalog_action_for_command(&parsed.command);
+                assert_eq!(action, *expected, "{arguments:?}");
+                action
+            })
+            .collect::<Vec<_>>();
+        parsed_actions.sort_unstable();
+
+        let mut expected_actions = ALL_CLI_ACTIONS.to_vec();
+        expected_actions.sort_unstable();
+        assert_eq!(parsed_actions, expected_actions);
+
+        let capabilities = DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::RepositoryWrite,
+            DepgraphCapability::DaemonControl,
+            DepgraphCapability::ProjectExec,
+        ])
+        .unwrap();
+        let catalog = ToolCatalog::for_capabilities(&capabilities).unwrap();
+        for action in expected_actions {
+            let mapped_tools = catalog
+                .tools()
+                .iter()
+                .filter(|tool| tool.cli_actions().contains(&action))
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_tools.len(),
+                1,
+                "CLI action {} must map to exactly one static MCP tool, got {mapped_tools:?}",
+                action.stable_id()
+            );
+        }
+    }
 
     #[test]
     fn classifies_cli_errors_without_hiding_internal_failures_as_usage() {

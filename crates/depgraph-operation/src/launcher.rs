@@ -1015,16 +1015,26 @@ int main(int argc, char **argv) {{
             policy: RunnerResolutionPolicy::DevelopmentSibling,
         };
 
-        let process = launcher.launch(&startup, true).unwrap();
+        let mut process = launcher.launch(&startup, true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !capture.is_file() && std::time::Instant::now() < deadline {
+        let completed = loop {
+            if process.has_exited().unwrap() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        };
+        assert!(
+            completed,
+            "fake daemon did not complete its invocation record"
+        );
+        process.terminate_and_reap().unwrap();
         assert!(
             capture.is_file(),
             "fake daemon did not record its invocation"
         );
-        process.terminate_and_reap().unwrap();
 
         let observed = std::fs::read_to_string(&capture).unwrap();
         let expected = [

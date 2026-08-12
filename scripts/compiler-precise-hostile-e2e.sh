@@ -41,6 +41,9 @@ cargo test --offline -p depgraph-store --lib --locked completed_build_delta_unio
 cargo test --offline -p depgraph-rustc-wrapper --test supervised --locked
 cargo test --offline -p depgraph-cli --test cli --locked compiler_precise
 cargo test --offline -p depgraph-cli --test cli --locked safe_scan_does_not_resolve_node_git_or_node_options_from_the_repository
+cargo test --offline -p depgraph-cli --bin depgraph --locked issue_317_
+cargo test --offline -p depgraph-core --lib --locked service_graph::tests::issue_317_
+cargo test --offline -p depgraph-mcp --test process --locked issue_317_
 
 fixture_secret="depgraph-hostile-parent-secret-must-not-leak"
 DEPGRAPH_HOSTILE_PARENT_SECRET="$fixture_secret" \
@@ -93,6 +96,7 @@ report = {
         "artifact-stale-foreign-symlink-escape-duplicate-truncated-oversized-postflight",
         "failure-cargo-rustc-ice-panic-protocol-crash-signal-timeout-cancel-disk-output-terminal",
         "redaction-cleanup-last-snapshot-product-rollback-safe-scan",
+        "mcp-cli-capability-path-cancel-recovery-security-matrix",
     ],
     "reason_codes": [
         "build-child-failed",
@@ -114,6 +118,36 @@ report = {
         "previous_completed_snapshot_preserved": True,
         "previous_completed_build_layer_preserved": True,
         "temporary_output_preserved": False,
+    },
+    "mcp_security_matrix": {
+        "cli_leaf_actions": 23,
+        "capability_profiles": [
+            "read",
+            "store-write",
+            "repository-write",
+            "daemon-control",
+            "project-exec",
+            "full",
+        ],
+        "durable_operation_kinds": [
+            "scan_submit",
+            "runtime_trace_import_submit",
+            "export_file",
+            "daemon_start_submit",
+            "daemon_stop",
+            "resolve_build_submit",
+        ],
+        "path_boundaries": [
+            "profile-input",
+            "query-input",
+            "runtime-input",
+            "repository-output",
+            "graph-path-selector",
+        ],
+        "denied_cancel_mutates_journal": False,
+        "forged_operation_executes": False,
+        "source_tree_preserved": True,
+        "external_canary_preserved": True,
     },
     "unsafe_internal_api_inventory": {
         "new_unsafe_blocks": 0,
