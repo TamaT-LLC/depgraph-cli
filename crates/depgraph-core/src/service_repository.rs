@@ -2377,7 +2377,7 @@ fn write_repository_file_atomically_platform(
 ) -> DepgraphServiceResult<()> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_CREATE,
-        Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE},
+        Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
     };
 
     let traversal = open_windows_parent(service, path, true, || {})?;
@@ -2386,7 +2386,7 @@ fn write_repository_file_atomically_platform(
     let mut staging = open_windows_at(
         traversal.parent(),
         OsStr::new(&staging_name),
-        FILE_GENERIC_WRITE | DELETE,
+        FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
         windows_staging_share_access(),
         FILE_CREATE,
         Some(false),
@@ -2452,7 +2452,9 @@ fn write_repository_file_atomically_platform(
     ) {
         return Err(discard_staging(staging, error));
     }
-    validate_windows_directories(&traversal.directories)?;
+    if let Err(error) = validate_windows_directories(&traversal.directories) {
+        return Err(discard_staging(staging, error));
+    }
     if let Err(error) = rename_windows_file_handle(
         &staging,
         traversal.parent(),
@@ -2967,7 +2969,7 @@ fn open_windows_repository_output_after_root(
 ) -> DepgraphServiceResult<File> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_CREATE,
-        Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, FILE_SHARE_READ},
+        Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ},
     };
 
     let traversal = open_windows_parent(service, path, true, after_parents_opened)?;
@@ -2975,7 +2977,7 @@ fn open_windows_repository_output_after_root(
     let file = match open_windows_at(
         traversal.parent(),
         traversal.final_name,
-        FILE_GENERIC_WRITE,
+        FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
         FILE_CREATE,
         Some(false),
@@ -3443,15 +3445,16 @@ fn rename_windows_file_handle(
     replace_if_exists: bool,
 ) -> DepgraphServiceResult<()> {
     use std::{
-        mem,
+        mem::{self, MaybeUninit},
         os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
         ptr,
     };
     use windows_sys::{
-        Wdk::Storage::FileSystem::{FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS},
-        Win32::Storage::FileSystem::{
-            FILE_RENAME_INFO, FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle,
+        Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+            FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
         },
+        Win32::{Foundation::RtlNtStatusToDosError, System::IO::IO_STATUS_BLOCK},
     };
 
     let encoded_name = destination.encode_wide().collect::<Vec<_>>();
@@ -3463,7 +3466,7 @@ fn rename_windows_file_handle(
     // Windows requires at least the complete fixed structure plus the encoded
     // name bytes for both FileRenameInfo and FileRenameInfoEx. The trailing
     // FileName member is not a C flexible array in the public Win32 ABI.
-    let buffer_size = mem::size_of::<FILE_RENAME_INFO>()
+    let buffer_size = mem::size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(name_bytes as usize)
         .ok_or(RepositoryFileError::BoundaryViolation)?;
     let word_count = buffer_size
@@ -3471,11 +3474,18 @@ fn rename_windows_file_handle(
         .ok_or(RepositoryFileError::BoundaryViolation)?
         / mem::size_of::<usize>();
     let mut storage = vec![0_usize; word_count];
-    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let buffer_size =
+        u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let mut io_status = MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
     // SAFETY: storage is pointer-aligned and large enough for the fixed header
     // plus every encoded destination code unit. All pointers remain valid for
-    // SetFileInformationByHandle, which does not retain them.
-    let success = unsafe {
+    // NtSetInformationFile, which does not retain them. The source and parent
+    // handles remain live and owned for each call.
+    let mut status = unsafe {
+        // Every caller supplies a simple leaf name under this retained parent.
+        // Keeping RootDirectory explicit avoids resolving a relative name from
+        // the process working directory and remains stable across ancestor moves.
         (*information).RootDirectory = parent.as_raw_handle();
         (*information).FileNameLength = name_bytes;
         ptr::copy_nonoverlapping(
@@ -3487,22 +3497,24 @@ fn rename_windows_file_handle(
             // POSIX replacement is defined only together with replace-existing.
             (*information).Anonymous.Flags =
                 FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_REPLACE_IF_EXISTS;
-            FileRenameInfoEx
+            FileRenameInformationEx
         } else {
             (*information).Anonymous.ReplaceIfExists = false;
-            FileRenameInfo
+            FileRenameInformation
         };
-        SetFileInformationByHandle(
+        NtSetInformationFile(
             file.as_raw_handle(),
-            information_class,
+            io_status.as_mut_ptr(),
             information.cast(),
-            u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
+            buffer_size,
+            information_class,
         )
     };
-    if success != 0 {
+    if status >= 0 {
         return Ok(());
     }
-    let mut source = io::Error::last_os_error();
+    // SAFETY: converting an NTSTATUS does not require additional invariants.
+    let mut source = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
     let extended_is_unsupported = source.raw_os_error().is_some_and(|error| {
         use windows_sys::Win32::Foundation::{
             ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
@@ -3517,20 +3529,23 @@ fn rename_windows_file_handle(
     });
     if replace_if_exists && extended_is_unsupported {
         // SAFETY: the same initialized buffer and owned handles remain valid;
-        // only the information class and union interpretation change.
-        let fallback_success = unsafe {
+        // only the information class and union interpretation change. The IO
+        // status block remains writable output storage for the fallback call.
+        status = unsafe {
             (*information).Anonymous.ReplaceIfExists = replace_if_exists;
-            SetFileInformationByHandle(
+            NtSetInformationFile(
                 file.as_raw_handle(),
-                FileRenameInfo,
+                io_status.as_mut_ptr(),
                 information.cast(),
-                u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
+                buffer_size,
+                FileRenameInformation,
             )
         };
-        if fallback_success != 0 {
+        if status >= 0 {
             return Ok(());
         }
-        source = io::Error::last_os_error();
+        // SAFETY: converting an NTSTATUS does not require additional invariants.
+        source = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
     }
     if source.kind() == io::ErrorKind::AlreadyExists {
         return classify_windows_existing_output(parent, destination).map(|_| ());
@@ -3729,25 +3744,125 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn rename_windows_directory_for_test(parent_path: &Path, source: &OsStr, destination: &OsStr) {
+    fn expect_windows_test_stage<T>(result: DepgraphServiceResult<T>, stage: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(DepgraphServiceError::RepositoryFile {
+                reason: RepositoryFileError::Unavailable { source },
+            }) => panic!(
+                "Windows repository {stage} failed with OS error {:?}",
+                source.raw_os_error()
+            ),
+            Err(error) => panic!(
+                "Windows repository {stage} failed with category {:?}",
+                error.category()
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_repository_output_open_stages_are_usable() {
         use windows_sys::{
-            Wdk::Storage::FileSystem::FILE_OPEN,
-            Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE},
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{
+                FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            },
         };
 
-        let parent = open_windows_directory(parent_path, false)
-            .expect("rename parent can be opened by handle");
-        let source = open_windows_at(
-            &parent,
-            source,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            windows_repository_input_share_access(),
-            FILE_OPEN,
-            Some(true),
-        )
-        .expect("rename source can be opened by handle");
-        rename_windows_file_handle(&source, &parent, destination, false)
-            .expect("enclosing ancestor can be moved with POSIX rename semantics");
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        let nested = root.join("nested");
+        let cache = temporary.path().join("cache");
+        fs::create_dir_all(&nested).expect("repository is created");
+        fs::create_dir_all(&cache).expect("cache is created");
+        let service = repository_write_service(&root, &cache.join("graph.db"));
+
+        let root_handle =
+            expect_windows_test_stage(open_windows_directory(&root, false), "root-directory open");
+        assert_eq!(
+            expect_windows_test_stage(identity_from_file(&root_handle), "root identity"),
+            *service.config().root_identity()
+        );
+        let parent = expect_windows_test_stage(
+            open_windows_directory_at(&root_handle, OsStr::new("nested"), true),
+            "output-parent open",
+        );
+        expect_windows_test_stage(
+            validate_opened_repository_output_not_persistent_state(
+                &service,
+                &parent,
+                OsStr::new("output.txt"),
+            ),
+            "persistent-state validation",
+        );
+        let output = expect_windows_test_stage(
+            open_windows_at(
+                &parent,
+                OsStr::new("output.txt"),
+                FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                FILE_CREATE,
+                Some(false),
+            ),
+            "output-file create",
+        );
+        expect_windows_test_stage(
+            validate_opened_windows_regular_file(&output),
+            "output-file validation",
+        );
+        drop(output);
+        fs::remove_file(nested.join("output.txt")).expect("diagnostic output is removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_same_parent_file_rename_publishes_and_replaces() {
+        use std::io::Write as _;
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).expect("repository is created");
+        let parent = open_windows_directory(&root, true)
+            .expect("publication parent can be opened by handle");
+
+        let create_source = |name: &str, contents: &[u8]| {
+            let mut source = open_windows_at(
+                &parent,
+                OsStr::new(name),
+                FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+                windows_staging_share_access(),
+                FILE_CREATE,
+                Some(false),
+            )
+            .expect("staging file can be created by handle");
+            source
+                .write_all(contents)
+                .expect("staging file is writable");
+            source
+        };
+
+        let source = create_source("stage-create", b"created");
+        rename_windows_file_handle(&source, &parent, OsStr::new("output.txt"), false)
+            .expect("missing destination can be published by handle");
+        drop(source);
+        assert_eq!(
+            fs::read(root.join("output.txt")).expect("published output is readable"),
+            b"created"
+        );
+
+        let source = create_source("stage-replace", b"replaced");
+        rename_windows_file_handle(&source, &parent, OsStr::new("output.txt"), true)
+            .expect("existing destination can be replaced by handle");
+        drop(source);
+        assert_eq!(
+            fs::read(root.join("output.txt")).expect("replaced output is readable"),
+            b"replaced"
+        );
     }
 
     #[cfg(unix)]
@@ -3879,7 +3994,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_handle_relative_input_stays_with_root_across_enclosing_ancestor_swap() {
+    fn windows_retained_input_handles_block_enclosing_ancestor_swap() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let enclosing = temporary.path().join("enclosing");
         let moved_enclosing = temporary.path().join("moved-enclosing");
@@ -3893,32 +4008,22 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_input_after_root(&service, &path, || {
-            rename_windows_directory_for_test(
-                temporary.path(),
-                enclosing.file_name().expect("enclosing name is available"),
-                moved_enclosing
-                    .file_name()
-                    .expect("moved enclosing name is available"),
-            );
-            fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
-            fs::write(root.join("nested/input.txt"), b"replacement")
-                .expect("replacement input is created");
+            let error = fs::rename(&enclosing, &moved_enclosing)
+                .expect_err("retained descendant handles block an enclosing rename on Windows");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         })
-        .expect("handle-relative traversal remains rooted in the original repository");
+        .expect("input remains available after the rejected ancestor swap");
 
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .expect("opened input is readable");
         assert_eq!(contents, "original");
-        assert_eq!(
-            fs::read(root.join("nested/input.txt")).expect("replacement input remains readable"),
-            b"replacement"
-        );
+        assert!(!moved_enclosing.exists());
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_handle_relative_output_ignores_replacement_absolute_tree() {
+    fn windows_retained_output_handles_block_enclosing_ancestor_swap() {
         use std::io::Write as _;
 
         let temporary = tempfile::tempdir().expect("temporary directory is available");
@@ -3933,26 +4038,20 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_output_after_root(&service, &path, || {
-            rename_windows_directory_for_test(
-                temporary.path(),
-                enclosing.file_name().expect("enclosing name is available"),
-                moved_enclosing
-                    .file_name()
-                    .expect("moved enclosing name is available"),
-            );
-            fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
+            let error = fs::rename(&enclosing, &moved_enclosing)
+                .expect_err("retained descendant handles block an enclosing rename on Windows");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         })
-        .expect("handle-relative creation remains rooted in the original repository");
+        .expect("output remains available after the rejected ancestor swap");
         file.write_all(b"original output")
             .expect("opened output is writable");
         drop(file);
 
         assert_eq!(
-            fs::read(moved_enclosing.join("repository/nested/output.txt"))
-                .expect("output was created in the original repository"),
+            fs::read(root.join("nested/output.txt")).expect("output was created in the repository"),
             b"original output"
         );
-        assert!(!root.join("nested/output.txt").exists());
+        assert!(!moved_enclosing.exists());
     }
 
     #[test]
