@@ -81,6 +81,7 @@ const CAPABILITY_PROFILES: &[(&str, &[DepgraphCapability])] = &[
 
 #[derive(Clone, Debug)]
 struct DocumentedLaunchProfile {
+    executable_relative: PathBuf,
     arguments: Vec<String>,
 }
 
@@ -178,8 +179,10 @@ fn documented_launch_profiles(
         );
     }
 
+    let expected_executable =
+        format!("/absolute/path/to/depgraph-{release_version}-TARGET_TRIPLE/bin/depgraph-mcp");
     let expected_command = [
-        format!("/absolute/path/to/depgraph-{release_version}-<target>/bin/depgraph-mcp \\"),
+        format!("{expected_executable} \\"),
         format!("  --root {DOCUMENTED_ROOT} \\"),
         format!("  --store {DOCUMENTED_STORE} \\"),
         "  --capability read \\".to_owned(),
@@ -188,10 +191,12 @@ fn documented_launch_profiles(
     ]
     .join("\n");
     let command = marked_code_block(&readme, "command", "sh")?;
+    let (command_executable, command_arguments) = documented_shell_command(command)?;
+    let command_executable_relative =
+        documented_executable_relative(&command_executable, release_version)?;
     if command != expected_command {
         bail!("README packaged MCP command example differs from the read-only launch contract");
     }
-    let command_arguments = documented_command_arguments(command)?;
 
     let mut profiles = BTreeMap::new();
     for (name, capabilities) in CAPABILITY_PROFILES.iter().copied() {
@@ -203,9 +208,7 @@ fn documented_launch_profiles(
         let expected = json!({
             "mcpServers": {
                 "depgraph": {
-                    "command": format!(
-                        "/absolute/path/to/depgraph-{release_version}-<target>/bin/depgraph-mcp"
-                    ),
+                    "command": expected_executable.clone(),
                     "args": arguments
                 }
             }
@@ -213,6 +216,10 @@ fn documented_launch_profiles(
         if actual != expected {
             bail!("packaged MCP {name} documentation differs from its exact capability profile");
         }
+        let executable = actual["mcpServers"]["depgraph"]["command"]
+            .as_str()
+            .context("packaged MCP documentation has no command")?;
+        let executable_relative = documented_executable_relative(executable, release_version)?;
         let arguments = actual["mcpServers"]["depgraph"]["args"]
             .as_array()
             .context("packaged MCP documentation has no argument array")?
@@ -224,33 +231,45 @@ fn documented_launch_profiles(
                     .context("packaged MCP documentation contains a non-string argument")
             })
             .collect::<Result<Vec<_>>>()?;
-        if name == "read" && arguments != command_arguments {
-            bail!("README packaged MCP command and Agent host entry use different arguments");
-        }
-        let launch_arguments = if name == "read" {
-            command_arguments.clone()
-        } else {
-            arguments
-        };
-        if profiles
-            .insert(
-                name.to_owned(),
-                DocumentedLaunchProfile {
-                    arguments: launch_arguments,
-                },
-            )
-            .is_some()
+        if name == "read"
+            && (executable_relative != command_executable_relative
+                || arguments != command_arguments)
         {
+            bail!("README packaged MCP command and Agent host entry differ");
+        }
+        let launch_profile = if name == "read" {
+            DocumentedLaunchProfile {
+                executable_relative: command_executable_relative.clone(),
+                arguments: command_arguments.clone(),
+            }
+        } else {
+            DocumentedLaunchProfile {
+                executable_relative,
+                arguments,
+            }
+        };
+        if profiles.insert(name.to_owned(), launch_profile).is_some() {
             bail!("packaged MCP documentation contains duplicate profile {name}");
         }
     }
     Ok(profiles)
 }
 
-fn documented_command_arguments(command: &str) -> Result<Vec<String>> {
+fn documented_shell_command(command: &str) -> Result<(String, Vec<String>)> {
     let lines = command.lines().collect::<Vec<_>>();
     if lines.len() < 2 {
         bail!("README packaged MCP command has no arguments");
+    }
+    let executable = lines[0]
+        .trim()
+        .strip_suffix(" \\")
+        .context("README packaged MCP command has a malformed executable continuation")?;
+    if executable.is_empty()
+        || !executable
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        bail!("README packaged MCP executable is not a shell-safe path token");
     }
     let mut arguments = Vec::new();
     for (index, line) in lines.iter().enumerate().skip(1) {
@@ -263,7 +282,18 @@ fn documented_command_arguments(command: &str) -> Result<Vec<String>> {
         };
         arguments.extend(line.split_ascii_whitespace().map(ToOwned::to_owned));
     }
-    Ok(arguments)
+    Ok((executable.to_owned(), arguments))
+}
+
+fn documented_executable_relative(executable: &str, release_version: &str) -> Result<PathBuf> {
+    let archive_prefix = format!("/absolute/path/to/depgraph-{release_version}-TARGET_TRIPLE/");
+    let relative = executable
+        .strip_prefix(&archive_prefix)
+        .context("packaged MCP command is outside the documented release directory")?;
+    if relative != "bin/depgraph-mcp" {
+        bail!("packaged MCP command does not name the packaged native server");
+    }
+    Ok(PathBuf::from(relative))
 }
 
 fn marked_code_block<'a>(document: &'a str, name: &str, language: &str) -> Result<&'a str> {
@@ -940,7 +970,10 @@ impl PackagedMcp {
         requirement: &Path,
         documented_profile: &DocumentedLaunchProfile,
     ) -> Result<Self> {
-        let executable = extracted.join("bin").join(executable_name("depgraph-mcp"));
+        let mut executable = extracted.join(&documented_profile.executable_relative);
+        if cfg!(windows) {
+            executable.set_extension("exe");
+        }
         let mut command = Command::new(&executable);
         command
             .current_dir(extracted)
@@ -1285,14 +1318,6 @@ fn capability_cli_name(capability: DepgraphCapability) -> &'static str {
     }
 }
 
-fn executable_name(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    }
-}
-
 fn canonical_sha256(value: &Value) -> String {
     hex::encode(Sha256::digest(
         depgraph_protocol::canonical_json(value).as_bytes(),
@@ -1348,6 +1373,20 @@ mod tests {
         )?;
         assert!(verify_documentation(temporary.path(), crate::VERSION).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn documented_shell_command_rejects_executable_metacharacters() {
+        let unsafe_command = concat!(
+            "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp \\\n",
+            "  --capability read"
+        );
+        let error = documented_shell_command(unsafe_command).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("executable is not a shell-safe path token")
+        );
     }
 
     #[test]

@@ -1462,3 +1462,36 @@ async fn resolve_build_rejects_missing_authority_or_acknowledgement_before_mutat
     assert!(!store_path.exists(), "a rejected request created the Store");
     Ok(())
 }
+
+#[tokio::test]
+async fn resolve_build_rejects_a_replaced_repository_root_before_mutation() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let original_root = temporary.path().join("original-repository");
+    let store_path = temporary.path().join("must-not-exist.sqlite");
+    std::fs::create_dir_all(&root)?;
+
+    let service = DepgraphService::new(DepgraphServiceConfig::new(
+        &root,
+        &store_path,
+        DepgraphCapabilitySet::try_new([
+            DepgraphCapability::Read,
+            DepgraphCapability::StoreWrite,
+            DepgraphCapability::ProjectExec,
+        ])?,
+        DepgraphServiceLimits::default(),
+    )?);
+    std::fs::rename(&root, &original_root)?;
+    std::fs::create_dir_all(&root)?;
+
+    let error = service
+        .resolve_build_cancellable(
+            &ResolveBuildRequest::new(true, false, None),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+    assert!(!store_path.exists(), "an invalid root created the Store");
+    Ok(())
+}

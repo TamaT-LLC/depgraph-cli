@@ -15,8 +15,9 @@ requirement as one operator-approved launch tuple.
   `bin/depgraph-mcp` from that extracted release. The sibling operation runner,
   schema, workers, and manifest must remain from the same archive.
 - Replace every `/absolute/path/to/...` placeholder below with a canonical
-  absolute path before saving host configuration. These are documentation
-  placeholders, not environment variables for the host to expand.
+  absolute path and `TARGET_TRIPLE` with the release host target before saving
+  host configuration. These are documentation placeholders, not environment
+  variables for the host to expand.
 - `--root` is an existing repository directory. The server seals that root for
   its lifetime; repository-relative input and output cannot switch roots.
 - `--store` is one fixed absolute SQLite file for that root. Keep it outside the
@@ -44,7 +45,7 @@ writes, daemon control, or project-code execution.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -69,7 +70,7 @@ symlinks, reparse points, and repository escapes remain denied.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -94,7 +95,7 @@ valid closure is `read` plus `store-write` plus `daemon-control`; omitting
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -120,7 +121,7 @@ project code. The valid closure is `read` plus `store-write` plus
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -146,7 +147,7 @@ effects.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
