@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -20,6 +21,7 @@ mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
+const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
 const STABLE_RELEASE_VERSION: &str = "0.5.0";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "candidate-unpinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
@@ -99,6 +101,16 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("x86_64-apple-darwin", "tar.gz"),
     ("aarch64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
+];
+const FULL_CI_JOB_NAMES: &[&str] = &[
+    "benchmark",
+    "compiler-precise-hostile",
+    "go",
+    "integration (macos-15, aarch64-apple-darwin)",
+    "integration (ubuntu-24.04, x86_64-unknown-linux-gnu)",
+    "rust",
+    "web",
+    "windows-smoke",
 ];
 const RELEASE_CARGO_BUILD_TARGETS: &[(&str, Option<&str>, Option<&str>)] = &[
     ("depgraph-cli", Some("depgraph"), Some("packaged")),
@@ -264,6 +276,27 @@ enum Task {
         release_verification: PathBuf,
         benchmark_report: PathBuf,
         compiler_pack_verification: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    ReleasePostPublishEvidence {
+        workflow_assets: PathBuf,
+        public_assets: PathBuf,
+        ci_run: PathBuf,
+        #[arg(long)]
+        tag: String,
+        #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
+        source_tree: String,
+        #[arg(long)]
+        tag_object_sha: String,
+        #[arg(long)]
+        tag_signature_verification: String,
+        #[arg(long)]
+        release_run_id: u64,
+        #[arg(long)]
+        release_run_url: String,
         #[arg(long)]
         output: PathBuf,
     },
@@ -659,6 +692,102 @@ struct StableReleaseGateReport {
     checks: Vec<StableReleaseGateCheck>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FullCiRunEvidenceInput {
+    database_id: u64,
+    head_sha: String,
+    head_branch: String,
+    event: String,
+    conclusion: String,
+    url: String,
+    jobs: Vec<FullCiJobEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FullCiJobEvidence {
+    name: String,
+    conclusion: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseAssetEvidence {
+    name: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseCandidateEvidence {
+    commit: String,
+    tree: String,
+    tag_object: String,
+    tag_signature_verification: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseWorkflowEvidence {
+    run_id: u64,
+    url: String,
+    head_sha: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FullCiRunEvidence {
+    run_id: u64,
+    url: String,
+    head_sha: String,
+    head_branch: String,
+    jobs: Vec<FullCiJobEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseAggregateEvidence {
+    release_verification_sha256: String,
+    compiler_pack_verification_sha256: String,
+    benchmark_report_sha256: String,
+    cache_hit_benchmark_report_sha256: String,
+    stable_release_gate_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReleasePostPublishEvidence {
+    schema_version: String,
+    repository: String,
+    release_version: String,
+    tag: String,
+    decision: StableReleaseDecision,
+    candidate: ReleaseCandidateEvidence,
+    full_ci: FullCiRunEvidence,
+    release_workflow: ReleaseWorkflowEvidence,
+    workflow_public_asset_identity: bool,
+    public_download_reverified: bool,
+    asset_set_sha256: String,
+    assets: Vec<ReleaseAssetEvidence>,
+    aggregates: ReleaseAggregateEvidence,
+}
+
+struct ReleasePostPublishEvidenceRequest {
+    workflow_assets: PathBuf,
+    public_assets: PathBuf,
+    ci_run: PathBuf,
+    tag: String,
+    source_sha: String,
+    source_tree: String,
+    tag_object_sha: String,
+    tag_signature_verification: String,
+    release_run_id: u64,
+    release_run_url: String,
+    output: PathBuf,
+}
+
 const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
 fn main() -> Result<()> {
@@ -701,6 +830,31 @@ fn main() -> Result<()> {
             &compiler_pack_verification,
             &output,
         ),
+        Task::ReleasePostPublishEvidence {
+            workflow_assets,
+            public_assets,
+            ci_run,
+            tag,
+            source_sha,
+            source_tree,
+            tag_object_sha,
+            tag_signature_verification,
+            release_run_id,
+            release_run_url,
+            output,
+        } => release_post_publish_evidence(ReleasePostPublishEvidenceRequest {
+            workflow_assets,
+            public_assets,
+            ci_run,
+            tag,
+            source_sha,
+            source_tree,
+            tag_object_sha,
+            tag_signature_verification,
+            release_run_id,
+            release_run_url,
+            output,
+        }),
         Task::GithubSettingsVerify { snapshot, output } => {
             github_settings_verify(&snapshot, &output)
         }
@@ -856,6 +1010,8 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
         "Pull requests, fork branches",
         "does not interpolate the `secrets` expression",
         "Only the final `publish` job receives job-scoped",
+        "`release-post-publish-evidence-v1`",
+        "Every one of the 51 pre-evidence public assets",
         "The stable source guard handles `workflow_run` metadata without checking out",
         "No current workflow requests `id-token: write`",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
@@ -1849,6 +2005,40 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5 release note is missing contract {required:?}");
         }
     }
+    let rc_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0-rc.1.md"))?;
+    for required in [
+        "first v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.1` tag",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.1.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc_release_note.contains(required) {
+            bail!("v0.5.0-rc.1 release note is missing contract {required:?}");
+        }
+    }
+    let release_procedure = fs::read_to_string(root.join("docs/50_test/release-procedure.md"))?;
+    for required in [
+        "git tag -s \"$release_tag\" \"$candidate\"",
+        "git verify-tag \"$release_tag\"",
+        "## 公開後の再取得検証",
+        "`release-post-publish-evidence-v1`",
+        "計51点",
+        "checkout内のproduct binaryや未公開package artifact",
+    ] {
+        if !release_procedure.contains(required) {
+            bail!("release procedure is missing post-publish contract {required:?}");
+        }
+    }
     if sha256_file(&root.join(STABLE_UPGRADE_SOURCE_FIXTURE_PATH))?
         != STABLE_UPGRADE_SOURCE_FIXTURE_SHA256
     {
@@ -1922,6 +2112,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.1.md",
         "docs/releases/v0.4.0-rc.6.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
@@ -1978,6 +2169,17 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_RELEASE_VERIFY_COMPILER_PACKS_RESULT: ${{ needs.verify-compiler-packs.result }}",
         "name: stable-release-gate",
         "needs: stable-gate",
+        "name: Verify the signed annotated release tag",
+        "git rev-parse \"${GITHUB_REF_NAME}^{tag}\"",
+        "git ls-remote origin refs/heads/main",
+        ".verification.signature != null",
+        "gh release download \"$GITHUB_REF_NAME\" --dir post-publish/public",
+        "cargo xtask verify-release-assets post-publish/normal",
+        "cargo xtask verify-compiler-pack-assets post-publish/compiler",
+        "gh run list --workflow CI --event workflow_dispatch --commit \"$GITHUB_SHA\" --status success",
+        "cargo xtask release-post-publish-evidence",
+        "gh release upload \"$GITHUB_REF_NAME\" \"$evidence\"",
+        "cmp --silent \"$evidence\"",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
@@ -5113,6 +5315,362 @@ fn stable_release_gate(
         output.display()
     );
     Ok(())
+}
+
+fn release_post_publish_evidence(request: ReleasePostPublishEvidenceRequest) -> Result<()> {
+    verify_project_metadata(&workspace_root())?;
+    if !supported_release_tag(&request.tag)
+        || request.tag == format!("v{VERSION}")
+        || !lowercase_git_sha(&request.source_sha)
+        || !lowercase_git_sha(&request.source_tree)
+        || !lowercase_git_sha(&request.tag_object_sha)
+        || !matches!(
+            request.tag_signature_verification.as_str(),
+            "valid" | "unknown_key" | "unverified_email"
+        )
+    {
+        bail!("post-publish evidence requires a signed canonical v{VERSION}-rc.N tag");
+    }
+    if request.release_run_id == 0
+        || request.release_run_url != canonical_actions_run_url(request.release_run_id)
+    {
+        bail!("post-publish evidence has a non-canonical Release workflow run");
+    }
+
+    let workflow_assets = release_asset_inventory(&request.workflow_assets)?;
+    let public_assets = release_asset_inventory(&request.public_assets)?;
+    let expected_assets = expected_release_asset_names();
+    let workflow_names = workflow_assets
+        .iter()
+        .map(|asset| asset.name.clone())
+        .collect::<BTreeSet<_>>();
+    let public_names = public_assets
+        .iter()
+        .map(|asset| asset.name.clone())
+        .collect::<BTreeSet<_>>();
+    if workflow_names != expected_assets
+        || public_names != expected_assets
+        || workflow_assets != public_assets
+    {
+        bail!(
+            "published release assets differ from the exact workflow-produced v{VERSION} closure"
+        );
+    }
+
+    let full_ci = validate_full_ci_run(&request.ci_run, &request.source_sha)?;
+    let aggregates = validate_post_publish_aggregates(
+        &request.public_assets,
+        &request.tag,
+        &request.source_sha,
+        &public_assets,
+    )?;
+    let evidence = ReleasePostPublishEvidence {
+        schema_version: RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION.to_owned(),
+        repository: "TamaT-LLC/depgraph-cli".to_owned(),
+        release_version: VERSION.to_owned(),
+        tag: request.tag,
+        decision: StableReleaseDecision::Allow,
+        candidate: ReleaseCandidateEvidence {
+            commit: request.source_sha.clone(),
+            tree: request.source_tree,
+            tag_object: request.tag_object_sha,
+            tag_signature_verification: request.tag_signature_verification,
+        },
+        full_ci,
+        release_workflow: ReleaseWorkflowEvidence {
+            run_id: request.release_run_id,
+            url: request.release_run_url,
+            head_sha: request.source_sha,
+        },
+        workflow_public_asset_identity: true,
+        public_download_reverified: true,
+        asset_set_sha256: release_asset_set_sha256(&public_assets),
+        assets: public_assets,
+        aggregates,
+    };
+    let output_parent = request
+        .output
+        .parent()
+        .context("post-publish evidence output has no parent")?;
+    fs::create_dir_all(output_parent)?;
+    let mut encoded = serde_json::to_vec_pretty(&evidence)?;
+    encoded.push(b'\n');
+    fs::write(&request.output, encoded).with_context(|| {
+        format!(
+            "failed to write post-publish evidence {}",
+            request.output.display()
+        )
+    })?;
+    println!(
+        "verified {} public release assets; evidence={}",
+        evidence.assets.len(),
+        request.output.display()
+    );
+    Ok(())
+}
+
+fn canonical_actions_run_url(run_id: u64) -> String {
+    format!("https://github.com/TamaT-LLC/depgraph-cli/actions/runs/{run_id}")
+}
+
+fn expected_release_asset_names() -> BTreeSet<String> {
+    let mut expected = [
+        "benchmark-report.json",
+        "cache-hit-benchmark-report.json",
+        "compiler-pack-verification.json",
+        "compiler-precise-hostile-e2e.json",
+        "release-verification.json",
+        "stable-release-gate.json",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    for (target, extension) in RELEASE_TARGETS {
+        let archive = format!("depgraph-{VERSION}-{target}.{extension}");
+        expected.extend([
+            archive.clone(),
+            format!("{archive}.sha256"),
+            format!("depgraph-{VERSION}-{target}.query-smoke.json"),
+            format!("depgraph-{VERSION}-{target}.cross-language-smoke.json"),
+            format!("depgraph-{VERSION}-{target}.mcp-smoke.json"),
+        ]);
+        let compiler_pack = format!("depgraph-compiler-pack-{VERSION}-{target}");
+        let compiler_archive = format!("{compiler_pack}.{extension}");
+        expected.extend([
+            compiler_archive.clone(),
+            format!("{compiler_archive}.sha256"),
+            format!("{compiler_pack}.requirement.json"),
+            format!("{compiler_pack}.smoke.json"),
+        ]);
+    }
+    expected
+}
+
+fn release_asset_inventory(directory: &Path) -> Result<Vec<ReleaseAssetEvidence>> {
+    if !directory.is_dir()
+        || fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        bail!(
+            "release evidence asset directory is missing or symlinked: {}",
+            directory.display()
+        );
+    }
+    let mut assets = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "release evidence asset directory contains a non-regular entry: {}",
+                entry.path().display()
+            );
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("release evidence asset name is not UTF-8"))?;
+        assets.push(ReleaseAssetEvidence {
+            name,
+            bytes: metadata.len(),
+            sha256: sha256_file_streaming(&entry.path())?,
+        });
+    }
+    assets.sort_by(|left, right| left.name.cmp(&right.name));
+    if assets.len() > 128 || assets.windows(2).any(|pair| pair[0].name >= pair[1].name) {
+        bail!("release evidence asset inventory is duplicated or unbounded");
+    }
+    Ok(assets)
+}
+
+fn sha256_file_streaming(path: &Path) -> Result<String> {
+    let mut input = fs::File::open(path)
+        .with_context(|| format!("failed to open release asset {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read release asset {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn release_asset_set_sha256(assets: &[ReleaseAssetEvidence]) -> String {
+    let mut hasher = Sha256::new();
+    for asset in assets {
+        hasher.update(asset.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(asset.bytes.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(asset.sha256.as_bytes());
+        hasher.update([b'\n']);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn validate_full_ci_run(path: &Path, source_sha: &str) -> Result<FullCiRunEvidence> {
+    let input: FullCiRunEvidenceInput = serde_json::from_slice(
+        &fs::read(path)
+            .with_context(|| format!("failed to read full CI evidence {}", path.display()))?,
+    )
+    .context("full CI evidence does not satisfy its closed schema")?;
+    let mut jobs = input.jobs;
+    jobs.sort_by(|left, right| left.name.cmp(&right.name));
+    let expected = FULL_CI_JOB_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    if input.database_id == 0
+        || input.head_sha != source_sha
+        || input.head_branch != "main"
+        || input.event != "workflow_dispatch"
+        || input.conclusion != "success"
+        || input.url != canonical_actions_run_url(input.database_id)
+        || jobs.iter().map(|job| job.name.clone()).collect::<Vec<_>>() != expected
+        || jobs.iter().any(|job| job.conclusion != "success")
+    {
+        bail!("full CI evidence is not the exact all-green candidate run");
+    }
+    Ok(FullCiRunEvidence {
+        run_id: input.database_id,
+        url: input.url,
+        head_sha: input.head_sha,
+        head_branch: input.head_branch,
+        jobs,
+    })
+}
+
+fn validate_post_publish_aggregates(
+    directory: &Path,
+    tag: &str,
+    source_sha: &str,
+    assets: &[ReleaseAssetEvidence],
+) -> Result<ReleaseAggregateEvidence> {
+    let digests = assets
+        .iter()
+        .map(|asset| (asset.name.as_str(), asset.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let release: Value =
+        serde_json::from_slice(&fs::read(directory.join("release-verification.json"))?)
+            .context("public release verification report is invalid JSON")?;
+    let release_targets = release["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target["target"].as_str())
+        .collect::<Vec<_>>();
+    let expected_targets = RELEASE_TARGETS
+        .iter()
+        .map(|(target, _)| *target)
+        .collect::<Vec<_>>();
+    if release["schema_version"] != 9
+        || release["release_version"] != VERSION
+        || release["tag"] != tag
+        || release_targets != expected_targets
+    {
+        bail!("public release aggregate does not bind the exact five-target candidate");
+    }
+
+    let compiler: Value = serde_json::from_slice(&fs::read(
+        directory.join("compiler-pack-verification.json"),
+    )?)
+    .context("public compiler-pack verification report is invalid JSON")?;
+    let compiler_targets = compiler["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target["target"].as_str())
+        .collect::<Vec<_>>();
+    if compiler["schema_version"]
+        != compiler_pack_release::COMPILER_PACK_VERIFICATION_SCHEMA_VERSION
+        || compiler["release_version"] != VERSION
+        || compiler_targets != expected_targets
+    {
+        bail!("public compiler-pack aggregate does not bind the exact five-target candidate");
+    }
+
+    let benchmark: Value =
+        serde_json::from_slice(&fs::read(directory.join("benchmark-report.json"))?)
+            .context("public benchmark report is invalid JSON")?;
+    let cache_hit: Value = serde_json::from_slice(&fs::read(
+        directory.join("cache-hit-benchmark-report.json"),
+    )?)
+    .context("public cache-hit benchmark report is invalid JSON")?;
+    if benchmark["schema_version"] != BENCHMARK_REPORT_SCHEMA_VERSION
+        || benchmark["gate"]["passed"] != Value::Bool(true)
+        || cache_hit["schema_version"] != "depgraph-cache-hit-benchmark-v1"
+        || cache_hit["commit"] != source_sha
+        || cache_hit["passed"] != Value::Bool(true)
+    {
+        bail!("public benchmark evidence is incompatible or failed");
+    }
+
+    let stable: StableReleaseGateReport =
+        serde_json::from_slice(&fs::read(directory.join("stable-release-gate.json"))?)
+            .context("public stable release gate does not satisfy its closed schema")?;
+    let release_sha = required_asset_digest(&digests, "release-verification.json")?;
+    let compiler_sha = required_asset_digest(&digests, "compiler-pack-verification.json")?;
+    let benchmark_sha = required_asset_digest(&digests, "benchmark-report.json")?;
+    if stable.schema_version != STABLE_RELEASE_GATE_SCHEMA_VERSION
+        || stable.release_version != VERSION
+        || stable.upgrade_source_version != STABLE_UPGRADE_SOURCE_VERSION
+        || stable.tag != tag
+        || stable.decision != StableReleaseDecision::Allow
+        || stable.release_verification_sha256 != release_sha
+        || stable.compiler_pack_verification_sha256 != compiler_sha
+        || stable.benchmark_report_sha256 != benchmark_sha
+        || stable.checks.is_empty()
+        || stable.checks.iter().any(|check| !check.passed)
+        || stable
+            .workflow_results
+            .get("github_actions")
+            .map(String::as_str)
+            != Some("true")
+        || stable.workflow_results.get("ref_type").map(String::as_str) != Some("tag")
+        || stable.workflow_results.get("ref_name").map(String::as_str) != Some(tag)
+        || stable
+            .workflow_results
+            .get("source_sha")
+            .map(String::as_str)
+            != Some(source_sha)
+        || [
+            "quality",
+            "compiler-precise-hostile",
+            "benchmark",
+            "package",
+            "verify-assets",
+            "compiler-pack",
+            "verify-compiler-packs",
+        ]
+        .iter()
+        .any(|job| stable.workflow_results.get(*job).map(String::as_str) != Some("success"))
+    {
+        bail!("public stable release gate is not the exact all-green candidate gate");
+    }
+
+    Ok(ReleaseAggregateEvidence {
+        release_verification_sha256: release_sha.to_owned(),
+        compiler_pack_verification_sha256: compiler_sha.to_owned(),
+        benchmark_report_sha256: benchmark_sha.to_owned(),
+        cache_hit_benchmark_report_sha256: required_asset_digest(
+            &digests,
+            "cache-hit-benchmark-report.json",
+        )?
+        .to_owned(),
+        stable_release_gate_sha256: required_asset_digest(&digests, "stable-release-gate.json")?
+            .to_owned(),
+    })
+}
+
+fn required_asset_digest<'a>(digests: &'a BTreeMap<&str, &str>, name: &str) -> Result<&'a str> {
+    digests
+        .get(name)
+        .copied()
+        .with_context(|| format!("release asset inventory is missing {name}"))
 }
 
 fn compiler_pack_release_binding(
@@ -13236,11 +13794,13 @@ mod tests {
     use super::{
         ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
-        CrossLanguagePackageSmokeReport, DependencyPackage, GithubActionsPolicy,
+        CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, GithubActionsPolicy,
         MCP_OPERATION_CONTRACT_VERSION, MCP_PROTOCOL_REVISION, MCP_SDK_VERSION,
         MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
-        RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
-        ReleaseVerificationReport, STABLE_BENCHMARK_METRICS, STABLE_RELEASE_VERSION,
+        RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
+        RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
+        ReleasePostPublishEvidence, ReleasePostPublishEvidenceRequest, ReleaseVerificationReport,
+        STABLE_BENCHMARK_METRICS, STABLE_RELEASE_GATE_SCHEMA_VERSION, STABLE_RELEASE_VERSION,
         STABLE_UPGRADE_SOURCE_FIXTURE_PATH, STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
         StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task,
@@ -13249,14 +13809,15 @@ mod tests {
         WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
         WorkerBackend, archive_entries, cargo_metadata, cargo_runtime_packages,
         compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
-        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
-        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
-        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
-        rust_backend_from_handshake, rustc_source_identity, supported_release_tag,
-        target_native_smoke_expectation, v0_4_stable_release_baseline_digest,
-        validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
-        verify_checksum_sidecar, verify_cross_language_package_smoke,
-        verify_github_actions_security, verify_local_markdown_links, verify_mcp_dependencies,
+        evaluate_stable_release_gate, executable_name_for_target, expected_release_asset_names,
+        extract_archive, github_settings_verify, has_windows_executable_extension,
+        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
+        release_post_publish_evidence, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
+        v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
+        validate_cross_language_package_smoke, verify_checksum_sidecar,
+        verify_cross_language_package_smoke, verify_github_actions_security,
+        verify_local_markdown_links, verify_mcp_dependencies,
         verify_mcp_tasks_architecture_decision, verify_packaged_cross_language,
         verify_pinned_rust_sysroot_digest, verify_project_metadata,
         verify_public_community_surface, verify_release_tag_values,
@@ -13265,6 +13826,128 @@ mod tests {
         verify_workflow_policy_text, web_runtime_packages, web_semantic_from_handshake,
         without_windows_verbatim_prefix, workspace_root,
     };
+
+    fn post_publish_evidence_fixture()
+    -> Result<(tempfile::TempDir, ReleasePostPublishEvidenceRequest)> {
+        let temp = tempfile::tempdir()?;
+        let workflow = temp.path().join("workflow");
+        let public = temp.path().join("public");
+        fs::create_dir_all(&workflow)?;
+        fs::create_dir_all(&public)?;
+        let source_sha = "a".repeat(40);
+        let source_tree = "b".repeat(40);
+        let tag_object_sha = "c".repeat(40);
+        let tag = "v0.5.0-rc.1";
+
+        let expected = expected_release_asset_names();
+        assert_eq!(expected.len(), 51);
+        for name in &expected {
+            fs::write(workflow.join(name), format!("fixture:{name}\n"))?;
+        }
+        let targets = RELEASE_TARGETS
+            .iter()
+            .map(|(target, _)| json!({"target": target}))
+            .collect::<Vec<_>>();
+        fs::write(
+            workflow.join("release-verification.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 9,
+                "release_version": VERSION,
+                "tag": tag,
+                "targets": targets,
+            }))?,
+        )?;
+        fs::write(
+            workflow.join("compiler-pack-verification.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": super::compiler_pack_release::COMPILER_PACK_VERIFICATION_SCHEMA_VERSION,
+                "release_version": VERSION,
+                "targets": RELEASE_TARGETS.iter().map(|(target, _)| json!({"target": target})).collect::<Vec<_>>(),
+            }))?,
+        )?;
+        fs::write(
+            workflow.join("benchmark-report.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": BENCHMARK_REPORT_SCHEMA_VERSION,
+                "gate": {"passed": true},
+            }))?,
+        )?;
+        fs::write(
+            workflow.join("cache-hit-benchmark-report.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": "depgraph-cache-hit-benchmark-v1",
+                "commit": source_sha,
+                "passed": true,
+            }))?,
+        )?;
+        let release_sha =
+            super::sha256_file_streaming(&workflow.join("release-verification.json"))?;
+        let compiler_sha =
+            super::sha256_file_streaming(&workflow.join("compiler-pack-verification.json"))?;
+        let benchmark_sha = super::sha256_file_streaming(&workflow.join("benchmark-report.json"))?;
+        fs::write(
+            workflow.join("stable-release-gate.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": STABLE_RELEASE_GATE_SCHEMA_VERSION,
+                "release_version": VERSION,
+                "upgrade_source_version": STABLE_UPGRADE_SOURCE_VERSION,
+                "tag": tag,
+                "decision": "allow",
+                "release_verification_sha256": release_sha,
+                "benchmark_report_sha256": benchmark_sha,
+                "compiler_pack_verification_sha256": compiler_sha,
+                "workflow_results": {
+                    "github_actions": "true",
+                    "ref_type": "tag",
+                    "ref_name": tag,
+                    "source_sha": source_sha,
+                    "quality": "success",
+                    "compiler-precise-hostile": "success",
+                    "benchmark": "success",
+                    "package": "success",
+                    "verify-assets": "success",
+                    "compiler-pack": "success",
+                    "verify-compiler-packs": "success"
+                },
+                "checks": [{"id": "fixture", "passed": true, "evidence": "fixture"}],
+            }))?,
+        )?;
+        for name in expected {
+            fs::copy(workflow.join(&name), public.join(name))?;
+        }
+
+        let full_ci = temp.path().join("full-ci.json");
+        fs::write(
+            &full_ci,
+            serde_json::to_vec(&json!({
+                "database_id": 123,
+                "head_sha": source_sha,
+                "head_branch": "main",
+                "event": "workflow_dispatch",
+                "conclusion": "success",
+                "url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/123",
+                "jobs": FULL_CI_JOB_NAMES.iter().rev().map(|name| json!({
+                    "name": name,
+                    "conclusion": "success",
+                })).collect::<Vec<_>>(),
+            }))?,
+        )?;
+        let request = ReleasePostPublishEvidenceRequest {
+            workflow_assets: workflow,
+            public_assets: public,
+            ci_run: full_ci,
+            tag: tag.to_owned(),
+            source_sha,
+            source_tree,
+            tag_object_sha,
+            tag_signature_verification: "valid".to_owned(),
+            release_run_id: 456,
+            release_run_url: "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/456"
+                .to_owned(),
+            output: temp.path().join("evidence.json"),
+        };
+        Ok((temp, request))
+    }
 
     fn release_tree() -> Result<(tempfile::TempDir, String)> {
         let temp = tempfile::tempdir()?;
@@ -13286,6 +13969,41 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn post_publish_evidence_binds_exact_public_assets_and_full_ci() -> Result<()> {
+        let (_temp, request) = post_publish_evidence_fixture()?;
+        let output = request.output.clone();
+        release_post_publish_evidence(request)?;
+        let evidence: ReleasePostPublishEvidence = serde_json::from_slice(&fs::read(output)?)?;
+        assert_eq!(
+            evidence.schema_version,
+            RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION
+        );
+        assert_eq!(evidence.decision, StableReleaseDecision::Allow);
+        assert_eq!(evidence.assets.len(), 51);
+        assert_eq!(evidence.full_ci.jobs.len(), FULL_CI_JOB_NAMES.len());
+        assert!(evidence.workflow_public_asset_identity);
+        assert!(evidence.public_download_reverified);
+        Ok(())
+    }
+
+    #[test]
+    fn post_publish_evidence_rejects_public_tamper_and_skipped_full_ci() -> Result<()> {
+        let (_temp, request) = post_publish_evidence_fixture()?;
+        fs::write(
+            request.public_assets.join("benchmark-report.json"),
+            b"tampered\n",
+        )?;
+        assert!(release_post_publish_evidence(request).is_err());
+
+        let (_temp, request) = post_publish_evidence_fixture()?;
+        let mut full_ci: Value = serde_json::from_slice(&fs::read(&request.ci_run)?)?;
+        full_ci["jobs"].as_array_mut().expect("fixture jobs").pop();
+        fs::write(&request.ci_run, serde_json::to_vec(&full_ci)?)?;
+        assert!(release_post_publish_evidence(request).is_err());
+        Ok(())
     }
 
     #[test]

@@ -310,10 +310,35 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: Verify the signed annotated release tag
+        id: signed-tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_object_sha="$(git rev-parse "${GITHUB_REF_NAME}^{tag}")"
+          tag_payload="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")"
+          test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
+          test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
+          test "$(jq -r '.verification.signature != null' <<<"$tag_payload")" = "true"
+          signature_verification="$(jq -r '.verification.reason' <<<"$tag_payload")"
+          case "$signature_verification" in
+            valid|unknown_key|unverified_email) ;;
+            *) echo "release tag signature is not validly formed: $signature_verification" >&2; exit 1 ;;
+          esac
+          echo "tag_object_sha=$tag_object_sha" >> "$GITHUB_OUTPUT"
+          echo "signature_verification=$signature_verification" >> "$GITHUB_OUTPUT"
       - name: Publish verified stable release
         shell: bash
         env:
@@ -326,4 +351,83 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             args+=(--prerelease)
           fi
-          gh "${args[@]}"
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh "${args[@]}"
+          fi
+          release_metadata="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json tagName,isDraft,isPrerelease,body)"
+          test "$(jq -r '.tagName' <<<"$release_metadata")" = "$GITHUB_REF_NAME"
+          test "$(jq -r '.isDraft' <<<"$release_metadata")" = "false"
+          test "$(jq -r '.body' <<<"$release_metadata")" = "$(cat "$notes")"
+          expected_prerelease="false"
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            expected_prerelease="true"
+          fi
+          test "$(jq -r '.isPrerelease' <<<"$release_metadata")" = "$expected_prerelease"
+      - name: Re-download and attest the public release closure
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_OBJECT_SHA: ${{ steps.signed-tag.outputs.tag_object_sha }}
+          TAG_SIGNATURE_VERIFICATION: ${{ steps.signed-tag.outputs.signature_verification }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          version="${version%%-rc.*}"
+          test "$version" = "0.5.0"
+
+          mkdir -p post-publish/public post-publish/normal post-publish/compiler post-publish/redownload
+          gh release download "$GITHUB_REF_NAME" --dir post-publish/public
+          evidence_name="release-post-publish-evidence-${GITHUB_REF_NAME}.json"
+          if [[ -f "post-publish/public/${evidence_name}" ]]; then
+            mv "post-publish/public/${evidence_name}" post-publish/existing-evidence.json
+          fi
+
+          normal_assets=(post-publish/public/depgraph-"${version}"-*)
+          compiler_assets=(post-publish/public/depgraph-compiler-pack-"${version}"-*)
+          test "${#normal_assets[@]}" -eq 25
+          test "${#compiler_assets[@]}" -eq 20
+          cp "${normal_assets[@]}" post-publish/normal/
+          cp "${compiler_assets[@]}" post-publish/compiler/
+
+          cargo xtask verify-release-assets post-publish/normal
+          cargo xtask verify-compiler-pack-assets post-publish/compiler
+          node scripts/benchmark-report.mjs verify post-publish/public/benchmark-report.json
+          node scripts/cache-hit-benchmark.mjs verify post-publish/public/cache-hit-benchmark-report.json
+          cmp --silent post-publish/normal/release-verification.json post-publish/public/release-verification.json
+          cmp --silent post-publish/compiler/compiler-pack-verification.json post-publish/public/compiler-pack-verification.json
+          cmp --silent artifacts/release-verification.json post-publish/public/release-verification.json
+          cmp --silent artifacts/compiler-pack-verification.json post-publish/public/compiler-pack-verification.json
+          cmp --silent artifacts/stable-release-gate.json post-publish/public/stable-release-gate.json
+
+          gh run list --workflow CI --event workflow_dispatch --commit "$GITHUB_SHA" --status success --limit 20 \
+            --json databaseId,headSha,conclusion,event,url > post-publish/ci-runs.json
+          ci_run_id="$(jq -r 'map(select(.headSha == env.GITHUB_SHA)) | sort_by(.databaseId) | last | .databaseId // empty' post-publish/ci-runs.json)"
+          test -n "$ci_run_id"
+          gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
+            | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}' \
+            > post-publish/full-ci.json
+
+          source_tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          evidence="post-publish/${evidence_name}"
+          cargo xtask release-post-publish-evidence \
+            artifacts \
+            post-publish/public \
+            post-publish/full-ci.json \
+            --tag "$GITHUB_REF_NAME" \
+            --source-sha "$GITHUB_SHA" \
+            --source-tree "$source_tree" \
+            --tag-object-sha "$TAG_OBJECT_SHA" \
+            --tag-signature-verification "$TAG_SIGNATURE_VERIFICATION" \
+            --release-run-id "$GITHUB_RUN_ID" \
+            --release-run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --output "$evidence"
+
+          if [[ -f post-publish/existing-evidence.json ]]; then
+            cmp --silent "$evidence" post-publish/existing-evidence.json
+          else
+            gh release upload "$GITHUB_REF_NAME" "$evidence"
+          fi
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "$evidence_name" \
+            --dir post-publish/redownload
+          cmp --silent "$evidence" "post-publish/redownload/$(basename "$evidence")"
