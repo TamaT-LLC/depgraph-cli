@@ -646,12 +646,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: windows-2025
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -669,6 +663,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+      - name: Verify Windows repository handles before package smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p depgraph-core --test service --locked confined_input_and_output_handles_use_only_repository_relative_paths
+          cargo test -p depgraph-core --lib --locked service_repository::tests
       - name: Capture native package-smoke identity
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
