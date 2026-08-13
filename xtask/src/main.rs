@@ -1099,12 +1099,21 @@ fn verify_workflow_policy_text(
                     .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
                     .count()
                     != 1
+                || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 2
+                || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 2
+                || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 2
+                || workflow
+                    .matches(
+                        "Reclaim integration build artifacts before the isolated Rust semantic gate",
+                    )
+                    .count()
+                    != 1
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
             {
                 bail!(
-                    "CI pull requests must remain read-only, secret-free, and pinned to the full-CI linker policy"
+                    "CI pull requests must remain read-only, secret-free, and pinned to the full-CI linker/resource policy"
                 );
             }
         }
@@ -14288,6 +14297,22 @@ mod tests {
             ci.replacen("      fail-fast: false", "      fail-fast: true", 1),
             ci.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
             ci.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
+            ci.replacen("CARGO_INCREMENTAL: \"0\"", "CARGO_INCREMENTAL: \"1\"", 1),
+            ci.replacen(
+                "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+                "CARGO_PROFILE_DEV_DEBUG: \"1\"",
+                1,
+            ),
+            ci.replacen(
+                "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+                "CARGO_PROFILE_TEST_DEBUG: \"1\"",
+                1,
+            ),
+            ci.replacen(
+                "Reclaim integration build artifacts before the isolated Rust semantic gate",
+                "Do not reclaim integration artifacts before Rust semantic verification",
+                1,
+            ),
         ] {
             assert!(
                 verify_workflow_policy_text(
