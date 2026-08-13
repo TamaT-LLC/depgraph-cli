@@ -53,7 +53,10 @@ gh run view "$run_id" --json headSha,conclusion,url
 
 ## リリースタグの作成
 
-フルCIを通過したcommitへannotated tagを作成する。
+フルCIを通過したcommitへ署名付きannotated tagを作成する。GitHub APIでtag
+objectの署名が`valid`、`unknown_key`、または`unverified_email`として構文・署名付き
+payloadを保持していることをRelease workflowが再確認する。`unsigned`、不正署名、
+lightweight tagは公開前に拒否する。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
@@ -63,7 +66,8 @@ git fetch origin main
 test "$(git rev-parse origin/main)" = "$candidate"
 test -f "docs/releases/${release_tag}.md"
 
-git tag -a "$release_tag" "$candidate" -m "depgraph $release_tag"
+git tag -s "$release_tag" "$candidate" -m "depgraph $release_tag"
+git verify-tag "$release_tag"
 git push origin "refs/tags/$release_tag"
 ```
 
@@ -100,7 +104,30 @@ Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-t
 
 Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 17へのtransactional migration、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-17 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
 
-公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、検証reportが同じタグに結び付いていることを確認する。
+## 公開後の再取得検証
+
+最終`publish`ジョブはGitHub Releaseを作成した後、公開assetを新しいdirectoryへ
+再取得する。v0.5 release closureでは、通常archive、checksum、query / cross-language /
+MCP smokeが5 targetで25点、compiler pack、checksum、requirement、smokeが5 targetで
+20点、benchmark / cache-hit / hostile / 二つのaggregate / stable gateが6点の計51点である。
+
+再取得した通常archiveには`cargo xtask verify-release-assets`、compiler packには
+`cargo xtask verify-compiler-pack-assets`を再実行する。これによりchecksum、manifest、
+SBOM、project / third-party license、protocol / Agent schema、native binary handshake、
+safe scan reconnect、stdout purity、root seal、compiler semantic / rollbackを公開byteだけで
+再検証する。benchmark二種も公開reportを入力に再検証し、再生成aggregate reportが
+公開reportおよび元のworkflow artifactとbyte一致することを要求する。
+
+さらに51点すべてについてpublic downloadとworkflow artifactのfilename、size、SHA-256
+が一致しなければ失敗する。`release-post-publish-evidence-v1` JSONは、candidate commit /
+tree、署名tag object、exact manual full-CI runと8 job、Release run、51 asset digest、
+aggregate digest、asset-set digestを記録する。最終jobはこのJSONを同じGitHub Releaseへ
+追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。
+
+公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、
+検証report、`release-post-publish-evidence-<tag>.json`が同じタグに結び付いていることを
+確認する。checkout内のproduct binaryや未公開package artifactを公開後verificationの
+代用品にしてはならない。
 
 ## 失敗時の扱い
 

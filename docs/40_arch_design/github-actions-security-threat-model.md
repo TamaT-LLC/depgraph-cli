@@ -48,7 +48,15 @@ verifier requires that to be the complete write-scope set, so adding another
 write permission to any release job fails the gate. It
 downloads artifacts produced by the same run and verifies their manifests,
 checksums, SBOMs, licenses, benchmark report, and stable release gate before
-publication. No fork event can trigger this path.
+publication. The same final job requires a signed annotated tag object, creates
+the GitHub Release, downloads the public assets into a fresh directory, and
+repeats the package, compiler-pack, benchmark, and aggregate verification.
+Every one of the 51 pre-evidence public assets must have the same filename,
+size, and SHA-256 as its same-run workflow artifact. The resulting closed
+`release-post-publish-evidence-v1` record binds the candidate commit/tree,
+manual full-CI jobs, Release run, signed tag object, and public asset set; it is
+uploaded and downloaded once more before the write-capable job succeeds. No
+fork event can trigger this path.
 
 The manual full CI run is a preflight for one candidate commit and cannot
 authorize publication. The tag-triggered Release workflow rebuilds and verifies
