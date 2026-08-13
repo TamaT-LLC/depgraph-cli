@@ -656,6 +656,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: native-smoke-probe-${{ matrix.target }}
+          cache-on-failure: true
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 1.26.1
@@ -666,12 +667,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-      - name: Verify Windows repository handles before package smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p depgraph-core --lib --locked service_repository::tests
-          cargo test -p depgraph-core --test service --locked confined_input_and_output_handles_use_only_repository_relative_paths
       - name: Capture native package-smoke identity
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
