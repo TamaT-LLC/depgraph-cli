@@ -722,7 +722,7 @@ fn source_evidence(detail: &str) -> Evidence {
     Evidence {
         kind: EvidenceKind::Source,
         extractor: "typescript-static".into(),
-        extractor_version: "0.4.0".into(),
+        extractor_version: "0.5.0".into(),
         path: Some("src/index.ts".into()),
         start_line: Some(1),
         start_column: Some(1),
@@ -756,7 +756,7 @@ fn common(seq: u64) -> CommonFields {
         protocol_version: "1.0".into(),
         scan_id: "scan-delta-golden".into(),
         adapter: "web".into(),
-        adapter_version: "0.4.0".into(),
+        adapter_version: "0.5.0".into(),
         seq,
     }
 }
@@ -766,7 +766,7 @@ fn common_json(mut value: Value, seq: u64) -> Value {
     object.insert("protocol_version".into(), json!("1.0"));
     object.insert("scan_id".into(), json!("scan-delta-golden"));
     object.insert("adapter".into(), json!("web"));
-    object.insert("adapter_version".into(), json!("0.4.0"));
+    object.insert("adapter_version".into(), json!("0.5.0"));
     object.insert("seq".into(), json!(seq));
     value
 }

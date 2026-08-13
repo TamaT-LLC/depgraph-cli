@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn documented_shell_command_rejects_executable_metacharacters() {
         let unsafe_command = concat!(
-            "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp \\\n",
+            "/absolute/path/to/depgraph-0.5.0-<target>/bin/depgraph-mcp \\\n",
             "  --capability read"
         );
         let error = documented_shell_command(unsafe_command).unwrap_err();
@@ -1422,7 +1422,7 @@ mod tests {
             schema_version: MCP_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
             target: "x86_64-unknown-linux-gnu".to_owned(),
             archive_sha256: "a".repeat(64),
-            release_version: "0.4.0".to_owned(),
+            release_version: "0.5.0".to_owned(),
             protocol_revisions: PROTOCOL_REVISIONS
                 .iter()
                 .map(|revision| (*revision).to_owned())
@@ -1450,7 +1450,7 @@ mod tests {
             stdout_json_rpc_only: true,
         };
         let validate_report = |report: &McpPackageSmokeReport| {
-            validate(report, "x86_64-unknown-linux-gnu", &"a".repeat(64), "0.4.0")
+            validate(report, "x86_64-unknown-linux-gnu", &"a".repeat(64), "0.5.0")
         };
         validate_report(&report)?;
 

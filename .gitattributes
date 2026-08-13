@@ -1,6 +1,7 @@
 LICENSE-APACHE text eol=lf
 LICENSE-MIT text eol=lf
 fixtures/** text eol=lf
+xtask/fixtures/** text eol=lf
 queries/** text eol=lf
 schemas/** text eol=lf
 third_party/rust-src/COPYRIGHT text eol=lf

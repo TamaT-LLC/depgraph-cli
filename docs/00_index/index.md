@@ -15,6 +15,7 @@
 | PROJ-ARC-001-ADR-004 | PROJ-ARC-001 | [Default profile selection and exploration budget](../40_arch_design/adr-default-profile-selection-budget.md) | Accepted |
 | PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |
 | PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |
+| PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |
 
 ## 運用手順
 
@@ -52,6 +53,7 @@
 
 ## 更新履歴
 
+- 2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加
 - 2026-08-12: MCP Agent hostのcapability、確認、reconnect、timeout、upgrade運用手順を追加
 - 2026-08-05: `PROJ-ARC-002` のMCP Tasks decisionを追加し、`Q-002`をResolvedへ更新
 - 2026-08-02: GitHub Actionsを使ったリリース手順を追加

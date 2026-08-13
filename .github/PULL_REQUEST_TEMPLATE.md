@@ -9,7 +9,7 @@ Closes #
 - What is intentionally included?
 - What is intentionally excluded?
 - Does this change CLI defaults, protocol/store/schema data, release artifacts,
-  supported platforms, or the `0.4.x` compatibility promise?
+  supported platforms, or the `0.5.x` compatibility promise?
 
 ## Verification
 

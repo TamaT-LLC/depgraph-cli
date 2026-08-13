@@ -9,7 +9,7 @@
     ],
     "compatibility_ids": [
       "depgraph-protocol:1.0",
-      "rust-adapter:0.4.0",
+      "rust-adapter:0.5.0",
       "rust-toolchain:1.93.1"
     ],
     "language_families": [
@@ -49,7 +49,7 @@
       "total_candidate_cap": 512
     }
   },
-  "input_digest": "profile-selection-input:sha256:d6e92f06c6e13def343a8e614f82affbd1e871b00778c40e6ac6eb57191faf70",
+  "input_digest": "profile-selection-input:sha256:23d21d72aa4d70dfbb6b0260c6b23b7d0657d957b18c237f3971a67a590d2b06",
   "profiles": [
     {
       "id": "profile:sha256:e9beef79b40efc812611b029b3152d607161d668c059cc7a2f8cafe79148d929",
@@ -163,5 +163,5 @@
     "candidate_discovery_complete": true,
     "selection_complete": true
   },
-  "plan_id": "profile-selection-plan:sha256:ed7468e5310c612bda01d09ac2db462ebca14019f201bcb4eec47c473ddfccfb"
+  "plan_id": "profile-selection-plan:sha256:1e70a859fab6f3223d41819e57b2c12f28de11b236e106c3fa1d358e1e725080"
 }

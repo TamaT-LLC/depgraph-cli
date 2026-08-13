@@ -887,7 +887,7 @@ fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
         "workers": [{
             "adapter":"rust",
             "available":true,
-            "version":"0.4.0",
+            "version":"0.5.0",
             "protocol":"1.0",
             "integrity":"verified",
             "root_launch_allowed":true

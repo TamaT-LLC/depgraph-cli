@@ -60,10 +60,13 @@ and repository rules rather than an unowned `CODEOWNERS` entry.
 Releases come from immutable reviewed commits and must pass the complete local
 and GitHub Actions quality gates, five-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
-maintainer plus an independent approver. The supported line is the latest
-`0.4.x`; compatible fixes land on `main` first and are cherry-picked with
-provenance to `release/0.4`. Breaking defaults do not enter that maintenance
-line.
+maintainer plus an independent approver. There is no supported stable line
+until v0.5 GA is published. The existing `release/0.4` ref and v0.4 tags are
+preserved historical anchors, not a current maintenance promise. The v0.5
+baseline and `release/0.5` branch are created together only after an exact
+reviewed candidate is approved; compatible fixes then land on `main` first
+and are cherry-picked with provenance. Breaking defaults do not enter a
+maintenance line.
 
 Release support is best effort and has no implied SLA. Security fixes follow
 [SECURITY.md](SECURITY.md); other support follows [SUPPORT.md](SUPPORT.md).

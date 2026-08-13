@@ -6,10 +6,14 @@ Every recognized dependency site is retained as `resolved`, `candidates`, `exter
 
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid/GraphML export.
 
-The stable `0.4.0` contract is documented in the
-[`v0.4.0` release notes](docs/releases/v0.4.0.md).
-The compiler-pack release candidate, original Milestone 4 candidate, and
-previous Milestone 2 semantic-graph candidate are documented as
+`main` implements the unreleased `0.5.0` candidate contract documented in the
+[`v0.5.0` release notes](docs/releases/v0.5.0.md). The latest published GitHub
+Release is `v0.4.0-rc.6`; no `v0.4.0` stable GitHub Release was published. Its
+reserved immutable baseline remains documented in the historical
+[`v0.4.0` contract](docs/releases/v0.4.0.md).
+
+The latest compiler-pack release candidate, original Milestone 4 candidate,
+and previous Milestone 2 semantic-graph candidate are documented as
 [`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md),
 [`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
@@ -17,24 +21,24 @@ previous Milestone 2 semantic-graph candidate are documented as
 
 ## Project status and public collaboration
 
-`v0.4.x` is the supported stable release line. Verified release archives are
-produced for Linux x86-64, Linux ARM64, macOS Intel, macOS Apple Silicon, and
-Windows x86-64; their checksums, SBOM, license inventory, and compatibility
-manifest are validated together by the release gate. Every archive includes the
-native MCP server, durable operation runner, and versioned Agent tool/operation
-schema. Source builds use the
-pinned toolchains documented under [Build](#build).
+There is currently no supported stable release. Published v0.4 release
+candidates are evaluation artifacts, and `main` is the v0.5 pre-release line.
+The v0.5 release workflow produces verified archives for Linux x86-64, Linux
+ARM64, macOS Intel, macOS Apple Silicon, and Windows x86-64; their checksums,
+SBOM, license inventory, and compatibility manifest are validated together by
+the release gate. Every v0.5 archive includes the native MCP server, durable
+operation runner, and versioned Agent tool/operation schema. Source builds use
+the pinned toolchains documented under [Build](#build).
 
-The worker protocol remains at `1.0` for the 0.4 line. Patch releases preserve
-the documented CLI, store, and release compatibility contract. New work lands
-on `main`; defaults that would break 0.4 behavior stay opt-in until a new minor
-release. The current limitations are that safe scans intentionally do not
+The worker protocol remains at `1.0` for v0.5. The candidate freezes Store
+schema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
+`depgraph-operation-v1`. The current limitations are that safe scans intentionally do not
 execute project code, compiler-precise and build-observation modes require
 explicit consent, unsupported or ambiguous input remains visible rather than
 being guessed, and product support is best effort without an SLA.
 
 Start with the [system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)
-and the [stable release notes](docs/releases/v0.4.0.md). Use
+and the [v0.5 candidate contract](docs/releases/v0.5.0.md). Use
 [SUPPORT.md](SUPPORT.md) to choose the right help channel,
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request,
 and [GOVERNANCE.md](GOVERNANCE.md) for project decision and maintainer rules.
@@ -203,7 +207,7 @@ hosts must not rely on shell or environment expansion.
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -219,7 +223,7 @@ unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -664,13 +668,13 @@ distribution and its `unsupported-no-fallback` policy.
 
 Download the four assets for the depgraph version and host target from the
 same [GitHub release](https://github.com/TamaT-LLC/depgraph-cli/releases). The
-release tag may be the stable tag or its matching release candidate (for
-example, `v0.4.0-rc.6`), but the normal depgraph archive and compiler pack must
-come from that one release run.
+release tag may be the stable tag or its matching release candidate. The v0.5
+example below becomes downloadable only after that candidate is published;
+the normal depgraph archive and compiler pack must come from one release run.
 
 ```bash
-version=0.4.0
-release_tag=v0.4.0-rc.6
+version=0.5.0
+release_tag=v0.5.0-rc.1
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 

@@ -6,9 +6,11 @@ repository.
 
 ## Supported release line
 
-The latest `0.4.x` release receives compatible defect and security fixes.
-`main` is the next-version development line and may contain unreleased
-features. Releases older than `0.4` and release candidates are unsupported.
+There is currently no supported stable release. The latest published artifact
+is the evaluation candidate `v0.4.0-rc.6`; `v0.4.0` stable was never published.
+`main` is the unreleased `0.5.0` line. Release candidates and historical
+versions are unsupported, although fixes land on `main` first. This matrix is
+updated only after a verified v0.5 GA GitHub Release exists.
 The pinned toolchains, five native archive targets, compatibility contract,
 known limitations, and verified release links are listed in [README.md](README.md).
 

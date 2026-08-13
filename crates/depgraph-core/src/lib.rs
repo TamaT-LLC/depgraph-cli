@@ -798,7 +798,11 @@ pub fn rust_sysroot_compatibility_contract() -> RustSysrootCompatibilityHealth {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseCompatibilityHealth {
+    pub worker_protocol_version: String,
     pub store_schema_version: i64,
+    pub operation_journal_schema_version: i64,
+    pub mcp_tool_contract_version: String,
+    pub mcp_operation_contract_version: String,
     pub minimum_migratable_store_schema_version: i64,
     pub previous_release_version: String,
     pub previous_release_store_schema_version: i64,
@@ -806,6 +810,8 @@ pub struct ReleaseCompatibilityHealth {
     pub stable_release_version: String,
     pub stable_upgrade_source_version: String,
     pub stable_upgrade_source_store_schema_version: i64,
+    pub stable_upgrade_source_fixture_path: String,
+    pub stable_upgrade_source_fixture_sha256: String,
     pub cache_contract_version: u32,
     pub snapshot_diff_schema_version: String,
     pub incremental_plan_schema_version: String,
@@ -1049,14 +1055,21 @@ pub fn bounded_query_release_compatibility_contract() -> BoundedQueryReleaseComp
 
 pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
     ReleaseCompatibilityHealth {
+        worker_protocol_version: depgraph_protocol::PROTOCOL_VERSION.to_owned(),
         store_schema_version: STORE_SCHEMA_VERSION,
+        operation_journal_schema_version: 5,
+        mcp_tool_contract_version: "depgraph-mcp-tools-v1".to_owned(),
+        mcp_operation_contract_version: "depgraph-operation-v1".to_owned(),
         minimum_migratable_store_schema_version: 1,
-        previous_release_version: "0.2.0-rc.1".to_owned(),
-        previous_release_store_schema_version: 5,
-        stable_release_gate_contract_version: "stable-release-gate-v1".to_owned(),
-        stable_release_version: "0.4.0".to_owned(),
-        stable_upgrade_source_version: "0.4.0-rc.1".to_owned(),
-        stable_upgrade_source_store_schema_version: 11,
+        previous_release_version: "0.4.0-rc.6".to_owned(),
+        previous_release_store_schema_version: 13,
+        stable_release_gate_contract_version: "stable-release-gate-v2".to_owned(),
+        stable_release_version: "0.5.0".to_owned(),
+        stable_upgrade_source_version: "0.4.0-rc.6".to_owned(),
+        stable_upgrade_source_store_schema_version: 13,
+        stable_upgrade_source_fixture_path: "xtask/fixtures/v0.4.0-rc.6-store-v13.sql".to_owned(),
+        stable_upgrade_source_fixture_sha256:
+            "sha256:43fe0dda73d03be9b8fff2ed9ff8ce888ad96e41e78335a1117646475c937150".to_owned(),
         cache_contract_version: CACHE_CONTRACT_VERSION,
         snapshot_diff_schema_version: SNAPSHOT_DIFF_SCHEMA_VERSION.to_owned(),
         incremental_plan_schema_version: INCREMENTAL_PLAN_SCHEMA_VERSION.to_owned(),
@@ -1070,7 +1083,7 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         runtime_trace_schema_version: RUNTIME_TRACE_SCHEMA_VERSION.to_owned(),
         runtime_collector_contract_version: RUNTIME_COLLECTOR_CONTRACT_VERSION.to_owned(),
         graphml_schema_version: GRAPHML_SCHEMA_VERSION.to_owned(),
-        packaged_smoke_contract: "stable-v0.4.0-packaged-smoke-v1".to_owned(),
+        packaged_smoke_contract: "stable-v0.5.0-packaged-smoke-v1".to_owned(),
         bounded_query: bounded_query_release_compatibility_contract(),
         profile_selection: profile_selection_release_compatibility_contract(),
         cross_language: cross_language_release_compatibility_contract(),
@@ -1993,6 +2006,20 @@ mod tests {
     fn release_compatibility_contract_rejects_drift() {
         let compatible = release_compatibility_contract();
         verify_release_compatibility(&compatible).unwrap();
+        assert_eq!(compatible.worker_protocol_version, "1.0");
+        assert_eq!(compatible.store_schema_version, 17);
+        assert_eq!(compatible.operation_journal_schema_version, 5);
+        assert_eq!(
+            compatible.mcp_tool_contract_version,
+            "depgraph-mcp-tools-v1"
+        );
+        assert_eq!(
+            compatible.mcp_operation_contract_version,
+            "depgraph-operation-v1"
+        );
+        assert_eq!(compatible.stable_release_version, "0.5.0");
+        assert_eq!(compatible.stable_upgrade_source_version, "0.4.0-rc.6");
+        assert_eq!(compatible.stable_upgrade_source_store_schema_version, 13);
 
         let mut drifted = compatible.clone();
         drifted.store_schema_version += 1;
@@ -2002,6 +2029,14 @@ mod tests {
                 .to_string()
                 .contains("does not match")
         );
+
+        let mut journal_drifted = compatible.clone();
+        journal_drifted.operation_journal_schema_version += 1;
+        assert!(verify_release_compatibility(&journal_drifted).is_err());
+
+        let mut mcp_drifted = compatible.clone();
+        mcp_drifted.mcp_tool_contract_version = "depgraph-mcp-tools-v2".to_owned();
+        assert!(verify_release_compatibility(&mcp_drifted).is_err());
 
         let mut collector_drifted = compatible.clone();
         collector_drifted.runtime_collector_contract_version = "runtime-collector-v2".to_owned();
