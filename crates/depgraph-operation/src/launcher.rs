@@ -688,6 +688,10 @@ fn spawn_detached_process(command: &mut Command) -> std::io::Result<std::process
     };
 
     const INHERITED_JOB_FLAGS: u32 = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
+    if !request_windows_job_breakaway(windows_job_breakaway_policy()) {
+        command.creation_flags(INHERITED_JOB_FLAGS);
+        return command.spawn();
+    }
     command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | INHERITED_JOB_FLAGS);
     let preferred = command.spawn();
     retry_without_windows_job_breakaway(preferred, || {
@@ -697,6 +701,75 @@ fn spawn_detached_process(command: &mut Command) -> std::io::Result<std::process
         command.creation_flags(INHERITED_JOB_FLAGS);
         command.spawn()
     })
+}
+
+#[cfg(any(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsJobBreakawayPolicy {
+    NotInJob,
+    Explicit,
+    Silent,
+    Denied,
+    Unknown,
+}
+
+#[cfg(windows)]
+fn windows_job_breakaway_policy() -> WindowsJobBreakawayPolicy {
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject,
+        },
+        Threading::GetCurrentProcess,
+    };
+
+    let mut in_job = 0;
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process,
+    // the null job handle asks about any containing job, and `in_job` is a
+    // writable BOOL for the duration of the call.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+        return WindowsJobBreakawayPolicy::Unknown;
+    }
+    if in_job == 0 {
+        return WindowsJobBreakawayPolicy::NotInJob;
+    }
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let size = u32::try_from(std::mem::size_of_val(&limits))
+        .expect("Windows job limit information size fits in u32");
+    // SAFETY: A null job handle queries the job containing the current
+    // process. `limits` points to a correctly sized writable structure and no
+    // return-length pointer is required.
+    if unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_mut(&mut limits).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return WindowsJobBreakawayPolicy::Unknown;
+    }
+
+    let flags = limits.BasicLimitInformation.LimitFlags;
+    if flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+        WindowsJobBreakawayPolicy::Silent
+    } else if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 {
+        WindowsJobBreakawayPolicy::Explicit
+    } else {
+        WindowsJobBreakawayPolicy::Denied
+    }
+}
+
+#[cfg(any(test, windows))]
+const fn request_windows_job_breakaway(policy: WindowsJobBreakawayPolicy) -> bool {
+    matches!(
+        policy,
+        WindowsJobBreakawayPolicy::Explicit | WindowsJobBreakawayPolicy::Unknown
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -791,6 +864,25 @@ mod tests {
         });
         assert_eq!(unchanged.unwrap(), 11);
         assert_eq!(success_retries, 0);
+    }
+
+    #[test]
+    fn windows_job_policy_avoids_known_unusable_breakaway_attempts() {
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::NotInJob
+        ));
+        assert!(request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Explicit
+        ));
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Silent
+        ));
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Denied
+        ));
+        assert!(request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Unknown
+        ));
     }
 
     fn sha256(path: &Path) -> String {
