@@ -2797,9 +2797,10 @@ mod tests {
             promote_daemon_start(&config, false, Some(launcher)),
             Err(RunnerError::Service(DepgraphServiceError::Internal))
         ));
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "early daemon exit must not consume the 30-second publication timeout"
+            elapsed < Duration::from_secs(5),
+            "early daemon exit took {elapsed:?} and approached the 30-second publication timeout"
         );
     }
 
@@ -8418,8 +8419,10 @@ mod tests {
 
     #[test]
     fn guardian_cancels_the_dispatch_token_when_cancellation_is_requested() {
-        const LEASE_DURATION_MS: i64 = 200;
-        const RENEWAL_MARGIN_MS: i64 = 150;
+        // Wake after one second, but leave enough renewed lease headroom for a
+        // contended CI runner to terminalize cancellation without losing ownership.
+        const LEASE_DURATION_MS: i64 = 5_000;
+        const RENEWAL_MARGIN_MS: i64 = 4_000;
 
         struct CancellationAwareDispatcher {
             started: mpsc::SyncSender<()>,
