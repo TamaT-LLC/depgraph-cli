@@ -531,7 +531,7 @@ function validIncrementalTrace(trace) {
   );
 }
 
-function validateIncrementalAttempts(rawDir, changedFile) {
+export function validateIncrementalAttempts(rawDir, changedFile) {
   const paths = orderedSampleNames(
     readdirSync(rawDir),
     /^incremental-status-(\d+)\.json$/,
@@ -544,19 +544,20 @@ function validateIncrementalAttempts(rawDir, changedFile) {
     const status = jsonFile(path);
     const attempt = status.last_completed_attempt;
     const trace = attempt?.incremental_trace;
+    const invalidation = attempt?.invalidation_summary;
     if (
       attempt?.status !== "completed" ||
       !attempt.base_snapshot_id ||
       !attempt.completed_snapshot_id ||
-      !attempt.invalidation_plan ||
-      attempt.invalidation_plan.schema_version !== "incremental-plan-v2" ||
+      !invalidation ||
+      invalidation.schema_version !== "incremental-plan-v2" ||
+      invalidation.mode !== "scoped_replacement" ||
       !/^profile-selection-plan:sha256:[0-9a-f]{64}$/.test(
-        attempt.invalidation_plan.base_profile_plan_id,
+        invalidation.base_profile_plan_id,
       ) ||
-      !Array.isArray(attempt.invalidation_plan.affected_profile_ids) ||
-      attempt.invalidation_plan.affected_profile_ids.length === 0 ||
+      !Number.isSafeInteger(invalidation.affected_profile_count) ||
+      invalidation.affected_profile_count <= 0 ||
       !validIncrementalTrace(trace) ||
-      attempt.invalidation_error !== null ||
       attempt.changes?.length !== 1 ||
       !["added", "modified"].includes(attempt.changes[0].kind) ||
       attempt.changes[0].new_path !== changedFile
@@ -569,9 +570,9 @@ function validateIncrementalAttempts(rawDir, changedFile) {
       changed_file: attempt.changes[0].new_path,
       base_snapshot_id: attempt.base_snapshot_id,
       completed_snapshot_id: attempt.completed_snapshot_id,
-      invalidation_schema_version: attempt.invalidation_plan.schema_version,
-      base_profile_plan_id: attempt.invalidation_plan.base_profile_plan_id,
-      affected_profiles: attempt.invalidation_plan.affected_profile_ids?.length ?? 0,
+      invalidation_schema_version: invalidation.schema_version,
+      base_profile_plan_id: invalidation.base_profile_plan_id,
+      affected_profiles: invalidation.affected_profile_count,
       incremental_trace: trace,
     };
   });

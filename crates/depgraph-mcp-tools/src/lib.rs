@@ -47,8 +47,9 @@ pub use dto::{
 };
 pub use lifecycle::{
     AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonControlAction,
-    AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentDaemonPhase, AgentDaemonStatus,
-    AgentDaemonTrace, AgentDoctor, AgentProfilePlan, AgentRecoveredAttempts,
+    AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentDaemonInvalidationSummary,
+    AgentDaemonPhase, AgentDaemonStatus, AgentDaemonTrace, AgentDoctor, AgentProfilePlan,
+    AgentRecoveredAttempts,
 };
 pub use operation::{
     AcceptedOperationStatus, AcceptedTaskStatus, AgentOperation, AgentOperationProgress,

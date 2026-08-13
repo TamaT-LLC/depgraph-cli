@@ -21,9 +21,67 @@ import {
   EXPECTED_FIXTURE_SHA256,
   orderedSampleNames,
   REPORT_SCHEMA_VERSION,
+  validateIncrementalAttempts,
   validateRustBenchmarkEvidence,
   verifyReport,
 } from "../benchmark-report.mjs";
+
+test("incremental evidence consumes the bounded Agent-safe invalidation summary", async (t) => {
+  const raw = mkdtempSync(join(tmpdir(), "depgraph-incremental-evidence-test-"));
+  t.after(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(raw, { recursive: true, force: true });
+  });
+  const changedFile = "src/f05000.ts";
+  const attempt = {
+    status: "completed",
+    base_snapshot_id: `snapshot:sha256:${"1".repeat(64)}`,
+    completed_snapshot_id: `snapshot:sha256:${"2".repeat(64)}`,
+    invalidation_summary: {
+      schema_version: "incremental-plan-v2",
+      mode: "scoped_replacement",
+      base_profile_plan_id: `profile-selection-plan:sha256:${"3".repeat(64)}`,
+      affected_profile_count: 1,
+    },
+    incremental_trace: {
+      schema_version: "daemon-incremental-trace-v1",
+      mode: "semantic_noop",
+      base_projection_milliseconds: 1,
+      worker_capability_milliseconds: 2,
+      worker_analysis_milliseconds: 3,
+      store_commit_milliseconds: 4,
+      total_milliseconds: 10,
+    },
+    changes: [{ kind: "modified", new_path: changedFile }],
+  };
+  for (let sample = 0; sample < 3; sample += 1) {
+    writeFileSync(
+      join(raw, `incremental-status-${sample}.json`),
+      `${JSON.stringify({ last_completed_attempt: attempt })}\n`,
+    );
+  }
+
+  const evidence = validateIncrementalAttempts(raw, changedFile);
+  assert.equal(evidence.length, 3);
+  assert.equal(evidence[0].invalidation_schema_version, "incremental-plan-v2");
+  assert.equal(evidence[0].affected_profiles, 1);
+
+  const legacy = structuredClone(attempt);
+  delete legacy.invalidation_summary;
+  legacy.invalidation_plan = {
+    schema_version: "incremental-plan-v2",
+    base_profile_plan_id: `profile-selection-plan:sha256:${"3".repeat(64)}`,
+    affected_profile_ids: ["profile:private"],
+  };
+  writeFileSync(
+    join(raw, "incremental-status-0.json"),
+    `${JSON.stringify({ last_completed_attempt: legacy })}\n`,
+  );
+  assert.throws(
+    () => validateIncrementalAttempts(raw, changedFile),
+    /incremental attempt validation failed/,
+  );
+});
 
 test("fixture generation is byte-for-byte deterministic and restorable", (t) => {
   const parent = mkdtempSync(join(tmpdir(), "depgraph-benchmark-test-"));

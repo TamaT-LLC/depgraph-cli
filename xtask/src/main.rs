@@ -9598,6 +9598,11 @@ fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> R
         || attempt["scan_id"].as_str().is_none_or(str::is_empty)
         || completed_snapshot_id == base_snapshot_id
         || attempt.get("invalidation_plan").is_some()
+        || attempt["invalidation_summary"]["schema_version"] != "incremental-plan-v2"
+        || attempt["invalidation_summary"]["mode"] != "scoped_replacement"
+        || attempt["invalidation_summary"]["affected_profile_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
     {
         bail!("packaged incremental watcher returned an invalid completed attempt: {completed}");
     }
