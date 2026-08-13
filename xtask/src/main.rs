@@ -1090,11 +1090,22 @@ fn verify_workflow_policy_text(
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
+                || workflow.matches("\n      fail-fast: false\n").count() != 1
+                || workflow
+                    .matches("rustflags: -C linker-features=-lld")
+                    .count()
+                    != 1
+                || workflow
+                    .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
+                    .count()
+                    != 1
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
             {
-                bail!("CI pull requests must remain read-only and secret-free");
+                bail!(
+                    "CI pull requests must remain read-only, secret-free, and pinned to the full-CI linker policy"
+                );
             }
         }
         "release.yml" => {
@@ -1108,8 +1119,18 @@ fn verify_workflow_policy_text(
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
                 || !publish.contains("permissions:\n      contents: write")
+                || workflow
+                    .matches("rustflags: -C linker-features=-lld")
+                    .count()
+                    != 2
+                || workflow
+                    .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
+                    .count()
+                    != 2
             {
-                bail!("release write permission must be confined to the tag-only publish job");
+                bail!(
+                    "release write permission must remain tag-publish-only and native x86_64 Linux builds must retain the pinned linker policy"
+                );
             }
         }
         "stable-release-source-guard.yml" => {
@@ -14263,6 +14284,22 @@ mod tests {
             .is_err()
         );
 
+        for linker_policy_drift in [
+            ci.replacen("      fail-fast: false", "      fail-fast: true", 1),
+            ci.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
+            ci.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "ci.yml",
+                    &linker_policy_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
         let escaped_secret = ci.replacen(
             "GOTOOLCHAIN: local",
             r#"GOTOOLCHAIN: "${{ \u0073ecrets.RELEASE_TOKEN }}""#,
@@ -14404,6 +14441,20 @@ jobs:
             )
             .is_err()
         );
+        for linker_policy_drift in [
+            release.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
+            release.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "release.yml",
+                    &linker_policy_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
 
         let guard =
             fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;

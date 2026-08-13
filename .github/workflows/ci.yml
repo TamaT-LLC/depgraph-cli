@@ -192,13 +192,24 @@ jobs:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
     strategy:
+      # Preserve the successful platform evidence when the other matrix leg
+      # fails so a transient/native failure cannot erase its diagnostics.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            # Rust 1.93 enables its self-contained rust-lld by default on this
+            # target. Repeated large debug relinks crash that linker with
+            # SIGBUS on ubuntu-24.04, so use rustc's stable opt-out and the
+            # runner's system linker for the entire job/fingerprint.
+            rustflags: -C linker-features=-lld
           - os: macos-15
             target: aarch64-apple-darwin
+            rustflags: ""
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src

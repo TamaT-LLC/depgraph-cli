@@ -127,15 +127,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rustflags: -C linker-features=-lld
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustflags: ""
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            rustflags: ""
           - os: macos-15
             target: aarch64-apple-darwin
+            rustflags: ""
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            rustflags: ""
     runs-on: ${{ matrix.os }}
+    env:
+      # Match the tag-time x86_64 package linker to the exact-head Full CI
+      # gate; other targets retain their platform defaults.
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
@@ -205,15 +214,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rustflags: -C linker-features=-lld
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustflags: ""
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            rustflags: ""
           - os: macos-15
             target: aarch64-apple-darwin
+            rustflags: ""
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            rustflags: ""
     runs-on: ${{ matrix.os }}
+    env:
+      # The x86_64 compiler-pack smoke performs the same repeated host relinks
+      # and must not re-enable the crashing Rust 1.93 self-contained linker.
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal
