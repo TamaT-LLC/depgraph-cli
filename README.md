@@ -197,12 +197,13 @@ depgraph export --format graphml --output graph.graphml
 `read` capability: no store mutation, repository write, daemon control, or
 project-code execution is enabled. It requires an existing fixed repository
 root, an explicit absolute store-file path, and the validated compiler-pack
-requirement published for the host. Replace the placeholders below with canonical
-absolute paths; Agent hosts must not rely on shell or environment expansion.
+requirement published for the host. Replace the path placeholders below with
+canonical absolute paths and `TARGET_TRIPLE` with the release host target; Agent
+hosts must not rely on shell or environment expansion.
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -218,7 +219,7 @@ unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-<target>/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",

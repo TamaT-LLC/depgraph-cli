@@ -136,6 +136,9 @@ impl DepgraphService {
         if !request.acknowledgement {
             return Err(DepgraphServiceError::InvalidInput);
         }
+        if !self.config().repository_root_seal().matches_live_root() {
+            return Err(DepgraphServiceError::Integrity);
+        }
         match (
             request.rust_compiler_precise,
             request.compiler_pack_requirement.as_ref(),
