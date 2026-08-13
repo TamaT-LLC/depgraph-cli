@@ -354,9 +354,10 @@ jobs:
           if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh "${args[@]}"
           fi
-          release_metadata="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json tagName,isDraft,isPrerelease)"
+          release_metadata="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json tagName,isDraft,isPrerelease,body)"
           test "$(jq -r '.tagName' <<<"$release_metadata")" = "$GITHUB_REF_NAME"
           test "$(jq -r '.isDraft' <<<"$release_metadata")" = "false"
+          test "$(jq -r '.body' <<<"$release_metadata")" = "$(cat "$notes")"
           expected_prerelease="false"
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             expected_prerelease="true"
