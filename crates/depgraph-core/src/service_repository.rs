@@ -1580,7 +1580,10 @@ const WINDOWS_FILE_SHARE_DELETE_ACCESS: u32 = 0x0000_0004;
 
 #[cfg(any(test, windows))]
 const fn windows_staging_share_access() -> u32 {
-    WINDOWS_FILE_SHARE_READ_ACCESS | WINDOWS_FILE_SHARE_DELETE_ACCESS
+    // A private stage must not acquire a compatible reader that can keep a
+    // legacy delete disposition alive after the writer closes. Publication
+    // renames through the retained handle, so no shared access is required.
+    0
 }
 
 #[cfg(any(test, windows))]
@@ -3260,12 +3263,11 @@ fn validate_opened_windows_regular_file(file: &File) -> DepgraphServiceResult<()
 }
 
 #[cfg(windows)]
-fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+fn try_posix_delete_windows_file_handle(file: &File) -> DepgraphServiceResult<bool> {
     use std::{mem, os::windows::io::AsRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
-        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
-        SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
     };
 
     let extended = FILE_DISPOSITION_INFO_EX {
@@ -3286,7 +3288,7 @@ fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
         )
     };
     if extended_success != 0 {
-        return Ok(());
+        return Ok(true);
     }
     let extended_error = io::Error::last_os_error();
     let extended_is_unsupported = extended_error.raw_os_error().is_some_and(|error| {
@@ -3307,6 +3309,16 @@ fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
         }
         .into());
     }
+
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn legacy_delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+    use std::{mem, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
 
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: file retains ownership of the live handle for the call and the
@@ -3331,8 +3343,61 @@ fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
 }
 
 #[cfg(windows)]
+fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+    if try_posix_delete_windows_file_handle(file)? {
+        Ok(())
+    } else {
+        legacy_delete_windows_file_handle(file)
+    }
+}
+
+#[cfg(any(test, windows))]
+fn delete_private_windows_staging_with(
+    try_posix_delete: impl FnOnce() -> DepgraphServiceResult<bool>,
+    sanitize: impl FnOnce() -> DepgraphServiceResult<()>,
+    legacy_delete: impl FnOnce() -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    if try_posix_delete()? {
+        return Ok(());
+    }
+
+    // Legacy disposition cannot unlink until every compatible handle closes.
+    // Sanitize first so an unexpected metadata-only/kernel observer can at
+    // most delay a zero-length delete-pending link. Always attempt deletion
+    // even when sanitization fails; a successful delete-pending transition is
+    // the stronger confidentiality boundary because private stages are opened
+    // without share access.
+    let sanitize_result = sanitize();
+    let delete_result = legacy_delete();
+    if delete_result.is_ok() {
+        return Ok(());
+    }
+    if let Err(error) = sanitize_result {
+        tracing::warn!(
+            cleanup_category = ?error.category(),
+            "private staging sanitization and legacy deletion both failed"
+        );
+    }
+    delete_result
+}
+
+#[cfg(windows)]
+fn delete_private_windows_staging_handle(staging: &File) -> DepgraphServiceResult<()> {
+    delete_private_windows_staging_with(
+        || try_posix_delete_windows_file_handle(staging),
+        || {
+            staging
+                .set_len(0)
+                .and_then(|()| staging.sync_all())
+                .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+        },
+        || legacy_delete_windows_file_handle(staging),
+    )
+}
+
+#[cfg(windows)]
 fn discard_windows_staging_handle(staging: File) -> DepgraphServiceResult<()> {
-    let result = delete_windows_file_handle(&staging);
+    let result = delete_private_windows_staging_handle(&staging);
     drop(staging);
     result
 }
@@ -3346,34 +3411,18 @@ fn discard_windows_staging(
 ) -> DepgraphServiceResult<()> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_OPEN,
-        Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE},
+        Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE},
     };
 
-    // Open a second handle while the unguessable staging name is still bound
-    // to the file we created. Its full share mask admits the writer's access,
-    // while its desired access is limited to identity validation and deletion.
-    let cleanup = open_windows_at(
-        parent,
-        staging_name,
-        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        windows_repository_input_share_access(),
-        FILE_OPEN,
-        Some(false),
-    )?;
-    validate_opened_windows_regular_file(&cleanup)?;
-    if identity_from_file(&cleanup)? != expected_identity
-        || identity_from_file(&staging)? != expected_identity
-    {
+    if identity_from_file(&staging)? != expected_identity {
         return Err(DepgraphServiceError::Integrity);
     }
 
-    // Close the write-capable handle before marking the verified delete-only
-    // handle. This leaves no process-owned writer that can defer legacy delete
-    // disposition, while POSIX disposition removes the namespace link even if
-    // a compatible observer opened the private staging object meanwhile.
+    // The stage is exclusive until publication, so no compatible reader can
+    // delay legacy deletion. Use the identity-verified writer itself for the
+    // disposition; the legacy path sanitizes its contents before last-close.
+    let deletion = delete_private_windows_staging_handle(&staging);
     drop(staging);
-    let deletion = delete_windows_file_handle(&cleanup);
-    drop(cleanup);
     deletion?;
 
     let remaining = open_windows_at(
@@ -3793,6 +3842,50 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_staging_rejects_readers_and_cleanup_removes_the_link() {
+        use std::{io::Write as _, os::windows::fs::OpenOptionsExt as _};
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).expect("repository is created");
+        let parent = open_windows_directory(&root, true)
+            .expect("publication parent can be opened by handle");
+        let staging_name = OsStr::new(".depgraph-stage-exclusive");
+        let staging_path = root.join(staging_name);
+        let mut staging = open_windows_at(
+            &parent,
+            staging_name,
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+            windows_staging_share_access(),
+            FILE_CREATE,
+            Some(false),
+        )
+        .expect("private staging file can be created");
+        staging
+            .write_all(b"private-stage-canary")
+            .expect("private staging file is writable");
+        let identity = identity_from_file(&staging).expect("staging identity is available");
+
+        let observer = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_repository_input_share_access())
+            .open(&staging_path);
+        assert!(
+            observer.is_err(),
+            "a reader must not coexist with an unpublished private stage"
+        );
+
+        discard_windows_staging(&parent, staging_name, identity, staging)
+            .expect("exclusive private staging cleanup succeeds");
+        assert!(!staging_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_repository_file_name_comparison_is_unicode_canonical_caseless() {
@@ -4069,11 +4162,52 @@ mod tests {
     }
 
     #[test]
-    fn windows_publication_stage_never_allows_shared_write_access() {
-        assert_eq!(
-            windows_staging_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
-            0
+    fn windows_publication_stage_is_exclusive_until_publish() {
+        assert_eq!(windows_staging_share_access(), 0);
+    }
+
+    #[test]
+    fn private_staging_delete_sanitizes_before_the_legacy_fallback() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix");
+                Ok(false)
+            },
+            || {
+                calls.borrow_mut().push("sanitize");
+                Err(DepgraphServiceError::Internal)
+            },
+            || {
+                calls.borrow_mut().push("legacy");
+                Ok(())
+            },
         );
+        assert!(result.is_ok());
+        assert_eq!(*calls.borrow(), ["posix", "sanitize", "legacy"]);
+
+        calls.borrow_mut().clear();
+        delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix");
+                Ok(true)
+            },
+            || panic!("POSIX deletion must not sanitize an unlinked stage"),
+            || panic!("POSIX deletion must not invoke legacy disposition"),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["posix"]);
+    }
+
+    #[test]
+    fn private_staging_delete_reports_a_failed_legacy_disposition() {
+        let error = delete_private_windows_staging_with(
+            || Ok(false),
+            || Ok(()),
+            || Err(DepgraphServiceError::Integrity),
+        )
+        .unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
     }
 
     #[test]
