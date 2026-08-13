@@ -169,8 +169,8 @@ fn documented_launch_profiles(
     workspace: &Path,
     release_version: &str,
 ) -> Result<BTreeMap<String, DocumentedLaunchProfile>> {
-    let readme = read_documentation_lf(&workspace.join("README.md"))?;
-    let runbook = read_documentation_lf(&workspace.join(DOCUMENTATION_PATH))?;
+    let readme = crate::read_lf_normalized_text(&workspace.join("README.md"))?;
+    let runbook = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
     let marker_count = readme.matches(DOCUMENTATION_MARKER_PREFIX).count()
         + runbook.matches(DOCUMENTATION_MARKER_PREFIX).count();
     if marker_count != CAPABILITY_PROFILES.len() + 1 {
@@ -253,11 +253,6 @@ fn documented_launch_profiles(
         }
     }
     Ok(profiles)
-}
-
-fn read_documentation_lf(path: &Path) -> Result<String> {
-    let content = fs::read_to_string(path)?;
-    Ok(content.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 fn documented_shell_command(command: &str) -> Result<(String, Vec<String>)> {
@@ -1357,7 +1352,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         fs::create_dir_all(temporary.path().join("docs/50_test"))?;
         for path in ["README.md", DOCUMENTATION_PATH] {
-            let content = read_documentation_lf(&workspace.join(path))?;
+            let content = crate::read_lf_normalized_text(&workspace.join(path))?;
             fs::write(temporary.path().join(path), content.replace('\n', "\r\n"))?;
         }
         verify_documentation(temporary.path(), crate::VERSION)

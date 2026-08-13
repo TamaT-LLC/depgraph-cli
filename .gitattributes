@@ -1,5 +1,6 @@
 LICENSE-APACHE text eol=lf
 LICENSE-MIT text eol=lf
+README.md text eol=lf
 docs/**/*.md text eol=lf
 fixtures/** text eol=lf
 xtask/fixtures/** text eol=lf

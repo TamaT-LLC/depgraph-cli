@@ -1428,7 +1428,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     verify_mcp_tasks_architecture_decision(root)?;
     mcp_package_smoke::verify_documentation(root, VERSION)?;
     let mcp_operations_path = "docs/50_test/mcp-agent-host-operations.md";
-    let mcp_operations = fs::read_to_string(root.join(mcp_operations_path))?;
+    let mcp_operations = read_lf_normalized_text(&root.join(mcp_operations_path))?;
     verify_local_markdown_links(root, mcp_operations_path, &mcp_operations)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
@@ -1544,33 +1544,37 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         );
     }
 
-    let readme = fs::read_to_string(root.join("README.md"))?;
-    let rc1_release = fs::read_to_string(root.join("docs/releases/v0.4.0-rc.1.md"))?;
-    let design = fs::read_to_string(
-        root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
+    let readme = read_lf_normalized_text(&root.join("README.md"))?;
+    let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
+    let design = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
     )?;
-    let docs_index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
-    let rust_compiler_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
+    let docs_index = read_lf_normalized_text(&root.join("docs/00_index/index.md"))?;
+    let rust_compiler_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"),
+    )?;
     let rust_compiler_hostile =
-        fs::read_to_string(root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
-    let rust_compiler_release =
-        fs::read_to_string(root.join("docs/50_test/compiler-precise-five-target-release.md"))?;
+        read_lf_normalized_text(&root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
+    let rust_compiler_release = read_lf_normalized_text(
+        &root.join("docs/50_test/compiler-precise-five-target-release.md"),
+    )?;
     let rust_compiler_hostile_gate =
         fs::read_to_string(root.join("scripts/compiler-precise-hostile-e2e.sh"))?;
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
-    let cross_language_adr = fs::read_to_string(
-        root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
+    let cross_language_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
     )?;
-    let default_profile_adr = fs::read_to_string(
-        root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
+    let default_profile_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
     )?;
-    let graph_query_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
-    let public_oss_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-public-oss-release-governance.md"))?;
+    let graph_query_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"),
+    )?;
+    let public_oss_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-public-oss-release-governance.md"),
+    )?;
     let v0_5_release_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
+        read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
     verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
@@ -1954,7 +1958,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         }
     }
     let migration_rehearsal =
-        fs::read_to_string(root.join("docs/50_test/public-migration-rehearsal.md"))?;
+        read_lf_normalized_text(&root.join("docs/50_test/public-migration-rehearsal.md"))?;
     for required in [
         "`temporary-repository-no-production-actuator`",
         "The production repository must retain its original visibility",
@@ -1970,7 +1974,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("public migration rehearsal is missing required contract {required:?}");
         }
     }
-    let v0_4_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
+    let v0_4_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.4.0.md"))?;
     if v0_4_stable_release_baseline_digest() != V0_4_STABLE_RELEASE_BASELINE_DIGEST {
         bail!("compiled v0.4 release baseline digest does not match its canonical record");
     }
@@ -1988,7 +1992,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.4 release note is missing preserved baseline contract {required:?}");
         }
     }
-    let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0.md"))?;
+    let stable_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0.md"))?;
     for required in [
         STABLE_RELEASE_VERSION,
         STABLE_RELEASE_GATE_SCHEMA_VERSION,
@@ -2005,7 +2009,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5 release note is missing contract {required:?}");
         }
     }
-    let rc_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0-rc.1.md"))?;
+    let rc_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.1.md"))?;
     for required in [
         "first v0.5 release candidate",
         "signed annotated `v0.5.0-rc.1` tag",
@@ -2026,7 +2030,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.1 release note is missing contract {required:?}");
         }
     }
-    let release_procedure = fs::read_to_string(root.join("docs/50_test/release-procedure.md"))?;
+    let release_procedure =
+        read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
         "git tag -s \"$release_tag\" \"$candidate\"",
         "git verify-tag \"$release_tag\"",
@@ -2060,6 +2065,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
+    if !git_attributes
+        .lines()
+        .any(|line| line.trim() == "README.md text eol=lf")
+    {
+        bail!("README release metadata is not pinned to LF in .gitattributes");
+    }
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
         if !git_attributes
@@ -13774,12 +13785,16 @@ fn copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_lf_normalized_text(source: &Path, destination: &Path) -> Result<()> {
-    let bytes = fs::read(source)
-        .with_context(|| format!("failed to read release text {}", source.display()))?;
+fn read_lf_normalized_text(path: &Path) -> Result<String> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read text {}", path.display()))?;
     let text = String::from_utf8(bytes)
-        .with_context(|| format!("release text {} is not UTF-8", source.display()))?;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        .with_context(|| format!("text {} is not UTF-8", path.display()))?;
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn copy_lf_normalized_text(source: &Path, destination: &Path) -> Result<()> {
+    let normalized = read_lf_normalized_text(source)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
