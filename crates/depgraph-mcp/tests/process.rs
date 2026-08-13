@@ -663,7 +663,7 @@ fn requirement() -> &'static RequirementFixture {
         let spec = CompilerPackBuildSpec {
             host: host.clone(),
             target: host.clone(),
-            release_checksum_reference: format!("release-checksums:v0.4.0/compiler-pack-{host}"),
+            release_checksum_reference: format!("release-checksums:v0.5.0/compiler-pack-{host}"),
             cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
             rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
             wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
@@ -3575,7 +3575,7 @@ fn unverifiable_compiler_pack_does_not_echo_secret_root() {
             "root": root.path().join("secret-missing-compiler-pack"),
             "expected_manifest_sha256": "0".repeat(64),
             "release_checksum_reference":
-                "release-checksums:v0.4.0/compiler-pack-x86_64-unknown-linux-gnu",
+                "release-checksums:v0.5.0/compiler-pack-x86_64-unknown-linux-gnu",
             "host": "x86_64-unknown-linux-gnu",
             "target": "x86_64-unknown-linux-gnu"
         }))

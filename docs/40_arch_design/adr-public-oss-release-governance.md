@@ -11,7 +11,7 @@
 The repository is private at the time of this decision. It already has dual
 MIT / Apache-2.0 project licenses, five-target release packaging, SBOM and
 third-party license output, artifact checksums and attestations, and the
-`stable-release-gate-v1` quality decision. Those controls establish whether a
+product release-gate quality decision. Those controls establish whether a
 specific product build is releasable. They do not establish whether the
 repository, its history, collaboration records, GitHub Actions history, or
 governance are safe and ready to become public.
@@ -58,7 +58,7 @@ The repository remains private until a closed
 `public-readiness-v1` decision record says `allow` for one exact candidate
 commit and the TamaT-LLC organization owner gives an explicit go decision.
 This ADR does not itself authorize or perform a GitHub visibility change.
-Passing `stable-release-gate-v1` is mandatory but insufficient.
+Passing the current `stable-release-gate-v2` is mandatory but insufficient.
 
 An `allow` decision expires when the candidate commit, audited reachable refs,
 release inputs, governance documents, GitHub control snapshot, assigned role,
@@ -430,7 +430,7 @@ read-only and does not mutate repository settings.
 
 - [ ] Run the complete local and GitHub Actions quality suite for the exact
   candidate on all supported platforms.
-- [ ] Produce `stable-release-gate-v1=allow` for the same candidate and retain
+- [ ] Produce `stable-release-gate-v2=allow` for the same candidate and retain
   all five archives, checksums, SBOMs, provenance/attestations, release notes,
   and gate record by digest.
 - [ ] Use Semantic Versioning; create an immutable annotated and
@@ -452,26 +452,27 @@ reproducible release closure whose commit matches the readiness record.
 Evidence: CI run identities, stable gate and artifact digests, signed tag
 verification, support matrix, and release dry-run results.
 
-### Stable baseline and maintenance line
+### Preserved v0.4 baseline and v0.5 maintenance line
 
-The first stable release is anchored by `release-baseline-v1` at commit
+The unpublished v0.4 stable plan is anchored by `release-baseline-v1` at commit
 `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`. The canonical record and its
 SHA-256 are defined in `docs/releases/v0.4.0.md`. The initial
 `refs/heads/release/0.4` ref points to that exact commit, and the peeled
-`v0.4.0` tag is valid only at the same commit.
+`v0.4.0` tag is valid only at the same commit. No `v0.4.0` GitHub Release was
+published, so this historical anchor does not create a supported stable line.
 
-`main` remains the next-version development line. A fix shared with 0.4.x
-lands on `main` first and is cherry-picked with `-x` through a distinct pull
-request to `release/0.4`. An urgent stable-first fix is forward-ported through
-a distinct pull request to `main`. Wholesale merges from `main`, force-pushes,
-history rewrites, and backports that narrow the 0.4.x compatibility promise
-are forbidden. Pull requests record the source commit, issue, compatibility
-assessment, and verification so both directions remain auditable.
+`main` is the unreleased v0.5 line. The preserved `release/0.4` ref is not an
+active support promise. The future `release/0.5` branch is created only at the
+exact approved v0.5 GA baseline. Compatible fixes then land on `main` first
+and are cherry-picked with `-x` through a distinct maintenance pull request;
+urgent stable-first fixes are forward-ported through a distinct pull request.
+Wholesale merges, force-pushes, and history rewrites are forbidden. Pull
+requests record the source commit, issue, compatibility assessment, and
+verification so both directions remain auditable.
 
-Next-version work on `main` that could alter an existing default remains
-default-disabled or explicitly opt-in while 0.4.x is supported. A breaking
-default requires a new minor release and migration contract. It does not enter
-the stable line as a patch.
+Before v0.5 GA, stable support is absent and candidate behavior remains
+evaluation-only. After GA, a breaking default requires a new minor release and
+migration contract; it does not enter the stable line as a patch.
 
 The baseline source predates this decision and cannot contain a new source
 check without changing the immutable commit. A `workflow_run(requested)`
@@ -484,6 +485,12 @@ Operators also reproduce the documented commit, tree, canonical digest,
 remote maintenance ref, and signed annotated tag before publication. The
 immutable anchor is not redefined when later approved patch commits advance
 `release/0.4`.
+
+For v0.5, canonical `v0.5.0-rc.N` tags bind their exact source SHA. The stable
+baseline remains `candidate-unpinned` until a reviewed full-CI-green candidate
+commit, tree, and digest are recorded. Until then, the source guard and
+`stable-release-gate-v2` both reject `v0.5.0`. The same GA commit becomes the
+initial `refs/heads/release/0.5` ref.
 
 ### Gate 8: migration dry run and change window
 
@@ -676,4 +683,5 @@ The contract also avoids false confidence:
   https://docs.github.com/en/repositories/creating-and-managing-repositories/best-practices-for-repositories
 - GitHub Docs, Status checks:
   https://docs.github.com/en/pull-requests/reference/status-checks
-- Stable `v0.4.0` release contract: `../releases/v0.4.0.md`
+- Reserved unpublished `v0.4.0` baseline contract: `../releases/v0.4.0.md`
+- v0.5 release contract: `../releases/v0.5.0.md`

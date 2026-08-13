@@ -286,7 +286,7 @@ jobs:
         with:
           name: compiler-pack-verification
           path: compiler-artifacts
-      - name: Evaluate the machine-readable stable v0.4.0 release gate
+      - name: Evaluate the machine-readable v0.5 release gate
         env:
           DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}
           DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT: ${{ needs.compiler-precise-hostile.result }}

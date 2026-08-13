@@ -367,7 +367,7 @@ fn compiler_pack_fixture(
         host: "x86_64-unknown-linux-gnu".to_owned(),
         target: "x86_64-unknown-linux-gnu".to_owned(),
         release_checksum_reference:
-            "release-checksums:v0.4.0/compiler-pack-x86_64-unknown-linux-gnu".to_owned(),
+            "release-checksums:v0.5.0/compiler-pack-x86_64-unknown-linux-gnu".to_owned(),
         cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
         rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
         wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),

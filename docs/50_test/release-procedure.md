@@ -18,13 +18,13 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 
 ## リリース準備
 
-1. バージョン変更とrelease noteを一つのPRにまとめる。
+1. バージョン変更とrelease noteを一つのPRにまとめる。現行契約ではbase versionは`0.5.0`である。
 2. release noteを`docs/releases/<タグ名>.md`として追加する。
 3. タグ名をworkspace versionと一致する`vX.Y.Z`または`vX.Y.Z-rc.N`にする。
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
-Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
+Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。`v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。`v0.5.0` stableはbaseline statusが`candidate-unpinned`の間、default-branch source guardと`stable-release-gate-v2`の双方がfail closedで拒否する。
 
 ## タグ作成前のフルCI
 
@@ -67,6 +67,8 @@ git tag -a "$release_tag" "$candidate" -m "depgraph $release_tag"
 git push origin "refs/tags/$release_tag"
 ```
 
+v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。push済みtagを移動・再利用しない。stable `v0.5.0`を作成する前に、GA PRでfull CIがgreenなexact commit、tree、canonical baseline digestを記録し、`candidate-unpinned` guardをそのcommitだけを許可するguardへ変更し、同じcommitから`refs/heads/release/0.5`を作る。
+
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。
 
@@ -95,6 +97,8 @@ Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-t
 欠損、改変、version drift、target間schema driftを拒否する。
 すべてのgateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
 `-rc.N`を含むタグはprereleaseとして公開される。
+
+Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 17へのtransactional migration、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-17 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
 
 公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、検証reportが同じタグに結び付いていることを確認する。
 

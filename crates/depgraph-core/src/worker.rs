@@ -6713,26 +6713,26 @@ for (const event of events) console.log(JSON.stringify(event));
     fn worker_capability_handshake_is_exact_sorted_and_fail_closed() {
         assert_eq!(
             worker_capabilities(
-                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities alpha,worker-delta-v1,zeta)"
+                "depgraph-web-worker 0.5.0 (protocol 1.0; capabilities alpha,worker-delta-v1,zeta)"
             ),
             ["alpha", "worker-delta-v1", "zeta"]
         );
-        assert!(worker_capabilities("depgraph-web-worker 0.4.0").is_empty());
+        assert!(worker_capabilities("depgraph-web-worker 0.5.0").is_empty());
         assert!(
             worker_capabilities(
-                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities worker-delta-v1,alpha)"
+                "depgraph-web-worker 0.5.0 (protocol 1.0; capabilities worker-delta-v1,alpha)"
             )
             .is_empty()
         );
         assert!(
             worker_capabilities(
-                "depgraph-web-worker 0.4.0 (protocol 1.0; capabilities worker-delta-v1,worker-delta-v1)"
+                "depgraph-web-worker 0.5.0 (protocol 1.0; capabilities worker-delta-v1,worker-delta-v1)"
             )
             .is_empty()
         );
         assert!(
             worker_capabilities(
-                "depgraph-web-worker 0.4.0 (protocol 1.0; future-capabilities worker-delta-v1)"
+                "depgraph-web-worker 0.5.0 (protocol 1.0; future-capabilities worker-delta-v1)"
             )
             .is_empty()
         );

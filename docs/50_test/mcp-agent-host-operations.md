@@ -45,7 +45,7 @@ writes, daemon control, or project-code execution.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -70,7 +70,7 @@ symlinks, reparse points, and repository escapes remain denied.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -95,7 +95,7 @@ valid closure is `read` plus `store-write` plus `daemon-control`; omitting
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -121,7 +121,7 @@ project code. The valid closure is `read` plus `store-write` plus
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -147,7 +147,7 @@ effects.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.4.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",

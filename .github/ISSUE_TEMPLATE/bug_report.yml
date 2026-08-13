@@ -11,7 +11,7 @@ body:
     attributes:
       label: depgraph version
       description: Use `depgraph --version` or provide the exact commit.
-      placeholder: "0.4.0"
+      placeholder: "exact release tag or commit"
     validations:
       required: true
   - type: dropdown

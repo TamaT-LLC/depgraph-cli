@@ -8,16 +8,17 @@ on:
 permissions: {}
 
 jobs:
-  guard-v0-4-0:
+  guard-stable-tags:
     if: >-
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'v0.4.0'
+      (github.event.workflow_run.head_branch == 'v0.4.0' ||
+       github.event.workflow_run.head_branch == 'v0.5.0')
     runs-on: ubuntu-24.04
     permissions:
       actions: write
       contents: write
     steps:
-      - name: Reject a v0.4.0 tag outside the immutable baseline
+      - name: Guard v0.4 and v0.5 stable tag sources
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -27,8 +28,19 @@ jobs:
           RELEASE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
           EXPECTED_RELEASE_TAG: v0.4.0
           EXPECTED_RELEASE_SOURCE_SHA: d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f
+          UNPINNED_RELEASE_TAG: v0.5.0
+          STABLE_BASELINE_STATUS: candidate-unpinned
         run: |
           set -euo pipefail
+          if [[ "$RELEASE_TAG" == "$UNPINNED_RELEASE_TAG" ]]; then
+            gh api --method POST \
+              "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel"
+            gh api --method DELETE \
+              "repos/$REPOSITORY/git/refs/tags/$UNPINNED_RELEASE_TAG"
+            echo "::error::v0.5.0 stable baseline has not been pinned ($STABLE_BASELINE_STATUS)"
+            exit 1
+          fi
+
           if [[ "$RELEASE_TAG" == "$EXPECTED_RELEASE_TAG" &&
                 "$RELEASE_SOURCE_SHA" == "$EXPECTED_RELEASE_SOURCE_SHA" ]]; then
             echo "$RELEASE_TAG source is the immutable release baseline"

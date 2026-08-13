@@ -7,8 +7,17 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-08-07
+updated: 2026-08-13
 ---
+
+> 2026-08-13: Issue #355として、GitHub上で公開済みなのは
+> `v0.4.0-rc.6`までで`v0.4.0` stableは未公開である事実をrelease contractへ反映した。
+> MCPを含むmainを`0.5.0`へ同期し、protocol `1.0`、Store schema `17`、
+> operation journal schema `5`、`depgraph-mcp-tools-v1`、
+> `depgraph-operation-v1`をv0.5 compatibility tupleへ固定する。
+> 公式rc.6 schema-13 fixtureをchecksum固定してschema 17へのmigrationと
+> byte不変rollback copyを検証し、v0.5 stableはexact GA baseline確定まで
+> `candidate-unpinned`としてsource guardとrelease gateの双方で拒否する。
 
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
 > Inline inputまたはrepository-relative regular fileの一方だけを受理し、size/confinement、credential policy、parse/type、query output admissionをstore access前にfail closedで検証する。
@@ -30,9 +39,10 @@ updated: 2026-08-07
 
 | Compatibility unit | Version |
 | --- | --- |
-| Product / Rust / Go / Web adapter | `0.4.0` |
+| Product / Rust / Go / Web adapter | `0.5.0` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / scan cache / impact query cache | `13` / `2` / `1` |
+| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |
+| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
@@ -48,7 +58,9 @@ Milestone 2のrelease candidateは`v0.2.0-rc.1`とする。5 targetのnative pac
 
 Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph schemaは`1.0`、SQLite storeは`11`、scan cache / impact query cache contractは`1`を維持し、公式`v0.2.0-rc.1`が生成したstore schema `5`からcompleted snapshotを失わずに移行する。全5 targetのnative package gateはsnapshot/diff/impact、watcher/incremental、architecture policyとGitHub annotation、packaged `runtime-collector-v1`による実fixture trace生成、runtime trace validate/import/query、GraphML stdout/atomic file exportを検証する。manifestにはcollectorを含むversioned compatibility unitと`milestone4-packaged-smoke-v1`を固定し、aggregate verifierはchecksum、archive、manifest、SBOM、project/third-party license、attestationと同じclosureで再検証する。性能結果、安全境界、migration / rollback、既知制約は[release note](../releases/v0.4.0-rc.1.md)をcanonicalな配布時説明とする。
 
-Milestone 4のstable releaseは`v0.4.0`とする。`stable-release-gate-v1`は公式`v0.4.0-rc.1` packageが生成したschema `11` store fixtureをstable packageでschema `13`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup非変更を検証する。tag workflowは`quality`、versioned 10,000-file `benchmark`、全5 target `package`、aggregate `verify-assets`の成功をdirect dependencyとし、release identity、protocol / store / cache、RC upgrade、performance、safety、framework / collector、license / SBOM / attestation closureを`stable-release-gate.json`へ`allow`または`reject`として出力する。`allow`以外ではpublish jobへ到達しない。0.4.xの互換性promise、GA exit criteria、support matrix、rollback、既知制約の更新規則は[stable release note](../releases/v0.4.0.md)をcanonical contractとする。
+Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable-release-gate-v1`を確定したが、stable GitHub Releaseは公開されなかった。公開済みの最終候補は`v0.4.0-rc.6`であり、[v0.4.0 document](../releases/v0.4.0.md)はimmutable baselineの履歴記録であって現行support claimではない。
+
+MCPを含むmainの次期stableは`v0.5.0`とする。`stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。canonical `v0.5.0-rc.N`はexact source SHAへ結び、stable `v0.5.0`はGA taskがreview済みcommit/tree/digestを固定するまで`candidate-unpinned`として拒否する。compatibility、tag、migration、maintenance contractは[ADR](adr-v0.5-release-contract.md)と[v0.5 release contract](../releases/v0.5.0.md)をcanonicalとする。
 
 Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`として固定し、初期`release/0.4` maintenance refと`v0.4.0` tag sourceを同じexact commitへ結び付けた。canonical baseline digest、tree、再現手順、main-first cherry-pick / stable-first forward-portの観測可能な変更フロー、force-push / wholesale merge禁止は[stable release note](../releases/v0.4.0.md)に定める。mainの次版機能は既存defaultへ影響する間default無効または明示opt-inとし、breaking defaultはminor releaseとmigration contractを要求する。baseline sourceはimmutableで新しい自己検証を含められないため、default branchの`workflow_run(requested)` guardが`Release` runのtag / source SHAを照合し、mismatch時はrunをcancelしてinvalid tagを削除する。
 

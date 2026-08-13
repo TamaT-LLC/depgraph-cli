@@ -19,15 +19,28 @@ mod mcp_package_smoke;
 mod rust_semantic_e2e;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v1";
-const STABLE_RELEASE_VERSION: &str = "0.4.0";
-const STABLE_RELEASE_BASELINE_COMMIT: &str = "d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f";
-const STABLE_RELEASE_BASELINE_TREE: &str = "46555a059070e94c3ed4567af3c58b278dbb0fb4";
-const STABLE_RELEASE_BASELINE_DIGEST: &str =
+const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
+const STABLE_RELEASE_VERSION: &str = "0.5.0";
+const STABLE_RELEASE_BASELINE_STATUS: &str = "candidate-unpinned";
+const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
+const V0_4_STABLE_RELEASE_BASELINE_COMMIT: &str = "d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f";
+const V0_4_STABLE_RELEASE_BASELINE_TREE: &str = "46555a059070e94c3ed4567af3c58b278dbb0fb4";
+const V0_4_STABLE_RELEASE_BASELINE_DIGEST: &str =
     "0bb7f33d212402025429382489d586956d16f7d63d2e4d9d781d5715a44b00fd";
-const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
-const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.1";
-const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 11;
+const V0_4_STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.4";
+const STABLE_UPGRADE_SOURCE_VERSION: &str = "0.4.0-rc.6";
+const STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION: i64 = 13;
+const STABLE_UPGRADE_SOURCE_FIXTURE_PATH: &str = "xtask/fixtures/v0.4.0-rc.6-store-v13.sql";
+const STABLE_UPGRADE_SOURCE_FIXTURE_SHA256: &str =
+    "43fe0dda73d03be9b8fff2ed9ff8ce888ad96e41e78335a1117646475c937150";
+const V0_4_RC6_TAG_COMMIT: &str = "bb5dbe67e737cf50f07d90e6f4c8b7658c631184";
+const V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256: &str =
+    "9dfde55ce04f940464c1d9215d165fb6786264f1b40fe4dd2c01a7b210eb18c3";
+const V0_4_RC6_AARCH64_APPLE_BINARY_SHA256: &str =
+    "c7d97ea0b2f4af388b6cd3ad7b69f41ac1ac5df65dadf7c20f749d4082f0fca4";
+#[cfg(test)]
+const V0_4_RC1_STORE_SCHEMA_VERSION: i64 = 11;
+const V0_2_RC1_STORE_SCHEMA_VERSION: i64 = 5;
 const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v6";
 const STABLE_BENCHMARK_METRICS: &[(&str, bool)] = &[
     ("safe_initial_scan", true),
@@ -446,14 +459,16 @@ fn release_compatibility() -> ReleaseCompatibility {
     depgraph_core::release_compatibility_contract()
 }
 
-fn stable_release_baseline_record() -> String {
+fn v0_4_stable_release_baseline_record() -> String {
     format!(
-        "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion={STABLE_RELEASE_VERSION}\ncommit={STABLE_RELEASE_BASELINE_COMMIT}\n"
+        "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion=0.4.0\ncommit={V0_4_STABLE_RELEASE_BASELINE_COMMIT}\n"
     )
 }
 
-fn stable_release_baseline_digest() -> String {
-    hex::encode(Sha256::digest(stable_release_baseline_record().as_bytes()))
+fn v0_4_stable_release_baseline_digest() -> String {
+    hex::encode(Sha256::digest(
+        v0_4_stable_release_baseline_record().as_bytes(),
+    ))
 }
 
 fn release_tag() -> Result<String> {
@@ -499,12 +514,23 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "types: [requested]",
         "github.event.workflow_run.head_branch == 'v0.4.0'",
         "github.event.workflow_run.head_sha",
-        STABLE_RELEASE_BASELINE_COMMIT,
+        V0_4_STABLE_RELEASE_BASELINE_COMMIT,
         "actions/runs/$RELEASE_RUN_ID/cancel",
         "git/refs/tags/$EXPECTED_RELEASE_TAG",
     ] {
         if !source_guard.contains(required) {
             bail!("stable release source guard is missing contract {required:?}");
+        }
+    }
+    for required in [
+        "guard-stable-tags:",
+        "github.event.workflow_run.head_branch == 'v0.5.0'",
+        "UNPINNED_RELEASE_TAG: v0.5.0",
+        "STABLE_BASELINE_STATUS: candidate-unpinned",
+        "v0.5.0 stable baseline has not been pinned",
+    ] {
+        if !source_guard.contains(required) {
+            bail!("stable release source guard is missing v0.5 contract {required:?}");
         }
     }
     Ok(())
@@ -1387,12 +1413,14 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
     let public_oss_adr =
         fs::read_to_string(root.join("docs/40_arch_design/adr-public-oss-release-governance.md"))?;
+    let v0_5_release_adr =
+        fs::read_to_string(root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
     verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
         "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
-        "[`v0.4.0` release notes](docs/releases/v0.4.0.md)",
+        "[`v0.4.0` contract](docs/releases/v0.4.0.md)",
         "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
         "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
         "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
@@ -1401,8 +1429,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
         "depgraph runtime validate --file runtime-trace.json --json",
-        "Every archive includes the\nnative MCP server, durable operation runner, and versioned Agent tool/operation\nschema.",
+        "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
+        "no `v0.4.0` stable GitHub Release was published",
+        "Store\nschema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
     ] {
         if !readme.contains(required) {
             bail!("README release metadata is missing {required:?}");
@@ -1417,11 +1447,15 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-08-07",
-        "| Product / Rust / Go / Web adapter | `0.4.0` |",
+        "updated: 2026-08-13",
+        "| Product / Rust / Go / Web adapter | `0.5.0` |",
+        "| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |",
+        "| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
-        "Milestone 4のstable releaseは`v0.4.0`",
-        "`stable-release-gate-v1`",
+        "stable GitHub Releaseは公開されなかった",
+        "`stable-release-gate-v2`",
+        "Issue #355として",
+        "`candidate-unpinned`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
         "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
         "Issue #146でRust `1.93.1`",
@@ -1464,6 +1498,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-005` を追加",
         "| PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |",
         "2026-07-25: `PROJ-ARC-001-ADR-006` を追加",
+        "| PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |",
+        "2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -1685,7 +1721,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| Current visibility | `private` |",
         "| Current public readiness | `reject` / no-go |",
         "| Accountable owner | TamaT-LLC organization owner |",
-        "Passing `stable-release-gate-v1` is mandatory but insufficient.",
+        "Passing the current `stable-release-gate-v2` is mandatory but insufficient.",
         "The readiness record is evidence, not an actuator.",
         "[`schemas/public-readiness-v1.schema.json`](../../schemas/public-readiness-v1.schema.json)",
         "`evidence-only-no-visibility-actuator`",
@@ -1730,12 +1766,35 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
         "| All gates pass but organization owner has not authorized visibility | remain private |",
-        "### Stable baseline and maintenance line",
+        "### Preserved v0.4 baseline and v0.5 maintenance line",
         "`refs/heads/release/0.4`",
-        "default-disabled or explicitly opt-in",
+        "`refs/heads/release/0.5`",
+        "`candidate-unpinned`",
     ] {
         if !public_oss_adr.contains(required) {
             bail!("public OSS governance ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-007`",
+        "- Issue: `PROJ-ARC-003-TASK-001` / #355",
+        "- Contract: `stable-release-gate-v2`",
+        "No `v0.4.0` stable GitHub Release was published",
+        "| Product and adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
+        V0_4_RC6_TAG_COMMIT,
+        V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
+        V0_4_RC6_AARCH64_APPLE_BINARY_SHA256,
+        "The stable baseline status is `candidate-unpinned`.",
+    ] {
+        if !v0_5_release_adr.contains(required) {
+            bail!("v0.5 release ADR is missing required contract {required:?}");
         }
     }
     let migration_rehearsal =
@@ -1755,23 +1814,59 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("public migration rehearsal is missing required contract {required:?}");
         }
     }
-    let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
-    if stable_release_baseline_digest() != STABLE_RELEASE_BASELINE_DIGEST {
-        bail!("compiled stable release baseline digest does not match its canonical record");
+    let v0_4_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
+    if v0_4_stable_release_baseline_digest() != V0_4_STABLE_RELEASE_BASELINE_DIGEST {
+        bail!("compiled v0.4 release baseline digest does not match its canonical record");
     }
     for required in [
         "## Release baseline and maintenance line",
-        STABLE_RELEASE_BASELINE_COMMIT,
-        STABLE_RELEASE_BASELINE_TREE,
-        STABLE_RELEASE_BASELINE_DIGEST,
-        STABLE_RELEASE_MAINTENANCE_BRANCH,
+        V0_4_STABLE_RELEASE_BASELINE_COMMIT,
+        V0_4_STABLE_RELEASE_BASELINE_TREE,
+        V0_4_STABLE_RELEASE_BASELINE_DIGEST,
+        V0_4_STABLE_RELEASE_MAINTENANCE_BRANCH,
         "git cherry-pick -x",
         "default-disabled or explicitly opt-in",
         "Stable release source guard",
     ] {
-        if !stable_release_note.contains(required) {
-            bail!("stable release note is missing baseline contract {required:?}");
+        if !v0_4_release_note.contains(required) {
+            bail!("v0.4 release note is missing preserved baseline contract {required:?}");
         }
+    }
+    let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0.md"))?;
+    for required in [
+        STABLE_RELEASE_VERSION,
+        STABLE_RELEASE_GATE_SCHEMA_VERSION,
+        STABLE_RELEASE_BASELINE_STATUS,
+        STABLE_RELEASE_MAINTENANCE_BRANCH,
+        STABLE_UPGRADE_SOURCE_VERSION,
+        STABLE_UPGRADE_SOURCE_FIXTURE_PATH,
+        STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
+        "depgraph-mcp-tools-v1",
+        "depgraph-operation-v1",
+        "operation journal schema `5`",
+    ] {
+        if !stable_release_note.contains(required) {
+            bail!("v0.5 release note is missing contract {required:?}");
+        }
+    }
+    if sha256_file(&root.join(STABLE_UPGRADE_SOURCE_FIXTURE_PATH))?
+        != STABLE_UPGRADE_SOURCE_FIXTURE_SHA256
+    {
+        bail!("official v0.4.0-rc.6 store fixture was modified");
+    }
+    let compatibility = release_compatibility();
+    if compatibility.worker_protocol_version != depgraph_protocol::PROTOCOL_VERSION
+        || compatibility.store_schema_version != depgraph_store::STORE_SCHEMA_VERSION
+        || compatibility.operation_journal_schema_version
+            != depgraph_operation::JOURNAL_SCHEMA_VERSION
+        || compatibility.mcp_tool_contract_version != MCP_TOOL_CONTRACT_VERSION
+        || compatibility.mcp_operation_contract_version != MCP_OPERATION_CONTRACT_VERSION
+        || compatibility.stable_release_version != VERSION
+        || compatibility.stable_upgrade_source_fixture_path != STABLE_UPGRADE_SOURCE_FIXTURE_PATH
+        || compatibility.stable_upgrade_source_fixture_sha256
+            != format!("sha256:{STABLE_UPGRADE_SOURCE_FIXTURE_SHA256}")
+    {
+        bail!("v0.5 release compatibility tuple is not synchronized");
     }
     verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
@@ -1806,6 +1901,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     for required_attribute in [
         "fixtures/** text eol=lf",
+        "xtask/fixtures/** text eol=lf",
         "queries/** text eol=lf",
         "schemas/** text eol=lf",
     ] {
@@ -1822,8 +1918,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-cross-language-adapter-contract.md",
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
+        "docs/40_arch_design/adr-v0.5-release-contract.md",
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
+        "docs/releases/v0.5.0.md",
         "docs/releases/v0.4.0-rc.6.md",
         "docs/releases/v0.4.0-rc.3.md",
         "docs/releases/v0.4.0-rc.2.md",
@@ -2109,7 +2207,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             "README.md",
             &[
                 "## Project status and public collaboration",
-                "`v0.4.x` is the supported stable release line.",
+                "There is currently no supported stable release.",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2152,7 +2250,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "best-effort basis",
                 "does not provide an SLA",
-                "latest `0.4.x` release",
+                "There is currently no supported stable release.",
                 "[SECURITY.md](SECURITY.md)",
                 "There is no automatic stale deadline",
             ],
@@ -5078,7 +5176,7 @@ fn evaluate_stable_release_gate(
         .get("source_sha")
         .is_some_and(|source_sha| {
             if release.tag == format!("v{STABLE_RELEASE_VERSION}") {
-                source_sha == STABLE_RELEASE_BASELINE_COMMIT
+                false
             } else {
                 supported_release_tag(&release.tag) && lowercase_git_sha(source_sha)
             }
@@ -5243,13 +5341,20 @@ fn evaluate_stable_release_gate(
             passed: release.protocol_version == "1.0"
                 && release.schema_compatibility_version == "1.0"
                 && release.compatibility == compatibility
+                && release.compatibility.worker_protocol_version
+                    == depgraph_protocol::PROTOCOL_VERSION
                 && release.compatibility.store_schema_version == depgraph_store::STORE_SCHEMA_VERSION
+                && release.compatibility.operation_journal_schema_version
+                    == depgraph_operation::JOURNAL_SCHEMA_VERSION
+                && release.compatibility.mcp_tool_contract_version == MCP_TOOL_CONTRACT_VERSION
+                && release.compatibility.mcp_operation_contract_version
+                    == MCP_OPERATION_CONTRACT_VERSION
                 && release.compatibility.cache_contract_version
                     == depgraph_store::CACHE_CONTRACT_VERSION,
             evidence: "release manifest closure uses the compiled compatibility contract".to_owned(),
         },
         StableReleaseGateCheck {
-            id: "rc1-upgrade-and-rollback".to_owned(),
+            id: "rc6-upgrade-and-rollback".to_owned(),
             passed: release.compatibility.stable_release_gate_contract_version
                 == STABLE_RELEASE_GATE_SCHEMA_VERSION
                 && release.compatibility.stable_release_version == STABLE_RELEASE_VERSION
@@ -5259,10 +5364,14 @@ fn evaluate_stable_release_gate(
                     .compatibility
                     .stable_upgrade_source_store_schema_version
                     == STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION
+                && release.compatibility.stable_upgrade_source_fixture_path
+                    == STABLE_UPGRADE_SOURCE_FIXTURE_PATH
+                && release.compatibility.stable_upgrade_source_fixture_sha256
+                    == format!("sha256:{STABLE_UPGRADE_SOURCE_FIXTURE_SHA256}")
                 && release.compatibility.packaged_smoke_contract
-                    == "stable-v0.4.0-packaged-smoke-v1",
+                    == "stable-v0.5.0-packaged-smoke-v1",
             evidence:
-                "official v0.4.0-rc.1 schema-11 fixture, migration, immutable graph, writable name, and untouched backup"
+                "checksum-pinned official v0.4.0-rc.6 schema-13 fixture, migration, immutable graph, writable name, and byte-unchanged rollback backup"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -5343,9 +5452,9 @@ fn evaluate_stable_release_gate(
             id: "tag-source-guard-contract".to_owned(),
             passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
                 && release_source_matches_tag,
-            evidence:
-                "the immutable v0.4.0 baseline is enforced while canonical rc tags bind their exact source SHA"
-                    .to_owned(),
+            evidence: format!(
+                "the immutable v0.4.0 baseline remains enforced, canonical v0.5.0-rc.N tags bind their exact source SHA, and stable v0.5.0 remains blocked while baseline status is {STABLE_RELEASE_BASELINE_STATUS}"
+            ),
         },
         StableReleaseGateCheck {
             id: "workflow-quality-closure".to_owned(),
@@ -8608,11 +8717,12 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     let connection = rusqlite::Connection::open(&store_path)?;
     connection.execute_batch(include_str!("../fixtures/v0.2.0-rc.1-store-v5.sql"))?;
     let original_schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if original_schema != release_compatibility().previous_release_store_schema_version {
+    if original_schema != V0_2_RC1_STORE_SCHEMA_VERSION {
         bail!("legacy release fixture is schema {original_schema}, expected schema 5");
     }
     drop(connection);
     fs::copy(&store_path, &backup_path)?;
+    let backup_bytes = fs::read(&backup_path)?;
 
     let show = Command::new(executable)
         .arg("--store")
@@ -8692,19 +8802,30 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
         bail!("packaged migration lost the legacy dependency path: {why}");
     }
 
-    let backup = rusqlite::Connection::open(&backup_path)?;
+    if fs::read(&backup_path)? != backup_bytes {
+        bail!("packaged migration changed the v0.2.0-rc.1 rollback backup bytes");
+    }
+    let backup = rusqlite::Connection::open_with_flags(
+        &backup_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if backup_schema != release_compatibility().previous_release_store_schema_version {
+    if backup_schema != V0_2_RC1_STORE_SCHEMA_VERSION {
         bail!("packaged migration modified the rollback backup");
     }
     Ok(())
 }
 
 fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Result<()> {
-    let store_path = verify_root.join("official-v0.4.0-rc.1-v11.db");
-    let backup_path = verify_root.join("official-v0.4.0-rc.1-v11.backup.db");
+    if sha256_file(&workspace_root().join(STABLE_UPGRADE_SOURCE_FIXTURE_PATH))?
+        != STABLE_UPGRADE_SOURCE_FIXTURE_SHA256
+    {
+        bail!("official v0.4.0-rc.6 store fixture checksum does not match its contract");
+    }
+    let store_path = verify_root.join("official-v0.4.0-rc.6-v13.db");
+    let backup_path = verify_root.join("official-v0.4.0-rc.6-v13.backup.db");
     let connection = rusqlite::Connection::open(&store_path)?;
-    connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.1-store-v11.sql"))?;
+    connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.6-store-v13.sql"))?;
     let original_schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if original_schema != release_compatibility().stable_upgrade_source_store_schema_version {
         bail!(
@@ -8714,20 +8835,21 @@ fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Resu
     }
     drop(connection);
     fs::copy(&store_path, &backup_path)?;
+    let backup_bytes = fs::read(&backup_path)?;
 
     let show = Command::new(executable)
         .arg("--store")
         .arg(&store_path)
         .args(["snapshot", "show", "current", "--json"])
         .output()
-        .context("failed to open the v0.4.0-rc.1 store with the stable packaged CLI")?;
-    let show = successful_json(show, "packaged stable v0.4.0-rc.1 upgrade")?;
+        .context("failed to open the v0.4.0-rc.6 store with the v0.5 packaged CLI")?;
+    let show = successful_json(show, "packaged v0.4.0-rc.6 to v0.5 upgrade")?;
     if show["data"]["source_kind"] != "scan"
         || show["data"]["scan_id"] != "official-v0.4.0-rc.1-scan"
         || show["data"]["status"] != "completed"
         || show["data"]["coverage"]["dependency_sites"] != 1
     {
-        bail!("stable upgrade lost the v0.4.0-rc.1 completed snapshot: {show}");
+        bail!("v0.5 upgrade lost the v0.4.0-rc.6 fixture's completed snapshot: {show}");
     }
 
     let upgraded = depgraph_store::Store::open(&store_path)?;
@@ -8745,24 +8867,30 @@ fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Resu
         || snapshot.evidence.len() != 2
         || !upgraded.verify_snapshot_integrity(&snapshot_id)?.valid
     {
-        bail!("stable upgrade changed the v0.4.0-rc.1 immutable graph");
+        bail!("v0.5 upgrade changed the v0.4.0-rc.6 fixture's immutable graph");
     }
     drop(upgraded);
 
     let named = Command::new(executable)
         .arg("--store")
         .arg(&store_path)
-        .args(["snapshot", "create", "stable-v0.4.0-upgrade", "--json"])
+        .args(["snapshot", "create", "stable-v0.5.0-upgrade", "--json"])
         .output()?;
     let named = successful_json(named, "packaged stable upgraded snapshot naming")?;
     if named["data"]["snapshot"]["id"] != snapshot_id {
         bail!("naming the stable upgraded snapshot changed its immutable ID: {named}");
     }
 
-    let backup = rusqlite::Connection::open(&backup_path)?;
+    if fs::read(&backup_path)? != backup_bytes {
+        bail!("v0.5 upgrade changed the v0.4.0-rc.6 rollback backup bytes");
+    }
+    let backup = rusqlite::Connection::open_with_flags(
+        &backup_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let backup_schema: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if backup_schema != release_compatibility().stable_upgrade_source_store_schema_version {
-        bail!("stable upgrade modified the v0.4.0-rc.1 rollback backup");
+        bail!("v0.5 upgrade modified the v0.4.0-rc.6 rollback backup");
     }
     Ok(())
 }
@@ -13112,17 +13240,20 @@ mod tests {
         MCP_OPERATION_CONTRACT_VERSION, MCP_PROTOCOL_REVISION, MCP_SDK_VERSION,
         MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
         RELEASE_TARGETS, RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
-        ReleaseVerificationReport, STABLE_BENCHMARK_METRICS, STABLE_RELEASE_BASELINE_COMMIT,
-        STABLE_RELEASE_BASELINE_DIGEST, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
-        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task, VERSION,
-        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
-        WebSemanticAttestation, WorkerBackend, archive_entries, cargo_metadata,
-        cargo_runtime_packages, compiler_pack_identity_binding, create_tar_archive,
-        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
-        extract_archive, github_settings_verify, has_windows_executable_extension,
-        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
-        stable_release_baseline_digest, target_native_smoke_expectation,
+        ReleaseVerificationReport, STABLE_BENCHMARK_METRICS, STABLE_RELEASE_VERSION,
+        STABLE_UPGRADE_SOURCE_FIXTURE_PATH, STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
+        STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
+        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task,
+        V0_2_RC1_STORE_SCHEMA_VERSION, V0_4_RC1_STORE_SCHEMA_VERSION,
+        V0_4_STABLE_RELEASE_BASELINE_DIGEST, VERSION, WEB_SEMANTIC_CAPABILITIES,
+        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
+        WorkerBackend, archive_entries, cargo_metadata, cargo_runtime_packages,
+        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
+        evaluate_stable_release_gate, executable_name_for_target, extract_archive,
+        github_settings_verify, has_windows_executable_extension, normalized_spdx_license,
+        package_url, parse_worker_handshake, release_compatibility, remove_transient_build_run_ids,
+        rust_backend_from_handshake, rustc_source_identity, supported_release_tag,
+        target_native_smoke_expectation, v0_4_stable_release_baseline_digest,
         validate_bounded_query_package_smoke, validate_cross_language_package_smoke,
         verify_checksum_sidecar, verify_cross_language_package_smoke,
         verify_github_actions_security, verify_local_markdown_links, verify_mcp_dependencies,
@@ -13508,10 +13639,10 @@ jobs:
     }
 
     #[test]
-    fn stable_release_baseline_digest_is_reproducible() {
+    fn v0_4_stable_release_baseline_digest_is_reproducible() {
         assert_eq!(
-            stable_release_baseline_digest(),
-            STABLE_RELEASE_BASELINE_DIGEST
+            v0_4_stable_release_baseline_digest(),
+            V0_4_STABLE_RELEASE_BASELINE_DIGEST
         );
     }
 
@@ -13574,10 +13705,7 @@ jobs:
         let connection = rusqlite::Connection::open(&path)?;
         connection.execute_batch(include_str!("../fixtures/v0.2.0-rc.1-store-v5.sql"))?;
         let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(
-            schema,
-            release_compatibility().previous_release_store_schema_version
-        );
+        assert_eq!(schema, V0_2_RC1_STORE_SCHEMA_VERSION);
         drop(connection);
 
         let store = depgraph_store::Store::open(&path)?;
@@ -13597,16 +13725,13 @@ jobs:
     }
 
     #[test]
-    fn official_v0_4_rc_1_store_fixture_opens_without_changing_the_immutable_graph() -> Result<()> {
+    fn historical_v0_4_rc_1_store_fixture_still_migrates_without_graph_drift() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("release-candidate.db");
         let connection = rusqlite::Connection::open(&path)?;
         connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.1-store-v11.sql"))?;
         let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(
-            schema,
-            release_compatibility().stable_upgrade_source_store_schema_version
-        );
+        assert_eq!(schema, V0_4_RC1_STORE_SCHEMA_VERSION);
         drop(connection);
 
         let mut store = depgraph_store::Store::open(&path)?;
@@ -13627,6 +13752,62 @@ jobs:
             store.resolve_completed_snapshot_selector("stable-v0.4.0-upgrade")?,
             snapshot_id
         );
+        Ok(())
+    }
+
+    #[test]
+    fn official_v0_4_rc_6_store_fixture_is_pinned_and_migrates_with_byte_safe_rollback()
+    -> Result<()> {
+        let fixture_path = workspace_root().join(STABLE_UPGRADE_SOURCE_FIXTURE_PATH);
+        assert_eq!(
+            super::sha256_file(&fixture_path)?,
+            STABLE_UPGRADE_SOURCE_FIXTURE_SHA256
+        );
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("release-candidate.db");
+        let backup = temp.path().join("release-candidate.backup.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(include_str!("../fixtures/v0.4.0-rc.6-store-v13.sql"))?;
+        let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(
+            schema,
+            release_compatibility().stable_upgrade_source_store_schema_version
+        );
+        drop(connection);
+        fs::copy(&path, &backup)?;
+        let backup_bytes = fs::read(&backup)?;
+
+        let mut store = depgraph_store::Store::open(&path)?;
+        assert_eq!(
+            store.schema_version()?,
+            release_compatibility().store_schema_version
+        );
+        let snapshot_id = store.current_snapshot_id()?.unwrap();
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            snapshot_id,
+            "snapshot:sha256:9586aa1acd653d75c867037b8d7ebc16241c29197b32217eb878e5f46888dd28"
+        );
+        assert_eq!(snapshot.scan.id, "official-v0.4.0-rc.1-scan");
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.sites.len(), 1);
+        assert_eq!(snapshot.edges.len(), 1);
+        assert_eq!(snapshot.evidence.len(), 2);
+        assert!(store.verify_snapshot_integrity(&snapshot_id)?.valid);
+        store.create_snapshot_name("stable-v0.5.0-upgrade", &snapshot_id)?;
+        assert_eq!(
+            store.resolve_completed_snapshot_selector("stable-v0.5.0-upgrade")?,
+            snapshot_id
+        );
+        drop(store);
+        assert_eq!(fs::read(&backup)?, backup_bytes);
+        let backup_connection = rusqlite::Connection::open_with_flags(
+            &backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let backup_schema: i64 =
+            backup_connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(backup_schema, STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -13693,7 +13874,7 @@ jobs:
     }
 
     #[test]
-    fn stable_release_gate_allows_exact_evidence_and_rejects_drift() {
+    fn stable_release_gate_allows_exact_rc_evidence_blocks_unpinned_ga_and_rejects_drift() {
         let target = |target: &str| TargetVerificationReport {
             target: target.to_owned(),
             archive: format!("depgraph-{VERSION}-{target}.tar.gz"),
@@ -13817,14 +13998,11 @@ jobs:
                 }
             }
         });
-        let workflow_results = BTreeMap::from([
+        let mut workflow_results = BTreeMap::from([
             ("github_actions".to_owned(), "true".to_owned()),
             ("ref_type".to_owned(), "tag".to_owned()),
-            ("ref_name".to_owned(), "v0.4.0".to_owned()),
-            (
-                "source_sha".to_owned(),
-                STABLE_RELEASE_BASELINE_COMMIT.to_owned(),
-            ),
+            ("ref_name".to_owned(), format!("v{STABLE_RELEASE_VERSION}")),
+            ("source_sha".to_owned(), "1".repeat(40)),
             ("quality".to_owned(), "success".to_owned()),
             ("compiler-precise-hostile".to_owned(), "success".to_owned()),
             ("benchmark".to_owned(), "success".to_owned()),
@@ -13834,6 +14012,23 @@ jobs:
             ("verify-compiler-packs".to_owned(), "success".to_owned()),
         ]);
 
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &release,
+                &benchmark,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                true,
+                workflow_results.clone(),
+            )
+            .decision,
+            StableReleaseDecision::Reject
+        );
+
+        release.tag = format!("v{STABLE_RELEASE_VERSION}-rc.2");
+        workflow_results.insert("ref_name".to_owned(), release.tag.clone());
+        workflow_results.insert("source_sha".to_owned(), "1".repeat(40));
         let evaluate = |release: &ReleaseVerificationReport, benchmark: &Value| {
             evaluate_stable_release_gate(
                 release,
@@ -13847,25 +14042,6 @@ jobs:
         };
         assert_eq!(
             evaluate(&release, &benchmark).decision,
-            StableReleaseDecision::Allow
-        );
-
-        let mut prerelease = release.clone();
-        prerelease.tag = format!("v{STABLE_RELEASE_VERSION}-rc.2");
-        let mut prerelease_workflow = workflow_results.clone();
-        prerelease_workflow.insert("ref_name".to_owned(), prerelease.tag.clone());
-        prerelease_workflow.insert("source_sha".to_owned(), "1".repeat(40));
-        assert_eq!(
-            evaluate_stable_release_gate(
-                &prerelease,
-                &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                prerelease_workflow,
-            )
-            .decision,
             StableReleaseDecision::Allow
         );
 
@@ -14310,6 +14486,10 @@ jobs:
             )
             .is_err()
         );
+        assert!(!supported_release_tag("v0.4.0"));
+        assert!(!supported_release_tag("v0.4.0-rc.7"));
+        assert!(supported_release_tag("v0.5.0"));
+        assert!(supported_release_tag("v0.5.0-rc.1"));
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {
@@ -14324,11 +14504,11 @@ jobs:
     #[test]
     fn rust_worker_handshake_captures_the_exact_backend_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-rust-worker 0.4.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
+            "depgraph-rust-worker 0.5.0 (protocol 1.0; rust-analyzer 0.0.330; rust-analyzer-revision 8954b66d43225e62c92e8bbcc8500191b5cceb1e; salsa 0.26.1)",
         )
         .expect("valid Rust worker handshake");
         assert_eq!(parsed.name, "depgraph-rust-worker");
-        assert_eq!(parsed.version, "0.4.0");
+        assert_eq!(parsed.version, "0.5.0");
         assert_eq!(parsed.protocol, "1.0");
         let backend = rust_backend_from_handshake(&parsed)?;
         verify_rust_backend(&backend)?;
@@ -14360,7 +14540,7 @@ jobs:
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.4.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
+            "depgraph-web-worker 0.5.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;
