@@ -663,14 +663,19 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                 .expect("test cleanup release");
         }
         let result = terminalize();
-        if let Some(guard) = cleanup_guard.as_ref() {
+        let unlock_result = if result.is_ok()
+            && let Some(guard) = cleanup_guard.as_ref()
+        {
             // Release exclusion synchronously before cleanup acknowledgement
             // reacquires the same sidecar lock; relying on close-on-drop can
             // leave a transient self-conflict on some hosts.
-            guard.unlock().map_err(JournalError::Io)?;
-        }
+            guard.unlock()
+        } else {
+            Ok(())
+        };
         drop(cleanup_guard);
         let value = result?;
+        unlock_result.map_err(JournalError::Io)?;
         #[cfg(test)]
         if let Some(barrier) = &self.cleanup_acknowledgement_barrier {
             barrier.ready.send(()).expect("test cleanup receiver");
