@@ -3357,7 +3357,8 @@ fn delete_private_windows_staging_with(
     sanitize: impl FnOnce() -> DepgraphServiceResult<()>,
     legacy_delete: impl FnOnce() -> DepgraphServiceResult<()>,
 ) -> DepgraphServiceResult<()> {
-    if try_posix_delete()? {
+    let posix_result = try_posix_delete();
+    if matches!(posix_result, Ok(true)) {
         return Ok(());
     }
 
@@ -3371,6 +3372,12 @@ fn delete_private_windows_staging_with(
     let delete_result = legacy_delete();
     if delete_result.is_ok() {
         return Ok(());
+    }
+    if let Err(error) = posix_result {
+        tracing::warn!(
+            cleanup_category = ?error.category(),
+            "private staging POSIX and legacy deletion both failed"
+        );
     }
     if let Err(error) = sanitize_result {
         tracing::warn!(
@@ -3414,13 +3421,11 @@ fn discard_windows_staging(
         Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE},
     };
 
-    if identity_from_file(&staging)? != expected_identity {
-        return Err(DepgraphServiceError::Integrity);
-    }
-
-    // The stage is exclusive until publication, so no compatible reader can
-    // delay legacy deletion. Use the identity-verified writer itself for the
-    // disposition; the legacy path sanitizes its contents before last-close.
+    // The retained stage handle was identity-verified immediately after its
+    // exclusive create and cannot be rebound to another file. Do not perform
+    // fallible metadata work before cleanup: use that same handle directly so
+    // every failure path reaches disposition. The legacy path sanitizes its
+    // contents before last-close.
     let deletion = delete_private_windows_staging_handle(&staging);
     drop(staging);
     deletion?;
@@ -4197,6 +4202,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*calls.borrow(), ["posix"]);
+    }
+
+    #[test]
+    fn private_staging_delete_still_cleans_up_after_a_posix_error() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix-error");
+                Err(DepgraphServiceError::Internal)
+            },
+            || {
+                calls.borrow_mut().push("sanitize");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("legacy");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["posix-error", "sanitize", "legacy"]);
     }
 
     #[test]
