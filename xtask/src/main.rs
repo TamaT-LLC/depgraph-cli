@@ -43,7 +43,7 @@ const V0_4_RC6_AARCH64_APPLE_BINARY_SHA256: &str =
 #[cfg(test)]
 const V0_4_RC1_STORE_SCHEMA_VERSION: i64 = 11;
 const V0_2_RC1_STORE_SCHEMA_VERSION: i64 = 5;
-const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v6";
+const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v7";
 const STABLE_BENCHMARK_METRICS: &[(&str, bool)] = &[
     ("safe_initial_scan", true),
     ("one_file_incremental_scan", true),
@@ -5998,7 +5998,7 @@ fn evaluate_stable_release_gate(
                 && benchmark["gate"]["passed"] == Value::Bool(true)
                 && benchmark_metrics_pass,
             evidence:
-                "depgraph-benchmark-report-v6 exact fixtures and thirteen exact metrics, including eleven gated bounded-query, Rust HIR, cache, and build-observation metrics"
+                "depgraph-benchmark-report-v7 exact fixtures and thirteen exact metrics, including eleven gated canonical-impact, bounded-query, Rust HIR, cache, and build-observation metrics"
                     .to_owned(),
         },
         StableReleaseGateCheck {

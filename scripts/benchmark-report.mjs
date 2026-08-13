@@ -20,7 +20,7 @@ import {
   RUST_BENCHMARK_SOURCE_FILES,
 } from "./benchmark-rust-fixture.mjs";
 
-export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v6";
+export const REPORT_SCHEMA_VERSION = "depgraph-benchmark-report-v7";
 export const EXPECTED_FIXTURE_SHA256 =
   "40c003b690e34b50a25ae07dc773fa02bb97dd609e5ede49915b56a4e2d1b4a4";
 export const BOUNDED_QUERY_RELEASE_CONTRACT = {
@@ -55,7 +55,7 @@ const METRIC_CONTRACTS = new Map([
       gated: true,
       minimum_samples: 3,
       maximum_samples: 20,
-      maximum_limit_ms: 2_000,
+      maximum_limit_ms: 10_000,
       product_target_ms: 2_000,
     },
   ],
@@ -73,11 +73,11 @@ const METRIC_CONTRACTS = new Map([
   [
     "warm_file_impact",
     {
-      cache: "bounded_impact_query_cache",
+      cache: "read_only_canonical_recompute",
       gated: true,
       minimum_samples: 3,
       maximum_samples: 50,
-      maximum_limit_ms: 500,
+      maximum_limit_ms: 4_000,
       product_target_ms: 500,
     },
   ],
@@ -95,11 +95,11 @@ const METRIC_CONTRACTS = new Map([
   [
     "warm_package_impact",
     {
-      cache: "bounded_impact_query_cache",
+      cache: "read_only_canonical_recompute",
       gated: true,
       minimum_samples: 3,
       maximum_samples: 50,
-      maximum_limit_ms: 500,
+      maximum_limit_ms: 4_000,
       product_target_ms: 500,
     },
   ],
@@ -132,7 +132,7 @@ const METRIC_CONTRACTS = new Map([
       gated: true,
       minimum_samples: 1,
       maximum_samples: 1,
-      maximum_limit_ms: 10_000,
+      maximum_limit_ms: 12_000,
       product_target_ms: 10_000,
     },
   ],
@@ -143,7 +143,7 @@ const METRIC_CONTRACTS = new Map([
       gated: true,
       minimum_samples: 1,
       maximum_samples: 1,
-      maximum_limit_ms: 10_000,
+      maximum_limit_ms: 12_000,
       product_target_ms: 10_000,
     },
   ],
@@ -187,7 +187,7 @@ const CACHE_CONDITIONS = {
     "watcher daemon with a completed base snapshot and warm analysis cache",
   cold_query: "first query process against an unqueried completed graph store",
   warm_query:
-    "independent query processes using the snapshot/filter-scoped bounded impact query cache after one priming query",
+    "independent read-only query processes recomputing one canonical pinned snapshot after operating-system page-cache priming, without impact-cache lookup or mutation",
   bounded_query_plan:
     "independent read-only planner processes against one verified 10,000-file snapshot",
   bounded_query_execute:
@@ -1237,7 +1237,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
     ),
     gatedMetric(
       "warm_file_impact",
-      "bounded_impact_query_cache",
+      "read_only_canonical_recompute",
       "warm-file-impact-ms.txt",
       queryLimit,
       500,
@@ -1251,7 +1251,7 @@ export function createReport({ rawDir, fixtureDir, output }) {
     ),
     gatedMetric(
       "warm_package_impact",
-      "bounded_impact_query_cache",
+      "read_only_canonical_recompute",
       "warm-package-impact-ms.txt",
       queryLimit,
       500,

@@ -112,8 +112,9 @@ The benchmark generates deterministic 100-, 1,000-, and 10,000-source-file
 fixtures plus a representative 31-source-file Rust HIR fixture and writes
 `dist/benchmark-report.json` plus
 `dist/cache-hit-benchmark-report.json`. It records cold safe initial scans,
-watcher-driven one-file incremental scans, cold and warm file/package impact
-queries, paired semantic-cache-hit versus `--no-cache` samples, and Rust HIR
+watcher-driven one-file incremental scans, cold and page-cache-warm independent
+read-only file/package impact recomputations, paired semantic-cache-hit versus
+`--no-cache` samples, and Rust HIR
 cold / `--no-cache` / warm scans. The Rust evidence includes worker model/VFS/
 crate-graph/semantic/protocol phases, core ingest, store validation/promotion,
 counts, and byte totals while requiring cold/no-cache graph equality and a
