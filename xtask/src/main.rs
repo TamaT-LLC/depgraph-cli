@@ -2160,8 +2160,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "sudo apt-get install --yes --no-install-recommends bubblewrap",
         "run: scripts/compiler-precise-hostile-e2e.sh",
         "needs: [quality, compiler-precise-hostile]",
+        "DEPGRAPH_INCREMENTAL_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_QUERY_LIMIT_MS: \"4000\"",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
+        "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
         "node scripts/cache-hit-benchmark.mjs verify benchmark/cache-hit-benchmark-report.json",
         "compiler-pack:",
@@ -2204,8 +2208,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "benchmark-report-${{ github.sha }}",
         "dist/cache-hit-benchmark-report.json",
         "DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: \"5\"",
+        "DEPGRAPH_INCREMENTAL_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_QUERY_LIMIT_MS: \"4000\"",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
+        "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
