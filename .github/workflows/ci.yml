@@ -228,9 +228,13 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
+          depgraph_bin="$PWD/target/debug/depgraph"
           target/debug/depgraph --store "$tmp/one.db" scan workers/web/test/fixtures/polyglot --json > "$tmp/scan.json"
           jq -e '.status == "completed" and .coverage.project_code_executed == false' "$tmp/scan.json"
-          target/debug/depgraph --store "$tmp/one.db" export --format json > "$tmp/one.json"
+          (
+            cd "$tmp"
+            "$depgraph_bin" --store one.db export --format json --output one.json
+          )
           jq -e '.graph as $graph
             | [$graph.evidence[] | select(
                 .owner_type == "site" and .ordinal == 0 and .kind == "semantic"
@@ -574,7 +578,10 @@ jobs:
             and (.coverage.reasons | length == 0)
             and .coverage.candidates > 0
             and .coverage.external > 0' "$tmp/semantic-complete-scan.json"
-          target/debug/depgraph --store "$tmp/semantic-complete.db" export --format json > "$tmp/semantic-complete.json"
+          (
+            cd "$tmp"
+            "$depgraph_bin" --store semantic-complete.db export --format json --output semantic-complete.json
+          )
           jq -e '.graph as $graph
             | ($graph.profiles | any(
                 (.features | length) == 0
@@ -590,7 +597,10 @@ jobs:
             and ($graph.sites | any(.resolution_status == "external"))' "$tmp/semantic-complete.json"
           cp -R workers/web/test/fixtures/polyglot "$tmp/checkout-two"
           target/debug/depgraph --store "$tmp/two.db" scan "$tmp/checkout-two" --json > /dev/null
-          target/debug/depgraph --store "$tmp/two.db" export --format json > "$tmp/two.json"
+          (
+            cd "$tmp"
+            "$depgraph_bin" --store two.db export --format json --output two.json
+          )
           jq -S '.graph' "$tmp/one.json" > "$tmp/one.graph.json"
           jq -S '.graph' "$tmp/two.json" > "$tmp/two.graph.json"
           diff -u "$tmp/one.graph.json" "$tmp/two.graph.json"

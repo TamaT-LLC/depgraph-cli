@@ -1573,7 +1573,7 @@ fn publication_policy_without_atomic_exchange(
 
 #[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_READ_ACCESS: u32 = 0x0000_0001;
-#[cfg(test)]
+#[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_WRITE_ACCESS: u32 = 0x0000_0002;
 #[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_DELETE_ACCESS: u32 = 0x0000_0004;
@@ -1581,6 +1581,13 @@ const WINDOWS_FILE_SHARE_DELETE_ACCESS: u32 = 0x0000_0004;
 #[cfg(any(test, windows))]
 const fn windows_staging_share_access() -> u32 {
     WINDOWS_FILE_SHARE_READ_ACCESS | WINDOWS_FILE_SHARE_DELETE_ACCESS
+}
+
+#[cfg(any(test, windows))]
+const fn windows_repository_input_share_access() -> u32 {
+    WINDOWS_FILE_SHARE_READ_ACCESS
+        | WINDOWS_FILE_SHARE_WRITE_ACCESS
+        | WINDOWS_FILE_SHARE_DELETE_ACCESS
 }
 
 #[cfg(unix)]
@@ -2386,26 +2393,26 @@ fn write_repository_file_atomically_platform(
     )?;
     validate_opened_windows_regular_file(&staging)?;
     if let Err(error) = write_contents(&mut staging) {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(error);
     }
     if cancellation.is_cancelled() {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(DepgraphServiceError::Cancelled);
     }
     if let Err(source) = staging.sync_all() {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(RepositoryFileError::Unavailable { source }.into());
     }
     if cancellation.is_cancelled() {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(DepgraphServiceError::Cancelled);
     }
     let publication_policy =
         match publication_policy_without_atomic_exchange(overwrite, expected_precondition) {
             Ok(policy) => policy,
             Err(error) => {
-                let _ = delete_windows_file_handle(&staging);
+                discard_windows_staging(staging)?;
                 return Err(error);
             }
         };
@@ -2417,7 +2424,7 @@ fn write_repository_file_atomically_platform(
             cancellation,
         )
     {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(error);
     }
     if let Err(error) = classify_windows_publication_target(
@@ -2425,7 +2432,7 @@ fn write_repository_file_atomically_platform(
         traversal.final_name,
         publication_policy,
     ) {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(error);
     }
     validate_windows_directories(&traversal.directories)?;
@@ -2435,7 +2442,7 @@ fn write_repository_file_atomically_platform(
         traversal.final_name,
         publication_policy == RepositoryOverwritePolicy::Overwrite,
     ) {
-        let _ = delete_windows_file_handle(&staging);
+        discard_windows_staging(staging)?;
         return Err(error);
     }
     validate_windows_directories(&traversal.directories)
@@ -2630,6 +2637,14 @@ fn map_open_component_error(source: io::Error) -> DepgraphServiceError {
     #[cfg(unix)]
     if matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
         return RepositoryFileError::BoundaryViolation.into();
+    }
+    #[cfg(windows)]
+    if source.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+        [ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS].contains(&(error as u32))
+    }) {
+        return RepositoryFileError::AlreadyExists.into();
     }
     #[cfg(windows)]
     if source.raw_os_error().is_some_and(|error| {
@@ -2910,8 +2925,7 @@ fn open_windows_repository_input_after_root(
     after_parents_opened: impl FnOnce(),
 ) -> DepgraphServiceResult<File> {
     use windows_sys::{
-        Wdk::Storage::FileSystem::FILE_OPEN,
-        Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_SHARE_READ},
+        Wdk::Storage::FileSystem::FILE_OPEN, Win32::Storage::FileSystem::FILE_GENERIC_READ,
     };
 
     let traversal = open_windows_parent(service, path, false, after_parents_opened)?;
@@ -2920,7 +2934,7 @@ fn open_windows_repository_input_after_root(
         traversal.parent(),
         traversal.final_name,
         FILE_GENERIC_READ,
-        FILE_SHARE_READ,
+        windows_repository_input_share_access(),
         FILE_OPEN,
         Some(false),
     )?;
@@ -3231,8 +3245,50 @@ fn validate_opened_windows_regular_file(file: &File) -> DepgraphServiceResult<()
 fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
     use std::{mem, os::windows::io::AsRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
     };
+
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: file retains ownership of the live handle for the call and the
+    // pointer/size describe one initialized FILE_DISPOSITION_INFO_EX value.
+    // POSIX disposition removes the private staging link when this handle
+    // closes even if another compatible handle appeared meanwhile. Older
+    // Windows versions and file systems can fall back to legacy disposition.
+    let extended_success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&extended).cast(),
+            u32::try_from(mem::size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("FILE_DISPOSITION_INFO_EX size fits in u32"),
+        )
+    };
+    if extended_success != 0 {
+        return Ok(());
+    }
+    let extended_error = io::Error::last_os_error();
+    let extended_is_unsupported = extended_error.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+        };
+
+        [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+        ]
+        .contains(&(error as u32))
+    });
+    if !extended_is_unsupported {
+        return Err(RepositoryFileError::Unavailable {
+            source: extended_error,
+        }
+        .into());
+    }
 
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: file retains ownership of the live handle for the call and the
@@ -3257,6 +3313,13 @@ fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
 }
 
 #[cfg(windows)]
+fn discard_windows_staging(staging: File) -> DepgraphServiceResult<()> {
+    let result = delete_windows_file_handle(&staging);
+    drop(staging);
+    result
+}
+
+#[cfg(windows)]
 fn rename_windows_file_handle(
     file: &File,
     parent: &File,
@@ -3268,8 +3331,11 @@ fn rename_windows_file_handle(
         os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
         ptr,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS},
+        Win32::Storage::FileSystem::{
+            FILE_RENAME_INFO, FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle,
+        },
     };
 
     let encoded_name = destination.encode_wide().collect::<Vec<_>>();
@@ -3291,7 +3357,12 @@ fn rename_windows_file_handle(
     // plus every encoded destination code unit. All pointers remain valid for
     // SetFileInformationByHandle, which does not retain them.
     let success = unsafe {
-        (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+        (*information).Anonymous.Flags = FILE_RENAME_POSIX_SEMANTICS
+            | if replace_if_exists {
+                FILE_RENAME_REPLACE_IF_EXISTS
+            } else {
+                0
+            };
         (*information).RootDirectory = parent.as_raw_handle();
         (*information).FileNameLength = name_bytes;
         ptr::copy_nonoverlapping(
@@ -3301,7 +3372,7 @@ fn rename_windows_file_handle(
         );
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            FileRenameInfo,
+            FileRenameInfoEx,
             information.cast(),
             u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
         )
@@ -3309,7 +3380,36 @@ fn rename_windows_file_handle(
     if success != 0 {
         return Ok(());
     }
-    let source = io::Error::last_os_error();
+    let mut source = io::Error::last_os_error();
+    let extended_is_unsupported = source.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+        };
+
+        [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+        ]
+        .contains(&(error as u32))
+    });
+    if extended_is_unsupported {
+        // SAFETY: the same initialized buffer and owned handles remain valid;
+        // only the information class and union interpretation change.
+        let fallback_success = unsafe {
+            (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileRenameInfo,
+                information.cast(),
+                u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
+            )
+        };
+        if fallback_success != 0 {
+            return Ok(());
+        }
+        source = io::Error::last_os_error();
+    }
     if source.kind() == io::ErrorKind::AlreadyExists {
         return classify_windows_existing_output(parent, destination).map(|_| ());
     }
@@ -3506,6 +3606,28 @@ mod tests {
         DepgraphService::new(config)
     }
 
+    #[cfg(windows)]
+    fn rename_windows_directory_for_test(parent_path: &Path, source: &OsStr, destination: &OsStr) {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_OPEN,
+            Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE},
+        };
+
+        let parent = open_windows_directory(parent_path, false)
+            .expect("rename parent can be opened by handle");
+        let source = open_windows_at(
+            &parent,
+            source,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            windows_repository_input_share_access(),
+            FILE_OPEN,
+            Some(true),
+        )
+        .expect("rename source can be opened by handle");
+        rename_windows_file_handle(&source, &parent, destination, false)
+            .expect("enclosing ancestor can be moved with POSIX rename semantics");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_repository_file_name_comparison_is_unicode_canonical_caseless() {
@@ -3649,7 +3771,13 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_input_after_root(&service, &path, || {
-            fs::rename(&enclosing, &moved_enclosing).expect("enclosing ancestor can be moved");
+            rename_windows_directory_for_test(
+                temporary.path(),
+                enclosing.file_name().expect("enclosing name is available"),
+                moved_enclosing
+                    .file_name()
+                    .expect("moved enclosing name is available"),
+            );
             fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
             fs::write(root.join("nested/input.txt"), b"replacement")
                 .expect("replacement input is created");
@@ -3683,7 +3811,13 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_output_after_root(&service, &path, || {
-            fs::rename(&enclosing, &moved_enclosing).expect("enclosing ancestor can be moved");
+            rename_windows_directory_for_test(
+                temporary.path(),
+                enclosing.file_name().expect("enclosing name is available"),
+                moved_enclosing
+                    .file_name()
+                    .expect("moved enclosing name is available"),
+            );
             fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
         })
         .expect("handle-relative creation remains rooted in the original repository");
@@ -3783,6 +3917,18 @@ mod tests {
     fn windows_publication_stage_never_allows_shared_write_access() {
         assert_eq!(
             windows_staging_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
+            0
+        );
+    }
+
+    #[test]
+    fn windows_repository_inputs_allow_non_blocking_repository_updates() {
+        assert_ne!(
+            windows_repository_input_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
+            0
+        );
+        assert_ne!(
+            windows_repository_input_share_access() & WINDOWS_FILE_SHARE_DELETE_ACCESS,
             0
         );
     }
