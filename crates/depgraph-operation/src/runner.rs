@@ -2815,6 +2815,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cleanup_guard_is_unlocked_before_acknowledgement_without_masking_terminal_errors() {
+        struct ReacquiringCleanupDispatcher {
+            store_path: PathBuf,
+            acknowledgements: usize,
+        }
+
+        impl OperationDispatcher for ReacquiringCleanupDispatcher {
+            fn dispatch(
+                &mut self,
+                _work: &RunnerWork,
+                _control: &mut ExecutionControl<'_>,
+            ) -> DispatchOutcome {
+                unreachable!("terminal cleanup test does not dispatch work")
+            }
+
+            fn finalize_cleanup_acknowledgement(
+                &mut self,
+                _kind: OperationKind,
+                _operation_id: &OperationId,
+            ) -> Result<(), RunnerError> {
+                let guard = depgraph_core::acquire_store_writer_lock(&self.store_path)
+                    .map_err(|_| RunnerError::Service(DepgraphServiceError::StoreWriterConflict))?;
+                self.acknowledgements += 1;
+                drop(guard);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut runner = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            ReacquiringCleanupDispatcher {
+                store_path: config.store_path().to_path_buf(),
+                acknowledgements: 0,
+            },
+        );
+        let work = RunnerWork {
+            operation_id: OperationId::parse(format!("op_{}", "a".repeat(32))).unwrap(),
+            kind: OperationKind::ScanSubmit,
+            input: CanonicalInput::new(&json!({})).unwrap(),
+            execution_deadline_ms: NOW + 10_000,
+        };
+        let guard = depgraph_core::acquire_store_writer_lock(config.store_path()).unwrap();
+        runner
+            .terminalize_after_cleanup(&work, Some(guard), || Ok::<_, RunnerError>(()))
+            .unwrap();
+        assert_eq!(runner.dispatcher.acknowledgements, 1);
+
+        let guard = depgraph_core::acquire_store_writer_lock(config.store_path()).unwrap();
+        assert!(matches!(
+            runner.terminalize_after_cleanup(&work, Some(guard), || {
+                Err::<(), _>(RunnerError::ClockUnavailable)
+            }),
+            Err(RunnerError::ClockUnavailable)
+        ));
+        assert_eq!(runner.dispatcher.acknowledgements, 1);
+    }
+
     fn counting_daemon_dispatcher(
         config: DepgraphServiceConfig,
         expected_strict: bool,
