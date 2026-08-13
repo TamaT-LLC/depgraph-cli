@@ -630,6 +630,8 @@ jobs:
           test ! -e "$fixture/CONFIG_EXECUTED"
       - name: Rust HIR semantic query, export, and determinism gate
         run: cargo xtask rust-semantic-e2e
+      - name: Reclaim integration build artifacts before the isolated package gate
+        run: cargo clean
       - name: Packaged semantic and cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
@@ -710,6 +712,8 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
+      - name: Reclaim smoke build artifacts before the isolated package gate
+        run: cargo clean
       - name: Packaged cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: x86_64-pc-windows-msvc

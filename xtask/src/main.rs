@@ -2264,6 +2264,13 @@ updated: 2026-08-12\n\
 open_questions: 0\n\
 ---\n";
 
+    let attributes = fs::read_to_string(root.join(".gitattributes"))?;
+    if !attributes
+        .lines()
+        .any(|line| line == "docs/**/*.md text eol=lf")
+    {
+        bail!("repository documentation is not pinned to LF checkout bytes");
+    }
     let decision = fs::read_to_string(root.join(DOCUMENT_PATH))?;
     if !decision.starts_with(EXPECTED_FRONTMATTER) || !decision.ends_with('\n') {
         bail!("MCP Agent Tools architecture frontmatter is missing, open, or noncanonical");
