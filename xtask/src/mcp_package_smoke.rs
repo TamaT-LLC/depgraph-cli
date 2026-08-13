@@ -1207,6 +1207,10 @@ fn create_compiler_pack_requirement(directory: &Path, release_version: &str) -> 
     let source = directory.join("compiler-pack-source");
     let pack = directory.join("compiler-pack");
     fs::create_dir(&source)?;
+    let cargo_path = fixture_executable_path("toolchain/cargo/bin/cargo");
+    let rustc_path = fixture_executable_path("toolchain/rustc/bin/rustc");
+    let wrapper_path = fixture_executable_path("bin/depgraph-rustc-wrapper");
+    let query_path = fixture_executable_path("bin/depgraph-rustc-query");
     let component = |name: &str, files: Vec<String>| CompilerPackBuildComponent {
         name: name.to_owned(),
         archive_sha256: "0".repeat(64),
@@ -1224,14 +1228,14 @@ fn create_compiler_pack_requirement(directory: &Path, release_version: &str) -> 
         release_checksum_reference: format!(
             "release-checksums:v{release_version}/mcp-smoke-compiler-pack-{host}"
         ),
-        cargo_path: "toolchain/cargo/bin/cargo".to_owned(),
-        rustc_path: "toolchain/rustc/bin/rustc".to_owned(),
-        wrapper_path: "bin/depgraph-rustc-wrapper".to_owned(),
-        query_path: "bin/depgraph-rustc-query".to_owned(),
+        cargo_path: cargo_path.clone(),
+        rustc_path: rustc_path.clone(),
+        wrapper_path,
+        query_path,
         wrapper_protocol_schema_path: "schemas/depgraph-rust-compiler-precise-v1.schema.json"
             .to_owned(),
         components: vec![
-            component("cargo", vec!["toolchain/cargo/bin/cargo".to_owned()]),
+            component("cargo", vec![cargo_path]),
             component(
                 "llvm-tools",
                 vec!["toolchain/llvm-tools/bin/llvm-config".to_owned()],
@@ -1244,7 +1248,7 @@ fn create_compiler_pack_requirement(directory: &Path, release_version: &str) -> 
                 "rust-std",
                 vec!["toolchain/rust-std/lib/libstd.rlib".to_owned()],
             ),
-            component("rustc", vec!["toolchain/rustc/bin/rustc".to_owned()]),
+            component("rustc", vec![rustc_path]),
             component(
                 "rustc-dev",
                 vec!["toolchain/rustc-dev/lib/librustc_driver.rlib".to_owned()],
@@ -1294,6 +1298,10 @@ fn create_compiler_pack_requirement(directory: &Path, release_version: &str) -> 
     Ok(path)
 }
 
+fn fixture_executable_path(relative: &str) -> String {
+    format!("{relative}{}", std::env::consts::EXE_SUFFIX)
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1340,6 +1348,15 @@ fn lowercase_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_pack_fixture_uses_native_executable_names() {
+        let path = fixture_executable_path("bin/depgraph-rustc-wrapper");
+        #[cfg(windows)]
+        assert_eq!(path, "bin/depgraph-rustc-wrapper.exe");
+        #[cfg(not(windows))]
+        assert_eq!(path, "bin/depgraph-rustc-wrapper");
+    }
 
     #[test]
     fn agent_host_documentation_profiles_are_exact_and_read_only_by_default() -> Result<()> {
