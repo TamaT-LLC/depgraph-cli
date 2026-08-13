@@ -2393,27 +2393,31 @@ fn write_repository_file_atomically_platform(
     )?;
     validate_opened_windows_regular_file(&staging)?;
     if let Err(error) = write_contents(&mut staging) {
-        discard_windows_staging(staging)?;
-        return Err(error);
+        return Err(discard_windows_staging_preserving_error(staging, error));
     }
     if cancellation.is_cancelled() {
-        discard_windows_staging(staging)?;
-        return Err(DepgraphServiceError::Cancelled);
+        return Err(discard_windows_staging_preserving_error(
+            staging,
+            DepgraphServiceError::Cancelled,
+        ));
     }
     if let Err(source) = staging.sync_all() {
-        discard_windows_staging(staging)?;
-        return Err(RepositoryFileError::Unavailable { source }.into());
+        return Err(discard_windows_staging_preserving_error(
+            staging,
+            RepositoryFileError::Unavailable { source }.into(),
+        ));
     }
     if cancellation.is_cancelled() {
-        discard_windows_staging(staging)?;
-        return Err(DepgraphServiceError::Cancelled);
+        return Err(discard_windows_staging_preserving_error(
+            staging,
+            DepgraphServiceError::Cancelled,
+        ));
     }
     let publication_policy =
         match publication_policy_without_atomic_exchange(overwrite, expected_precondition) {
             Ok(policy) => policy,
             Err(error) => {
-                discard_windows_staging(staging)?;
-                return Err(error);
+                return Err(discard_windows_staging_preserving_error(staging, error));
             }
         };
     if let Some(expected_precondition) = expected_precondition
@@ -2424,16 +2428,14 @@ fn write_repository_file_atomically_platform(
             cancellation,
         )
     {
-        discard_windows_staging(staging)?;
-        return Err(error);
+        return Err(discard_windows_staging_preserving_error(staging, error));
     }
     if let Err(error) = classify_windows_publication_target(
         traversal.parent(),
         traversal.final_name,
         publication_policy,
     ) {
-        discard_windows_staging(staging)?;
-        return Err(error);
+        return Err(discard_windows_staging_preserving_error(staging, error));
     }
     validate_windows_directories(&traversal.directories)?;
     if let Err(error) = rename_windows_file_handle(
@@ -2442,8 +2444,7 @@ fn write_repository_file_atomically_platform(
         traversal.final_name,
         publication_policy == RepositoryOverwritePolicy::Overwrite,
     ) {
-        discard_windows_staging(staging)?;
-        return Err(error);
+        return Err(discard_windows_staging_preserving_error(staging, error));
     }
     validate_windows_directories(&traversal.directories)
 }
@@ -3319,6 +3320,30 @@ fn discard_windows_staging(staging: File) -> DepgraphServiceResult<()> {
     result
 }
 
+#[cfg(any(test, windows))]
+fn preserve_primary_error_after_cleanup(
+    primary: DepgraphServiceError,
+    cleanup: DepgraphServiceResult<()>,
+) -> DepgraphServiceError {
+    if let Err(cleanup) = cleanup {
+        tracing::warn!(
+            primary_category = ?primary.category(),
+            cleanup_category = ?cleanup.category(),
+            "private staging cleanup failed after a repository write failure"
+        );
+    }
+    primary
+}
+
+#[cfg(windows)]
+fn discard_windows_staging_preserving_error(
+    staging: File,
+    primary: DepgraphServiceError,
+) -> DepgraphServiceError {
+    let cleanup = discard_windows_staging(staging);
+    preserve_primary_error_after_cleanup(primary, cleanup)
+}
+
 #[cfg(windows)]
 fn rename_windows_file_handle(
     file: &File,
@@ -3931,6 +3956,19 @@ mod tests {
             windows_repository_input_share_access() & WINDOWS_FILE_SHARE_DELETE_ACCESS,
             0
         );
+    }
+
+    #[test]
+    fn staging_cleanup_failure_preserves_the_primary_error_category() {
+        let error = preserve_primary_error_after_cleanup(
+            DepgraphServiceError::Cancelled,
+            Err(RepositoryFileError::Unavailable {
+                source: io::Error::other("cleanup failure"),
+            }
+            .into()),
+        );
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Cancelled);
     }
 
     #[test]
