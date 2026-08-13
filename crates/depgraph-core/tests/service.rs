@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use depgraph_core::service::ResolveBuildRequest;
 use depgraph_core::service::{
     CurrentSnapshotAvailability, DEPGRAPH_SERVICE_LIMITS_VERSION, DepgraphCapability,
@@ -571,26 +571,13 @@ fn confined_input_and_output_handles_use_only_repository_relative_paths() -> Res
     std::fs::write(root.join("nested/input.txt"), b"confined")?;
     let service = repository_write_service(&root, &store_path)?;
 
-    let mut input = service
-        .open_repository_input("nested/input.txt")
-        .context("open confined repository input")?;
+    let mut input = service.open_repository_input("nested/input.txt")?;
     let mut contents = String::new();
     input.read_to_string(&mut contents)?;
     assert_eq!(contents, "confined");
     assert_eq!(input.relative_path().as_str(), "nested/input.txt");
 
-    let output = service.create_repository_output("nested/output.txt");
-    #[cfg(windows)]
-    if let Err(DepgraphServiceError::RepositoryFile {
-        reason: RepositoryFileError::Unavailable { source },
-    }) = &output
-    {
-        panic!(
-            "create confined repository output failed with Windows error code {:?}",
-            source.raw_os_error()
-        );
-    }
-    let mut output = output.context("create confined repository output")?;
+    let mut output = service.create_repository_output("nested/output.txt")?;
     output.write_all(b"created through confined handle")?;
     output.flush()?;
     drop(output);

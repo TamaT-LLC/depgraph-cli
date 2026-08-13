@@ -2564,11 +2564,26 @@ fn verify_local_markdown_links(root: &Path, source: &str, content: &str) -> Resu
         let resolved = resolved.canonicalize().with_context(|| {
             format!("public community document {source} has broken local link {target:?}")
         })?;
-        if !resolved.starts_with(root) || !resolved.is_file() {
+        if !resolved.is_file() || !path_is_within_directory_by_identity(root, &resolved)? {
             bail!("public community document {source} has unsafe local link {target:?}");
         }
     }
     Ok(())
+}
+
+fn path_is_within_directory_by_identity(root: &Path, path: &Path) -> Result<bool> {
+    for ancestor in path.ancestors() {
+        if same_file::is_same_file(root, ancestor).with_context(|| {
+            format!(
+                "compare community link ancestor {} with root {}",
+                ancestor.display(),
+                root.display()
+            )
+        })? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn markdown_link_target_end(input: &str) -> Option<usize> {

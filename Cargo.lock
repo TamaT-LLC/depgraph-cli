@@ -3707,6 +3707,7 @@ dependencies = [
  "flate2",
  "hex",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
