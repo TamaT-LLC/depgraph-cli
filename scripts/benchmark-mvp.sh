@@ -78,6 +78,18 @@ measure_capture() {
   printf '%d\n' "$((finished - started))" >> "$destination"
 }
 
+export_raw_json() {
+  local store="$1"
+  local destination="$2"
+  local output_directory output_name
+  output_directory="$(dirname "$destination")"
+  output_name="$(basename "$destination")"
+  (
+    cd "$output_directory"
+    "$binary" --store "$store" export --format json --output "$output_name"
+  )
+}
+
 initial_stores=()
 for ((sample = 0; sample < samples; sample++)); do
   store="$cache/initial-$sample.db"
@@ -105,10 +117,8 @@ benchmark_cache_comparison() {
       "$raw/cache-$size-bypass-ms.txt" "$raw/cache-$size-bypass-$sample.json" \
       "$binary" --store "$bypass_store" scan "$comparison_fixture" --no-cache --json
   done
-  "$binary" --store "$hit_store" export --format json \
-    > "$raw/cache-$size-hit-graph.json"
-  "$binary" --store "$bypass_store" export --format json \
-    > "$raw/cache-$size-bypass-graph.json"
+  export_raw_json "$hit_store" "$raw/cache-$size-hit-graph.json"
+  export_raw_json "$bypass_store" "$raw/cache-$size-bypass-graph.json"
 }
 
 cache_fixture_small="$fixture_parent/cache-small"
@@ -157,8 +167,7 @@ done
 # proves complete zero-result execution inside the hard work budget; the
 # depth-eight real-edge variant proves that the same graph rejects hostile work
 # before traversal even with LIMIT 1.
-"$binary" --store "$file_query_store" export --format json \
-  > "$raw/bounded-query-graph.json"
+export_raw_json "$file_query_store" "$raw/bounded-query-graph.json"
 bounded_query_source="$(node -e '
   const fs = require("node:fs");
   const graph = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).graph;
@@ -196,8 +205,7 @@ if [[ "$hostile_status" -ne 1 ]]; then
   exit 1
 fi
 
-"$binary" --store "$incremental_store" export --format json \
-  > "$raw/graph-before.json"
+export_raw_json "$incremental_store" "$raw/graph-before.json"
 
 "$binary" --store "$incremental_store" daemon start "$fixture" --json \
   > "$raw/daemon-final.json" 2> "$raw/daemon.log" &
@@ -280,8 +288,7 @@ for ((sample = 0; sample < samples; sample++)); do
   wait_for_idle
 done
 
-"$binary" --store "$incremental_store" export --format json \
-  > "$raw/graph-after.json"
+export_raw_json "$incremental_store" "$raw/graph-after.json"
 "$binary" --store "$incremental_store" daemon stop "$fixture" --json \
   > "$raw/daemon-stopped.json"
 wait "$daemon_pid"
@@ -305,10 +312,8 @@ measure_capture \
   "$raw/rust-warm-scan-ms.txt" "$raw/rust-warm-scan.json" \
   env DEPGRAPH_SCAN_PROFILE=1 \
   "$binary" --store "$rust_cold_store" scan "$rust_fixture" --json
-"$binary" --store "$rust_cold_store" export --format json \
-  > "$raw/rust-cold-graph.json"
-"$binary" --store "$rust_no_cache_store" export --format json \
-  > "$raw/rust-no-cache-graph.json"
+export_raw_json "$rust_cold_store" "$raw/rust-cold-graph.json"
+export_raw_json "$rust_no_cache_store" "$raw/rust-no-cache-graph.json"
 cmp "$raw/rust-cold-graph.json" "$raw/rust-no-cache-graph.json"
 "$binary" --store "$rust_cold_store" cycles --level symbol --json > /dev/null
 for ((sample = 0; sample < query_samples; sample++)); do
@@ -327,8 +332,7 @@ for app in next-app astro-app start rust-app; do
   cp "$build_base_store" "$build_store"
   "$binary" --store "$build_store" resolve --build \
     "$build_fixture/apps/$app" --allow-project-code > /dev/null
-  "$binary" --store "$build_store" export --format json \
-    > "$raw/build-$app.json"
+  export_raw_json "$build_store" "$raw/build-$app.json"
 done
 finished="$(now_ms)"
 printf '%d\n' "$((finished - started))" > "$raw/build-observation-ms.txt"
@@ -340,8 +344,7 @@ next_build_store="$cache/build-next-app.db"
 grep -F "project code executed: false" "$raw/build-next-app-warm.txt" > /dev/null
 grep -F "build cache lookup: hit (validated)" "$raw/build-next-app-warm.txt" > /dev/null
 grep -F "build cache: hit" "$raw/build-next-app-warm.txt" > /dev/null
-"$binary" --store "$next_build_store" export --format json \
-  > "$raw/build-next-app-warm.json"
+export_raw_json "$next_build_store" "$raw/build-next-app-warm.json"
 cmp "$raw/build-next-app.json" "$raw/build-next-app-warm.json"
 
 DEPGRAPH_BENCH_BINARY="$binary" \
