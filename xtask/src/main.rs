@@ -165,11 +165,11 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:84828680ba3c9a2365e0c960d25ac8b2061bcc5ecd41d7d1b455367a91f88f73",
-        query_result_digest: "bounded-query-result:sha256:ea53e45d10ed036b7a5998f68366919401f45911efac91538d255fe24dc619ff",
-        query_output_sha256: "2ad6f0f6db4ff5c0d9eebc50003c38ccf5ab7be9c6cdd058b3169189ed01a116",
-        profile_plan_digest: "profile-selection-plan:sha256:b8c85453d631399a69a0a710d84b451c904552c4e8208057439585ff9d407011",
-        profile_plan_output_sha256: "89bbd316705d1994eabdc988a893dc13a0d1fe2860cff5cc22c690727cae67e6",
+        query_plan_digest: "bounded-query-plan:sha256:8eb0e0fdd1c0cae9453abe718d73db94e8f4132fe868334c8c7bcb0462d4e8b1",
+        query_result_digest: "bounded-query-result:sha256:42ec882b59a1f2284016e531f73efc9d49c59259d9fd524d8466590f0e580675",
+        query_output_sha256: "5740ea2b649989babe370c3f03cc7166f17f65dc226810f133ad99eaf35187bb",
+        profile_plan_digest: "profile-selection-plan:sha256:aabac99b77622684b20f0d6343c20e14136ce8c5282b5e50e333d61341d9be3b",
+        profile_plan_output_sha256: "4ad1e71b0bac7c5bc8c06697c379be1f98712c17a549eb3a7fe98591429496ab",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
