@@ -91,7 +91,7 @@ report = {
         "bubblewrap_sha256": bwrap_sha256,
     },
     "fixture_groups": [
-        "project-code-build-script-proc-macro-descendant-secret-network",
+        "project-code-build-script-proc-macro-descendant-secret-network-host-linker-alias",
         "cargo-config-wrapper-rustc-runner-linker-response-rustflags-path-shadow",
         "artifact-stale-foreign-symlink-escape-duplicate-truncated-oversized-postflight",
         "failure-cargo-rustc-ice-panic-protocol-crash-signal-timeout-cancel-disk-output-terminal",

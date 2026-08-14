@@ -1649,7 +1649,7 @@ fn linux_namespace_command(
         "--hostname",
         "depgraph-build",
     ]);
-    add_linux_runtime_mounts(&mut command)?;
+    add_linux_runtime_mounts(&mut command, &run.workspace)?;
     add_sandbox_parent_directories(&mut command, run._root.path())?;
     command
         .arg("--ro-bind")
@@ -1678,7 +1678,7 @@ fn linux_namespace_command(
 }
 
 #[cfg(target_os = "linux")]
-fn add_linux_runtime_mounts(command: &mut Command) -> Result<()> {
+fn add_linux_runtime_mounts(command: &mut Command, root: &Path) -> Result<()> {
     let usr = Path::new("/usr");
     if !usr.is_dir() {
         bail!("enforced build isolation requires the system /usr runtime");
@@ -1698,11 +1698,48 @@ fn add_linux_runtime_mounts(command: &mut Command) -> Result<()> {
         }
     }
     command.args(["--dir", "/etc"]);
+    add_linux_cc_alias(command, root)?;
     let loader_cache = Path::new("/etc/ld.so.cache");
     if loader_cache.is_file() {
         command.arg("--ro-bind").arg(loader_cache).arg(loader_cache);
     }
     command.args(["--dir", "/tmp", "--proc", "/proc", "--dev", "/dev"]);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
+    let alternatives_cc = Path::new("/etc/alternatives/cc");
+    let requires_alternatives_alias = [Path::new("/usr/bin/cc"), Path::new("/bin/cc")]
+        .into_iter()
+        .filter_map(|candidate| {
+            fs::symlink_metadata(candidate)
+                .ok()
+                .filter(|metadata| metadata.file_type().is_symlink())
+                .and_then(|_| fs::read_link(candidate).ok())
+                .map(|target| {
+                    if target.is_absolute() {
+                        target
+                    } else {
+                        candidate.parent().unwrap_or(Path::new("/")).join(target)
+                    }
+                })
+        })
+        .any(|target| target == alternatives_cc);
+    if !requires_alternatives_alias {
+        return Ok(());
+    }
+
+    let compiler = trusted_host_executable(
+        "C compiler",
+        &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
+        root,
+    )?;
+    command
+        .args(["--dir", "/etc/alternatives"])
+        .arg("--ro-bind")
+        .arg(compiler)
+        .arg(alternatives_cc);
     Ok(())
 }
 
@@ -3514,6 +3551,7 @@ if [ "${{DEPGRAPH_HOSTILE_PARENT_SECRET+x}}" = x ]; then exit 81; fi
 if [ -r "{private}" ]; then exit 82; fi
 if [ -r "{store}" ]; then exit 83; fi
 if timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' 2>/dev/null; then exit 84; fi
+cc --version >/dev/null
 printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
 "#,
                 private = private_file.display(),
