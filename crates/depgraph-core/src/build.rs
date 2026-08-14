@@ -1225,8 +1225,17 @@ where
     let mut reader_errors = Vec::new();
     let (stdout, stdout_truncated) =
         finish_reader(stdout_task, "build stdout", &mut reader_errors).await?;
-    let (_stderr, stderr_truncated) =
+    let (stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
+    if plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER
+        && std::env::var_os("DEPGRAPH_TEST_CAPTURE_COMPILER_STDERR").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
+        eprintln!(
+            "depgraph controlled compiler diagnostic:\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
     let mut outcome = outcome;
     let mut diagnostic_code = diagnostic_code;
