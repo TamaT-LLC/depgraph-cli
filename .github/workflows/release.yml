@@ -347,7 +347,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_object_sha="$(git rev-parse "${GITHUB_REF_NAME}^{tag}")"
+          tag_ref_payload="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+          test "$(jq -r '.ref' <<<"$tag_ref_payload")" = "refs/tags/${GITHUB_REF_NAME}"
+          test "$(jq -r '.object.type' <<<"$tag_ref_payload")" = "tag"
+          tag_object_sha="$(jq -r '.object.sha' <<<"$tag_ref_payload")"
           tag_payload="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")"
           test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
           test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"

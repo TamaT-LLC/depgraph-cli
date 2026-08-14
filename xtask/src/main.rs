@@ -2137,6 +2137,31 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.4 release note is missing contract {required:?}");
         }
     }
+    let rc5_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.5.md"))?;
+    for required in [
+        "fifth v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.5` tag",
+        "`v0.5.0-rc.1` through `v0.5.0-rc.4` tags remain immutable",
+        "GitHub Git Data API",
+        "remote tag object type is `tag`",
+        "shallow checkout",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.5.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc5_release_note.contains(required) {
+            bail!("v0.5.0-rc.5 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2144,6 +2169,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "git verify-tag \"$release_tag\"",
         "## 公開後の再取得検証",
         "`release-post-publish-evidence-v1`",
+        "GitHub Git Data APIからremote",
+        "local `git rev-parse <tag>^{tag}`",
         "計51点",
         "checkout内のproduct binaryや未公開package artifact",
     ] {
@@ -2230,6 +2257,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.5.md",
         "docs/releases/v0.5.0-rc.4.md",
         "docs/releases/v0.5.0-rc.3.md",
         "docs/releases/v0.5.0-rc.2.md",
@@ -2295,7 +2323,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "name: stable-release-gate",
         "needs: stable-gate",
         "name: Verify the signed annotated release tag",
-        "git rev-parse \"${GITHUB_REF_NAME}^{tag}\"",
+        "gh api \"repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}\"",
+        "test \"$(jq -r '.ref' <<<\"$tag_ref_payload\")\" = \"refs/tags/${GITHUB_REF_NAME}\"",
+        "test \"$(jq -r '.object.type' <<<\"$tag_ref_payload\")\" = \"tag\"",
+        "tag_object_sha=\"$(jq -r '.object.sha' <<<\"$tag_ref_payload\")\"",
         "git ls-remote origin refs/heads/main",
         ".verification.signature != null",
         "gh release download \"$GITHUB_REF_NAME\" --dir post-publish/public",
