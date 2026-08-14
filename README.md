@@ -675,7 +675,7 @@ the normal depgraph archive and compiler pack must come from one release run.
 
 ```bash
 version=0.5.0
-release_tag=v0.5.0-rc.1
+release_tag=v0.5.0-rc.2
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 

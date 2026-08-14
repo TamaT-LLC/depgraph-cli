@@ -1365,8 +1365,8 @@ fn export_graph(cli: &Path, store: &Path, export: &Path) -> Result<()> {
     let output_argument = export
         .strip_prefix(repository_root)
         .context("compiler-pack export path is outside the repository root")?;
-    let output = Command::new(cli)
-        .current_dir(repository_root)
+    let mut command = command_in_directory(cli, repository_root)?;
+    let output = command
         .args([
             OsStr::new("--store"),
             store.as_os_str(),
@@ -1387,6 +1387,22 @@ fn export_graph(cli: &Path, store: &Path, export: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn command_in_directory(executable: &Path, directory: &Path) -> Result<Command> {
+    // `cargo_target_dir()` is normally relative to the xtask launch directory.
+    // Resolve it before changing cwd so repository-relative output arguments do
+    // not also make the executable path repository-relative.
+    let executable = executable.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve executable {} before changing directory to {}",
+            executable.display(),
+            directory.display()
+        )
+    })?;
+    let mut command = Command::new(executable);
+    command.current_dir(directory);
+    Ok(command)
 }
 
 fn run_cli<'a>(cli: &Path, arguments: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {
@@ -2112,5 +2128,23 @@ mod tests {
             enforce_extraction_bounds(MAX_PACK_FILES, MAX_PACK_DIRECTORIES, MAX_UNPACKED_BYTES + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn repository_scoped_command_resolves_relative_executable_before_chdir() -> Result<()> {
+        let current = std::env::current_dir()?;
+        let launch = TempDir::new_in(&current)?;
+        let executable = launch.path().join("depgraph-fixture");
+        fs::write(&executable, b"fixture")?;
+        let relative = executable
+            .strip_prefix(&current)
+            .context("fixture executable is outside the launch directory")?;
+        let repository = TempDir::new()?;
+
+        let command = command_in_directory(relative, repository.path())?;
+
+        assert_eq!(command.get_program(), executable.canonicalize()?);
+        assert_eq!(command.get_current_dir(), Some(repository.path()));
+        Ok(())
     }
 }
