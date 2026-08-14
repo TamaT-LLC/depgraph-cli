@@ -45,6 +45,9 @@ cargo test --offline -p depgraph-cli --bin depgraph --locked issue_317_
 cargo test --offline -p depgraph-core --lib --locked service_graph::tests::issue_317_
 cargo test --offline -p depgraph-mcp --test process --locked issue_317_
 
+cargo test --offline -p depgraph-core --lib --locked \
+  build::tests::enforced_linux_namespace_links_and_runs_a_host_executable \
+  -- --ignored --exact
 fixture_secret="depgraph-hostile-parent-secret-must-not-leak"
 DEPGRAPH_HOSTILE_PARENT_SECRET="$fixture_secret" \
   cargo test --offline -p depgraph-core --lib --locked \
@@ -91,7 +94,7 @@ report = {
         "bubblewrap_sha256": bwrap_sha256,
     },
     "fixture_groups": [
-        "project-code-build-script-proc-macro-descendant-secret-network-host-linker-alias",
+        "project-code-build-script-proc-macro-descendant-secret-network-host-executable-link",
         "cargo-config-wrapper-rustc-runner-linker-response-rustflags-path-shadow",
         "artifact-stale-foreign-symlink-escape-duplicate-truncated-oversized-postflight",
         "failure-cargo-rustc-ice-panic-protocol-crash-signal-timeout-cancel-disk-output-terminal",

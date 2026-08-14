@@ -3524,6 +3524,45 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires the dedicated Linux bubblewrap hostile CI boundary"]
+    async fn enforced_linux_namespace_links_and_runs_a_host_executable() -> Result<()> {
+        let run = BuildRunDirectories::create()?;
+        let source = run.workspace.join("link-probe.c");
+        let executable = run.output.join("link-probe");
+        fs::write(&source, "int main(void) { return 0; }\n")?;
+        let script = format!(
+            "set -eu\ncc -v {:?} -o {:?}\n{:?}\n",
+            source, executable, executable
+        );
+        let arguments = vec!["-c".to_owned(), script];
+        let mut command = linux_namespace_command(
+            Path::new("/usr/bin/bash"),
+            &arguments,
+            &run.workspace,
+            &run,
+            None,
+        )?;
+        command
+            .current_dir(&run.workspace)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().await?;
+        if !output.status.success() {
+            bail!(
+                "trusted host executable link failed inside the Linux namespace (status {:?})\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the dedicated Linux bubblewrap hostile CI boundary"]
     async fn enforced_hostile_boundary_denies_parent_secret_network_and_private_paths() -> Result<()>
     {
         use std::net::TcpListener;
@@ -3551,12 +3590,17 @@ if [ "${{DEPGRAPH_HOSTILE_PARENT_SECRET+x}}" = x ]; then exit 81; fi
 if [ -r "{private}" ]; then exit 82; fi
 if [ -r "{store}" ]; then exit 83; fi
 if timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' 2>/dev/null; then exit 84; fi
-cc --version >/dev/null
+cc link-probe.c -o "$DEPGRAPH_OUTPUT_DIR/link-probe"
+"$DEPGRAPH_OUTPUT_DIR/link-probe"
 printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
 "#,
                 private = private_file.display(),
                 store = store_file.display(),
             ),
+        )?;
+        fs::write(
+            project.join("link-probe.c"),
+            "int main(void) { return 0; }\n",
         )?;
         let mut benign = node_plan(vec!["benign-hostile-boundary.sh".to_owned()]);
         benign.program = "bash".to_owned();
