@@ -2085,6 +2085,32 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.2 release note is missing contract {required:?}");
         }
     }
+    let rc3_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.3.md"))?;
+    for required in [
+        "third v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.3` tag",
+        "`v0.5.0-rc.1` and `v0.5.0-rc.2` tags remain immutable",
+        "validates each rollback failure by its exact typed",
+        "removing only execution",
+        "`/etc/alternatives/cc`",
+        "canonical root-owned compiler executable",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.3.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc3_release_note.contains(required) {
+            bail!("v0.5.0-rc.3 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2178,6 +2204,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.3.md",
         "docs/releases/v0.5.0-rc.2.md",
         "docs/releases/v0.5.0-rc.1.md",
         "docs/releases/v0.4.0-rc.6.md",

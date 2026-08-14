@@ -468,35 +468,102 @@ fn validate_aggregate_targets(
     let compatibility = compiler_precise_release_compatibility_contract();
     let expected_handshakes = ["wrapper", "query"].into_iter().collect::<BTreeSet<_>>();
     for target in targets {
-        if !COMPILER_PACK_SUPPORTED_TARGETS.contains(&target.target.as_str())
-            || !lowercase_sha256(&target.archive_sha256)
-            || !lowercase_sha256(&target.requirement_sha256)
-            || !lowercase_sha256(&target.smoke_sha256)
-            || target
-                .handshakes
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>()
-                != expected_handshakes
-            || !target.resources.admitted
-            || !target.rollback.tamper_rejected
-            || !target.rollback.missing_pack_rejected
-            || !target.rollback.unsupported_target_rejected
-            || !target.rollback.no_fallback_observed
-            || !target.rollback.completed_graph_preserved
-            || !lowercase_sha256(&target.semantic.checkout_a_export_sha256)
-            || !lowercase_sha256(&target.semantic.checkout_b_export_sha256)
-            || !lowercase_sha256(&target.semantic.cross_checkout_semantic_sha256)
-            || !lowercase_sha256(&target.semantic.canonical_graph_sha256)
-            || target.semantic.typed_mir_body_count == 0
-            || target.semantic.compiler_instance_count == 0
-            || target.semantic.compiler_call_count == 0
-            || target.semantic.mir_constant_count == 0
-            || target.semantic.query_capabilities != compatibility.query_capabilities
-        {
+        let mut incomplete = Vec::new();
+        if !COMPILER_PACK_SUPPORTED_TARGETS.contains(&target.target.as_str()) {
+            incomplete.push(format!("unsupported target {}", target.target));
+        }
+        for (field, digest) in [
+            ("archive_sha256", &target.archive_sha256),
+            ("requirement_sha256", &target.requirement_sha256),
+            ("smoke_sha256", &target.smoke_sha256),
+            (
+                "semantic.checkout_a_export_sha256",
+                &target.semantic.checkout_a_export_sha256,
+            ),
+            (
+                "semantic.checkout_b_export_sha256",
+                &target.semantic.checkout_b_export_sha256,
+            ),
+            (
+                "semantic.cross_checkout_semantic_sha256",
+                &target.semantic.cross_checkout_semantic_sha256,
+            ),
+            (
+                "semantic.canonical_graph_sha256",
+                &target.semantic.canonical_graph_sha256,
+            ),
+        ] {
+            if !lowercase_sha256(digest) {
+                incomplete.push(format!("{field} is not a lowercase SHA-256"));
+            }
+        }
+        let actual_handshakes = target
+            .handshakes
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if actual_handshakes != expected_handshakes {
+            incomplete.push(format!(
+                "handshakes={actual_handshakes:?}, expected {expected_handshakes:?}"
+            ));
+        }
+        for (field, admitted) in [
+            ("resources.admitted", target.resources.admitted),
+            ("rollback.tamper_rejected", target.rollback.tamper_rejected),
+            (
+                "rollback.missing_pack_rejected",
+                target.rollback.missing_pack_rejected,
+            ),
+            (
+                "rollback.unsupported_target_rejected",
+                target.rollback.unsupported_target_rejected,
+            ),
+            (
+                "rollback.no_fallback_observed",
+                target.rollback.no_fallback_observed,
+            ),
+            (
+                "rollback.completed_graph_preserved",
+                target.rollback.completed_graph_preserved,
+            ),
+        ] {
+            if !admitted {
+                incomplete.push(format!("{field}=false"));
+            }
+        }
+        for (field, count) in [
+            (
+                "semantic.typed_mir_body_count",
+                target.semantic.typed_mir_body_count,
+            ),
+            (
+                "semantic.compiler_instance_count",
+                target.semantic.compiler_instance_count,
+            ),
+            (
+                "semantic.compiler_call_count",
+                target.semantic.compiler_call_count,
+            ),
+            (
+                "semantic.mir_constant_count",
+                target.semantic.mir_constant_count,
+            ),
+        ] {
+            if count == 0 {
+                incomplete.push(format!("{field}=0"));
+            }
+        }
+        if target.semantic.query_capabilities != compatibility.query_capabilities {
+            incomplete.push(format!(
+                "semantic.query_capabilities={:?}, expected {:?}",
+                target.semantic.query_capabilities, compatibility.query_capabilities
+            ));
+        }
+        if !incomplete.is_empty() {
             bail!(
-                "compiler pack target evidence is incomplete for {}",
-                target.target
+                "compiler pack target evidence is incomplete for {}: {}",
+                target.target,
+                incomplete.join(", ")
             );
         }
         for (component, handshake) in &target.handshakes {
@@ -954,9 +1021,11 @@ fn run_semantic_fixture(
     let tamper = failed_resolve(&cli, &checkout_a, &store, &requirement_path)?;
     export_graph(&cli, &store, &export_after)?;
     let after = fs::read(&export_after)?;
-    let no_fallback = [&missing, &unsupported, &tamper]
-        .iter()
-        .all(|output| output.contains("unsupported") && output.contains("fallback"));
+    let no_fallback = rollback_failures_prove_no_fallback(&missing, &unsupported, &tamper);
+    let completed_graph_preserved = execution_provenance_equivalent(
+        &serde_json::from_slice(&before)?,
+        &serde_json::from_slice(&after)?,
+    );
     Ok(SemanticRun {
         report: semantic,
         rollback: CompilerPackRollbackReport {
@@ -964,7 +1033,7 @@ fn run_semantic_fixture(
             missing_pack_rejected: !missing.is_empty(),
             unsupported_target_rejected: !unsupported.is_empty(),
             no_fallback_observed: no_fallback,
-            completed_graph_preserved: before == after,
+            completed_graph_preserved,
         },
         elapsed_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
@@ -1193,11 +1262,7 @@ fn verify_compiler_precise_warm_cache(
     }
     export_graph(cli, store, warm_export_path)?;
     let warm_export: Value = serde_json::from_slice(&fs::read(warm_export_path)?)?;
-    let mut normalized_cold = cold_export.clone();
-    let mut normalized_warm = warm_export.clone();
-    remove_execution_provenance(&mut normalized_cold);
-    remove_execution_provenance(&mut normalized_warm);
-    if normalized_cold != normalized_warm {
+    if !execution_provenance_equivalent(cold_export, &warm_export) {
         bail!("compiler-precise cold and warm exports differ outside execution provenance");
     }
     Ok(warm_export)
@@ -1235,6 +1300,14 @@ fn run_compiler_precise_resolve(
         );
     }
     Ok(rendered)
+}
+
+fn execution_provenance_equivalent(left: &Value, right: &Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    remove_execution_provenance(&mut left);
+    remove_execution_provenance(&mut right);
+    left == right
 }
 
 fn remove_execution_provenance(value: &mut Value) {
@@ -1375,6 +1448,27 @@ fn failed_resolve(cli: &Path, checkout: &Path, store: &Path, requirement: &Path)
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+fn rollback_failures_prove_no_fallback(missing: &str, unsupported: &str, tamper: &str) -> bool {
+    [
+        (
+            missing,
+            "exact compiler pack is missing; install the target-specific first-party pack",
+        ),
+        (unsupported, "compiler pack host/target mismatch"),
+        (
+            tamper,
+            "compiler pack file closure does not match the manifest",
+        ),
+    ]
+    .into_iter()
+    .all(|(output, expected)| {
+        output.contains(expected)
+            && !output.contains("project code executed: true")
+            && !output.contains("build cache: stored")
+            && !output.contains("build cache: hit")
+    })
 }
 
 fn export_graph(cli: &Path, store: &Path, export: &Path) -> Result<()> {
@@ -1974,7 +2068,47 @@ mod tests {
 
         let mut rollback = targets;
         rollback[0].rollback.tamper_rejected = false;
-        assert!(validate_aggregate_targets(&rollback, &expected).is_err());
+        let error = validate_aggregate_targets(&rollback, &expected).unwrap_err();
+        assert!(format!("{error:#}").contains("rollback.tamper_rejected=false"));
+    }
+
+    #[test]
+    fn rollback_rejections_are_typed_and_preserve_the_completed_graph() {
+        let missing =
+            "error: exact compiler pack is missing; install the target-specific first-party pack";
+        let unsupported = "error: compiler pack host/target mismatch";
+        let tamper = "error: compiler pack file closure does not match the manifest";
+        assert!(rollback_failures_prove_no_fallback(
+            missing,
+            unsupported,
+            tamper
+        ));
+        assert!(!rollback_failures_prove_no_fallback(
+            "error: generic failure",
+            unsupported,
+            tamper
+        ));
+        assert!(!rollback_failures_prove_no_fallback(
+            &format!("{missing}\nproject code executed: true"),
+            unsupported,
+            tamper
+        ));
+
+        let before = json!({
+            "build_run_id": "before",
+            "created_at": "before",
+            "graph": {"nodes": [{"id": "node", "value": 1}]}
+        });
+        let after = json!({
+            "build_run_id": "after",
+            "created_at": "after",
+            "graph": {"nodes": [{"id": "node", "value": 1}]}
+        });
+        assert!(execution_provenance_equivalent(&before, &after));
+
+        let mut graph_drift = after;
+        graph_drift["graph"]["nodes"][0]["value"] = json!(2);
+        assert!(!execution_provenance_equivalent(&before, &graph_drift));
     }
 
     #[test]
