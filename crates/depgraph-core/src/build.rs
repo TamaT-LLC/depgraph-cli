@@ -1709,6 +1709,8 @@ fn add_linux_runtime_mounts(command: &mut Command, root: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let alternatives_cc = Path::new("/etc/alternatives/cc");
     let requires_alternatives_alias = [Path::new("/usr/bin/cc"), Path::new("/bin/cc")]
         .into_iter()
@@ -1735,6 +1737,13 @@ fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
         &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
         root,
     )?;
+    let alternatives_directory = alternatives_cc
+        .parent()
+        .context("C compiler alternatives alias has no parent directory")?;
+    let etc_metadata = fs::symlink_metadata(Path::new("/etc"))
+        .context("system configuration directory is unavailable")?;
+    let directory_metadata = fs::symlink_metadata(alternatives_directory)
+        .context("C compiler alternatives directory is unavailable")?;
     let metadata = fs::symlink_metadata(alternatives_cc)
         .context("C compiler alternatives alias is unavailable")?;
     let alias_target =
@@ -1747,11 +1756,20 @@ fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
             .unwrap_or(Path::new("/"))
             .join(&alias_target)
     };
-    if !metadata.file_type().is_symlink()
+    if !etc_metadata.is_dir()
+        || etc_metadata.uid() != 0
+        || etc_metadata.mode() & 0o022 != 0
+        || !directory_metadata.is_dir()
+        || directory_metadata.uid() != 0
+        || directory_metadata.mode() & 0o022 != 0
+        || !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
         || resolved_target.canonicalize().ok().as_deref() != Some(compiler.as_path())
         || !compiler.starts_with("/usr")
     {
-        bail!("C compiler alternatives alias does not resolve to the trusted /usr executable");
+        bail!(
+            "C compiler alternatives alias is not a root-owned link to the trusted /usr executable"
+        );
     }
     command
         .args(["--dir", "/etc/alternatives"])
@@ -3547,11 +3565,19 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         let source = run.workspace.join("link-probe.c");
         let executable = run.output.join("link-probe");
         fs::write(&source, "int main(void) { return 0; }\n")?;
-        let script = format!(
-            "set -eu\ncc -v {:?} -o {:?}\n{:?}\n",
-            source, executable, executable
-        );
-        let arguments = vec!["-c".to_owned(), script];
+        let arguments = vec![
+            "-c".to_owned(),
+            "set -eu\ncc -v \"$1\" -o \"$2\"\n\"$2\"\n".to_owned(),
+            "depgraph-link-probe".to_owned(),
+            source
+                .to_str()
+                .context("link probe source path is not UTF-8")?
+                .to_owned(),
+            executable
+                .to_str()
+                .context("link probe executable path is not UTF-8")?
+                .to_owned(),
+        ];
         let mut command = linux_namespace_command(
             Path::new("/usr/bin/bash"),
             &arguments,
