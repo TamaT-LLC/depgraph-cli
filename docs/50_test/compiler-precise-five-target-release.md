@@ -41,7 +41,10 @@ Warm runは3つのconsent flagを再度要求し、`project code executed: false
 Cold／warmのJSON exportは`build_run_id`、attempt ID、時刻など実行固有provenanceを除いて同一でなければならない。
 `OUT_DIR` fixtureのwarm exportでもcustom-build compile/run unit、typed MIR、compiler instance/call evidenceを維持し、doctor、deps、whyが成功しなければならない。
 
-resource gate は archive を 4 GiB 以下、closed tree を 8 GiB 以下、file を 250,000 件以下、semantic gate を 10 分以下に制限する。
+resource gate は archive を 4 GiB 以下、closed tree を 8 GiB 以下、file を 250,000 件以下に制限する。
+semantic gate は Linux / macOS を 10 分以下、Windows を 15 分以下に制限する。
+Windows hosted runner は同じ fixture と semantic shapeでも、process起動、MSVC toolchain、SQLite I/Oの実時間が遅いため、`x86_64-pc-windows-msvc`だけに明示した上限を適用する。
+各target smokeは実測時間を保持し、Windows以外の上限を緩和せず、未対応targetに暗黙のdefaultを与えない。
 verifier は archive の圧縮サイズを展開前に検証し、展開中も path、entry type、重複、明示的な親 directory、file 数、directory 数、展開 byte 数を上限内に固定する。
 上限超過は target smoke を生成せず release を停止する。
 

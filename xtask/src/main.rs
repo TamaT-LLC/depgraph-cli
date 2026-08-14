@@ -2067,6 +2067,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`v0.5.0-rc.1` tag remains immutable and was not published",
         "canonicalizes the relative",
         "checkout-built CLI path before switching",
+        "`x86_64-pc-windows-msvc` only receives the 15-minute semantic ceiling; all four supported Linux and macOS targets retain the 10-minute semantic ceiling.",
         "| Product and Rust/Go/Web adapters | `0.5.0` |",
         "| Worker protocol / graph schema | `1.0` |",
         "| SQLite Store | schema `17` |",

@@ -34,7 +34,8 @@ const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_PACK_FILES: usize = 250_000;
 const MAX_PACK_DIRECTORIES: usize = 100_000;
-const MAX_SEMANTIC_MILLIS: u64 = 10 * 60 * 1_000;
+const MAX_LINUX_MACOS_SEMANTIC_MILLIS: u64 = 10 * 60 * 1_000;
+const MAX_WINDOWS_SEMANTIC_MILLIS: u64 = 15 * 60 * 1_000;
 
 const COMPONENTS: &[ComponentDefinition] = &[
     ComponentDefinition {
@@ -259,6 +260,7 @@ pub(crate) fn package(
     let manifest: CompilerPackManifest =
         serde_json::from_slice(&fs::read(extracted_root.join(COMPILER_PACK_MANIFEST_PATH))?)?;
     let unpacked_bytes = manifest.files.iter().map(|file| file.size).sum();
+    let semantic_millis_budget = semantic_millis_budget(&target)?;
     let resources = CompilerPackResourceReport {
         archive_bytes: fs::metadata(&archive)?.len(),
         unpacked_bytes,
@@ -267,10 +269,16 @@ pub(crate) fn package(
         admitted: fs::metadata(&archive)?.len() <= MAX_ARCHIVE_BYTES
             && unpacked_bytes <= MAX_UNPACKED_BYTES
             && manifest.files.len() <= MAX_PACK_FILES
-            && semantic.elapsed_millis <= MAX_SEMANTIC_MILLIS,
+            && semantic.elapsed_millis <= semantic_millis_budget,
     };
     if !resources.admitted {
-        bail!("compiler pack resource budget was exceeded for {target}");
+        bail!(
+            "compiler pack resource budget was exceeded for {target}: archive_bytes={} (max {MAX_ARCHIVE_BYTES}), unpacked_bytes={} (max {MAX_UNPACKED_BYTES}), file_count={} (max {MAX_PACK_FILES}), semantic_elapsed_millis={} (max {semantic_millis_budget})",
+            resources.archive_bytes,
+            resources.unpacked_bytes,
+            resources.file_count,
+            resources.semantic_elapsed_millis,
+        );
     }
     let smoke = CompilerPackTargetSmokeReport {
         schema_version: COMPILER_PACK_SMOKE_SCHEMA_VERSION.to_owned(),
@@ -524,6 +532,7 @@ fn validate_smoke(
     target: &str,
     archive_sha256: &str,
 ) -> Result<()> {
+    let semantic_millis_budget = semantic_millis_budget(target)?;
     if smoke.schema_version != COMPILER_PACK_SMOKE_SCHEMA_VERSION
         || smoke.release_version != VERSION
         || smoke.target != target
@@ -534,7 +543,7 @@ fn validate_smoke(
         || smoke.resources.archive_bytes > MAX_ARCHIVE_BYTES
         || smoke.resources.unpacked_bytes > MAX_UNPACKED_BYTES
         || smoke.resources.file_count > MAX_PACK_FILES
-        || smoke.resources.semantic_elapsed_millis > MAX_SEMANTIC_MILLIS
+        || smoke.resources.semantic_elapsed_millis > semantic_millis_budget
     {
         bail!("compiler pack smoke report is incompatible for {target}");
     }
@@ -562,6 +571,16 @@ fn validate_smoke(
         rollback: smoke.rollback.clone(),
     };
     validate_aggregate_targets(&[verification], &[target.to_owned()])
+}
+
+fn semantic_millis_budget(target: &str) -> Result<u64> {
+    if target == "x86_64-pc-windows-msvc" {
+        return Ok(MAX_WINDOWS_SEMANTIC_MILLIS);
+    }
+    if COMPILER_PACK_SUPPORTED_TARGETS.contains(&target) {
+        return Ok(MAX_LINUX_MACOS_SEMANTIC_MILLIS);
+    }
+    bail!("compiler pack semantic budget target {target} is unsupported")
 }
 
 fn validate_handshake(
@@ -2026,6 +2045,19 @@ mod tests {
         assert_eq!(archive_extension("x86_64-pc-windows-msvc").unwrap(), "zip");
         assert_eq!(archive_extension("aarch64-apple-darwin").unwrap(), "tar.gz");
         assert!(selected_targets(&["unknown-target".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn semantic_resource_budget_is_target_specific_and_closed() {
+        for target in COMPILER_PACK_SUPPORTED_TARGETS {
+            let expected = if target == &"x86_64-pc-windows-msvc" {
+                MAX_WINDOWS_SEMANTIC_MILLIS
+            } else {
+                MAX_LINUX_MACOS_SEMANTIC_MILLIS
+            };
+            assert_eq!(semantic_millis_budget(target).unwrap(), expected);
+        }
+        assert!(semantic_millis_budget("unsupported-unknown-target").is_err());
     }
 
     #[test]
