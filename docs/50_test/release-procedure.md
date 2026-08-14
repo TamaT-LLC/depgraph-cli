@@ -57,6 +57,11 @@ gh run view "$run_id" --json headSha,conclusion,url
 objectの署名が`valid`、`unknown_key`、または`unverified_email`として構文・署名付き
 payloadを保持していることをRelease workflowが再確認する。`unsigned`、不正署名、
 lightweight tagは公開前に拒否する。
+publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIからremote
+`refs/tags/<tag>`を取得してobject typeが`tag`であることを要求する。
+`actions/checkout`の既定shallow tag checkoutはpeeled commitを同名のlocal tag refへ
+配置するため、local `git rev-parse <tag>^{tag}`では正しいremote annotated tagを検証
+できない。署名payloadとpeeled commitの検証にはremote tag object SHAだけを使う。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
