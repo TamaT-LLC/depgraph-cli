@@ -2111,6 +2111,32 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.3 release note is missing contract {required:?}");
         }
     }
+    let rc4_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.4.md"))?;
+    for required in [
+        "fourth v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.4` tag",
+        "`v0.5.0-rc.1`, `v0.5.0-rc.2`, and `v0.5.0-rc.3` tags",
+        "`/etc/alternatives/cc`",
+        "root-owned, non-writable path",
+        "actual C executable link and launch",
+        "exact Linux compiler-pack semantic release smoke",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.4.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc4_release_note.contains(required) {
+            bail!("v0.5.0-rc.4 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2204,6 +2230,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.4.md",
         "docs/releases/v0.5.0-rc.3.md",
         "docs/releases/v0.5.0-rc.2.md",
         "docs/releases/v0.5.0-rc.1.md",
@@ -2297,6 +2324,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
         "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
+        "crates/depgraph-operation/|xtask/src/compiler_pack_release\\.rs|scripts/compiler-precise-hostile",
+        "name: Exact Linux compiler-pack semantic release smoke",
+        "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");

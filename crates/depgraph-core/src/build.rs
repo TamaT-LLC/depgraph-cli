@@ -1709,6 +1709,8 @@ fn add_linux_runtime_mounts(command: &mut Command, root: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let alternatives_cc = Path::new("/etc/alternatives/cc");
     let requires_alternatives_alias = [Path::new("/usr/bin/cc"), Path::new("/bin/cc")]
         .into_iter()
@@ -1735,10 +1737,44 @@ fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
         &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
         root,
     )?;
+    let alternatives_directory = alternatives_cc
+        .parent()
+        .context("C compiler alternatives alias has no parent directory")?;
+    let etc_metadata = fs::symlink_metadata(Path::new("/etc"))
+        .context("system configuration directory is unavailable")?;
+    let directory_metadata = fs::symlink_metadata(alternatives_directory)
+        .context("C compiler alternatives directory is unavailable")?;
+    let metadata = fs::symlink_metadata(alternatives_cc)
+        .context("C compiler alternatives alias is unavailable")?;
+    let alias_target =
+        fs::read_link(alternatives_cc).context("C compiler alternatives alias is unreadable")?;
+    let resolved_target = if alias_target.is_absolute() {
+        alias_target.clone()
+    } else {
+        alternatives_cc
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join(&alias_target)
+    };
+    if !etc_metadata.is_dir()
+        || etc_metadata.uid() != 0
+        || etc_metadata.mode() & 0o022 != 0
+        || !directory_metadata.is_dir()
+        || directory_metadata.uid() != 0
+        || directory_metadata.mode() & 0o022 != 0
+        || !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || resolved_target.canonicalize().ok().as_deref() != Some(compiler.as_path())
+        || !compiler.starts_with("/usr")
+    {
+        bail!(
+            "C compiler alternatives alias is not a root-owned link to the trusted /usr executable"
+        );
+    }
     command
         .args(["--dir", "/etc/alternatives"])
-        .arg("--ro-bind")
-        .arg(compiler)
+        .arg("--symlink")
+        .arg(alias_target)
         .arg(alternatives_cc);
     Ok(())
 }
@@ -3524,6 +3560,53 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires the dedicated Linux bubblewrap hostile CI boundary"]
+    async fn enforced_linux_namespace_links_and_runs_a_host_executable() -> Result<()> {
+        let run = BuildRunDirectories::create()?;
+        let source = run.workspace.join("link-probe.c");
+        let executable = run.output.join("link-probe");
+        fs::write(&source, "int main(void) { return 0; }\n")?;
+        let arguments = vec![
+            "-c".to_owned(),
+            "set -eu\ncc -v \"$1\" -o \"$2\"\n\"$2\"\n".to_owned(),
+            "depgraph-link-probe".to_owned(),
+            source
+                .to_str()
+                .context("link probe source path is not UTF-8")?
+                .to_owned(),
+            executable
+                .to_str()
+                .context("link probe executable path is not UTF-8")?
+                .to_owned(),
+        ];
+        let mut command = linux_namespace_command(
+            Path::new("/usr/bin/bash"),
+            &arguments,
+            &run.workspace,
+            &run,
+            None,
+        )?;
+        command
+            .current_dir(&run.workspace)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().await?;
+        if !output.status.success() {
+            bail!(
+                "trusted host executable link failed inside the Linux namespace (status {:?})\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the dedicated Linux bubblewrap hostile CI boundary"]
     async fn enforced_hostile_boundary_denies_parent_secret_network_and_private_paths() -> Result<()>
     {
         use std::net::TcpListener;
@@ -3551,12 +3634,17 @@ if [ "${{DEPGRAPH_HOSTILE_PARENT_SECRET+x}}" = x ]; then exit 81; fi
 if [ -r "{private}" ]; then exit 82; fi
 if [ -r "{store}" ]; then exit 83; fi
 if timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' 2>/dev/null; then exit 84; fi
-cc --version >/dev/null
+cc link-probe.c -o "$DEPGRAPH_OUTPUT_DIR/link-probe"
+"$DEPGRAPH_OUTPUT_DIR/link-probe"
 printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
 "#,
                 private = private_file.display(),
                 store = store_file.display(),
             ),
+        )?;
+        fs::write(
+            project.join("link-probe.c"),
+            "int main(void) { return 0; }\n",
         )?;
         let mut benign = node_plan(vec!["benign-hostile-boundary.sh".to_owned()]);
         benign.program = "bash".to_owned();

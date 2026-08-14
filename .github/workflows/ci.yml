@@ -96,7 +96,7 @@ jobs:
             exit 0
           fi
           changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
-          if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -133,6 +133,32 @@ jobs:
         env:
           DEPGRAPH_COMPILER_HOSTILE_REPORT: dist/compiler-precise-hostile-e2e.json
         run: scripts/compiler-precise-hostile-e2e.sh
+      - name: Decide whether the exact Linux compiler-pack smoke must run
+        if: github.event_name == 'pull_request' && steps.decide.outputs.run == 'true'
+        id: compiler-pack-smoke
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the exact Linux compiler-pack toolchain
+        if: steps.compiler-pack-smoke.outputs.run == 'true'
+        run: rustup toolchain install nightly-2026-07-17 --profile minimal --component rust-src,rustc-dev,llvm-tools-preview
+      - name: Acquire the release-bound Rust channel manifest
+        if: steps.compiler-pack-smoke.outputs.run == 'true'
+        run: |
+          curl --fail --silent --show-error --location \
+            --output channel-rust-nightly-2026-07-17.toml \
+            https://static.rust-lang.org/dist/2026-07-17/channel-rust-nightly.toml
+      - name: Exact Linux compiler-pack semantic release smoke
+        if: steps.compiler-pack-smoke.outputs.run == 'true'
+        env:
+          DEPGRAPH_TARGET: x86_64-unknown-linux-gnu
+          RUSTFLAGS: -C linker-features=-lld
+        run: cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.decide.outputs.run == 'true'
         with:
