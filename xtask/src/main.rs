@@ -2324,6 +2324,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
         "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
         "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
+        "crates/depgraph-operation/|xtask/src/compiler_pack_release\\.rs|scripts/compiler-precise-hostile",
+        "name: Exact Linux compiler-pack semantic release smoke",
+        "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
