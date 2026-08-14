@@ -16,6 +16,14 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 fn repository_write_service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
+    repository_write_service_with_output_limit(root, store_path, 16 * 1024 * 1024)
+}
+
+fn repository_write_service_with_output_limit(
+    root: &Path,
+    store_path: &Path,
+    max_output_bytes: usize,
+) -> Result<DepgraphService> {
     Ok(DepgraphService::new(DepgraphServiceConfig::new(
         root,
         store_path,
@@ -23,7 +31,13 @@ fn repository_write_service(root: &Path, store_path: &Path) -> Result<DepgraphSe
             DepgraphCapability::Read,
             DepgraphCapability::RepositoryWrite,
         ])?,
-        DepgraphServiceLimits::default(),
+        DepgraphServiceLimits::try_new(
+            DEPGRAPH_SERVICE_LIMITS_VERSION,
+            1024 * 1024,
+            max_output_bytes,
+            100,
+            1_000,
+        )?,
     )?))
 }
 
@@ -259,6 +273,44 @@ fn export_file_writes_complete_content_and_reports_exact_digest_and_bytes() -> R
         hex::encode(Sha256::digest(&content))
     );
     assert_eq!(std::fs::read_dir(root.join("artifacts"))?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn raw_compatible_export_file_is_the_inline_limit_remediation() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir(&root)?;
+    let mut store = Store::open(&store_path)?;
+    let snapshot_id = seed_completed_snapshot(&mut store, &root)?;
+    drop(store);
+    let service = repository_write_service_with_output_limit(&root, &store_path, 128)?;
+    let graph = GraphExportRequest::try_new(
+        SnapshotLocator::parse(&snapshot_id)?,
+        GraphExportFormat::Json,
+        None,
+        GraphQueryFilter::default(),
+        100,
+        100,
+    )?;
+    let request = ExportFileRequest::raw_compatible(
+        graph,
+        RepositoryRelativePath::parse("graph.json")?,
+        RepositoryOverwritePolicy::NoReplace,
+    );
+
+    let result = service.export_file(&request, &CancellationToken::new())?;
+    let content = std::fs::read(root.join("graph.json"))?;
+
+    assert!(content.len() > service.config().limits().max_output_bytes());
+    assert_eq!(result.output_bytes(), content.len() as u64);
+    assert_eq!(
+        result.content_sha256(),
+        hex::encode(Sha256::digest(&content))
+    );
+    let exported: serde_json::Value = serde_json::from_slice(&content)?;
+    assert!(exported.get("graph").is_some());
     Ok(())
 }
 

@@ -106,8 +106,7 @@ impl OperationRunnerLauncher {
             command.arg("--compiler-pack-requirement").arg(requirement);
         }
         copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
-        configure_detached_process(&mut command);
-        let mut child = command.spawn().map_err(RunnerLaunchError::Launch)?;
+        let mut child = spawn_detached_process(&mut command).map_err(RunnerLaunchError::Launch)?;
         let process_id = child.id();
         // Reap while the launcher remains alive. If it exits first, dropping the
         // wait thread does not signal or otherwise own the detached runner.
@@ -164,8 +163,7 @@ impl DaemonExecutableLauncher {
             command.arg("--strict");
         }
         copy_safe_daemon_environment(&mut command, startup.service_config().canonical_root())?;
-        configure_detached_process(&mut command);
-        let child = command.spawn().map_err(RunnerLaunchError::Launch)?;
+        let child = spawn_detached_process(&mut command).map_err(RunnerLaunchError::Launch)?;
         Ok(LaunchedDaemonProcess { child: Some(child) })
     }
 }
@@ -676,22 +674,119 @@ const fn capability_argument(capability: DepgraphCapability) -> &'static str {
 }
 
 #[cfg(unix)]
-fn configure_detached_process(command: &mut Command) {
+fn spawn_detached_process(command: &mut Command) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
+    command.spawn()
 }
 
 #[cfg(windows)]
-fn configure_detached_process(command: &mut Command) {
+fn spawn_detached_process(command: &mut Command) -> std::io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt as _;
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
     };
-    command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+
+    const INHERITED_JOB_FLAGS: u32 = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
+    if !request_windows_job_breakaway(windows_job_breakaway_policy()) {
+        command.creation_flags(INHERITED_JOB_FLAGS);
+        return command.spawn();
+    }
+    command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | INHERITED_JOB_FLAGS);
+    let preferred = command.spawn();
+    retry_without_windows_job_breakaway(preferred, || {
+        // Some hosts, including GitHub-hosted runners, assign the MCP server to
+        // a job object that does not grant breakaway permission. The runner can
+        // still outlive its direct parent while detached inside that outer job.
+        command.creation_flags(INHERITED_JOB_FLAGS);
+        command.spawn()
+    })
+}
+
+#[cfg(any(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsJobBreakawayPolicy {
+    NotInJob,
+    Explicit,
+    Silent,
+    Denied,
+    Unknown,
+}
+
+#[cfg(windows)]
+fn windows_job_breakaway_policy() -> WindowsJobBreakawayPolicy {
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject,
+        },
+        Threading::GetCurrentProcess,
+    };
+
+    let mut in_job = 0;
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process,
+    // the null job handle asks about any containing job, and `in_job` is a
+    // writable BOOL for the duration of the call.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+        return WindowsJobBreakawayPolicy::Unknown;
+    }
+    if in_job == 0 {
+        return WindowsJobBreakawayPolicy::NotInJob;
+    }
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let size = u32::try_from(std::mem::size_of_val(&limits))
+        .expect("Windows job limit information size fits in u32");
+    // SAFETY: A null job handle queries the job containing the current
+    // process. `limits` points to a correctly sized writable structure and no
+    // return-length pointer is required.
+    if unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_mut(&mut limits).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return WindowsJobBreakawayPolicy::Unknown;
+    }
+
+    let flags = limits.BasicLimitInformation.LimitFlags;
+    if flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+        WindowsJobBreakawayPolicy::Silent
+    } else if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 {
+        WindowsJobBreakawayPolicy::Explicit
+    } else {
+        WindowsJobBreakawayPolicy::Denied
+    }
+}
+
+#[cfg(any(test, windows))]
+const fn request_windows_job_breakaway(policy: WindowsJobBreakawayPolicy) -> bool {
+    matches!(
+        policy,
+        WindowsJobBreakawayPolicy::Explicit | WindowsJobBreakawayPolicy::Unknown
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_detached_process(_command: &mut Command) {}
+fn spawn_detached_process(command: &mut Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
+}
+
+#[cfg(any(test, windows))]
+fn retry_without_windows_job_breakaway<T>(
+    preferred: std::io::Result<T>,
+    retry: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    match preferred {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => retry(),
+        result => result,
+    }
+}
 
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
@@ -738,6 +833,56 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[test]
+    fn windows_job_breakaway_fallback_retries_only_permission_denied() {
+        let mut permission_retries = 0_u8;
+        let recovered: std::io::Result<u8> = retry_without_windows_job_breakaway(
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+            || {
+                permission_retries += 1;
+                Ok(7)
+            },
+        );
+        assert_eq!(recovered.unwrap(), 7);
+        assert_eq!(permission_retries, 1);
+
+        let mut missing_retries = 0_u8;
+        let rejected: std::io::Result<u8> =
+            retry_without_windows_job_breakaway(Err(std::io::ErrorKind::NotFound.into()), || {
+                missing_retries += 1;
+                Ok(9)
+            });
+        assert_eq!(rejected.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(missing_retries, 0);
+
+        let mut success_retries = 0_u8;
+        let unchanged = retry_without_windows_job_breakaway(Ok(11), || {
+            success_retries += 1;
+            Ok(13)
+        });
+        assert_eq!(unchanged.unwrap(), 11);
+        assert_eq!(success_retries, 0);
+    }
+
+    #[test]
+    fn windows_job_policy_avoids_known_unusable_breakaway_attempts() {
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::NotInJob
+        ));
+        assert!(request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Explicit
+        ));
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Silent
+        ));
+        assert!(!request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Denied
+        ));
+        assert!(request_windows_job_breakaway(
+            WindowsJobBreakawayPolicy::Unknown
+        ));
     }
 
     fn sha256(path: &Path) -> String {

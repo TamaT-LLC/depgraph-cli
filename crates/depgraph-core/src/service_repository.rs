@@ -1573,14 +1573,24 @@ fn publication_policy_without_atomic_exchange(
 
 #[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_READ_ACCESS: u32 = 0x0000_0001;
-#[cfg(test)]
+#[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_WRITE_ACCESS: u32 = 0x0000_0002;
 #[cfg(any(test, windows))]
 const WINDOWS_FILE_SHARE_DELETE_ACCESS: u32 = 0x0000_0004;
 
 #[cfg(any(test, windows))]
 const fn windows_staging_share_access() -> u32 {
-    WINDOWS_FILE_SHARE_READ_ACCESS | WINDOWS_FILE_SHARE_DELETE_ACCESS
+    // A private stage must not acquire a compatible reader that can keep a
+    // legacy delete disposition alive after the writer closes. Publication
+    // renames through the retained handle, so no shared access is required.
+    0
+}
+
+#[cfg(any(test, windows))]
+const fn windows_repository_input_share_access() -> u32 {
+    WINDOWS_FILE_SHARE_READ_ACCESS
+        | WINDOWS_FILE_SHARE_WRITE_ACCESS
+        | WINDOWS_FILE_SHARE_DELETE_ACCESS
 }
 
 #[cfg(unix)]
@@ -2370,7 +2380,7 @@ fn write_repository_file_atomically_platform(
 ) -> DepgraphServiceResult<()> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_CREATE,
-        Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE},
+        Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
     };
 
     let traversal = open_windows_parent(service, path, true, || {})?;
@@ -2379,34 +2389,53 @@ fn write_repository_file_atomically_platform(
     let mut staging = open_windows_at(
         traversal.parent(),
         OsStr::new(&staging_name),
-        FILE_GENERIC_WRITE | DELETE,
+        FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
         windows_staging_share_access(),
         FILE_CREATE,
         Some(false),
     )?;
-    validate_opened_windows_regular_file(&staging)?;
+    if let Err(error) = validate_opened_windows_regular_file(&staging) {
+        return Err(discard_windows_staging_handle_preserving_error(
+            staging, error,
+        ));
+    }
+    let staging_identity = match identity_from_file(&staging) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(discard_windows_staging_handle_preserving_error(
+                staging, error,
+            ));
+        }
+    };
+    let discard_staging = |staging, primary| {
+        discard_windows_staging_preserving_error(
+            traversal.parent(),
+            OsStr::new(&staging_name),
+            staging_identity,
+            staging,
+            primary,
+        )
+    };
     if let Err(error) = write_contents(&mut staging) {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(error);
+        return Err(discard_staging(staging, error));
     }
     if cancellation.is_cancelled() {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(DepgraphServiceError::Cancelled);
+        return Err(discard_staging(staging, DepgraphServiceError::Cancelled));
     }
     if let Err(source) = staging.sync_all() {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(RepositoryFileError::Unavailable { source }.into());
+        return Err(discard_staging(
+            staging,
+            RepositoryFileError::Unavailable { source }.into(),
+        ));
     }
     if cancellation.is_cancelled() {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(DepgraphServiceError::Cancelled);
+        return Err(discard_staging(staging, DepgraphServiceError::Cancelled));
     }
     let publication_policy =
         match publication_policy_without_atomic_exchange(overwrite, expected_precondition) {
             Ok(policy) => policy,
             Err(error) => {
-                let _ = delete_windows_file_handle(&staging);
-                return Err(error);
+                return Err(discard_staging(staging, error));
             }
         };
     if let Some(expected_precondition) = expected_precondition
@@ -2417,26 +2446,25 @@ fn write_repository_file_atomically_platform(
             cancellation,
         )
     {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(error);
+        return Err(discard_staging(staging, error));
     }
     if let Err(error) = classify_windows_publication_target(
         traversal.parent(),
         traversal.final_name,
         publication_policy,
     ) {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(error);
+        return Err(discard_staging(staging, error));
     }
-    validate_windows_directories(&traversal.directories)?;
+    if let Err(error) = validate_windows_directories(&traversal.directories) {
+        return Err(discard_staging(staging, error));
+    }
     if let Err(error) = rename_windows_file_handle(
         &staging,
         traversal.parent(),
         traversal.final_name,
         publication_policy == RepositoryOverwritePolicy::Overwrite,
     ) {
-        let _ = delete_windows_file_handle(&staging);
-        return Err(error);
+        return Err(discard_staging(staging, error));
     }
     validate_windows_directories(&traversal.directories)
 }
@@ -2630,6 +2658,14 @@ fn map_open_component_error(source: io::Error) -> DepgraphServiceError {
     #[cfg(unix)]
     if matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
         return RepositoryFileError::BoundaryViolation.into();
+    }
+    #[cfg(windows)]
+    if source.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+        [ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS].contains(&(error as u32))
+    }) {
+        return RepositoryFileError::AlreadyExists.into();
     }
     #[cfg(windows)]
     if source.raw_os_error().is_some_and(|error| {
@@ -2910,8 +2946,7 @@ fn open_windows_repository_input_after_root(
     after_parents_opened: impl FnOnce(),
 ) -> DepgraphServiceResult<File> {
     use windows_sys::{
-        Wdk::Storage::FileSystem::FILE_OPEN,
-        Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_SHARE_READ},
+        Wdk::Storage::FileSystem::FILE_OPEN, Win32::Storage::FileSystem::FILE_GENERIC_READ,
     };
 
     let traversal = open_windows_parent(service, path, false, after_parents_opened)?;
@@ -2920,7 +2955,7 @@ fn open_windows_repository_input_after_root(
         traversal.parent(),
         traversal.final_name,
         FILE_GENERIC_READ,
-        FILE_SHARE_READ,
+        windows_repository_input_share_access(),
         FILE_OPEN,
         Some(false),
     )?;
@@ -2937,7 +2972,7 @@ fn open_windows_repository_output_after_root(
 ) -> DepgraphServiceResult<File> {
     use windows_sys::{
         Wdk::Storage::FileSystem::FILE_CREATE,
-        Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, FILE_SHARE_READ},
+        Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ},
     };
 
     let traversal = open_windows_parent(service, path, true, after_parents_opened)?;
@@ -2945,7 +2980,7 @@ fn open_windows_repository_output_after_root(
     let file = match open_windows_at(
         traversal.parent(),
         traversal.final_name,
-        FILE_GENERIC_WRITE,
+        FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
         FILE_CREATE,
         Some(false),
@@ -3228,7 +3263,58 @@ fn validate_opened_windows_regular_file(file: &File) -> DepgraphServiceResult<()
 }
 
 #[cfg(windows)]
-fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+fn try_posix_delete_windows_file_handle(file: &File) -> DepgraphServiceResult<bool> {
+    use std::{mem, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: file retains ownership of the live handle for the call and the
+    // pointer/size describe one initialized FILE_DISPOSITION_INFO_EX value.
+    // POSIX disposition removes the private staging link when this handle
+    // closes even if another compatible handle appeared meanwhile. Older
+    // Windows versions and file systems can fall back to legacy disposition.
+    let extended_success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&extended).cast(),
+            u32::try_from(mem::size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("FILE_DISPOSITION_INFO_EX size fits in u32"),
+        )
+    };
+    if extended_success != 0 {
+        return Ok(true);
+    }
+    let extended_error = io::Error::last_os_error();
+    let extended_is_unsupported = extended_error.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+        };
+
+        [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+        ]
+        .contains(&(error as u32))
+    });
+    if !extended_is_unsupported {
+        return Err(RepositoryFileError::Unavailable {
+            source: extended_error,
+        }
+        .into());
+    }
+
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn legacy_delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
     use std::{mem, os::windows::io::AsRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
@@ -3257,6 +3343,155 @@ fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
 }
 
 #[cfg(windows)]
+fn delete_windows_file_handle(file: &File) -> DepgraphServiceResult<()> {
+    if try_posix_delete_windows_file_handle(file)? {
+        Ok(())
+    } else {
+        legacy_delete_windows_file_handle(file)
+    }
+}
+
+#[cfg(any(test, windows))]
+fn delete_private_windows_staging_with(
+    try_posix_delete: impl FnOnce() -> DepgraphServiceResult<bool>,
+    sanitize: impl FnOnce() -> DepgraphServiceResult<()>,
+    legacy_delete: impl FnOnce() -> DepgraphServiceResult<()>,
+) -> DepgraphServiceResult<()> {
+    let posix_result = try_posix_delete();
+    if matches!(posix_result, Ok(true)) {
+        return Ok(());
+    }
+
+    // Legacy disposition cannot unlink until every compatible handle closes.
+    // Sanitize first so an unexpected metadata-only/kernel observer can at
+    // most delay a zero-length delete-pending link. Always attempt deletion
+    // even when sanitization fails; a successful delete-pending transition is
+    // the stronger confidentiality boundary because private stages are opened
+    // without share access.
+    let sanitize_result = sanitize();
+    let delete_result = legacy_delete();
+    if delete_result.is_ok() {
+        return Ok(());
+    }
+    if let Err(error) = posix_result {
+        tracing::warn!(
+            cleanup_category = ?error.category(),
+            "private staging POSIX and legacy deletion both failed"
+        );
+    }
+    if let Err(error) = sanitize_result {
+        tracing::warn!(
+            cleanup_category = ?error.category(),
+            "private staging sanitization and legacy deletion both failed"
+        );
+    }
+    delete_result
+}
+
+#[cfg(windows)]
+fn delete_private_windows_staging_handle(staging: &File) -> DepgraphServiceResult<()> {
+    delete_private_windows_staging_with(
+        || try_posix_delete_windows_file_handle(staging),
+        || {
+            staging
+                .set_len(0)
+                .and_then(|()| staging.sync_all())
+                .map_err(|source| RepositoryFileError::Unavailable { source }.into())
+        },
+        || legacy_delete_windows_file_handle(staging),
+    )
+}
+
+#[cfg(windows)]
+fn discard_windows_staging_handle(staging: File) -> DepgraphServiceResult<()> {
+    let result = delete_private_windows_staging_handle(&staging);
+    drop(staging);
+    result
+}
+
+#[cfg(windows)]
+fn discard_windows_staging(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+    staging: File,
+) -> DepgraphServiceResult<()> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_OPEN,
+        Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE},
+    };
+
+    // The retained stage handle was identity-verified immediately after its
+    // exclusive create and cannot be rebound to another file. Do not perform
+    // fallible metadata work before cleanup: use that same handle directly so
+    // every failure path reaches disposition. The legacy path sanitizes its
+    // contents before last-close.
+    let deletion = delete_private_windows_staging_handle(&staging);
+    drop(staging);
+    deletion?;
+
+    let remaining = open_windows_at(
+        parent,
+        staging_name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        windows_repository_input_share_access(),
+        FILE_OPEN,
+        Some(false),
+    );
+    match remaining {
+        Err(DepgraphServiceError::RepositoryFile {
+            reason: RepositoryFileError::NotFound,
+        }) => Ok(()),
+        Err(error) => Err(error),
+        Ok(remaining) if identity_from_file(&remaining)? == expected_identity => {
+            Err(RepositoryFileError::Unavailable {
+                source: io::Error::other(
+                    "private staging deletion did not remove its namespace link",
+                ),
+            }
+            .into())
+        }
+        Ok(_) => Err(DepgraphServiceError::Integrity),
+    }
+}
+
+#[cfg(any(test, windows))]
+fn preserve_primary_error_after_cleanup(
+    primary: DepgraphServiceError,
+    cleanup: DepgraphServiceResult<()>,
+) -> DepgraphServiceError {
+    if let Err(cleanup) = cleanup {
+        tracing::warn!(
+            primary_category = ?primary.category(),
+            cleanup_category = ?cleanup.category(),
+            "private staging cleanup failed after a repository write failure"
+        );
+    }
+    primary
+}
+
+#[cfg(windows)]
+fn discard_windows_staging_preserving_error(
+    parent: &File,
+    staging_name: &OsStr,
+    expected_identity: RepositoryFileIdentity,
+    staging: File,
+    primary: DepgraphServiceError,
+) -> DepgraphServiceError {
+    let cleanup = discard_windows_staging(parent, staging_name, expected_identity, staging);
+    preserve_primary_error_after_cleanup(primary, cleanup)
+}
+
+#[cfg(windows)]
+fn discard_windows_staging_handle_preserving_error(
+    staging: File,
+    primary: DepgraphServiceError,
+) -> DepgraphServiceError {
+    let cleanup = discard_windows_staging_handle(staging);
+    preserve_primary_error_after_cleanup(primary, cleanup)
+}
+
+#[cfg(windows)]
 fn rename_windows_file_handle(
     file: &File,
     parent: &File,
@@ -3264,12 +3499,16 @@ fn rename_windows_file_handle(
     replace_if_exists: bool,
 ) -> DepgraphServiceResult<()> {
     use std::{
-        mem,
+        mem::{self, MaybeUninit},
         os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
         ptr,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+            FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
+        },
+        Win32::{Foundation::RtlNtStatusToDosError, System::IO::IO_STATUS_BLOCK},
     };
 
     let encoded_name = destination.encode_wide().collect::<Vec<_>>();
@@ -3278,7 +3517,10 @@ fn rename_windows_file_handle(
         .checked_mul(mem::size_of::<u16>())
         .and_then(|length| u32::try_from(length).ok())
         .ok_or(RepositoryFileError::BoundaryViolation)?;
-    let buffer_size = mem::offset_of!(FILE_RENAME_INFO, FileName)
+    // Windows requires at least the complete fixed structure plus the encoded
+    // name bytes for both FileRenameInfo and FileRenameInfoEx. The trailing
+    // FileName member is not a C flexible array in the public Win32 ABI.
+    let buffer_size = mem::size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(name_bytes as usize)
         .ok_or(RepositoryFileError::BoundaryViolation)?;
     let word_count = buffer_size
@@ -3286,12 +3528,18 @@ fn rename_windows_file_handle(
         .ok_or(RepositoryFileError::BoundaryViolation)?
         / mem::size_of::<usize>();
     let mut storage = vec![0_usize; word_count];
-    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let buffer_size =
+        u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?;
+    let mut io_status = MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
     // SAFETY: storage is pointer-aligned and large enough for the fixed header
     // plus every encoded destination code unit. All pointers remain valid for
-    // SetFileInformationByHandle, which does not retain them.
-    let success = unsafe {
-        (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+    // NtSetInformationFile, which does not retain them. The source and parent
+    // handles remain live and owned for each call.
+    let mut status = unsafe {
+        // Every caller supplies a simple leaf name under this retained parent.
+        // Keeping RootDirectory explicit avoids resolving a relative name from
+        // the process working directory and remains stable across ancestor moves.
         (*information).RootDirectory = parent.as_raw_handle();
         (*information).FileNameLength = name_bytes;
         ptr::copy_nonoverlapping(
@@ -3299,17 +3547,60 @@ fn rename_windows_file_handle(
             ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
             encoded_name.len(),
         );
-        SetFileInformationByHandle(
+        let information_class = if replace_if_exists {
+            // POSIX replacement is defined only together with replace-existing.
+            (*information).Anonymous.Flags =
+                FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_REPLACE_IF_EXISTS;
+            FileRenameInformationEx
+        } else {
+            (*information).Anonymous.ReplaceIfExists = false;
+            FileRenameInformation
+        };
+        NtSetInformationFile(
             file.as_raw_handle(),
-            FileRenameInfo,
+            io_status.as_mut_ptr(),
             information.cast(),
-            u32::try_from(buffer_size).map_err(|_| RepositoryFileError::BoundaryViolation)?,
+            buffer_size,
+            information_class,
         )
     };
-    if success != 0 {
+    if status >= 0 {
         return Ok(());
     }
-    let source = io::Error::last_os_error();
+    // SAFETY: converting an NTSTATUS does not require additional invariants.
+    let mut source = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+    let extended_is_unsupported = source.raw_os_error().is_some_and(|error| {
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+        };
+
+        [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+        ]
+        .contains(&(error as u32))
+    });
+    if replace_if_exists && extended_is_unsupported {
+        // SAFETY: the same initialized buffer and owned handles remain valid;
+        // only the information class and union interpretation change. The IO
+        // status block remains writable output storage for the fallback call.
+        status = unsafe {
+            (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                io_status.as_mut_ptr(),
+                information.cast(),
+                buffer_size,
+                FileRenameInformation,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+        // SAFETY: converting an NTSTATUS does not require additional invariants.
+        source = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+    }
     if source.kind() == io::ErrorKind::AlreadyExists {
         return classify_windows_existing_output(parent, destination).map(|_| ());
     }
@@ -3506,6 +3797,100 @@ mod tests {
         DepgraphService::new(config)
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_same_parent_file_rename_publishes_and_replaces() {
+        use std::io::Write as _;
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).expect("repository is created");
+        let parent = open_windows_directory(&root, true)
+            .expect("publication parent can be opened by handle");
+
+        let create_source = |name: &str, contents: &[u8]| {
+            let mut source = open_windows_at(
+                &parent,
+                OsStr::new(name),
+                FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+                windows_staging_share_access(),
+                FILE_CREATE,
+                Some(false),
+            )
+            .expect("staging file can be created by handle");
+            source
+                .write_all(contents)
+                .expect("staging file is writable");
+            source
+        };
+
+        let source = create_source("stage-create", b"created");
+        rename_windows_file_handle(&source, &parent, OsStr::new("output.txt"), false)
+            .expect("missing destination can be published by handle");
+        drop(source);
+        assert_eq!(
+            fs::read(root.join("output.txt")).expect("published output is readable"),
+            b"created"
+        );
+
+        let source = create_source("stage-replace", b"replaced");
+        rename_windows_file_handle(&source, &parent, OsStr::new("output.txt"), true)
+            .expect("existing destination can be replaced by handle");
+        drop(source);
+        assert_eq!(
+            fs::read(root.join("output.txt")).expect("replaced output is readable"),
+            b"replaced"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_staging_rejects_readers_and_cleanup_removes_the_link() {
+        use std::{io::Write as _, os::windows::fs::OpenOptionsExt as _};
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES},
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let root = temporary.path().join("repository");
+        fs::create_dir_all(&root).expect("repository is created");
+        let parent = open_windows_directory(&root, true)
+            .expect("publication parent can be opened by handle");
+        let staging_name = OsStr::new(".depgraph-stage-exclusive");
+        let staging_path = root.join(staging_name);
+        let mut staging = open_windows_at(
+            &parent,
+            staging_name,
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+            windows_staging_share_access(),
+            FILE_CREATE,
+            Some(false),
+        )
+        .expect("private staging file can be created");
+        staging
+            .write_all(b"private-stage-canary")
+            .expect("private staging file is writable");
+        let identity = identity_from_file(&staging).expect("staging identity is available");
+
+        let observer = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_repository_input_share_access())
+            .open(&staging_path);
+        assert!(
+            observer.is_err(),
+            "a reader must not coexist with an unpublished private stage"
+        );
+
+        discard_windows_staging(&parent, staging_name, identity, staging)
+            .expect("exclusive private staging cleanup succeeds");
+        assert!(!staging_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_repository_file_name_comparison_is_unicode_canonical_caseless() {
@@ -3635,7 +4020,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_handle_relative_input_stays_with_root_across_enclosing_ancestor_swap() {
+    fn windows_retained_input_handles_block_enclosing_ancestor_swap() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let enclosing = temporary.path().join("enclosing");
         let moved_enclosing = temporary.path().join("moved-enclosing");
@@ -3649,26 +4034,22 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_input_after_root(&service, &path, || {
-            fs::rename(&enclosing, &moved_enclosing).expect("enclosing ancestor can be moved");
-            fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
-            fs::write(root.join("nested/input.txt"), b"replacement")
-                .expect("replacement input is created");
+            let error = fs::rename(&enclosing, &moved_enclosing)
+                .expect_err("retained descendant handles block an enclosing rename on Windows");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         })
-        .expect("handle-relative traversal remains rooted in the original repository");
+        .expect("input remains available after the rejected ancestor swap");
 
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .expect("opened input is readable");
         assert_eq!(contents, "original");
-        assert_eq!(
-            fs::read(root.join("nested/input.txt")).expect("replacement input remains readable"),
-            b"replacement"
-        );
+        assert!(!moved_enclosing.exists());
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_handle_relative_output_ignores_replacement_absolute_tree() {
+    fn windows_retained_output_handles_block_enclosing_ancestor_swap() {
         use std::io::Write as _;
 
         let temporary = tempfile::tempdir().expect("temporary directory is available");
@@ -3683,20 +4064,20 @@ mod tests {
             .expect("test path is repository-relative");
 
         let mut file = open_windows_repository_output_after_root(&service, &path, || {
-            fs::rename(&enclosing, &moved_enclosing).expect("enclosing ancestor can be moved");
-            fs::create_dir_all(root.join("nested")).expect("replacement repository is created");
+            let error = fs::rename(&enclosing, &moved_enclosing)
+                .expect_err("retained descendant handles block an enclosing rename on Windows");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         })
-        .expect("handle-relative creation remains rooted in the original repository");
+        .expect("output remains available after the rejected ancestor swap");
         file.write_all(b"original output")
             .expect("opened output is writable");
         drop(file);
 
         assert_eq!(
-            fs::read(moved_enclosing.join("repository/nested/output.txt"))
-                .expect("output was created in the original repository"),
+            fs::read(root.join("nested/output.txt")).expect("output was created in the repository"),
             b"original output"
         );
-        assert!(!root.join("nested/output.txt").exists());
+        assert!(!moved_enclosing.exists());
     }
 
     #[test]
@@ -3744,12 +4125,18 @@ mod tests {
             fs::read(root.join("output.txt")).expect("existing output remains readable"),
             b"existing-canary"
         );
-        assert_eq!(
-            fs::read_dir(&root)
-                .expect("repository remains readable")
-                .count(),
-            1
-        );
+        let mut entries = fs::read_dir(&root)
+            .expect("repository remains readable")
+            .map(|entry| {
+                entry
+                    .expect("repository entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, ["output.txt"]);
     }
 
     #[test]
@@ -3780,11 +4167,98 @@ mod tests {
     }
 
     #[test]
-    fn windows_publication_stage_never_allows_shared_write_access() {
-        assert_eq!(
-            windows_staging_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
+    fn windows_publication_stage_is_exclusive_until_publish() {
+        assert_eq!(windows_staging_share_access(), 0);
+    }
+
+    #[test]
+    fn private_staging_delete_sanitizes_before_the_legacy_fallback() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix");
+                Ok(false)
+            },
+            || {
+                calls.borrow_mut().push("sanitize");
+                Err(DepgraphServiceError::Internal)
+            },
+            || {
+                calls.borrow_mut().push("legacy");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*calls.borrow(), ["posix", "sanitize", "legacy"]);
+
+        calls.borrow_mut().clear();
+        delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix");
+                Ok(true)
+            },
+            || panic!("POSIX deletion must not sanitize an unlinked stage"),
+            || panic!("POSIX deletion must not invoke legacy disposition"),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["posix"]);
+    }
+
+    #[test]
+    fn private_staging_delete_still_cleans_up_after_a_posix_error() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        delete_private_windows_staging_with(
+            || {
+                calls.borrow_mut().push("posix-error");
+                Err(DepgraphServiceError::Internal)
+            },
+            || {
+                calls.borrow_mut().push("sanitize");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("legacy");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["posix-error", "sanitize", "legacy"]);
+    }
+
+    #[test]
+    fn private_staging_delete_reports_a_failed_legacy_disposition() {
+        let error = delete_private_windows_staging_with(
+            || Ok(false),
+            || Ok(()),
+            || Err(DepgraphServiceError::Integrity),
+        )
+        .unwrap_err();
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Integrity);
+    }
+
+    #[test]
+    fn windows_repository_inputs_allow_non_blocking_repository_updates() {
+        assert_ne!(
+            windows_repository_input_share_access() & WINDOWS_FILE_SHARE_WRITE_ACCESS,
             0
         );
+        assert_ne!(
+            windows_repository_input_share_access() & WINDOWS_FILE_SHARE_DELETE_ACCESS,
+            0
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_failure_preserves_the_primary_error_category() {
+        let error = preserve_primary_error_after_cleanup(
+            DepgraphServiceError::Cancelled,
+            Err(RepositoryFileError::Unavailable {
+                source: io::Error::other("cleanup failure"),
+            }
+            .into()),
+        );
+
+        assert_eq!(error.category(), DepgraphServiceErrorCategory::Cancelled);
     }
 
     #[test]

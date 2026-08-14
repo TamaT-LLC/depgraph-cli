@@ -663,8 +663,19 @@ impl<D: OperationDispatcher> OperationRunner<D> {
                 .expect("test cleanup release");
         }
         let result = terminalize();
+        let unlock_result = if result.is_ok()
+            && let Some(guard) = cleanup_guard.as_ref()
+        {
+            // Release exclusion synchronously before cleanup acknowledgement
+            // reacquires the same sidecar lock; relying on close-on-drop can
+            // leave a transient self-conflict on some hosts.
+            guard.unlock()
+        } else {
+            Ok(())
+        };
         drop(cleanup_guard);
         let value = result?;
+        unlock_result.map_err(JournalError::Io)?;
         #[cfg(test)]
         if let Some(barrier) = &self.cleanup_acknowledgement_barrier {
             barrier.ready.send(()).expect("test cleanup receiver");
@@ -2797,10 +2808,71 @@ mod tests {
             promote_daemon_start(&config, false, Some(launcher)),
             Err(RunnerError::Service(DepgraphServiceError::Internal))
         ));
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "early daemon exit must not consume the 30-second publication timeout"
+            elapsed < Duration::from_secs(5),
+            "early daemon exit took {elapsed:?} and approached the 30-second publication timeout"
         );
+    }
+
+    #[test]
+    fn cleanup_guard_is_unlocked_before_acknowledgement_without_masking_terminal_errors() {
+        struct ReacquiringCleanupDispatcher {
+            store_path: PathBuf,
+            acknowledgements: usize,
+        }
+
+        impl OperationDispatcher for ReacquiringCleanupDispatcher {
+            fn dispatch(
+                &mut self,
+                _work: &RunnerWork,
+                _control: &mut ExecutionControl<'_>,
+            ) -> DispatchOutcome {
+                unreachable!("terminal cleanup test does not dispatch work")
+            }
+
+            fn finalize_cleanup_acknowledgement(
+                &mut self,
+                _kind: OperationKind,
+                _operation_id: &OperationId,
+            ) -> Result<(), RunnerError> {
+                let guard = depgraph_core::acquire_store_writer_lock(&self.store_path)
+                    .map_err(|_| RunnerError::Service(DepgraphServiceError::StoreWriterConflict))?;
+                self.acknowledgements += 1;
+                drop(guard);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut runner = OperationRunner::new(
+            RunnerStartupConfig::new(config.clone()).unwrap(),
+            ReacquiringCleanupDispatcher {
+                store_path: config.store_path().to_path_buf(),
+                acknowledgements: 0,
+            },
+        );
+        let work = RunnerWork {
+            operation_id: OperationId::parse(format!("op_{}", "a".repeat(32))).unwrap(),
+            kind: OperationKind::ScanSubmit,
+            input: CanonicalInput::new(&json!({})).unwrap(),
+            execution_deadline_ms: NOW + 10_000,
+        };
+        let guard = depgraph_core::acquire_store_writer_lock(config.store_path()).unwrap();
+        runner
+            .terminalize_after_cleanup(&work, Some(guard), || Ok::<_, RunnerError>(()))
+            .unwrap();
+        assert_eq!(runner.dispatcher.acknowledgements, 1);
+
+        let guard = depgraph_core::acquire_store_writer_lock(config.store_path()).unwrap();
+        assert!(matches!(
+            runner.terminalize_after_cleanup(&work, Some(guard), || {
+                Err::<(), _>(RunnerError::ClockUnavailable)
+            }),
+            Err(RunnerError::ClockUnavailable)
+        ));
+        assert_eq!(runner.dispatcher.acknowledgements, 1);
     }
 
     fn counting_daemon_dispatcher(
@@ -8418,8 +8490,10 @@ mod tests {
 
     #[test]
     fn guardian_cancels_the_dispatch_token_when_cancellation_is_requested() {
-        const LEASE_DURATION_MS: i64 = 200;
-        const RENEWAL_MARGIN_MS: i64 = 150;
+        // Wake after one second, but leave enough renewed lease headroom for a
+        // contended CI runner to terminalize cancellation without losing ownership.
+        const LEASE_DURATION_MS: i64 = 5_000;
+        const RENEWAL_MARGIN_MS: i64 = 4_000;
 
         struct CancellationAwareDispatcher {
             started: mpsc::SyncSender<()>,

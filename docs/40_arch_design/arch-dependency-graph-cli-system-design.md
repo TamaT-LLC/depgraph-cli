@@ -74,7 +74,7 @@ Issue #180で`bounded-query-result-v1`のstaged executorを追加した。admitt
 
 Issue #181でpublic `depgraph query`を追加した。`--query` / `--file`をclapで排他的かつ必須にし、`--file`はcurrent repository boundary内のbounded regular file readerだけを通す。parse / credential policy / closed type checkをstore access前に完了してから、global `--store` / `--scan-id`でcurrentまたはscan由来のimmutable completed snapshot IDを解決し、storeをread-onlyで開く。`--explain`はexecutorを呼ばず同じadmission / plan digestをcanonical JSONまたはredacted human summaryへ出力する。execute JSONは`bounded-query-result-v1`そのものをcanonical key orderで出力し、humanはsnapshot / graph / plan / result digest、projection label、closed row / path / evidence、deterministic metricsを表示する。syntax / type / binding / limitはexit `2`、plan / runtime resource exhaustionはexit `1`、store / integrity failureはexit `3`、unsafe file / credential inputはexit `4`とし、zero rowはcomplete exit `0`を保つ。query / explainはwriter lock、cache、attempt row、worker、project processを使用しない。
 
-Issue #182で`bounded-query-release-smoke-v1`を追加した。parser / type checker / planner / executorを決定論的byte mutation corpusへ通し、malformed / deep / wide / alternate-path入力がpanic、hang、prefix acceptance、partial resultを起こさないことを固定する。10,000-file benchmarkはexact-sourceのadmitted plan / canonical executionと、同じgraphに対するdepth 8 hostile planの事前拒否を計測し、plan bounds、runtime metrics、result digestを`depgraph-benchmark-report-v6`へ記録する。全5 native packageはmanifestに同一query fixtureとlanguage / type / statistics / plan / limit / result versionを固定し、SBOMとlicense inventoryへfirst-party contractとして含める。各native packageがcheckout-equivalent storeでquery / explainの同一canonical bytesを実行し、target別sidecarのplan / result / output digestをrelease asset集約とstable gateで一致検証する。fixture missing / tamper、capability version drift、sidecar output driftはfail closedである。
+Issue #182で`bounded-query-release-smoke-v1`を追加した。parser / type checker / planner / executorを決定論的byte mutation corpusへ通し、malformed / deep / wide / alternate-path入力がpanic、hang、prefix acceptance、partial resultを起こさないことを固定する。10,000-file benchmarkはexact-sourceのadmitted plan / canonical executionと、同じgraphに対するdepth 8 hostile planの事前拒否を計測し、plan bounds、runtime metrics、result digestを`depgraph-benchmark-report-v7`へ記録する。全5 native packageはmanifestに同一query fixtureとlanguage / type / statistics / plan / limit / result versionを固定し、SBOMとlicense inventoryへfirst-party contractとして含める。各native packageがcheckout-equivalent storeでquery / explainの同一canonical bytesを実行し、target別sidecarのplan / result / output digestをrelease asset集約とstable gateで一致検証する。fixture missing / tamper、capability version drift、sidecar output driftはfail closedである。
 
 Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
 
@@ -1620,14 +1620,16 @@ manifestへsource count、期待dependency site数、変更path、boundedな
 SHA-256を記録する。benchmarkはfresh SQLite storeのsafe initial scan、
 completed base snapshotとwarm analysis cacheを持つwatcher daemon経由の
 1-file incremental scan、別storeに対する最初のcold file/package impact、
-priming後にsnapshot / selector / filter scoped bounded cacheを使うwarm
-file/package impactを個別に計測する。
+OS page cache priming後も独立processが同じpinned snapshotをread-onlyで
+canonical recomputeするfile/package impactを個別に計測する。Issue #303で
+共有Agent read serviceをStore不変かつcache-independentにしたため、impact
+query cacheのlookup、insert、touchをwarm条件として扱わない。
 
 開発機のproduct targetは次のとおり。
 
 - 10,000 source files の safe initial scan: 開発機で 30 秒以内
 - 1 file 変更の incremental semantic scan: build を除き 2 秒以内
-- query latency: warm cache の file / package impact で 500 ms 以内
+- query latency: read-only canonical file / package impact で 500 ms 以内
 
 2026-07-24のIssue #135後の10,000-file macOS local baselineはinitial
 33.458 / 32.641 / 33.206秒、watcher incremental 860 / 513 / 518ms
@@ -1635,17 +1637,22 @@ file/package impactを個別に計測する。
 初回523ms、以降143msで、初回base projection 303ms、worker capability
 60–63ms、worker analysis 64–67msが支配する。
 node 20,003、dependency site 19,998、edge 40,000と全coverageを保存した。
-benchmarkのincremental ceilingはproduct targetと同じ2秒とする。
+このbaselineはcache利用時の履歴であり、Issue #303以降のread-only canonical
+recomputeとは直接比較しない。2秒と500msのproduct targetはreportへ残し、
+改善余地を不可視化しない。
 
-共有GitHub hosted Linux runnerのCI/release ceilingはinitial 80秒、
-incremental 2秒、warm query 500msとする。initial / incrementalは3 sample、
-warm queryは5 sampleを採り、medianがceiling
+共有GitHub hosted Linux runnerのCI/release回帰ceilingはinitial 80秒、
+incremental 10秒、read-only canonical impactとwarm Rust symbol query 4秒、
+Rust HIR cold / no-cache 12秒とする。initial / incrementalは3 sample、
+impact queryは5 sampleを採り、medianがceiling
 以内、ceiling超過sampleは最大1件、全sampleはceiling + 20%以内というnoise
 allowanceを同時に満たした場合だけpassする。cold queryは継続取得するが、
-product targetがwarm cacheであるためgateには使わない。report
-`depgraph-benchmark-report-v6`はraw sample、median / max、cache条件、
+同じcanonical read pathの初回process観測であるためgateには使わない。report
+`depgraph-benchmark-report-v7`はraw sample、median / max、cache条件、
 platform / architecture / GitHub runner、depgraph / Rust / Cargo / Go / Node /
-pnpm version、commit、threshold、allowance、判定を保持する。
+pnpm version、commit、product target、runner ceiling、allowance、判定を保持する。
+v7は旧`bounded_impact_query_cache`表記を拒否し、Agent read serviceと同じ
+`read_only_canonical_recompute`条件だけを受理する。
 
 incremental前後ではprofile、node identity/property（意図した変更fileの
 `content_hash`だけを除く）、dependency site、edge、evidence、file/profile/

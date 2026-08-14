@@ -37,6 +37,7 @@ pub const MAX_GRAPH_EXPORT_EDGES: usize = 100_000;
 pub const MAX_SHARED_ARTIFACT_ITEMS: usize = 50_000;
 pub const MAX_SHARED_ARTIFACT_WORK_ITEMS: usize = 1_000_000;
 const GRAPH_EXPORT_ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
+const MAX_RAW_COMPATIBLE_GRAPH_EXPORT_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -853,9 +854,13 @@ impl DepgraphService {
         let content = crate::export_filtered(&selected, format, &GraphQueryFilter::default())
             .map_err(|_| DepgraphServiceError::Internal)?;
         check_cancelled(cancellation)?;
-        let maximum = self.config().limits().max_output_bytes();
+        // Raw-compatible exports are the file-based remediation for an Agent-safe
+        // inline export that exceeded the service response ceiling. Keep a separate
+        // hard file bound so that remediation can carry complete graphs without
+        // weakening the bounded inline contract.
+        let maximum = MAX_RAW_COMPATIBLE_GRAPH_EXPORT_BYTES;
         if content.len() > maximum {
-            return Err(DepgraphServiceError::InlineExportTooLarge { maximum });
+            return Err(DepgraphServiceError::ResourceExhausted);
         }
         Ok(GraphExportResult {
             schema_version: GRAPH_EXPORT_SERVICE_SCHEMA_VERSION.to_owned(),

@@ -224,6 +224,14 @@ Use this sequence:
    Cancellation is cooperative; continue polling until terminal. Cancelling an
    already terminal operation is an idempotent no-op.
 
+On Windows, the server inspects the containing Job Object before launching the
+detached operation runner. It requests explicit breakaway only when the Job
+Object permits it, relies on silent breakaway when configured, and otherwise
+keeps the runner inside the host Job Object. In that last case MCP stdio EOF
+still does not cancel the runner, but terminating the containing host job does.
+Hosts that require work to survive their own job lifetime must permit explicit
+or silent breakaway.
+
 The stdio request budgets are 30 seconds for reads and 2 seconds for durable
 submission; the 2-second budget is for committing and returning the handle,
 not for finishing the operation. A submitted operation has a one-hour execution

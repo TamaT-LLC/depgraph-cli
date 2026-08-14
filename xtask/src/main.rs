@@ -43,7 +43,7 @@ const V0_4_RC6_AARCH64_APPLE_BINARY_SHA256: &str =
 #[cfg(test)]
 const V0_4_RC1_STORE_SCHEMA_VERSION: i64 = 11;
 const V0_2_RC1_STORE_SCHEMA_VERSION: i64 = 5;
-const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v6";
+const BENCHMARK_REPORT_SCHEMA_VERSION: &str = "depgraph-benchmark-report-v7";
 const STABLE_BENCHMARK_METRICS: &[(&str, bool)] = &[
     ("safe_initial_scan", true),
     ("one_file_incremental_scan", true),
@@ -133,43 +133,43 @@ struct TargetNativeSmokeExpectation {
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:38729c001146ed5e203bec6ed5e29f9db9c27a14e0c113bd1b2976028c7e5c19",
-        query_result_digest: "bounded-query-result:sha256:d3795bb2a24fab977de7f0bce3143f207934ebe59d9a92a40388e6872f0900da",
-        query_output_sha256: "9099aa8dbce6fd4a559d520c892f864f532dde041c7c83dd7a3d1dd1933774bc",
-        profile_plan_digest: "profile-selection-plan:sha256:fb436331a593d909d8d51c5dd4844cf84f16d04f6659f3c4b6d934467cc6bbb9",
-        profile_plan_output_sha256: "ae1905d035661fa5753bed426c6d99fd8993f99f941692e1d2714811aaab7ede",
+        query_plan_digest: "bounded-query-plan:sha256:cae06d8db032d85c7062998a7d06676a09dff1ee9948245596389ee9b741b364",
+        query_result_digest: "bounded-query-result:sha256:ba0505b32283b127764b8b2b826dc05211c61cd498838ef9d4d90842ac279247",
+        query_output_sha256: "db91cbfb34e790175c1677b15a1b88722bd21488a443bf64fa30d09c08f88f93",
+        profile_plan_digest: "profile-selection-plan:sha256:27c862f2305386cac9ab65aef94e61c0be53cf57744f350e1ada1076cd5a361f",
+        profile_plan_output_sha256: "8ffa2c3ba5b3eec35bb6cbf21d0ed51885254eda32ddab5b642df3ecc1ad8f4a",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:be976447c420ff15f1c145b78a62aa5c5aa0c128868e0bbb7ece0595de105b33",
-        query_result_digest: "bounded-query-result:sha256:2c17f973ed9c3032a019cc51a929ab7c5b0f9963a58fccb43d248941c79f0029",
-        query_output_sha256: "31c3308fe5e4b26850bab1a820ba1bd1fe65fe51d1296ab967f999e6f9a5f656",
-        profile_plan_digest: "profile-selection-plan:sha256:415586af7cbf8c0f92e046e1f5b51a9d41d37c5b9fc64fe7d9ed868e62eb8a29",
-        profile_plan_output_sha256: "a30369a84f6ca70a63b2ff29760cfb7ddb05926ae706a762cb7f55703e2460cc",
+        query_plan_digest: "bounded-query-plan:sha256:9fc87029cd412ab7eac77700feddc7ff623eddc6adc506c6b93729d783bb85ff",
+        query_result_digest: "bounded-query-result:sha256:06b24d5c6b1ba2c4528eb710468ce8c71c56fdde30fd65d1c584057635c730d1",
+        query_output_sha256: "ad5f3e4e377fed2e3edf0dea248fabd0af0c0dadf9210ceb41a7233aa99f4abd",
+        profile_plan_digest: "profile-selection-plan:sha256:363b492f375b041073b317ff0579589545b5ebca37aaef9f8b933de96edd2958",
+        profile_plan_output_sha256: "50d5fe0f605efac9a7b9ca7a9d6b6bff9727b20dbc8a75727456328a0fd49211",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:cd5f49e7a1b92d75a7c65434b79f632df4caf16c5783c38a018f54b95545a0c1",
-        query_result_digest: "bounded-query-result:sha256:34c09e5456443d51a82999be9d45907b9b1b280362855b1f88e434e7903ea67a",
-        query_output_sha256: "af73ad257d9828b895025fec6af011d2f4bf94358fe902f09c7f15c2c6001763",
-        profile_plan_digest: "profile-selection-plan:sha256:9b56308660bb581507384b5fb3c6629739da7563ee1e43f53c7c69015cdfa51e",
-        profile_plan_output_sha256: "d6cc71e80d66bafa2349599356f512f7d0425f2038bb508db8bdad940b76220f",
+        query_plan_digest: "bounded-query-plan:sha256:d664b46af73b184714ed57a828fc56e65d2b0f2cf837de9f953f926a2e992648",
+        query_result_digest: "bounded-query-result:sha256:998496968a872291847d5d9d73b61e63c92377e76e2fb9895577d1643d4c368a",
+        query_output_sha256: "4f8637e6b0bf350036c1cbebdca4b177b1f74360e1e65f33905f995817b55704",
+        profile_plan_digest: "profile-selection-plan:sha256:f44bce61595b71869cac635acc4256a269e04b7849020766c2c308d5ab4e6632",
+        profile_plan_output_sha256: "90e0c0aa6f453cf5277051ef7385ddee047a45d522b955292a179020a3dc1cf6",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:0ea68ae4240774092f33fa0b0353168b9ae2412eedccccac34ba1ff2ece929f6",
-        query_result_digest: "bounded-query-result:sha256:1ab6701936ea78da323268dcea9a73db4db0f920b6844748a315ed62e507d45b",
-        query_output_sha256: "d1e793c0cea143813de95a4ccbbd1a8a5733d230f0033e2adde1cf6d0127a4f7",
-        profile_plan_digest: "profile-selection-plan:sha256:11682a31f985d29cd7c4fd8440a808ed68af337e3753bf73926617b946fb3431",
-        profile_plan_output_sha256: "fd725f63c5ff8f6992b008b295ce6fc7637dc2f5e83a418fe0e118989c25272d",
+        query_plan_digest: "bounded-query-plan:sha256:5cf0533d47220d99cf033cf879aa7bf1b142330567962bbf75b9245f82dfbfa5",
+        query_result_digest: "bounded-query-result:sha256:456cabca0c093cb59ef670407f969ec677102870e4661f306a46b03bc89eb6f8",
+        query_output_sha256: "c2ddbfc2348604051d7f61497fcef2cd6c5114ce7e2cce575560fcb7d03e1332",
+        profile_plan_digest: "profile-selection-plan:sha256:b8e63fb7da635639c6e5c0d4c7aa844f0f5afe167923420f543f74a3fc8deb5e",
+        profile_plan_output_sha256: "1072395911f92adaad1007a11ea53f81bfbcd3a105179d9526ed87136efdae62",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:84828680ba3c9a2365e0c960d25ac8b2061bcc5ecd41d7d1b455367a91f88f73",
-        query_result_digest: "bounded-query-result:sha256:ea53e45d10ed036b7a5998f68366919401f45911efac91538d255fe24dc619ff",
-        query_output_sha256: "2ad6f0f6db4ff5c0d9eebc50003c38ccf5ab7be9c6cdd058b3169189ed01a116",
-        profile_plan_digest: "profile-selection-plan:sha256:b8c85453d631399a69a0a710d84b451c904552c4e8208057439585ff9d407011",
-        profile_plan_output_sha256: "89bbd316705d1994eabdc988a893dc13a0d1fe2860cff5cc22c690727cae67e6",
+        query_plan_digest: "bounded-query-plan:sha256:8eb0e0fdd1c0cae9453abe718d73db94e8f4132fe868334c8c7bcb0462d4e8b1",
+        query_result_digest: "bounded-query-result:sha256:42ec882b59a1f2284016e531f73efc9d49c59259d9fd524d8466590f0e580675",
+        query_output_sha256: "5740ea2b649989babe370c3f03cc7166f17f65dc226810f133ad99eaf35187bb",
+        profile_plan_digest: "profile-selection-plan:sha256:aabac99b77622684b20f0d6343c20e14136ce8c5282b5e50e333d61341d9be3b",
+        profile_plan_output_sha256: "4ad1e71b0bac7c5bc8c06697c379be1f98712c17a549eb3a7fe98591429496ab",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -1090,11 +1090,31 @@ fn verify_workflow_policy_text(
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
+                || workflow.matches("\n      fail-fast: false\n").count() != 1
+                || workflow
+                    .matches("rustflags: -C linker-features=-lld")
+                    .count()
+                    != 1
+                || workflow
+                    .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
+                    .count()
+                    != 1
+                || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 2
+                || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 2
+                || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 2
+                || workflow
+                    .matches(
+                        "Reclaim integration build artifacts before the isolated Rust semantic gate",
+                    )
+                    .count()
+                    != 1
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
             {
-                bail!("CI pull requests must remain read-only and secret-free");
+                bail!(
+                    "CI pull requests must remain read-only, secret-free, and pinned to the full-CI linker/resource policy"
+                );
             }
         }
         "release.yml" => {
@@ -1108,8 +1128,18 @@ fn verify_workflow_policy_text(
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
                 || !publish.contains("permissions:\n      contents: write")
+                || workflow
+                    .matches("rustflags: -C linker-features=-lld")
+                    .count()
+                    != 2
+                || workflow
+                    .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
+                    .count()
+                    != 2
             {
-                bail!("release write permission must be confined to the tag-only publish job");
+                bail!(
+                    "release write permission must remain tag-publish-only and native x86_64 Linux builds must retain the pinned linker policy"
+                );
             }
         }
         "stable-release-source-guard.yml" => {
@@ -1428,7 +1458,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     verify_mcp_tasks_architecture_decision(root)?;
     mcp_package_smoke::verify_documentation(root, VERSION)?;
     let mcp_operations_path = "docs/50_test/mcp-agent-host-operations.md";
-    let mcp_operations = fs::read_to_string(root.join(mcp_operations_path))?;
+    let mcp_operations = read_lf_normalized_text(&root.join(mcp_operations_path))?;
     verify_local_markdown_links(root, mcp_operations_path, &mcp_operations)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
@@ -1544,33 +1574,37 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         );
     }
 
-    let readme = fs::read_to_string(root.join("README.md"))?;
-    let rc1_release = fs::read_to_string(root.join("docs/releases/v0.4.0-rc.1.md"))?;
-    let design = fs::read_to_string(
-        root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
+    let readme = read_lf_normalized_text(&root.join("README.md"))?;
+    let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
+    let design = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
     )?;
-    let docs_index = fs::read_to_string(root.join("docs/00_index/index.md"))?;
-    let rust_compiler_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"))?;
+    let docs_index = read_lf_normalized_text(&root.join("docs/00_index/index.md"))?;
+    let rust_compiler_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-rust-compiler-precise-backend.md"),
+    )?;
     let rust_compiler_hostile =
-        fs::read_to_string(root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
-    let rust_compiler_release =
-        fs::read_to_string(root.join("docs/50_test/compiler-precise-five-target-release.md"))?;
+        read_lf_normalized_text(&root.join("docs/50_test/compiler-precise-hostile-e2e.md"))?;
+    let rust_compiler_release = read_lf_normalized_text(
+        &root.join("docs/50_test/compiler-precise-five-target-release.md"),
+    )?;
     let rust_compiler_hostile_gate =
         fs::read_to_string(root.join("scripts/compiler-precise-hostile-e2e.sh"))?;
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
-    let cross_language_adr = fs::read_to_string(
-        root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
+    let cross_language_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-cross-language-adapter-contract.md"),
     )?;
-    let default_profile_adr = fs::read_to_string(
-        root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
+    let default_profile_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-default-profile-selection-budget.md"),
     )?;
-    let graph_query_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"))?;
-    let public_oss_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-public-oss-release-governance.md"))?;
+    let graph_query_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-bounded-graph-query-language.md"),
+    )?;
+    let public_oss_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-public-oss-release-governance.md"),
+    )?;
     let v0_5_release_adr =
-        fs::read_to_string(root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
+        read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
     verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
@@ -1954,7 +1988,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         }
     }
     let migration_rehearsal =
-        fs::read_to_string(root.join("docs/50_test/public-migration-rehearsal.md"))?;
+        read_lf_normalized_text(&root.join("docs/50_test/public-migration-rehearsal.md"))?;
     for required in [
         "`temporary-repository-no-production-actuator`",
         "The production repository must retain its original visibility",
@@ -1970,7 +2004,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("public migration rehearsal is missing required contract {required:?}");
         }
     }
-    let v0_4_release_note = fs::read_to_string(root.join("docs/releases/v0.4.0.md"))?;
+    let v0_4_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.4.0.md"))?;
     if v0_4_stable_release_baseline_digest() != V0_4_STABLE_RELEASE_BASELINE_DIGEST {
         bail!("compiled v0.4 release baseline digest does not match its canonical record");
     }
@@ -1988,7 +2022,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.4 release note is missing preserved baseline contract {required:?}");
         }
     }
-    let stable_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0.md"))?;
+    let stable_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0.md"))?;
     for required in [
         STABLE_RELEASE_VERSION,
         STABLE_RELEASE_GATE_SCHEMA_VERSION,
@@ -2005,7 +2039,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5 release note is missing contract {required:?}");
         }
     }
-    let rc_release_note = fs::read_to_string(root.join("docs/releases/v0.5.0-rc.1.md"))?;
+    let rc_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.1.md"))?;
     for required in [
         "first v0.5 release candidate",
         "signed annotated `v0.5.0-rc.1` tag",
@@ -2026,7 +2060,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.1 release note is missing contract {required:?}");
         }
     }
-    let release_procedure = fs::read_to_string(root.join("docs/50_test/release-procedure.md"))?;
+    let release_procedure =
+        read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
         "git tag -s \"$release_tag\" \"$candidate\"",
         "git verify-tag \"$release_tag\"",
@@ -2060,6 +2095,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
+    if !git_attributes
+        .lines()
+        .any(|line| line.trim() == "README.md text eol=lf")
+    {
+        bail!("README release metadata is not pinned to LF in .gitattributes");
+    }
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
         if !git_attributes
@@ -2149,8 +2190,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "sudo apt-get install --yes --no-install-recommends bubblewrap",
         "run: scripts/compiler-precise-hostile-e2e.sh",
         "needs: [quality, compiler-precise-hostile]",
+        "DEPGRAPH_INCREMENTAL_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_QUERY_LIMIT_MS: \"4000\"",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
+        "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
         "node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json",
         "node scripts/cache-hit-benchmark.mjs verify benchmark/cache-hit-benchmark-report.json",
         "compiler-pack:",
@@ -2193,8 +2238,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "benchmark-report-${{ github.sha }}",
         "dist/cache-hit-benchmark-report.json",
         "DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: \"5\"",
+        "DEPGRAPH_INCREMENTAL_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_QUERY_LIMIT_MS: \"4000\"",
         "DEPGRAPH_BOUNDED_QUERY_PLAN_LIMIT_MS: \"7000\"",
         "DEPGRAPH_BOUNDED_QUERY_EXECUTE_LIMIT_MS: \"10000\"",
+        "DEPGRAPH_RUST_SCAN_LIMIT_MS: \"12000\"",
+        "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
@@ -2264,6 +2313,13 @@ updated: 2026-08-12\n\
 open_questions: 0\n\
 ---\n";
 
+    let attributes = fs::read_to_string(root.join(".gitattributes"))?;
+    if !attributes
+        .lines()
+        .any(|line| line == "docs/**/*.md text eol=lf")
+    {
+        bail!("repository documentation is not pinned to LF checkout bytes");
+    }
     let decision = fs::read_to_string(root.join(DOCUMENT_PATH))?;
     if !decision.starts_with(EXPECTED_FRONTMATTER) || !decision.ends_with('\n') {
         bail!("MCP Agent Tools architecture frontmatter is missing, open, or noncanonical");
@@ -2557,11 +2613,26 @@ fn verify_local_markdown_links(root: &Path, source: &str, content: &str) -> Resu
         let resolved = resolved.canonicalize().with_context(|| {
             format!("public community document {source} has broken local link {target:?}")
         })?;
-        if !resolved.starts_with(root) || !resolved.is_file() {
+        if !resolved.is_file() || !path_is_within_directory_by_identity(root, &resolved)? {
             bail!("public community document {source} has unsafe local link {target:?}");
         }
     }
     Ok(())
+}
+
+fn path_is_within_directory_by_identity(root: &Path, path: &Path) -> Result<bool> {
+    for ancestor in path.ancestors() {
+        if same_file::is_same_file(root, ancestor).with_context(|| {
+            format!(
+                "compare community link ancestor {} with root {}",
+                ancestor.display(),
+                root.display()
+            )
+        })? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn markdown_link_target_end(input: &str) -> Option<usize> {
@@ -5146,7 +5217,19 @@ fn validate_bounded_query_package_smoke(
         || report.profile_plan_digest != expected.profile_plan_digest
         || report.profile_canonical_output_sha256 != expected.profile_plan_output_sha256
     {
-        bail!("packaged bounded query smoke report is incompatible for {target}");
+        bail!(
+            "packaged bounded query smoke report is incompatible for {target}: observed query=({}, {}, {}), profile=({}, {}); expected query=({}, {}, {}), profile=({}, {})",
+            report.plan_digest,
+            report.result_digest,
+            report.canonical_output_sha256,
+            report.profile_plan_digest,
+            report.profile_canonical_output_sha256,
+            expected.query_plan_digest,
+            expected.query_result_digest,
+            expected.query_output_sha256,
+            expected.profile_plan_digest,
+            expected.profile_plan_output_sha256,
+        );
     }
     Ok(())
 }
@@ -5953,7 +6036,7 @@ fn evaluate_stable_release_gate(
                 && benchmark["gate"]["passed"] == Value::Bool(true)
                 && benchmark_metrics_pass,
             evidence:
-                "depgraph-benchmark-report-v6 exact fixtures and thirteen exact metrics, including eleven gated bounded-query, Rust HIR, cache, and build-observation metrics"
+                "depgraph-benchmark-report-v7 exact fixtures and thirteen exact metrics, including eleven gated canonical-impact, bounded-query, Rust HIR, cache, and build-observation metrics"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -7424,44 +7507,44 @@ fn verify_packaged_build_evidence(
         }
         let doctor_json: Value = serde_json::from_slice(&doctor.stdout)?;
         let latest = &doctor_json["latest_attempt"];
-        let phases = &latest["profile_matrix"]["phase_coverage"];
+        let matrix = &latest["profile_matrix"];
+        let phases = &matrix["phase_coverage"];
+        let semantic_profile_retained = matrix["entries"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["phases"]
+                    .as_array()
+                    .is_some_and(|phases| phases.iter().any(|phase| phase == "semantic"))
+            })
+        });
         if latest["project_code_executed"] != Value::Bool(true)
             || !phases["static"].is_object()
-            || !phases["semantic"].is_object()
+            || !semantic_profile_retained
             || !phases["build"].is_object()
             || !latest["profiles"].as_array().is_some_and(|profiles| {
                 profiles.iter().any(|profile| {
                     profile["id"] == profile_id
-                        && profile["properties"]["profile_phase"] == "build"
-                        && profile["properties"]["project_code_executed"] == Value::Bool(true)
+                        && profile["coverage"]["project_code_executed"] == Value::Bool(true)
+                        && profile["coverage"]["completeness"].as_array().is_some_and(
+                            |completeness| completeness.iter().any(|item| item == "build-observed"),
+                        )
                 })
             })
         {
             bail!("packaged {adapter} doctor lost the static/semantic/build profile union");
         }
-        let runtime_integrity = doctor_json["release"]["runtime_integrity"]
-            .as_object()
-            .context("packaged build doctor omitted runtime integrity")?;
-        if WEB_RUNTIME_ARTIFACTS.iter().any(|name| {
-            runtime_integrity
-                .get(&format!("libexec/{name}"))
-                .and_then(Value::as_str)
-                != Some("verified")
-        }) {
-            bail!("packaged {adapter} doctor did not verify all Web runtime artifacts");
+        // The agent-safe doctor projection intentionally omits per-file runtime integrity.
+        // Package metadata verification above checks the complete runtime closure instead.
+        if doctor_json["release"].get("runtime_integrity").is_some() {
+            bail!("packaged {adapter} doctor leaked detailed runtime integrity");
         }
 
-        let exported = Command::new(executable)
-            .arg("--store")
-            .arg(&store)
-            .arg("export")
-            .arg("--format")
-            .arg("json")
-            .output()?;
-        if !exported.status.success() {
-            bail!("packaged {adapter} export failed after build observation");
-        }
-        let export_json: Value = serde_json::from_slice(&exported.stdout)?;
+        let export_json = packaged_raw_export_json(
+            executable,
+            &store,
+            &[],
+            &format!("export packaged {adapter} graph after build observation"),
+        )?;
+        let exported_bytes = serde_json::to_vec(&export_json)?;
         let graph = &export_json["graph"];
         let edge = graph["edges"]
             .as_array()
@@ -7546,7 +7629,7 @@ fn verify_packaged_build_evidence(
         if bytes_contain(&allowed.stdout, secret_bytes)
             || bytes_contain(&allowed.stderr, secret_bytes)
             || bytes_contain(&doctor.stdout, secret_bytes)
-            || bytes_contain(&exported.stdout, secret_bytes)
+            || bytes_contain(&exported_bytes, secret_bytes)
             || bytes_contain(&fs::read(&store)?, secret_bytes)
             || deterministic_outputs.as_ref().is_some_and(|output| {
                 bytes_contain(&output.stdout, secret_bytes)
@@ -7586,14 +7669,12 @@ fn verify_packaged_build_evidence(
         if failed.status.code() != Some(3) {
             bail!("packaged {adapter} crash gate did not report a failed build");
         }
-        let retained = Command::new(executable)
-            .arg("--store")
-            .arg(&store)
-            .arg("export")
-            .arg("--format")
-            .arg("json")
-            .output()?;
-        let retained: Value = serde_json::from_slice(&retained.stdout)?;
+        let retained = packaged_raw_export_json(
+            executable,
+            &store,
+            &[],
+            &format!("export packaged {adapter} graph after failed build"),
+        )?;
         if retained["graph"] != completed_graph {
             bail!("packaged {adapter} failed build replaced the last completed graph");
         }
@@ -7972,18 +8053,10 @@ fn verify_packaged_framework_build_e2e(
         );
     }
 
-    let filtered = packaged_web_query(
+    let filtered = packaged_raw_export_json(
         executable,
         store,
-        &[
-            "export",
-            "--format",
-            "json",
-            "--phase",
-            "build",
-            "--profile",
-            profile_id,
-        ],
+        &["--phase", "build", "--profile", profile_id],
         &format!("export packaged {} build JSON", capability.framework),
     )?;
     if !filtered["graph"]["edges"].as_array().is_some_and(|edges| {
@@ -8856,19 +8929,12 @@ fn verify_packaged_web_runtime_fails_closed(
         fixture,
         "tampered TypeScript runtime file",
     )?;
-    let doctor = Command::new(executable)
-        .arg("--store")
-        .arg(verify_root.join("typescript-tampered-doctor.db"))
-        .arg("doctor")
-        .arg("--json")
-        .output()?;
-    let report: Value = serde_json::from_slice(&doctor.stdout)?;
-    let component_integrity =
-        report["release"]["runtime_integrity"]["component:typescript-native-compiler@7.0.2"]
-            .as_str()
-            .unwrap_or_default();
-    if !component_integrity.contains("checksum mismatch") {
-        bail!("doctor did not report the tampered TypeScript component: {report}");
+    let metadata_error = verify_release_metadata(extracted)
+        .expect_err("release metadata accepted the tampered TypeScript component");
+    if !format!("{metadata_error:#}")
+        .contains("runtime component typescript-native-compiler failed its whole-tree checksum")
+    {
+        bail!("TypeScript metadata gate returned the wrong error: {metadata_error:#}");
     }
     fs::write(&standard_library, original)?;
 
@@ -8942,19 +9008,12 @@ fn verify_packaged_web_runtime_fails_closed(
         fixture,
         "tampered Astro parser runtime",
     )?;
-    let doctor = Command::new(executable)
-        .arg("--store")
-        .arg(verify_root.join("astro-tampered-doctor.db"))
-        .arg("doctor")
-        .arg("--json")
-        .output()?;
-    let report: Value = serde_json::from_slice(&doctor.stdout)?;
-    let component_integrity =
-        report["release"]["runtime_integrity"]["component:astro-parser-wasm@4.0.0"]
-            .as_str()
-            .unwrap_or_default();
-    if !component_integrity.contains("checksum mismatch") {
-        bail!("doctor did not report the tampered Astro component: {report}");
+    let metadata_error = verify_release_metadata(extracted)
+        .expect_err("release metadata accepted the tampered Astro component");
+    if !format!("{metadata_error:#}")
+        .contains("runtime component astro-parser-wasm failed its whole-tree checksum")
+    {
+        bail!("Astro metadata gate returned the wrong error: {metadata_error:#}");
     }
     fs::write(&astro_wasm, &original_astro)?;
 
@@ -9282,12 +9341,38 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     fs::copy(&store_path, &backup_path)?;
     let backup_bytes = fs::read(&backup_path)?;
 
-    let show = Command::new(executable)
+    let read_only_before_migration = Command::new(executable)
         .arg("--store")
         .arg(&store_path)
         .args(["snapshot", "show", "current", "--json"])
         .output()
         .context("failed to open the v0.2.0-rc.1 store with the packaged CLI")?;
+    if read_only_before_migration.status.code() != Some(3)
+        || !read_only_before_migration.stdout.is_empty()
+        || !String::from_utf8_lossy(&read_only_before_migration.stderr)
+            .contains("outside supported read-only schema range")
+        || fs::read(&store_path)? != backup_bytes
+    {
+        bail!("packaged read-only command did not require an explicit legacy store mutation");
+    }
+
+    let named = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "create", "migrated-v0.2.0-rc.1", "--json"])
+        .output()?;
+    let named = successful_json(named, "packaged migrated snapshot naming")?;
+    let snapshot_id = named["data"]["snapshot"]["id"]
+        .as_str()
+        .context("packaged migrated snapshot has no ID")?
+        .to_owned();
+
+    let show = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "show", "current", "--json"])
+        .output()
+        .context("failed to read the migrated v0.2.0-rc.1 store")?;
     let show = successful_json(show, "packaged v0.2.0-rc.1 store migration")?;
     if show["data"]["source_kind"] != "scan"
         || show["data"]["scan_id"] != "legacy-v0.2.0-rc.1-scan"
@@ -9301,9 +9386,9 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     if migrated.schema_version()? != depgraph_store::STORE_SCHEMA_VERSION {
         bail!("packaged migration did not reach the current store schema");
     }
-    let snapshot_id = migrated
-        .current_snapshot_id()?
-        .context("packaged migration has no current completed snapshot")?;
+    if migrated.current_snapshot_id()?.as_deref() != Some(snapshot_id.as_str()) {
+        bail!("packaged migration changed the current completed snapshot identity");
+    }
     let snapshot = migrated.load_completed_snapshot(&snapshot_id)?;
     if snapshot.nodes.len() != 2
         || snapshot.sites.len() != 1
@@ -9315,22 +9400,16 @@ fn verify_packaged_legacy_store_migration(executable: &Path, verify_root: &Path)
     }
     drop(migrated);
 
-    let named = Command::new(executable)
-        .arg("--store")
-        .arg(&store_path)
-        .args(["snapshot", "create", "migrated-v0.2.0-rc.1", "--json"])
-        .output()?;
-    let named = successful_json(named, "packaged migrated snapshot naming")?;
     if named["data"]["snapshot"]["id"] != snapshot_id {
         bail!("naming the migrated snapshot changed its immutable ID: {named}");
     }
 
-    let exported = Command::new(executable)
-        .arg("--store")
-        .arg(&store_path)
-        .args(["export", "--format", "json"])
-        .output()?;
-    let exported = successful_json(exported, "packaged migrated graph export")?;
+    let exported = packaged_raw_export_json(
+        executable,
+        &store_path,
+        &[],
+        "export packaged migrated graph",
+    )?;
     if exported["graph"]["nodes"]
         .as_array()
         .is_none_or(|nodes| nodes.len() != 2)
@@ -9395,12 +9474,38 @@ fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Resu
     fs::copy(&store_path, &backup_path)?;
     let backup_bytes = fs::read(&backup_path)?;
 
-    let show = Command::new(executable)
+    let read_only_before_migration = Command::new(executable)
         .arg("--store")
         .arg(&store_path)
         .args(["snapshot", "show", "current", "--json"])
         .output()
         .context("failed to open the v0.4.0-rc.6 store with the v0.5 packaged CLI")?;
+    if read_only_before_migration.status.code() != Some(3)
+        || !read_only_before_migration.stdout.is_empty()
+        || !String::from_utf8_lossy(&read_only_before_migration.stderr)
+            .contains("outside supported read-only schema range")
+        || fs::read(&store_path)? != backup_bytes
+    {
+        bail!("packaged read-only command did not require an explicit stable store mutation");
+    }
+
+    let named = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "create", "stable-v0.5.0-upgrade", "--json"])
+        .output()?;
+    let named = successful_json(named, "packaged stable upgraded snapshot naming")?;
+    let snapshot_id = named["data"]["snapshot"]["id"]
+        .as_str()
+        .context("packaged stable upgraded snapshot has no ID")?
+        .to_owned();
+
+    let show = Command::new(executable)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["snapshot", "show", "current", "--json"])
+        .output()
+        .context("failed to read the migrated v0.4.0-rc.6 store")?;
     let show = successful_json(show, "packaged v0.4.0-rc.6 to v0.5 upgrade")?;
     if show["data"]["source_kind"] != "scan"
         || show["data"]["scan_id"] != "official-v0.4.0-rc.1-scan"
@@ -9414,9 +9519,9 @@ fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Resu
     if upgraded.schema_version()? != depgraph_store::STORE_SCHEMA_VERSION {
         bail!("stable upgrade did not retain the current store schema");
     }
-    let snapshot_id = upgraded
-        .current_snapshot_id()?
-        .context("stable upgrade has no current completed snapshot")?;
+    if upgraded.current_snapshot_id()?.as_deref() != Some(snapshot_id.as_str()) {
+        bail!("stable upgrade changed the current completed snapshot identity");
+    }
     let snapshot = upgraded.load_completed_snapshot(&snapshot_id)?;
     if snapshot.scan.id != "official-v0.4.0-rc.1-scan"
         || snapshot.nodes.len() != 2
@@ -9429,12 +9534,6 @@ fn verify_packaged_stable_upgrade(executable: &Path, verify_root: &Path) -> Resu
     }
     drop(upgraded);
 
-    let named = Command::new(executable)
-        .arg("--store")
-        .arg(&store_path)
-        .args(["snapshot", "create", "stable-v0.5.0-upgrade", "--json"])
-        .output()?;
-    let named = successful_json(named, "packaged stable upgraded snapshot naming")?;
     if named["data"]["snapshot"]["id"] != snapshot_id {
         bail!("naming the stable upgraded snapshot changed its immutable ID: {named}");
     }
@@ -9521,9 +9620,27 @@ fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> R
     }
     let completed =
         completed.context("packaged incremental watcher did not complete the change")?;
-    if completed["last_completed_attempt"]["invalidation_plan"]["schema_version"]
-        != depgraph_core::INCREMENTAL_PLAN_SCHEMA_VERSION
-        || completed["last_completed_attempt"]["status"] != "completed"
+    let attempt = &completed["last_completed_attempt"];
+    let base_snapshot_id = attempt["base_snapshot_id"]
+        .as_str()
+        .filter(|value| prefixed_lowercase_sha256(value, "snapshot:sha256:"))
+        .context("packaged watcher omitted its valid base snapshot ID")?;
+    let completed_snapshot_id = attempt["completed_snapshot_id"]
+        .as_str()
+        .filter(|value| prefixed_lowercase_sha256(value, "snapshot:sha256:"))
+        .context("packaged watcher omitted its valid completed snapshot ID")?
+        .to_owned();
+    if completed["schema_version"] != depgraph_core::DAEMON_STATUS_SCHEMA_VERSION
+        || attempt["status"] != "completed"
+        || attempt["attempt_id"].as_str().is_none_or(str::is_empty)
+        || attempt["scan_id"].as_str().is_none_or(str::is_empty)
+        || completed_snapshot_id == base_snapshot_id
+        || attempt.get("invalidation_plan").is_some()
+        || attempt["invalidation_summary"]["schema_version"] != "incremental-plan-v2"
+        || attempt["invalidation_summary"]["mode"] != "scoped_replacement"
+        || attempt["invalidation_summary"]["affected_profile_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
     {
         bail!("packaged incremental watcher returned an invalid completed attempt: {completed}");
     }
@@ -9548,6 +9665,22 @@ fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> R
     if !status.success() {
         bail!("packaged incremental watcher exited with {status}");
     }
+    let packaged_store = depgraph_store::Store::open(store)?;
+    if packaged_store.current_snapshot_id()?.as_deref() != Some(completed_snapshot_id.as_str())
+        || !packaged_store
+            .verify_snapshot_integrity(&completed_snapshot_id)?
+            .valid
+    {
+        bail!("packaged incremental watcher did not promote its completed snapshot");
+    }
+    let snapshot = packaged_store.load_completed_snapshot(&completed_snapshot_id)?;
+    if !snapshot.nodes.iter().any(|node| {
+        node.properties["path"]
+            .as_str()
+            .is_some_and(|path| path == "src/watched_release_candidate.ts")
+    }) {
+        bail!("packaged incremental watcher snapshot omitted the watched file");
+    }
     Ok(())
 }
 
@@ -9557,12 +9690,8 @@ fn verify_packaged_runtime_and_graphml(
     verify_root: &Path,
     fixture: &Path,
 ) -> Result<()> {
-    let exported = Command::new(executable)
-        .arg("--store")
-        .arg(store)
-        .args(["export", "--format", "json"])
-        .output()?;
-    let exported = successful_json(exported, "packaged runtime base export")?;
+    let exported =
+        packaged_raw_export_json(executable, store, &[], "export packaged runtime base graph")?;
     let graph = &exported["graph"];
     let repository_identity = graph["nodes"]
         .as_array()
@@ -9760,13 +9889,18 @@ process.stdout.write(JSON.stringify({
     {
         bail!("packaged runtime collector generated an incompatible trace: {generated_trace}");
     }
+    let trace_argument = trace_path
+        .strip_prefix(verify_root)
+        .context("packaged runtime trace path is outside the verification root")?;
 
     let validated = Command::new(executable)
+        .current_dir(verify_root)
         .arg("--store")
         .arg(store)
         .arg("runtime")
         .arg("validate")
-        .arg(&trace_path)
+        .arg("--file")
+        .arg(trace_argument)
         .arg("--json")
         .output()?;
     let validated = successful_json(validated, "packaged runtime trace validation")?;
@@ -9779,11 +9913,12 @@ process.stdout.write(JSON.stringify({
     }
 
     let imported = Command::new(executable)
+        .current_dir(verify_root)
         .arg("--store")
         .arg(store)
         .arg("runtime")
         .arg("import")
-        .arg(&trace_path)
+        .arg(trace_argument)
         .arg("--json")
         .output()?;
     let imported = successful_json(imported, "packaged runtime trace import")?;
@@ -9815,27 +9950,24 @@ process.stdout.write(JSON.stringify({
     }
 
     let render = || {
-        Command::new(executable)
-            .arg("--store")
-            .arg(store)
-            .args([
-                "export",
-                "--format",
-                "graphml",
+        packaged_raw_export_text(
+            executable,
+            store,
+            "graphml",
+            &[
                 "--phase",
                 "runtime",
                 "--session",
                 "milestone4-packaged-session",
-            ])
-            .output()
+            ],
+            "export packaged runtime GraphML",
+        )
     };
     let first = render()?;
     let second = render()?;
-    if !first.status.success()
-        || !second.status.success()
-        || first.stdout != second.stdout
-        || !String::from_utf8_lossy(&first.stdout).contains("<graphml xmlns=")
-        || !String::from_utf8_lossy(&first.stdout).contains("<data key=\"e_phase\">runtime</data>")
+    if first != second
+        || !first.contains("<graphml xmlns=")
+        || !first.contains("<data key=\"e_phase\">runtime</data>")
     {
         bail!("packaged GraphML runtime export was invalid or nondeterministic");
     }
@@ -9862,7 +9994,7 @@ process.stdout.write(JSON.stringify({
         .output()?;
     if !file.status.success()
         || !file.stdout.is_empty()
-        || fs::read(&graphml_path)? != first.stdout
+        || fs::read_to_string(&graphml_path)? != first
         || fs::read_dir(verify_root)?.any(|entry| {
             entry
                 .ok()
@@ -9870,10 +10002,10 @@ process.stdout.write(JSON.stringify({
                 .is_some_and(|name| name.starts_with(".depgraph-export-"))
         })
     {
-        bail!("packaged GraphML atomic file export did not match stdout");
+        bail!("packaged GraphML atomic file export did not match the canonical raw export");
     }
     if bytes_contain(&fs::read(&trace_path)?, b"release_secret_value")
-        || bytes_contain(&first.stdout, b"release_secret_value")
+        || bytes_contain(first.as_bytes(), b"release_secret_value")
         || bytes_contain(&fs::read(store)?, b"release_secret_value")
     {
         bail!("packaged runtime trace leaked a secret value");
@@ -12290,12 +12422,43 @@ fn verify_packaged_web_framework_query(
 }
 
 fn packaged_web_export_json(executable: &Path, store: &Path) -> Result<Value> {
-    packaged_web_query(
+    packaged_raw_export_json(
         executable,
         store,
-        &["export", "--format", "json"],
+        &[],
         "export the packaged Web semantic graph",
     )
+}
+
+fn packaged_raw_export_json(
+    executable: &Path,
+    store: &Path,
+    filters: &[&str],
+    action: &str,
+) -> Result<Value> {
+    let output_root = tempfile::tempdir().context("create packaged raw export directory")?;
+    let output_name = "graph.json";
+    let output = Command::new(executable)
+        .current_dir(output_root.path())
+        .arg("--store")
+        .arg(store)
+        .args(["export", "--format", "json"])
+        .args(filters)
+        .args(["--output", output_name])
+        .output()
+        .with_context(|| format!("failed to {action}"))?;
+    if !output.status.success() || !output.stdout.is_empty() {
+        bail!(
+            "failed to {action}: {}\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output_path = output_root.path().join(output_name);
+    let bytes = fs::read(&output_path)
+        .with_context(|| format!("read packaged raw export {}", output_path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("{action} returned invalid JSON"))
 }
 
 fn packaged_web_query(
@@ -12322,21 +12485,13 @@ fn packaged_web_query(
 }
 
 fn packaged_web_export_text(executable: &Path, store: &Path, format: &str) -> Result<String> {
-    let output = Command::new(executable)
-        .arg("--store")
-        .arg(store)
-        .args(["export", "--format", format])
-        .output()
-        .with_context(|| format!("failed to export packaged Web graph as {format}"))?;
-    if !output.status.success() {
-        bail!(
-            "packaged Web {format} export failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("packaged Web {format} export returned non-UTF-8 output"))
+    packaged_raw_export_text(
+        executable,
+        store,
+        format,
+        &[],
+        &format!("export packaged Web graph as {format}"),
+    )
 }
 
 fn packaged_web_export_filtered_text(
@@ -12346,29 +12501,45 @@ fn packaged_web_export_filtered_text(
     profile: &str,
     phase: &str,
 ) -> Result<String> {
+    packaged_raw_export_text(
+        executable,
+        store,
+        format,
+        &["--phase", phase, "--profile", profile],
+        &format!("export filtered packaged Web graph as {format}"),
+    )
+}
+
+fn packaged_raw_export_text(
+    executable: &Path,
+    store: &Path,
+    format: &str,
+    filters: &[&str],
+    action: &str,
+) -> Result<String> {
+    let output_root = tempfile::tempdir().context("create packaged raw export directory")?;
+    let output_name = format!("graph.{format}");
     let output = Command::new(executable)
+        .current_dir(output_root.path())
         .arg("--store")
         .arg(store)
-        .args([
-            "export",
-            "--format",
-            format,
-            "--phase",
-            phase,
-            "--profile",
-            profile,
-        ])
+        .args(["export", "--format", format])
+        .args(filters)
+        .arg("--output")
+        .arg(&output_name)
         .output()
-        .with_context(|| format!("failed to export filtered packaged Web graph as {format}"))?;
-    if !output.status.success() {
+        .with_context(|| format!("failed to {action}"))?;
+    if !output.status.success() || !output.stdout.is_empty() {
         bail!(
-            "packaged filtered Web {format} export failed: {}\n{}",
+            "failed to {action}: {}\nstdout={}\nstderr={}",
+            output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("packaged filtered Web {format} export returned non-UTF-8 output"))
+    let output_path = output_root.path().join(output_name);
+    fs::read_to_string(&output_path)
+        .with_context(|| format!("read packaged raw export {}", output_path.display()))
 }
 
 fn verify_packaged_web_graph_exports_deterministic(
@@ -13657,12 +13828,16 @@ fn copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_lf_normalized_text(source: &Path, destination: &Path) -> Result<()> {
-    let bytes = fs::read(source)
-        .with_context(|| format!("failed to read release text {}", source.display()))?;
+fn read_lf_normalized_text(path: &Path) -> Result<String> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read text {}", path.display()))?;
     let text = String::from_utf8(bytes)
-        .with_context(|| format!("release text {} is not UTF-8", source.display()))?;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        .with_context(|| format!("text {} is not UTF-8", path.display()))?;
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn copy_lf_normalized_text(source: &Path, destination: &Path) -> Result<()> {
+    let normalized = read_lf_normalized_text(source)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -14118,6 +14293,38 @@ mod tests {
             .is_err()
         );
 
+        for linker_policy_drift in [
+            ci.replacen("      fail-fast: false", "      fail-fast: true", 1),
+            ci.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
+            ci.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
+            ci.replacen("CARGO_INCREMENTAL: \"0\"", "CARGO_INCREMENTAL: \"1\"", 1),
+            ci.replacen(
+                "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+                "CARGO_PROFILE_DEV_DEBUG: \"1\"",
+                1,
+            ),
+            ci.replacen(
+                "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+                "CARGO_PROFILE_TEST_DEBUG: \"1\"",
+                1,
+            ),
+            ci.replacen(
+                "Reclaim integration build artifacts before the isolated Rust semantic gate",
+                "Do not reclaim integration artifacts before Rust semantic verification",
+                1,
+            ),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "ci.yml",
+                    &linker_policy_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
         let escaped_secret = ci.replacen(
             "GOTOOLCHAIN: local",
             r#"GOTOOLCHAIN: "${{ \u0073ecrets.RELEASE_TOKEN }}""#,
@@ -14259,6 +14466,20 @@ jobs:
             )
             .is_err()
         );
+        for linker_policy_drift in [
+            release.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
+            release.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "release.yml",
+                    &linker_policy_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
 
         let guard =
             fs::read_to_string(root.join(".github/workflows/stable-release-source-guard.yml"))?;

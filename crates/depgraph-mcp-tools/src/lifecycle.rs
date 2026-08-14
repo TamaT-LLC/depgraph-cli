@@ -2,7 +2,8 @@ use std::borrow::Cow;
 
 use depgraph_core::{
     DaemonAttempt, DaemonIncrementalTrace, DaemonPhase, DaemonStatus, DoctorResponse,
-    IncrementalChangeKind, IncrementalFileChange, RepositoryProfilePlanPreview,
+    IncrementalChangeKind, IncrementalFileChange, IncrementalInvalidationMode,
+    IncrementalInvalidationPlan, RepositoryProfilePlanPreview,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -179,6 +180,35 @@ impl TryFrom<DaemonIncrementalTrace> for AgentDaemonTrace {
     }
 }
 
+/// Bounded, path-free evidence that an incremental attempt used a planned invalidation.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDaemonInvalidationSummary {
+    schema_version: AgentToken,
+    mode: AgentToken,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_profile_plan_id: Option<AgentId>,
+    affected_profile_count: u64,
+}
+
+impl TryFrom<IncrementalInvalidationPlan> for AgentDaemonInvalidationSummary {
+    type Error = ContractBuildError;
+
+    fn try_from(plan: IncrementalInvalidationPlan) -> Result<Self, Self::Error> {
+        let mode = match plan.mode {
+            IncrementalInvalidationMode::ScopedReplacement => "scoped_replacement",
+            IncrementalInvalidationMode::WorkspaceReplan => "workspace_replan",
+        };
+        Ok(Self {
+            schema_version: parse_value(plan.schema_version)?,
+            mode: parse_value(mode.to_owned())?,
+            base_profile_plan_id: plan.base_profile_plan_id.map(parse_value).transpose()?,
+            affected_profile_count: u64::try_from(plan.affected_profile_ids.len())
+                .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDaemonAttempt {
@@ -195,6 +225,8 @@ pub struct AgentDaemonAttempt {
     base_snapshot_id: Option<SnapshotId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_snapshot_id: Option<SnapshotId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidation_summary: Option<AgentDaemonInvalidationSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     incremental_trace: Option<AgentDaemonTrace>,
 }
@@ -219,6 +251,10 @@ impl TryFrom<DaemonAttempt> for AgentDaemonAttempt {
                 .collect::<Result<_, _>>()?,
             base_snapshot_id: attempt.base_snapshot_id.map(parse_value).transpose()?,
             completed_snapshot_id: attempt.completed_snapshot_id.map(parse_value).transpose()?,
+            invalidation_summary: attempt
+                .invalidation_plan
+                .map(AgentDaemonInvalidationSummary::try_from)
+                .transpose()?,
             incremental_trace: attempt
                 .incremental_trace
                 .map(AgentDaemonTrace::try_from)
@@ -880,5 +916,74 @@ mod tests {
         ))
         .unwrap();
         assert!(!schema.to_string().contains("#/$defs/"));
+    }
+
+    #[test]
+    fn daemon_attempt_projects_only_bounded_invalidation_evidence() {
+        let plan_id = format!("profile-selection-plan:sha256:{}", "3".repeat(64));
+        let profile_id = format!("profile:sha256:{}", "4".repeat(64));
+        let attempt: DaemonAttempt = serde_json::from_value(serde_json::json!({
+            "attempt_id": "attempt:fixture",
+            "scan_id": "scan:fixture",
+            "status": "completed",
+            "started_at": "2026-08-13T00:00:00.000Z",
+            "finished_at": "2026-08-13T00:00:01.000Z",
+            "changes": [{"kind": "modified", "new_path": "src/index.ts"}],
+            "base_snapshot_id": format!("snapshot:sha256:{}", "1".repeat(64)),
+            "completed_snapshot_id": format!("snapshot:sha256:{}", "2".repeat(64)),
+            "invalidation_plan": {
+                "schema_version": "incremental-plan-v2",
+                "base_snapshot_id": format!("snapshot:sha256:{}", "1".repeat(64)),
+                "base_profile_plan_id": plan_id,
+                "mode": "scoped_replacement",
+                "changes": [{"kind": "modified", "new_path": "src/index.ts"}],
+                "reasons": ["source_changed"],
+                "affected_package_locators": ["npm:workspace:fixture@1.0.0#."],
+                "affected_profile_ids": [profile_id.clone()],
+                "affected_generated_artifact_ids": [],
+                "replacement_scope": {
+                    "paths": ["src/index.ts"],
+                    "package_locators": ["npm:workspace:fixture@1.0.0#."],
+                    "profile_ids": [profile_id],
+                    "replanned_profile_ids": [],
+                    "artifact_node_ids": [],
+                    "adapters": ["web"]
+                }
+            },
+            "invalidation_error": "private invalidation diagnostic /outside/repository",
+            "incremental_trace": {
+                "schema_version": "daemon-incremental-trace-v1",
+                "mode": "semantic_noop",
+                "base_projection_milliseconds": 1,
+                "worker_capability_milliseconds": 2,
+                "worker_analysis_milliseconds": 3,
+                "store_commit_milliseconds": 4,
+                "total_milliseconds": 10
+            },
+            "error": null
+        }))
+        .unwrap();
+
+        let projected = AgentDaemonAttempt::try_from(attempt).unwrap();
+        let mut value = serde_json::to_value(projected).unwrap();
+        assert_eq!(
+            value["invalidation_summary"],
+            serde_json::json!({
+                "schema_version": "incremental-plan-v2",
+                "mode": "scoped_replacement",
+                "base_profile_plan_id": format!(
+                    "profile-selection-plan:sha256:{}",
+                    "3".repeat(64)
+                ),
+                "affected_profile_count": 1
+            })
+        );
+        let encoded = value.to_string();
+        assert!(!encoded.contains("invalidation_plan"));
+        assert!(!encoded.contains("private invalidation diagnostic"));
+        assert!(value["invalidation_summary"].get("paths").is_none());
+
+        value["invalidation_summary"]["paths"] = serde_json::json!(["src/index.ts"]);
+        assert!(serde_json::from_value::<AgentDaemonAttempt>(value).is_err());
     }
 }

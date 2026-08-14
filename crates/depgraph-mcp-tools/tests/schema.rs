@@ -746,7 +746,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 159, "review newly added object schemas explicitly");
+    assert_eq!(objects, 160, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -918,6 +918,23 @@ fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
     let doctor_validator = validator_for("Doctor");
     assert!(doctor_validator.is_valid(&doctor));
 
+    let invalidation_summary = json!({
+        "schema_version": "incremental-plan-v2",
+        "mode": "scoped_replacement",
+        "base_profile_plan_id": format!("profile-selection-plan:sha256:{}", "3".repeat(64)),
+        "affected_profile_count": 1
+    });
+    let invalidation_validator = validator_for("AgentDaemonInvalidationSummary");
+    assert!(invalidation_validator.is_valid(&invalidation_summary));
+    for field in ["paths", "affected_profile_ids", "error"] {
+        let mut invalid = invalidation_summary.clone();
+        invalid[field] = json!(["/private/secret"]);
+        assert!(
+            !invalidation_validator.is_valid(&invalid),
+            "daemon invalidation summary schema accepted {field}"
+        );
+    }
+
     for field in [
         "root",
         "diagnostic_root",
@@ -958,7 +975,12 @@ fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
         );
     }
 
-    for definition in ["AgentProfilePlan", "AgentDaemonStatus", "AgentDoctor"] {
+    for definition in [
+        "AgentProfilePlan",
+        "AgentDaemonInvalidationSummary",
+        "AgentDaemonStatus",
+        "AgentDoctor",
+    ] {
         assert!(
             schema["$defs"].get(definition).is_some(),
             "missing {definition}"

@@ -750,7 +750,7 @@ impl DepgraphService {
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        let _writer = acquire_store_writer_lock(self.config().store_path())
+        let writer = acquire_store_writer_lock(self.config().store_path())
             .map_err(|_| DepgraphServiceError::StoreWriterConflict)?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
@@ -778,10 +778,18 @@ impl DepgraphService {
         } else {
             None
         };
-        Ok(ScanServiceOutcome {
+        let outcome = ScanServiceOutcome {
             outcome,
             completed_snapshot_id,
-        })
+        };
+        drop(store);
+        // A caller may immediately start another scan against the same store.
+        // Release exclusion synchronously because close-on-drop can otherwise
+        // leave a transient self-conflict on some hosts.
+        writer
+            .unlock()
+            .map_err(|source| DepgraphServiceError::store_operation(source.into()))?;
+        Ok(outcome)
     }
 
     /// Run and validate a scan while retaining the store-writer lock and
