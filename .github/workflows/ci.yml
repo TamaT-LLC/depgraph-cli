@@ -157,7 +157,6 @@ jobs:
         if: steps.compiler-pack-smoke.outputs.run == 'true'
         env:
           DEPGRAPH_TARGET: x86_64-unknown-linux-gnu
-          DEPGRAPH_TEST_CAPTURE_COMPILER_STDERR: "1"
           RUSTFLAGS: -C linker-features=-lld
         run: cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

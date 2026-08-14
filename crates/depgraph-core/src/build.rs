@@ -1225,17 +1225,8 @@ where
     let mut reader_errors = Vec::new();
     let (stdout, stdout_truncated) =
         finish_reader(stdout_task, "build stdout", &mut reader_errors).await?;
-    let (stderr, stderr_truncated) =
+    let (_stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
-    if plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER
-        && std::env::var_os("DEPGRAPH_TEST_CAPTURE_COMPILER_STDERR").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-    {
-        eprintln!(
-            "depgraph controlled compiler diagnostic:\n{}",
-            String::from_utf8_lossy(&stderr)
-        );
-    }
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
     let mut outcome = outcome;
     let mut diagnostic_code = diagnostic_code;
@@ -1744,10 +1735,28 @@ fn add_linux_cc_alias(command: &mut Command, root: &Path) -> Result<()> {
         &[Path::new("/usr/bin/cc"), Path::new("/bin/cc")],
         root,
     )?;
+    let metadata = fs::symlink_metadata(alternatives_cc)
+        .context("C compiler alternatives alias is unavailable")?;
+    let alias_target =
+        fs::read_link(alternatives_cc).context("C compiler alternatives alias is unreadable")?;
+    let resolved_target = if alias_target.is_absolute() {
+        alias_target.clone()
+    } else {
+        alternatives_cc
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join(&alias_target)
+    };
+    if !metadata.file_type().is_symlink()
+        || resolved_target.canonicalize().ok().as_deref() != Some(compiler.as_path())
+        || !compiler.starts_with("/usr")
+    {
+        bail!("C compiler alternatives alias does not resolve to the trusted /usr executable");
+    }
     command
         .args(["--dir", "/etc/alternatives"])
-        .arg("--ro-bind")
-        .arg(compiler)
+        .arg("--symlink")
+        .arg(alias_target)
         .arg(alternatives_cc);
     Ok(())
 }
