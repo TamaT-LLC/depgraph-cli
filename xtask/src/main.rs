@@ -2067,6 +2067,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`v0.5.0-rc.1` tag remains immutable and was not published",
         "canonicalizes the relative",
         "checkout-built CLI path before switching",
+        "explicit 15-minute Windows semantic ceiling",
+        "retaining the 10-minute",
         "| Product and Rust/Go/Web adapters | `0.5.0` |",
         "| Worker protocol / graph schema | `1.0` |",
         "| SQLite Store | schema `17` |",
