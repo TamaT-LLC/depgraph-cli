@@ -313,6 +313,16 @@ test("trace safety fails closed on project or compound shell commands", () => {
     true,
   );
   assert.equal(
+    observation('/bin/zsh -lc "rg --pr{,}e ./project-script pattern ."')
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'rg pattern *(.e:project-script:)' ")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
     observation('/bin/zsh -lc "rg \'--hostname-bin=./project-script\' pattern ."')
       .project_code_execution_observed,
     true,

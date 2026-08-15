@@ -89,7 +89,6 @@ const DOGFOOD_SAFETY_BASELINE = Object.freeze({
   daemon_state_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   relevant_processes: 0,
 });
-const SHELL_COMMAND = /^\/bin\/zsh -(?:l)?c (["'])([\s\S]*)\1$/u;
 const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
 const UNSAFE_GIT_OPTIONS = new Set(["--ext-diff", "--output", "--textconv"]);
 const UNSAFE_RG_OPTIONS = new Set(["--hostname-bin", "--pre", "--pre-glob"]);
@@ -676,11 +675,21 @@ function hasUnsafeOption(payload, argumentOffset, unsafeOptions) {
   ));
 }
 
+function shellCommandPayload(command) {
+  const words = shellWords(command);
+  if (
+    words === null
+    || words.length !== 3
+    || words[0] !== "/bin/zsh"
+    || !["-c", "-lc"].includes(words[1])
+  ) return null;
+  return words[2];
+}
+
 function approvedReadOnlyCommand(command) {
   if (typeof command !== "string") return false;
-  const match = command.match(SHELL_COMMAND);
-  if (match === null || hasUnsafeShellSyntax(match[2])) return false;
-  const payload = match[2];
+  const payload = shellCommandPayload(command);
+  if (payload === null || hasUnsafeShellSyntax(payload)) return false;
   if (APPROVED_GIT_COMMAND.test(payload)) {
     return !hasUnsafeOption(payload, 2, UNSAFE_GIT_OPTIONS);
   }
@@ -711,7 +720,7 @@ function hasUnsafeShellSyntax(payload) {
       continue;
     }
     if (
-      (quote === null && ";&|<>\r\n".includes(character))
+      (quote === null && ";&|<>\r\n(){}[]*?~#!^".includes(character))
       || ((quote === null || quote === '"') && character === "`")
       || ((quote === null || quote === '"') && character === "$")
     ) return true;
