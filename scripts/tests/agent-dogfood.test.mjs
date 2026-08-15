@@ -273,6 +273,26 @@ test("trace safety fails closed on project or compound shell commands", () => {
     true,
   );
   assert.equal(
+    observation("/bin/zsh -lc 'git diff --output=/tmp/diff.txt HEAD^ HEAD'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'git log --output /tmp/log.txt -1'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation('/bin/zsh -lc "git show \'--output=/tmp/show.txt\' HEAD"')
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation('/bin/zsh -lc "git diff --out\'\'put=/tmp/diff.txt HEAD^ HEAD"')
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
     observation("/bin/zsh -lc 'sed -i bak README.md'")
       .project_code_execution_observed,
     true,

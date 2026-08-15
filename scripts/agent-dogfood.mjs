@@ -91,7 +91,7 @@ const DOGFOOD_SAFETY_BASELINE = Object.freeze({
 });
 const SHELL_COMMAND = /^\/bin\/zsh -(?:l)?c (["'])([\s\S]*)\1$/u;
 const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
-const UNSAFE_GIT_OPTION = /(?:^|\s)--(?:ext-diff|textconv)(?:[=\s]|$)/u;
+const UNSAFE_GIT_OPTIONS = new Set(["--ext-diff", "--output", "--textconv"]);
 const UNSAFE_RG_OPTION = /(?:^|\s)--(?:hostname-bin|pre|pre-glob)(?:[=\s]|$)/u;
 const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
 const DOGFOOD_CLAIM_IDS = Object.freeze([
@@ -625,12 +625,63 @@ function codeUnitCompare(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function shellWords(payload) {
+  const words = [];
+  let word = "";
+  let wordStarted = false;
+  let quote = null;
+  for (let index = 0; index < payload.length; index += 1) {
+    const character = payload[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else word += character;
+      continue;
+    }
+    if (character === "\\") {
+      if (index + 1 >= payload.length) return null;
+      wordStarted = true;
+      word += payload[index + 1];
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      quote = quote === '"' ? null : '"';
+      wordStarted = true;
+      continue;
+    }
+    if (quote === null && character === "'") {
+      quote = "'";
+      wordStarted = true;
+      continue;
+    }
+    if (quote === null && /\s/u.test(character)) {
+      if (wordStarted) words.push(word);
+      word = "";
+      wordStarted = false;
+      continue;
+    }
+    wordStarted = true;
+    word += character;
+  }
+  if (quote !== null) return null;
+  if (wordStarted) words.push(word);
+  return words;
+}
+
+function hasUnsafeGitOption(payload) {
+  const words = shellWords(payload);
+  if (words === null) return true;
+  return words.slice(2).some((word) => [...UNSAFE_GIT_OPTIONS].some(
+    (option) => word === option || word.startsWith(`${option}=`),
+  ));
+}
+
 function approvedReadOnlyCommand(command) {
   if (typeof command !== "string") return false;
   const match = command.match(SHELL_COMMAND);
   if (match === null || hasUnsafeShellSyntax(match[2])) return false;
   const payload = match[2];
-  if (APPROVED_GIT_COMMAND.test(payload)) return !UNSAFE_GIT_OPTION.test(payload);
+  if (APPROVED_GIT_COMMAND.test(payload)) return !hasUnsafeGitOption(payload);
   if (/^rg(?:\s|$)/u.test(payload)) return !UNSAFE_RG_OPTION.test(payload);
   return APPROVED_SED_PRINT.test(payload);
 }
