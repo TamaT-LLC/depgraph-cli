@@ -107,11 +107,15 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
     "compiler-precise-hostile",
     "go",
     "integration (macos-15, aarch64-apple-darwin)",
-    "integration (ubuntu-24.04, x86_64-unknown-linux-gnu)",
+    "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
     "rust",
     "web",
     "windows-smoke",
 ];
+const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
+    "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
+const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
+    "335945d35d3b99f169a55c3a7101806a21a6a75cd7b3249ee502cee89eb806cf";
 const RELEASE_CARGO_BUILD_TARGETS: &[(&str, Option<&str>, Option<&str>)] = &[
     ("depgraph-cli", Some("depgraph"), Some("packaged")),
     ("depgraph-mcp", Some("depgraph-mcp"), None),
@@ -2246,6 +2250,32 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.6 release note is missing contract {required:?}");
         }
     }
+    let rc7_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.7.md"))?;
+    for required in [
+        "seventh v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.7` tag",
+        "`v0.5.0-rc.1` through `v0.5.0-rc.6` tags remain immutable",
+        "Full CI run `31867648482`",
+        "non-empty `rustflags` matrix value",
+        V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
+        V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256,
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.7.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc7_release_note.contains(required) {
+            bail!("v0.5.0-rc.7 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2257,6 +2287,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "local `git rev-parse <tag>^{tag}`",
         "計51点",
         "checkout内のproduct binaryや未公開package artifact",
+        "non-empty matrix値をすべて含む",
+        V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
     ] {
         if !release_procedure.contains(required) {
             bail!("release procedure is missing post-publish contract {required:?}");
@@ -2266,6 +2298,11 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         != STABLE_UPGRADE_SOURCE_FIXTURE_SHA256
     {
         bail!("official v0.4.0-rc.6 store fixture was modified");
+    }
+    if sha256_file(&root.join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH))?
+        != V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256
+    {
+        bail!("captured v0.5.0-rc.6 Full CI API fixture was modified");
     }
     let compatibility = release_compatibility();
     if compatibility.worker_protocol_version != depgraph_protocol::PROTOCOL_VERSION
@@ -2341,6 +2378,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.7.md",
         "docs/releases/v0.5.0-rc.6.md",
         "docs/releases/v0.5.0-rc.5.md",
         "docs/releases/v0.5.0-rc.4.md",
@@ -14179,7 +14217,8 @@ mod tests {
         STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
         StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task,
         V0_2_RC1_STORE_SCHEMA_VERSION, V0_4_RC1_STORE_SCHEMA_VERSION,
-        V0_4_STABLE_RELEASE_BASELINE_DIGEST, VERSION, WEB_SEMANTIC_CAPABILITIES,
+        V0_4_STABLE_RELEASE_BASELINE_DIGEST, V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
+        V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION, WEB_SEMANTIC_CAPABILITIES,
         WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
         WorkerBackend, archive_entries, cargo_metadata, cargo_runtime_packages,
         compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
@@ -14189,7 +14228,7 @@ mod tests {
         release_post_publish_evidence, remove_transient_build_run_ids, rust_backend_from_handshake,
         rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
-        validate_cross_language_package_smoke, verify_checksum_sidecar,
+        validate_cross_language_package_smoke, validate_full_ci_run, verify_checksum_sidecar,
         verify_cross_language_package_smoke, verify_github_actions_security,
         verify_local_markdown_links, verify_mcp_dependencies,
         verify_mcp_tasks_architecture_decision, verify_packaged_cross_language,
@@ -14360,6 +14399,53 @@ mod tests {
         assert_eq!(evidence.full_ci.jobs.len(), FULL_CI_JOB_NAMES.len());
         assert!(evidence.workflow_public_asset_identity);
         assert!(evidence.public_download_reverified);
+        Ok(())
+    }
+
+    #[test]
+    fn full_ci_job_identity_matches_captured_github_api_response() -> Result<()> {
+        let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
+        assert_eq!(
+            super::sha256_file_streaming(&fixture)?,
+            V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256
+        );
+        let source_sha = "7b0cd4cb31067874a71854c212be037b00519889";
+        let run = validate_full_ci_run(&fixture, source_sha)?;
+        assert_eq!(run.run_id, 31_867_648_482);
+        assert_eq!(run.head_sha, source_sha);
+        assert_eq!(run.jobs.len(), 8);
+        assert!(run.jobs.iter().any(|job| {
+            job.name
+                == "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)"
+                && job.conclusion == "success"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn full_ci_job_identity_rejects_the_stale_linux_display_name() -> Result<()> {
+        let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
+        let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let linux = input["jobs"]
+            .as_array_mut()
+            .expect("captured Full CI jobs")
+            .iter_mut()
+            .find(|job| {
+                job["name"]
+                    == "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)"
+            })
+            .expect("captured Linux integration job");
+        linux["name"] = json!("integration (ubuntu-24.04, x86_64-unknown-linux-gnu)");
+
+        let temp = tempfile::tempdir()?;
+        let stale = temp.path().join("stale-full-ci.json");
+        fs::write(&stale, serde_json::to_vec(&input)?)?;
+        let error = validate_full_ci_run(&stale, "7b0cd4cb31067874a71854c212be037b00519889")
+            .expect_err("stale implicit matrix job identity must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "full CI evidence is not the exact all-green candidate run"
+        );
         Ok(())
     }
 

@@ -1,0 +1,42 @@
+{
+  "database_id": 31867648482,
+  "head_sha": "7b0cd4cb31067874a71854c212be037b00519889",
+  "head_branch": "main",
+  "event": "workflow_dispatch",
+  "conclusion": "success",
+  "url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/31867648482",
+  "jobs": [
+    {
+      "name": "rust",
+      "conclusion": "success"
+    },
+    {
+      "name": "compiler-precise-hostile",
+      "conclusion": "success"
+    },
+    {
+      "name": "go",
+      "conclusion": "success"
+    },
+    {
+      "name": "web",
+      "conclusion": "success"
+    },
+    {
+      "name": "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
+      "conclusion": "success"
+    },
+    {
+      "name": "benchmark",
+      "conclusion": "success"
+    },
+    {
+      "name": "windows-smoke",
+      "conclusion": "success"
+    },
+    {
+      "name": "integration (macos-15, aarch64-apple-darwin)",
+      "conclusion": "success"
+    }
+  ]
+}
