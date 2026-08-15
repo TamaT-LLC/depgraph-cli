@@ -2,33 +2,33 @@
   "arm": "baseline",
   "artifacts": {
     "answer": {
-      "bytes": 3074,
+      "bytes": 3335,
       "path": "baseline-1.answer.json",
-      "sha256": "d2b5171a59575c5c3d7fdf258014e3f582be49c55234696466fac7e088abf40a"
+      "sha256": "d31041086daa0d4e169e65341dff6440eef8ca58124c131db1e11f7a61759ad8"
     },
     "host_output": {
-      "bytes": 2424,
+      "bytes": 2685,
       "path": "baseline-1.last-message.txt",
-      "sha256": "20b175b621b80148a964bce91288a82f9cee97917032183234ecf4bd8059ec7e"
+      "sha256": "6a3281b4402f29975389d98af885f0470f2c95d328a8e8eb847964c4bc15c272"
     },
     "safety": {
       "bytes": 1084,
       "path": "baseline-1.safety.json",
-      "sha256": "41aae2b67de18ff8fb720d631c3737092f758202431f1701e867d492a511a1db"
+      "sha256": "fbdb267c9194d2b06dc699d2f4373b65b8719ee822b59543b1f0d02e917e5e96"
     },
     "trace": {
-      "bytes": 5432,
+      "bytes": 8590,
       "path": "baseline-1.trace.jsonl",
-      "sha256": "e289a6f3297ad7d784c974e41c09276f5de78e4371cf11f46eb0a304191db43a"
+      "sha256": "8ac57a254f17ece327fa87661074f809eaf59248a6d42f50f7664ce6df031c0e"
     }
   },
   "failure": null,
-  "finished_at": "2026-08-15T20:03:05.562Z",
+  "finished_at": "2026-08-15T20:49:45.772Z",
   "identity": {
     "answer_schema_sha256": "8da6fb5d20b130859077769c7afd7acb0bab325eade9b9d454a9635ca5bc42c5",
     "approval_policy": "never",
     "benchmark_id": "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
-    "environment_sha256": "e9897c91593c12c03a517c64395ea3ed0979266a06eb1bd4547ba166daa62c9f",
+    "environment_sha256": "bf70ad335f24177bac44c34db852a82dda8034d5c79e2cb0476706bc92de8a50",
     "maximum_tool_calls": 28,
     "mcp_enabled_tools": [
       "agent_edges_list",
@@ -52,32 +52,33 @@
       "snapshot_diff_get"
     ],
     "model": "gpt-5.6-terra",
-    "prompt_sha256": "636e788263f5ee8c0451c21e5abf7562177ced17ebae39c0066206bcd34c6de9",
+    "prompt_sha256": "7a09400667b53f44e1b0ae0c69bcbb8759712a957bc8ff8b56910a261badec19",
     "reasoning_effort": "medium",
     "repository_commit": "85dcf029ad4d536b1ffa5f9b148749f2beb95128",
     "repository_tree": "8bed5aeb17a9213946f7f9e6711923b4e8d419b4",
     "safety_schema_sha256": "6a28a611b227a2ea9416fd5bc93d68bdf4c8e90bebbcae7bbf28c267024bbde2",
     "sandbox": "read-only",
-    "spec_sha256": "418e41532a580f806fe997abb48a613318a08a8278b9fed5aa68c4f12b64adf3",
+    "spec_sha256": "7c5d8ffbeaeac8858e35e2d44745b945e1e3c002fabd087a88aa65a094f9d517",
     "timeout_ms": 300000
   },
   "ordinal": 1,
   "runtime": {
-    "cached_input_tokens": 26112,
-    "effective_tokens": 8273,
-    "elapsed_ms": 29496,
+    "cached_input_tokens": 46336,
+    "effective_tokens": 6342,
+    "elapsed_ms": 41566,
     "exit_code": 0,
     "host_output_valid": true,
-    "input_tokens": 33026,
+    "input_tokens": 50689,
     "mcp_tools": [],
-    "output_tokens": 1359,
+    "mcp_tools_succeeded": [],
+    "output_tokens": 1989,
     "stderr_bytes": 268,
-    "stderr_sha256": "6a02727e03fb1b8247b8b90daddf00d940906fcff0229655de47b388ccdd28da",
+    "stderr_sha256": "99144645cdd1fff17cfbdc3eb0a2c207fe4c84fe1c94dc23ca1e0dc0e656d31f",
     "timed_out": false,
     "tool_budget_exhausted": false,
-    "tool_calls": 0,
-    "tool_result_bytes": 0,
-    "total_tokens": 34385
+    "tool_calls": 1,
+    "tool_result_bytes": 41,
+    "total_tokens": 52678
   },
   "safety": {
     "daemon_state_unchanged": true,
@@ -123,5 +124,5 @@
     ],
     "total_claims": 12
   },
-  "started_at": "2026-08-15T20:02:35.813Z"
+  "started_at": "2026-08-15T20:49:03.954Z"
 }

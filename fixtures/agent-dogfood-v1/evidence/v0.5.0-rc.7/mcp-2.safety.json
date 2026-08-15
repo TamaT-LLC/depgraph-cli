@@ -16,8 +16,8 @@
   "sample_id": "mcp-2",
   "schema_version": "agent-dogfood-safety-v1",
   "trace": {
-    "command_execution_count": 2,
-    "commands_sha256": "67b9d46396be3f96d7d20f738e719be7529ffae7b1da24884acbcb02ae7122fb",
+    "command_execution_count": 1,
+    "commands_sha256": "28dbe8bb61be69a5464ae3dcae23b98df2ac6a21aab36a8de8740c18144d6219",
     "project_code_execution_observed": false
   }
 }

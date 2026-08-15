@@ -3,84 +3,84 @@
     "candidate_coverage": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; snapshot coverage metrics are unavailable.",
+      "reason": "Dependency-graph MCP is unavailable; snapshot coverage metrics are not established.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; file-cycle graph evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source imports cannot establish opaque graph-cycle endpoints.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "go_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; graph resolution evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source imports do not establish graph resolution.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "package_cycles": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; package-cycle graph evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source/Git inspection cannot establish graph cycle count.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_candidate_import": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; edge status and precision require graph evidence.",
+      "reason": "Dependency-graph MCP is unavailable; source inspection cannot establish candidate precision.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_impact": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; impact traversal evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source/Git inspection cannot establish impact traversal.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_path": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; graph path evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source/Git inspection cannot establish a graph path.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_unresolved_type": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; edge status and precision require graph evidence.",
+      "reason": "Dependency-graph MCP is unavailable; source inspection cannot establish unresolved precision.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_file_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; requested snapshot digest is unavailable.",
+      "reason": "Dependency-graph MCP is unavailable; the required collection digest is not established.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_package_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; requested snapshot digest is unavailable.",
+      "reason": "Dependency-graph MCP is unavailable; the required snapshot-diff aggregate is not established.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; graph resolution evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source imports do not establish graph resolution.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependents": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "depgraph MCP is unavailable; direct incoming-edge evidence is required.",
+      "reason": "Dependency-graph MCP is unavailable; source inspection cannot establish all direct graph incoming edges.",
       "value": "unknown",
       "verdict": "insufficient"
     }

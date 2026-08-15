@@ -2,33 +2,33 @@
   "arm": "mcp",
   "artifacts": {
     "answer": {
-      "bytes": 5145,
+      "bytes": 5098,
       "path": "mcp-2.answer.json",
-      "sha256": "68c2b2668d781466cbfe6b131c24a0545794c817c5a46804a844811f3d2d31f3"
+      "sha256": "9437b910ceb0451c3f94dea09a10d1ad0afedadf87a0e77593c5f3ed03556ae0"
     },
     "host_output": {
-      "bytes": 3852,
+      "bytes": 3859,
       "path": "mcp-2.last-message.txt",
-      "sha256": "18b358ba4fffcd6645b34aaa47998c862af83d52dcb69348e9fe7b14f5f0b8d7"
+      "sha256": "b2611ec473b5d89521185486f6b8d061053eb161287685ca20cb84d244ff7282"
     },
     "safety": {
       "bytes": 1079,
       "path": "mcp-2.safety.json",
-      "sha256": "757c8651d8fa792acb5e7fb24d1cdf98d524ad86d2d90160fbbe1cd061ad9a02"
+      "sha256": "1f3e50edbee5d5f64453faf47f6fdd35fb8f866262fe837e1c381d39f241dd23"
     },
     "trace": {
-      "bytes": 224193,
+      "bytes": 228554,
       "path": "mcp-2.trace.jsonl",
-      "sha256": "4ff89210f480f4049c0d778ae95c4f9491772d0500c1b8b602a1ede0a7e4d4cf"
+      "sha256": "f06b7a7b54cd1cc8247dc37e091213e10a9d7b6f225ec6275ca2a1460ddd1a49"
     }
   },
   "failure": null,
-  "finished_at": "2026-08-15T20:09:11.364Z",
+  "finished_at": "2026-08-15T20:55:27.726Z",
   "identity": {
     "answer_schema_sha256": "8da6fb5d20b130859077769c7afd7acb0bab325eade9b9d454a9635ca5bc42c5",
     "approval_policy": "never",
     "benchmark_id": "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
-    "environment_sha256": "e9897c91593c12c03a517c64395ea3ed0979266a06eb1bd4547ba166daa62c9f",
+    "environment_sha256": "bf70ad335f24177bac44c34db852a82dda8034d5c79e2cb0476706bc92de8a50",
     "maximum_tool_calls": 28,
     "mcp_enabled_tools": [
       "agent_edges_list",
@@ -52,23 +52,23 @@
       "snapshot_diff_get"
     ],
     "model": "gpt-5.6-terra",
-    "prompt_sha256": "636e788263f5ee8c0451c21e5abf7562177ced17ebae39c0066206bcd34c6de9",
+    "prompt_sha256": "7a09400667b53f44e1b0ae0c69bcbb8759712a957bc8ff8b56910a261badec19",
     "reasoning_effort": "medium",
     "repository_commit": "85dcf029ad4d536b1ffa5f9b148749f2beb95128",
     "repository_tree": "8bed5aeb17a9213946f7f9e6711923b4e8d419b4",
     "safety_schema_sha256": "6a28a611b227a2ea9416fd5bc93d68bdf4c8e90bebbcae7bbf28c267024bbde2",
     "sandbox": "read-only",
-    "spec_sha256": "418e41532a580f806fe997abb48a613318a08a8278b9fed5aa68c4f12b64adf3",
+    "spec_sha256": "7c5d8ffbeaeac8858e35e2d44745b945e1e3c002fabd087a88aa65a094f9d517",
     "timeout_ms": 300000
   },
   "ordinal": 2,
   "runtime": {
-    "cached_input_tokens": 636928,
-    "effective_tokens": 59486,
-    "elapsed_ms": 135073,
+    "cached_input_tokens": 609536,
+    "effective_tokens": 59773,
+    "elapsed_ms": 127444,
     "exit_code": 0,
     "host_output_valid": true,
-    "input_tokens": 692097,
+    "input_tokens": 665050,
     "mcp_tools": [
       "agent_nodes_list",
       "get_context",
@@ -79,14 +79,24 @@
       "graph_path_get",
       "snapshot_diff_get"
     ],
-    "output_tokens": 4317,
+    "mcp_tools_succeeded": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
+    "output_tokens": 4259,
     "stderr_bytes": 268,
-    "stderr_sha256": "61a63ae25d9a3c2955d5d38869f2b1e6a720442ab847b2e7ed62717ca6f50755",
+    "stderr_sha256": "03394139361220725f7e832ca2b6506bbda7261d9114d34361755f55f9ce2a6e",
     "timed_out": false,
     "tool_budget_exhausted": false,
-    "tool_calls": 18,
-    "tool_result_bytes": 202438,
-    "total_tokens": 696414
+    "tool_calls": 17,
+    "tool_result_bytes": 207684,
+    "total_tokens": 669309
   },
   "safety": {
     "daemon_state_unchanged": true,
@@ -115,5 +125,5 @@
     "missed_major_claim_ids": [],
     "total_claims": 12
   },
-  "started_at": "2026-08-15T20:06:56.039Z"
+  "started_at": "2026-08-15T20:53:20.028Z"
 }

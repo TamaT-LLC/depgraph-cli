@@ -82,8 +82,14 @@ const DOGFOOD_REQUIRED_MCP_TOOLS = Object.freeze([
   "graph_path_get",
   "snapshot_diff_get",
 ]);
+const DOGFOOD_SAFETY_BASELINE = Object.freeze({
+  source_sha256: "ee7c2d70bff926657b091834fa5bc3a69a04f3d3573b116e1d8e3f194d9a9515",
+  store_sha256: "9b03498b33abed475f7950aa865fb9d8c755f0cb0015dc923495b60792739f20",
+  journal_sha256: "15df9ae7a75ab8383c84066c9d5e326ba7ef18f1c60655026d3a89be2b7564b9",
+  daemon_state_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  relevant_processes: 0,
+});
 const SHELL_COMMAND = /^\/bin\/zsh -(?:l)?c (["'])([\s\S]*)\1$/u;
-const UNSAFE_SHELL_SYNTAX = /(?:&&|\|\||[;&|<>`]|\$\(|[\r\n])/u;
 const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
 const UNSAFE_GIT_OPTION = /(?:^|\s)--(?:ext-diff|textconv)(?:[=\s]|$)/u;
 const UNSAFE_RG_OPTION = /(?:^|\s)--(?:hostname-bin|pre|pre-glob)(?:[=\s]|$)/u;
@@ -204,6 +210,7 @@ export function validateSpec(spec) {
       "release",
       "repository",
       "snapshots",
+      "safety_baseline",
       "host",
       "thresholds",
       "claims",
@@ -240,6 +247,13 @@ export function validateSpec(spec) {
     || !exactKeys(spec.snapshots, ["baseline", "candidate"])
     || !exactKeys(spec.snapshots.baseline, ["name", "id", "source_revision"])
     || !exactKeys(spec.snapshots.candidate, ["name", "id", "source_revision"])
+    || !exactKeys(spec.safety_baseline, [
+      "source_sha256",
+      "store_sha256",
+      "journal_sha256",
+      "daemon_state_sha256",
+      "relevant_processes",
+    ])
     || !exactKeys(spec.host, [
       "program",
       "minimum_cli_version",
@@ -262,6 +276,7 @@ export function validateSpec(spec) {
   ) {
     throw new Error("Agent dogfood spec is incomplete or incompatible");
   }
+  validateSafetySnapshot(spec.safety_baseline);
   for (const [label, value] of [
     ["release archive", spec.release.archive?.sha256],
     ["compiler-pack archive", spec.release.compiler_pack_archive?.sha256],
@@ -297,6 +312,7 @@ export function validateSpec(spec) {
     || spec.snapshots.candidate?.source_revision !== spec.repository.candidate_commit
     || spec.snapshots.baseline.name !== "agent-tools-baseline"
     || spec.snapshots.candidate.name !== "rc7-candidate"
+    || canonicalJson(spec.safety_baseline) !== canonicalJson(DOGFOOD_SAFETY_BASELINE)
     || typeof spec.snapshots.baseline.id !== "string"
     || typeof spec.snapshots.candidate.id !== "string"
     || !/^snapshot:sha256:[0-9a-f]{64}$/u.test(spec.snapshots.baseline.id)
@@ -526,6 +542,8 @@ export function traceMetrics(text) {
   let outputTokens = null;
   let finalMessage = null;
   const mcpTools = new Set();
+  const mcpToolsSucceeded = new Set();
+  const startedMcpTools = new Map();
   for (const [lineIndex, line] of text.split(/\r?\n/u).entries()) {
     if (line.length === 0) continue;
     let event;
@@ -540,6 +558,28 @@ export function traceMetrics(text) {
       else if (event.type === "item.started") anonymousTools += 1;
       if (item.type === "mcp_tool_call" && typeof item.tool === "string") {
         mcpTools.add(item.tool);
+        if (event.type === "item.started" && typeof item.id === "string") {
+          const previous = startedMcpTools.get(item.id);
+          if (previous !== undefined && previous !== item.tool) {
+            throw new Error(`Codex MCP call ${item.id} changed tools within its trace`);
+          }
+          startedMcpTools.set(item.id, item.tool);
+        }
+        if (
+          event.type === "item.completed"
+          && typeof item.id === "string"
+          && startedMcpTools.get(item.id) === item.tool
+          && item.status === "completed"
+          && item.error == null
+          && isRecord(item.result)
+          && isRecord(item.result.structured_content)
+          && item.result.structured_content.contract_version
+            === "depgraph-mcp-tools-v1"
+          && item.result.structured_content.repository_id === "repository"
+          && isRecord(item.result.structured_content.result)
+          && item.result.isError !== true
+          && item.result.is_error !== true
+        ) mcpToolsSucceeded.add(item.tool);
       }
       if (event.type === "item.completed") {
         toolResultBytes += stringBytes(
@@ -577,6 +617,7 @@ export function traceMetrics(text) {
       : inputTokens - cachedInputTokens + outputTokens,
     final_message: finalMessage,
     mcp_tools: [...mcpTools].sort(),
+    mcp_tools_succeeded: [...mcpToolsSucceeded].sort(),
   };
 }
 
@@ -587,11 +628,42 @@ function codeUnitCompare(left, right) {
 function approvedReadOnlyCommand(command) {
   if (typeof command !== "string") return false;
   const match = command.match(SHELL_COMMAND);
-  if (match === null || UNSAFE_SHELL_SYNTAX.test(match[2])) return false;
+  if (match === null || hasUnsafeShellSyntax(match[2])) return false;
   const payload = match[2];
   if (APPROVED_GIT_COMMAND.test(payload)) return !UNSAFE_GIT_OPTION.test(payload);
   if (/^rg(?:\s|$)/u.test(payload)) return !UNSAFE_RG_OPTION.test(payload);
   return APPROVED_SED_PRINT.test(payload);
+}
+
+function hasUnsafeShellSyntax(payload) {
+  let quote = null;
+  for (let index = 0; index < payload.length; index += 1) {
+    const character = payload[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      quote = quote === '"' ? null : '"';
+      continue;
+    }
+    if (quote === null && character === "'") {
+      quote = "'";
+      continue;
+    }
+    if (
+      (quote === null && ";&|<>\r\n".includes(character))
+      || ((quote === null || quote === '"') && character === "`")
+      || ((quote === null || quote === '"')
+        && character === "$"
+        && payload[index + 1] === "(")
+    ) return true;
+  }
+  return quote !== null;
 }
 
 export function traceSafety(text) {
@@ -723,7 +795,11 @@ function validateSafetySnapshot(snapshot) {
   ]) assertDigest(digest, `Agent dogfood safety ${label}`);
 }
 
-function validateSafetyEvidence(evidence, sampleId, traceObservation) {
+function matchesSafetyBaseline(snapshot, baseline) {
+  return canonicalJson(snapshot) === canonicalJson(baseline);
+}
+
+function validateSafetyEvidence(evidence, sampleId, traceObservation, baseline) {
   if (
     !exactKeys(evidence, ["schema_version", "sample_id", "before", "after", "trace"])
     || evidence.schema_version !== SAFETY_SCHEMA_VERSION
@@ -743,6 +819,10 @@ function validateSafetyEvidence(evidence, sampleId, traceObservation) {
   if (canonicalJson(evidence.trace) !== canonicalJson(traceObservation)) {
     throw new Error("Agent dogfood safety trace observation drifted");
   }
+  if (
+    !matchesSafetyBaseline(evidence.before, baseline)
+    || !matchesSafetyBaseline(evidence.after, baseline)
+  ) throw new Error("Agent dogfood safety evidence drifted from its predeclared baseline");
   return evidence;
 }
 
@@ -874,6 +954,7 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
       "stderr_sha256",
       "host_output_valid",
       "mcp_tools",
+      "mcp_tools_succeeded",
     ])
     || (sample.runtime.exit_code !== null
       && !Number.isSafeInteger(sample.runtime.exit_code))
@@ -905,20 +986,30 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
         || sample.runtime.tool_calls > spec.host.maximum_tool_calls + 1))
     || !Array.isArray(sample.runtime.mcp_tools)
     || sample.runtime.mcp_tools.some((tool) => typeof tool !== "string")
+    || !Array.isArray(sample.runtime.mcp_tools_succeeded)
+    || sample.runtime.mcp_tools_succeeded.some((tool) => typeof tool !== "string")
     || canonicalJson(sample.runtime.mcp_tools)
       !== canonicalJson([...new Set(sample.runtime.mcp_tools)].sort())
+    || canonicalJson(sample.runtime.mcp_tools_succeeded)
+      !== canonicalJson([...new Set(sample.runtime.mcp_tools_succeeded)].sort())
+    || sample.runtime.mcp_tools_succeeded.some(
+      (tool) => !sample.runtime.mcp_tools.includes(tool),
+    )
     || (sample.arm === "baseline" && sample.runtime.mcp_tools.length !== 0)
+    || (sample.arm === "baseline" && sample.runtime.mcp_tools_succeeded.length !== 0)
     || (sample.arm === "mcp"
       && sample.runtime.mcp_tools.some(
         (tool) => !spec.host.mcp_enabled_tools.includes(tool),
       ))
     || canonicalJson(sample.runtime.mcp_tools) !== canonicalJson(metrics.mcp_tools)
+    || canonicalJson(sample.runtime.mcp_tools_succeeded)
+      !== canonicalJson(metrics.mcp_tools_succeeded)
   ) throw new Error("Agent dogfood sample runtime is invalid");
   assertDigest(sample.runtime.stderr_sha256, "Agent dogfood stderr");
   validateSampleFailure(sample.failure);
   if (
     sample.failure === null
-    && !mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools)
+    && !mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools_succeeded)
   ) throw new Error("Agent dogfood successful sample did not satisfy its tool contract");
   if (
     sample.failure === null
@@ -950,6 +1041,7 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
     jsonFile(safetyPath),
     expectedSampleId,
     traceObservation,
+    spec.safety_baseline,
   );
   if (
     canonicalJson(sample.safety)
@@ -1018,7 +1110,7 @@ function evaluateGate(spec, samples, environment, aggregates) {
   const thresholds = spec.thresholds;
   const mcpSamples = samples.filter((sample) => sample.arm === "mcp");
   const mcpToolContractPasses = mcpSamples.filter((sample) =>
-    mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools)
+    mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools_succeeded)
   ).length;
   const toolCallRatio = efficiencyRatio(
     mcp.tool_calls_median,
@@ -1309,6 +1401,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
     release: environment.release,
     repository: spec.repository,
     snapshots: environment.snapshots,
+    safety_baseline: spec.safety_baseline,
     host: {
       ...environment.host,
       model: spec.host.model,
@@ -1741,6 +1834,9 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
   }
   args.push("-");
   const before = await safetySnapshot(runtime);
+  if (!matchesSafetyBaseline(before, spec.safety_baseline)) {
+    throw new Error("Agent dogfood runtime drifted from the predeclared safety baseline");
+  }
   const startedAt = new Date();
   const startNs = process.hrtime.bigint();
   const child = spawn(spec.host.program, args, {
@@ -1890,7 +1986,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
   const safety = derivedSafety(safetyEvidence, metrics.mcp_tools);
   if (
     failure === null
-    && !mcpToolContractPassed(spec, arm, metrics.mcp_tools)
+    && !mcpToolContractPassed(spec, arm, metrics.mcp_tools_succeeded)
   ) {
     failure = typedFailure(
       "agent_misuse",
@@ -1939,6 +2035,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
       stderr_sha256: stderrHash.digest("hex"),
       host_output_valid: hostOutputValid,
       mcp_tools: metrics.mcp_tools,
+      mcp_tools_succeeded: metrics.mcp_tools_succeeded,
     },
     score: scoreAnswer(spec, answer),
     failure,

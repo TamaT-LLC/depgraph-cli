@@ -16,8 +16,8 @@
   "sample_id": "baseline-2",
   "schema_version": "agent-dogfood-safety-v1",
   "trace": {
-    "command_execution_count": 9,
-    "commands_sha256": "36a7617e3bded9ff4df49ee396d9e0df3022aa2a66a12d3c17f1a7cedee29080",
+    "command_execution_count": 0,
+    "commands_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     "project_code_execution_observed": false
   }
 }

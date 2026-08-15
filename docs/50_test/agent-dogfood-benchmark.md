@@ -26,7 +26,8 @@ Both arms use the same candidate checkout, prompt, model, reasoning effort,
 read-only sandbox, approval policy, 28-call budget, five-minute sample timeout,
 and three samples. The baseline has source and Git read tools. The MCP arm adds
 only nine fixed `read`-capability graph tools from the downloaded package and
-must exercise all eight tools needed by the ordered workflow in every sample.
+must successfully complete all eight tools needed by the ordered workflow in
+every sample. Started, failed, or incomplete MCP calls do not satisfy the gate.
 User configuration and repository rules are ignored, every host is ephemeral,
 and no successful sample may be selected or discarded.
 
@@ -50,10 +51,10 @@ scored sample for all three baseline and all three MCP executions.
 | False exact claims | 0 | 0 | total = 0 |
 | Candidate/unresolved promoted to exact | 0 | 0 | total = 0 |
 | Required MCP workflow tools | n/a | 8/8 per sample | each sample = 8/8 |
-| Tool calls | 0 | 17 | median <= 28 |
-| Tool-result bytes | 0 | 202,404 | median <= 327,680 |
-| Elapsed time | 29,496 ms | 132,819 ms | median <= 240,000 ms |
-| Effective host tokens | 8,273 | 77,922 | median <= 100,000 |
+| Tool calls | 1 | 17 | median <= 28 |
+| Tool-result bytes | 41 | 207,684 | median <= 327,680 |
+| Elapsed time | 41,566 ms | 127,444 ms | median <= 240,000 ms |
+| Effective host tokens | 12,094 | 59,773 | median <= 100,000 |
 | Successful setup | 3/3 | 3/3 | each arm = 3/3 |
 
 All MCP samples found all five major dependency/path/impact claims. Each missed
@@ -62,16 +63,18 @@ opaque node IDs and the Agent did not complete the permitted source mapping.
 No sample fabricated an exact result. The baseline correctly marked graph-only
 facts insufficient instead of guessing, which explains its zero accuracy.
 
-The observed MCP/baseline median ratios were undefined for calls and result
-bytes because both baseline medians were zero, 4.5029 for elapsed time, and
-9.4188 for effective tokens. Ratios remain diagnostic: a baseline may correctly
-stop with zero graph calls, so the pass/fail contract uses absolute MCP ceilings
-plus accuracy-not-below-baseline rather than an undefined or gameable ratio.
+The observed MCP/baseline median ratios were 17 calls, 5,065.4634 result bytes,
+3.0661 elapsed time, and 4.9424 effective tokens. Ratios remain diagnostic: a
+baseline may correctly stop with zero graph calls, so the pass/fail contract
+uses absolute MCP ceilings plus accuracy-not-below-baseline rather than an
+undefined or gameable ratio.
 
 Before and after every sample the runner fingerprints the repository, Store,
 operation journal, daemon-adjacent state, and matching depgraph process set.
-The digest-bound raw safety artifact preserves both snapshots, and offline
-verification derives each unchanged/process verdict from them. It also hashes
+The exact zero-process baseline and four fingerprints are predeclared in the
+fixed spec and verifier contract before the six-sample run. The digest-bound raw
+safety artifact preserves both snapshots, and offline verification requires
+both to match that external baseline before deriving each verdict. It also hashes
 the trace command inventory and fails closed on anything other than one
 non-compound `git`, `rg`, or `sed` read command. All six samples preserved the
 state, exposed no privileged MCP tool, executed no project code, and left no

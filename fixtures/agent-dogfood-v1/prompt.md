@@ -104,7 +104,7 @@ discovery for a graph query that already accepts a `path:` selector:
 8. Call `snapshot_diff_get` once for package and once for file.
 9. Call `graph_cycles_list` for file. If it returns opaque IDs, use exactly one
    source command:
-   `rg -n '^import .*from "\\./' workers/web/src --glob '*.ts'`.
+   `rg -n '^import .*from ' workers/web/src --glob '*.ts'`.
 10. Call `graph_cycles_list` for package, then call `get_context` for coverage.
 
 Never call `agent_nodes_list` with a repository path, a `path:` query, or

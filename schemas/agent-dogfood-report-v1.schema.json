@@ -13,6 +13,7 @@
     "release",
     "repository",
     "snapshots",
+    "safety_baseline",
     "host",
     "thresholds",
     "samples",
@@ -50,6 +51,7 @@
     "release": { "$ref": "#/$defs/release" },
     "repository": { "$ref": "#/$defs/repository" },
     "snapshots": { "$ref": "#/$defs/snapshots" },
+    "safety_baseline": { "$ref": "#/$defs/safetyBaseline" },
     "host": { "$ref": "#/$defs/host" },
     "thresholds": { "$ref": "#/$defs/thresholds" },
     "samples": {
@@ -160,6 +162,24 @@
         "baseline_revision": { "$ref": "#/$defs/gitObject" },
         "candidate_id": { "$ref": "#/$defs/snapshotId" },
         "candidate_revision": { "$ref": "#/$defs/gitObject" }
+      }
+    },
+    "safetyBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_sha256",
+        "store_sha256",
+        "journal_sha256",
+        "daemon_state_sha256",
+        "relevant_processes"
+      ],
+      "properties": {
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "store_sha256": { "$ref": "#/$defs/sha256" },
+        "journal_sha256": { "$ref": "#/$defs/sha256" },
+        "daemon_state_sha256": { "$ref": "#/$defs/sha256" },
+        "relevant_processes": { "type": "integer", "const": 0 }
       }
     },
     "host": {

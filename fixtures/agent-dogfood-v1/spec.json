@@ -45,6 +45,13 @@
       "source_revision": "85dcf029ad4d536b1ffa5f9b148749f2beb95128"
     }
   },
+  "safety_baseline": {
+    "source_sha256": "ee7c2d70bff926657b091834fa5bc3a69a04f3d3573b116e1d8e3f194d9a9515",
+    "store_sha256": "9b03498b33abed475f7950aa865fb9d8c755f0cb0015dc923495b60792739f20",
+    "journal_sha256": "15df9ae7a75ab8383c84066c9d5e326ba7ef18f1c60655026d3a89be2b7564b9",
+    "daemon_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "relevant_processes": 0
+  },
   "host": {
     "program": "codex",
     "minimum_cli_version": "0.146.0",

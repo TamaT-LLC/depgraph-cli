@@ -3,14 +3,14 @@
     "candidate_coverage": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Candidate snapshot coverage returned these deterministic aggregates.",
+      "reason": "Completed candidate snapshot coverage returned.",
       "value": "files=368;sites=93305;resolved=33028;candidates=96;external=25619;unresolved=34562;unsupported=3252;project_code_executed=false",
       "verdict": "supported"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "The cycle result exposes only opaque file IDs; public evidence does not establish their repository paths.",
+      "reason": "The file-cycle result exposes only opaque IDs, which cannot be mapped exactly to the requested paths from public evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
@@ -23,14 +23,14 @@
           "source": "mcp"
         }
       ],
-      "reason": "The exact resolved import targets the internal Go package.",
+      "reason": "Internal import resolved exactly.",
       "value": "target=go-package:github.com/TamaT-LLC/depgraph-cli/workers/go/internal/worker;line=10;kind=imports",
       "verdict": "supported"
     },
     "package_cycles": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Complete package-cycle result is empty.",
+      "reason": "No package-level cycles returned.",
       "value": "count=0",
       "verdict": "supported"
     },
@@ -43,7 +43,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "The import edge is reported as candidates with overapprox precision.",
+      "reason": "Import edge is a candidate with overapproximate precision.",
       "value": "target=rust-module:depgraph-cli:bin:depgraph::;status=candidates;precision=overapprox;line=2704",
       "verdict": "supported"
     },
@@ -61,7 +61,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Complete impact result contains three non-root nodes through depth two.",
+      "reason": "Complete depth-two impact set returned.",
       "value": "complete=true;items=cargo-target:depgraph-mcp-tools@0.5.0#crates/depgraph-mcp-tools:lib:depgraph_mcp_tools@2,file:crates/depgraph-mcp-tools/src/lib.rs@1,rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::@2",
       "verdict": "supported"
     },
@@ -74,7 +74,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Shortest graph path has one exact reexports edge.",
+      "reason": "Shortest path found.",
       "value": "target=rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::catalog;steps=1;kind=reexports",
       "verdict": "supported"
     },
@@ -87,21 +87,21 @@
           "source": "mcp"
         }
       ],
-      "reason": "The type-use edge is unresolved with heuristic precision.",
+      "reason": "Type-use edge is unresolved with heuristic precision.",
       "value": "target=unknown:rust:rust_type:DepgraphService;status=unresolved;precision=heuristic;line=2064",
       "verdict": "supported"
     },
     "snapshot_file_diff": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Authoritative file-diff collection digest was returned.",
+      "reason": "Authoritative file-diff collection digest returned.",
       "value": "digest=snapshot-diff-collection:sha256:9e7fee60ccb5e4ce7067888b27c3990961918872d3b7f84ae7cae735d3ae25cc",
       "verdict": "supported"
     },
     "snapshot_package_diff": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Package diff returned an empty, zero-change collection.",
+      "reason": "Package diff returned an empty collection.",
       "value": "total=0;empty=true;digest=snapshot-diff-collection:sha256:d3b1c57569e2d98c2ed067adc3d0b4f26fd79900fb0ceceb75d94e348935568b",
       "verdict": "supported"
     },
@@ -114,7 +114,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "The exact resolved import is the scanner file.",
+      "reason": "Scanner import resolved exactly.",
       "value": "target=file://workers/web/src/scanner.ts;line=17;condition=(mode == \"production\" && environment in [\"browser\", \"server\"])",
       "verdict": "supported"
     },
@@ -127,17 +127,17 @@
           "source": "mcp"
         },
         {
-          "line": 14,
-          "path": "workers/web/test/typescript-semantic.test.ts",
-          "source": "mcp"
-        },
-        {
           "line": 1,
           "path": "workers/web/src/scanner.ts",
           "source": "mcp"
+        },
+        {
+          "line": 14,
+          "path": "workers/web/test/typescript-semantic.test.ts",
+          "source": "mcp"
         }
       ],
-      "reason": "All three direct incoming edges are returned, including contains.",
+      "reason": "Three direct incoming edges returned.",
       "value": "count=3;sources=file://workers/web/src/worker.ts,file://workers/web/test/typescript-semantic.test.ts,id:package:sha256:5361cf1544af6a59b6697802c670280832a4935ae3baf80b3da6610660e415c9",
       "verdict": "supported"
     }

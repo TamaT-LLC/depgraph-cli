@@ -64,6 +64,10 @@ test("Agent dogfood spec fixes identities, samples, budgets, and thresholds", ()
   const missingRequiredTool = structuredClone(spec);
   missingRequiredTool.host.mcp_required_tools.pop();
   assert.throws(() => validateSpec(missingRequiredTool), /identity or host controls/);
+
+  const driftedSafetyBaseline = structuredClone(spec);
+  driftedSafetyBaseline.safety_baseline.source_sha256 = "0".repeat(64);
+  assert.throws(() => validateSpec(driftedSafetyBaseline), /identity or host controls/);
 });
 
 test("every successful MCP sample must exercise the fixed workflow tool set", () => {
@@ -163,7 +167,16 @@ test("Codex JSONL metrics count completed tool bytes and effective host tokens",
         id: "two",
         type: "mcp_tool_call",
         tool: "get_context",
-        result: { content: "value" },
+        status: "completed",
+        error: null,
+        result: {
+          content: "value",
+          structured_content: {
+            contract_version: "depgraph-mcp-tools-v1",
+            repository_id: "repository",
+            result: { value: "value" },
+          },
+        },
       },
     },
     {
@@ -177,10 +190,41 @@ test("Codex JSONL metrics count completed tool bytes and effective host tokens",
   ].map(JSON.stringify).join("\n");
   const metrics = traceMetrics(trace);
   assert.equal(metrics.tool_calls, 2);
-  assert.equal(metrics.tool_result_bytes, 3 + Buffer.byteLength('{"content":"value"}'));
+  assert.equal(
+    metrics.tool_result_bytes,
+    3 + Buffer.byteLength(
+      '{"content":"value","structured_content":{"contract_version":"depgraph-mcp-tools-v1","repository_id":"repository","result":{"value":"value"}}}',
+    ),
+  );
   assert.equal(metrics.total_tokens, 120);
   assert.equal(metrics.effective_tokens, 60);
   assert.deepEqual(metrics.mcp_tools, ["get_context"]);
+  assert.deepEqual(metrics.mcp_tools_succeeded, ["get_context"]);
+
+  const failed = traceMetrics([
+    JSON.stringify({
+      type: "item.started",
+      item: {
+        id: "failed",
+        type: "mcp_tool_call",
+        tool: "graph_path_get",
+        status: "in_progress",
+      },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "failed",
+        type: "mcp_tool_call",
+        tool: "graph_path_get",
+        status: "failed",
+        error: "unavailable",
+      },
+    }),
+  ].join("\n"));
+  assert.deepEqual(failed.mcp_tools, ["graph_path_get"]);
+  assert.deepEqual(failed.mcp_tools_succeeded, []);
+  assert.equal(mcpToolContractPassed(spec, "mcp", failed.mcp_tools_succeeded), false);
 });
 
 test("trace safety fails closed on project or compound shell commands", () => {
@@ -201,6 +245,17 @@ test("trace safety fails closed on project or compound shell commands", () => {
   assert.equal(
     observation("/bin/zsh -c \"sed -n '1,10p' README.md\"")
       .project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc \"rg -n 'from a|from b' workers/web/src\"")
+      .project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation(
+      "/bin/zsh -lc \"rg -n '^import .*from ' workers/web/src --glob '*.ts'\"",
+    ).project_code_execution_observed,
     false,
   );
   assert.equal(
@@ -229,6 +284,11 @@ test("trace safety fails closed on project or compound shell commands", () => {
   );
   assert.equal(
     observation("/bin/zsh -lc 'rg pattern . &'").project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'rg pattern .|sed -n 1p'")
+      .project_code_execution_observed,
     true,
   );
 });
@@ -289,6 +349,7 @@ test("raw evidence rejects extra entries and symlink substitution", async (conte
   cpSync(rawDir, forged, { recursive: true });
   const safetyPath = join(forged, "baseline-1.safety.json");
   const safety = JSON.parse(readFileSync(safetyPath, "utf8"));
+  safety.before.source_sha256 = "0".repeat(64);
   safety.after.source_sha256 = "0".repeat(64);
   writeFileSync(safetyPath, `${JSON.stringify(safety, null, 2)}\n`);
   const safetyBytes = readFileSync(safetyPath);
@@ -301,7 +362,7 @@ test("raw evidence rejects extra entries and symlink substitution", async (conte
   writeFileSync(samplePath, `${JSON.stringify(sample, null, 2)}\n`);
   await assert.rejects(
     verifyReport({ specPath, rawDir: forged, report }),
-    /safety result is not derived from raw evidence/,
+    /predeclared baseline/,
   );
 
   const trace = join(copied, "baseline-1.trace.jsonl");
