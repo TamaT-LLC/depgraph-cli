@@ -1523,6 +1523,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let mcp_operations_path = "docs/50_test/mcp-agent-host-operations.md";
     let mcp_operations = read_lf_normalized_text(&root.join(mcp_operations_path))?;
     verify_local_markdown_links(root, mcp_operations_path, &mcp_operations)?;
+    let agent_dogfood_path = "docs/50_test/agent-dogfood-benchmark.md";
+    let agent_dogfood = read_lf_normalized_text(&root.join(agent_dogfood_path))?;
+    verify_local_markdown_links(root, agent_dogfood_path, &agent_dogfood)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
         .lines()
@@ -2376,6 +2379,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/40_arch_design/adr-v0.5-release-contract.md",
         "docs/50_test/mcp-agent-host-operations.md",
+        "docs/50_test/agent-dogfood-benchmark.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
         "docs/releases/v0.5.0-rc.7.md",
@@ -2467,7 +2471,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
         "needs: [rust, go, web]",
-        "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs",
+        "node --test scripts/tests/agent-dogfood.test.mjs",
+        "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs",
         "scripts/benchmark-mvp.sh",
         "benchmark-report-${{ github.sha }}",
         "dist/cache-hit-benchmark-report.json",
@@ -2929,6 +2934,7 @@ fn test() -> Result<()> {
         "--test",
         "scripts/tests/benchmark.test.mjs",
         "scripts/tests/cache-hit-benchmark.test.mjs",
+        "scripts/tests/agent-dogfood.test.mjs",
     ]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")

@@ -18,6 +18,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - run: node --test scripts/tests/agent-dogfood.test.mjs
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -203,7 +207,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-      - run: node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs
+      - run: node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs
       - run: scripts/benchmark-mvp.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()

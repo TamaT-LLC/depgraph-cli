@@ -1,0 +1,94 @@
+{
+  "claims": {
+    "candidate_coverage": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Candidate snapshot coverage aggregates require graph context.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "file_cycle": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "A file-level graph cycle and its canonical file-node correspondence require graph evidence.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "go_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Source shows an import at line 10, but cannot establish depgraph’s resolved target or edge classification.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "package_cycles": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The candidate package-cycle count requires graph evidence.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_candidate_import": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The source contains the use-super import at line 2704, but cannot establish resolution status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_impact": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Depth-bounded impacted nodes and completeness require graph evidence.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_path": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source confirms the module declaration but not a resolved graph path.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_unresolved_type": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The source contains the type use at line 2064, but cannot establish resolution status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_file_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required authoritative collection digest is unavailable without graph tooling.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_package_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required snapshot-diff aggregate and collection digest are unavailable without graph tooling.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Source shows the line-17 import, but cannot establish the graph-rendered target and condition.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependents": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Direct incoming graph edges, including package and contains edges, require graph evidence.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    }
+  },
+  "failure": {
+    "code": "none",
+    "remediation": "",
+    "task": ""
+  },
+  "schema_version": "agent-dogfood-answer-v1"
+}

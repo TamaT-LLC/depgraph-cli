@@ -21,6 +21,7 @@
 
 - [GitHub Actionsを使ったリリース手順](../50_test/release-procedure.md)
 - [MCP Agent host operations](../50_test/mcp-agent-host-operations.md)
+- [Packaged MCP Agent dogfood benchmark](../50_test/agent-dogfood-benchmark.md)
 
 ## 統計
 
@@ -53,6 +54,7 @@
 
 ## 更新履歴
 
+- 2026-08-16: packaged MCP Agent dogfood benchmarkの再実行手順と固定evidenceを追加
 - 2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加
 - 2026-08-12: MCP Agent hostのcapability、確認、reconnect、timeout、upgrade運用手順を追加
 - 2026-08-05: `PROJ-ARC-002` のMCP Tasks decisionを追加し、`Q-002`をResolvedへ更新

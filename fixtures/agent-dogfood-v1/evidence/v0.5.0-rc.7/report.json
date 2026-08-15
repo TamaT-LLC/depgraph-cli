@@ -1,0 +1,493 @@
+{
+  "aggregates": {
+    "baseline": {
+      "accuracy_percent_median": 0,
+      "accuracy_percent_samples": [
+        0,
+        0,
+        0
+      ],
+      "candidate_or_unresolved_as_exact": 0,
+      "effective_tokens_median": 12094,
+      "effective_tokens_samples": [
+        6342,
+        17496,
+        12094
+      ],
+      "elapsed_ms_median": 41566,
+      "elapsed_ms_samples": [
+        41566,
+        26135,
+        50261
+      ],
+      "false_exact_claims": 0,
+      "major_recall_percent_median": 0,
+      "major_recall_percent_samples": [
+        0,
+        0,
+        0
+      ],
+      "samples": 3,
+      "setup_successes": 3,
+      "tokens_available": true,
+      "tool_calls_median": 1,
+      "tool_calls_samples": [
+        1,
+        0,
+        7
+      ],
+      "tool_result_bytes_median": 41,
+      "tool_result_bytes_samples": [
+        41,
+        0,
+        9391
+      ],
+      "total_tokens_median": 52678,
+      "total_tokens_samples": [
+        52678,
+        17496,
+        166462
+      ],
+      "typed_failures": {
+        "agent_misuse": 0,
+        "excessive_context": 0,
+        "host_failure": 0,
+        "setup_blocker": 0,
+        "tool_or_schema_missing": 0
+      }
+    },
+    "mcp": {
+      "accuracy_percent_median": 91.67,
+      "accuracy_percent_samples": [
+        91.67,
+        91.67,
+        91.67
+      ],
+      "candidate_or_unresolved_as_exact": 0,
+      "effective_tokens_median": 59773,
+      "effective_tokens_samples": [
+        61011,
+        59773,
+        56731
+      ],
+      "elapsed_ms_median": 127444,
+      "elapsed_ms_samples": [
+        133109,
+        127444,
+        124795
+      ],
+      "false_exact_claims": 0,
+      "major_recall_percent_median": 100,
+      "major_recall_percent_samples": [
+        100,
+        100,
+        100
+      ],
+      "samples": 3,
+      "setup_successes": 3,
+      "tokens_available": true,
+      "tool_calls_median": 17,
+      "tool_calls_samples": [
+        18,
+        17,
+        17
+      ],
+      "tool_result_bytes_median": 207684,
+      "tool_result_bytes_samples": [
+        207718,
+        207684,
+        207684
+      ],
+      "total_tokens_median": 669309,
+      "total_tokens_samples": [
+        697939,
+        669309,
+        663195
+      ],
+      "typed_failures": {
+        "agent_misuse": 0,
+        "excessive_context": 0,
+        "host_failure": 0,
+        "setup_blocker": 0,
+        "tool_or_schema_missing": 0
+      }
+    }
+  },
+  "benchmark_id": "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
+  "gate": {
+    "checks": [
+      {
+        "actual": "91.67",
+        "name": "mcp_accuracy_each_sample",
+        "passed": true,
+        "threshold": ">=90"
+      },
+      {
+        "actual": "100",
+        "name": "mcp_major_recall_each_sample",
+        "passed": true,
+        "threshold": ">=100"
+      },
+      {
+        "actual": "0",
+        "name": "mcp_false_exact_claims",
+        "passed": true,
+        "threshold": "<=0"
+      },
+      {
+        "actual": "0",
+        "name": "mcp_candidate_or_unresolved_as_exact",
+        "passed": true,
+        "threshold": "<=0"
+      },
+      {
+        "actual": "3",
+        "name": "baseline_setup_successes",
+        "passed": true,
+        "threshold": ">=3"
+      },
+      {
+        "actual": "3",
+        "name": "mcp_setup_successes",
+        "passed": true,
+        "threshold": ">=3"
+      },
+      {
+        "actual": "3/3",
+        "name": "mcp_required_tools_each_sample",
+        "passed": true,
+        "threshold": "3/3"
+      },
+      {
+        "actual": "91.67/0",
+        "name": "mcp_accuracy_not_below_baseline",
+        "passed": true,
+        "threshold": ">=1"
+      },
+      {
+        "actual": "17",
+        "name": "mcp_median_tool_calls",
+        "passed": true,
+        "threshold": "<=28"
+      },
+      {
+        "actual": "207684",
+        "name": "mcp_median_tool_result_bytes",
+        "passed": true,
+        "threshold": "<=327680"
+      },
+      {
+        "actual": "127444",
+        "name": "mcp_median_elapsed_ms",
+        "passed": true,
+        "threshold": "<=240000"
+      },
+      {
+        "actual": "59773",
+        "name": "mcp_median_effective_tokens",
+        "passed": true,
+        "threshold": "<=100000"
+      },
+      {
+        "actual": "6",
+        "name": "read_only_safety",
+        "passed": true,
+        "threshold": "6/6"
+      },
+      {
+        "actual": "true",
+        "name": "packaged_disconnect_reconnect",
+        "passed": true,
+        "threshold": "true"
+      }
+    ],
+    "efficiency_ratios": {
+      "elapsed_ms": 3.0661,
+      "token_metric": "host_effective_usage",
+      "tool_calls": 17,
+      "tool_result_bytes": 5065.4634,
+      "total_tokens": 4.9424
+    },
+    "passed": true
+  },
+  "generated_at": "2026-08-15T20:57:33.779Z",
+  "host": {
+    "approval_policy": "never",
+    "architecture": "arm64",
+    "cli_version": "codex-cli 0.146.0",
+    "maximum_tool_calls": 28,
+    "mcp_enabled_tools": [
+      "agent_edges_list",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
+    "model": "gpt-5.6-terra",
+    "platform": "darwin",
+    "program": "codex",
+    "reasoning_effort": "medium",
+    "samples_per_arm": 3,
+    "sandbox": "read-only",
+    "timeout_ms": 300000
+  },
+  "inputs": {
+    "answer_schema_sha256": "8da6fb5d20b130859077769c7afd7acb0bab325eade9b9d454a9635ca5bc42c5",
+    "environment": {
+      "bytes": 1843,
+      "path": "environment.json",
+      "sha256": "bf70ad335f24177bac44c34db852a82dda8034d5c79e2cb0476706bc92de8a50"
+    },
+    "prompt_sha256": "7a09400667b53f44e1b0ae0c69bcbb8759712a957bc8ff8b56910a261badec19",
+    "safety_schema_sha256": "6a28a611b227a2ea9416fd5bc93d68bdf4c8e90bebbcae7bbf28c267024bbde2",
+    "spec_sha256": "7c5d8ffbeaeac8858e35e2d44745b945e1e3c002fabd087a88aa65a094f9d517"
+  },
+  "issue": 357,
+  "release": {
+    "archive_sha256": "5d12ad5dad86106d9ffa520e01acd19530c56cbf034071a3c4da6f45c0958064",
+    "compiler_pack_archive_sha256": "05fed1972bfdefee8092223100db447104e5477abe34b64cc8f7bbaf43f6f904",
+    "compiler_pack_requirement_sha256": "1093e7a3148fc068b4624822d8cce25d84eef3b29db96efdd0188966bb69d3ab",
+    "depgraph_sha256": "62e67dc41c96f6f6ddf62ab342f1baacf6385b2d2f91a51669f7de22e8b5d66b",
+    "manifest_sha256": "cd0ed08628c5b53804ab28ea474c69a04979b07c68af50652ba30725a9097964",
+    "mcp_binary_sha256": "2b0794720c276dd161781d0af3efbccae8ac85e53528310ddb014db15d300cec",
+    "mcp_smoke_sha256": "d6e4d925b6192ac0ffe55f30835096aac0a6d9a8177f6d1676b4389b88e1a403",
+    "tag": "v0.5.0-rc.7",
+    "target": "aarch64-apple-darwin"
+  },
+  "repository": {
+    "baseline_commit": "ccd71620deb53161b5856c8e93fecae4ffdf163c",
+    "baseline_tree": "ca5321d8db4a651752b469097c2053af4f242499",
+    "candidate_commit": "85dcf029ad4d536b1ffa5f9b148749f2beb95128",
+    "candidate_tree": "8bed5aeb17a9213946f7f9e6711923b4e8d419b4"
+  },
+  "safety_baseline": {
+    "daemon_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "journal_sha256": "15df9ae7a75ab8383c84066c9d5e326ba7ef18f1c60655026d3a89be2b7564b9",
+    "relevant_processes": 0,
+    "source_sha256": "ee7c2d70bff926657b091834fa5bc3a69a04f3d3573b116e1d8e3f194d9a9515",
+    "store_sha256": "9b03498b33abed475f7950aa865fb9d8c755f0cb0015dc923495b60792739f20"
+  },
+  "samples": [
+    {
+      "answer": {
+        "bytes": 3335,
+        "path": "baseline-1.answer.json",
+        "sha256": "d31041086daa0d4e169e65341dff6440eef8ca58124c131db1e11f7a61759ad8"
+      },
+      "host_output": {
+        "bytes": 2685,
+        "path": "baseline-1.last-message.txt",
+        "sha256": "6a3281b4402f29975389d98af885f0470f2c95d328a8e8eb847964c4bc15c272"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-1.safety.json",
+        "sha256": "fbdb267c9194d2b06dc699d2f4373b65b8719ee822b59543b1f0d02e917e5e96"
+      },
+      "sample": {
+        "bytes": 3895,
+        "path": "baseline-1.sample.json",
+        "sha256": "6a4f4298a3c03ee92d57e0cd8eba69eddf89494d803d600b41443a802ea8584d"
+      },
+      "sample_id": "baseline-1",
+      "trace": {
+        "bytes": 8590,
+        "path": "baseline-1.trace.jsonl",
+        "sha256": "8ac57a254f17ece327fa87661074f809eaf59248a6d42f50f7664ce6df031c0e"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 2705,
+        "path": "baseline-2.answer.json",
+        "sha256": "a2f213bc2825f76357fa0a2e5acff087013e4688d75b142eaea8465c0b0729c0"
+      },
+      "host_output": {
+        "bytes": 2055,
+        "path": "baseline-2.last-message.txt",
+        "sha256": "84bb38038ae619128cac537bc80e24048c4d1750efdfba26687fbef223686990"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-2.safety.json",
+        "sha256": "df16108c732f16e3d9a3f4920adb3d450c8b408e10488defdd0347469ba242e6"
+      },
+      "sample": {
+        "bytes": 3891,
+        "path": "baseline-2.sample.json",
+        "sha256": "78a5503da0d6b952de0479b4a99c61065829c01055c966df87483f81a91e3470"
+      },
+      "sample_id": "baseline-2",
+      "trace": {
+        "bytes": 5057,
+        "path": "baseline-2.trace.jsonl",
+        "sha256": "1c3243ca2e7d14a0ebbd59215df4aeece439fd462543b9ba355685b4a7886bed"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 3302,
+        "path": "baseline-3.answer.json",
+        "sha256": "ff4f42e617508fed81d7fc8d496781a7972300807ff39497e1d0f729414d55df"
+      },
+      "host_output": {
+        "bytes": 2652,
+        "path": "baseline-3.last-message.txt",
+        "sha256": "ca18f1fcaa8a18fcb28c2b2c60d23f740e172cc08e8f84edc27217e033d76bc7"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-3.safety.json",
+        "sha256": "5464c6d25ab2028f9f1c4be6f430a3a00fb5eee406f168b21da93aecfed14343"
+      },
+      "sample": {
+        "bytes": 3902,
+        "path": "baseline-3.sample.json",
+        "sha256": "b00a85ba240d5f27adc79d5484ae61fd2539813d1eceefc1f7470185e83a9892"
+      },
+      "sample_id": "baseline-3",
+      "trace": {
+        "bytes": 18108,
+        "path": "baseline-3.trace.jsonl",
+        "sha256": "25f7214db5a00f6a17be51985f4980567ea8ddc9d7a6f811c8191d12116b2304"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 5250,
+        "path": "mcp-1.answer.json",
+        "sha256": "b8ab9a3b14c1828ba465b56285147c6b94e9d81820e1c0717b13704688bbb690"
+      },
+      "host_output": {
+        "bytes": 4011,
+        "path": "mcp-1.last-message.txt",
+        "sha256": "020762c68fad363b275461419c8ab29576fe652a6e76ff45f6bc252d74886cfa"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-1.safety.json",
+        "sha256": "2aa80b73fca48b37446d7aea7f6cc3be95ff6ca659decc579614dcf26d2330d1"
+      },
+      "sample": {
+        "bytes": 3924,
+        "path": "mcp-1.sample.json",
+        "sha256": "9211b199f55b5b87a8dfd3b5a7e91db1ee6dddd1dacb3cd969161229d75cd0e7"
+      },
+      "sample_id": "mcp-1",
+      "trace": {
+        "bytes": 229336,
+        "path": "mcp-1.trace.jsonl",
+        "sha256": "8974acff9f668f183988a79650cfbc1b0ab9336a0397350fc1a03bf3f7673a63"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 5098,
+        "path": "mcp-2.answer.json",
+        "sha256": "9437b910ceb0451c3f94dea09a10d1ad0afedadf87a0e77593c5f3ed03556ae0"
+      },
+      "host_output": {
+        "bytes": 3859,
+        "path": "mcp-2.last-message.txt",
+        "sha256": "b2611ec473b5d89521185486f6b8d061053eb161287685ca20cb84d244ff7282"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-2.safety.json",
+        "sha256": "1f3e50edbee5d5f64453faf47f6fdd35fb8f866262fe837e1c381d39f241dd23"
+      },
+      "sample": {
+        "bytes": 3924,
+        "path": "mcp-2.sample.json",
+        "sha256": "f1210c9cdceae0081906964501ee8a05d8b65432ab66ec07c954dcf3541b4bf0"
+      },
+      "sample_id": "mcp-2",
+      "trace": {
+        "bytes": 228554,
+        "path": "mcp-2.trace.jsonl",
+        "sha256": "f06b7a7b54cd1cc8247dc37e091213e10a9d7b6f225ec6275ca2a1460ddd1a49"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 5146,
+        "path": "mcp-3.answer.json",
+        "sha256": "4e2be29b4595931970fba3aaaab0a37435c52117fb10c4aaf9b7619c84f08aec"
+      },
+      "host_output": {
+        "bytes": 3907,
+        "path": "mcp-3.last-message.txt",
+        "sha256": "bda150cf6a38f14b916aef4a9eecd911dc247f9941f7688a08665c3c98b84d9d"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-3.safety.json",
+        "sha256": "b95436e36096d452c4f9a6c099d0551062ecb3429ce9f68b0f92eefea1f5c42f"
+      },
+      "sample": {
+        "bytes": 3924,
+        "path": "mcp-3.sample.json",
+        "sha256": "e6b88bb778c32872b4fcd0061634cc57615c86de438d6e943397d9e31c2b436e"
+      },
+      "sample_id": "mcp-3",
+      "trace": {
+        "bytes": 227203,
+        "path": "mcp-3.trace.jsonl",
+        "sha256": "5251e8e3647a1b00f3419bd0a6a8d461d217dcb11d5dc0c101b99c533893aa08"
+      }
+    }
+  ],
+  "schema_version": "agent-dogfood-report-v1",
+  "security": {
+    "operation_cancel_denied_code": "CAPABILITY_DENIED",
+    "read_catalog_sha256": "64910928f49d914eb642c81ae828cb105b54ac72b6d6cbd54050a051ce13e230",
+    "safe_scan_project_code_executed": false,
+    "safe_scan_recovered_after_eof": true,
+    "safe_scan_terminal_status": "completed",
+    "schema_version": "mcp-package-smoke-v1",
+    "stdin_eof_clean_exit": true,
+    "stdout_json_rpc_only": true
+  },
+  "snapshots": {
+    "baseline_id": "snapshot:sha256:76baa9fb71d01f516c8f4883911692558cbaeb8abbb5604c586deb75a3c8dd5a",
+    "baseline_revision": "ccd71620deb53161b5856c8e93fecae4ffdf163c",
+    "candidate_id": "snapshot:sha256:c301fe1a4ba53ccb38eb852351ff74c116c9fa656254810069eabf332befef57",
+    "candidate_revision": "85dcf029ad4d536b1ffa5f9b148749f2beb95128"
+  },
+  "thresholds": {
+    "maximum_candidate_or_unresolved_as_exact": 0,
+    "maximum_false_exact_claims": 0,
+    "maximum_mcp_median_effective_tokens": 100000,
+    "maximum_mcp_median_elapsed_ms": 240000,
+    "maximum_mcp_median_tool_calls": 28,
+    "maximum_mcp_median_tool_result_bytes": 327680,
+    "minimum_mcp_accuracy_percent": 90,
+    "minimum_mcp_major_recall_percent": 100,
+    "minimum_setup_successes_per_arm": 3,
+    "require_mcp_accuracy_not_below_baseline": true,
+    "require_mcp_tool_contract": true,
+    "require_packaged_reconnect": true,
+    "require_read_only_safety": true
+  },
+  "typed_failures": {
+    "agent_misuse": 0,
+    "excessive_context": 0,
+    "host_failure": 0,
+    "setup_blocker": 0,
+    "tool_or_schema_missing": 0
+  }
+}

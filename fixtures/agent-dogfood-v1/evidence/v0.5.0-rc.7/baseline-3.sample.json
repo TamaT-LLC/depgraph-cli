@@ -1,0 +1,128 @@
+{
+  "arm": "baseline",
+  "artifacts": {
+    "answer": {
+      "bytes": 3302,
+      "path": "baseline-3.answer.json",
+      "sha256": "ff4f42e617508fed81d7fc8d496781a7972300807ff39497e1d0f729414d55df"
+    },
+    "host_output": {
+      "bytes": 2652,
+      "path": "baseline-3.last-message.txt",
+      "sha256": "ca18f1fcaa8a18fcb28c2b2c60d23f740e172cc08e8f84edc27217e033d76bc7"
+    },
+    "safety": {
+      "bytes": 1084,
+      "path": "baseline-3.safety.json",
+      "sha256": "5464c6d25ab2028f9f1c4be6f430a3a00fb5eee406f168b21da93aecfed14343"
+    },
+    "trace": {
+      "bytes": 18108,
+      "path": "baseline-3.trace.jsonl",
+      "sha256": "25f7214db5a00f6a17be51985f4980567ea8ddc9d7a6f811c8191d12116b2304"
+    }
+  },
+  "failure": null,
+  "finished_at": "2026-08-15T20:51:04.659Z",
+  "identity": {
+    "answer_schema_sha256": "8da6fb5d20b130859077769c7afd7acb0bab325eade9b9d454a9635ca5bc42c5",
+    "approval_policy": "never",
+    "benchmark_id": "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
+    "environment_sha256": "bf70ad335f24177bac44c34db852a82dda8034d5c79e2cb0476706bc92de8a50",
+    "maximum_tool_calls": 28,
+    "mcp_enabled_tools": [
+      "agent_edges_list",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
+    "model": "gpt-5.6-terra",
+    "prompt_sha256": "7a09400667b53f44e1b0ae0c69bcbb8759712a957bc8ff8b56910a261badec19",
+    "reasoning_effort": "medium",
+    "repository_commit": "85dcf029ad4d536b1ffa5f9b148749f2beb95128",
+    "repository_tree": "8bed5aeb17a9213946f7f9e6711923b4e8d419b4",
+    "safety_schema_sha256": "6a28a611b227a2ea9416fd5bc93d68bdf4c8e90bebbcae7bbf28c267024bbde2",
+    "sandbox": "read-only",
+    "spec_sha256": "7c5d8ffbeaeac8858e35e2d44745b945e1e3c002fabd087a88aa65a094f9d517",
+    "timeout_ms": 300000
+  },
+  "ordinal": 3,
+  "runtime": {
+    "cached_input_tokens": 154368,
+    "effective_tokens": 12094,
+    "elapsed_ms": 50261,
+    "exit_code": 0,
+    "host_output_valid": true,
+    "input_tokens": 164375,
+    "mcp_tools": [],
+    "mcp_tools_succeeded": [],
+    "output_tokens": 2087,
+    "stderr_bytes": 268,
+    "stderr_sha256": "905c3caf0ddd9d463d32d47622cf5cc280d052286b72e579df743c0f7ef7b351",
+    "timed_out": false,
+    "tool_budget_exhausted": false,
+    "tool_calls": 7,
+    "tool_result_bytes": 9391,
+    "total_tokens": 166462
+  },
+  "safety": {
+    "daemon_state_unchanged": true,
+    "journal_unchanged": true,
+    "no_lingering_depgraph_process": true,
+    "privileged_tools_observed": [],
+    "project_code_executed": false,
+    "source_unchanged": true,
+    "store_unchanged": true
+  },
+  "sample_id": "baseline-3",
+  "schema_version": "agent-dogfood-sample-v1",
+  "score": {
+    "accuracy_percent": 0,
+    "candidate_or_unresolved_as_exact": 0,
+    "candidate_or_unresolved_as_exact_ids": [],
+    "correct_claims": 0,
+    "correct_major_claims": 0,
+    "false_exact_claim_ids": [],
+    "false_exact_claims": 0,
+    "major_claims": 5,
+    "major_recall_percent": 0,
+    "missed_claim_ids": [
+      "rust_path",
+      "go_dependency",
+      "web_dependency",
+      "web_dependents",
+      "rust_impact",
+      "rust_unresolved_type",
+      "rust_candidate_import",
+      "snapshot_package_diff",
+      "snapshot_file_diff",
+      "file_cycle",
+      "package_cycles",
+      "candidate_coverage"
+    ],
+    "missed_major_claim_ids": [
+      "rust_path",
+      "go_dependency",
+      "web_dependency",
+      "web_dependents",
+      "rust_impact"
+    ],
+    "total_claims": 12
+  },
+  "started_at": "2026-08-15T20:50:14.145Z"
+}
