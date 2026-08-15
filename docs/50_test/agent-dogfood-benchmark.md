@@ -76,9 +76,13 @@ fixed spec and verifier contract before the six-sample run. The digest-bound raw
 safety artifact preserves both snapshots, and offline verification requires
 both to match that external baseline before deriving each verdict. It also hashes
 the trace command inventory and fails closed on anything other than one
-non-compound `git`, `rg`, or `sed` read command. All six samples preserved the
-state, exposed no privileged MCP tool, executed no project code, and left no
-process behind. The exact downloaded package smoke is digest-bound into the
+non-compound `git`, `rg`, or `sed` read command. The live runner clears inherited
+Git and ripgrep configuration, disables system/global Git configuration,
+fsmonitor, hooks, external attributes, optional locks, and pager execution,
+rejects local Git config outside the closed clone-metadata allowlist, and uses
+the fresh raw directory as `ZDOTDIR`. All six samples preserved the state,
+exposed no privileged MCP tool, executed no project code, and left no process
+behind. The exact downloaded package smoke is digest-bound into the
 report and proves safe-scan completion after stdio EOF, terminal recovery from
 the same operation, read-profile cancellation denial, clean EOF, and
 JSON-RPC-only stdout. The server root is fixed at launch; the enabled tool

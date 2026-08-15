@@ -17,7 +17,9 @@ import {
   ANSWER_SCHEMA_VERSION,
   REPORT_SCHEMA_VERSION,
   efficiencyRatio,
+  localGitConfigAllowed,
   mcpToolContractPassed,
+  sanitizedAgentEnvironment,
   scoreAnswer,
   traceMetrics,
   traceSafety,
@@ -336,6 +338,42 @@ test("trace safety fails closed on project or compound shell commands", () => {
       .project_code_execution_observed,
     true,
   );
+});
+
+test("Agent runs discard external Git and ripgrep execution configuration", () => {
+  const environment = sanitizedAgentEnvironment({
+    PATH: "/trusted/bin",
+    GIT_EXTERNAL_DIFF: "./project-script",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "diff.external",
+    GIT_CONFIG_VALUE_0: "./project-script",
+    RIPGREP_CONFIG_PATH: "/tmp/host-ripgreprc",
+    ZDOTDIR: "/tmp/host-zdotdir",
+  }, "/tmp/fresh-dogfood-output");
+  assert.equal(environment.PATH, "/trusted/bin");
+  assert.equal(environment.GIT_EXTERNAL_DIFF, undefined);
+  assert.equal(environment.GIT_CONFIG_COUNT, "3");
+  assert.equal(environment.GIT_CONFIG_KEY_0, "core.fsmonitor");
+  assert.equal(environment.GIT_CONFIG_VALUE_0, "false");
+  assert.equal(environment.GIT_CONFIG_GLOBAL, "/dev/null");
+  assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+  assert.equal(environment.GIT_ATTR_NOSYSTEM, "1");
+  assert.equal(environment.GIT_OPTIONAL_LOCKS, "0");
+  assert.equal(environment.GIT_PAGER, "");
+  assert.equal(environment.RIPGREP_CONFIG_PATH, "/dev/null");
+  assert.equal(environment.ZDOTDIR, "/tmp/fresh-dogfood-output");
+  assert.equal(localGitConfigAllowed([
+    "core.repositoryformatversion",
+    "remote.origin.url",
+    "branch.benchmark.remote",
+  ]), true);
+  for (const key of [
+    "core.fsmonitor",
+    "diff.project.command",
+    "diff.project.textconv",
+    "include.path",
+    "pager.diff",
+  ]) assert.equal(localGitConfigAllowed([key]), false);
 });
 
 test("efficiency ratios make a zero baseline explicit", () => {

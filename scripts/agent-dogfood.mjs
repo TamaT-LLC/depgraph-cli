@@ -92,6 +92,12 @@ const DOGFOOD_SAFETY_BASELINE = Object.freeze({
 const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
 const UNSAFE_GIT_OPTIONS = new Set(["--ext-diff", "--output", "--textconv"]);
 const UNSAFE_RG_OPTIONS = new Set(["--hostname-bin", "--pre", "--pre-glob"]);
+const APPROVED_LOCAL_GIT_CONFIG = Object.freeze([
+  /^core\.(?:bare|filemode|ignorecase|logallrefupdates|precomposeunicode|repositoryformatversion)$/u,
+  /^remote\.[A-Za-z0-9._/-]+\.(?:fetch|url)$/u,
+  /^branch\..+\.(?:merge|remote)$/u,
+  /^submodule\.active$/u,
+]);
 const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
 const DOGFOOD_CLAIM_IDS = Object.freeze([
   "rust_path",
@@ -1512,6 +1518,61 @@ function commandOutput(program, args, options = {}) {
   }).trim();
 }
 
+export function sanitizedAgentEnvironment(sourceEnvironment, zDotDir) {
+  const environment = {};
+  for (const [key, value] of Object.entries(sourceEnvironment)) {
+    if (
+      value === undefined
+      || key.startsWith("GIT_")
+      || key === "RIPGREP_CONFIG_PATH"
+      || key === "ZDOTDIR"
+    ) continue;
+    environment[key] = value;
+  }
+  return {
+    ...environment,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_KEY_0: "core.fsmonitor",
+    GIT_CONFIG_KEY_1: "core.hooksPath",
+    GIT_CONFIG_KEY_2: "core.attributesFile",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_VALUE_1: "/dev/null",
+    GIT_CONFIG_VALUE_2: "/dev/null",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "",
+    GIT_TERMINAL_PROMPT: "0",
+    RIPGREP_CONFIG_PATH: "/dev/null",
+    ZDOTDIR: zDotDir,
+  };
+}
+
+export function localGitConfigAllowed(keys) {
+  return Array.isArray(keys) && keys.every((key) =>
+    typeof key === "string"
+    && APPROVED_LOCAL_GIT_CONFIG.some((pattern) => pattern.test(key))
+  );
+}
+
+function validateLocalGitConfiguration(repository, environment) {
+  const keys = execFileSync(
+    "git",
+    ["config", "--local", "--includes", "--name-only", "--null", "--list"],
+    {
+      cwd: repository,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  ).split("\0").filter(Boolean);
+  if (!localGitConfigAllowed(keys)) {
+    throw new Error("dogfood repository has unsafe local Git config");
+  }
+}
+
 function semverTuple(value) {
   const match = value.match(/(\d+)\.(\d+)\.(\d+)/u);
   if (!match) throw new Error(`cannot parse semantic version from ${value}`);
@@ -1672,7 +1733,7 @@ function snapshotShow(depgraph, store, name, cwd) {
   )).data;
 }
 
-async function preflight(spec, runtime) {
+async function preflight(spec, runtime, agentEnvironment) {
   if (await sha256File(runtime.releaseArchive) !== spec.release.archive.sha256) {
     throw new Error("public release archive digest mismatch");
   }
@@ -1687,16 +1748,19 @@ async function preflight(spec, runtime) {
   if (await sha256File(runtime.mcpSmoke) !== spec.release.mcp_smoke.sha256) {
     throw new Error("public MCP smoke digest mismatch");
   }
+  validateLocalGitConfiguration(runtime.repository, agentEnvironment);
   const candidateCommit = commandOutput("git", ["rev-parse", "HEAD"], {
     cwd: runtime.repository,
+    env: agentEnvironment,
   });
   const candidateTree = commandOutput("git", ["rev-parse", "HEAD^{tree}"], {
     cwd: runtime.repository,
+    env: agentEnvironment,
   });
   const baselineTree = commandOutput(
     "git",
     ["rev-parse", `${spec.repository.baseline_commit}^{tree}`],
-    { cwd: runtime.repository },
+    { cwd: runtime.repository, env: agentEnvironment },
   );
   if (
     candidateCommit !== spec.repository.candidate_commit
@@ -1706,7 +1770,7 @@ async function preflight(spec, runtime) {
   const repositoryStatus = commandOutput(
     "git",
     ["status", "--porcelain=v1", "--untracked-files=all"],
-    { cwd: runtime.repository },
+    { cwd: runtime.repository, env: agentEnvironment },
   );
   if (repositoryStatus.length !== 0) {
     throw new Error("dogfood repository must be a clean fixed candidate checkout");
@@ -1780,7 +1844,9 @@ async function preflight(spec, runtime) {
     || smoke.profile_catalog_sha256?.read
       !== spec.release.mcp_smoke.read_catalog_sha256
   ) throw new Error("public packaged MCP smoke identity mismatch");
-  const codexVersion = commandOutput(spec.host.program, ["--version"]);
+  const codexVersion = commandOutput(spec.host.program, ["--version"], {
+    env: agentEnvironment,
+  });
   if (!semverAtLeast(codexVersion, spec.host.minimum_cli_version)) {
     throw new Error("Codex CLI does not meet the fixed dogfood host version");
   }
@@ -1846,7 +1912,17 @@ function terminateProcessGroup(child, signal = "SIGTERM") {
   }
 }
 
-async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, arm, ordinal, rawDir }) {
+async function runCodex({
+  spec,
+  runtime,
+  preflightResult,
+  prompt,
+  answerSchema,
+  arm,
+  ordinal,
+  rawDir,
+  agentEnvironment,
+}) {
   const sampleId = `${arm}-${ordinal}`;
   const tracePath = join(rawDir, `${sampleId}.trace.jsonl`);
   const hostOutputPath = join(rawDir, `${sampleId}.last-message.txt`);
@@ -1905,7 +1981,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
     cwd: runtime.repository,
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
-    env: process.env,
+    env: agentEnvironment,
   });
   let stderrBytes = 0;
   const stderrHash = createHash("sha256");
@@ -2115,7 +2191,8 @@ export async function runBenchmark({ specPath, rawDir, output }) {
   const spec = validateSpec(jsonFile(specPath));
   const digests = sourceDigests(specPath);
   const runtime = requiredRuntime();
-  const ready = await preflight(spec, runtime);
+  const agentEnvironment = sanitizedAgentEnvironment(process.env, rawDir);
+  const ready = await preflight(spec, runtime, agentEnvironment);
   const environmentPath = join(rawDir, "environment.json");
   writeJson(environmentPath, ready.environment);
   const environmentSha256 = await sha256File(environmentPath);
@@ -2132,6 +2209,7 @@ export async function runBenchmark({ specPath, rawDir, output }) {
         arm,
         ordinal,
         rawDir,
+        agentEnvironment,
       });
       sample.identity = identity;
       writeJson(join(rawDir, `${sample.sample_id}.sample.json`), sample);
