@@ -1127,7 +1127,8 @@ fn verify_workflow_policy_text(
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
-                || !publish.contains("permissions:\n      contents: write")
+                || !publish
+                    .contains("permissions:\n      actions: read\n      contents: write")
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
                     .count()
@@ -1138,7 +1139,7 @@ fn verify_workflow_policy_text(
                     != 2
             {
                 bail!(
-                    "release write permission must remain tag-publish-only and native x86_64 Linux builds must retain the pinned linker policy"
+                    "release publish permissions must remain actions-read/contents-write, tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
                 );
             }
         }
@@ -2162,6 +2163,31 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.5 release note is missing contract {required:?}");
         }
     }
+    let rc6_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.6.md"))?;
+    for required in [
+        "sixth v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.6` tag",
+        "`v0.5.0-rc.1` through `v0.5.0-rc.5` tags remain immutable",
+        "51 pre-evidence",
+        "lacked `actions: read`",
+        "`actions: write`",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.6.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc6_release_note.contains(required) {
+            bail!("v0.5.0-rc.6 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2257,6 +2283,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.6.md",
         "docs/releases/v0.5.0-rc.5.md",
         "docs/releases/v0.5.0-rc.4.md",
         "docs/releases/v0.5.0-rc.3.md",
@@ -14552,6 +14579,26 @@ jobs:
         );
 
         let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let missing_actions_read = release.replacen("      actions: read\n", "", 1);
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &missing_actions_read,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let writable_actions = release.replacen("      actions: read", "      actions: write", 1);
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &writable_actions,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
         let overprivileged_release = release.replacen(
             "      contents: write",
             "      contents: write\n      issues: write",
