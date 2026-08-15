@@ -92,7 +92,7 @@ const DOGFOOD_SAFETY_BASELINE = Object.freeze({
 const SHELL_COMMAND = /^\/bin\/zsh -(?:l)?c (["'])([\s\S]*)\1$/u;
 const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
 const UNSAFE_GIT_OPTIONS = new Set(["--ext-diff", "--output", "--textconv"]);
-const UNSAFE_RG_OPTION = /(?:^|\s)--(?:hostname-bin|pre|pre-glob)(?:[=\s]|$)/u;
+const UNSAFE_RG_OPTIONS = new Set(["--hostname-bin", "--pre", "--pre-glob"]);
 const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
 const DOGFOOD_CLAIM_IDS = Object.freeze([
   "rust_path",
@@ -668,10 +668,10 @@ function shellWords(payload) {
   return words;
 }
 
-function hasUnsafeGitOption(payload) {
+function hasUnsafeOption(payload, argumentOffset, unsafeOptions) {
   const words = shellWords(payload);
   if (words === null) return true;
-  return words.slice(2).some((word) => [...UNSAFE_GIT_OPTIONS].some(
+  return words.slice(argumentOffset).some((word) => [...unsafeOptions].some(
     (option) => word === option || word.startsWith(`${option}=`),
   ));
 }
@@ -681,8 +681,12 @@ function approvedReadOnlyCommand(command) {
   const match = command.match(SHELL_COMMAND);
   if (match === null || hasUnsafeShellSyntax(match[2])) return false;
   const payload = match[2];
-  if (APPROVED_GIT_COMMAND.test(payload)) return !hasUnsafeGitOption(payload);
-  if (/^rg(?:\s|$)/u.test(payload)) return !UNSAFE_RG_OPTION.test(payload);
+  if (APPROVED_GIT_COMMAND.test(payload)) {
+    return !hasUnsafeOption(payload, 2, UNSAFE_GIT_OPTIONS);
+  }
+  if (/^rg(?:\s|$)/u.test(payload)) {
+    return !hasUnsafeOption(payload, 1, UNSAFE_RG_OPTIONS);
+  }
   return APPROVED_SED_PRINT.test(payload);
 }
 
@@ -709,9 +713,7 @@ function hasUnsafeShellSyntax(payload) {
     if (
       (quote === null && ";&|<>\r\n".includes(character))
       || ((quote === null || quote === '"') && character === "`")
-      || ((quote === null || quote === '"')
-        && character === "$"
-        && payload[index + 1] === "(")
+      || ((quote === null || quote === '"') && character === "$")
     ) return true;
   }
   return quote !== null;
