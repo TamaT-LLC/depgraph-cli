@@ -51,6 +51,14 @@ gh run view "$run_id" --json headSha,conclusion,url
 表示された`headSha`が`candidate`と一致し、全ジョブが成功したことを確認する。
 確認が終わるまで`main`へ別の変更をマージしない。
 
+post-publish evidenceはGitHub Actions APIが返すjob表示名を完全一致で検証する。
+matrix jobの暗黙の表示名は、空文字を除くnon-empty matrix値をすべて含むため、
+workflowのmatrix axisを追加・変更した場合は実際の`gh run view --json jobs`出力と
+validatorのjob identityを同時に更新する。期待値の定数からtest inputを生成するだけでは
+API driftを検出できない。既知の実API応答
+`xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json`を独立fixtureとして固定し、
+完全な8 job名と改変拒否をunit testで維持する。
+
 ## リリースタグの作成
 
 フルCIを通過したcommitへ署名付きannotated tagを作成する。GitHub APIでtag
