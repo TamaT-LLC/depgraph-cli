@@ -36,12 +36,14 @@
         "spec_sha256",
         "prompt_sha256",
         "answer_schema_sha256",
+        "safety_schema_sha256",
         "environment"
       ],
       "properties": {
         "spec_sha256": { "$ref": "#/$defs/sha256" },
         "prompt_sha256": { "$ref": "#/$defs/sha256" },
         "answer_schema_sha256": { "$ref": "#/$defs/sha256" },
+        "safety_schema_sha256": { "$ref": "#/$defs/sha256" },
         "environment": { "$ref": "#/$defs/artifact" }
       }
     },
@@ -175,6 +177,7 @@
         "samples_per_arm",
         "maximum_tool_calls",
         "mcp_enabled_tools",
+        "mcp_required_tools",
         "timeout_ms"
       ],
       "properties": {
@@ -195,6 +198,13 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/nonEmpty" }
         },
+        "mcp_required_tools": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmpty" }
+        },
         "timeout_ms": { "type": "integer", "minimum": 1 }
       }
     },
@@ -212,6 +222,7 @@
         "maximum_mcp_median_tool_result_bytes",
         "maximum_mcp_median_elapsed_ms",
         "maximum_mcp_median_effective_tokens",
+        "require_mcp_tool_contract",
         "require_read_only_safety",
         "require_packaged_reconnect"
       ],
@@ -226,6 +237,7 @@
         "maximum_mcp_median_tool_result_bytes": { "type": "integer", "minimum": 1 },
         "maximum_mcp_median_elapsed_ms": { "type": "integer", "minimum": 1 },
         "maximum_mcp_median_effective_tokens": { "type": "integer", "minimum": 1 },
+        "require_mcp_tool_contract": { "type": "boolean" },
         "require_read_only_safety": { "type": "boolean" },
         "require_packaged_reconnect": { "type": "boolean" }
       }
@@ -233,7 +245,7 @@
     "sampleBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sample_id", "sample", "answer", "host_output", "trace"],
+      "required": ["sample_id", "sample", "answer", "host_output", "safety", "trace"],
       "properties": {
         "sample_id": {
           "type": "string",
@@ -242,6 +254,7 @@
         "sample": { "$ref": "#/$defs/artifact" },
         "answer": { "$ref": "#/$defs/artifact" },
         "host_output": { "$ref": "#/$defs/artifact" },
+        "safety": { "$ref": "#/$defs/artifact" },
         "trace": { "$ref": "#/$defs/artifact" }
       }
     },
@@ -375,8 +388,8 @@
       "properties": {
         "checks": {
           "type": "array",
-          "minItems": 13,
-          "maxItems": 13,
+          "minItems": 14,
+          "maxItems": 14,
           "items": { "$ref": "#/$defs/gateCheck" }
         },
         "passed": { "type": "boolean" },

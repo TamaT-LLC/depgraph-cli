@@ -12,6 +12,10 @@ packaged reconnect evidence, and every pass/fail gate. The deterministic runner
 and corpus live under `scripts/agent-dogfood.mjs` and
 `fixtures/agent-dogfood-v1`; ordinary CI verifies the checked-in evidence,
 while a live six-Agent rerun is an explicit release/dogfood gate.
+The fixture's closed `safety.schema.json` preserves each sample's before/after
+source, Store, journal, daemon-state, and process fingerprints plus a
+trace-derived project-execution observation; report verification recomputes
+the safety verdicts from that digest-bound raw artifact.
 
 `depgraph-mcp-tools-v1.schema.json` is the checked-in JSON Schema 2020-12 catalog
 for the closed Agent-facing contracts implemented by `depgraph-mcp-tools`. It covers

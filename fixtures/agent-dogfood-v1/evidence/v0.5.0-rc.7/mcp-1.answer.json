@@ -3,14 +3,14 @@
     "candidate_coverage": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Candidate snapshot coverage returned by context.",
+      "reason": "Returned candidate snapshot coverage.",
       "value": "files=368;sites=93305;resolved=33028;candidates=96;external=25619;unresolved=34562;unsupported=3252;project_code_executed=false",
       "verdict": "supported"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "The cycle result exposed only opaque file IDs, so its required path rotation cannot be established.",
+      "reason": "Cycle returned opaque file IDs that public results did not map to repository paths.",
       "value": "unknown",
       "verdict": "insufficient"
     },
@@ -30,7 +30,7 @@
     "package_cycles": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Complete package-cycle query returned zero items.",
+      "reason": "No package-level cycles returned.",
       "value": "count=0",
       "verdict": "supported"
     },
@@ -43,7 +43,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Import edge is a candidate overapproximation.",
+      "reason": "Import edge is a candidate.",
       "value": "target=rust-module:depgraph-cli:bin:depgraph::;status=candidates;precision=overapprox;line=2704",
       "verdict": "supported"
     },
@@ -61,7 +61,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Complete depth-two impact result.",
+      "reason": "Complete impact set through depth 2.",
       "value": "complete=true;items=cargo-target:depgraph-mcp-tools@0.5.0#crates/depgraph-mcp-tools:lib:depgraph_mcp_tools@2,file:crates/depgraph-mcp-tools/src/lib.rs@1,rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::@2",
       "verdict": "supported"
     },
@@ -87,21 +87,21 @@
           "source": "mcp"
         }
       ],
-      "reason": "Type-use edge is unresolved and heuristic.",
+      "reason": "Type-use edge is unresolved.",
       "value": "target=unknown:rust:rust_type:DepgraphService;status=unresolved;precision=heuristic;line=2064",
       "verdict": "supported"
     },
     "snapshot_file_diff": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Returned collection digest is authoritative.",
+      "reason": "Returned file diff digest.",
       "value": "digest=snapshot-diff-collection:sha256:9e7fee60ccb5e4ce7067888b27c3990961918872d3b7f84ae7cae735d3ae25cc",
       "verdict": "supported"
     },
     "snapshot_package_diff": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Returned aggregate package diff is empty.",
+      "reason": "Returned package diff aggregate.",
       "value": "total=0;empty=true;digest=snapshot-diff-collection:sha256:d3b1c57569e2d98c2ed067adc3d0b4f26fd79900fb0ceceb75d94e348935568b",
       "verdict": "supported"
     },

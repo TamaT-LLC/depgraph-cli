@@ -2,28 +2,33 @@
   "arm": "baseline",
   "artifacts": {
     "answer": {
-      "bytes": 3227,
+      "bytes": 3214,
       "path": "baseline-2.answer.json",
-      "sha256": "112df5a8d62d591b51d171a2994b1530a2081c0cfa411e58f6c42e5a421efa99"
+      "sha256": "66a3ace6e4178d82e29b112f7a78c23c867617996eca7b9ae49a3e6ccb55da48"
     },
     "host_output": {
-      "bytes": 2577,
+      "bytes": 2564,
       "path": "baseline-2.last-message.txt",
-      "sha256": "82fee62c6b9af46f1b333919b3923dd9f0c0ccc85f0ecbae83775523bac5e211"
+      "sha256": "7a7d3576dc145335216aff9e74a8f0457a30cfb10857cc747234bdd880f1f27c"
+    },
+    "safety": {
+      "bytes": 1084,
+      "path": "baseline-2.safety.json",
+      "sha256": "41f23c9198fa80d727a83c1fc663b4fc6edf77d6f3bd426613b341104095e5b5"
     },
     "trace": {
-      "bytes": 30375,
+      "bytes": 37978,
       "path": "baseline-2.trace.jsonl",
-      "sha256": "c920cd0ce1b3c5c99c0c6d1364adb21177bc0c5a9cbdca809e4deed9fd55188b"
+      "sha256": "d452cf46fe9977ab78d2dc11a123048aae72457a7bb64db654cf75043685349e"
     }
   },
   "failure": null,
-  "finished_at": "2026-08-15T18:53:33.726Z",
+  "finished_at": "2026-08-15T20:04:12.788Z",
   "identity": {
     "answer_schema_sha256": "8da6fb5d20b130859077769c7afd7acb0bab325eade9b9d454a9635ca5bc42c5",
     "approval_policy": "never",
     "benchmark_id": "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
-    "environment_sha256": "6962495ffb1ad4dd4b80ab9e9bfe4e2ea9a385dd4db4193596d4a48e19cc4848",
+    "environment_sha256": "e9897c91593c12c03a517c64395ea3ed0979266a06eb1bd4547ba166daa62c9f",
     "maximum_tool_calls": 28,
     "mcp_enabled_tools": [
       "agent_edges_list",
@@ -36,32 +41,43 @@
       "graph_path_get",
       "snapshot_diff_get"
     ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
     "model": "gpt-5.6-terra",
-    "prompt_sha256": "78b6a46fc7a0912a157546f6816e6a2f2f8fc1964198a285a4ced71528cbeeef",
+    "prompt_sha256": "636e788263f5ee8c0451c21e5abf7562177ced17ebae39c0066206bcd34c6de9",
     "reasoning_effort": "medium",
     "repository_commit": "85dcf029ad4d536b1ffa5f9b148749f2beb95128",
     "repository_tree": "8bed5aeb17a9213946f7f9e6711923b4e8d419b4",
+    "safety_schema_sha256": "6a28a611b227a2ea9416fd5bc93d68bdf4c8e90bebbcae7bbf28c267024bbde2",
     "sandbox": "read-only",
-    "spec_sha256": "0186892eabfe1f4a6d881d6e19fbbe3836ef0109da59ca6a206256d6d93fba8b",
+    "spec_sha256": "418e41532a580f806fe997abb48a613318a08a8278b9fed5aa68c4f12b64adf3",
     "timeout_ms": 300000
   },
   "ordinal": 2,
   "runtime": {
-    "cached_input_tokens": 205824,
-    "effective_tokens": 30236,
-    "elapsed_ms": 83595,
+    "cached_input_tokens": 204032,
+    "effective_tokens": 19725,
+    "elapsed_ms": 65991,
     "exit_code": 0,
     "host_output_valid": true,
-    "input_tokens": 232507,
+    "input_tokens": 221442,
     "mcp_tools": [],
-    "output_tokens": 3553,
+    "output_tokens": 2315,
     "stderr_bytes": 268,
-    "stderr_sha256": "d43f7c67f9b2c3eea19e70a3e8aa5bbc5f2b6f914ef5d327fd81e04200153678",
+    "stderr_sha256": "b66a771bcd0a5e938add1854e117e26ba1d095ead13b980a59bad711023fd345",
     "timed_out": false,
     "tool_budget_exhausted": false,
-    "tool_calls": 10,
-    "tool_result_bytes": 16266,
-    "total_tokens": 236060
+    "tool_calls": 9,
+    "tool_result_bytes": 27492,
+    "total_tokens": 223757
   },
   "safety": {
     "daemon_state_unchanged": true,
@@ -107,5 +123,5 @@
     ],
     "total_claims": 12
   },
-  "started_at": "2026-08-15T18:52:09.879Z"
+  "started_at": "2026-08-15T20:03:06.547Z"
 }

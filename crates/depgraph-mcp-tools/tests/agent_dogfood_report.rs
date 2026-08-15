@@ -33,12 +33,21 @@ fn issue_357_report_and_answers_validate_against_their_closed_schemas() {
     assert!(jsonschema::draft202012::meta::is_valid(&answer_schema));
     let answer_validator =
         jsonschema::draft202012::new(&answer_schema).expect("answer schema compiles");
+    let safety_schema = read_json(&root.join("fixtures/agent-dogfood-v1/safety.schema.json"));
+    assert!(jsonschema::draft202012::meta::is_valid(&safety_schema));
+    let safety_validator =
+        jsonschema::draft202012::new(&safety_schema).expect("safety schema compiles");
     for arm in ["baseline", "mcp"] {
         for ordinal in 1..=3 {
             let answer = read_json(&evidence.join(format!("{arm}-{ordinal}.answer.json")));
             assert!(
                 answer_validator.is_valid(&answer),
                 "{arm}-{ordinal} answer does not match the checked-in schema"
+            );
+            let safety = read_json(&evidence.join(format!("{arm}-{ordinal}.safety.json")));
+            assert!(
+                safety_validator.is_valid(&safety),
+                "{arm}-{ordinal} safety evidence does not match the checked-in schema"
             );
         }
     }

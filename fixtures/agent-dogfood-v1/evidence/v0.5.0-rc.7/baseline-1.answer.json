@@ -3,84 +3,84 @@
     "candidate_coverage": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph coverage result is available.",
+      "reason": "depgraph MCP is unavailable; snapshot coverage metrics are unavailable.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph cycle result is available.",
+      "reason": "depgraph MCP is unavailable; file-cycle graph evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "go_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph evidence is available to establish the resolved package edge.",
+      "reason": "depgraph MCP is unavailable; graph resolution evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "package_cycles": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph cycle result is available.",
+      "reason": "depgraph MCP is unavailable; package-cycle graph evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_candidate_import": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "Source inspection cannot establish depgraph resolution status or precision.",
+      "reason": "depgraph MCP is unavailable; edge status and precision require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_impact": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph evidence is available to establish bounded impact.",
+      "reason": "depgraph MCP is unavailable; impact traversal evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_path": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No depgraph graph service is available to establish the resolved path.",
+      "reason": "depgraph MCP is unavailable; graph path evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_unresolved_type": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "Source inspection cannot establish depgraph resolution status or precision.",
+      "reason": "depgraph MCP is unavailable; edge status and precision require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_file_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No snapshot-diff graph result is available.",
+      "reason": "depgraph MCP is unavailable; requested snapshot digest is unavailable.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_package_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No snapshot-diff graph result is available.",
+      "reason": "depgraph MCP is unavailable; requested snapshot digest is unavailable.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph evidence is available to establish the file dependency.",
+      "reason": "depgraph MCP is unavailable; graph resolution evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependents": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No graph evidence is available to enumerate direct incoming edges.",
+      "reason": "depgraph MCP is unavailable; direct incoming-edge evidence is required.",
       "value": "unknown",
       "verdict": "insufficient"
     }

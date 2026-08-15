@@ -3,84 +3,84 @@
     "candidate_coverage": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "Candidate snapshot coverage metrics are unavailable without the dependency-graph service.",
+      "reason": "Candidate snapshot coverage aggregates require MCP context evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "Source imports cannot establish opaque graph-node correspondence or the graph cycle.",
+      "reason": "Source imports do not establish a canonical graph cycle or its node correspondence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "go_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish depgraph resolution.",
+      "reason": "The import is visible in source, but its graph target locator and edge classification require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "package_cycles": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available to count package cycles.",
+      "reason": "Package-level cycle count requires graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_candidate_import": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish resolution status or precision.",
+      "reason": "Source shows the import, but resolution status and precision require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_impact": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish complete graph impact.",
+      "reason": "Depth-bounded impact and completeness require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_path": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish the graph shortest path.",
+      "reason": "The depgraph MCP server is unavailable; source cannot establish shortest graph paths.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "rust_unresolved_type": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish resolution status or precision.",
+      "reason": "Source shows the type use, but resolution status and precision require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_file_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "The required graph snapshot-diff digest is unavailable.",
+      "reason": "The authoritative depgraph file-diff collection digest requires MCP evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "snapshot_package_diff": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "The required graph snapshot-diff digest is unavailable.",
+      "reason": "Git confirms changes exist, but depgraph package-diff totals and digest require MCP evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependency": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish depgraph resolution.",
+      "reason": "Source imports scanner.ts, but graph condition and canonical edge evidence are unavailable.",
       "value": "unknown",
       "verdict": "insufficient"
     },
     "web_dependents": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "No dependency-graph service is available; source cannot establish all direct incoming graph edges.",
+      "reason": "Direct incoming graph edges, including package and contains edges, require graph evidence.",
       "value": "unknown",
       "verdict": "insufficient"
     }

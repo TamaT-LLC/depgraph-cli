@@ -22,6 +22,7 @@ import { pathToFileURL } from "node:url";
 export const SPEC_SCHEMA_VERSION = "agent-dogfood-spec-v1";
 export const ANSWER_SCHEMA_VERSION = "agent-dogfood-answer-v1";
 export const SAMPLE_SCHEMA_VERSION = "agent-dogfood-sample-v1";
+export const SAFETY_SCHEMA_VERSION = "agent-dogfood-safety-v1";
 export const ENVIRONMENT_SCHEMA_VERSION = "agent-dogfood-environment-v1";
 export const REPORT_SCHEMA_VERSION = "agent-dogfood-report-v1";
 
@@ -71,6 +72,22 @@ const DOGFOOD_MCP_TOOLS = Object.freeze([
   "graph_path_get",
   "snapshot_diff_get",
 ]);
+const DOGFOOD_REQUIRED_MCP_TOOLS = Object.freeze([
+  "agent_nodes_list",
+  "get_context",
+  "graph_cycles_list",
+  "graph_dependencies_list",
+  "graph_dependents_list",
+  "graph_impact_get",
+  "graph_path_get",
+  "snapshot_diff_get",
+]);
+const SHELL_COMMAND = /^\/bin\/zsh -(?:l)?c (["'])([\s\S]*)\1$/u;
+const UNSAFE_SHELL_SYNTAX = /(?:&&|\|\||[;&|<>`]|\$\(|[\r\n])/u;
+const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
+const UNSAFE_GIT_OPTION = /(?:^|\s)--(?:ext-diff|textconv)(?:[=\s]|$)/u;
+const UNSAFE_RG_OPTION = /(?:^|\s)--(?:hostname-bin|pre|pre-glob)(?:[=\s]|$)/u;
+const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
 const DOGFOOD_CLAIM_IDS = Object.freeze([
   "rust_path",
   "go_dependency",
@@ -96,6 +113,7 @@ const DOGFOOD_THRESHOLDS = Object.freeze({
   maximum_mcp_median_tool_result_bytes: 327_680,
   maximum_mcp_median_elapsed_ms: 240_000,
   maximum_mcp_median_effective_tokens: 100_000,
+  require_mcp_tool_contract: true,
   require_read_only_safety: true,
   require_packaged_reconnect: true,
 });
@@ -235,6 +253,7 @@ export function validateSpec(spec) {
       "samples_per_arm",
       "maximum_tool_calls",
       "mcp_enabled_tools",
+      "mcp_required_tools",
       "timeout_ms",
     ])
     || !isRecord(spec.thresholds)
@@ -289,6 +308,11 @@ export function validateSpec(spec) {
     || spec.host.samples_per_arm !== 3
     || spec.host.maximum_tool_calls !== 28
     || canonicalJson(spec.host.mcp_enabled_tools) !== canonicalJson(DOGFOOD_MCP_TOOLS)
+    || canonicalJson(spec.host.mcp_required_tools)
+      !== canonicalJson(DOGFOOD_REQUIRED_MCP_TOOLS)
+    || spec.host.mcp_required_tools.some(
+      (tool) => !spec.host.mcp_enabled_tools.includes(tool),
+    )
     || spec.host.timeout_ms !== 300_000
     || spec.host.sandbox !== "read-only"
     || spec.host.approval_policy !== "never"
@@ -309,6 +333,7 @@ export function validateSpec(spec) {
     "maximum_mcp_median_tool_result_bytes",
     "maximum_mcp_median_elapsed_ms",
     "maximum_mcp_median_effective_tokens",
+    "require_mcp_tool_contract",
     "require_read_only_safety",
     "require_packaged_reconnect",
   ];
@@ -555,6 +580,65 @@ export function traceMetrics(text) {
   };
 }
 
+function codeUnitCompare(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function approvedReadOnlyCommand(command) {
+  if (typeof command !== "string") return false;
+  const match = command.match(SHELL_COMMAND);
+  if (match === null || UNSAFE_SHELL_SYNTAX.test(match[2])) return false;
+  const payload = match[2];
+  if (APPROVED_GIT_COMMAND.test(payload)) return !UNSAFE_GIT_OPTION.test(payload);
+  if (/^rg(?:\s|$)/u.test(payload)) return !UNSAFE_RG_OPTION.test(payload);
+  return APPROVED_SED_PRINT.test(payload);
+}
+
+export function traceSafety(text) {
+  const commands = new Map();
+  let malformedCommandObserved = false;
+  let malformedCommandCount = 0;
+  let anonymous = 0;
+  for (const [lineIndex, line] of text.split(/\r?\n/u).entries()) {
+    if (line.length === 0) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      throw new Error(`Codex JSONL trace line ${lineIndex + 1} is invalid`);
+    }
+    const item = event.item;
+    if (!isRecord(item) || item.type !== "command_execution") continue;
+    const id = typeof item.id === "string" ? item.id : `anonymous-${anonymous++}`;
+    if (typeof item.command !== "string" || item.command.length === 0) {
+      malformedCommandObserved = true;
+      malformedCommandCount += 1;
+      continue;
+    }
+    const previous = commands.get(id);
+    if (previous !== undefined && previous !== item.command) {
+      throw new Error(`Codex command ${id} changed within its trace`);
+    }
+    commands.set(id, item.command);
+  }
+  const orderedCommands = [...commands.entries()]
+    .sort(([left], [right]) => codeUnitCompare(left, right))
+    .map(([id, command]) => ({ id, command }));
+  return {
+    command_execution_count: orderedCommands.length + malformedCommandCount,
+    commands_sha256: sha256Bytes(Buffer.from(canonicalJson(orderedCommands))),
+    project_code_execution_observed: malformedCommandObserved
+      || orderedCommands.some(({ command }) => !approvedReadOnlyCommand(command)),
+  };
+}
+
+export function mcpToolContractPassed(spec, arm, tools) {
+  if (!Array.isArray(tools)) return false;
+  if (arm === "baseline") return tools.length === 0;
+  if (arm !== "mcp" || !Array.isArray(spec?.host?.mcp_required_tools)) return false;
+  return spec.host.mcp_required_tools.every((tool) => tools.includes(tool));
+}
+
 function confinedArtifact(rawDir, artifact) {
   if (
     !exactKeys(artifact, ["path", "sha256", "bytes"])
@@ -585,7 +669,13 @@ function validateRawDirectory(rawDir, spec) {
   for (const arm of ARM_NAMES) {
     for (let ordinal = 1; ordinal <= spec.host.samples_per_arm; ordinal += 1) {
       const sampleId = `${arm}-${ordinal}`;
-      for (const suffix of ["answer.json", "last-message.txt", "sample.json", "trace.jsonl"]) {
+      for (const suffix of [
+        "answer.json",
+        "last-message.txt",
+        "safety.json",
+        "sample.json",
+        "trace.jsonl",
+      ]) {
         required.add(`${sampleId}.${suffix}`);
       }
     }
@@ -613,12 +703,74 @@ async function validateArtifact(rawDir, artifact) {
   return path;
 }
 
+function validateSafetySnapshot(snapshot) {
+  if (
+    !exactKeys(snapshot, [
+      "source_sha256",
+      "store_sha256",
+      "journal_sha256",
+      "daemon_state_sha256",
+      "relevant_processes",
+    ])
+    || !Number.isSafeInteger(snapshot.relevant_processes)
+    || snapshot.relevant_processes < 0
+  ) throw new Error("Agent dogfood safety snapshot is invalid");
+  for (const [label, digest] of [
+    ["source", snapshot.source_sha256],
+    ["Store", snapshot.store_sha256],
+    ["journal", snapshot.journal_sha256],
+    ["daemon state", snapshot.daemon_state_sha256],
+  ]) assertDigest(digest, `Agent dogfood safety ${label}`);
+}
+
+function validateSafetyEvidence(evidence, sampleId, traceObservation) {
+  if (
+    !exactKeys(evidence, ["schema_version", "sample_id", "before", "after", "trace"])
+    || evidence.schema_version !== SAFETY_SCHEMA_VERSION
+    || evidence.sample_id !== sampleId
+    || !exactKeys(evidence.trace, [
+      "command_execution_count",
+      "commands_sha256",
+      "project_code_execution_observed",
+    ])
+    || !Number.isSafeInteger(evidence.trace.command_execution_count)
+    || evidence.trace.command_execution_count < 0
+    || typeof evidence.trace.project_code_execution_observed !== "boolean"
+  ) throw new Error("Agent dogfood safety evidence is invalid");
+  assertDigest(evidence.trace.commands_sha256, "Agent dogfood safety command trace");
+  validateSafetySnapshot(evidence.before);
+  validateSafetySnapshot(evidence.after);
+  if (canonicalJson(evidence.trace) !== canonicalJson(traceObservation)) {
+    throw new Error("Agent dogfood safety trace observation drifted");
+  }
+  return evidence;
+}
+
+function derivedSafety(evidence, mcpTools) {
+  return {
+    source_unchanged:
+      evidence.before.source_sha256 === evidence.after.source_sha256,
+    store_unchanged:
+      evidence.before.store_sha256 === evidence.after.store_sha256,
+    journal_unchanged:
+      evidence.before.journal_sha256 === evidence.after.journal_sha256,
+    daemon_state_unchanged:
+      evidence.before.daemon_state_sha256 === evidence.after.daemon_state_sha256,
+    no_lingering_depgraph_process: evidence.before.relevant_processes === 0
+      && evidence.after.relevant_processes === 0,
+    project_code_executed: evidence.trace.project_code_execution_observed,
+    privileged_tools_observed:
+      mcpTools.filter((tool) => PRIVILEGED_MCP_TOOLS.has(tool)),
+  };
+}
+
 function expectedSampleIdentity(spec, digests, environmentSha256) {
   return {
     benchmark_id: spec.benchmark_id,
     spec_sha256: digests.spec,
     prompt_sha256: digests.prompt,
     answer_schema_sha256: digests.answerSchema,
+    safety_schema_sha256: digests.safetySchema,
     environment_sha256: environmentSha256,
     repository_commit: spec.repository.candidate_commit,
     repository_tree: spec.repository.candidate_tree,
@@ -629,6 +781,7 @@ function expectedSampleIdentity(spec, digests, environmentSha256) {
     maximum_tool_calls: spec.host.maximum_tool_calls,
     timeout_ms: spec.host.timeout_ms,
     mcp_enabled_tools: spec.host.mcp_enabled_tools,
+    mcp_required_tools: spec.host.mcp_required_tools,
   };
 }
 
@@ -663,15 +816,19 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
     || !Number.isFinite(Date.parse(sample.finished_at))
     || Date.parse(sample.finished_at) < Date.parse(sample.started_at)
     || canonicalJson(sample.identity) !== canonicalJson(expectedIdentity)
-    || !exactKeys(sample.artifacts, ["trace", "host_output", "answer"])
+    || !exactKeys(sample.artifacts, ["trace", "host_output", "answer", "safety"])
     || sample.artifacts.trace?.path !== `${expectedSampleId}.trace.jsonl`
     || sample.artifacts.host_output?.path !== `${expectedSampleId}.last-message.txt`
     || sample.artifacts.answer?.path !== `${expectedSampleId}.answer.json`
+    || sample.artifacts.safety?.path !== `${expectedSampleId}.safety.json`
   ) throw new Error("Agent dogfood sample envelope is invalid");
   const tracePath = await validateArtifact(rawDir, sample.artifacts.trace);
   const hostOutputPath = await validateArtifact(rawDir, sample.artifacts.host_output);
   const answerPath = await validateArtifact(rawDir, sample.artifacts.answer);
-  const metrics = traceMetrics(readFileSync(tracePath, "utf8"));
+  const safetyPath = await validateArtifact(rawDir, sample.artifacts.safety);
+  const traceText = readFileSync(tracePath, "utf8");
+  const metrics = traceMetrics(traceText);
+  const traceObservation = traceSafety(traceText);
   for (const key of [
     "tool_calls",
     "tool_result_bytes",
@@ -761,6 +918,10 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
   validateSampleFailure(sample.failure);
   if (
     sample.failure === null
+    && !mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools)
+  ) throw new Error("Agent dogfood successful sample did not satisfy its tool contract");
+  if (
+    sample.failure === null
     && (sample.runtime.exit_code !== 0
       || sample.runtime.timed_out
       || sample.runtime.tool_budget_exhausted
@@ -785,26 +946,15 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
   if (canonicalJson(score) !== canonicalJson(sample.score)) {
     throw new Error("Agent dogfood sample score is not canonical");
   }
-  const safetyKeys = [
-    "source_unchanged",
-    "store_unchanged",
-    "journal_unchanged",
-    "daemon_state_unchanged",
-    "no_lingering_depgraph_process",
-    "project_code_executed",
-    "privileged_tools_observed",
-  ];
+  const safetyEvidence = validateSafetyEvidence(
+    jsonFile(safetyPath),
+    expectedSampleId,
+    traceObservation,
+  );
   if (
-    !exactKeys(sample.safety, safetyKeys)
-    || safetyKeys.slice(0, 5).some((key) => typeof sample.safety[key] !== "boolean")
-    || sample.safety.project_code_executed !== false
-    || !Array.isArray(sample.safety.privileged_tools_observed)
-    || sample.safety.privileged_tools_observed.some((tool) => typeof tool !== "string")
-    || canonicalJson(sample.safety.privileged_tools_observed)
-      !== canonicalJson(
-        sample.runtime.mcp_tools.filter((tool) => PRIVILEGED_MCP_TOOLS.has(tool)),
-      )
-  ) throw new Error("Agent dogfood sample safety evidence is invalid");
+    canonicalJson(sample.safety)
+      !== canonicalJson(derivedSafety(safetyEvidence, sample.runtime.mcp_tools))
+  ) throw new Error("Agent dogfood sample safety result is not derived from raw evidence");
   return { sample, answer };
 }
 
@@ -866,6 +1016,10 @@ function gateCheck(name, passed, actual, threshold) {
 function evaluateGate(spec, samples, environment, aggregates) {
   const { baseline, mcp } = aggregates;
   const thresholds = spec.thresholds;
+  const mcpSamples = samples.filter((sample) => sample.arm === "mcp");
+  const mcpToolContractPasses = mcpSamples.filter((sample) =>
+    mcpToolContractPassed(spec, sample.arm, sample.runtime.mcp_tools)
+  ).length;
   const toolCallRatio = efficiencyRatio(
     mcp.tool_calls_median,
     baseline.tool_calls_median,
@@ -929,6 +1083,13 @@ function evaluateGate(spec, samples, environment, aggregates) {
       mcp.setup_successes >= thresholds.minimum_setup_successes_per_arm,
       mcp.setup_successes,
       `>=${thresholds.minimum_setup_successes_per_arm}`,
+    ),
+    gateCheck(
+      "mcp_required_tools_each_sample",
+      !thresholds.require_mcp_tool_contract
+        || mcpToolContractPasses === mcpSamples.length,
+      `${mcpToolContractPasses}/${mcpSamples.length}`,
+      `${mcpSamples.length}/${mcpSamples.length}`,
     ),
     gateCheck(
       "mcp_accuracy_not_below_baseline",
@@ -1086,13 +1247,16 @@ function sourceDigests(specPath) {
   const fixtureDir = dirname(resolve(specPath));
   const promptPath = join(fixtureDir, "prompt.md");
   const answerSchemaPath = join(fixtureDir, "answer.schema.json");
+  const safetySchemaPath = join(fixtureDir, "safety.schema.json");
   return {
     fixtureDir,
     promptPath,
     answerSchemaPath,
+    safetySchemaPath,
     spec: sha256Bytes(readFileSync(specPath)),
     prompt: sha256Bytes(readFileSync(promptPath)),
     answerSchema: sha256Bytes(readFileSync(answerSchemaPath)),
+    safetySchema: sha256Bytes(readFileSync(safetySchemaPath)),
   };
 }
 
@@ -1119,6 +1283,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
         sample: await fileArtifact(path),
         answer: sample.artifacts.answer,
         host_output: sample.artifacts.host_output,
+        safety: sample.artifacts.safety,
         trace: sample.artifacts.trace,
       });
     }
@@ -1138,6 +1303,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
       spec_sha256: digests.spec,
       prompt_sha256: digests.prompt,
       answer_schema_sha256: digests.answerSchema,
+      safety_schema_sha256: digests.safetySchema,
       environment: await fileArtifact(environmentPath),
     },
     release: environment.release,
@@ -1152,6 +1318,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
       samples_per_arm: spec.host.samples_per_arm,
       maximum_tool_calls: spec.host.maximum_tool_calls,
       mcp_enabled_tools: spec.host.mcp_enabled_tools,
+      mcp_required_tools: spec.host.mcp_required_tools,
       timeout_ms: spec.host.timeout_ms,
     },
     thresholds: spec.thresholds,
@@ -1334,10 +1501,10 @@ function relevantProcesses(packageRoot, repository) {
 
 async function safetySnapshot(runtime) {
   return {
-    source: await fingerprintTree(runtime.repository, new Set([".git"])),
-    store: await fingerprintFileSet(storePaths(runtime.store)),
-    journal: await fingerprintFileSet(journalPaths(runtime.store)),
-    daemon: await daemonStateFingerprint(runtime.store),
+    source_sha256: await fingerprintTree(runtime.repository, new Set([".git"])),
+    store_sha256: await fingerprintFileSet(storePaths(runtime.store)),
+    journal_sha256: await fingerprintFileSet(journalPaths(runtime.store)),
+    daemon_state_sha256: await daemonStateFingerprint(runtime.store),
     relevant_processes: relevantProcesses(runtime.packageRoot, runtime.repository).length,
   };
 }
@@ -1381,6 +1548,14 @@ async function preflight(spec, runtime) {
     || candidateTree !== spec.repository.candidate_tree
     || baselineTree !== spec.repository.baseline_tree
   ) throw new Error("dogfood repository is not the fixed candidate checkout");
+  const repositoryStatus = commandOutput(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    { cwd: runtime.repository },
+  );
+  if (repositoryStatus.length !== 0) {
+    throw new Error("dogfood repository must be a clean fixed candidate checkout");
+  }
   const archiveRoot = spec.release.archive.name.replace(/\.tar\.gz$/u, "");
   if (basename(runtime.packageRoot) !== archiveRoot) {
     throw new Error("extracted release package root has the wrong identity");
@@ -1521,6 +1696,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
   const tracePath = join(rawDir, `${sampleId}.trace.jsonl`);
   const hostOutputPath = join(rawDir, `${sampleId}.last-message.txt`);
   const answerPath = join(rawDir, `${sampleId}.answer.json`);
+  const safetyPath = join(rawDir, `${sampleId}.safety.json`);
   const traceStream = createWriteStream(tracePath, { flags: "wx" });
   const traceClosed = once(traceStream, "close");
   const args = [
@@ -1653,6 +1829,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
   }
   const traceText = readFileSync(tracePath, "utf8");
   const metrics = traceMetrics(traceText);
+  const traceObservation = traceSafety(traceText);
   let answer;
   let failure = null;
   let hostOutputValid = false;
@@ -1702,22 +1879,28 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
       "Inspect the retained raw trace and rerun all samples without selection.",
     );
   }
-  const privilegedTools = metrics.mcp_tools
-    .filter((tool) => PRIVILEGED_MCP_TOOLS.has(tool));
-  const sourceUnchanged = before.source === after.source;
-  const storeUnchanged = before.store === after.store;
-  const journalUnchanged = before.journal === after.journal;
-  const daemonUnchanged = before.daemon === after.daemon;
-  const noLingeringProcess = before.relevant_processes === 0
-    && after.relevant_processes === 0;
+  const safetyEvidence = {
+    schema_version: SAFETY_SCHEMA_VERSION,
+    sample_id: sampleId,
+    before,
+    after,
+    trace: traceObservation,
+  };
+  writeJson(safetyPath, safetyEvidence);
+  const safety = derivedSafety(safetyEvidence, metrics.mcp_tools);
   if (
     failure === null
-    && (!sourceUnchanged
-      || !storeUnchanged
-      || !journalUnchanged
-      || !daemonUnchanged
-      || !noLingeringProcess
-      || privilegedTools.length > 0)
+    && !mcpToolContractPassed(spec, arm, metrics.mcp_tools)
+  ) {
+    failure = typedFailure(
+      "agent_misuse",
+      sampleId,
+      "Use every predeclared MCP workflow tool, then rerun all samples.",
+    );
+  }
+  if (
+    failure === null
+    && !safetyPassed({ safety })
   ) {
     failure = typedFailure(
       "agent_misuse",
@@ -1737,6 +1920,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
       trace: await fileArtifact(tracePath),
       host_output: await fileArtifact(hostOutputPath),
       answer: await fileArtifact(answerPath),
+      safety: await fileArtifact(safetyPath),
     },
     runtime: {
       exit_code: exitCode,
@@ -1758,15 +1942,7 @@ async function runCodex({ spec, runtime, preflightResult, prompt, answerSchema, 
     },
     score: scoreAnswer(spec, answer),
     failure,
-    safety: {
-      source_unchanged: sourceUnchanged,
-      store_unchanged: storeUnchanged,
-      journal_unchanged: journalUnchanged,
-      daemon_state_unchanged: daemonUnchanged,
-      no_lingering_depgraph_process: noLingeringProcess,
-      project_code_executed: false,
-      privileged_tools_observed: privilegedTools,
-    },
+    safety,
   };
   return sample;
 }
@@ -1847,7 +2023,7 @@ async function main(argv) {
   );
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`${error.stack ?? error}\n`);
     process.exitCode = 1;

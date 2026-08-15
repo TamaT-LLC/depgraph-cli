@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   mkdtempSync,
@@ -16,8 +17,10 @@ import {
   ANSWER_SCHEMA_VERSION,
   REPORT_SCHEMA_VERSION,
   efficiencyRatio,
+  mcpToolContractPassed,
   scoreAnswer,
   traceMetrics,
+  traceSafety,
   validateAnswer,
   validateSpec,
   verifyReport,
@@ -57,6 +60,28 @@ test("Agent dogfood spec fixes identities, samples, budgets, and thresholds", ()
   const extended = structuredClone(spec);
   extended.release.unreviewed = true;
   assert.throws(() => validateSpec(extended), /incomplete or incompatible/);
+
+  const missingRequiredTool = structuredClone(spec);
+  missingRequiredTool.host.mcp_required_tools.pop();
+  assert.throws(() => validateSpec(missingRequiredTool), /identity or host controls/);
+});
+
+test("every successful MCP sample must exercise the fixed workflow tool set", () => {
+  assert.equal(mcpToolContractPassed(spec, "baseline", []), true);
+  assert.equal(mcpToolContractPassed(spec, "baseline", ["get_context"]), false);
+  assert.equal(mcpToolContractPassed(spec, "mcp", []), false);
+  assert.equal(
+    mcpToolContractPassed(spec, "mcp", spec.host.mcp_required_tools),
+    true,
+  );
+  assert.equal(
+    mcpToolContractPassed(
+      spec,
+      "mcp",
+      spec.host.mcp_required_tools.filter((tool) => tool !== "graph_path_get"),
+    ),
+    false,
+  );
 });
 
 test("golden scoring is exact and candidate or unresolved promotion fails closed", () => {
@@ -158,6 +183,56 @@ test("Codex JSONL metrics count completed tool bytes and effective host tokens",
   assert.deepEqual(metrics.mcp_tools, ["get_context"]);
 });
 
+test("trace safety fails closed on project or compound shell commands", () => {
+  const observation = (command) => traceSafety([
+    JSON.stringify({
+      type: "item.started",
+      item: { id: "command", type: "command_execution", command },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { id: "command", type: "command_execution", command },
+    }),
+  ].join("\n"));
+  const safe = observation("/bin/zsh -lc 'git status --short'");
+  assert.equal(safe.command_execution_count, 1);
+  assert.equal(safe.project_code_execution_observed, false);
+  assert.match(safe.commands_sha256, /^[0-9a-f]{64}$/u);
+  assert.equal(
+    observation("/bin/zsh -c \"sed -n '1,10p' README.md\"")
+      .project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'cargo test'").project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'git status && cargo test'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'git reset --hard HEAD'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'sed -i bak README.md'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'rg --pre ./project-script pattern .'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/zsh -lc 'rg pattern . &'").project_code_execution_observed,
+    true,
+  );
+});
+
 test("efficiency ratios make a zero baseline explicit", () => {
   assert.equal(efficiencyRatio(0, 0), 1);
   assert.equal(efficiencyRatio(1, 0), null);
@@ -209,6 +284,25 @@ test("raw evidence rejects extra entries and symlink substitution", async (conte
     /unexpected entry/,
   );
   rmSync(extra);
+
+  const forged = join(temporary, "forged");
+  cpSync(rawDir, forged, { recursive: true });
+  const safetyPath = join(forged, "baseline-1.safety.json");
+  const safety = JSON.parse(readFileSync(safetyPath, "utf8"));
+  safety.after.source_sha256 = "0".repeat(64);
+  writeFileSync(safetyPath, `${JSON.stringify(safety, null, 2)}\n`);
+  const safetyBytes = readFileSync(safetyPath);
+  const samplePath = join(forged, "baseline-1.sample.json");
+  const sample = JSON.parse(readFileSync(samplePath, "utf8"));
+  sample.artifacts.safety.bytes = safetyBytes.length;
+  sample.artifacts.safety.sha256 = createHash("sha256")
+    .update(safetyBytes)
+    .digest("hex");
+  writeFileSync(samplePath, `${JSON.stringify(sample, null, 2)}\n`);
+  await assert.rejects(
+    verifyReport({ specPath, rawDir: forged, report }),
+    /safety result is not derived from raw evidence/,
+  );
 
   const trace = join(copied, "baseline-1.trace.jsonl");
   rmSync(trace);

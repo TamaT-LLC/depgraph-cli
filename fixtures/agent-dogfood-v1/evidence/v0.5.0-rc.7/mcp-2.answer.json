@@ -3,14 +3,14 @@
     "candidate_coverage": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Candidate snapshot coverage returned.",
+      "reason": "Returned candidate snapshot coverage.",
       "value": "files=368;sites=93305;resolved=33028;candidates=96;external=25619;unresolved=34562;unsupported=3252;project_code_executed=false",
       "verdict": "supported"
     },
     "file_cycle": {
       "classification": "not_applicable",
       "evidence": [],
-      "reason": "Cycle result exposed only opaque node IDs; public evidence did not establish their repository paths.",
+      "reason": "Cycle node IDs were opaque and public results did not establish their repository paths.",
       "value": "unknown",
       "verdict": "insufficient"
     },
@@ -30,7 +30,7 @@
     "package_cycles": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Complete package-cycle result is empty.",
+      "reason": "No package-level cycles returned.",
       "value": "count=0",
       "verdict": "supported"
     },
@@ -43,7 +43,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Graph reports a candidate overapproximate import.",
+      "reason": "Graph reports candidate import.",
       "value": "target=rust-module:depgraph-cli:bin:depgraph::;status=candidates;precision=overapprox;line=2704",
       "verdict": "supported"
     },
@@ -51,13 +51,18 @@
       "classification": "exact",
       "evidence": [
         {
-          "line": 1,
-          "path": "crates/depgraph-mcp-tools/Cargo.toml",
+          "line": null,
+          "path": "crates/depgraph-mcp-tools/src/catalog.rs",
           "source": "mcp"
         },
         {
           "line": 3,
           "path": "crates/depgraph-mcp-tools/src/lib.rs",
+          "source": "mcp"
+        },
+        {
+          "line": 1,
+          "path": "crates/depgraph-mcp-tools/Cargo.toml",
           "source": "mcp"
         }
       ],
@@ -74,7 +79,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "Shortest path found.",
+      "reason": "Shortest graph path found.",
       "value": "target=rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::catalog;steps=1;kind=reexports",
       "verdict": "supported"
     },
@@ -87,14 +92,14 @@
           "source": "mcp"
         }
       ],
-      "reason": "Graph reports an unresolved heuristic type-use.",
+      "reason": "Graph reports unresolved heuristic type use.",
       "value": "target=unknown:rust:rust_type:DepgraphService;status=unresolved;precision=heuristic;line=2064",
       "verdict": "supported"
     },
     "snapshot_file_diff": {
       "classification": "exact",
       "evidence": [],
-      "reason": "Returned file diff collection digest.",
+      "reason": "Returned file diff digest.",
       "value": "digest=snapshot-diff-collection:sha256:9e7fee60ccb5e4ce7067888b27c3990961918872d3b7f84ae7cae735d3ae25cc",
       "verdict": "supported"
     },
@@ -137,7 +142,7 @@
           "source": "mcp"
         }
       ],
-      "reason": "All three direct incoming edges returned.",
+      "reason": "All direct incoming edges returned.",
       "value": "count=3;sources=file://workers/web/src/worker.ts,file://workers/web/test/typescript-semantic.test.ts,id:package:sha256:5361cf1544af6a59b6697802c670280832a4935ae3baf80b3da6610660e415c9",
       "verdict": "supported"
     }

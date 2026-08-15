@@ -68,6 +68,16 @@
       "graph_path_get",
       "snapshot_diff_get"
     ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get"
+    ],
     "timeout_ms": 300000
   },
   "thresholds": {
@@ -81,6 +91,7 @@
     "maximum_mcp_median_tool_result_bytes": 327680,
     "maximum_mcp_median_elapsed_ms": 240000,
     "maximum_mcp_median_effective_tokens": 100000,
+    "require_mcp_tool_contract": true,
     "require_read_only_safety": true,
     "require_packaged_reconnect": true
   },

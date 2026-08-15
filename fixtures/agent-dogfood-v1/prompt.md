@@ -6,7 +6,11 @@ run a scan, invoke a depgraph CLI binary, submit an operation, start or stop a
 daemon, or execute project code. Read-only source and Git inspection are allowed.
 If the `depgraph` MCP server is available, use only its read-capability tools;
 you may combine those graph results with the same read-only source and Git
-inspection available to the baseline arm.
+inspection available to the baseline arm. Every MCP run must complete the
+ordered claim plan and call all eight required workflow tools:
+`agent_nodes_list`, `get_context`, `graph_cycles_list`,
+`graph_dependencies_list`, `graph_dependents_list`, `graph_impact_get`,
+`graph_path_get`, and `snapshot_diff_get`.
 If it is absent, that is the intended baseline condition, not a setup blocker or
 missing-tool failure: investigate with read-only source and Git commands, mark
 facts that cannot be established without graph evidence as `insufficient`, and
@@ -18,7 +22,10 @@ and `rc7-candidate` (the candidate commit above). Use `rc7-candidate` unless a
 task explicitly asks for a diff. Keep the investigation within 28 tool calls.
 For comparable accounting, one tool call may investigate at most one numbered
 claim. Do not join unrelated commands, targets, or claim investigations in one
-shell invocation; a pipeline used only to bound or project one claim is allowed.
+shell invocation. Every source/Git shell invocation must contain exactly one
+`git`, `rg`, or `sed` command, with no shell chaining, pipeline, substitution,
+redirection, or project executable. Unrecognized commands conservatively fail
+the read-only safety gate.
 
 For this fixed large snapshot, use `path:<repository-relative-path>` for file
 selectors. Set `max_traversal` to `1000000` for dependency, path, and cycle

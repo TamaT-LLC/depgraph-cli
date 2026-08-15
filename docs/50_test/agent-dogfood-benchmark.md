@@ -18,15 +18,17 @@ Rust, Go, and TypeScript/Web: node/path discovery, outgoing and incoming
 dependencies, impact, unresolved and candidate precision, file and package
 cycles, snapshot diffs, and snapshot coverage. The
 [`prompt`](../../fixtures/agent-dogfood-v1/prompt.md),
-[`answer schema`](../../fixtures/agent-dogfood-v1/answer.schema.json), and
+[`answer schema`](../../fixtures/agent-dogfood-v1/answer.schema.json),
+[`raw safety schema`](../../fixtures/agent-dogfood-v1/safety.schema.json), and
 golden values are versioned with it.
 
 Both arms use the same candidate checkout, prompt, model, reasoning effort,
 read-only sandbox, approval policy, 28-call budget, five-minute sample timeout,
 and three samples. The baseline has source and Git read tools. The MCP arm adds
-only nine fixed `read`-capability graph tools from the downloaded package. User
-configuration and repository rules are ignored, every host is ephemeral, and
-no successful sample may be selected or discarded.
+only nine fixed `read`-capability graph tools from the downloaded package and
+must exercise all eight tools needed by the ordered workflow in every sample.
+User configuration and repository rules are ignored, every host is ephemeral,
+and no successful sample may be selected or discarded.
 
 This evidence uses the public [`v0.5.0-rc.7` release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.0-rc.7),
 which superseded the earlier release-candidate prerequisite while closing the
@@ -37,9 +39,9 @@ requirement, packaged smoke, commits, trees, and snapshot IDs by digest.
 
 The canonical
 [`report.json`](../../fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json)
-passed all 13 gates. Its directory contains the environment plus the trace,
-last host message, normalized answer, and scored sample for all three baseline
-and all three MCP executions.
+passed all 14 gates. Its directory contains the environment plus the trace,
+last host message, normalized answer, raw before/after safety fingerprints, and
+scored sample for all three baseline and all three MCP executions.
 
 | Metric | Baseline median | MCP median | MCP gate |
 | --- | ---: | ---: | ---: |
@@ -47,10 +49,11 @@ and all three MCP executions.
 | Major-claim recall | 0% | 100% | each sample = 100% |
 | False exact claims | 0 | 0 | total = 0 |
 | Candidate/unresolved promoted to exact | 0 | 0 | total = 0 |
-| Tool calls | 1 | 18 | median <= 28 |
-| Tool-result bytes | 59 | 202,438 | median <= 327,680 |
-| Elapsed time | 40,183 ms | 122,439 ms | median <= 240,000 ms |
-| Effective host tokens | 9,954 | 77,283 | median <= 100,000 |
+| Required MCP workflow tools | n/a | 8/8 per sample | each sample = 8/8 |
+| Tool calls | 0 | 17 | median <= 28 |
+| Tool-result bytes | 0 | 202,404 | median <= 327,680 |
+| Elapsed time | 29,496 ms | 132,819 ms | median <= 240,000 ms |
+| Effective host tokens | 8,273 | 77,922 | median <= 100,000 |
 | Successful setup | 3/3 | 3/3 | each arm = 3/3 |
 
 All MCP samples found all five major dependency/path/impact claims. Each missed
@@ -59,20 +62,24 @@ opaque node IDs and the Agent did not complete the permitted source mapping.
 No sample fabricated an exact result. The baseline correctly marked graph-only
 facts insufficient instead of guessing, which explains its zero accuracy.
 
-The observed MCP/baseline median ratios were 18 calls, 3,431.1525 result bytes,
-3.047 elapsed time, and 7.764 effective tokens. Ratios remain diagnostic: a
-baseline may correctly stop with zero graph calls, so the pass/fail contract
-uses absolute MCP ceilings plus accuracy-not-below-baseline rather than an
-undefined or gameable ratio.
+The observed MCP/baseline median ratios were undefined for calls and result
+bytes because both baseline medians were zero, 4.5029 for elapsed time, and
+9.4188 for effective tokens. Ratios remain diagnostic: a baseline may correctly
+stop with zero graph calls, so the pass/fail contract uses absolute MCP ceilings
+plus accuracy-not-below-baseline rather than an undefined or gameable ratio.
 
 Before and after every sample the runner fingerprints the repository, Store,
 operation journal, daemon-adjacent state, and matching depgraph process set.
-All six samples preserved them, exposed no privileged MCP tool, executed no
-project code, and left no process behind. The exact downloaded package smoke is
-digest-bound into the report and proves safe-scan completion after stdio EOF,
-terminal recovery from the same operation, read-profile cancellation denial,
-clean EOF, and JSON-RPC-only stdout. The server root is fixed at launch; the
-enabled tool inputs contain no replacement-root field.
+The digest-bound raw safety artifact preserves both snapshots, and offline
+verification derives each unchanged/process verdict from them. It also hashes
+the trace command inventory and fails closed on anything other than one
+non-compound `git`, `rg`, or `sed` read command. All six samples preserved the
+state, exposed no privileged MCP tool, executed no project code, and left no
+process behind. The exact downloaded package smoke is digest-bound into the
+report and proves safe-scan completion after stdio EOF, terminal recovery from
+the same operation, read-profile cancellation denial, clean EOF, and
+JSON-RPC-only stdout. The server root is fixed at launch; the enabled tool
+inputs contain no replacement-root field.
 
 ## Reproduce the snapshots
 
@@ -119,8 +126,9 @@ requirement, smoke, checkout, tree, or snapshot digest that differs from the
 spec.
 
 Create both safe-scan snapshots with the downloaded `depgraph` binary. The
-dedicated clone must end at the candidate commit before running the Agent
-comparison.
+dedicated clone must end at the candidate commit with an empty porcelain status
+before running the Agent comparison; the runner rejects tracked, staged, or
+untracked drift.
 
 ```sh
 dogfood_repo=/absolute/path/to/dedicated/depgraph-cli
@@ -134,6 +142,7 @@ git -C "$dogfood_repo" checkout --detach ccd71620deb53161b5856c8e93fecae4ffdf163
 git -C "$dogfood_repo" checkout --detach 85dcf029ad4d536b1ffa5f9b148749f2beb95128
 "$dogfood_depgraph" scan "$dogfood_repo" --store "$dogfood_store" --json
 "$dogfood_depgraph" snapshot create rc7-candidate --store "$dogfood_store" --json
+test -z "$(git -C "$dogfood_repo" status --porcelain=v1 --untracked-files=all)"
 ```
 
 ## Run all six samples
