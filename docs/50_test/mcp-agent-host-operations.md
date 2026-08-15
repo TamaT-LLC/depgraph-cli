@@ -8,12 +8,24 @@ profiles for the same repository as an accidental privilege fallback.
 
 ## Fixed trust boundary
 
-Treat the release directory, repository root, store path, and compiler-pack
-requirement as one operator-approved launch tuple.
+Treat the release directory, official post-publish evidence, repository root,
+store path, and compiler-pack requirement as one operator-approved launch
+tuple.
 
+- Download `release-post-publish-evidence-<tag>.json` from the official
+  `TamaT-LLC/depgraph-cli` GitHub Release. Obtain its asset digest independently
+  from GitHub's release-asset API over HTTPS and pass the bare 64-character
+  digest with `--trusted-release-evidence-sha256`. Never derive that trusted
+  digest from the local evidence file, archive, checksum, or manifest.
+- Pass the evidence file with `--release-evidence`. `agent-config` requires the
+  exact official repository, product version/canonical tag, allowed signed-tag
+  result, all-green eight-job Full CI and release workflow identities, and the
+  sorted 51-asset public closure. It binds the selected archive, checksum, and
+  target compiler-pack requirement by exact filename, size, and SHA-256.
 - Verify the release checksum and `release-manifest.json`, then use
-  `bin/depgraph-mcp` from that extracted release. The sibling operation runner,
-  schema, workers, and manifest must remain from the same archive.
+  `bin/depgraph-mcp` from that evidence-bound extracted release. The sibling
+  operation runner, schema, workers, and manifest must remain from the same
+  archive.
 - Replace every `/absolute/path/to/...` placeholder below with a canonical
   absolute path and `TARGET_TRIPLE` with the release host target before saving
   host configuration. These are documentation placeholders, not environment
@@ -33,6 +45,85 @@ requirement as one operator-approved launch tuple.
 
 The read-only README entry is the default. The following examples are complete
 replacement entries, not arguments to append to that running entry.
+
+## Generated host quickstarts
+
+Run the packaged `depgraph agent-config` command from the README with one of
+the following `--host` values and redirect stdout only after reviewing stderr.
+The command never discovers or writes a host configuration path. A successful
+diagnostic names the authenticated official release tag and evidence digest.
+Merge the single generated `depgraph` entry into an existing host file
+yourself; do not replace unrelated host settings.
+
+For Codex, use `--host codex` and merge the output into user
+`~/.codex/config.toml` or a trusted project's `.codex/config.toml`. The
+read-only profile may be approved statically because its server catalog has no
+mutation or project-execution tool; privileged profiles render `prompt`
+instead.
+
+<!-- depgraph-agent-config:codex -->
+```toml
+[mcp_servers.depgraph]
+command = "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp"
+args = ["--root", "/absolute/path/to/repository", "--store", "/absolute/path/to/state/depgraph.sqlite", "--capability", "read", "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json", "--log-level", "warn"]
+enabled = true
+required = true
+default_tools_approval_mode = "approve"
+```
+
+For Claude Desktop, use `--host claude-desktop`; the exact read-only output is
+the `mcpServers` JSON in the README. For VS Code, use `--host vscode` and merge
+the following entry into the user or workspace `mcp.json` `servers` object.
+
+<!-- depgraph-agent-config:vscode -->
+```json
+{
+  "servers": {
+    "depgraph": {
+      "type": "stdio",
+      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "args": [
+        "--root",
+        "/absolute/path/to/repository",
+        "--store",
+        "/absolute/path/to/state/depgraph.sqlite",
+        "--capability",
+        "read",
+        "--compiler-pack-requirement",
+        "/absolute/path/to/compiler-pack-requirement.json",
+        "--log-level",
+        "warn"
+      ]
+    }
+  }
+}
+```
+
+All three formats carry the same absolute launch tuple and exact capability
+closure. They do not contain shell expansion, ambient `PATH` lookup, checkout
+worker overrides, or a host-file destination.
+
+## Dogfood setup classification
+
+The fixed v0.5.0-rc.7 dogfood evidence recorded zero `setup_blocker`,
+`tool_or_schema_missing`, `agent_misuse`, `excessive_context`, and
+`host_failure` results across all three MCP samples. The remaining onboarding
+risks were therefore classified before implementation rather than inferred
+from selected failures:
+
+| Priority | Observed or residual risk | Resolution |
+| --- | --- | --- |
+| P0 | No observed blocking setup failure | Keep the checked-in 3/3 setup-success gate and do not invent a fallback package path |
+| P1 | Manual archive, manifest, target, binary, root, Store, and requirement path mixing | `agent-config` authenticates the official public asset closure through an independently obtained evidence digest and binds the complete tuple before starting the server |
+| P1 | Accidental privileged profile or treating acknowledgement as authorization | Read-only remains the default; effect acknowledgement and a separate project-exec human-confirmation responsibility are mandatory |
+| P2 | Excessive tool/result context or misuse | The observed 207,684-byte median remained below the 327,680-byte gate with zero typed misuse; hosts may further allow-list task-specific read tools without changing server authority |
+| P2 | Empty Store or no current snapshot discovered only after host startup | Preflight stops before launch and returns the packaged safe-scan argv as a distinct Store-write preparation step |
+
+The compiler-pack requirement remains mandatory for read-only startup. The
+dogfood evidence achieved 3/3 setup success with the existing requirement and
+showed no blocker that would justify weakening the single verified startup
+tuple. Consequently this task makes no capability-authority change and needs
+no replacement ADR.
 
 ## Store-write profile
 

@@ -34,8 +34,10 @@ use depgraph_protocol::canonical_json;
 use depgraph_store::CoverageRecord;
 use serde::Serialize;
 
+mod agent_config;
 mod snapshot_diff;
 
+use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use snapshot_diff::render_service_human_diff;
 
 #[derive(Debug, Parser)]
@@ -76,6 +78,42 @@ struct InteractiveOutputArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Verify one packaged MCP launch tuple and print an Agent host configuration.
+    AgentConfig {
+        /// Existing canonical repository directory bound to this server.
+        #[arg(long, value_name = "PATH")]
+        root: PathBuf,
+        /// Checksum-verified native release archive used for this extraction.
+        #[arg(long, value_name = "PATH")]
+        release_archive: PathBuf,
+        /// Exact SHA-256 sidecar published beside the release archive.
+        #[arg(long, value_name = "PATH")]
+        release_checksum: PathBuf,
+        /// Post-publish evidence downloaded from the same official GitHub release.
+        #[arg(long, value_name = "PATH")]
+        release_evidence: PathBuf,
+        /// Independently obtained GitHub asset digest for the post-publish evidence.
+        #[arg(long, value_name = "SHA256")]
+        trusted_release_evidence_sha256: String,
+        /// Extracted release-manifest.json beside the packaged bin/ and libexec/.
+        #[arg(long, value_name = "PATH")]
+        release_manifest: PathBuf,
+        /// Validated target-specific compiler-pack requirement JSON.
+        #[arg(long, value_name = "PATH")]
+        compiler_pack_requirement: PathBuf,
+        /// Agent host configuration syntax to emit on stdout.
+        #[arg(long, value_enum)]
+        host: AgentHostFormatArg,
+        /// Static server capability closure. Defaults to read-only.
+        #[arg(long, value_enum, default_value_t = AgentHostProfileArg::Read)]
+        profile: AgentHostProfileArg,
+        /// Confirm that the selected non-read profile's effects were reviewed.
+        #[arg(long)]
+        acknowledge_privileged_effects: bool,
+        /// Confirm the host will obtain a separate human decision for every project execution.
+        #[arg(long)]
+        acknowledge_project_exec_human_confirmation: bool,
+    },
     /// Create a versioned .depgraph.toml without scanning the project.
     Init {
         #[arg(default_value = ".")]
@@ -458,39 +496,82 @@ enum RuntimeCommands {
 /// catalog action fails compilation. The catalog has a separate const assertion that every
 /// `CliAction` is mapped by at least one tool.
 #[allow(dead_code)]
-fn catalog_action_for_command(command: &Commands) -> CliAction {
+fn catalog_action_for_command(command: &Commands) -> Option<CliAction> {
     match command {
-        Commands::Init { .. } => CliAction::Init,
-        Commands::Scan { .. } => CliAction::Scan,
+        Commands::AgentConfig { .. } => None,
+        Commands::Init { .. } => Some(CliAction::Init),
+        Commands::Scan { .. } => Some(CliAction::Scan),
         Commands::Profiles { command } => match command {
-            ProfileCommands::Plan { .. } => CliAction::ProfilesPlan,
+            ProfileCommands::Plan { .. } => Some(CliAction::ProfilesPlan),
         },
         Commands::Daemon { command } => match command {
-            DaemonCommands::Start { .. } => CliAction::DaemonStart,
-            DaemonCommands::Status { .. } => CliAction::DaemonStatus,
-            DaemonCommands::Stop { .. } => CliAction::DaemonStop,
+            DaemonCommands::Start { .. } => Some(CliAction::DaemonStart),
+            DaemonCommands::Status { .. } => Some(CliAction::DaemonStatus),
+            DaemonCommands::Stop { .. } => Some(CliAction::DaemonStop),
         },
-        Commands::Resolve { .. } => CliAction::ResolveBuild,
-        Commands::Doctor { .. } => CliAction::Doctor,
-        Commands::Deps { .. } => CliAction::Deps,
-        Commands::Dependents { .. } => CliAction::Dependents,
-        Commands::Why { .. } => CliAction::Why,
-        Commands::Impact { .. } => CliAction::Impact,
-        Commands::Cycles { .. } => CliAction::Cycles,
-        Commands::Unresolved { .. } => CliAction::Unresolved,
-        Commands::Query { .. } => CliAction::Query,
+        Commands::Resolve { .. } => Some(CliAction::ResolveBuild),
+        Commands::Doctor { .. } => Some(CliAction::Doctor),
+        Commands::Deps { .. } => Some(CliAction::Deps),
+        Commands::Dependents { .. } => Some(CliAction::Dependents),
+        Commands::Why { .. } => Some(CliAction::Why),
+        Commands::Impact { .. } => Some(CliAction::Impact),
+        Commands::Cycles { .. } => Some(CliAction::Cycles),
+        Commands::Unresolved { .. } => Some(CliAction::Unresolved),
+        Commands::Query { .. } => Some(CliAction::Query),
         Commands::Runtime { command } => match command {
-            RuntimeCommands::Validate { .. } => CliAction::RuntimeValidate,
-            RuntimeCommands::Import { .. } => CliAction::RuntimeImport,
+            RuntimeCommands::Validate { .. } => Some(CliAction::RuntimeValidate),
+            RuntimeCommands::Import { .. } => Some(CliAction::RuntimeImport),
         },
         Commands::Snapshot { command } => match command {
-            SnapshotCommands::Create { .. } => CliAction::SnapshotCreate,
-            SnapshotCommands::List { .. } => CliAction::SnapshotList,
-            SnapshotCommands::Show { .. } => CliAction::SnapshotShow,
+            SnapshotCommands::Create { .. } => Some(CliAction::SnapshotCreate),
+            SnapshotCommands::List { .. } => Some(CliAction::SnapshotList),
+            SnapshotCommands::Show { .. } => Some(CliAction::SnapshotShow),
         },
-        Commands::Diff { .. } => CliAction::Diff,
-        Commands::Policy { .. } => CliAction::Policy,
-        Commands::Export { .. } => CliAction::Export,
+        Commands::Diff { .. } => Some(CliAction::Diff),
+        Commands::Policy { .. } => Some(CliAction::Policy),
+        Commands::Export { .. } => Some(CliAction::Export),
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentHostFormatArg {
+    Codex,
+    #[value(name = "claude-desktop")]
+    ClaudeDesktop,
+    #[value(name = "vscode")]
+    VsCode,
+}
+
+impl From<AgentHostFormatArg> for depgraph_mcp_tools::AgentHostFormat {
+    fn from(value: AgentHostFormatArg) -> Self {
+        match value {
+            AgentHostFormatArg::Codex => Self::Codex,
+            AgentHostFormatArg::ClaudeDesktop => Self::ClaudeDesktop,
+            AgentHostFormatArg::VsCode => Self::VsCode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentHostProfileArg {
+    Read,
+    StoreWrite,
+    RepositoryWrite,
+    DaemonControl,
+    ProjectExec,
+    Full,
+}
+
+impl From<AgentHostProfileArg> for depgraph_mcp_tools::AgentHostCapabilityProfile {
+    fn from(value: AgentHostProfileArg) -> Self {
+        match value {
+            AgentHostProfileArg::Read => Self::Read,
+            AgentHostProfileArg::StoreWrite => Self::StoreWrite,
+            AgentHostProfileArg::RepositoryWrite => Self::RepositoryWrite,
+            AgentHostProfileArg::DaemonControl => Self::DaemonControl,
+            AgentHostProfileArg::ProjectExec => Self::ProjectExec,
+            AgentHostProfileArg::Full => Self::Full,
+        }
     }
 }
 
@@ -650,6 +731,77 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
 
 async fn run(cli: Cli) -> Result<u8> {
     match cli.command {
+        Commands::AgentConfig {
+            root,
+            release_archive,
+            release_checksum,
+            release_evidence,
+            trusted_release_evidence_sha256,
+            release_manifest,
+            compiler_pack_requirement,
+            host,
+            profile,
+            acknowledge_privileged_effects,
+            acknowledge_project_exec_human_confirmation,
+        } => {
+            let store = cli
+                .store
+                .context("agent-config requires an explicit global --store PATH")?;
+            let profile = depgraph_mcp_tools::AgentHostCapabilityProfile::from(profile);
+            eprintln!("agent-config profile: {}", profile.as_str());
+            let capability_names = profile
+                .capabilities()
+                .iter()
+                .map(|capability| depgraph_mcp_tools::agent_host_capability_name(*capability))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("agent-config capabilities: {capability_names}");
+            eprintln!("agent-config effects: {}", profile.effect_summary());
+            if profile.permits_project_execution() {
+                eprintln!(
+                    "agent-config responsibility: the host must obtain an independent human decision for every project-code execution request"
+                );
+            }
+            let host = depgraph_mcp_tools::AgentHostFormat::from(host);
+            let output = generate_agent_config(&AgentConfigRequest {
+                root: &root,
+                store: &store,
+                release_archive: &release_archive,
+                release_checksum: &release_checksum,
+                release_evidence: &release_evidence,
+                trusted_release_evidence_sha256: &trusted_release_evidence_sha256,
+                release_manifest: &release_manifest,
+                compiler_pack_requirement: &compiler_pack_requirement,
+                format: host,
+                profile,
+                acknowledge_privileged_effects,
+                acknowledge_project_exec_human_confirmation,
+            })?;
+            eprintln!(
+                "agent-config preflight: verified depgraph {} for {} ({}) from official release {} ({})",
+                output.release_version,
+                output.target,
+                output.archive_sha256,
+                output.release_tag,
+                output.release_evidence_sha256
+            );
+            eprintln!(
+                "agent-config binding: root={} store={} snapshot={}",
+                output.canonical_root.display(),
+                output.canonical_store.display(),
+                output.current_snapshot_id
+            );
+            eprintln!(
+                "agent-config connection: initialize, tools/list ({} tools), and get_context verified",
+                output.tool_count
+            );
+            eprintln!(
+                "agent-config output: {} configuration follows on stdout; no host file was changed",
+                host.as_str()
+            );
+            println!("{}", output.configuration);
+            Ok(0)
+        }
         Commands::Init { path, force } => {
             let root = canonical_directory(path)?;
             let store_path = store_path(cli.store, &root)?;
@@ -2773,7 +2925,9 @@ mod tests {
             .map(|(arguments, expected)| {
                 let parsed = <Cli as clap::Parser>::try_parse_from(*arguments)
                     .unwrap_or_else(|error| panic!("failed to parse {arguments:?}: {error}"));
-                let action = catalog_action_for_command(&parsed.command);
+                let action = catalog_action_for_command(&parsed.command).unwrap_or_else(|| {
+                    panic!("repository action unexpectedly excluded: {arguments:?}")
+                });
                 assert_eq!(action, *expected, "{arguments:?}");
                 action
             })
@@ -2783,6 +2937,31 @@ mod tests {
         let mut expected_actions = ALL_CLI_ACTIONS.to_vec();
         expected_actions.sort_unstable();
         assert_eq!(parsed_actions, expected_actions);
+
+        let control_plane = <Cli as clap::Parser>::try_parse_from([
+            "depgraph",
+            "agent-config",
+            "--root",
+            "/repository",
+            "--release-archive",
+            "/release.tar.gz",
+            "--release-checksum",
+            "/release.tar.gz.sha256",
+            "--release-evidence",
+            "/release-post-publish-evidence.json",
+            "--trusted-release-evidence-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--release-manifest",
+            "/release/release-manifest.json",
+            "--compiler-pack-requirement",
+            "/compiler-pack.requirement.json",
+            "--host",
+            "codex",
+            "--store",
+            "/state/depgraph.sqlite",
+        ])
+        .expect("Agent host control-plane command parses");
+        assert_eq!(catalog_action_for_command(&control_plane.command), None);
 
         let capabilities = DepgraphCapabilitySet::try_new([
             DepgraphCapability::Read,

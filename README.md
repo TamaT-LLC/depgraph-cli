@@ -206,6 +206,50 @@ requirement published for the host. Replace the path placeholders below with
 canonical absolute paths and `TARGET_TRIPLE` with the release host target; Agent
 hosts must not rely on shell or environment expansion.
 
+The recommended onboarding command authenticates the downloaded inputs against
+the official release's closed post-publish evidence, verifies the archive and
+exact checksum sidecar, binds the extracted manifest to that archive, checks
+every MCP/runner/schema/worker sibling, validates the compiler pack and fixed
+root/Store snapshot, and performs `initialize`, `tools/list`, and `get_context`
+before printing a host entry. The default profile is `read`; stdout contains
+only the requested configuration and no host file is edited. Diagnostics and
+the exact capability closure and effect summary go to stderr.
+
+Download `release-post-publish-evidence-RELEASE_TAG.json` from the same
+[official GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases),
+then obtain that asset's SHA-256 independently from GitHub's release-asset API
+over HTTPS. Strip the `sha256:` prefix and pass the remaining 64 lowercase hex
+characters below. Do not calculate this trusted value from the downloaded
+evidence file or any local archive/sidecar: that would make a forged local set
+self-authenticating. For example, the API field can be read with
+
+```sh
+gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
+  --jq '.assets[] | select(.name == "release-post-publish-evidence-RELEASE_TAG.json") | .digest | sub("^sha256:"; "")'
+```
+
+```sh
+/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph agent-config \
+  --root /absolute/path/to/repository \
+  --store /absolute/path/to/state/depgraph.sqlite \
+  --release-archive /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
+  --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --release-manifest /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.5.0-TARGET_TRIPLE.requirement.json \
+  --host codex
+```
+
+Use the matching `.zip` and `.zip.sha256` paths on Windows. `--host` accepts
+`codex`, `claude-desktop`, or `vscode`. A missing current snapshot fails before
+server launch and reports an exact argv array for a separate safe scan; the
+onboarding command itself never creates or migrates the Store. Non-read
+profiles are selected explicitly with `--profile store-write`,
+`repository-write`, `daemon-control`, `project-exec`, or `full` and require
+`--acknowledge-privileged-effects`. `project-exec`/`full` also require
+`--acknowledge-project-exec-human-confirmation`.
+
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
 /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp \
@@ -216,8 +260,8 @@ hosts must not rely on shell or environment expansion.
   --log-level warn
 ```
 
-The equivalent Agent host entry is read-only. This is the configuration to copy
-unless an operator has approved a narrower privileged use case.
+The equivalent Claude Desktop entry is read-only. This is also the generic JSON
+form to copy unless an operator has approved a narrower privileged use case.
 
 <!-- depgraph-mcp-package-smoke:read -->
 ```json
@@ -240,8 +284,8 @@ unless an operator has approved a narrower privileged use case.
 The fixed root and store form a trust boundary: use a separate private store per
 repository, keep it outside the repository when possible, and launch the MCP
 server, sibling operation runner, schema, manifest, and workers from one
-checksum-verified release archive. stdout is reserved for newline-delimited MCP
-JSON-RPC; bounded diagnostics go to stderr.
+official-evidence-bound release archive. stdout is reserved for
+newline-delimited MCP JSON-RPC; bounded diagnostics go to stderr.
 
 Privileged profiles are explicit replacements for the read-only entry, not a
 runtime elevation mechanism. Complete Agent host examples for `store-write`,
@@ -737,6 +781,17 @@ evidence.
 Run `rustup component add rust-src --toolchain 1.93.1` once, then `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` and `depgraph-mcp` under `bin/`, compatible workers and `depgraph-operation-runner` under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, checksum-verified protocol and `depgraph-mcp-tools-v1` schemas, an SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0`, attests both project license files independently from `THIRD_PARTY_LICENSES.txt`, and binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`. The SBOM and license inventory include the complete shipped rmcp dependency closure and an Apache-2.0 notice. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. It also carries `rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` under `libexec/rust-sysroot` as a licensed, SBOM-recorded `data-tree` copied only from that pinned toolchain's `rust-src` and independently matched to the known normalized digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
 The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, MCP/Rust/Web handshakes, per-framework scan/query/export E2E, dynamic framework build query/diff/impact/policy/JSON/GraphML E2E, cross-checkout determinism, rollback, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, MCP server/runner/schema/SDK metadata, Web worker, build observer/converter, Astro parser, TypeScript compiler, Rust sysroot source, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. The aggregate release verifier requires all five target archives to attest identical MCP schema and Rust sysroot source bytes. After core verifies that data tree, it hands the canonical root to the packaged Rust worker; the worker rechecks the pinned source identity, builds separate library VFS roots for `core`, `alloc`, and `std`, and emits exact standard-library import, type-use, and direct-call edges. Development, mismatched, missing, unsupported-target, and tampered inputs preserve syntax output without `semantic-complete`, and neither packaging nor scanning falls back implicitly to project or system `rust-src` or backend bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the MCP, Web semantic, dynamic framework, and Rust sysroot archive contracts.
+
+`mcp-package-smoke-v2` also runs `depgraph agent-config` for all three host
+formats from a clean temporary home, verifies the complete package/root/Store/
+compiler-pack tuple against a separately pinned `release-post-publish-evidence-v1`
+digest, connects through the generated read-only launch arguments, and rejects
+any repository, private Store, host-config, or journal mutation. Its report
+records `agent_host_release_evidence_contract_version` and requires
+`agent_host_release_trust_verified=true`.
+The CLI runtime closure for this archive preflight (`flate2`, `tar`, `zip`, and
+their transitive dependencies) is included in the SBOM and third-party license
+inventory.
 
 ## License
 

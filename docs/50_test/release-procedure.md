@@ -112,6 +112,21 @@ Releaseはquality、benchmark、hostile E2E、通常archive、compiler pack、ag
 `2026-07-28`をattestし、SBOMとthird-party inventoryはrmcp dependency closureと
 Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-target` checkは、
 欠損、改変、version drift、target間schema driftを拒否する。
+
+各native jobのMCP sidecarは`mcp-package-smoke-v2`である。従来のprotocol/catalog、
+durable recovery、stdio purityに加え、`depgraph-agent-host-config-v1`からCodex、
+Claude Desktop、VS Codeのread-only設定をclean temporary homeで生成する。公開前smokeは
+closed synthetic `release-post-publish-evidence-v1`と別計算したtrusted digestを用い、
+archive/checksum/manifest/sibling executable/schema/worker、target固有compiler-pack requirement、
+root seal、private Store/current snapshotをpreflightしたうえで、生成されたlaunch tupleから
+`initialize`、`tools/list`、`get_context`へ接続する。sidecarはevidence contract versionと
+`agent_host_release_trust_verified=true`を記録する。source、Store、home、operation journalの
+不変が一つでも崩れたpackageは公開対象にしない。archive preflightのruntime dependencyである`flate2`、
+`tar`、`zip`とそのtransitive closureもSBOMとthird-party license inventoryの対象であり、
+build/test-only dependencyとして除外してはならない。
+Store不変性はmain databaseとWALのbyte完全一致で判定する。read connection自身がlock/index
+として更新するSQLite `-shm`は存在とsizeを固定し、内容digestには含めない。operation
+journal、そのWAL/SHM/rollback journal、runner purge lockはすべて不存在でなければならない。
 すべてのgateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 

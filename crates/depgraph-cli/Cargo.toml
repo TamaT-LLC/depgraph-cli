@@ -18,14 +18,20 @@ anyhow.workspace = true
 clap.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
+depgraph-operation = { path = "../depgraph-operation" }
 depgraph-protocol = { path = "../depgraph-protocol" }
 depgraph-store = { path = "../depgraph-store" }
+flate2 = "1.1"
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar = { version = "0.4", default-features = false }
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 assert_cmd.workspace = true
