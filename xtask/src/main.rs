@@ -1118,17 +1118,14 @@ fn verify_workflow_policy_text(
             }
         }
         "release.yml" => {
-            let publish = workflow
-                .split_once("\n  publish:")
-                .map(|(_, publish)| publish)
-                .context("release workflow is missing the publish job")?;
+            let publish = workflow_job_block(workflow, "publish")?;
+            let publish_permissions = job_permissions(publish)?;
             if top_level_trigger_keys(workflow)? != ["push"]
                 || !workflow.contains("tags: [\"v*\"]")
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
-                || !publish
-                    .contains("permissions:\n      actions: read\n      contents: write")
+                || publish_permissions != ["actions: read", "contents: write"]
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
                     .count()
@@ -1164,6 +1161,67 @@ fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
+    let header = format!("  {job_name}:");
+    if workflow.lines().filter(|line| *line == header).count() != 1 {
+        bail!("workflow must contain exactly one {job_name} job");
+    }
+
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = workflow.len();
+    for line in workflow.split_inclusive('\n') {
+        let code = line.strip_suffix('\n').unwrap_or(line);
+        if start.is_some()
+            && code.starts_with("  ")
+            && !code.starts_with("    ")
+            && code.ends_with(':')
+        {
+            end = offset;
+            break;
+        }
+        if code == header {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    let start = start.context("workflow job disappeared while extracting its block")?;
+    Ok(&workflow[start..end])
+}
+
+fn job_permissions(job: &str) -> Result<Vec<&str>> {
+    let lines = job.lines().collect::<Vec<_>>();
+    let declarations = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "    permissions:")
+        .collect::<Vec<_>>();
+    if declarations.len() != 1 {
+        bail!("workflow job must contain exactly one canonical permissions block");
+    }
+
+    let mut permissions = Vec::new();
+    for line in &lines[declarations[0].0 + 1..] {
+        let code = line.split('#').next().unwrap_or_default();
+        if code.trim().is_empty() {
+            continue;
+        }
+        let indentation = code.len() - code.trim_start_matches(' ').len();
+        if indentation <= 4 {
+            break;
+        }
+        if indentation != 6 {
+            bail!("workflow job permissions nesting is malformed");
+        }
+        permissions.push(code.trim());
+    }
+    permissions.sort_unstable();
+    if permissions.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("workflow job permissions contain a duplicate scope");
+    }
+    Ok(permissions)
 }
 
 fn contains_yaml_hex_escape(workflow: &str) -> bool {
@@ -14579,6 +14637,37 @@ jobs:
         );
 
         let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let relocated_publish_permissions = format!(
+            "{}\n  evidence-proxy:\n    permissions:\n      actions: read\n      contents: write\n    runs-on: ubuntu-24.04\n    steps: []\n",
+            release.replacen(
+                "    permissions:\n      actions: read\n      contents: write",
+                "    permissions:\n      contents: read",
+                1,
+            )
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &relocated_publish_permissions,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let extra_publish_read_scope = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: read",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &extra_publish_read_scope,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
         let missing_actions_read = release.replacen("      actions: read\n", "", 1);
         assert!(
             verify_workflow_policy_text(
