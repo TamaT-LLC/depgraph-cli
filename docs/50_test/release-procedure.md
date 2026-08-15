@@ -127,7 +127,9 @@ safe scan reconnect、stdout purity、root seal、compiler semantic / rollback�
 が一致しなければ失敗する。`release-post-publish-evidence-v1` JSONは、candidate commit /
 tree、署名tag object、exact manual full-CI runと8 job、Release run、51 asset digest、
 aggregate digest、asset-set digestを記録する。最終jobはこのJSONを同じGitHub Releaseへ
-追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。
+追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。最終jobの
+job-scoped tokenは、Full CIのrun/jobを読むための`actions: read`と、Releaseへ成果物を
+公開するための`contents: write`だけを持つ。
 
 公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、
 検証report、`release-post-publish-evidence-<tag>.json`が同じタグに結び付いていることを

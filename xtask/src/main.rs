@@ -1118,16 +1118,14 @@ fn verify_workflow_policy_text(
             }
         }
         "release.yml" => {
-            let publish = workflow
-                .split_once("\n  publish:")
-                .map(|(_, publish)| publish)
-                .context("release workflow is missing the publish job")?;
+            let publish = workflow_job_block(workflow, "publish")?;
+            let publish_permissions = job_permissions(publish)?;
             if top_level_trigger_keys(workflow)? != ["push"]
                 || !workflow.contains("tags: [\"v*\"]")
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
-                || !publish.contains("permissions:\n      contents: write")
+                || publish_permissions != ["actions: read", "contents: write"]
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
                     .count()
@@ -1138,7 +1136,7 @@ fn verify_workflow_policy_text(
                     != 2
             {
                 bail!(
-                    "release write permission must remain tag-publish-only and native x86_64 Linux builds must retain the pinned linker policy"
+                    "release publish permissions must remain actions-read/contents-write, tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
                 );
             }
         }
@@ -1163,6 +1161,67 @@ fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
+    let header = format!("  {job_name}:");
+    if workflow.lines().filter(|line| *line == header).count() != 1 {
+        bail!("workflow must contain exactly one {job_name} job");
+    }
+
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = workflow.len();
+    for line in workflow.split_inclusive('\n') {
+        let code = line.strip_suffix('\n').unwrap_or(line);
+        if start.is_some()
+            && code.starts_with("  ")
+            && !code.starts_with("    ")
+            && code.ends_with(':')
+        {
+            end = offset;
+            break;
+        }
+        if code == header {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    let start = start.context("workflow job disappeared while extracting its block")?;
+    Ok(&workflow[start..end])
+}
+
+fn job_permissions(job: &str) -> Result<Vec<&str>> {
+    let lines = job.lines().collect::<Vec<_>>();
+    let declarations = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "    permissions:")
+        .collect::<Vec<_>>();
+    if declarations.len() != 1 {
+        bail!("workflow job must contain exactly one canonical permissions block");
+    }
+
+    let mut permissions = Vec::new();
+    for line in &lines[declarations[0].0 + 1..] {
+        let code = line.split('#').next().unwrap_or_default();
+        if code.trim().is_empty() {
+            continue;
+        }
+        let indentation = code.len() - code.trim_start_matches(' ').len();
+        if indentation <= 4 {
+            break;
+        }
+        if indentation != 6 {
+            bail!("workflow job permissions nesting is malformed");
+        }
+        permissions.push(code.trim());
+    }
+    permissions.sort_unstable();
+    if permissions.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("workflow job permissions contain a duplicate scope");
+    }
+    Ok(permissions)
 }
 
 fn contains_yaml_hex_escape(workflow: &str) -> bool {
@@ -2162,6 +2221,31 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.5.0-rc.5 release note is missing contract {required:?}");
         }
     }
+    let rc6_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.6.md"))?;
+    for required in [
+        "sixth v0.5 release candidate",
+        "signed annotated `v0.5.0-rc.6` tag",
+        "`v0.5.0-rc.1` through `v0.5.0-rc.5` tags remain immutable",
+        "51 pre-evidence",
+        "lacked `actions: read`",
+        "`actions: write`",
+        "| Product and Rust/Go/Web adapters | `0.5.0` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `17` |",
+        "| Durable operation journal | schema `5` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v1` |",
+        "| Post-publish evidence | `release-post-publish-evidence-v1` |",
+        "release-post-publish-evidence-v0.5.0-rc.6.json",
+        "all 51 pre-evidence asset sizes and SHA-256 digests",
+        "does not substitute checkout-built product binaries",
+        "Agent host operations runbook",
+        "Downgrade-in-place is unsupported",
+    ] {
+        if !rc6_release_note.contains(required) {
+            bail!("v0.5.0-rc.6 release note is missing contract {required:?}");
+        }
+    }
     let release_procedure =
         read_lf_normalized_text(&root.join("docs/50_test/release-procedure.md"))?;
     for required in [
@@ -2257,6 +2341,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/releases/v0.4.0.md",
         "docs/releases/v0.5.0.md",
+        "docs/releases/v0.5.0-rc.6.md",
         "docs/releases/v0.5.0-rc.5.md",
         "docs/releases/v0.5.0-rc.4.md",
         "docs/releases/v0.5.0-rc.3.md",
@@ -14552,6 +14637,57 @@ jobs:
         );
 
         let release = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+        let relocated_publish_permissions = format!(
+            "{}\n  evidence-proxy:\n    permissions:\n      actions: read\n      contents: write\n    runs-on: ubuntu-24.04\n    steps: []\n",
+            release.replacen(
+                "    permissions:\n      actions: read\n      contents: write",
+                "    permissions:\n      contents: read",
+                1,
+            )
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &relocated_publish_permissions,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let extra_publish_read_scope = release.replacen(
+            "      contents: write",
+            "      contents: write\n      issues: read",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &extra_publish_read_scope,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let missing_actions_read = release.replacen("      actions: read\n", "", 1);
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &missing_actions_read,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+        let writable_actions = release.replacen("      actions: read", "      actions: write", 1);
+        assert!(
+            verify_workflow_policy_text(
+                "release.yml",
+                &writable_actions,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
         let overprivileged_release = release.replacen(
             "      contents: write",
             "      contents: write\n      issues: write",

@@ -43,9 +43,11 @@ caches are untrusted inputs and cannot authorize a release.
 The release workflow is triggered only by a pushed `v*` tag. Its quality,
 benchmark, package, verification, and stable-gate jobs retain read-only
 repository permissions. Only the final `publish` job receives job-scoped
-`contents: write`, after all exact-candidate verification jobs succeed. The
-verifier requires that to be the complete write-scope set, so adding another
-write permission to any release job fails the gate. It
+`actions: read` and `contents: write`, after all exact-candidate verification
+jobs succeed. `actions: read` is required only to bind the successful manual
+full-CI run and its job conclusions into the post-publish evidence. The verifier
+requires `contents` to be the complete write-scope set, so adding another write
+permission to any release job fails the gate. It
 downloads artifacts produced by the same run and verifies their manifests,
 checksums, SBOMs, licenses, benchmark report, and stable release gate before
 publication. The same final job requires a signed annotated tag object, creates
