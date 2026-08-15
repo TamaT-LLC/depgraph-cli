@@ -4,6 +4,15 @@ This directory contains versioned, machine-readable contracts shipped with depgr
 Consumers should select a schema by its declared contract version and fail closed on
 unknown versions or properties.
 
+`agent-dogfood-report-v1.schema.json` is the closed JSON Schema 2020-12
+contract for the packaged MCP real-Agent comparison. It binds the public
+release and compiler-pack digests, fixed repository commits and snapshots,
+host controls, all six raw samples, medians, typed failures, read-only safety,
+packaged reconnect evidence, and every pass/fail gate. The deterministic runner
+and corpus live under `scripts/agent-dogfood.mjs` and
+`fixtures/agent-dogfood-v1`; ordinary CI verifies the checked-in evidence,
+while a live six-Agent rerun is an explicit release/dogfood gate.
+
 `depgraph-mcp-tools-v1.schema.json` is the checked-in JSON Schema 2020-12 catalog
 for the closed Agent-facing contracts implemented by `depgraph-mcp-tools`. It covers
 the common request and versioned envelopes, snapshot selector, bounded page/cursor,

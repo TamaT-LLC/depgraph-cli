@@ -1,0 +1,406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/agent-dogfood-report-v1.schema.json",
+  "title": "depgraph Agent dogfood report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "generated_at",
+    "issue",
+    "inputs",
+    "release",
+    "repository",
+    "snapshots",
+    "host",
+    "thresholds",
+    "samples",
+    "aggregates",
+    "typed_failures",
+    "security",
+    "gate"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agent-dogfood-report-v1"
+    },
+    "benchmark_id": { "$ref": "#/$defs/nonEmpty" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "issue": { "type": "integer", "const": 357 },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spec_sha256",
+        "prompt_sha256",
+        "answer_schema_sha256",
+        "environment"
+      ],
+      "properties": {
+        "spec_sha256": { "$ref": "#/$defs/sha256" },
+        "prompt_sha256": { "$ref": "#/$defs/sha256" },
+        "answer_schema_sha256": { "$ref": "#/$defs/sha256" },
+        "environment": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "release": { "$ref": "#/$defs/release" },
+    "repository": { "$ref": "#/$defs/repository" },
+    "snapshots": { "$ref": "#/$defs/snapshots" },
+    "host": { "$ref": "#/$defs/host" },
+    "thresholds": { "$ref": "#/$defs/thresholds" },
+    "samples": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/sampleBinding" }
+    },
+    "aggregates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "mcp"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/armAggregate" },
+        "mcp": { "$ref": "#/$defs/armAggregate" }
+      }
+    },
+    "typed_failures": { "$ref": "#/$defs/failureCounts" },
+    "security": { "$ref": "#/$defs/security" },
+    "gate": { "$ref": "#/$defs/gate" }
+  },
+  "$defs": {
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitObject": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^snapshot:sha256:[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\]+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "target",
+        "archive_sha256",
+        "compiler_pack_archive_sha256",
+        "compiler_pack_requirement_sha256",
+        "manifest_sha256",
+        "depgraph_sha256",
+        "mcp_binary_sha256",
+        "mcp_smoke_sha256"
+      ],
+      "properties": {
+        "tag": { "type": "string", "const": "v0.5.0-rc.7" },
+        "target": { "type": "string", "const": "aarch64-apple-darwin" },
+        "archive_sha256": { "$ref": "#/$defs/sha256" },
+        "compiler_pack_archive_sha256": { "$ref": "#/$defs/sha256" },
+        "compiler_pack_requirement_sha256": { "$ref": "#/$defs/sha256" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "depgraph_sha256": { "$ref": "#/$defs/sha256" },
+        "mcp_binary_sha256": { "$ref": "#/$defs/sha256" },
+        "mcp_smoke_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_commit",
+        "baseline_tree",
+        "candidate_commit",
+        "candidate_tree"
+      ],
+      "properties": {
+        "baseline_commit": { "$ref": "#/$defs/gitObject" },
+        "baseline_tree": { "$ref": "#/$defs/gitObject" },
+        "candidate_commit": { "$ref": "#/$defs/gitObject" },
+        "candidate_tree": { "$ref": "#/$defs/gitObject" }
+      }
+    },
+    "snapshots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_id",
+        "baseline_revision",
+        "candidate_id",
+        "candidate_revision"
+      ],
+      "properties": {
+        "baseline_id": { "$ref": "#/$defs/snapshotId" },
+        "baseline_revision": { "$ref": "#/$defs/gitObject" },
+        "candidate_id": { "$ref": "#/$defs/snapshotId" },
+        "candidate_revision": { "$ref": "#/$defs/gitObject" }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "cli_version",
+        "platform",
+        "architecture",
+        "model",
+        "reasoning_effort",
+        "sandbox",
+        "approval_policy",
+        "samples_per_arm",
+        "maximum_tool_calls",
+        "mcp_enabled_tools",
+        "timeout_ms"
+      ],
+      "properties": {
+        "program": { "type": "string", "const": "codex" },
+        "cli_version": { "$ref": "#/$defs/nonEmpty" },
+        "platform": { "$ref": "#/$defs/nonEmpty" },
+        "architecture": { "$ref": "#/$defs/nonEmpty" },
+        "model": { "$ref": "#/$defs/nonEmpty" },
+        "reasoning_effort": { "type": "string", "const": "medium" },
+        "sandbox": { "type": "string", "const": "read-only" },
+        "approval_policy": { "type": "string", "const": "never" },
+        "samples_per_arm": { "type": "integer", "const": 3 },
+        "maximum_tool_calls": { "type": "integer", "const": 28 },
+        "mcp_enabled_tools": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmpty" }
+        },
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_mcp_accuracy_percent",
+        "minimum_mcp_major_recall_percent",
+        "maximum_false_exact_claims",
+        "maximum_candidate_or_unresolved_as_exact",
+        "minimum_setup_successes_per_arm",
+        "require_mcp_accuracy_not_below_baseline",
+        "maximum_mcp_median_tool_calls",
+        "maximum_mcp_median_tool_result_bytes",
+        "maximum_mcp_median_elapsed_ms",
+        "maximum_mcp_median_effective_tokens",
+        "require_read_only_safety",
+        "require_packaged_reconnect"
+      ],
+      "properties": {
+        "minimum_mcp_accuracy_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "minimum_mcp_major_recall_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "maximum_false_exact_claims": { "type": "integer", "minimum": 0 },
+        "maximum_candidate_or_unresolved_as_exact": { "type": "integer", "minimum": 0 },
+        "minimum_setup_successes_per_arm": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "require_mcp_accuracy_not_below_baseline": { "type": "boolean" },
+        "maximum_mcp_median_tool_calls": { "type": "integer", "minimum": 1 },
+        "maximum_mcp_median_tool_result_bytes": { "type": "integer", "minimum": 1 },
+        "maximum_mcp_median_elapsed_ms": { "type": "integer", "minimum": 1 },
+        "maximum_mcp_median_effective_tokens": { "type": "integer", "minimum": 1 },
+        "require_read_only_safety": { "type": "boolean" },
+        "require_packaged_reconnect": { "type": "boolean" }
+      }
+    },
+    "sampleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_id", "sample", "answer", "host_output", "trace"],
+      "properties": {
+        "sample_id": {
+          "type": "string",
+          "pattern": "^(baseline|mcp)-[1-3]$"
+        },
+        "sample": { "$ref": "#/$defs/artifact" },
+        "answer": { "$ref": "#/$defs/artifact" },
+        "host_output": { "$ref": "#/$defs/artifact" },
+        "trace": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "failureCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "setup_blocker",
+        "tool_or_schema_missing",
+        "agent_misuse",
+        "excessive_context",
+        "host_failure"
+      ],
+      "properties": {
+        "setup_blocker": { "type": "integer", "minimum": 0 },
+        "tool_or_schema_missing": { "type": "integer", "minimum": 0 },
+        "agent_misuse": { "type": "integer", "minimum": 0 },
+        "excessive_context": { "type": "integer", "minimum": 0 },
+        "host_failure": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "threeNumbers": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number", "minimum": 0 }
+    },
+    "threeIntegers": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "nullableThreeIntegers": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/threeIntegers" }
+      ]
+    },
+    "nullableInteger": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "armAggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "samples",
+        "setup_successes",
+        "accuracy_percent_samples",
+        "accuracy_percent_median",
+        "major_recall_percent_samples",
+        "major_recall_percent_median",
+        "false_exact_claims",
+        "candidate_or_unresolved_as_exact",
+        "tool_calls_samples",
+        "tool_calls_median",
+        "tool_result_bytes_samples",
+        "tool_result_bytes_median",
+        "elapsed_ms_samples",
+        "elapsed_ms_median",
+        "tokens_available",
+        "total_tokens_samples",
+        "total_tokens_median",
+        "effective_tokens_samples",
+        "effective_tokens_median",
+        "typed_failures"
+      ],
+      "properties": {
+        "samples": { "type": "integer", "const": 3 },
+        "setup_successes": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "accuracy_percent_samples": { "$ref": "#/$defs/threeNumbers" },
+        "accuracy_percent_median": { "type": "number", "minimum": 0, "maximum": 100 },
+        "major_recall_percent_samples": { "$ref": "#/$defs/threeNumbers" },
+        "major_recall_percent_median": { "type": "number", "minimum": 0, "maximum": 100 },
+        "false_exact_claims": { "type": "integer", "minimum": 0 },
+        "candidate_or_unresolved_as_exact": { "type": "integer", "minimum": 0 },
+        "tool_calls_samples": { "$ref": "#/$defs/threeIntegers" },
+        "tool_calls_median": { "type": "integer", "minimum": 0 },
+        "tool_result_bytes_samples": { "$ref": "#/$defs/threeIntegers" },
+        "tool_result_bytes_median": { "type": "integer", "minimum": 0 },
+        "elapsed_ms_samples": { "$ref": "#/$defs/threeIntegers" },
+        "elapsed_ms_median": { "type": "integer", "minimum": 0 },
+        "tokens_available": { "type": "boolean" },
+        "total_tokens_samples": { "$ref": "#/$defs/nullableThreeIntegers" },
+        "total_tokens_median": { "$ref": "#/$defs/nullableInteger" },
+        "effective_tokens_samples": { "$ref": "#/$defs/nullableThreeIntegers" },
+        "effective_tokens_median": { "$ref": "#/$defs/nullableInteger" },
+        "typed_failures": { "$ref": "#/$defs/failureCounts" }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "read_catalog_sha256",
+        "safe_scan_recovered_after_eof",
+        "safe_scan_terminal_status",
+        "safe_scan_project_code_executed",
+        "operation_cancel_denied_code",
+        "stdin_eof_clean_exit",
+        "stdout_json_rpc_only"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "mcp-package-smoke-v1" },
+        "read_catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "safe_scan_recovered_after_eof": { "type": "boolean" },
+        "safe_scan_terminal_status": { "$ref": "#/$defs/nonEmpty" },
+        "safe_scan_project_code_executed": { "type": "boolean" },
+        "operation_cancel_denied_code": { "$ref": "#/$defs/nonEmpty" },
+        "stdin_eof_clean_exit": { "type": "boolean" },
+        "stdout_json_rpc_only": { "type": "boolean" }
+      }
+    },
+    "gateCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "passed", "actual", "threshold"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmpty" },
+        "passed": { "type": "boolean" },
+        "actual": { "$ref": "#/$defs/nonEmpty" },
+        "threshold": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checks", "passed", "efficiency_ratios"],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "minItems": 13,
+          "maxItems": 13,
+          "items": { "$ref": "#/$defs/gateCheck" }
+        },
+        "passed": { "type": "boolean" },
+        "efficiency_ratios": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool_calls",
+            "tool_result_bytes",
+            "elapsed_ms",
+            "total_tokens",
+            "token_metric"
+          ],
+          "properties": {
+            "tool_calls": { "type": ["number", "null"], "minimum": 0 },
+            "tool_result_bytes": { "type": ["number", "null"], "minimum": 0 },
+            "elapsed_ms": { "type": ["number", "null"], "minimum": 0 },
+            "total_tokens": { "type": ["number", "null"], "minimum": 0 },
+            "token_metric": {
+              "enum": ["host_effective_usage", "tool_result_bytes_proxy"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

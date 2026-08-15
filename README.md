@@ -254,6 +254,12 @@ independent host decision; it does not grant `project-exec` or replace human
 confirmation. Only enforced isolation plus a successful source postflight can
 claim source non-mutation; best-effort isolation cannot.
 
+The [packaged MCP Agent dogfood benchmark](docs/50_test/agent-dogfood-benchmark.md)
+compares the same fixed code-investigation corpus with and without this MCP
+server. The checked-in `v0.5.0-rc.7` evidence records all three samples per arm,
+91.67% MCP accuracy, 100% major-claim recall, zero false exact claims, and a
+side-effect-free read-only run.
+
 Modern protocol `2026-07-28` can negotiate MCP Tasks. Its `taskId` is the same
 durable ID exposed by `operation_get`, `operation_result`, and
 `operation_cancel`; legacy `2025-11-25` and Tasks-unaware hosts use those

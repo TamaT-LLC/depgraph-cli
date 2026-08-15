@@ -1,0 +1,94 @@
+{
+  "claims": {
+    "candidate_coverage": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph coverage result is available.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "file_cycle": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph cycle result is available.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "go_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph evidence is available to establish the resolved package edge.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "package_cycles": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph cycle result is available.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_candidate_import": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Source inspection cannot establish depgraph resolution status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_impact": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph evidence is available to establish bounded impact.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_path": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No depgraph graph service is available to establish the resolved path.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_unresolved_type": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Source inspection cannot establish depgraph resolution status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_file_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No snapshot-diff graph result is available.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_package_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No snapshot-diff graph result is available.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph evidence is available to establish the file dependency.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependents": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No graph evidence is available to enumerate direct incoming edges.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    }
+  },
+  "failure": {
+    "code": "none",
+    "remediation": "",
+    "task": ""
+  },
+  "schema_version": "agent-dogfood-answer-v1"
+}

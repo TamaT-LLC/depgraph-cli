@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/agent-dogfood-answer-v1.schema.json",
+  "title": "depgraph Agent dogfood answer v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "claims", "failure"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "agent-dogfood-answer-v1"
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rust_path",
+        "go_dependency",
+        "web_dependency",
+        "web_dependents",
+        "rust_impact",
+        "rust_unresolved_type",
+        "rust_candidate_import",
+        "snapshot_package_diff",
+        "snapshot_file_diff",
+        "file_cycle",
+        "package_cycles",
+        "candidate_coverage"
+      ],
+      "properties": {
+        "rust_path": { "$ref": "#/$defs/claim" },
+        "go_dependency": { "$ref": "#/$defs/claim" },
+        "web_dependency": { "$ref": "#/$defs/claim" },
+        "web_dependents": { "$ref": "#/$defs/claim" },
+        "rust_impact": { "$ref": "#/$defs/claim" },
+        "rust_unresolved_type": { "$ref": "#/$defs/claim" },
+        "rust_candidate_import": { "$ref": "#/$defs/claim" },
+        "snapshot_package_diff": { "$ref": "#/$defs/claim" },
+        "snapshot_file_diff": { "$ref": "#/$defs/claim" },
+        "file_cycle": { "$ref": "#/$defs/claim" },
+        "package_cycles": { "$ref": "#/$defs/claim" },
+        "candidate_coverage": { "$ref": "#/$defs/claim" }
+      }
+    },
+    "failure": { "$ref": "#/$defs/failure" }
+  },
+  "$defs": {
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "classification", "value", "evidence", "reason"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["supported", "refuted", "insufficient"]
+        },
+        "classification": {
+          "type": "string",
+          "enum": ["exact", "candidate", "unresolved", "external", "heuristic", "not_applicable"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+      "evidence": {
+        "type": "array",
+        "description": "Use 1-3 repository-relative evidence entries for supported/refuted path-bearing graph claims. Aggregate-only or insufficient claims may be empty.",
+        "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "line", "source"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "line": { "type": ["integer", "null"], "minimum": 1 },
+              "source": {
+                "type": "string",
+                "enum": ["mcp", "source", "git"]
+              }
+            }
+          }
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "task", "remediation"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": ["none", "setup_blocker", "tool_or_schema_missing", "agent_misuse", "excessive_context", "host_failure"]
+        },
+        "task": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "remediation": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 500
+        }
+      }
+    }
+  }
+}
