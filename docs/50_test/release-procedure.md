@@ -206,10 +206,11 @@ exact Full CI run `31923533506`、元Release run、元17 jobの結論集合、ev
 Node.js 24.18.0をcanary前に固定する。このruntime setupを省略したrunner既定Nodeでの
 scan failureを、公開packageの不良やimmutable release closureの失敗として扱ってはならない。
 GitHub Release APIの52 assetをevidence内の51 asset inventoryと照合し、evidence、Linux
-archive、checksum、compiler-pack requirementだけを公開面から再取得する。その後、共通
-canaryへ絶対パスを渡してsafe scan、`agent-config`、`initialize`、`tools/list`、`get_context`
-を完走する。GitHub Releaseへのmutation APIは呼ばず、green recovery runを元runと
-post-publish evidenceに連結した復旧証明とする。
+archiveとchecksum、同targetのcompiler-pack archiveとchecksum、compiler-pack requirementを
+公開面から再取得する。digest検証後にcompiler packをcanary専用outputへ展開し、requirementを
+同じ親へbyte-identicalに配置する。その後、共通canaryへ絶対パスを渡してsafe scan、
+`agent-config`、`initialize`、`tools/list`、`get_context`を完走する。GitHub Releaseへのmutation
+APIは呼ばず、green recovery runを元runとpost-publish evidenceに連結した復旧証明とする。
 
 ## 失敗時の扱い
 

@@ -2670,6 +2670,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "canonical_directory()",
         "realpath \"$path\"",
         "sha256sum --check --strict --status",
+        "canary_compiler_archive",
+        "canary_compiler_checksum",
+        "output_root/compiler",
+        "compiler-pack-manifest.json",
         "agent-config",
         "--release-archive \"$canary_archive\"",
         "--release-checksum \"$canary_checksum\"",
@@ -2717,6 +2721,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "preflight input file paths must be absolute",
         "(.assets | length) == 52",
         "(.assets | length) == 51",
+        "compiler_archive_name",
+        "compiler_checksum_name",
+        "= \"6\"",
         "release-post-publish-canary.sh",
     ] {
         if !recovery_script.contains(required) {
