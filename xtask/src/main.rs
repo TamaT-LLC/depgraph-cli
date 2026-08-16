@@ -1090,6 +1090,17 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
     Ok(())
 }
 
+const RECOVERY_PINNED_NODE_SETUP_STEP: &str = concat!(
+    "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4\n",
+    "        with:\n",
+    "          node-version: 24.18.0\n",
+);
+const RECOVERY_PINNED_NODE_SETUP_HEADER: &str =
+    "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4";
+const RECOVERY_VERIFIER_HEADER: &str =
+    "      - name: Verify the immutable v0.5.0 public closure and recover its Agent host canary";
+const RECOVERY_VERIFIER_RUN: &str = "        run: scripts/release-post-publish-recovery.sh";
+
 fn verify_workflow_policy_text(
     name: &str,
     workflow: &str,
@@ -1209,6 +1220,10 @@ fn verify_workflow_policy_text(
         "release-post-publish-recovery.yml" => {
             let verification = workflow_job_block(workflow, "verify-v0-5-0")?;
             let verification_permissions = job_permissions(verification)?;
+            let (node_setup_offset, node_setup) =
+                workflow_step_block(verification, RECOVERY_PINNED_NODE_SETUP_HEADER)?;
+            let (verifier_offset, verifier) =
+                workflow_step_block(verification, RECOVERY_VERIFIER_HEADER)?;
             if top_level_trigger_keys(workflow)? != ["workflow_dispatch"]
                 || !workflow.contains("\n  workflow_dispatch:\n\npermissions: {}\n")
                 || !top_permissions.is_empty()
@@ -1216,14 +1231,17 @@ fn verify_workflow_policy_text(
                 || !write_permissions.is_empty()
                 || contains_expression_context(workflow, "secrets")
                 || workflow.matches("actions/checkout@").count() != 1
-                || !workflow.contains("run: scripts/release-post-publish-recovery.sh")
+                || workflow.matches("actions/setup-node@").count() != 1
+                || node_setup != RECOVERY_PINNED_NODE_SETUP_STEP
+                || verifier.matches(RECOVERY_VERIFIER_RUN).count() != 1
+                || node_setup_offset >= verifier_offset
                 || workflow.contains("gh release upload")
                 || workflow.contains("gh release create")
                 || workflow.contains("gh release delete")
                 || workflow.contains("gh api --method")
             {
                 bail!(
-                    "release post-publish recovery must remain input-free, main-checked, read-only, and pinned to its reviewed verifier"
+                    "release post-publish recovery must remain input-free, main-checked, read-only, pinned to Node.js 24.18.0, and pinned to its reviewed verifier"
                 );
             }
         }
@@ -1276,6 +1294,66 @@ fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> 
     }
     let start = start.context("workflow job disappeared while extracting its block")?;
     Ok(&workflow[start..end])
+}
+
+fn workflow_step_block<'a>(job: &'a str, step_header: &str) -> Result<(usize, &'a str)> {
+    if !step_header.starts_with("      - ") || step_header.contains('\n') {
+        bail!("workflow step header is not canonical");
+    }
+    if job.lines().filter(|line| *line == "    steps:").count() != 1 {
+        bail!("workflow job must contain exactly one canonical steps sequence");
+    }
+
+    let mut offset = 0;
+    let mut steps_start = None;
+    let mut steps_end = job.len();
+    for line in job.split_inclusive('\n') {
+        let code = line.strip_suffix('\n').unwrap_or(line);
+        if steps_start.is_some() && !code.is_empty() && !code.starts_with("      ") {
+            steps_end = offset;
+            break;
+        }
+        if code == "    steps:" {
+            steps_start = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+    let steps_start = steps_start.context("workflow steps disappeared while extracting them")?;
+    let steps = &job[steps_start..steps_end];
+
+    let mut relative_offset = 0;
+    let mut candidates = Vec::new();
+    for line in steps.split_inclusive('\n') {
+        let code = line.strip_suffix('\n').unwrap_or(line);
+        if code == step_header {
+            candidates.push(relative_offset);
+        }
+        relative_offset += line.len();
+    }
+    if candidates.len() != 1 {
+        bail!("workflow steps must contain exactly one {step_header:?}");
+    }
+
+    let step_start = candidates[0];
+    let first_line_len = steps[step_start..]
+        .split_inclusive('\n')
+        .next()
+        .context("workflow step header disappeared")?
+        .len();
+    let mut step_end = steps.len();
+    relative_offset = step_start + first_line_len;
+    for line in steps[relative_offset..].split_inclusive('\n') {
+        let code = line.strip_suffix('\n').unwrap_or(line);
+        if code.starts_with("      - ") {
+            step_end = relative_offset;
+            break;
+        }
+        relative_offset += line.len();
+    }
+
+    let absolute_start = steps_start + step_start;
+    let absolute_end = steps_start + step_end;
+    Ok((absolute_start, &job[absolute_start..absolute_end]))
 }
 
 fn job_permissions(job: &str) -> Result<Vec<&str>> {
@@ -2613,6 +2691,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "permissions: {}",
         "actions: read",
         "contents: read",
+        "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+        "node-version: 24.18.0",
         "run: scripts/release-post-publish-recovery.sh",
     ] {
         if !recovery_workflow.contains(required) {
@@ -14596,8 +14676,8 @@ mod tests {
         CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, FullCiJobEvidence,
         FullCiRunEvidence, GithubActionsPolicy, MCP_OPERATION_CONTRACT_VERSION,
         MCP_PROTOCOL_REVISION, MCP_SDK_VERSION, MCP_TOOL_CONTRACT_VERSION,
-        PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
-        RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
+        PROJECT_LICENSE_EXPRESSION, RECOVERY_PINNED_NODE_SETUP_STEP, RECOVERY_VERIFIER_RUN,
+        RELEASE_CARGO_BUILD_TARGETS, RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
         RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleasePostPublishEvidence, ReleasePostPublishEvidenceRequest, ReleaseVerificationReport,
         STABLE_BENCHMARK_METRICS, STABLE_RELEASE_GATE_CHECK_IDS,
@@ -15271,6 +15351,29 @@ jobs:
             fs::read_to_string(root.join(".github/workflows/release-post-publish-recovery.yml"))?;
         for drifted_recovery in [
             recovery.replacen("      contents: read", "      contents: write", 1),
+            recovery.replacen(
+                RECOVERY_PINNED_NODE_SETUP_STEP,
+                "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4\n      - name: Detached Node version text\n        run: echo 'node-version: 24.18.0'\n",
+                1,
+            ),
+            recovery
+                .replacen(RECOVERY_PINNED_NODE_SETUP_STEP, "", 1)
+                .replacen(
+                    RECOVERY_VERIFIER_RUN,
+                    &format!(
+                        "{RECOVERY_VERIFIER_RUN}\n{RECOVERY_PINNED_NODE_SETUP_STEP}"
+                    ),
+                    1,
+                ),
+            recovery
+                .replacen(RECOVERY_PINNED_NODE_SETUP_STEP, "", 1)
+                .replacen(
+                    "    steps:\n",
+                    &format!(
+                        "    decoy:\n{RECOVERY_PINNED_NODE_SETUP_STEP}    steps:\n"
+                    ),
+                    1,
+                ),
             recovery.replacen(
                 "  workflow_dispatch:\n",
                 "  workflow_dispatch:\n    inputs:\n      tag:\n        required: true\n",

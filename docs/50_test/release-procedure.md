@@ -202,6 +202,9 @@ Agent host canaryへ相対file pathを渡したため失敗した。公開binary
 `contents: read`だけで実行する。v0.5.0のcommit、tree、signed annotated tag object、
 exact Full CI run `31923533506`、元Release run、元17 jobの結論集合、evidenceのSHA-256
 `13e253b3759a9729f43ff8dbe6f6a48191770681b02a57cb5197bc908ab77524`を固定する。
+公開archive内のWeb workerはNode.js 24以上を要求するため、workflowは元Release jobと同じ
+Node.js 24.18.0をcanary前に固定する。このruntime setupを省略したrunner既定Nodeでの
+scan failureを、公開packageの不良やimmutable release closureの失敗として扱ってはならない。
 GitHub Release APIの52 assetをevidence内の51 asset inventoryと照合し、evidence、Linux
 archive、checksum、compiler-pack requirementだけを公開面から再取得する。その後、共通
 canaryへ絶対パスを渡してsafe scan、`agent-config`、`initialize`、`tools/list`、`get_context`
