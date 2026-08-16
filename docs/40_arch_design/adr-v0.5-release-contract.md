@@ -83,25 +83,28 @@ The first candidate is `v0.5.0-rc.1`; a changed candidate receives the next
 RC number and no pushed tag or asset is replaced. Canonical RC tags bind their
 exact source SHA and may exercise the complete release gate.
 
-The stable baseline status is `candidate-unpinned`. Until the GA task records
-one reviewed, full-CI-green candidate commit, tree, and canonical digest, both
-the release gate and the default-branch source guard reject and delete a
-`v0.5.0` tag. The preserved v0.4 guard continues to allow `v0.4.0` only at its
-original immutable baseline, so current `main` can never publish a v0.4
-package.
+The stable baseline status is `maintenance-ref-pinned`. A `v0.5.0` Release is
+allowed only when the signed annotated tag source, remote `main`, and the
+initial `refs/heads/release/0.5` ref identify the same reviewed commit and an
+exact eight-job `workflow_dispatch` Full CI run succeeded for that `main`
+head. The default-branch source guard cancels the Release run and deletes a
+mismatched tag; `stable-release-gate-v2` independently validates the refs,
+source tree, Full CI evidence, and the digest-pinned Agent dogfood report.
 
-At GA, the release PR replaces the unpinned state with the exact approved
-v0.5 commit/tree/digest and creates `refs/heads/release/0.5` at that same
-commit. The branch is not created or advanced speculatively. Later compatible
-fixes land on `main` first and are cherry-picked with `-x`; force-pushes,
-history rewrites, and wholesale merges are forbidden.
+The runtime gate records the selected commit, tree, canonical
+`release-baseline-v1` digest, and Full CI identity in `stable-release-gate.json`.
+The post-publish record then binds those values to the signed tag object,
+Release run, and exact public asset closure. This external record avoids
+attempting to embed a commit SHA in its own source tree. Later compatible fixes
+land on `main` first and are cherry-picked with `-x`; force-pushes, history
+rewrites, and wholesale merges are forbidden.
 
 ## Consequences
 
 - v0.4 remains reproducible history without claiming a release that does not
   exist on GitHub.
-- v0.5 RCs can validate real packages while stable publication remains
-  fail-closed until an exact GA baseline is approved.
+- v0.5 RCs validate real packages while stable publication remains fail-closed
+  unless the exact main/maintenance/tag/Full-CI identity is present.
 - Store and operation-journal compatibility are separate and explicit.
 - Fixture, version, tag, manifest, and documentation drift fail tests before
   publication.

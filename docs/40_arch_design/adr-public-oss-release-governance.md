@@ -461,8 +461,8 @@ SHA-256 are defined in `docs/releases/v0.4.0.md`. The initial
 `v0.4.0` tag is valid only at the same commit. No `v0.4.0` GitHub Release was
 published, so this historical anchor does not create a supported stable line.
 
-`main` is the unreleased v0.5 line. The preserved `release/0.4` ref is not an
-active support promise. The future `release/0.5` branch is created only at the
+`main` is the v0.5 development line. The preserved `release/0.4` ref is not an
+active support promise. The initial `release/0.5` branch is created only at the
 exact approved v0.5 GA baseline. Compatible fixes then land on `main` first
 and are cherry-picked with `-x` through a distinct maintenance pull request;
 urgent stable-first fixes are forward-ported through a distinct pull request.
@@ -487,10 +487,11 @@ immutable anchor is not redefined when later approved patch commits advance
 `release/0.4`.
 
 For v0.5, canonical `v0.5.0-rc.N` tags bind their exact source SHA. The stable
-baseline remains `candidate-unpinned` until a reviewed full-CI-green candidate
-commit, tree, and digest are recorded. Until then, the source guard and
-`stable-release-gate-v2` both reject `v0.5.0`. The same GA commit becomes the
-initial `refs/heads/release/0.5` ref.
+baseline is `maintenance-ref-pinned`: the signed stable tag, `main`, and the
+initial `refs/heads/release/0.5` ref must share one source SHA, and the exact
+eight-job Full CI plus digest-pinned Agent dogfood report must pass before
+publication. The gate and post-publish evidence record the commit, tree,
+canonical baseline digest, workflow identities, and asset closure.
 
 ### Gate 8: migration dry run and change window
 

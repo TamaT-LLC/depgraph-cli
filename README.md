@@ -6,11 +6,13 @@ Every recognized dependency site is retained as `resolved`, `candidates`, `exter
 
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md): a Rust core, isolated Rust/Go/Web workers using protocol `1.0` NDJSON, an immutable SQLite evidence store, graph queries, and deterministic JSON/DOT/Mermaid/GraphML export.
 
-`main` implements the unreleased `0.5.0` candidate contract documented in the
-[`v0.5.0` release notes](docs/releases/v0.5.0.md). The latest published GitHub
-Release is `v0.4.0-rc.6`; no `v0.4.0` stable GitHub Release was published. Its
-reserved immutable baseline remains documented in the historical
-[`v0.4.0` contract](docs/releases/v0.4.0.md).
+`main` implements the `0.5.0` contract documented in the
+[`v0.5.0` release notes](docs/releases/v0.5.0.md). `v0.5.0` is the supported
+stable line only when the official
+[`v0.5.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.0)
+and its post-publish evidence exist and agree; no `v0.4.0` stable GitHub
+Release was published. Its reserved immutable baseline remains documented in
+the historical [`v0.4.0` contract](docs/releases/v0.4.0.md).
 
 The latest compiler-pack release candidate, original Milestone 4 candidate,
 and previous Milestone 2 semantic-graph candidate are documented as
@@ -21,9 +23,9 @@ and previous Milestone 2 semantic-graph candidate are documented as
 
 ## Project status and public collaboration
 
-There is currently no supported stable release. Published v0.4 release
-candidates are evaluation artifacts, and `main` is the v0.5 pre-release line.
-The v0.5 release workflow produces verified archives for Linux x86-64, Linux
+The supported line is conditionally anchored by the verified `v0.5.0` Release
+described above; release candidates and historical versions are evaluation
+artifacts. The v0.5 release workflow produces verified archives for Linux x86-64, Linux
 ARM64, macOS Intel, macOS Apple Silicon, and Windows x86-64; their checksums,
 SBOM, license inventory, and compatibility manifest are validated together by
 the release gate. Every v0.5 archive includes the native MCP server, durable
@@ -38,7 +40,7 @@ explicit consent, unsupported or ambiguous input remains visible rather than
 being guessed, and product support is best effort without an SLA.
 
 Start with the [system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)
-and the [v0.5 candidate contract](docs/releases/v0.5.0.md). Use
+and the [v0.5 stable contract](docs/releases/v0.5.0.md). Use
 [SUPPORT.md](SUPPORT.md) to choose the right help channel,
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request,
 and [GOVERNANCE.md](GOVERNANCE.md) for project decision and maintainer rules.

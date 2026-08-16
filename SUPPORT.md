@@ -6,11 +6,13 @@ repository.
 
 ## Supported release line
 
-There is currently no supported stable release. The latest published artifact
-is the evaluation candidate `v0.4.0-rc.6`; `v0.4.0` stable was never published.
-`main` is the unreleased `0.5.0` line. Release candidates and historical
-versions are unsupported, although fixes land on `main` first. This matrix is
-updated only after a verified v0.5 GA GitHub Release exists.
+The supported stable line is `v0.5.0` once the official
+[`v0.5.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.0)
+and its `release-post-publish-evidence-v0.5.0.json` asset exist and agree.
+Before that condition is met there is no supported stable release. Release
+candidates and historical versions are unsupported; fixes land on `main`
+first and compatible stable fixes are cherry-picked with `-x` to
+`release/0.5` through a separate pull request.
 The pinned toolchains, five native archive targets, compatibility contract,
 known limitations, and verified release links are listed in [README.md](README.md).
 
