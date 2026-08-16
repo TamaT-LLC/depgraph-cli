@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -32,7 +32,7 @@ test("post-publish canary rejects mutable or malformed invocation", () => {
 
 test(
   "post-publish canary canonicalizes every packaged Agent host input",
-  { skip: process.platform !== "linux" },
+  { skip: process.platform === "win32" },
   async () => {
     const temporary = await mkdtemp(path.join(os.tmpdir(), "depgraph-release-canary-"));
     const publicRoot = path.join(temporary, "public");
@@ -43,6 +43,10 @@ test(
     const packageRoot = path.join(staging, packageName);
     const archiveName = `${packageName}.tar.gz`;
     const archive = path.join(publicRoot, archiveName);
+    const compilerPackName = "depgraph-compiler-pack-1.2.3-x86_64-unknown-linux-gnu";
+    const compilerPackRoot = path.join(staging, compilerPackName);
+    const compilerArchiveName = `${compilerPackName}.tar.gz`;
+    const compilerArchive = path.join(publicRoot, compilerArchiveName);
     const evidence = path.join(temporary, "release-post-publish-evidence-v1.2.3.json");
     const requirement = path.join(
       publicRoot,
@@ -51,10 +55,12 @@ test(
     const invocationLog = path.join(temporary, "invocations.log");
 
     await mkdir(path.join(packageRoot, "bin"), { recursive: true });
+    await mkdir(compilerPackRoot, { recursive: true });
     await mkdir(publicRoot, { recursive: true });
     await mkdir(repository, { recursive: true });
     await writeFile(path.join(repository, "fixture.ts"), "export const fixture = true;\n");
     await writeFile(path.join(packageRoot, "release-manifest.json"), "{}\n");
+    await writeFile(path.join(compilerPackRoot, "compiler-pack-manifest.json"), "{}\n");
     await writeFile(requirement, "{}\n");
     await writeFile(evidence, "closed evidence\n");
 
@@ -89,6 +95,14 @@ fi
     run("tar", ["-czf", archive, "-C", staging, packageName]);
     const archiveDigest = createHash("sha256").update(await readFile(archive)).digest("hex");
     await writeFile(path.join(publicRoot, `${archiveName}.sha256`), `${archiveDigest}  ${archiveName}\n`);
+    run("tar", ["-czf", compilerArchive, "-C", staging, compilerPackName]);
+    const compilerArchiveDigest = createHash("sha256")
+      .update(await readFile(compilerArchive))
+      .digest("hex");
+    await writeFile(
+      path.join(publicRoot, `${compilerArchiveName}.sha256`),
+      `${compilerArchiveDigest}  ${compilerArchiveName}\n`,
+    );
     const evidenceDigest = createHash("sha256").update(await readFile(evidence)).digest("hex");
 
     run(
@@ -100,6 +114,17 @@ fi
     const configuration = JSON.parse(await readFile(path.join(output, "claude-desktop.json"), "utf8"));
     assert.equal(path.isAbsolute(configuration.mcpServers.depgraph.command), true);
     const invocations = await readFile(invocationLog, "utf8");
+    const extractedRequirement = await realpath(
+      path.join(output, "compiler", path.basename(requirement)),
+    );
+    assert.ok(invocations.includes(`--compiler-pack-requirement ${extractedRequirement}`));
+    assert.equal(
+      await readFile(
+        path.join(output, "compiler", compilerPackName, "compiler-pack-manifest.json"),
+        "utf8",
+      ),
+      "{}\n",
+    );
     for (const flag of [
       "--store",
       "--root",

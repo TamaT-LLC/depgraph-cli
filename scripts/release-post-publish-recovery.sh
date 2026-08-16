@@ -141,12 +141,20 @@ jq -e --arg tag "$release_tag" --arg evidence "$evidence_name" --arg digest "sha
 
 readonly archive_name="depgraph-0.5.0-x86_64-unknown-linux-gnu.tar.gz"
 readonly checksum_name="${archive_name}.sha256"
+readonly compiler_archive_name="depgraph-compiler-pack-0.5.0-x86_64-unknown-linux-gnu.tar.gz"
+readonly compiler_checksum_name="${compiler_archive_name}.sha256"
 readonly requirement_name="depgraph-compiler-pack-0.5.0-x86_64-unknown-linux-gnu.requirement.json"
-for asset in "$evidence_name" "$archive_name" "$checksum_name" "$requirement_name"; do
+for asset in \
+  "$evidence_name" \
+  "$archive_name" \
+  "$checksum_name" \
+  "$compiler_archive_name" \
+  "$compiler_checksum_name" \
+  "$requirement_name"; do
   gh release download "$release_tag" --repo "$expected_repository" \
     --pattern "$asset" --dir "$public_root"
 done
-test "$(find "$public_root" -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
+test "$(find "$public_root" -maxdepth 1 -type f | wc -l | tr -d ' ')" = "6"
 evidence="$(realpath "$public_root/$evidence_name")"
 printf '%s  %s\n' "$evidence_sha256" "$evidence" | sha256sum --check --strict --status -
 
@@ -191,7 +199,7 @@ while IFS=$'\t' read -r asset digest; do
   printf '%s  %s\n' "${digest#sha256:}" "$public_root/$asset" \
     | sha256sum --check --strict --status -
 done < <(
-  jq -r --argjson names "$(printf '%s\n' "$evidence_name" "$archive_name" "$checksum_name" "$requirement_name" | jq -Rsc 'split("\n")[:-1]')" '
+  jq -r --argjson names "$(printf '%s\n' "$evidence_name" "$archive_name" "$checksum_name" "$compiler_archive_name" "$compiler_checksum_name" "$requirement_name" | jq -Rsc 'split("\n")[:-1]')" '
     .assets[] | select(.name as $name | $names | index($name)) | [.name, .digest] | @tsv
   ' "$recovery_root/release.json"
 )

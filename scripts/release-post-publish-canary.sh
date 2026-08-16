@@ -63,20 +63,34 @@ esac
 
 canary_target="x86_64-unknown-linux-gnu"
 archive_name="depgraph-${version}-${canary_target}.tar.gz"
+compiler_pack_name="depgraph-compiler-pack-${version}-${canary_target}"
+compiler_archive_name="${compiler_pack_name}.tar.gz"
 canary_archive="$(canonical_file "${public_root}/${archive_name}")"
 canary_checksum="$(canonical_file "${public_root}/${archive_name}.sha256")"
-canary_requirement="$(canonical_file "${public_root}/depgraph-compiler-pack-${version}-${canary_target}.requirement.json")"
+canary_compiler_archive="$(canonical_file "${public_root}/${compiler_archive_name}")"
+canary_compiler_checksum="$(canonical_file "${public_root}/${compiler_archive_name}.sha256")"
+public_requirement="$(canonical_file "${public_root}/${compiler_pack_name}.requirement.json")"
 
 printf '%s  %s\n' "$trusted_evidence_sha256" "$evidence" \
   | sha256sum --check --strict --status -
 (
   cd "$public_root"
   sha256sum --check --strict --status "$(basename "$canary_checksum")"
+  sha256sum --check --strict --status "$(basename "$canary_compiler_checksum")"
 )
 
-mkdir -p "$output_root/extracted" "$output_root/state"
+mkdir -p "$output_root/extracted" "$output_root/compiler" "$output_root/state"
 tar --extract --gzip --file "$canary_archive" --directory "$output_root/extracted" --no-same-owner
+cp "$public_requirement" "$output_root/compiler/$(basename "$public_requirement")"
+tar --extract --gzip --file "$canary_compiler_archive" --directory "$output_root/compiler" --no-same-owner
 canary_package="$(canonical_directory "$output_root/extracted/depgraph-${version}-${canary_target}")"
+canary_compiler_package="$(canonical_directory "$output_root/compiler/${compiler_pack_name}")"
+canonical_file "$canary_compiler_package/compiler-pack-manifest.json" >/dev/null
+canary_requirement="$(canonical_file "$output_root/compiler/$(basename "$public_requirement")")"
+if [[ "$(find "$output_root/compiler" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" != "2" ]]; then
+  echo "release post-publish canary compiler-pack extraction has an unexpected top-level closure" >&2
+  exit 1
+fi
 canary_binary="$(canonical_file "$canary_package/bin/depgraph")"
 canary_mcp_binary="$(canonical_file "$canary_package/bin/depgraph-mcp")"
 canary_manifest="$(canonical_file "$canary_package/release-manifest.json")"
