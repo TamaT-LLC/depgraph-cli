@@ -604,6 +604,8 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "STABLE_MAINTENANCE_REF: heads/release/0.5",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
+        "signed tag preserved for retry",
+        "http_status\" == \"404\"",
         "is not the exact main/release/0.5 baseline",
     ] {
         if !source_guard.contains(required) {

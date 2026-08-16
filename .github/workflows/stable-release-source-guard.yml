@@ -35,9 +35,39 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$RELEASE_TAG" == "$STABLE_RELEASE_TAG" ]]; then
-            maintenance_sha="$(gh api "repos/$REPOSITORY/git/ref/$STABLE_MAINTENANCE_REF" --jq '.object.sha' 2>/dev/null || true)"
-            main_sha="$(gh api "repos/$REPOSITORY/git/ref/$STABLE_MAIN_REF" --jq '.object.sha' 2>/dev/null || true)"
-            if [[ -n "$maintenance_sha" &&
+            fetch_ref_sha() {
+              local ref="$1"
+              local allow_missing="$2"
+              local response
+              local http_status
+              local sha
+              if response="$(gh api --include "repos/$REPOSITORY/git/ref/$ref" --jq '.object.sha' 2>/dev/null)"; then
+                sha="$(tail -n 1 <<<"$response")"
+                [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+                printf '%s\n' "$sha"
+                return 0
+              fi
+              http_status="$(awk '$1 ~ /^HTTP\// { status = $2 } END { print status }' <<<"$response")"
+              if [[ "$allow_missing" == "true" && "$http_status" == "404" ]]; then
+                printf '%s\n' missing
+                return 0
+              fi
+              return 1
+            }
+
+            if ! main_sha="$(fetch_ref_sha "$STABLE_MAIN_REF" false)"; then
+              gh api --method POST \
+                "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel" || true
+              echo "::error::unable to verify $STABLE_MAIN_REF; signed tag preserved for retry"
+              exit 1
+            fi
+            if ! maintenance_sha="$(fetch_ref_sha "$STABLE_MAINTENANCE_REF" true)"; then
+              gh api --method POST \
+                "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel" || true
+              echo "::error::unable to verify $STABLE_MAINTENANCE_REF; signed tag preserved for retry"
+              exit 1
+            fi
+            if [[ "$maintenance_sha" != "missing" &&
                   "$RELEASE_SOURCE_SHA" == "$maintenance_sha" &&
                   "$RELEASE_SOURCE_SHA" == "$main_sha" ]]; then
               echo "$RELEASE_TAG source is the exact main and release/0.5 baseline ($STABLE_BASELINE_STATUS)"
