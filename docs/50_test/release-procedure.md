@@ -24,7 +24,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
-Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。`v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。`v0.5.0` stableはbaseline statusが`candidate-unpinned`の間、default-branch source guardと`stable-release-gate-v2`の双方がfail closedで拒否する。
+Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。`v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。`v0.5.0` stableはbaseline statusを`maintenance-ref-pinned`とし、tag source、remote `main`、`refs/heads/release/0.5`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければdefault-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
 
 ## タグ作成前のフルCI
 
@@ -73,7 +73,7 @@ publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIか�
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
-release_tag="vX.Y.Z-rc.N"
+release_tag="vX.Y.Z-rc.N" # stable GAでは v0.5.0
 
 git fetch origin main
 test "$(git rev-parse origin/main)" = "$candidate"
@@ -84,7 +84,23 @@ git verify-tag "$release_tag"
 git push origin "refs/tags/$release_tag"
 ```
 
-v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。push済みtagを移動・再利用しない。stable `v0.5.0`を作成する前に、GA PRでfull CIがgreenなexact commit、tree、canonical baseline digestを記録し、`candidate-unpinned` guardをそのcommitだけを許可するguardへ変更し、同じcommitから`refs/heads/release/0.5`を作る。
+v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。push済みtagを移動・再利用しない。stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、そのexact headでFull CIを完走させてから、まだ存在しない`refs/heads/release/0.5`を同じSHAで作成する。
+
+```bash
+test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+test -z "$(git ls-remote origin refs/heads/release/0.5)"
+git push origin "$candidate:refs/heads/release/0.5"
+test "$candidate" = "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
+git rev-parse "$candidate^{tree}"
+printf '%s\n' \
+  release-baseline-v1 \
+  repository=TamaT-LLC/depgraph-cli \
+  version=0.5.0 \
+  commit="$candidate" |
+  shasum -a 256
+```
+
+その後だけsigned annotated `v0.5.0` tagを同じSHAへpushする。default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。tag側のstable gateはGitHub APIから`main` headのexact eight-job Full CIを再取得し、`agent-dogfood-report-v1`の固定SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`と全14 gateを再計算する。exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.5.0.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。
@@ -127,7 +143,8 @@ build/test-only dependencyとして除外してはならない。
 Store不変性はmain databaseとWALのbyte完全一致で判定する。read connection自身がlock/index
 として更新するSQLite `-shm`は存在とsizeを固定し、内容digestには含めない。operation
 journal、そのWAL/SHM/rollback journal、runner purge lockはすべて不存在でなければならない。
-すべてのgateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
+すべてのpre-publish gateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
+同じjobの公開後再取得・Agent host canaryまで成功しなければRelease workflow全体はsuccessにならない。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
 Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 17へのtransactional migration、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-17 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
@@ -153,6 +170,16 @@ aggregate digest、asset-set digestを記録する。最終jobはこのJSONを�
 追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。最終jobの
 job-scoped tokenは、Full CIのrun/jobを読むための`actions: read`と、Releaseへ成果物を
 公開するための`contents: write`だけを持つ。
+公開後検証は「その時点の最新run」を再選択せず、`stable-release-gate.json`が記録した
+同一`full_ci_run_id`を再取得し、SHA、branch、8 job、job-set digestまで一致させる。
+
+最後にLinux x86-64の公開archiveを新しいdirectoryへ展開し、固定polyglot fixtureを
+公開`depgraph`でsafe scanする。GitHub release-asset APIからpost-publish evidenceの
+SHA-256を独立取得し、公開archive/checksum、展開manifest、compiler-pack requirement、
+repository、Storeを入力に、公開binaryの`agent-config --host claude-desktop`をread-only
+defaultで実行する。このcanaryはarchive真正性、root seal、Store/current snapshot、全sibling、
+compiler requirement、`initialize`、`tools/list`、`get_context`、source/Store不変を同時に
+再検証する。checkout-built product binaryを実行経路へ混ぜない。
 
 公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、
 検証report、`release-post-publish-evidence-<tag>.json`が同じタグに結び付いていることを

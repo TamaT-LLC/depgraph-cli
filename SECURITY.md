@@ -4,11 +4,12 @@
 
 | Version | Security fixes |
 | --- | --- |
-| Stable release | None published yet |
-| `main` (`0.5.0`) and release candidates | Evaluation only; fixes land on `main` first |
+| `v0.5.0` | Supported only when the official GitHub Release and matching post-publish evidence exist |
+| `main` and release candidates | Evaluation only; fixes land on `main` first |
 | v0.4 candidates and older versions | Unsupported |
 
-The candidate release and future maintenance policy is documented in
+Until that v0.5 publication condition is met, there is no supported stable
+release. The release and maintenance policy is documented in
 [GOVERNANCE.md](GOVERNANCE.md). Unsupported versions may still receive a
 public advisory, but are not promised a patch.
 

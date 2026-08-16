@@ -23,8 +23,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
 const STABLE_RELEASE_VERSION: &str = "0.5.0";
-const STABLE_RELEASE_BASELINE_STATUS: &str = "candidate-unpinned";
+const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
+const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
+const AGENT_DOGFOOD_REPORT_PATH: &str =
+    "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json";
+const AGENT_DOGFOOD_REPORT_SHA256: &str =
+    "3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b";
+const AGENT_DOGFOOD_SPEC_PATH: &str = "fixtures/agent-dogfood-v1/spec.json";
+const AGENT_DOGFOOD_EVIDENCE_DIRECTORY: &str = "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7";
 const V0_4_STABLE_RELEASE_BASELINE_COMMIT: &str = "d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f";
 const V0_4_STABLE_RELEASE_BASELINE_TREE: &str = "46555a059070e94c3ed4567af3c58b278dbb0fb4";
 const V0_4_STABLE_RELEASE_BASELINE_DIGEST: &str =
@@ -111,6 +118,23 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
     "rust",
     "web",
     "windows-smoke",
+];
+const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
+    "release-identity",
+    "protocol-store-cache-compatibility",
+    "rc6-upgrade-and-rollback",
+    "five-target-package-closure",
+    "mcp-five-target",
+    "agent-dogfood-ga",
+    "performance-budget",
+    "bounded-query-five-target",
+    "profile-selection-five-target",
+    "cross-language-five-target",
+    "compiler-pack-five-target",
+    "safety-framework-collector",
+    "tag-source-guard-contract",
+    "ga-baseline-full-ci",
+    "workflow-quality-closure",
 ];
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
@@ -280,6 +304,8 @@ enum Task {
         release_verification: PathBuf,
         benchmark_report: PathBuf,
         compiler_pack_verification: PathBuf,
+        agent_dogfood_report: PathBuf,
+        full_ci_run: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -508,6 +534,18 @@ fn v0_4_stable_release_baseline_digest() -> String {
     ))
 }
 
+fn v0_5_stable_release_baseline_record(commit: &str) -> String {
+    format!(
+        "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion={STABLE_RELEASE_VERSION}\ncommit={commit}\n"
+    )
+}
+
+fn v0_5_stable_release_baseline_digest(commit: &str) -> String {
+    hex::encode(Sha256::digest(
+        v0_5_stable_release_baseline_record(commit).as_bytes(),
+    ))
+}
+
 fn release_tag() -> Result<String> {
     let tag = if matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"))
         && matches!(std::env::var("GITHUB_REF_TYPE").as_deref(), Ok("tag"))
@@ -562,9 +600,13 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
     for required in [
         "guard-stable-tags:",
         "github.event.workflow_run.head_branch == 'v0.5.0'",
-        "UNPINNED_RELEASE_TAG: v0.5.0",
-        "STABLE_BASELINE_STATUS: candidate-unpinned",
-        "v0.5.0 stable baseline has not been pinned",
+        "STABLE_RELEASE_TAG: v0.5.0",
+        "STABLE_MAINTENANCE_REF: heads/release/0.5",
+        "STABLE_MAIN_REF: heads/main",
+        "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
+        "signed tag preserved for retry",
+        "http_status\" == \"404\"",
+        "is not the exact main/release/0.5 baseline",
     ] {
         if !source_guard.contains(required) {
             bail!("stable release source guard is missing v0.5 contract {required:?}");
@@ -694,6 +736,16 @@ struct StableReleaseGateReport {
     compiler_pack_verification_sha256: String,
     workflow_results: BTreeMap<String, String>,
     checks: Vec<StableReleaseGateCheck>,
+}
+
+struct StableReleaseGateInput<'a> {
+    release_verification_sha256: String,
+    benchmark_report_sha256: String,
+    compiler_pack_verification_sha256: String,
+    agent_dogfood_report_sha256: String,
+    compiler_pack_verified: bool,
+    full_ci: &'a FullCiRunEvidence,
+    workflow_results: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -827,11 +879,15 @@ fn main() -> Result<()> {
             release_verification,
             benchmark_report,
             compiler_pack_verification,
+            agent_dogfood_report,
+            full_ci_run,
             output,
         } => stable_release_gate(
             &release_verification,
             &benchmark_report,
             &compiler_pack_verification,
+            &agent_dogfood_report,
+            &full_ci_run,
             &output,
         ),
         Task::ReleasePostPublishEvidence {
@@ -1122,6 +1178,8 @@ fn verify_workflow_policy_text(
             }
         }
         "release.yml" => {
+            let stable_gate = workflow_job_block(workflow, "stable-gate")?;
+            let stable_gate_permissions = job_permissions(stable_gate)?;
             let publish = workflow_job_block(workflow, "publish")?;
             let publish_permissions = job_permissions(publish)?;
             if top_level_trigger_keys(workflow)? != ["push"]
@@ -1129,6 +1187,7 @@ fn verify_workflow_policy_text(
                 || workflow.contains("\n  pull_request:")
                 || workflow.contains("\n  workflow_run:")
                 || write_permissions != ["contents"]
+                || stable_gate_permissions != ["actions: read", "contents: read"]
                 || publish_permissions != ["actions: read", "contents: write"]
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
@@ -1140,7 +1199,7 @@ fn verify_workflow_policy_text(
                     != 2
             {
                 bail!(
-                    "release publish permissions must remain actions-read/contents-write, tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
+                    "release gate permissions must remain read-only, publish permissions must remain actions-read/contents-write, the workflow must remain tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
                 );
             }
         }
@@ -1687,7 +1746,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "depgraph runtime validate --file runtime-trace.json --json",
         "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
-        "no `v0.4.0` stable GitHub Release was published",
+        "no `v0.4.0` stable GitHub",
         "Store\nschema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
     ] {
         if !readme.contains(required) {
@@ -1711,7 +1770,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "stable GitHub Releaseは公開されなかった",
         "`stable-release-gate-v2`",
         "Issue #355として",
-        "`candidate-unpinned`",
+        "Issue #359のGA gate",
+        "`maintenance-ref-pinned`",
         "Issue #55ではこのWeb semantic compatibility unitをrelease manifest",
         "Issue #145のrelease gate contractは`dynamic-framework-evidence-release-gate-v1`",
         "Issue #146でRust `1.93.1`",
@@ -2025,7 +2085,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "### Preserved v0.4 baseline and v0.5 maintenance line",
         "`refs/heads/release/0.4`",
         "`refs/heads/release/0.5`",
-        "`candidate-unpinned`",
+        "`maintenance-ref-pinned`",
     ] {
         if !public_oss_adr.contains(required) {
             bail!("public OSS governance ADR is missing required contract {required:?}");
@@ -2050,7 +2110,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         V0_4_RC6_TAG_COMMIT,
         V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
         V0_4_RC6_AARCH64_APPLE_BINARY_SHA256,
-        "The stable baseline status is `candidate-unpinned`.",
+        "The stable baseline status is `maintenance-ref-pinned`.",
     ] {
         if !v0_5_release_adr.contains(required) {
             bail!("v0.5 release ADR is missing required contract {required:?}");
@@ -2105,6 +2165,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "depgraph-agent-host-config-v1",
         "release-post-publish-evidence-v1",
         "mcp-package-smoke-v2",
+        AGENT_DOGFOOD_REPORT_PATH,
+        AGENT_DOGFOOD_REPORT_SHA256,
         "`flate2`, `tar`, `zip`",
         "operation journal schema `5`",
     ] {
@@ -2300,6 +2362,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "non-empty matrix値をすべて含む",
         "`mcp-package-smoke-v2`",
         "`depgraph-agent-host-config-v1`",
+        "`maintenance-ref-pinned`",
+        AGENT_DOGFOOD_REPORT_SHA256,
+        "release-post-publish-evidence-v0.5.0.json",
         "`tar`、`zip`とそのtransitive closure",
         V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
     ] {
@@ -2449,7 +2514,15 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
-        "cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json compiler-artifacts/compiler-pack-verification.json --output artifacts/stable-release-gate.json",
+        "name: Bind the stable candidate to main, release/0.5, and exact Full CI",
+        "api_source_tree=\"$(gh api",
+        "test \"$source_tree\" = \"$api_source_tree\"",
+        "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
+        "DEPGRAPH_RELEASE_MAIN_HEAD_SHA=$main_head_sha",
+        "DEPGRAPH_RELEASE_MAINTENANCE_HEAD_SHA=$maintenance_head_sha",
+        "cargo xtask stable-release-gate",
+        AGENT_DOGFOOD_REPORT_PATH,
+        "artifacts/full-ci.json",
         "DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}",
         "DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT: ${{ needs.compiler-precise-hostile.result }}",
         "DEPGRAPH_RELEASE_BENCHMARK_RESULT: ${{ needs.benchmark.result }}",
@@ -2471,8 +2544,14 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-compiler-pack-assets post-publish/compiler",
         "gh run list --workflow CI --event workflow_dispatch --commit \"$GITHUB_SHA\" --status success",
         "cargo xtask release-post-publish-evidence",
+        "ci_run_id=\"$(jq -r '.workflow_results.full_ci_run_id // empty' artifacts/stable-release-gate.json)\"",
         "gh release upload \"$GITHUB_REF_NAME\" \"$evidence\"",
         "cmp --silent \"$evidence\"",
+        "git ls-remote origin refs/heads/release/0.5",
+        "trusted_evidence_sha256",
+        "agent-config",
+        "--host claude-desktop",
+        "post-publish/canary/claude-desktop.json",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
@@ -2723,7 +2802,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             "README.md",
             &[
                 "## Project status and public collaboration",
-                "There is currently no supported stable release.",
+                "The supported line is conditionally anchored by the verified `v0.5.0` Release",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2766,7 +2845,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "best-effort basis",
                 "does not provide an SLA",
-                "There is currently no supported stable release.",
+                "The supported stable line is `v0.5.0` once the official",
                 "[SECURITY.md](SECURITY.md)",
                 "There is no automatic stale deadline",
             ],
@@ -5595,6 +5674,8 @@ fn stable_release_gate(
     release_verification_path: &Path,
     benchmark_report_path: &Path,
     compiler_pack_verification_path: &Path,
+    agent_dogfood_report_path: &Path,
+    full_ci_run_path: &Path,
     output: &Path,
 ) -> Result<()> {
     verify_project_metadata(&workspace_root())?;
@@ -5625,15 +5706,41 @@ fn stable_release_gate(
     let compiler_pack_verified =
         compiler_pack_release::validate_verification_report(&compiler_pack_verification).is_ok()
             && compiler_pack_release_binding(&release_verification, &compiler_pack_verification);
+    let agent_dogfood_report_sha256 = verify_agent_dogfood_release_gate(agent_dogfood_report_path)?;
+    let mut workflow_results = stable_release_workflow_results();
+    let source_sha = workflow_results
+        .get("source_sha")
+        .filter(|source_sha| lowercase_git_sha(source_sha))
+        .context("stable release gate requires the exact GitHub Actions source SHA")?;
+    let full_ci = validate_full_ci_run(full_ci_run_path, source_sha)?;
+    workflow_results.insert("full_ci_run_id".to_owned(), full_ci.run_id.to_string());
+    workflow_results.insert("full_ci_url".to_owned(), full_ci.url.clone());
+    workflow_results.insert("full_ci_head_sha".to_owned(), full_ci.head_sha.clone());
+    workflow_results.insert(
+        "full_ci_head_branch".to_owned(),
+        full_ci.head_branch.clone(),
+    );
+    workflow_results.insert(
+        "full_ci_jobs_sha256".to_owned(),
+        hex::encode(Sha256::digest(serde_json::to_vec(&full_ci.jobs)?)),
+    );
+    workflow_results.insert(
+        "agent_dogfood_report_sha256".to_owned(),
+        agent_dogfood_report_sha256.clone(),
+    );
 
     let report = evaluate_stable_release_gate(
         &release_verification,
         &benchmark_report,
-        sha256_file(release_verification_path)?,
-        sha256_file(benchmark_report_path)?,
-        sha256_file(compiler_pack_verification_path)?,
-        compiler_pack_verified,
-        stable_release_workflow_results(),
+        StableReleaseGateInput {
+            release_verification_sha256: sha256_file(release_verification_path)?,
+            benchmark_report_sha256: sha256_file(benchmark_report_path)?,
+            compiler_pack_verification_sha256: sha256_file(compiler_pack_verification_path)?,
+            agent_dogfood_report_sha256,
+            compiler_pack_verified,
+            full_ci: &full_ci,
+            workflow_results,
+        },
     );
     fs::write(
         output,
@@ -5661,10 +5768,52 @@ fn stable_release_gate(
     Ok(())
 }
 
+fn verify_agent_dogfood_release_gate(report_path: &Path) -> Result<String> {
+    let report_sha256 = sha256_file(report_path)?;
+    if report_sha256 != AGENT_DOGFOOD_REPORT_SHA256 {
+        bail!(
+            "Agent dogfood report digest mismatch: expected {AGENT_DOGFOOD_REPORT_SHA256}, found {report_sha256}"
+        );
+    }
+    let report: Value = serde_json::from_slice(&fs::read(report_path).with_context(|| {
+        format!(
+            "failed to read Agent dogfood report {}",
+            report_path.display()
+        )
+    })?)
+    .context("Agent dogfood report is not valid JSON")?;
+    if report["schema_version"] != AGENT_DOGFOOD_REPORT_SCHEMA_VERSION
+        || report["release"]["tag"] != "v0.5.0-rc.7"
+        || report["gate"]["passed"] != Value::Bool(true)
+        || report["gate"]["checks"].as_array().is_none_or(|checks| {
+            checks.len() != 14
+                || checks
+                    .iter()
+                    .any(|check| !check["passed"].as_bool().unwrap_or(false))
+        })
+    {
+        bail!("Agent dogfood report does not contain the exact all-green GA input");
+    }
+
+    let root = workspace_root();
+    let status = Command::new("node")
+        .current_dir(&root)
+        .arg("scripts/agent-dogfood.mjs")
+        .arg("verify")
+        .arg(root.join(AGENT_DOGFOOD_SPEC_PATH))
+        .arg(root.join(AGENT_DOGFOOD_EVIDENCE_DIRECTORY))
+        .arg(report_path)
+        .status()
+        .context("failed to launch the deterministic Agent dogfood verifier")?;
+    if !status.success() {
+        bail!("deterministic Agent dogfood verification rejected the GA input");
+    }
+    Ok(report_sha256)
+}
+
 fn release_post_publish_evidence(request: ReleasePostPublishEvidenceRequest) -> Result<()> {
     verify_project_metadata(&workspace_root())?;
     if !supported_release_tag(&request.tag)
-        || request.tag == format!("v{VERSION}")
         || !lowercase_git_sha(&request.source_sha)
         || !lowercase_git_sha(&request.source_tree)
         || !lowercase_git_sha(&request.tag_object_sha)
@@ -5673,7 +5822,9 @@ fn release_post_publish_evidence(request: ReleasePostPublishEvidenceRequest) -> 
             "valid" | "unknown_key" | "unverified_email"
         )
     {
-        bail!("post-publish evidence requires a signed canonical v{VERSION}-rc.N tag");
+        bail!(
+            "post-publish evidence requires a signed canonical v{VERSION} or v{VERSION}-rc.N tag"
+        );
     }
     if request.release_run_id == 0
         || request.release_run_url != canonical_actions_run_url(request.release_run_id)
@@ -5706,6 +5857,8 @@ fn release_post_publish_evidence(request: ReleasePostPublishEvidenceRequest) -> 
         &request.public_assets,
         &request.tag,
         &request.source_sha,
+        &request.source_tree,
+        &full_ci,
         &public_assets,
     )?;
     let evidence = ReleasePostPublishEvidence {
@@ -5892,6 +6045,8 @@ fn validate_post_publish_aggregates(
     directory: &Path,
     tag: &str,
     source_sha: &str,
+    source_tree: &str,
+    full_ci: &FullCiRunEvidence,
     assets: &[ReleaseAssetEvidence],
 ) -> Result<ReleaseAggregateEvidence> {
     let digests = assets
@@ -5959,6 +6114,9 @@ fn validate_post_publish_aggregates(
     let release_sha = required_asset_digest(&digests, "release-verification.json")?;
     let compiler_sha = required_asset_digest(&digests, "compiler-pack-verification.json")?;
     let benchmark_sha = required_asset_digest(&digests, "benchmark-report.json")?;
+    let full_ci_jobs_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&full_ci.jobs)?));
+    let full_ci_run_id = full_ci.run_id.to_string();
+    let expected_baseline_digest = v0_5_stable_release_baseline_digest(source_sha);
     if stable.schema_version != STABLE_RELEASE_GATE_SCHEMA_VERSION
         || stable.release_version != VERSION
         || stable.upgrade_source_version != STABLE_UPGRADE_SOURCE_VERSION
@@ -5967,7 +6125,11 @@ fn validate_post_publish_aggregates(
         || stable.release_verification_sha256 != release_sha
         || stable.compiler_pack_verification_sha256 != compiler_sha
         || stable.benchmark_report_sha256 != benchmark_sha
-        || stable.checks.is_empty()
+        || stable
+            .checks
+            .iter()
+            .map(|check| check.id.as_str())
+            .ne(STABLE_RELEASE_GATE_CHECK_IDS.iter().copied())
         || stable.checks.iter().any(|check| !check.passed)
         || stable
             .workflow_results
@@ -5981,6 +6143,56 @@ fn validate_post_publish_aggregates(
             .get("source_sha")
             .map(String::as_str)
             != Some(source_sha)
+        || stable
+            .workflow_results
+            .get("source_tree")
+            .map(String::as_str)
+            != Some(source_tree)
+        || stable
+            .workflow_results
+            .get("main_head_sha")
+            .map(String::as_str)
+            != Some(source_sha)
+        || stable
+            .workflow_results
+            .get("maintenance_head_sha")
+            .map(String::as_str)
+            != Some(source_sha)
+        || stable
+            .workflow_results
+            .get("baseline_digest")
+            .map(String::as_str)
+            != Some(expected_baseline_digest.as_str())
+        || stable
+            .workflow_results
+            .get("agent_dogfood_report_sha256")
+            .map(String::as_str)
+            != Some(AGENT_DOGFOOD_REPORT_SHA256)
+        || stable
+            .workflow_results
+            .get("full_ci_run_id")
+            .map(String::as_str)
+            != Some(full_ci_run_id.as_str())
+        || stable
+            .workflow_results
+            .get("full_ci_url")
+            .map(String::as_str)
+            != Some(full_ci.url.as_str())
+        || stable
+            .workflow_results
+            .get("full_ci_head_sha")
+            .map(String::as_str)
+            != Some(full_ci.head_sha.as_str())
+        || stable
+            .workflow_results
+            .get("full_ci_head_branch")
+            .map(String::as_str)
+            != Some(full_ci.head_branch.as_str())
+        || stable
+            .workflow_results
+            .get("full_ci_jobs_sha256")
+            .map(String::as_str)
+            != Some(full_ci_jobs_sha256.as_str())
         || [
             "quality",
             "compiler-precise-hostile",
@@ -6058,12 +6270,17 @@ fn compiler_pack_identity_binding(
 fn evaluate_stable_release_gate(
     release: &ReleaseVerificationReport,
     benchmark: &Value,
-    release_verification_sha256: String,
-    benchmark_report_sha256: String,
-    compiler_pack_verification_sha256: String,
-    compiler_pack_verified: bool,
-    workflow_results: BTreeMap<String, String>,
+    input: StableReleaseGateInput<'_>,
 ) -> StableReleaseGateReport {
+    let StableReleaseGateInput {
+        release_verification_sha256,
+        benchmark_report_sha256,
+        compiler_pack_verification_sha256,
+        agent_dogfood_report_sha256,
+        compiler_pack_verified,
+        full_ci,
+        mut workflow_results,
+    } = input;
     let compatibility = release_compatibility();
     let expected_targets = RELEASE_TARGETS
         .iter()
@@ -6074,15 +6291,43 @@ fn evaluate_stable_release_gate(
         .iter()
         .map(|target| target.target.as_str())
         .collect::<BTreeSet<_>>();
-    let release_source_matches_tag = workflow_results
+    let source_sha = workflow_results
         .get("source_sha")
-        .is_some_and(|source_sha| {
-            if release.tag == format!("v{STABLE_RELEASE_VERSION}") {
-                false
-            } else {
-                supported_release_tag(&release.tag) && lowercase_git_sha(source_sha)
-            }
-        });
+        .cloned()
+        .unwrap_or_default();
+    let source_tree = workflow_results
+        .get("source_tree")
+        .cloned()
+        .unwrap_or_default();
+    let main_head_sha = workflow_results
+        .get("main_head_sha")
+        .cloned()
+        .unwrap_or_default();
+    let maintenance_head_sha = workflow_results
+        .get("maintenance_head_sha")
+        .cloned()
+        .unwrap_or_default();
+    let baseline_digest = v0_5_stable_release_baseline_digest(&source_sha);
+    workflow_results.insert("baseline_digest".to_owned(), baseline_digest.clone());
+    let full_ci_matches_source = lowercase_git_sha(&source_sha)
+        && full_ci.run_id != 0
+        && full_ci.url == canonical_actions_run_url(full_ci.run_id)
+        && full_ci.head_sha == source_sha
+        && full_ci.head_branch == "main"
+        && full_ci
+            .jobs
+            .iter()
+            .map(|job| job.name.as_str())
+            .eq(FULL_CI_JOB_NAMES.iter().copied())
+        && full_ci.jobs.iter().all(|job| job.conclusion == "success");
+    let stable_baseline_matches_source = release.tag == format!("v{STABLE_RELEASE_VERSION}")
+        && source_sha == main_head_sha
+        && source_sha == maintenance_head_sha
+        && lowercase_git_sha(&source_tree)
+        && lowercase_sha256(&baseline_digest);
+    let release_source_matches_tag = supported_release_tag(&release.tag)
+        && full_ci_matches_source
+        && (release.tag != format!("v{STABLE_RELEASE_VERSION}") || stable_baseline_matches_source);
     let metrics = benchmark["metrics"].as_array();
     let benchmark_metrics_pass = metrics.is_some_and(|metrics| {
         metrics.len() == STABLE_BENCHMARK_METRICS.len()
@@ -6291,6 +6536,13 @@ fn evaluate_stable_release_gate(
             evidence: "five native archives attest identical packaged MCP discovery/fixture digests, bounded durable safe-scan submit with post-EOF recovery, clean stdin EOF, JSON-RPC-only stdout, server/runner binaries, and versioned compatibility metadata".to_owned(),
         },
         StableReleaseGateCheck {
+            id: "agent-dogfood-ga".to_owned(),
+            passed: agent_dogfood_report_sha256 == AGENT_DOGFOOD_REPORT_SHA256,
+            evidence: format!(
+                "the exact {AGENT_DOGFOOD_REPORT_SCHEMA_VERSION} report passed all fourteen precommitted accuracy, safety, reconnect, setup, and efficiency gates at sha256:{agent_dogfood_report_sha256}"
+            ),
+        },
+        StableReleaseGateCheck {
             id: "performance-budget".to_owned(),
             passed: benchmark["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
                 && benchmark["fixture"]["source_file_count"] == 10_000
@@ -6355,7 +6607,17 @@ fn evaluate_stable_release_gate(
             passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
                 && release_source_matches_tag,
             evidence: format!(
-                "the immutable v0.4.0 baseline remains enforced, canonical v0.5.0-rc.N tags bind their exact source SHA, and stable v0.5.0 remains blocked while baseline status is {STABLE_RELEASE_BASELINE_STATUS}"
+                "the immutable v0.4.0 baseline remains enforced; canonical v0.5.0-rc.N tags bind their exact source SHA; stable v0.5.0 binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
+            ),
+        },
+        StableReleaseGateCheck {
+            id: "ga-baseline-full-ci".to_owned(),
+            passed: full_ci_matches_source
+                && (release.tag != format!("v{STABLE_RELEASE_VERSION}")
+                    || stable_baseline_matches_source),
+            evidence: format!(
+                "full CI run {} has the exact eight all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
+                full_ci.run_id, full_ci.head_sha
             ),
         },
         StableReleaseGateCheck {
@@ -6403,6 +6665,12 @@ fn stable_release_workflow_results() -> BTreeMap<String, String> {
         ("ref_type", "GITHUB_REF_TYPE"),
         ("ref_name", "GITHUB_REF_NAME"),
         ("source_sha", "GITHUB_SHA"),
+        ("source_tree", "DEPGRAPH_RELEASE_SOURCE_TREE"),
+        ("main_head_sha", "DEPGRAPH_RELEASE_MAIN_HEAD_SHA"),
+        (
+            "maintenance_head_sha",
+            "DEPGRAPH_RELEASE_MAINTENANCE_HEAD_SHA",
+        ),
         ("quality", "DEPGRAPH_RELEASE_QUALITY_RESULT"),
         (
             "compiler-precise-hostile",
@@ -14232,33 +14500,39 @@ mod tests {
 
     use anyhow::Result;
     use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
 
     use super::{
-        ARCHIVE_MTIME, BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
+        AGENT_DOGFOOD_REPORT_PATH, AGENT_DOGFOOD_REPORT_SHA256, ARCHIVE_MTIME,
+        BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
-        CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, GithubActionsPolicy,
-        MCP_OPERATION_CONTRACT_VERSION, MCP_PROTOCOL_REVISION, MCP_SDK_VERSION,
-        MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
+        CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, FullCiJobEvidence,
+        FullCiRunEvidence, GithubActionsPolicy, MCP_OPERATION_CONTRACT_VERSION,
+        MCP_PROTOCOL_REVISION, MCP_SDK_VERSION, MCP_TOOL_CONTRACT_VERSION,
+        PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
         RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
         RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleasePostPublishEvidence, ReleasePostPublishEvidenceRequest, ReleaseVerificationReport,
-        STABLE_BENCHMARK_METRICS, STABLE_RELEASE_GATE_SCHEMA_VERSION, STABLE_RELEASE_VERSION,
+        STABLE_BENCHMARK_METRICS, STABLE_RELEASE_GATE_CHECK_IDS,
+        STABLE_RELEASE_GATE_SCHEMA_VERSION, STABLE_RELEASE_VERSION,
         STABLE_UPGRADE_SOURCE_FIXTURE_PATH, STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         STABLE_UPGRADE_SOURCE_STORE_SCHEMA_VERSION, STABLE_UPGRADE_SOURCE_VERSION,
-        StableReleaseDecision, TYPESCRIPT_VERSION, TargetVerificationReport, Task,
-        V0_2_RC1_STORE_SCHEMA_VERSION, V0_4_RC1_STORE_SCHEMA_VERSION,
-        V0_4_STABLE_RELEASE_BASELINE_DIGEST, V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
-        V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION, WEB_SEMANTIC_CAPABILITIES,
-        WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS, WebSemanticAttestation,
-        WorkerBackend, archive_entries, cargo_metadata, cargo_runtime_packages,
-        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
-        evaluate_stable_release_gate, executable_name_for_target, expected_release_asset_names,
-        extract_archive, github_settings_verify, has_windows_executable_extension,
-        normalized_spdx_license, package_url, parse_worker_handshake, release_compatibility,
-        release_post_publish_evidence, remove_transient_build_run_ids, rust_backend_from_handshake,
-        rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
+        StableReleaseDecision, StableReleaseGateInput, TYPESCRIPT_VERSION,
+        TargetVerificationReport, Task, V0_2_RC1_STORE_SCHEMA_VERSION,
+        V0_4_RC1_STORE_SCHEMA_VERSION, V0_4_STABLE_RELEASE_BASELINE_DIGEST,
+        V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH, V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION,
+        WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
+        WebSemanticAttestation, WorkerBackend, archive_entries, canonical_actions_run_url,
+        cargo_metadata, cargo_runtime_packages, compiler_pack_identity_binding, create_tar_archive,
+        create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
+        expected_release_asset_names, extract_archive, github_settings_verify,
+        has_windows_executable_extension, normalized_spdx_license, package_url,
+        parse_worker_handshake, release_compatibility, release_post_publish_evidence,
+        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
+        supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
-        validate_cross_language_package_smoke, validate_full_ci_run, verify_checksum_sidecar,
+        validate_cross_language_package_smoke, validate_full_ci_run,
+        verify_agent_dogfood_release_gate, verify_checksum_sidecar,
         verify_cross_language_package_smoke, verify_github_actions_security,
         verify_local_markdown_links, verify_mcp_dependencies,
         verify_mcp_tasks_architecture_decision, verify_packaged_cross_language,
@@ -14270,8 +14544,9 @@ mod tests {
         without_windows_verbatim_prefix, workspace_root,
     };
 
-    fn post_publish_evidence_fixture()
-    -> Result<(tempfile::TempDir, ReleasePostPublishEvidenceRequest)> {
+    fn post_publish_evidence_fixture(
+        tag: &str,
+    ) -> Result<(tempfile::TempDir, ReleasePostPublishEvidenceRequest)> {
         let temp = tempfile::tempdir()?;
         let workflow = temp.path().join("workflow");
         let public = temp.path().join("public");
@@ -14280,8 +14555,6 @@ mod tests {
         let source_sha = "a".repeat(40);
         let source_tree = "b".repeat(40);
         let tag_object_sha = "c".repeat(40);
-        let tag = "v0.5.0-rc.1";
-
         let expected = expected_release_asset_names();
         assert_eq!(expected.len(), 51);
         for name in &expected {
@@ -14328,6 +14601,14 @@ mod tests {
         let compiler_sha =
             super::sha256_file_streaming(&workflow.join("compiler-pack-verification.json"))?;
         let benchmark_sha = super::sha256_file_streaming(&workflow.join("benchmark-report.json"))?;
+        let full_ci_jobs = FULL_CI_JOB_NAMES
+            .iter()
+            .map(|name| FullCiJobEvidence {
+                name: (*name).to_owned(),
+                conclusion: "success".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let full_ci_jobs_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&full_ci_jobs)?));
         fs::write(
             workflow.join("stable-release-gate.json"),
             serde_json::to_vec(&json!({
@@ -14344,6 +14625,16 @@ mod tests {
                     "ref_type": "tag",
                     "ref_name": tag,
                     "source_sha": source_sha,
+                    "source_tree": source_tree,
+                    "main_head_sha": source_sha,
+                    "maintenance_head_sha": source_sha,
+                    "baseline_digest": super::v0_5_stable_release_baseline_digest(&source_sha),
+                    "agent_dogfood_report_sha256": AGENT_DOGFOOD_REPORT_SHA256,
+                    "full_ci_run_id": "123",
+                    "full_ci_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/123",
+                    "full_ci_head_sha": source_sha,
+                    "full_ci_head_branch": "main",
+                    "full_ci_jobs_sha256": full_ci_jobs_sha256,
                     "quality": "success",
                     "compiler-precise-hostile": "success",
                     "benchmark": "success",
@@ -14352,7 +14643,11 @@ mod tests {
                     "compiler-pack": "success",
                     "verify-compiler-packs": "success"
                 },
-                "checks": [{"id": "fixture", "passed": true, "evidence": "fixture"}],
+                "checks": STABLE_RELEASE_GATE_CHECK_IDS.iter().map(|id| json!({
+                    "id": id,
+                    "passed": true,
+                    "evidence": "fixture",
+                })).collect::<Vec<_>>(),
             }))?,
         )?;
         for name in expected {
@@ -14416,7 +14711,7 @@ mod tests {
 
     #[test]
     fn post_publish_evidence_binds_exact_public_assets_and_full_ci() -> Result<()> {
-        let (_temp, request) = post_publish_evidence_fixture()?;
+        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
         let output = request.output.clone();
         release_post_publish_evidence(request)?;
         let evidence: ReleasePostPublishEvidence = serde_json::from_slice(&fs::read(output)?)?;
@@ -14430,6 +14725,12 @@ mod tests {
         assert!(evidence.workflow_public_asset_identity);
         assert!(evidence.public_download_reverified);
         Ok(())
+    }
+
+    #[test]
+    fn post_publish_evidence_accepts_the_exact_stable_tag() -> Result<()> {
+        let (_temp, request) = post_publish_evidence_fixture("v0.5.0")?;
+        release_post_publish_evidence(request)
     }
 
     #[test]
@@ -14480,18 +14781,28 @@ mod tests {
     }
 
     #[test]
-    fn post_publish_evidence_rejects_public_tamper_and_skipped_full_ci() -> Result<()> {
-        let (_temp, request) = post_publish_evidence_fixture()?;
+    fn post_publish_evidence_rejects_public_tamper_skipped_or_rebound_full_ci() -> Result<()> {
+        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
         fs::write(
             request.public_assets.join("benchmark-report.json"),
             b"tampered\n",
         )?;
         assert!(release_post_publish_evidence(request).is_err());
 
-        let (_temp, request) = post_publish_evidence_fixture()?;
+        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
         let mut full_ci: Value = serde_json::from_slice(&fs::read(&request.ci_run)?)?;
         full_ci["jobs"].as_array_mut().expect("fixture jobs").pop();
         fs::write(&request.ci_run, serde_json::to_vec(&full_ci)?)?;
+        assert!(release_post_publish_evidence(request).is_err());
+
+        let (_temp, request) = post_publish_evidence_fixture("v0.5.0")?;
+        let stable_name = "stable-release-gate.json";
+        let mut stable: Value =
+            serde_json::from_slice(&fs::read(request.workflow_assets.join(stable_name))?)?;
+        stable["workflow_results"]["full_ci_run_id"] = json!("124");
+        let stable = serde_json::to_vec(&stable)?;
+        fs::write(request.workflow_assets.join(stable_name), &stable)?;
+        fs::write(request.public_assets.join(stable_name), stable)?;
         assert!(release_post_publish_evidence(request).is_err());
         Ok(())
     }
@@ -15179,7 +15490,25 @@ jobs:
     }
 
     #[test]
-    fn stable_release_gate_allows_exact_rc_evidence_blocks_unpinned_ga_and_rejects_drift() {
+    fn agent_dogfood_release_gate_is_digest_pinned_and_recomputed() -> Result<()> {
+        let canonical = workspace_root().join(AGENT_DOGFOOD_REPORT_PATH);
+        assert_eq!(
+            verify_agent_dogfood_release_gate(&canonical)?,
+            AGENT_DOGFOOD_REPORT_SHA256
+        );
+
+        let temp = tempfile::tempdir()?;
+        let tampered = temp.path().join("report.json");
+        let mut bytes = fs::read(canonical)?;
+        bytes.push(b'\n');
+        fs::write(&tampered, bytes)?;
+        let error = verify_agent_dogfood_release_gate(&tampered).unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn stable_release_gate_allows_pinned_ga_and_exact_rc_evidence_and_rejects_drift() {
         let target = |target: &str| TargetVerificationReport {
             target: target.to_owned(),
             archive: format!("depgraph-{VERSION}-{target}.tar.gz"),
@@ -15316,18 +15645,56 @@ jobs:
             ("compiler-pack".to_owned(), "success".to_owned()),
             ("verify-compiler-packs".to_owned(), "success".to_owned()),
         ]);
+        let full_ci = FullCiRunEvidence {
+            run_id: 42,
+            url: canonical_actions_run_url(42),
+            head_sha: "1".repeat(40),
+            head_branch: "main".to_owned(),
+            jobs: FULL_CI_JOB_NAMES
+                .iter()
+                .map(|name| FullCiJobEvidence {
+                    name: (*name).to_owned(),
+                    conclusion: "success".to_owned(),
+                })
+                .collect(),
+        };
+        let gate_input = |workflow_results| StableReleaseGateInput {
+            release_verification_sha256: "a".repeat(64),
+            benchmark_report_sha256: "b".repeat(64),
+            compiler_pack_verification_sha256: "c".repeat(64),
+            agent_dogfood_report_sha256: AGENT_DOGFOOD_REPORT_SHA256.to_owned(),
+            compiler_pack_verified: true,
+            full_ci: &full_ci,
+            workflow_results,
+        };
 
         assert_eq!(
             evaluate_stable_release_gate(
                 &release,
                 &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                workflow_results.clone(),
+                gate_input(workflow_results.clone()),
             )
             .decision,
+            StableReleaseDecision::Reject
+        );
+
+        let mut pinned_stable_workflow = workflow_results.clone();
+        pinned_stable_workflow.insert("source_tree".to_owned(), "2".repeat(40));
+        pinned_stable_workflow.insert("main_head_sha".to_owned(), "1".repeat(40));
+        pinned_stable_workflow.insert("maintenance_head_sha".to_owned(), "1".repeat(40));
+        assert_eq!(
+            evaluate_stable_release_gate(
+                &release,
+                &benchmark,
+                gate_input(pinned_stable_workflow.clone()),
+            )
+            .decision,
+            StableReleaseDecision::Allow
+        );
+        pinned_stable_workflow.insert("maintenance_head_sha".to_owned(), "3".repeat(40));
+        assert_eq!(
+            evaluate_stable_release_gate(&release, &benchmark, gate_input(pinned_stable_workflow),)
+                .decision,
             StableReleaseDecision::Reject
         );
 
@@ -15335,15 +15702,7 @@ jobs:
         workflow_results.insert("ref_name".to_owned(), release.tag.clone());
         workflow_results.insert("source_sha".to_owned(), "1".repeat(40));
         let evaluate = |release: &ReleaseVerificationReport, benchmark: &Value| {
-            evaluate_stable_release_gate(
-                release,
-                benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                workflow_results.clone(),
-            )
+            evaluate_stable_release_gate(release, benchmark, gate_input(workflow_results.clone()))
         };
         assert_eq!(
             evaluate(&release, &benchmark).decision,
@@ -15360,11 +15719,7 @@ jobs:
             evaluate_stable_release_gate(
                 &malformed_prerelease,
                 &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                malformed_prerelease_workflow,
+                gate_input(malformed_prerelease_workflow),
             )
             .decision,
             StableReleaseDecision::Reject
@@ -15559,32 +15914,16 @@ jobs:
         let mut failed_workflow = workflow_results.clone();
         failed_workflow.insert("quality".to_owned(), "failure".to_owned());
         assert_eq!(
-            evaluate_stable_release_gate(
-                &release,
-                &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                failed_workflow,
-            )
-            .decision,
+            evaluate_stable_release_gate(&release, &benchmark, gate_input(failed_workflow),)
+                .decision,
             StableReleaseDecision::Reject
         );
 
         let mut failed_hostile = workflow_results.clone();
         failed_hostile.insert("compiler-precise-hostile".to_owned(), "failure".to_owned());
         assert_eq!(
-            evaluate_stable_release_gate(
-                &release,
-                &benchmark,
-                "a".repeat(64),
-                "b".repeat(64),
-                "c".repeat(64),
-                true,
-                failed_hostile,
-            )
-            .decision,
+            evaluate_stable_release_gate(&release, &benchmark, gate_input(failed_hostile),)
+                .decision,
             StableReleaseDecision::Reject
         );
 

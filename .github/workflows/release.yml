@@ -291,10 +291,16 @@ jobs:
   stable-gate:
     needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-verification
@@ -307,6 +313,34 @@ jobs:
         with:
           name: compiler-pack-verification
           path: compiler-artifacts
+      - name: Bind the stable candidate to main, release/0.5, and exact Full CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          api_source_tree="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${GITHUB_SHA}" --jq '.tree.sha')"
+          test "$source_tree" = "$api_source_tree"
+          main_head_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          test "$GITHUB_SHA" = "$main_head_sha"
+          maintenance_head_sha="$GITHUB_SHA"
+          if [[ "$GITHUB_REF_NAME" == "v0.5.0" ]]; then
+            maintenance_head_sha="$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
+            test "$GITHUB_SHA" = "$maintenance_head_sha"
+          fi
+
+          gh run list --workflow CI --event workflow_dispatch --commit "$GITHUB_SHA" --status success --limit 100 \
+            --json databaseId,headSha,headBranch,conclusion,event,url > artifacts/ci-runs.json
+          ci_run_id="$(jq -r 'map(select(.headSha == env.GITHUB_SHA and .headBranch == "main")) | sort_by(.databaseId) | last | .databaseId // empty' artifacts/ci-runs.json)"
+          test -n "$ci_run_id"
+          gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
+            | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}' \
+            > artifacts/full-ci.json
+
+          echo "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree" >> "$GITHUB_ENV"
+          echo "DEPGRAPH_RELEASE_MAIN_HEAD_SHA=$main_head_sha" >> "$GITHUB_ENV"
+          echo "DEPGRAPH_RELEASE_MAINTENANCE_HEAD_SHA=$maintenance_head_sha" >> "$GITHUB_ENV"
       - name: Evaluate the machine-readable v0.5 release gate
         env:
           DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}
@@ -316,7 +350,14 @@ jobs:
           DEPGRAPH_RELEASE_VERIFY_ASSETS_RESULT: ${{ needs.verify-assets.result }}
           DEPGRAPH_RELEASE_COMPILER_PACK_RESULT: ${{ needs.compiler-pack.result }}
           DEPGRAPH_RELEASE_VERIFY_COMPILER_PACKS_RESULT: ${{ needs.verify-compiler-packs.result }}
-        run: cargo xtask stable-release-gate artifacts/release-verification.json benchmark/benchmark-report.json compiler-artifacts/compiler-pack-verification.json --output artifacts/stable-release-gate.json
+        run: >-
+          cargo xtask stable-release-gate
+          artifacts/release-verification.json
+          benchmark/benchmark-report.json
+          compiler-artifacts/compiler-pack-verification.json
+          fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json
+          artifacts/full-ci.json
+          --output artifacts/stable-release-gate.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -356,6 +397,9 @@ jobs:
           test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
           test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
+          if [[ "$GITHUB_REF_NAME" == "v0.5.0" ]]; then
+            test "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')" = "$GITHUB_SHA"
+          fi
           test "$(jq -r '.verification.signature != null' <<<"$tag_payload")" = "true"
           signature_verification="$(jq -r '.verification.reason' <<<"$tag_payload")"
           case "$signature_verification" in
@@ -424,10 +468,8 @@ jobs:
           cmp --silent artifacts/compiler-pack-verification.json post-publish/public/compiler-pack-verification.json
           cmp --silent artifacts/stable-release-gate.json post-publish/public/stable-release-gate.json
 
-          gh run list --workflow CI --event workflow_dispatch --commit "$GITHUB_SHA" --status success --limit 20 \
-            --json databaseId,headSha,conclusion,event,url > post-publish/ci-runs.json
-          ci_run_id="$(jq -r 'map(select(.headSha == env.GITHUB_SHA)) | sort_by(.databaseId) | last | .databaseId // empty' post-publish/ci-runs.json)"
-          test -n "$ci_run_id"
+          ci_run_id="$(jq -r '.workflow_results.full_ci_run_id // empty' artifacts/stable-release-gate.json)"
+          [[ "$ci_run_id" =~ ^[1-9][0-9]*$ ]]
           gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
             | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}' \
             > post-publish/full-ci.json
@@ -456,3 +498,33 @@ jobs:
             --pattern "$evidence_name" \
             --dir post-publish/redownload
           cmp --silent "$evidence" "post-publish/redownload/$(basename "$evidence")"
+
+          trusted_evidence_sha256="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+            | jq -r --arg name "$evidence_name" '.assets[] | select(.name == $name) | .digest | sub("^sha256:"; "")')"
+          test "${#trusted_evidence_sha256}" -eq 64
+
+          canary_target="x86_64-unknown-linux-gnu"
+          canary_archive="post-publish/public/depgraph-${version}-${canary_target}.tar.gz"
+          canary_checksum="${canary_archive}.sha256"
+          canary_requirement="post-publish/public/depgraph-compiler-pack-${version}-${canary_target}.requirement.json"
+          mkdir -p post-publish/canary/extracted post-publish/canary/state
+          tar -xzf "$canary_archive" -C post-publish/canary/extracted
+          canary_package="post-publish/canary/extracted/depgraph-${version}-${canary_target}"
+          canary_binary="${canary_package}/bin/depgraph"
+          canary_repository="$(realpath workers/web/test/fixtures/polyglot)"
+          canary_store="$(realpath post-publish/canary/state)/depgraph.sqlite"
+
+          "$canary_binary" --store "$canary_store" scan "$canary_repository" --no-cache --json \
+            > post-publish/canary/scan.json
+          "$canary_binary" --store "$canary_store" agent-config \
+            --root "$canary_repository" \
+            --release-archive "$canary_archive" \
+            --release-checksum "$canary_checksum" \
+            --release-evidence "$evidence" \
+            --trusted-release-evidence-sha256 "$trusted_evidence_sha256" \
+            --release-manifest "${canary_package}/release-manifest.json" \
+            --compiler-pack-requirement "$canary_requirement" \
+            --host claude-desktop \
+            > post-publish/canary/claude-desktop.json
+          jq -e 'type == "object" and (.mcpServers.depgraph.command | type == "string")' \
+            post-publish/canary/claude-desktop.json >/dev/null
