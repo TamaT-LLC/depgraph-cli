@@ -514,15 +514,21 @@ dependencies = [
  "clap",
  "depgraph-core",
  "depgraph-mcp-tools",
+ "depgraph-operation",
  "depgraph-protocol",
  "depgraph-store",
+ "flate2",
+ "hex",
  "predicates",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

@@ -54,6 +54,7 @@
 
 ## 更新履歴
 
+- 2026-08-16: verified packageからAgent host設定を生成・接続検証するonboarding契約を追加
 - 2026-08-16: packaged MCP Agent dogfood benchmarkの再実行手順と固定evidenceを追加
 - 2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加
 - 2026-08-12: MCP Agent hostのcapability、確認、reconnect、timeout、upgrade運用手順を追加

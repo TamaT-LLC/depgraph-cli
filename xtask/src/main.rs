@@ -67,10 +67,10 @@ const CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID: &str = "release:polyglot";
 const CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const MCP_SERVER_NAME: &str = "depgraph-mcp";
-const MCP_SDK_NAME: &str = "rmcp";
-const MCP_SDK_VERSION: &str = "3.1.0";
+const MCP_SDK_NAME: &str = depgraph_mcp_tools::MCP_SDK_NAME;
+const MCP_SDK_VERSION: &str = depgraph_mcp_tools::MCP_SDK_VERSION;
 const MCP_MACROS_VERSION: &str = "3.1.2";
-const MCP_PROTOCOL_REVISION: &str = "2026-07-28";
+const MCP_PROTOCOL_REVISION: &str = depgraph_mcp_tools::MCP_PROTOCOL_REVISION;
 const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
 const MCP_OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const MCP_TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
@@ -2043,6 +2043,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "| Durable operation journal | schema `5` |",
         "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
         "| Operation DTO | `depgraph-operation-v1` |",
+        "| Agent host configuration | `depgraph-agent-host-config-v1` |",
+        "| Agent onboarding release evidence | `release-post-publish-evidence-v1` |",
+        "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         V0_4_RC6_TAG_COMMIT,
         V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
@@ -2099,6 +2102,10 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         "depgraph-mcp-tools-v1",
         "depgraph-operation-v1",
+        "depgraph-agent-host-config-v1",
+        "release-post-publish-evidence-v1",
+        "mcp-package-smoke-v2",
+        "`flate2`, `tar`, `zip`",
         "operation journal schema `5`",
     ] {
         if !stable_release_note.contains(required) {
@@ -2291,6 +2298,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "計51点",
         "checkout内のproduct binaryや未公開package artifact",
         "non-empty matrix値をすべて含む",
+        "`mcp-package-smoke-v2`",
+        "`depgraph-agent-host-config-v1`",
+        "`tar`、`zip`とそのtransitive closure",
         V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
     ] {
         if !release_procedure.contains(required) {
@@ -2551,7 +2561,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-12\n\
+updated: 2026-08-16\n\
 open_questions: 0\n\
 ---\n";
 
@@ -2614,6 +2624,12 @@ open_questions: 0\n\
         "handle受領を2,000 ms未満",
         "stdin close後5,000 ms以内",
         "### Issue #319 acceptance mapping",
+        "| `#358` | verified release archiveからAgent host onboardingを自動化する |",
+        "## Issue #358 verified Agent host onboarding",
+        "`depgraph-agent-host-config-v1`",
+        "`mcp-package-smoke-v2`",
+        "`flate2`/`tar`/`zip`",
+        "### Issue #358 acceptance mapping",
         "## Issue #292 acceptance mapping",
     ] {
         if !decision.contains(required) {
@@ -3212,7 +3228,24 @@ fn package() -> Result<()> {
     )?;
 
     let archive = create_archive(dist, &name)?;
-    let (query_smoke, cross_language_smoke, mcp_smoke) = verify_archive(&archive, &name)?;
+    let checksum = sha256_file(&archive)?;
+    let checksum_path = archive.with_extension(format!(
+        "{}sha256",
+        archive
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ));
+    fs::write(
+        &checksum_path,
+        format!(
+            "{checksum}  {}\n",
+            archive.file_name().unwrap().to_string_lossy()
+        ),
+    )?;
+    let (query_smoke, cross_language_smoke, mcp_smoke) =
+        verify_archive(&archive, &checksum_path, &name)?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
@@ -3224,21 +3257,6 @@ fn package() -> Result<()> {
     fs::write(
         dist.join(format!("{name}.mcp-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&mcp_smoke)?),
-    )?;
-    let checksum = sha256_file(&archive)?;
-    fs::write(
-        archive.with_extension(format!(
-            "{}sha256",
-            archive
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(|extension| format!("{extension}."))
-                .unwrap_or_default()
-        )),
-        format!(
-            "{checksum}  {}\n",
-            archive.file_name().unwrap().to_string_lossy()
-        ),
     )?;
     println!("packaged {}", archive.display());
     Ok(())
@@ -6875,6 +6893,7 @@ fn verify_published_release_tree(
         BOUNDED_QUERY_SBOM_PACKAGE_NAME,
         CROSS_LANGUAGE_SBOM_PACKAGE_NAME,
         "depgraph-runtime-collector",
+        "flate2",
         "typescript",
         "golang.org/x/tools",
         "ra_ap_hir",
@@ -6884,6 +6903,8 @@ fn verify_published_release_tree(
         "rmcp",
         "rmcp-macros",
         "salsa",
+        "tar",
+        "zip",
     ] {
         if !package_names.contains(required) {
             bail!("published release SBOM is missing {required}");
@@ -7486,6 +7507,7 @@ fn verify_packaged_cross_language(
 
 fn verify_archive(
     archive: &Path,
+    checksum: &Path,
     name: &str,
 ) -> Result<(
     BoundedQueryPackageSmokeReport,
@@ -7526,6 +7548,8 @@ fn verify_archive(
     let mcp_smoke = mcp_package_smoke::verify(
         &workspace_root(),
         &extracted,
+        archive,
+        checksum,
         &release_manifest.target,
         &archive_sha256,
         VERSION,
@@ -13418,6 +13442,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         BOUNDED_QUERY_SBOM_PACKAGE_NAME,
         CROSS_LANGUAGE_SBOM_PACKAGE_NAME,
         "depgraph-runtime-collector",
+        "flate2",
         "typescript",
         "golang.org/x/tools",
         "ra_ap_hir",
@@ -13431,6 +13456,8 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "salsa-macro-rules",
         "salsa-macros",
         "syn",
+        "tar",
+        "zip",
     ] {
         if !package_names.contains(required) {
             bail!("release SBOM is missing runtime dependency {required}");
@@ -13457,14 +13484,11 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
         "@types/node",
         "assert_cmd",
         "esbuild",
-        "flate2",
         "jsonschema",
         "predicates",
         "pretty_assertions",
         "spdx",
-        "tar",
         "tsx",
-        "zip",
     ] {
         if package_names.contains(build_only) {
             bail!("release SBOM incorrectly contains build/test dependency {build_only}");
