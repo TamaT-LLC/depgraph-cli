@@ -1,0 +1,25 @@
+name: Release post-publish recovery
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-post-publish-recovery-v0.5.0
+  cancel-in-progress: false
+
+jobs:
+  verify-v0-5-0:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify the immutable v0.5.0 public closure and recover its Agent host canary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release-post-publish-recovery.sh
