@@ -11,6 +11,7 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 | `main` push | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile 含む4ジョブを常時） | マージ結果の確認 |
 | `workflow_dispatch` | CI | 上記4ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
 | `v*`タグのpush | Release | quality、hostile E2E、benchmark、全5 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
+| `workflow_dispatch` | Release post-publish recovery | 固定済みv0.5.0 Release、元run、evidence、公開Linux archiveのread-only canary | 公開後orchestration失敗の復旧証明 |
 
 GreptileはGitHub Actionsのジョブではないが、PRをマージする前に未解決の指摘を残さない。
 PRまたは`main` pushでbenchmark、integration、windows-smokeが`skipped`になるのは正常である。
@@ -179,12 +180,33 @@ SHA-256を独立取得し、公開archive/checksum、展開manifest、compiler-p
 repository、Storeを入力に、公開binaryの`agent-config --host claude-desktop`をread-only
 defaultで実行する。このcanaryはarchive真正性、root seal、Store/current snapshot、全sibling、
 compiler requirement、`initialize`、`tools/list`、`get_context`、source/Store不変を同時に
-再検証する。checkout-built product binaryを実行経路へ混ぜない。
+再検証する。共通`scripts/release-post-publish-canary.sh`はこれらすべてのfile/directory入力を
+`realpath`で絶対パスへ固定してから公開binaryへ渡す。checkout-built product binaryを
+実行経路へ混ぜない。
 
 公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、
 検証report、`release-post-publish-evidence-<tag>.json`が同じタグに結び付いていることを
 確認する。checkout内のproduct binaryや未公開package artifactを公開後verificationの
 代用品にしてはならない。
+
+### v0.5.0のimmutable post-publish recovery
+
+最初のstable Release run `31928961757`は、51点の公開assetを再取得・検証し、52点目の
+`release-post-publish-evidence-v0.5.0.json`をupload、再取得、digest照合した後、最後の
+Agent host canaryへ相対file pathを渡したため失敗した。公開binaryが
+`preflight input file paths must be absolute`として拒否したのは意図したsecurity policyであり、
+失敗はworkflow orchestration側にある。元runはfailureのまま保持し、再実行、削除、checkの
+上書き、tag移動、asset置換を行わない。
+
+`Release post-publish recovery` workflowは入力なし、`main`限定、`actions: read`と
+`contents: read`だけで実行する。v0.5.0のcommit、tree、signed annotated tag object、
+exact Full CI run `31923533506`、元Release run、元17 jobの結論集合、evidenceのSHA-256
+`13e253b3759a9729f43ff8dbe6f6a48191770681b02a57cb5197bc908ab77524`を固定する。
+GitHub Release APIの52 assetをevidence内の51 asset inventoryと照合し、evidence、Linux
+archive、checksum、compiler-pack requirementだけを公開面から再取得する。その後、共通
+canaryへ絶対パスを渡してsafe scan、`agent-config`、`initialize`、`tools/list`、`get_context`
+を完走する。GitHub Releaseへのmutation APIは呼ばず、green recovery runを元runと
+post-publish evidenceに連結した復旧証明とする。
 
 ## 失敗時の扱い
 
@@ -192,6 +214,11 @@ runner障害や一時的なdownload失敗でsourceを変更しない場合は、
 
 コード、設定、release noteの修正が必要な場合は、push済みタグをforce updateしない。
 修正PRを`main`へマージし、手動フルCIを再実行して、次のRC番号または次のversionのタグを作成する。
+
+公開assetとpost-publish evidenceがすでにbyte一致で閉じた後のread-only canary orchestration
+だけに不具合があった場合は、対象tag、source、元run、evidence digestを固定した専用recovery
+workflowで残りの検証を完走できる。recoveryは元runをsuccessに見せかけず、公開面を変更せず、
+元runの成功済みstepと失敗原因をGitHub Actions APIおよびlogから再確認しなければならない。
 
 公開済みreleaseのassetやタグは置き換えない。
 配布後に不具合が見つかった場合は、影響範囲をrelease noteへ記録し、修正版を新しいpatch versionとして公開する。

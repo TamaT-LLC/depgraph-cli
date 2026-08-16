@@ -503,28 +503,10 @@ jobs:
             | jq -r --arg name "$evidence_name" '.assets[] | select(.name == $name) | .digest | sub("^sha256:"; "")')"
           test "${#trusted_evidence_sha256}" -eq 64
 
-          canary_target="x86_64-unknown-linux-gnu"
-          canary_archive="post-publish/public/depgraph-${version}-${canary_target}.tar.gz"
-          canary_checksum="${canary_archive}.sha256"
-          canary_requirement="post-publish/public/depgraph-compiler-pack-${version}-${canary_target}.requirement.json"
-          mkdir -p post-publish/canary/extracted post-publish/canary/state
-          tar -xzf "$canary_archive" -C post-publish/canary/extracted
-          canary_package="post-publish/canary/extracted/depgraph-${version}-${canary_target}"
-          canary_binary="${canary_package}/bin/depgraph"
-          canary_repository="$(realpath workers/web/test/fixtures/polyglot)"
-          canary_store="$(realpath post-publish/canary/state)/depgraph.sqlite"
-
-          "$canary_binary" --store "$canary_store" scan "$canary_repository" --no-cache --json \
-            > post-publish/canary/scan.json
-          "$canary_binary" --store "$canary_store" agent-config \
-            --root "$canary_repository" \
-            --release-archive "$canary_archive" \
-            --release-checksum "$canary_checksum" \
-            --release-evidence "$evidence" \
-            --trusted-release-evidence-sha256 "$trusted_evidence_sha256" \
-            --release-manifest "${canary_package}/release-manifest.json" \
-            --compiler-pack-requirement "$canary_requirement" \
-            --host claude-desktop \
-            > post-publish/canary/claude-desktop.json
-          jq -e 'type == "object" and (.mcpServers.depgraph.command | type == "string")' \
-            post-publish/canary/claude-desktop.json >/dev/null
+          scripts/release-post-publish-canary.sh \
+            "$GITHUB_REF_NAME" \
+            post-publish/public \
+            "$evidence" \
+            "$trusted_evidence_sha256" \
+            workers/web/test/fixtures/polyglot \
+            post-publish/canary

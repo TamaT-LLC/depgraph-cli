@@ -72,6 +72,17 @@ source identity is wrong; its complete write-scope set is exactly `actions` and
 `contents`. It must never run repository scripts or consume an
 artifact from the triggering run.
 
+The v0.5.0 post-publish recovery workflow is an incident-specific read-only
+closure verifier, not a second publisher. It has no dispatch inputs and only
+job-scoped `actions: read` and `contents: read`. It pins the immutable source,
+tree, signed tag object, exact Full CI run, failed Release run and job-set
+digest, and public evidence digest in reviewed source. It accepts only a
+`main` dispatch, verifies that the original failure occurred after publication
+at the absolute-path Agent host canary boundary, compares all 52 GitHub Release
+assets with the closed 51-asset evidence inventory, and runs the published
+Linux binary with canonical absolute inputs. It cannot upload or replace an
+asset, move a tag, change a check conclusion, or delete a run.
+
 No current workflow requests `id-token: write` or an environment secret. If
 OIDC or GitHub Environments are added, the policy must first bind the exact
 workflow, protected tag, repository, audience, environment reviewers, and
@@ -108,6 +119,7 @@ To update an Action:
 | OIDC token is replayed | OIDC disabled until exact claims and environment review are implemented |
 | Release tag points at another commit | immutable stable source guard cancels the run and removes the tag |
 | `workflow_run` executes attacker code with write token | guard consumes metadata only and performs no checkout or repository execution |
+| Post-publish recovery rewrites release history | no inputs or write scopes; exact immutable run/tag/evidence binding and published-binary canary only |
 | Private advisory leaks into public CI | advisory data stays in GitHub Security Advisories and is represented publicly only by redacted dry-run digests |
 
 ## Evidence

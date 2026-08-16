@@ -1073,12 +1073,15 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
         "`release-post-publish-evidence-v1`",
         "Every one of the 51 pre-evidence public assets",
         "The stable source guard handles `workflow_run` metadata without checking out",
+        "The v0.5.0 post-publish recovery workflow is an incident-specific read-only",
+        "It cannot upload or replace an\nasset, move a tag, change a check conclusion, or delete a run.",
         "No current workflow requests `id-token: write`",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
         "`.github/actions-policy.json` is the canonical allowlist",
         "A mutable tag or branch is never a temporary fallback.",
         "| Fork changes a workflow to print a secret |",
         "| `workflow_run` executes attacker code with write token |",
+        "| Post-publish recovery rewrites release history |",
     ] {
         if !threat_model.contains(required) {
             bail!("GitHub Actions threat model is missing {required:?}");
@@ -1200,6 +1203,27 @@ fn verify_workflow_policy_text(
             {
                 bail!(
                     "release gate permissions must remain read-only, publish permissions must remain actions-read/contents-write, the workflow must remain tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
+                );
+            }
+        }
+        "release-post-publish-recovery.yml" => {
+            let verification = workflow_job_block(workflow, "verify-v0-5-0")?;
+            let verification_permissions = job_permissions(verification)?;
+            if top_level_trigger_keys(workflow)? != ["workflow_dispatch"]
+                || !workflow.contains("\n  workflow_dispatch:\n\npermissions: {}\n")
+                || !top_permissions.is_empty()
+                || verification_permissions != ["actions: read", "contents: read"]
+                || !write_permissions.is_empty()
+                || contains_expression_context(workflow, "secrets")
+                || workflow.matches("actions/checkout@").count() != 1
+                || !workflow.contains("run: scripts/release-post-publish-recovery.sh")
+                || workflow.contains("gh release upload")
+                || workflow.contains("gh release create")
+                || workflow.contains("gh release delete")
+                || workflow.contains("gh api --method")
+            {
+                bail!(
+                    "release post-publish recovery must remain input-free, main-checked, read-only, and pinned to its reviewed verifier"
                 );
             }
         }
@@ -2367,6 +2391,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "release-post-publish-evidence-v0.5.0.json",
         "`tar`、`zip`とそのtransitive closure",
         V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
+        "### v0.5.0のimmutable post-publish recovery",
+        "Release post-publish recovery",
+        "31928961757",
+        "31923533506",
+        "preflight input file paths must be absolute",
+        "green recovery run",
     ] {
         if !release_procedure.contains(required) {
             bail!("release procedure is missing post-publish contract {required:?}");
@@ -2549,18 +2579,74 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "cmp --silent \"$evidence\"",
         "git ls-remote origin refs/heads/release/0.5",
         "trusted_evidence_sha256",
-        "agent-config",
-        "--host claude-desktop",
-        "post-publish/canary/claude-desktop.json",
+        "scripts/release-post-publish-canary.sh",
+        "post-publish/canary",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
         }
     }
+    let canary_script = fs::read_to_string(root.join("scripts/release-post-publish-canary.sh"))?;
+    for required in [
+        "canonical_file()",
+        "canonical_directory()",
+        "realpath \"$path\"",
+        "sha256sum --check --strict --status",
+        "agent-config",
+        "--release-archive \"$canary_archive\"",
+        "--release-checksum \"$canary_checksum\"",
+        "--release-evidence \"$evidence\"",
+        "--release-manifest \"$canary_manifest\"",
+        "--compiler-pack-requirement \"$canary_requirement\"",
+        "--host claude-desktop",
+        "claude-desktop.json",
+    ] {
+        if !canary_script.contains(required) {
+            bail!("release post-publish canary is missing {required:?}");
+        }
+    }
+    let recovery_workflow =
+        fs::read_to_string(root.join(".github/workflows/release-post-publish-recovery.yml"))?;
+    for required in [
+        "name: Release post-publish recovery",
+        "workflow_dispatch:",
+        "permissions: {}",
+        "actions: read",
+        "contents: read",
+        "run: scripts/release-post-publish-recovery.sh",
+    ] {
+        if !recovery_workflow.contains(required) {
+            bail!("release post-publish recovery workflow is missing {required:?}");
+        }
+    }
+    let recovery_script =
+        fs::read_to_string(root.join("scripts/release-post-publish-recovery.sh"))?;
+    for required in [
+        "v0.5.0 post-publish recovery accepts no mutable inputs",
+        "f1071178d3888503b6e02d4aec5e058f0b87d035",
+        "2e1825dda4493acf581dbad9ef66f8f3a44bb734",
+        "dd81d5f108fb8fc3db1afcad62d422c9d9c34415",
+        "31928961757",
+        "31923533506",
+        "13e253b3759a9729f43ff8dbe6f6a48191770681b02a57cb5197bc908ab77524",
+        "original_job_set_sha256",
+        "compare/${source_sha}...${GITHUB_SHA}",
+        ".path == \".github/workflows/release.yml\"",
+        ".run_attempt == 1",
+        "--log-failed",
+        "preflight input file paths must be absolute",
+        "(.assets | length) == 52",
+        "(.assets | length) == 51",
+        "release-post-publish-canary.sh",
+    ] {
+        if !recovery_script.contains(required) {
+            bail!("release post-publish recovery script is missing {required:?}");
+        }
+    }
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
         "needs: [rust, go, web]",
-        "node --test scripts/tests/agent-dogfood.test.mjs",
+        "node --test scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs",
         "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs",
         "scripts/benchmark-mvp.sh",
         "benchmark-report-${{ github.sha }}",
@@ -3030,6 +3116,7 @@ fn test() -> Result<()> {
         "scripts/tests/benchmark.test.mjs",
         "scripts/tests/cache-hit-benchmark.test.mjs",
         "scripts/tests/agent-dogfood.test.mjs",
+        "scripts/tests/release-post-publish-canary.test.mjs",
     ]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")
@@ -14859,7 +14946,12 @@ mod tests {
             );
         }
 
-        for workflow_name in ["ci.yml", "release.yml", "stable-release-source-guard.yml"] {
+        for workflow_name in [
+            "ci.yml",
+            "release-post-publish-recovery.yml",
+            "release.yml",
+            "stable-release-source-guard.yml",
+        ] {
             let workflow = fs::read_to_string(root.join(".github/workflows").join(workflow_name))?;
             let crlf_workflow = workflow.replace('\n', "\r\n");
             verify_workflow_policy_text(
@@ -15174,6 +15266,32 @@ jobs:
             )
             .is_err()
         );
+
+        let recovery =
+            fs::read_to_string(root.join(".github/workflows/release-post-publish-recovery.yml"))?;
+        for drifted_recovery in [
+            recovery.replacen("      contents: read", "      contents: write", 1),
+            recovery.replacen(
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n    inputs:\n      tag:\n        required: true\n",
+                1,
+            ),
+            recovery.replacen(
+                "run: scripts/release-post-publish-recovery.sh",
+                "run: gh release upload v0.5.0 replacement.json",
+                1,
+            ),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "release-post-publish-recovery.yml",
+                    &drifted_recovery,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
 
         let dry_run = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
         verify_security_disclosure_dry_run(&dry_run)?;
