@@ -546,6 +546,10 @@ over the phase, outcome, and complete evidence object, and every checkpoint is
 bound to the target attestation. Write reopening additionally binds the
 settings-verification checkpoint and anonymous smoke digests.
 
+The candidate freeze, evidence binding, final verification, owner approval,
+production stop conditions, and initial observation procedure are defined in
+[`docs/50_test/public-readiness-final-audit.md`](../50_test/public-readiness-final-audit.md).
+
 ### Gate 9: incident readiness
 
 - [ ] Maintain an incident tree covering secret/private-data exposure,

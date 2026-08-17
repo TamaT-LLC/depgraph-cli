@@ -335,6 +335,29 @@ enum Task {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Verify a public-readiness-v1 bundle without changing repository visibility.
+    PublicReadinessVerify {
+        /// Closed public-readiness-v1 bundle to verify.
+        bundle: PathBuf,
+        /// Independently observed default-branch head.
+        #[arg(long)]
+        candidate_commit: String,
+        /// Digest from the independently collected final ref inventory.
+        #[arg(long)]
+        audited_refs_digest: String,
+        /// Digest from the independently collected GitHub settings snapshot.
+        #[arg(long)]
+        github_settings_digest: String,
+        /// Digest from the independently reviewed governance tree.
+        #[arg(long)]
+        governance_tree_digest: String,
+        /// Digest from the stable release gate for the same candidate.
+        #[arg(long)]
+        release_gate_digest: String,
+        /// Redacted deterministic evaluation output.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -918,6 +941,26 @@ fn main() -> Result<()> {
         Task::GithubSettingsVerify { snapshot, output } => {
             github_settings_verify(&snapshot, &output)
         }
+        Task::PublicReadinessVerify {
+            bundle,
+            candidate_commit,
+            audited_refs_digest,
+            github_settings_digest,
+            governance_tree_digest,
+            release_gate_digest,
+            output,
+        } => public_readiness_verify(
+            &bundle,
+            depgraph_core::PublicReadinessExpectedState {
+                repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+                candidate_commit,
+                audited_refs_digest,
+                github_settings_digest,
+                governance_tree_digest,
+                release_gate_digest,
+            },
+            &output,
+        ),
     }
 }
 
@@ -5839,6 +5882,44 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
     }
     println!(
         "GitHub settings verification allowed; redacted evaluation={}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn public_readiness_verify(
+    bundle_path: &Path,
+    expected: depgraph_core::PublicReadinessExpectedState,
+    output: &Path,
+) -> Result<()> {
+    let bundle: depgraph_core::PublicReadinessBundle =
+        serde_json::from_slice(&fs::read(bundle_path).with_context(|| {
+            format!(
+                "failed to read public readiness bundle {}",
+                bundle_path.display()
+            )
+        })?)
+        .context("public readiness bundle does not satisfy its closed schema")?;
+    let evaluation = depgraph_core::evaluate_public_readiness(&bundle, &expected)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write redacted public readiness evaluation {}",
+            output.display()
+        )
+    })?;
+
+    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+        bail!(
+            "public readiness verification rejected; redacted evaluation={}",
+            output.display()
+        );
+    }
+    println!(
+        "public readiness verification allowed; redacted evaluation={}",
         output.display()
     );
     Ok(())
@@ -14701,9 +14782,9 @@ mod tests {
         create_zip_archive, evaluate_stable_release_gate, executable_name_for_target,
         expected_release_asset_names, extract_archive, github_settings_verify,
         has_windows_executable_extension, normalized_spdx_license, package_url,
-        parse_worker_handshake, release_compatibility, release_post_publish_evidence,
-        remove_transient_build_run_ids, rust_backend_from_handshake, rustc_source_identity,
-        supported_release_tag, target_native_smoke_expectation,
+        parse_worker_handshake, public_readiness_verify, release_compatibility,
+        release_post_publish_evidence, remove_transient_build_run_ids, rust_backend_from_handshake,
+        rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, validate_full_ci_run,
         verify_agent_dogfood_release_gate, verify_checksum_sidecar,
@@ -15713,6 +15794,186 @@ jobs:
                 .iter()
                 .any(|drift| drift.reason
                     == depgraph_core::GitHubSettingsDriftReason::RulesetDisabled)
+        );
+        Ok(())
+    }
+
+    fn public_readiness_fixture() -> (
+        depgraph_core::PublicReadinessBundle,
+        depgraph_core::PublicReadinessExpectedState,
+    ) {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let mut manifest = depgraph_core::PublicReadinessEvidenceManifest {
+            schema_version: depgraph_core::PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION.into(),
+            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+            candidate_commit: COMMIT.into(),
+            audited_refs_digest: HASH_A.into(),
+            github_settings_digest: HASH_B.into(),
+            governance_tree_digest: HASH_C.into(),
+            release_gate_digest: HASH_D.into(),
+            generated_at: "2026-07-26T00:02:00Z".into(),
+            evidence: Vec::new(),
+        };
+        let input_digest = depgraph_core::public_readiness_evidence_input_digest(&manifest);
+        manifest.evidence = depgraph_core::PUBLIC_READINESS_GATE_IDS
+            .iter()
+            .enumerate()
+            .map(|(index, gate_id)| {
+                let mut evidence = depgraph_core::PublicReadinessEvidence {
+                    gate_id: (*gate_id).into(),
+                    evidence_digest: String::new(),
+                    input_digest: input_digest.clone(),
+                    started_at: "2026-07-26T00:00:00Z".into(),
+                    ended_at: format!("2026-07-26T00:01:{index:02}Z"),
+                    producer_role: "repository-administrator".into(),
+                    producer_identity: "team:readiness-producers".into(),
+                    approver_role: "independent-code-reviewer".into(),
+                    approver_identity: "team:readiness-gate-reviewers".into(),
+                    tool: depgraph_core::PublicReadinessToolIdentity {
+                        name: "readiness-auditor".into(),
+                        version: "1.0.0".into(),
+                        acquisition_digest: HASH_B.into(),
+                        configuration_digest: HASH_C.into(),
+                    },
+                    findings: depgraph_core::PublicReadinessFindingSummary {
+                        resolved: 0,
+                        unresolved: 0,
+                    },
+                };
+                evidence.evidence_digest =
+                    depgraph_core::public_readiness_evidence_digest(&evidence).unwrap();
+                evidence
+            })
+            .collect();
+        let evidence_manifest_digest =
+            depgraph_core::canonical_public_readiness_digest(&manifest).unwrap();
+        let gates = manifest
+            .evidence
+            .iter()
+            .map(|evidence| depgraph_core::PublicReadinessGate {
+                id: evidence.gate_id.clone(),
+                decision: depgraph_core::PublicReadinessDecision::Allow,
+                evidence_digest: evidence.evidence_digest.clone(),
+                producer_role: evidence.producer_role.clone(),
+                producer_identity: evidence.producer_identity.clone(),
+                approver_role: evidence.approver_role.clone(),
+                approver_identity: evidence.approver_identity.clone(),
+            })
+            .collect();
+        let mut record = depgraph_core::PublicReadinessRecord {
+            schema_version: depgraph_core::PUBLIC_READINESS_SCHEMA_VERSION.into(),
+            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+            candidate_commit: COMMIT.into(),
+            audited_refs_digest: HASH_A.into(),
+            github_settings_digest: HASH_B.into(),
+            governance_tree_digest: HASH_C.into(),
+            release_gate_digest: HASH_D.into(),
+            evidence_manifest_digest,
+            gates,
+            decision: depgraph_core::PublicReadinessDecision::Allow,
+            decided_at: "2026-07-26T00:04:00Z".into(),
+            accountable_role: "tamat-llc-organization-owner".into(),
+            approvals: depgraph_core::PUBLIC_READINESS_FINAL_APPROVAL_ROLES
+                .iter()
+                .map(|role| depgraph_core::PublicReadinessApproval {
+                    role: (*role).into(),
+                    identity: format!("team:{role}s"),
+                    approved_at: "2026-07-26T00:03:00Z".into(),
+                    statement_digest: String::new(),
+                })
+                .collect(),
+        };
+        let statement_digests = record
+            .approvals
+            .iter()
+            .map(|approval| {
+                depgraph_core::public_readiness_approval_statement_digest(
+                    &record,
+                    &approval.role,
+                    &approval.identity,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (approval, statement_digest) in record.approvals.iter_mut().zip(statement_digests) {
+            approval.statement_digest = statement_digest;
+        }
+        let expected = depgraph_core::PublicReadinessExpectedState {
+            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+            candidate_commit: COMMIT.into(),
+            audited_refs_digest: HASH_A.into(),
+            github_settings_digest: HASH_B.into(),
+            governance_tree_digest: HASH_C.into(),
+            release_gate_digest: HASH_D.into(),
+        };
+        (
+            depgraph_core::PublicReadinessBundle {
+                record,
+                evidence_manifest: manifest,
+            },
+            expected,
+        )
+    }
+
+    #[test]
+    fn public_readiness_verify_command_binds_expected_state_and_writes_reject() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundle_path = temp.path().join("bundle.json");
+        let output_path = temp.path().join("evaluation.json");
+        let (bundle, expected) = public_readiness_fixture();
+        fs::write(&bundle_path, serde_json::to_vec(&bundle)?)?;
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "public-readiness-verify",
+            bundle_path.to_str().unwrap(),
+            "--candidate-commit",
+            &expected.candidate_commit,
+            "--audited-refs-digest",
+            &expected.audited_refs_digest,
+            "--github-settings-digest",
+            &expected.github_settings_digest,
+            "--governance-tree-digest",
+            &expected.governance_tree_digest,
+            "--release-gate-digest",
+            &expected.release_gate_digest,
+            "--output",
+            output_path.to_str().unwrap(),
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Task::PublicReadinessVerify { bundle, output, .. }
+                if bundle == bundle_path && output == output_path
+        ));
+
+        public_readiness_verify(&bundle_path, expected.clone(), &output_path)?;
+        let allow: depgraph_core::PublicReadinessEvaluation =
+            serde_json::from_slice(&fs::read(&output_path)?)?;
+        assert_eq!(
+            allow.decision,
+            depgraph_core::PublicReadinessDecision::Allow
+        );
+        assert!(allow.reasons.is_empty());
+
+        let mut stale = expected;
+        stale.github_settings_digest =
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+        let error = public_readiness_verify(&bundle_path, stale, &output_path).unwrap_err();
+        assert!(error.to_string().contains("verification rejected"));
+        let reject: depgraph_core::PublicReadinessEvaluation =
+            serde_json::from_slice(&fs::read(&output_path)?)?;
+        assert_eq!(
+            reject.decision,
+            depgraph_core::PublicReadinessDecision::Reject
+        );
+        assert!(
+            reject
+                .reasons
+                .contains(&depgraph_core::PublicReadinessRejectionReason::CandidateStateStale)
         );
         Ok(())
     }
