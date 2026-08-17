@@ -169,6 +169,30 @@ test("owner-specific TypeScript paths never leak into the neutral compiler progr
   assert.ok(foreignResolution.targets.every((target) => target.kind !== "file"));
 });
 
+test("TypeScript path mapping captures are inserted as literal text", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-path-literal-capture-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  const files = ["package.json", "tsconfig.json", "index.ts", "src/$&.ts"]
+    .map((relative) => path.join(root, relative));
+  await Promise.all([
+    writeFile(files[0]!, JSON.stringify({ name: "path-literal-capture", version: "1.0.0" })),
+    writeFile(files[1]!, JSON.stringify({
+      compilerOptions: { paths: { "@special/*": ["src/*"] } },
+    })),
+    writeFile(files[2]!, "export {};\n"),
+    writeFile(files[3]!, "export const literalCapture = true;\n"),
+  ]);
+  const workspace = await discoverWorkspace(root, files);
+  const resolver = await ModuleResolver.create(workspace, files);
+  const owner = workspace.packages.find((record) => record.name === "path-literal-capture")!;
+  const resolution = await resolver.resolve(rawDependency("@special/$&"), files[2]!, owner);
+  assert.equal(
+    resolution.targets[0]?.kind === "file" ? resolution.targets[0].absolutePath : null,
+    files[3],
+  );
+});
+
 test("neutral TypeScript paths require identical owner pattern order", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-owner-path-order-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
