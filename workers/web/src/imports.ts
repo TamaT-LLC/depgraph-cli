@@ -2073,7 +2073,7 @@ export class ModuleResolver {
     for (const replacement of selected.rule.replacements) {
       const resolved = this.#resolveFileBase(path.resolve(
         selected.rule.basePath,
-        replacement.replace("*", selected.capture),
+        replacement.replaceAll("*", () => selected.capture),
       ), new Set(), 0, stripSpecifierSuffix, !stripSpecifierSuffix);
       if (resolved.length === 0) continue;
       // `compilerOptions.paths` replacements are ordered fallbacks. Once a

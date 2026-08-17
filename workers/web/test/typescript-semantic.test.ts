@@ -2927,7 +2927,7 @@ test("dependency collector recovers safe unresolved sites from broken source wit
     "src/missing-import.ts": "import { Foo } from ;\n",
     "src/missing-export.ts": "export { Foo } from ;\n",
     "src/missing-import-binding.ts": 'import { Foo as } from "./defs";\n',
-    "src/missing-export-binding.ts": 'export { Foo as } from "./defs";\n',
+    "src/missing-export-binding.ts": 'export { Foo as } /* block */\n// line\nfrom "./defs";\n',
     "src/broken-type-import.ts": [
       'import type { require } from "./types";',
       'const loaded = require("./invalid-type-import-not-a-shadow");',

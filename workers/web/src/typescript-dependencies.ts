@@ -3568,7 +3568,7 @@ function collectInvalidOccurrences(node: Node, context: CollectionContext): Type
     return text.length === 0 ? "<missing>" : text;
   };
   const startsWithFromToken = (source: string): boolean => (
-    /^(?:(?:\s+)|(?:\/\*[\s\S]*?\*\/)|(?:\/\/[^\r\n]*(?:\r?\n|$)))*from\b/u.test(source)
+    scanTypeScriptSyntaxTokens(source)[0]?.kind === SyntaxKind.FromKeyword
   );
   const unresolved = (
     kind: TypeScriptRawDependencySiteKind,
