@@ -40,10 +40,11 @@ their source, exact version, reproduction command, license/provenance impact,
 and resulting lockfile or artifact changes.
 
 Security-sensitive changes, workflows, release code, schemas/migrations,
-dependency manifests, and governance documents require an independent
+dependency manifests, and governance documents normally require an independent
 organization-assigned reviewer. Authors cannot provide their own independent
-approval. All required CI must be green and every review conversation resolved
-before merge.
+approval. The organization owner's recorded emergency bypass does not waive
+required CI or history protection. All required CI must be green and every
+review conversation resolved before merge.
 
 ## Developer Certificate of Origin
 

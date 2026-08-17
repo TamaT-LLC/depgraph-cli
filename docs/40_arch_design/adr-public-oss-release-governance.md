@@ -16,12 +16,13 @@ specific product build is releasable. They do not establish whether the
 repository, its history, collaboration records, GitHub Actions history, or
 governance are safe and ready to become public.
 
-The current repository also does not yet contain the complete public
-community and security surface required by this ADR: `SECURITY.md`,
+At the time of this decision, the repository did not contain the complete
+public community and security surface required by this ADR: `SECURITY.md`,
 `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`, `GOVERNANCE.md`, issue
-forms, a pull-request template, and an assigned team-backed `CODEOWNERS` file.
-Adding placeholder contacts or naming an unconfirmed person would be worse
-than keeping the repository private.
+forms, a pull-request template, and an assigned organization-backed `CODEOWNERS`
+file.
+The follow-up implementation added each document and added `CODEOWNERS` only
+after the organization owner confirmed the two active repository administrators.
 
 Changing a repository from private to public has a wider effect than exposing
 the default branch:
@@ -361,8 +362,9 @@ verified release, and coordinated disclosure.
 - [ ] Define PR size/scope, tests, DCO/CLA attestation, review expectations,
   generated/dependency updates, security-sensitive changes, and release-note
   requirements.
-- [ ] Assign organization teams before adding `CODEOWNERS`; every pattern must
-  name an existing team with active members and least-privilege access.
+- [ ] Assign organization-backed maintainers before adding `CODEOWNERS`; every
+  pattern must name an existing user or team with active responsibility and
+  least-privilege access.
 - [ ] Verify the GitHub community profile and every document link through an
   anonymous session.
 
@@ -384,7 +386,8 @@ report, and approvals.
   `.github/workflows/**`, release/signing/security policy, dependency
   manifests/locks, schema/migration, and governance control paths.
 - [ ] Prohibit direct push, force push, branch/tag deletion, and ruleset bypass
-  except a minimal audited emergency role.
+  except the recorded `@TakehiroT` pull-request-only code-owner bypass. The
+  bypass must not skip required checks, history protection, or tag protection.
 - [ ] Inventory GitHub Apps, webhooks, deploy keys, fine-grained tokens,
   collaborators, teams, environments, runners, Pages, and package permissions;
   remove stale, broad, personal, or unexplained access.
@@ -545,6 +548,10 @@ evidence under a build-defined verifier identity. Its digest is recomputed
 over the phase, outcome, and complete evidence object, and every checkpoint is
 bound to the target attestation. Write reopening additionally binds the
 settings-verification checkpoint and anonymous smoke digests.
+
+The candidate freeze, evidence binding, final verification, owner approval,
+production stop conditions, and initial observation procedure are defined in
+[`docs/50_test/public-readiness-final-audit.md`](../50_test/public-readiness-final-audit.md).
 
 ### Gate 9: incident readiness
 

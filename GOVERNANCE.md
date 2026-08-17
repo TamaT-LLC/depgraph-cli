@@ -22,11 +22,13 @@ decision and rationale when consensus is not reached. Durable architecture,
 security-boundary, release, or governance changes require an ADR and an
 independent reviewer.
 
-Authors do not approve their own work. Required CI must be green and review
-conversations resolved. Security, workflows, release controls, dependency
-manifests, schemas/migrations, and governance paths require an
+Authors do not normally approve their own work. Required CI must be green and
+review conversations resolved. Security, workflows, release controls,
+dependency manifests, schemas/migrations, and governance paths require an
 organization-assigned reviewer for that domain. Conflicted reviewers disclose
-the conflict and recuse.
+the conflict and recuse. The organization owner grants `@TakehiroT` a
+pull-request-only code-owner bypass for an audited emergency; it does not bypass
+required CI, non-fast-forward/deletion protection, or version-tag protection.
 
 The issue tracker informs the roadmap but does not create a delivery promise.
 Organization-assigned maintainers may prioritize, defer, or decline work based
@@ -34,7 +36,7 @@ on scope, risk, compatibility, and capacity. Material project direction is
 recorded in issues, pull requests, release notes, or ADRs rather than private
 individual preference.
 
-## Maintainer lifecycle and team boundary
+## Maintainer lifecycle and owner boundary
 
 The TamaT-LLC organization owner appoints maintainers after sustained,
 constructive contributions and evidence that the candidate can apply the
@@ -48,12 +50,13 @@ limit a maintainer for inactivity, loss of trust, policy violations, unresolved
 conflicts, security risk, or organizational need. Removal revokes access
 promptly while preserving a restricted audit record and a continuity handoff.
 
-`CODEOWNERS` is added only after the organization owner confirms an existing
-TamaT-LLC team with active members, least-privilege repository access, and the
-relevant role assignment. Personal accounts, invented team names, and
-placeholder contacts are not acceptable substitutes. Until that assignment is
-verified, protected-path review is enforced by organization-assigned reviewers
-and repository rules rather than an unowned `CODEOWNERS` entry.
+The `CODEOWNERS` principals are added only after the organization owner confirms
+that each account is an active TamaT-LLC maintainer with repository access and
+the relevant role assignment. The current owner pair is `@TakehiroT` and
+`@Fuelda`; both accounts have independently confirmed repository administration
+access. Invented identities and placeholder contacts are not acceptable
+substitutes. Access and role changes must update `CODEOWNERS` and the repository
+access review in the same change.
 
 ## Releases and maintenance
 
