@@ -3069,9 +3069,9 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
         (
             "GOVERNANCE.md",
             &[
-                "## Maintainer lifecycle and team boundary",
-                "`CODEOWNERS` is added only after",
-                "Personal accounts, invented team names, and",
+                "## Maintainer lifecycle and owner boundary",
+                "The `CODEOWNERS` principals are added only after",
+                "The current owner pair is `@TakehiroT` and",
                 "Authors do not approve their own work.",
                 "Developer Certificate of Origin",
             ],
@@ -3135,10 +3135,12 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
         }
         verify_local_markdown_links(&root, path, &content)?;
     }
-    if root.join(".github/CODEOWNERS").exists() {
-        bail!(
-            "CODEOWNERS must remain absent until an organization owner attests a live assigned team"
-        );
+    let codeowners = fs::read_to_string(root.join(".github/CODEOWNERS"))
+        .context("public community profile is missing .github/CODEOWNERS")?;
+    if codeowners
+        != "# Require an owner review for every change in this repository.\n* @TakehiroT @Fuelda\n"
+    {
+        bail!("CODEOWNERS must match the organization-approved owner pair");
     }
     Ok(())
 }

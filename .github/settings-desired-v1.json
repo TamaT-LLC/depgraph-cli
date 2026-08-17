@@ -60,16 +60,7 @@
     "webhook_digests": [],
     "deploy_key_fingerprints": [],
     "token_fingerprints": [],
-    "teams": [
-      {
-        "identity": "team:depgraph-maintainers",
-        "permission": "maintain"
-      },
-      {
-        "identity": "team:depgraph-security",
-        "permission": "security-manager"
-      }
-    ],
+    "teams": [],
     "environments": [
       "release"
     ],

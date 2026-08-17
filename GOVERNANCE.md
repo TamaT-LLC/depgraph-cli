@@ -34,7 +34,7 @@ on scope, risk, compatibility, and capacity. Material project direction is
 recorded in issues, pull requests, release notes, or ADRs rather than private
 individual preference.
 
-## Maintainer lifecycle and team boundary
+## Maintainer lifecycle and owner boundary
 
 The TamaT-LLC organization owner appoints maintainers after sustained,
 constructive contributions and evidence that the candidate can apply the
@@ -48,12 +48,13 @@ limit a maintainer for inactivity, loss of trust, policy violations, unresolved
 conflicts, security risk, or organizational need. Removal revokes access
 promptly while preserving a restricted audit record and a continuity handoff.
 
-`CODEOWNERS` is added only after the organization owner confirms an existing
-TamaT-LLC team with active members, least-privilege repository access, and the
-relevant role assignment. Personal accounts, invented team names, and
-placeholder contacts are not acceptable substitutes. Until that assignment is
-verified, protected-path review is enforced by organization-assigned reviewers
-and repository rules rather than an unowned `CODEOWNERS` entry.
+The `CODEOWNERS` principals are added only after the organization owner confirms
+that each account is an active TamaT-LLC maintainer with repository access and
+the relevant role assignment. The current owner pair is `@TakehiroT` and
+`@Fuelda`; both accounts have independently confirmed repository administration
+access. Invented identities and placeholder contacts are not acceptable
+substitutes. Access and role changes must update `CODEOWNERS` and the repository
+access review in the same change.
 
 ## Releases and maintenance
 
