@@ -1134,12 +1134,12 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
 }
 
 const RECOVERY_PINNED_NODE_SETUP_STEP: &str = concat!(
-    "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4\n",
+    "      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n",
     "        with:\n",
     "          node-version: 24.18.0\n",
 );
 const RECOVERY_PINNED_NODE_SETUP_HEADER: &str =
-    "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4";
+    "      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0";
 const RECOVERY_VERIFIER_HEADER: &str =
     "      - name: Verify the immutable v0.5.0 public closure and recover its Agent host canary";
 const RECOVERY_VERIFIER_RUN: &str = "        run: scripts/release-post-publish-recovery.sh";
@@ -1193,6 +1193,14 @@ fn verify_workflow_policy_text(
             bail!("{name} uses unreviewed or mutable Action {specification}");
         }
         used_actions.insert(identity.to_owned());
+    }
+
+    let setup_go_steps = workflow.matches("actions/setup-go@").count();
+    let setup_go_cache_paths = workflow
+        .matches("          cache-dependency-path: workers/go/go.sum\n")
+        .count();
+    if setup_go_steps != setup_go_cache_paths {
+        bail!("{name} must bind every setup-go cache to the checked-in workers/go/go.sum");
     }
 
     match name {
@@ -2738,7 +2746,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "permissions: {}",
         "actions: read",
         "contents: read",
-        "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+        "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
         "node-version: 24.18.0",
         "run: scripts/release-post-publish-recovery.sh",
     ] {
@@ -15133,7 +15141,7 @@ mod tests {
         }
 
         let mutable = ci.replacen(
-            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
             "actions/checkout@v4",
             1,
         );
@@ -15161,6 +15169,21 @@ mod tests {
             verify_workflow_policy_text(
                 "ci.yml",
                 &missing_manual_dispatch,
+                &pins,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let missing_go_cache_path = ci.replacen(
+            "          cache-dependency-path: workers/go/go.sum\n",
+            "",
+            1,
+        );
+        assert!(
+            verify_workflow_policy_text(
+                "ci.yml",
+                &missing_go_cache_path,
                 &pins,
                 &mut BTreeSet::new(),
             )
@@ -15224,7 +15247,7 @@ mod tests {
         );
 
         let inline_mutable = ci.replacen(
-            "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
             "- { uses: actions/checkout@v4 }",
             1,
         );
@@ -15443,7 +15466,7 @@ jobs:
             recovery.replacen("      contents: read", "      contents: write", 1),
             recovery.replacen(
                 RECOVERY_PINNED_NODE_SETUP_STEP,
-                "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4\n      - name: Detached Node version text\n        run: echo 'node-version: 24.18.0'\n",
+                "      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n      - name: Detached Node version text\n        run: echo 'node-version: 24.18.0'\n",
                 1,
             ),
             recovery
