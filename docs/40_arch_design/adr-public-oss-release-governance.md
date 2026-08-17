@@ -386,7 +386,8 @@ report, and approvals.
   `.github/workflows/**`, release/signing/security policy, dependency
   manifests/locks, schema/migration, and governance control paths.
 - [ ] Prohibit direct push, force push, branch/tag deletion, and ruleset bypass
-  except a minimal audited emergency role.
+  except the recorded `@TakehiroT` pull-request-only code-owner bypass. The
+  bypass must not skip required checks, history protection, or tag protection.
 - [ ] Inventory GitHub Apps, webhooks, deploy keys, fine-grained tokens,
   collaborators, teams, environments, runners, Pages, and package permissions;
   remove stale, broad, personal, or unexplained access.

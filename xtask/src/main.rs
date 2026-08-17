@@ -3072,7 +3072,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
                 "## Maintainer lifecycle and owner boundary",
                 "The `CODEOWNERS` principals are added only after",
                 "The current owner pair is `@TakehiroT` and",
-                "Authors do not approve their own work.",
+                "Authors do not normally approve their own work.",
                 "Developer Certificate of Origin",
             ],
         ),

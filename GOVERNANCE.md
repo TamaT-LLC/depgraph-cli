@@ -22,11 +22,13 @@ decision and rationale when consensus is not reached. Durable architecture,
 security-boundary, release, or governance changes require an ADR and an
 independent reviewer.
 
-Authors do not approve their own work. Required CI must be green and review
-conversations resolved. Security, workflows, release controls, dependency
-manifests, schemas/migrations, and governance paths require an
+Authors do not normally approve their own work. Required CI must be green and
+review conversations resolved. Security, workflows, release controls,
+dependency manifests, schemas/migrations, and governance paths require an
 organization-assigned reviewer for that domain. Conflicted reviewers disclose
-the conflict and recuse.
+the conflict and recuse. The organization owner grants `@TakehiroT` a
+pull-request-only code-owner bypass for an audited emergency; it does not bypass
+required CI, non-fast-forward/deletion protection, or version-tag protection.
 
 The issue tracker informs the roadmap but does not create a delivery promise.
 Organization-assigned maintainers may prioritize, defer, or decline work based
