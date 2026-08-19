@@ -9,6 +9,7 @@
     "repository",
     "default_branch",
     "rulesets",
+    "environment_policies",
     "surface",
     "security"
   ],
@@ -28,6 +29,14 @@
       "maxItems": 64,
       "items": {
         "$ref": "#/$defs/ruleset"
+      }
+    },
+    "environment_policies": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/environmentPolicy"
       }
     },
     "surface": {
@@ -157,6 +166,80 @@
           "items": {
             "$ref": "#/$defs/principal"
           }
+        }
+      }
+    },
+    "deploymentCustomPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "type": {
+          "enum": [
+            "branch",
+            "tag"
+          ]
+        }
+      }
+    },
+    "deploymentRefPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protected_branches",
+        "custom_branch_policies",
+        "custom_policies"
+      ],
+      "properties": {
+        "protected_branches": {
+          "type": "boolean"
+        },
+        "custom_branch_policies": {
+          "type": "boolean"
+        },
+        "custom_policies": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/deploymentCustomPolicy"
+          }
+        }
+      }
+    },
+    "environmentPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "prevent_self_review",
+        "reviewers",
+        "deployment_ref_policy"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/token"
+        },
+        "prevent_self_review": {
+          "type": "boolean"
+        },
+        "reviewers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/token"
+          }
+        },
+        "deployment_ref_policy": {
+          "$ref": "#/$defs/deploymentRefPolicy"
         }
       }
     },

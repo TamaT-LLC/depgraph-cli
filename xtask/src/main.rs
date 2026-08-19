@@ -1318,6 +1318,7 @@ fn verify_workflow_policy_text(
                 || !prepare.contains("cargo xtask verify-release-assets release-assets")
                 || !prepare.contains("node npm/scripts/build-packages.mjs")
                 || !prepare.contains("--ignore-scripts")
+                || !publish.contains("if: startsWith(github.ref, 'refs/tags/v')")
                 || !publish.contains("    environment: npm\n")
                 || publish.contains("actions/checkout@")
                 || publish.contains("run: cargo")
@@ -1327,7 +1328,7 @@ fn verify_workflow_policy_text(
                 || !publish.contains("needs: prepare")
             {
                 bail!(
-                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, and publish provenance from an environment-protected no-checkout OIDC job"
+                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, and publish provenance from a tag-guarded environment-protected no-checkout OIDC job"
                 );
             }
         }
