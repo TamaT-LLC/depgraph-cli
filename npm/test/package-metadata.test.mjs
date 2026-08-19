@@ -8,6 +8,12 @@ import {
   createPlatformManifest,
   createRootManifest,
 } from "../scripts/build-packages.mjs";
+import {
+  BOOTSTRAP_PACKAGE_NAMES,
+  BOOTSTRAP_TAG,
+  BOOTSTRAP_VERSION,
+  createBootstrapManifest,
+} from "../scripts/build-bootstrap-packages.mjs";
 
 const template = JSON.parse(await readFile(new URL("../depgraph-cli/package.json", import.meta.url), "utf8"));
 
@@ -53,4 +59,36 @@ test("platform package constraints cover the five native release targets exactly
 
 test("release packaging rejects source-version drift", () => {
   assert.throws(() => createRootManifest(template, "9.9.9"), /not synchronized/u);
+});
+
+test("bootstrap packages are inert, non-latest name reservations", () => {
+  assert.deepEqual(BOOTSTRAP_PACKAGE_NAMES, [
+    ...TARGETS.map((target) => target.packageName),
+    ROOT_PACKAGE_NAME,
+  ]);
+  assert.equal(new Set(BOOTSTRAP_PACKAGE_NAMES).size, 6);
+  for (const name of BOOTSTRAP_PACKAGE_NAMES) {
+    const manifest = createBootstrapManifest(name);
+    assert.equal(manifest.name, name);
+    assert.equal(manifest.version, BOOTSTRAP_VERSION);
+    assert.deepEqual(manifest.publishConfig, { access: "public", tag: BOOTSTRAP_TAG });
+    assert.deepEqual(manifest.files, ["README.md", "LICENSE-APACHE", "LICENSE-MIT"]);
+    assert.equal(manifest.license, "MIT OR Apache-2.0");
+    assert.equal(manifest.repository.url, "git+https://github.com/TamaT-LLC/depgraph-cli.git");
+    for (const forbidden of [
+      "private",
+      "bin",
+      "scripts",
+      "dependencies",
+      "optionalDependencies",
+      "peerDependencies",
+      "devDependencies",
+    ]) {
+      assert.equal(manifest[forbidden], undefined);
+    }
+  }
+});
+
+test("bootstrap manifest rejects a name outside the closed package set", () => {
+  assert.throws(() => createBootstrapManifest("depgraph-cli-unknown"), /unknown bootstrap package/u);
 });

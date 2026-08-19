@@ -102,7 +102,24 @@ npmは存在しないpackageへTrusted Publisherを設定できない。
 名前、repository、license、公開範囲はstable packageと一致させる。
 長期tokenやGitHub Actions secretは作成しない。
 
-公開前に`npm pack --dry-run --json`のfile listとpackage metadataを確認する。
+次の生成器は既存の出力directoryを上書きせず、6つのpackageとSHA-256付き
+inventoryを作成する。
+
+```sh
+node npm/scripts/build-bootstrap-packages.mjs --output npm-bootstrap
+jq . npm-bootstrap/npm-bootstrap-set.json
+```
+
+公開前にinventory、各tarballのfile list、package metadataを確認する。
+inventory順に`bootstrap` tagへ公開し、root packageは最後にする。
+
+```sh
+npx --yes npm@11.15.0 publish \
+  ./npm-bootstrap/PACKAGE_TARBALL \
+  --access public \
+  --tag bootstrap
+```
+
 公開後は次の値を6 packageすべてで確認する。
 
 ```sh
