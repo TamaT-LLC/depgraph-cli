@@ -14,7 +14,7 @@ pub const GITHUB_SETTINGS_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
 pub const GITHUB_SETTINGS_VERIFIER_NAME: &str = "depgraph-github-settings-verifier";
 pub const GITHUB_SETTINGS_VERIFIER_VERSION: &str = "1.0.0";
 pub const GITHUB_SETTINGS_DESIRED_DIGEST: &str =
-    "e907ec911e3867e2716c812adbd751f2fa61851aeff536d0b5aa8cbf081a58ae";
+    "ad5080e91289a35d7088506523a1bfb497652eb55aaf21b27f25f0b9a3661fc4";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
