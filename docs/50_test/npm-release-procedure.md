@@ -96,7 +96,6 @@ npm install \
 npmは存在しないpackageへTrusted Publisherを設定できない。
 初回だけ、2FAを有効にしたowner accountで6 packageの
 `0.0.0-bootstrap.0`を`bootstrap` dist-tagへ対話的に公開する。
-このversionを`latest`へ付けない。
 各bootstrap packageに含めるのは`package.json`、`README.md`、2種類のlicenseだけ
 とし、`bin`、`scripts`、`dependencies`、`optionalDependencies`は定義しない。
 名前、repository、license、公開範囲はstable packageと一致させる。
@@ -127,6 +126,21 @@ npm view PACKAGE_NAME@0.0.0-bootstrap.0 \
   name version dist-tags repository.url --json
 ```
 
+npm registryは`--tag bootstrap`を指定しても、初回versionだけのpackageへ
+`latest`を追加する場合がある。
+この状態で`latest`の削除が拒否された場合、versionをunpublishしない。
+代わりにexact bootstrap versionを直ちにdeprecateする。
+
+```sh
+npx --yes npm@11.15.0 deprecate \
+  'PACKAGE_NAME@0.0.0-bootstrap.0' \
+  'Bootstrap placeholder only; install a supported stable version after it is published.'
+```
+
+最初のsupported stable versionをOIDCで公開するとき、workflowの`latest`指定が
+bootstrap versionからstable versionへtagを移す。
+5つのnative packageがすべて存在するまでroot packageを公開しない。
+
 初回公開直後、npm CLI 11.15.0以降で各packageへ同じtrustを設定する。
 
 ```sh
@@ -144,6 +158,12 @@ workflow、environment、permissionを確認する。
 同じ作業時間内に、通常の公開フローから最初のsupported stable versionをOIDCで
 公開する。
 これにより、利用者が導入する最初のstable versionにもnpm provenanceが付く。
+
+新規packageが`Package name triggered spam detection`で拒否された場合、別名や
+metadata変更による回避を試みない。
+成功済みpackageのintegrityを照合し、bootstrap versionをdeprecateしてTrusted
+Publisherを設定したうえで、未作成package名をnpm Supportへ解除依頼する。
+5つのnative packageが揃うまでroot packageは未公開のまま維持する。
 
 ## 失敗時
 

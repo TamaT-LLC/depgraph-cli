@@ -101,10 +101,11 @@ packages before the root CLI package, and requires npm provenance. No npm token
 or environment secret is available. The npm Trusted Publisher subject must
 bind `TamaT-LLC/depgraph-cli`, `npm-release.yml`, and environment `npm` with
 publish-only permission. Each name is reserved interactively with an inert,
-non-`latest` bootstrap version and an npm account protected by 2FA because npm
-cannot configure trust before a package exists. After trust is configured,
-traditional token publication is disabled and the first supported stable
-version is published through OIDC.
+deprecated bootstrap version and an npm account protected by 2FA because npm
+cannot configure trust before a package exists.
+The root name is reserved only after all native names exist.
+After trust is configured, traditional token publication is disabled and the
+first supported stable version replaces the bootstrap `latest` through OIDC.
 
 ## Third-party Action review and update
 

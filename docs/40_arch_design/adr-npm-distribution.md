@@ -77,9 +77,14 @@ No `NPM_TOKEN` or `NODE_AUTH_TOKEN` secret is stored.
 
 npm requires a package to exist before a Trusted Publisher can be configured.
 The six names therefore receive an inert `0.0.0-bootstrap.0` version under the
-non-`latest` `bootstrap` dist-tag through one interactive, 2FA-protected
-publication before the first supported npm release.
+`bootstrap` dist-tag through one interactive, 2FA-protected publication before
+the first supported npm release.
 Bootstrap packages contain no executable, dependency, or lifecycle script.
+The npm registry may also point `latest` at the only published version even
+when the publish requested another tag.
+The bootstrap version is therefore deprecated immediately, and the first
+supported stable publication replaces `latest` through OIDC.
+The root package is not bootstrapped until all five platform names exist.
 Immediately afterward, each package is bound to repository
 `TamaT-LLC/depgraph-cli`, workflow `npm-release.yml`, environment `npm`, and
 publish-only permission; traditional token publication is then disabled and
