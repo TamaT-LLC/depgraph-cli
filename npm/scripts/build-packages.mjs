@@ -182,6 +182,13 @@ export function createRootManifest(template, version) {
   return manifest;
 }
 
+export function validateReleaseManifestDigest(actualDigest, expectedDigest, archiveName) {
+  if (!SHA256_PATTERN.test(actualDigest) || actualDigest !== expectedDigest) {
+    throw new Error(`${archiveName} release manifest differs from release-verification.json`);
+  }
+  return actualDigest;
+}
+
 function platformReadme(target) {
   return `# ${target.packageName}\n\n` +
     `Native depgraph release package for \`${target.target}\`. This package is selected by ` +
@@ -288,8 +295,14 @@ async function preparePlatformPackage({ target, version, releaseAssets, verifica
   const releaseRoot = path.join(extraction, expectedRootName);
   await assertRegularDirectory(releaseRoot, "extracted release root");
   await rejectSymlinks(releaseRoot);
-  const releaseManifest = await readJson(path.join(releaseRoot, "release-manifest.json"), "release manifest");
+  const releaseManifestPath = path.join(releaseRoot, "release-manifest.json");
+  const releaseManifest = await readJson(releaseManifestPath, "release manifest");
   validateReleaseManifest(releaseManifest, target, version);
+  const releaseManifestDigest = validateReleaseManifestDigest(
+    await sha256(releaseManifestPath),
+    verificationTarget.release_manifest_sha256,
+    archiveName,
+  );
 
   const staging = path.join(stagingRoot, "packages", target.packageName);
   await cp(releaseRoot, staging, { recursive: true, force: false, errorOnExist: true });
@@ -301,7 +314,7 @@ async function preparePlatformPackage({ target, version, releaseAssets, verifica
     target: target.target,
     source_archive: archiveName,
     source_archive_sha256: archiveDigest,
-    release_manifest_sha256: verificationTarget.release_manifest_sha256,
+    release_manifest_sha256: releaseManifestDigest,
   };
 }
 

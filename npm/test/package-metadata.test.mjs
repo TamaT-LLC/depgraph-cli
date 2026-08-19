@@ -7,6 +7,7 @@ import {
   TARGETS,
   createPlatformManifest,
   createRootManifest,
+  validateReleaseManifestDigest,
 } from "../scripts/build-packages.mjs";
 import {
   BOOTSTRAP_PACKAGE_NAMES,
@@ -59,6 +60,18 @@ test("platform package constraints cover the five native release targets exactly
 
 test("release packaging rejects source-version drift", () => {
   assert.throws(() => createRootManifest(template, "9.9.9"), /not synchronized/u);
+});
+
+test("release packaging rejects release manifest digest drift", () => {
+  const verifiedDigest = "a".repeat(64);
+  assert.equal(
+    validateReleaseManifestDigest(verifiedDigest, verifiedDigest, "depgraph.tar.gz"),
+    verifiedDigest,
+  );
+  assert.throws(
+    () => validateReleaseManifestDigest("b".repeat(64), verifiedDigest, "depgraph.tar.gz"),
+    /release manifest differs from release-verification\.json/u,
+  );
 });
 
 test("bootstrap packages are inert, non-latest name reservations", () => {

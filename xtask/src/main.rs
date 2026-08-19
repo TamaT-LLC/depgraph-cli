@@ -1804,6 +1804,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         || npm_package["publishConfig"]["access"] != "public"
         || npm_package["publishConfig"]["provenance"] != true
         || npm_package["bin"]["depgraph"] != "bin/depgraph.js"
+        || npm_package["bin"]["depgraph-cli"] != "bin/depgraph.js"
         || npm_package["bin"]["depgraph-mcp"] != "bin/depgraph-mcp.js"
         || !npm_package["scripts"].is_null()
     {

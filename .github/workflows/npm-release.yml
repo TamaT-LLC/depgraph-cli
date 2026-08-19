@@ -104,6 +104,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
@@ -146,6 +147,8 @@ jobs:
             --output npm-dist
       - name: Install the tarballs without lifecycle scripts and run the packaged Linux CLI
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.release_version }}
         run: |
           set -euo pipefail
           inventory=npm-dist/npm-package-set.json
@@ -164,7 +167,7 @@ jobs:
             --package-lock=false \
             "${GITHUB_WORKSPACE}/npm-dist/${native}" \
             "${GITHUB_WORKSPACE}/npm-dist/${meta}"
-          test "$("${smoke}/node_modules/.bin/depgraph" --version)" = "depgraph ${{ steps.release.outputs.release_version }}"
+          test "$("${smoke}/node_modules/.bin/depgraph" --version)" = "depgraph ${RELEASE_VERSION}"
           "${smoke}/node_modules/.bin/depgraph-mcp" --version
           "${smoke}/node_modules/.bin/depgraph" \
             --store "${smoke}/store.sqlite" \
