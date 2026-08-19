@@ -83,10 +83,29 @@ assets with the closed 51-asset evidence inventory, and runs the published
 Linux binary with canonical absolute inputs. It cannot upload or replace an
 asset, move a tag, change a check conclusion, or delete a run.
 
-No current workflow requests `id-token: write` or an environment secret. If
-OIDC or GitHub Environments are added, the policy must first bind the exact
-workflow, protected tag, repository, audience, environment reviewers, and
-subject claim, and must add negative fork and replay tests.
+The npm release workflow is manually dispatched against the exact stable tag
+after the `Release` workflow succeeds.
+Its `prepare` job has `actions: read` and `contents: read`, validates the tag
+ref, exact `main` commit, signed annotated stable tag, public GitHub Release,
+post-publish evidence, and the successful Release run named by that evidence
+before checking out the attested commit.
+It re-verifies the five public native archives, generates six script-free npm
+tarballs, and installs the Linux pair with lifecycle scripts disabled.
+This job has no OIDC permission.
+
+Only the npm publisher receives job-scoped `id-token: write` through the
+GitHub Environment named `npm`. The OIDC-capable npm job performs no checkout
+and executes no repository script. It downloads only the same-run package-set
+artifact, rechecks every tarball digest and manifest, publishes the five native
+packages before the root CLI package, and requires npm provenance. No npm token
+or environment secret is available. The npm Trusted Publisher subject must
+bind `TamaT-LLC/depgraph-cli`, `npm-release.yml`, and environment `npm` with
+publish-only permission. Each name is reserved interactively with an inert,
+deprecated bootstrap version and an npm account protected by 2FA because npm
+cannot configure trust before a package exists.
+The root name is reserved only after all native names exist.
+After trust is configured, traditional token publication is disabled and the
+first supported stable version replaces the bootstrap `latest` through OIDC.
 
 ## Third-party Action review and update
 
@@ -116,7 +135,8 @@ To update an Action:
 | Mutable Action tag is retargeted | exact allowlisted full SHA and CI verifier |
 | Cache or artifact is poisoned | never an authorization signal; release closure re-verifies exact digests |
 | Runner image is compromised or persists data | ephemeral hosted runners, bounded credentials, no cross-job secret handoff |
-| OIDC token is replayed | OIDC disabled until exact claims and environment review are implemented |
+| OIDC token is replayed | exact repository/workflow/environment Trusted Publisher subject, short-lived token, protected stable source, and no-checkout publish job |
+| npm workflow is dispatched against an untrusted ref | only an exact stable tag equal to `main`, a signed tag object, closed post-publish evidence, and its successful Release run pass before checkout; OIDC is isolated in a second job that executes no repository code |
 | Release tag points at another commit | immutable stable source guard cancels the run and removes the tag |
 | `workflow_run` executes attacker code with write token | guard consumes metadata only and performs no checkout or repository execution |
 | Post-publish recovery rewrites release history | no inputs or write scopes; exact immutable run/tag/evidence binding and published-binary canary only |

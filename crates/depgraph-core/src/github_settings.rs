@@ -14,7 +14,7 @@ pub const GITHUB_SETTINGS_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
 pub const GITHUB_SETTINGS_VERIFIER_NAME: &str = "depgraph-github-settings-verifier";
 pub const GITHUB_SETTINGS_VERIFIER_VERSION: &str = "1.0.0";
 pub const GITHUB_SETTINGS_DESIRED_DIGEST: &str =
-    "e907ec911e3867e2716c812adbd751f2fa61851aeff536d0b5aa8cbf081a58ae";
+    "df441e087e5799ddb5f9f1377b412fb318a5ade274b7583e24e6225bce99e977";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +61,38 @@ pub struct GitHubRuleset {
     pub bypass_actors: Vec<GitHubRedactedPrincipal>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubDeploymentRefType {
+    Branch,
+    Tag,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubDeploymentCustomPolicy {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ref_type: GitHubDeploymentRefType,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubDeploymentRefPolicy {
+    pub protected_branches: bool,
+    pub custom_branch_policies: bool,
+    pub custom_policies: Vec<GitHubDeploymentCustomPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubEnvironmentPolicy {
+    pub name: String,
+    pub prevent_self_review: bool,
+    pub reviewers: Vec<String>,
+    pub deployment_ref_policy: GitHubDeploymentRefPolicy,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubRedactedSurface {
@@ -93,6 +125,7 @@ pub struct GitHubSettingsState {
     pub repository: String,
     pub default_branch: String,
     pub rulesets: Vec<GitHubRuleset>,
+    pub environment_policies: Vec<GitHubEnvironmentPolicy>,
     pub surface: GitHubRedactedSurface,
     pub security: GitHubSecuritySettings,
 }
@@ -341,8 +374,78 @@ fn compare_settings(
             )?);
         }
     }
+    compare_environment_policies(
+        &desired.environment_policies,
+        &observed.environment_policies,
+        drift,
+    )?;
     compare_surface(&desired.surface, &observed.surface, drift)?;
     compare_security(&desired.security, &observed.security, drift)?;
+    Ok(())
+}
+
+fn compare_environment_policies(
+    expected: &[GitHubEnvironmentPolicy],
+    actual: &[GitHubEnvironmentPolicy],
+    drift: &mut Vec<GitHubSettingsDrift>,
+) -> Result<()> {
+    let expected_by_name = expected
+        .iter()
+        .map(|policy| (policy.name.as_str(), policy))
+        .collect::<BTreeMap<_, _>>();
+    let actual_by_name = actual
+        .iter()
+        .map(|policy| (policy.name.as_str(), policy))
+        .collect::<BTreeMap<_, _>>();
+    for (name, expected_policy) in &expected_by_name {
+        let path = format!("environment_policies/{name}");
+        let Some(actual_policy) = actual_by_name.get(name) else {
+            drift.push(drift_entry(
+                &path,
+                GitHubSettingsDriftReason::MissingSetting,
+                Some(*expected_policy),
+                Option::<&GitHubEnvironmentPolicy>::None,
+            )?);
+            continue;
+        };
+        for (setting, expected_digest, actual_digest) in [
+            (
+                "prevent_self_review",
+                canonical_public_readiness_digest(&expected_policy.prevent_self_review)?,
+                canonical_public_readiness_digest(&actual_policy.prevent_self_review)?,
+            ),
+            (
+                "reviewers",
+                canonical_public_readiness_digest(&expected_policy.reviewers)?,
+                canonical_public_readiness_digest(&actual_policy.reviewers)?,
+            ),
+            (
+                "deployment_ref_policy",
+                canonical_public_readiness_digest(&expected_policy.deployment_ref_policy)?,
+                canonical_public_readiness_digest(&actual_policy.deployment_ref_policy)?,
+            ),
+        ] {
+            if expected_digest != actual_digest {
+                drift.push(GitHubSettingsDrift {
+                    path: format!("{path}/{setting}"),
+                    reason: GitHubSettingsDriftReason::SettingMismatch,
+                    expected_digest: Some(expected_digest),
+                    actual_digest: Some(actual_digest),
+                });
+            }
+        }
+    }
+    for (name, actual_policy) in &actual_by_name {
+        if !expected_by_name.contains_key(name) {
+            let identity_digest = canonical_public_readiness_digest(name)?;
+            drift.push(drift_entry(
+                &format!("environment_policies/unexpected/{identity_digest}"),
+                GitHubSettingsDriftReason::UnexpectedSetting,
+                Option::<&GitHubEnvironmentPolicy>::None,
+                Some(*actual_policy),
+            )?);
+        }
+    }
     Ok(())
 }
 
@@ -519,6 +622,16 @@ fn canonical_github_settings_state(mut state: GitHubSettingsState) -> Result<Git
         bail!("GitHub rulesets must have unique target/name identities");
     }
     canonicalize_surface(&mut state.surface)?;
+    canonicalize_environment_policies(&mut state.environment_policies)?;
+    if state.environment_policies.iter().any(|policy| {
+        !state
+            .surface
+            .environments
+            .iter()
+            .any(|environment| environment == &policy.name)
+    }) {
+        bail!("GitHub environment policies must reference inventoried environments");
+    }
     Ok(state)
 }
 
@@ -526,9 +639,55 @@ fn validate_desired_identity(state: &GitHubSettingsState) -> Result<()> {
     if state.repository != GITHUB_SETTINGS_REPOSITORY
         || state.default_branch != "main"
         || state.rulesets.is_empty()
+        || state.environment_policies.is_empty()
         || canonical_public_readiness_digest(state)? != GITHUB_SETTINGS_DESIRED_DIGEST
     {
         bail!("GitHub desired settings must match the build-pinned repository settings manifest");
+    }
+    Ok(())
+}
+
+fn canonicalize_environment_policies(
+    environment_policies: &mut [GitHubEnvironmentPolicy],
+) -> Result<()> {
+    if environment_policies.len() > 128 {
+        bail!("GitHub environment policy inventory exceeds its bound");
+    }
+    for policy in environment_policies.iter_mut() {
+        if !valid_token(&policy.name) || policy.reviewers.is_empty() || policy.reviewers.len() > 6 {
+            bail!("GitHub environment reviewer policy is malformed or exceeds its bound");
+        }
+        sort_unique_strings(&mut policy.reviewers, false)?;
+        let deployment = &mut policy.deployment_ref_policy;
+        if deployment.protected_branches == deployment.custom_branch_policies
+            || deployment.custom_policies.len() > 128
+            || (!deployment.custom_branch_policies && !deployment.custom_policies.is_empty())
+        {
+            bail!("GitHub environment deployment ref policy is inconsistent or exceeds its bound");
+        }
+        deployment.custom_policies.sort_by(|left, right| {
+            left.ref_type
+                .cmp(&right.ref_type)
+                .then(left.name.cmp(&right.name))
+        });
+        if deployment
+            .custom_policies
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+            || deployment
+                .custom_policies
+                .iter()
+                .any(|custom| !valid_deployment_ref_pattern(&custom.name))
+        {
+            bail!("GitHub environment custom deployment ref policies are malformed or duplicate");
+        }
+    }
+    environment_policies.sort_by(|left, right| left.name.cmp(&right.name));
+    if environment_policies
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        bail!("GitHub environment policies must have unique names");
     }
     Ok(())
 }
@@ -624,6 +783,14 @@ fn valid_ref_pattern(value: &str, target: GitHubRulesetTarget) -> bool {
         && !value.contains('\0')
 }
 
+fn valid_deployment_ref_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains("..")
+        && !value.contains('\\')
+        && !value.contains('\0')
+}
+
 fn valid_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -680,6 +847,12 @@ mod tests {
         reordered.rulesets.reverse();
         reordered.surface.teams.reverse();
         reordered.rulesets[0].include.reverse();
+        reordered.environment_policies.reverse();
+        reordered.environment_policies[0].reviewers.reverse();
+        reordered.environment_policies[0]
+            .deployment_ref_policy
+            .custom_policies
+            .reverse();
         let evaluation = evaluate_github_settings(
             &expected,
             &GitHubSettingsApiSnapshot {
@@ -811,6 +984,35 @@ mod tests {
                 .count(),
             expected.rulesets.len()
         );
+    }
+
+    #[test]
+    fn environment_reviewer_and_deployment_ref_policy_drift_rejects() {
+        let expected = desired();
+        let mut actual = expected.clone();
+        let npm = actual
+            .environment_policies
+            .iter_mut()
+            .find(|policy| policy.name == "npm")
+            .unwrap();
+        npm.prevent_self_review = false;
+        npm.reviewers.pop();
+        npm.deployment_ref_policy.custom_policies[0].name = "release-*".into();
+        let evaluation = evaluate_github_settings(
+            &expected,
+            &GitHubSettingsApiSnapshot {
+                collection_status: GitHubSettingsCollectionStatus::Complete,
+                settings: Some(actual),
+            },
+        )
+        .unwrap();
+        assert_eq!(evaluation.decision, PublicReadinessDecision::Reject);
+        for setting in ["prevent_self_review", "reviewers", "deployment_ref_policy"] {
+            assert!(evaluation.drift.iter().any(|drift| {
+                drift.path == format!("environment_policies/npm/{setting}")
+                    && drift.reason == GitHubSettingsDriftReason::SettingMismatch
+            }));
+        }
     }
 
     #[test]

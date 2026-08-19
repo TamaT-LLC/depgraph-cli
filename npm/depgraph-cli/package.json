@@ -1,0 +1,45 @@
+{
+  "name": "depgraph-cli",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Explainable dependency graph CLI for Rust, Go, TypeScript, and JavaScript",
+  "type": "module",
+  "bin": {
+    "depgraph": "bin/depgraph.js",
+    "depgraph-cli": "bin/depgraph.js",
+    "depgraph-mcp": "bin/depgraph-mcp.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "dependency-graph",
+    "static-analysis",
+    "rust",
+    "golang",
+    "typescript",
+    "javascript",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TamaT-LLC/depgraph-cli.git"
+  },
+  "homepage": "https://github.com/TamaT-LLC/depgraph-cli#readme",
+  "bugs": {
+    "url": "https://github.com/TamaT-LLC/depgraph-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "preferGlobal": true
+}

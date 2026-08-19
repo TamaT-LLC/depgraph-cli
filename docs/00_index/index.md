@@ -16,10 +16,12 @@
 | PROJ-ARC-001-ADR-005 | PROJ-ARC-001 | [Bounded read-only graph query language](../40_arch_design/adr-bounded-graph-query-language.md) | Accepted |
 | PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |
 | PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |
+| PROJ-ARC-001-ADR-008 | PROJ-ARC-001 | [npm distribution for the native CLI](../40_arch_design/adr-npm-distribution.md) | Accepted |
 
 ## 運用手順
 
 - [GitHub Actionsを使ったリリース手順](../50_test/release-procedure.md)
+- [npmリリース手順](../50_test/npm-release-procedure.md)
 - [MCP Agent host operations](../50_test/mcp-agent-host-operations.md)
 - [Packaged MCP Agent dogfood benchmark](../50_test/agent-dogfood-benchmark.md)
 
@@ -54,6 +56,7 @@
 
 ## 更新履歴
 
+- 2026-08-19: `PROJ-ARC-001-ADR-008` とnpmリリース手順を追加
 - 2026-08-16: verified packageからAgent host設定を生成・接続検証するonboarding契約を追加
 - 2026-08-16: packaged MCP Agent dogfood benchmarkの再実行手順と固定evidenceを追加
 - 2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加

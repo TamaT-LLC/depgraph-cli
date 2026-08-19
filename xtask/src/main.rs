@@ -1118,7 +1118,8 @@ fn verify_github_actions_security(root: &Path) -> Result<()> {
         "The stable source guard handles `workflow_run` metadata without checking out",
         "The v0.5.0 post-publish recovery workflow is an incident-specific read-only",
         "It cannot upload or replace an\nasset, move a tag, change a check conclusion, or delete a run.",
-        "No current workflow requests `id-token: write`",
+        "Only the npm publisher receives job-scoped `id-token: write`",
+        "The OIDC-capable npm job performs no checkout\nand executes no repository script.",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
         "`.github/actions-policy.json` is the canonical allowlist",
         "A mutable tag or branch is never a temporary fallback.",
@@ -1156,7 +1157,6 @@ fn verify_workflow_policy_text(
     if workflow.contains("pull_request_target")
         || contains_yaml_hex_escape(workflow)
         || write_permissions.contains(&"write-all")
-        || write_permissions.contains(&"id-token")
         || has_noncanonical_permissions_declaration(workflow)
     {
         bail!("{name} enables a forbidden trigger or broad credential");
@@ -1293,6 +1293,42 @@ fn verify_workflow_policy_text(
             {
                 bail!(
                     "release post-publish recovery must remain input-free, main-checked, read-only, pinned to Node.js 24.18.0, and pinned to its reviewed verifier"
+                );
+            }
+        }
+        "npm-release.yml" => {
+            let prepare = workflow_job_block(workflow, "prepare")?;
+            let prepare_permissions = job_permissions(prepare)?;
+            let publish = workflow_job_block(workflow, "publish")?;
+            let publish_permissions = job_permissions(publish)?;
+            if top_level_trigger_keys(workflow)? != ["workflow_dispatch"]
+                || !workflow.contains("\n  workflow_dispatch:\n")
+                || !top_permissions.is_empty()
+                || write_permissions != ["id-token"]
+                || prepare_permissions != ["actions: read", "contents: read"]
+                || publish_permissions != ["id-token: write"]
+                || contains_expression_context(workflow, "secrets")
+                || workflow.contains("NODE_AUTH_TOKEN")
+                || workflow.contains("NPM_TOKEN")
+                || workflow.matches("actions/checkout@").count() != 1
+                || !prepare.contains("ref: ${{ github.sha }}")
+                || !prepare.contains("test \"$RELEASE_REF\" = \"refs/tags/${RELEASE_TAG}\"")
+                || !prepare.contains(".schema_version == \"release-post-publish-evidence-v1\"")
+                || !prepare.contains(".conclusion == \"success\"")
+                || !prepare.contains("cargo xtask verify-release-assets release-assets")
+                || !prepare.contains("node npm/scripts/build-packages.mjs")
+                || !prepare.contains("--ignore-scripts")
+                || !publish.contains("if: startsWith(github.ref, 'refs/tags/v')")
+                || !publish.contains("    environment: npm\n")
+                || publish.contains("actions/checkout@")
+                || publish.contains("run: cargo")
+                || publish.contains("npm/scripts/")
+                || publish.matches("npm publish").count() != 1
+                || !publish.contains("--provenance")
+                || !publish.contains("needs: prepare")
+            {
+                bail!(
+                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, and publish provenance from a tag-guarded environment-protected no-checkout OIDC job"
                 );
             }
         }
@@ -1738,6 +1774,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let agent_dogfood_path = "docs/50_test/agent-dogfood-benchmark.md";
     let agent_dogfood = read_lf_normalized_text(&root.join(agent_dogfood_path))?;
     verify_local_markdown_links(root, agent_dogfood_path, &agent_dogfood)?;
+    let npm_release_path = "docs/50_test/npm-release-procedure.md";
+    let npm_release = read_lf_normalized_text(&root.join(npm_release_path))?;
+    verify_local_markdown_links(root, npm_release_path, &npm_release)?;
     let cargo_manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     if !cargo_manifest
         .lines()
@@ -1753,6 +1792,23 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         || web_package["engines"]["node"] != ">=24.0.0"
     {
         bail!("Web package version/runtime metadata is not synchronized with release {VERSION}");
+    }
+    let npm_package: Value =
+        serde_json::from_slice(&fs::read(root.join("npm/depgraph-cli/package.json"))?)?;
+    if npm_package["name"] != "depgraph-cli"
+        || npm_package["version"] != VERSION
+        || npm_package["private"] != true
+        || npm_package["engines"]["node"] != ">=24.0.0"
+        || npm_package["license"] != PROJECT_LICENSE_EXPRESSION
+        || npm_package["repository"]["url"] != "git+https://github.com/TamaT-LLC/depgraph-cli.git"
+        || npm_package["publishConfig"]["access"] != "public"
+        || npm_package["publishConfig"]["provenance"] != true
+        || npm_package["bin"]["depgraph"] != "bin/depgraph.js"
+        || npm_package["bin"]["depgraph-cli"] != "bin/depgraph.js"
+        || npm_package["bin"]["depgraph-mcp"] != "bin/depgraph-mcp.js"
+        || !npm_package["scripts"].is_null()
+    {
+        bail!("npm CLI template metadata is not synchronized with release {VERSION}");
     }
 
     let go_model = fs::read_to_string(root.join("workers/go/internal/worker/model.go"))?;
@@ -2784,7 +2840,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
         "needs: [rust, go, web]",
-        "node --test scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs",
+        "node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs",
         "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs",
         "scripts/benchmark-mvp.sh",
         "benchmark-report-${{ github.sha }}",
@@ -3253,6 +3309,8 @@ fn test() -> Result<()> {
     run(Command::new("cargo").args(["test", "--workspace", "--locked"]))?;
     run(Command::new("node").args([
         "--test",
+        "npm/test/launcher.test.mjs",
+        "npm/test/package-metadata.test.mjs",
         "scripts/tests/benchmark.test.mjs",
         "scripts/tests/cache-hit-benchmark.test.mjs",
         "scripts/tests/agent-dogfood.test.mjs",
@@ -15126,6 +15184,7 @@ mod tests {
 
         for workflow_name in [
             "ci.yml",
+            "npm-release.yml",
             "release-post-publish-recovery.yml",
             "release.yml",
             "stable-release-source-guard.yml",
@@ -15436,6 +15495,35 @@ jobs:
                 verify_workflow_policy_text(
                     "release.yml",
                     &linker_policy_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
+
+        let npm_release = fs::read_to_string(root.join(".github/workflows/npm-release.yml"))?;
+        for drifted_npm_release in [
+            npm_release.replacen("      actions: read\n", "", 1),
+            npm_release.replacen("      id-token: write", "      contents: write", 1),
+            npm_release.replacen("    environment: npm", "    environment: unreviewed", 1),
+            npm_release.replacen(
+                "          ref: ${{ github.sha }}",
+                "          ref: main",
+                1,
+            ),
+            npm_release.replacen(
+                "      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+                "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+                1,
+            ),
+            npm_release.replacen(" --provenance", "", 1),
+            format!("{npm_release}\n# ${{{{ secrets.NPM_TOKEN }}}}\n"),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "npm-release.yml",
+                    &drifted_npm_release,
                     &pins,
                     &mut BTreeSet::new(),
                 )
