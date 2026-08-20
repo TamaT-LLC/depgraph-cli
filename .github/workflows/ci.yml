@@ -692,8 +692,8 @@ jobs:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
 
-  # Temporary branch-only probe used to refresh the five native package-smoke
-  # identities for v0.5.1. Remove after the workflow-dispatch logs are captured.
+  # Temporary branch-only probe used to refresh the Intel macOS native
+  # package-smoke identity for v0.5.1. Remove after the log is captured.
   native-smoke-probe:
     if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 90
@@ -701,20 +701,8 @@ jobs:
       fail-fast: ${{ false }}
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            rustflags: "-C linker-features=-lld"
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            rustflags: ""
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            rustflags: ""
-          - os: macos-15
-            target: aarch64-apple-darwin
-            rustflags: ""
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
             rustflags: ""
     runs-on: ${{ matrix.os }}
     env:
@@ -727,13 +715,13 @@ jobs:
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          version: 10.33.0
-          standalone: true
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.0
+          standalone: false
       - name: Capture native package-smoke identity
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}

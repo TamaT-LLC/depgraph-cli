@@ -161,19 +161,19 @@ struct TargetNativeSmokeExpectation {
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:cae06d8db032d85c7062998a7d06676a09dff1ee9948245596389ee9b741b364",
-        query_result_digest: "bounded-query-result:sha256:ba0505b32283b127764b8b2b826dc05211c61cd498838ef9d4d90842ac279247",
-        query_output_sha256: "db91cbfb34e790175c1677b15a1b88722bd21488a443bf64fa30d09c08f88f93",
-        profile_plan_digest: "profile-selection-plan:sha256:27c862f2305386cac9ab65aef94e61c0be53cf57744f350e1ada1076cd5a361f",
-        profile_plan_output_sha256: "8ffa2c3ba5b3eec35bb6cbf21d0ed51885254eda32ddab5b642df3ecc1ad8f4a",
+        query_plan_digest: "bounded-query-plan:sha256:976a53fcdaa907e6f071db9ab30b5eca793038a0aa3a4660833b14a954b47d15",
+        query_result_digest: "bounded-query-result:sha256:b3703d5891d0daca25697c7ea6785842ffee79fb33e0dc70b6f6f6acb09f4bb0",
+        query_output_sha256: "237175dd2f952f4d434e1fc15aa115f53cc331957c55f4ae547ba3fc2d1be024",
+        profile_plan_digest: "profile-selection-plan:sha256:8ce04768f76deb91d496b690904afc03810fea5cf8c179fca771898a27632cac",
+        profile_plan_output_sha256: "d9f6d418f1055229481feb7fae47d4f3c2701b588c9021ff67bcfbef7b071b89",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:9fc87029cd412ab7eac77700feddc7ff623eddc6adc506c6b93729d783bb85ff",
-        query_result_digest: "bounded-query-result:sha256:06b24d5c6b1ba2c4528eb710468ce8c71c56fdde30fd65d1c584057635c730d1",
-        query_output_sha256: "ad5f3e4e377fed2e3edf0dea248fabd0af0c0dadf9210ceb41a7233aa99f4abd",
-        profile_plan_digest: "profile-selection-plan:sha256:363b492f375b041073b317ff0579589545b5ebca37aaef9f8b933de96edd2958",
-        profile_plan_output_sha256: "50d5fe0f605efac9a7b9ca7a9d6b6bff9727b20dbc8a75727456328a0fd49211",
+        query_plan_digest: "bounded-query-plan:sha256:3ee98b87d313261696a2d82996655db87e9aea4d23ec39f6c8adaee0df1c937f",
+        query_result_digest: "bounded-query-result:sha256:63399d948594f5c3e83600d1482afd260f135001ce6ababfa5471e998a5c26ca",
+        query_output_sha256: "04aa0624ba0483498e12ae1527e3a4dde749c674d78dd6f50cd802b3633f0adf",
+        profile_plan_digest: "profile-selection-plan:sha256:ad10a32c4a225fe78b4568302c62938d7c98e1a4b958004f6dc9cfbf675ad75a",
+        profile_plan_output_sha256: "f1d7b5163df1e0269df0f742235c3e033f5de6c0def1bae3d90a7b29cf039143",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
@@ -185,19 +185,19 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:5cf0533d47220d99cf033cf879aa7bf1b142330567962bbf75b9245f82dfbfa5",
-        query_result_digest: "bounded-query-result:sha256:456cabca0c093cb59ef670407f969ec677102870e4661f306a46b03bc89eb6f8",
-        query_output_sha256: "c2ddbfc2348604051d7f61497fcef2cd6c5114ce7e2cce575560fcb7d03e1332",
-        profile_plan_digest: "profile-selection-plan:sha256:b8e63fb7da635639c6e5c0d4c7aa844f0f5afe167923420f543f74a3fc8deb5e",
-        profile_plan_output_sha256: "1072395911f92adaad1007a11ea53f81bfbcd3a105179d9526ed87136efdae62",
+        query_plan_digest: "bounded-query-plan:sha256:241388ae145cfd537fe8c15dfd20b5de53a08d7bec2b1a31921bc998b4c3d2eb",
+        query_result_digest: "bounded-query-result:sha256:a3269fc2469eb8a94c43b596a04f7a96f3b3fb88d1da3601585d57058c4d289a",
+        query_output_sha256: "f1fe3ae9bb1fd434b54bb43e6ac24eb7fc1b05382fc893bb3199ce55fe5f3e17",
+        profile_plan_digest: "profile-selection-plan:sha256:49b1ea87f9fd84ceca76fcaca67c7c067fee7b343f180a529d4f322666022fbf",
+        profile_plan_output_sha256: "4abd66bd051e4127b667bf72c76ec7e1211df5c96a7dedb587a760323bd85998",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:8eb0e0fdd1c0cae9453abe718d73db94e8f4132fe868334c8c7bcb0462d4e8b1",
-        query_result_digest: "bounded-query-result:sha256:42ec882b59a1f2284016e531f73efc9d49c59259d9fd524d8466590f0e580675",
-        query_output_sha256: "5740ea2b649989babe370c3f03cc7166f17f65dc226810f133ad99eaf35187bb",
-        profile_plan_digest: "profile-selection-plan:sha256:aabac99b77622684b20f0d6343c20e14136ce8c5282b5e50e333d61341d9be3b",
-        profile_plan_output_sha256: "4ad1e71b0bac7c5bc8c06697c379be1f98712c17a549eb3a7fe98591429496ab",
+        query_plan_digest: "bounded-query-plan:sha256:88136fe9c2e827d9381df06f4396c2287548f1673add358933e6c680c89ced33",
+        query_result_digest: "bounded-query-result:sha256:f292577ed31703e3c1ebcc065cbfa755515dd6c914b64af23301ed58431e8751",
+        query_output_sha256: "07703994d4f8d7d2c5aaf2f21d399bc1888369ae365e0e447277cf33851dfced",
+        profile_plan_digest: "profile-selection-plan:sha256:76304bae24b9fbc86137b6a7c57c8006383646e15931f15a587f794f69168d71",
+        profile_plan_output_sha256: "41eecfd06f70f469e0f98a4d5fe1e44e799604a37acfeeca70f1ee45ae645486",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -1253,6 +1253,13 @@ fn verify_workflow_policy_text(
         "release.yml" => {
             let stable_gate = workflow_job_block(workflow, "stable-gate")?;
             let stable_gate_permissions = job_permissions(stable_gate)?;
+            let package = workflow_job_block(workflow, "package")?;
+            let package_node_setup = package
+                .find("actions/setup-node@")
+                .context("release package job is missing setup-node")?;
+            let package_pnpm_setup = package
+                .find("pnpm/action-setup@")
+                .context("release package job is missing pnpm/action-setup")?;
             let publish = workflow_job_block(workflow, "publish")?;
             let publish_permissions = job_permissions(publish)?;
             if top_level_trigger_keys(workflow)? != ["push"]
@@ -1262,6 +1269,9 @@ fn verify_workflow_policy_text(
                 || write_permissions != ["contents"]
                 || stable_gate_permissions != ["actions: read", "contents: read"]
                 || publish_permissions != ["actions: read", "contents: write"]
+                || package_node_setup >= package_pnpm_setup
+                || package.matches("standalone: false").count() != 1
+                || package.contains("standalone: true")
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
                     .count()
@@ -1272,7 +1282,7 @@ fn verify_workflow_policy_text(
                     != 2
             {
                 bail!(
-                    "release gate permissions must remain read-only, publish permissions must remain actions-read/contents-write, the workflow must remain tag-only, and native x86_64 Linux builds must retain the pinned linker policy"
+                    "release gate permissions must remain read-only, publish permissions must remain actions-read/contents-write, the workflow must remain tag-only, native packages must use pinned Node-backed pnpm, and native x86_64 Linux builds must retain the pinned linker policy"
                 );
             }
         }
