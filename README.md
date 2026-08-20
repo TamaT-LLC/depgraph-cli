@@ -107,8 +107,8 @@ depgraph export --format mermaid > graph.mmd
 
 ## 公式パッケージの導入
 
-`v0.5.0`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
-`v0.5.0`の正式な配布先はGitHub Releaseであり、npm版はこの配布契約を含む次のstable versionから提供する。
+`v0.5.1`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
+`v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCのorganization scopeである`@tamat-llc`から公開する。
 `npm i -g @tamat-llc/depgraph`により同じ5 targetの検証済みnative packageを導入でき、install scriptによる外部downloadは行わない。
 公開状態と初回bootstrapは[npmリリース手順](docs/50_test/npm-release-procedure.md)で確認する。
@@ -125,7 +125,7 @@ npm版はTamaT LLCのorganization scopeである`@tamat-llc`から公開する�
 macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
 
 ```sh
-VERSION=0.5.0
+VERSION=0.5.1
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -167,8 +167,8 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-`main`は[`v0.5.0` release notes](docs/releases/v0.5.0.md)に記載した`0.5.0`契約を実装している。
-正式版は、[`v0.5.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.0)と公開後証跡が一致するときに限り有効である。
+`main`は[`v0.5.1` release notes](docs/releases/v0.5.1.md)に記載した`0.5.1`契約を実装している。
+正式版は、[`v0.5.1` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.1)と公開後証跡が一致するときに限り有効である。
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
 Every v0.5 archive includes the native MCP server, durable
@@ -181,12 +181,13 @@ schema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
 履歴上の契約は[`v0.4.0` contract](docs/releases/v0.4.0.md)に残している。
 過去のRelease Candidateは[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
-完全な互換性タプル、Store移行、ロールバック、既知の制約は[`v0.5.0` release notes](docs/releases/v0.5.0.md)を参照する。
+完全な互換性タプル、Store移行、ロールバック、既知の制約は[`v0.5.1` release notes](docs/releases/v0.5.1.md)を参照する。
 
 ## Project status and public collaboration
 
-The supported line is conditionally anchored by the verified `v0.5.0` Release.
-`v0.5.0`が現在の安定版であり、Release Candidateと過去のバージョンは評価用の成果物である。
+The supported line is conditionally anchored by the verified `v0.5.1` Release.
+`v0.5.1`は、公式Releaseとpost-publish evidenceの公開後に現在の安定版となる。
+それまでは`v0.5.0`が安定版であり、Release Candidateは評価用の過去の配布物である。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
 
 利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従う。
@@ -336,15 +337,15 @@ gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
 ```
 
 ```sh
-/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph agent-config \
+/absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE/bin/depgraph agent-config \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
-  --release-archive /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE.tar.gz \
-  --release-checksum /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-archive /absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE.tar.gz.sha256 \
   --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
   --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --release-manifest /absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/release-manifest.json \
-  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.5.0-TARGET_TRIPLE.requirement.json \
+  --release-manifest /absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.5.1-TARGET_TRIPLE.requirement.json \
   --host codex
 ```
 
@@ -359,7 +360,7 @@ profiles are selected explicitly with `--profile store-write`,
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -375,7 +376,7 @@ form to copy unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -831,8 +832,8 @@ example below becomes downloadable only after that candidate is published;
 the normal depgraph archive and compiler pack must come from one release run.
 
 ```bash
-version=0.5.0
-release_tag=v0.5.0-rc.2
+version=0.5.1
+release_tag=v0.5.1
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 

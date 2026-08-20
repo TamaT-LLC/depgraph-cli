@@ -1061,10 +1061,10 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
         mcp_tool_contract_version: "depgraph-mcp-tools-v1".to_owned(),
         mcp_operation_contract_version: "depgraph-operation-v1".to_owned(),
         minimum_migratable_store_schema_version: 1,
-        previous_release_version: "0.4.0-rc.6".to_owned(),
-        previous_release_store_schema_version: 13,
+        previous_release_version: "0.5.0".to_owned(),
+        previous_release_store_schema_version: 17,
         stable_release_gate_contract_version: "stable-release-gate-v2".to_owned(),
-        stable_release_version: "0.5.0".to_owned(),
+        stable_release_version: "0.5.1".to_owned(),
         stable_upgrade_source_version: "0.4.0-rc.6".to_owned(),
         stable_upgrade_source_store_schema_version: 13,
         stable_upgrade_source_fixture_path: "xtask/fixtures/v0.4.0-rc.6-store-v13.sql".to_owned(),
@@ -2017,7 +2017,9 @@ mod tests {
             compatible.mcp_operation_contract_version,
             "depgraph-operation-v1"
         );
-        assert_eq!(compatible.stable_release_version, "0.5.0");
+        assert_eq!(compatible.stable_release_version, "0.5.1");
+        assert_eq!(compatible.previous_release_version, "0.5.0");
+        assert_eq!(compatible.previous_release_store_schema_version, 17);
         assert_eq!(compatible.stable_upgrade_source_version, "0.4.0-rc.6");
         assert_eq!(compatible.stable_upgrade_source_store_schema_version, 13);
 

@@ -18,8 +18,8 @@ npmへ公開するpackageは次の6つである。
 
 `@depgraph/web-worker`はnative archiveへ組み込む内部Workerであり、npmへ
 直接公開しない。
-既存の`v0.5.0`はGitHub Releaseのみで配布し、この仕組みを含む次のstable
-versionからnpm公開を開始する。
+既存の`v0.5.0`はGitHub Releaseのみで配布する。
+最初のnpm stableは、この仕組みを含む`v0.5.1`である。
 
 ## 通常の公開フロー
 

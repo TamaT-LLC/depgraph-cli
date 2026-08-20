@@ -22,7 +22,7 @@ mod rust_semantic_e2e;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.5.0";
+const STABLE_RELEASE_VERSION: &str = "0.5.1";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -614,7 +614,7 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_sha",
         V0_4_STABLE_RELEASE_BASELINE_COMMIT,
         "actions/runs/$RELEASE_RUN_ID/cancel",
-        "git/refs/tags/$EXPECTED_RELEASE_TAG",
+        "git/refs/tags/$RELEASE_TAG",
     ] {
         if !source_guard.contains(required) {
             bail!("stable release source guard is missing contract {required:?}");
@@ -623,13 +623,15 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
     for required in [
         "guard-stable-tags:",
         "github.event.workflow_run.head_branch == 'v0.5.0'",
-        "STABLE_RELEASE_TAG: v0.5.0",
+        "V0_5_0_RELEASE_SOURCE_SHA: f1071178d3888503b6e02d4aec5e058f0b87d035",
+        "github.event.workflow_run.head_branch == 'v0.5.1'",
+        "STABLE_RELEASE_TAG: v0.5.1",
         "STABLE_MAINTENANCE_REF: heads/release/0.5",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
         "signed tag preserved for retry",
         "http_status\" == \"404\"",
-        "is not the exact main/release/0.5 baseline",
+        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline",
     ] {
         if !source_guard.contains(required) {
             bail!("stable release source guard is missing v0.5 contract {required:?}");
@@ -1971,8 +1973,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-08-13",
-        "| Product / Rust / Go / Web adapter | `0.5.0` |",
+        "updated: 2026-08-20",
+        "| Product / Rust / Go / Web adapter | `0.5.1` |",
         "| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |",
         "| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
@@ -2360,12 +2362,12 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("v0.4 release note is missing preserved baseline contract {required:?}");
         }
     }
-    let stable_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0.md"))?;
+    let v0_5_0_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0.md"))?;
     for required in [
-        STABLE_RELEASE_VERSION,
-        STABLE_RELEASE_GATE_SCHEMA_VERSION,
-        STABLE_RELEASE_BASELINE_STATUS,
-        STABLE_RELEASE_MAINTENANCE_BRANCH,
+        "0.5.0",
+        "stable-release-gate-v2",
+        "maintenance-ref-pinned",
+        "refs/heads/release/0.5",
         STABLE_UPGRADE_SOURCE_VERSION,
         STABLE_UPGRADE_SOURCE_FIXTURE_PATH,
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
@@ -2379,8 +2381,32 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "`flate2`, `tar`, `zip`",
         "operation journal schema `5`",
     ] {
+        if !v0_5_0_release_note.contains(required) {
+            bail!("v0.5.0 release note is missing historical contract {required:?}");
+        }
+    }
+    let stable_release_note =
+        read_lf_normalized_text(&root.join(format!("docs/releases/v{VERSION}.md")))?;
+    for required in [
+        STABLE_RELEASE_VERSION,
+        STABLE_RELEASE_GATE_SCHEMA_VERSION,
+        STABLE_RELEASE_BASELINE_STATUS,
+        STABLE_RELEASE_MAINTENANCE_BRANCH,
+        STABLE_UPGRADE_SOURCE_VERSION,
+        STABLE_UPGRADE_SOURCE_FIXTURE_PATH,
+        STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
+        "`v0.5.0`, Store schema `17`",
+        "@tamat-llc/depgraph",
+        "@tamat-llc/depgraph-win32-x64",
+        "npm Trusted Publishing",
+        "release-post-publish-evidence-v0.5.1.json",
+        "stable-v0.5.0-packaged-smoke-v1",
+        "mcp-package-smoke-v2",
+        "Node.js 24",
+        "musl",
+    ] {
         if !stable_release_note.contains(required) {
-            bail!("v0.5 release note is missing contract {required:?}");
+            bail!("v{VERSION} release note is missing contract {required:?}");
         }
     }
     let rc_release_note = read_lf_normalized_text(&root.join("docs/releases/v0.5.0-rc.1.md"))?;
@@ -2671,6 +2697,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/50_test/agent-dogfood-benchmark.md",
         "docs/releases/v0.4.0.md",
+        "docs/releases/v0.5.1.md",
         "docs/releases/v0.5.0.md",
         "docs/releases/v0.5.0-rc.7.md",
         "docs/releases/v0.5.0-rc.6.md",
@@ -2730,6 +2757,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
         "name: Bind the stable candidate to main, release/0.5, and exact Full CI",
+        "if [[ \"$GITHUB_REF_NAME\" == \"v0.5.1\" ]]",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -3082,7 +3110,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             "README.md",
             &[
                 "## Project status and public collaboration",
-                "The supported line is conditionally anchored by the verified `v0.5.0` Release",
+                "The supported line is conditionally anchored by the verified `v0.5.1` Release",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -3125,7 +3153,7 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "best-effort basis",
                 "does not provide an SLA",
-                "The supported stable line is `v0.5.0` once the official",
+                "The supported stable line is the newest stable version whose official GitHub",
                 "[SECURITY.md](SECURITY.md)",
                 "There is no automatic stale deadline",
             ],
@@ -6930,7 +6958,7 @@ fn evaluate_stable_release_gate(
             passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
                 && release_source_matches_tag,
             evidence: format!(
-                "the immutable v0.4.0 baseline remains enforced; canonical v0.5.0-rc.N tags bind their exact source SHA; stable v0.5.0 binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
+                "the immutable v0.4.0 and v0.5.0 sources remain enforced; canonical v{STABLE_RELEASE_VERSION}-rc.N tags bind their exact source SHA; stable v{STABLE_RELEASE_VERSION} binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
             ),
         },
         StableReleaseGateCheck {
@@ -15034,7 +15062,8 @@ mod tests {
 
     #[test]
     fn post_publish_evidence_binds_exact_public_assets_and_full_ci() -> Result<()> {
-        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
+        let tag = format!("v{STABLE_RELEASE_VERSION}-rc.1");
+        let (_temp, request) = post_publish_evidence_fixture(&tag)?;
         let output = request.output.clone();
         release_post_publish_evidence(request)?;
         let evidence: ReleasePostPublishEvidence = serde_json::from_slice(&fs::read(output)?)?;
@@ -15052,7 +15081,8 @@ mod tests {
 
     #[test]
     fn post_publish_evidence_accepts_the_exact_stable_tag() -> Result<()> {
-        let (_temp, request) = post_publish_evidence_fixture("v0.5.0")?;
+        let tag = format!("v{STABLE_RELEASE_VERSION}");
+        let (_temp, request) = post_publish_evidence_fixture(&tag)?;
         release_post_publish_evidence(request)
     }
 
@@ -15105,20 +15135,22 @@ mod tests {
 
     #[test]
     fn post_publish_evidence_rejects_public_tamper_skipped_or_rebound_full_ci() -> Result<()> {
-        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
+        let prerelease_tag = format!("v{STABLE_RELEASE_VERSION}-rc.1");
+        let (_temp, request) = post_publish_evidence_fixture(&prerelease_tag)?;
         fs::write(
             request.public_assets.join("benchmark-report.json"),
             b"tampered\n",
         )?;
         assert!(release_post_publish_evidence(request).is_err());
 
-        let (_temp, request) = post_publish_evidence_fixture("v0.5.0-rc.1")?;
+        let (_temp, request) = post_publish_evidence_fixture(&prerelease_tag)?;
         let mut full_ci: Value = serde_json::from_slice(&fs::read(&request.ci_run)?)?;
         full_ci["jobs"].as_array_mut().expect("fixture jobs").pop();
         fs::write(&request.ci_run, serde_json::to_vec(&full_ci)?)?;
         assert!(release_post_publish_evidence(request).is_err());
 
-        let (_temp, request) = post_publish_evidence_fixture("v0.5.0")?;
+        let stable_tag = format!("v{STABLE_RELEASE_VERSION}");
+        let (_temp, request) = post_publish_evidence_fixture(&stable_tag)?;
         let stable_name = "stable-release-gate.json";
         let mut stable: Value =
             serde_json::from_slice(&fs::read(request.workflow_assets.join(stable_name))?)?;
@@ -16734,8 +16766,12 @@ jobs:
         );
         assert!(!supported_release_tag("v0.4.0"));
         assert!(!supported_release_tag("v0.4.0-rc.7"));
-        assert!(supported_release_tag("v0.5.0"));
-        assert!(supported_release_tag("v0.5.0-rc.1"));
+        assert!(!supported_release_tag("v0.5.0"));
+        assert!(!supported_release_tag("v0.5.0-rc.1"));
+        assert!(supported_release_tag(&format!("v{STABLE_RELEASE_VERSION}")));
+        assert!(supported_release_tag(&format!(
+            "v{STABLE_RELEASE_VERSION}-rc.1"
+        )));
     }
 
     fn change_source_mtime(path: &std::path::Path) -> Result<()> {

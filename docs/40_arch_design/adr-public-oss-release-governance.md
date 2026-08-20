@@ -466,12 +466,13 @@ published, so this historical anchor does not create a supported stable line.
 
 `main` is the v0.5 development line. The preserved `release/0.4` ref is not an
 active support promise. The initial `release/0.5` branch is created only at the
-exact approved v0.5 GA baseline. Compatible fixes then land on `main` first
-and are cherry-picked with `-x` through a distinct maintenance pull request;
-urgent stable-first fixes are forward-ported through a distinct pull request.
-Wholesale merges, force-pushes, and history rewrites are forbidden. Pull
-requests record the source commit, issue, compatibility assessment, and
-verification so both directions remain auditable.
+exact approved v0.5 GA baseline. Compatible fixes land on `main` first through
+reviewed pull requests. For each stable patch, Full CI fixes an exact `main`
+candidate and `release/0.5` advances to that same commit by fast-forward only.
+Urgent stable-first fixes are not allowed; they must first enter `main` through
+the normal review path. Force-pushes and history rewrites are forbidden. Pull
+requests record the issue, compatibility assessment, and verification so the
+maintenance history remains auditable.
 
 Before v0.5 GA, stable support is absent and candidate behavior remains
 evaluation-only. After GA, a breaking default requires a new minor release and
@@ -495,6 +496,10 @@ initial `refs/heads/release/0.5` ref must share one source SHA, and the exact
 eight-job Full CI plus digest-pinned Agent dogfood report must pass before
 publication. The gate and post-publish evidence record the commit, tree,
 canonical baseline digest, workflow identities, and asset closure.
+
+The same identity rule applies to `v0.5.1` and later v0.5 stable patches.
+The maintenance ref is fast-forwarded only after the exact `main` candidate
+passes Full CI, then the signed tag is created at that shared source SHA.
 
 ### Gate 8: migration dry run and change window
 

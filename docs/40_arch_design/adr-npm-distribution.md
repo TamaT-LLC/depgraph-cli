@@ -107,8 +107,8 @@ The npm version always equals the stable native release version.
 Release candidates are not published to npm by this workflow.
 Published npm versions are immutable and are never rebuilt from a later commit.
 The existing v0.5.0 GitHub Release predates this decision and remains a
-GitHub-Release-only distribution; npm publication begins with a later stable
-tag that contains this contract.
+GitHub-Release-only distribution. npm publication begins with `v0.5.1`, the
+first stable tag that contains this contract.
 
 Linux musl, Windows ARM64, and other targets fail with an explicit unsupported
 platform error.

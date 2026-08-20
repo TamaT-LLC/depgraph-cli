@@ -19,13 +19,18 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 
 ## リリース準備
 
-1. バージョン変更とrelease noteを一つのPRにまとめる。現行契約ではbase versionは`0.5.0`である。
+1. バージョン変更とrelease noteを一つのPRにまとめる。
+   現行契約ではbase versionは`0.5.1`である。
 2. release noteを`docs/releases/<タグ名>.md`として追加する。
 3. タグ名をworkspace versionと一致する`vX.Y.Z`または`vX.Y.Z-rc.N`にする。
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
-Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。`v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。`v0.5.0` stableはbaseline statusを`maintenance-ref-pinned`とし、tag source、remote `main`、`refs/heads/release/0.5`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければdefault-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
+Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
+`v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。
+現行の`v0.5.1` stableはbaseline statusを`maintenance-ref-pinned`とする。
+tag source、remote `main`、`refs/heads/release/0.5`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければ、default-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
+公開済み`v0.5.0`のsource SHAは履歴検証用に固定し、現行candidateのSHAとして再利用しない。
 
 ## タグ作成前のフルCI
 
@@ -74,7 +79,7 @@ publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIか�
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
-release_tag="vX.Y.Z-rc.N" # stable GAでは v0.5.0
+release_tag="vX.Y.Z-rc.N" # 現行stableでは v0.5.1
 
 git fetch origin main
 test "$(git rev-parse origin/main)" = "$candidate"
@@ -85,23 +90,34 @@ git verify-tag "$release_tag"
 git push origin "refs/tags/$release_tag"
 ```
 
-v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。push済みtagを移動・再利用しない。stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、そのexact headでFull CIを完走させてから、まだ存在しない`refs/heads/release/0.5`を同じSHAで作成する。
+v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。
+push済みtagを移動・再利用しない。
+初回stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、exact Full CIを通過した同一SHAで`refs/heads/release/0.5`を作成した。
+`v0.5.1`以降のpatch releaseでは、同じexact-source条件を維持したまま、既存の`release/0.5`をcandidateへfast-forwardする。
 
 ```bash
+git fetch origin main release/0.5
 test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-test -z "$(git ls-remote origin refs/heads/release/0.5)"
+maintenance="$(git rev-parse origin/release/0.5)"
+git merge-base --is-ancestor "$maintenance" "$candidate"
 git push origin "$candidate:refs/heads/release/0.5"
 test "$candidate" = "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
 git rev-parse "$candidate^{tree}"
 printf '%s\n' \
   release-baseline-v1 \
   repository=TamaT-LLC/depgraph-cli \
-  version=0.5.0 \
+  version=0.5.1 \
   commit="$candidate" |
   shasum -a 256
 ```
 
-その後だけsigned annotated `v0.5.0` tagを同じSHAへpushする。default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。tag側のstable gateはGitHub APIから`main` headのexact eight-job Full CIを再取得し、`agent-dogfood-report-v1`の固定SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`と全14 gateを再計算する。exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.5.0.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
+このfast-forwardは、review済みでFull CIを通過した`main`のexact commitだけを対象にする。
+`release/0.5`側で新しいmerge commitやcherry-pickを作らず、force-pushや履歴書き換えも行わない。
+その後だけsigned annotated `v0.5.1` tagを同じSHAへpushする。
+default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
+API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
+tag側のstable gateはGitHub APIから`main` headのexact eight-job Full CIを再取得し、`agent-dogfood-report-v1`の固定SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`と全14 gateを再計算する。
+exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.5.1.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。
