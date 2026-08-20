@@ -328,7 +328,7 @@ jobs:
           main_head_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
           test "$GITHUB_SHA" = "$main_head_sha"
           maintenance_head_sha="$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.5.0" ]]; then
+          if [[ "$GITHUB_REF_NAME" == "v0.5.1" ]]; then
             maintenance_head_sha="$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
             test "$GITHUB_SHA" = "$maintenance_head_sha"
           fi
@@ -400,7 +400,7 @@ jobs:
           test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
           test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.5.0" ]]; then
+          if [[ "$GITHUB_REF_NAME" == "v0.5.1" ]]; then
             test "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')" = "$GITHUB_SHA"
           fi
           test "$(jq -r '.verification.signature != null' <<<"$tag_payload")" = "true"
@@ -445,7 +445,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           version="${version%%-rc.*}"
-          test "$version" = "0.5.0"
+          test "$version" = "0.5.1"
 
           mkdir -p post-publish/public post-publish/normal post-publish/compiler post-publish/redownload
           gh release download "$GITHUB_REF_NAME" --dir post-publish/public

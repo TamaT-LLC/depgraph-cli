@@ -809,7 +809,7 @@ export function frameworkBuildProtocolEvents(
     protocol_version: "1.0" as const,
     scan_id: provenance.build_run_id,
     adapter: "web" as const,
-    adapter_version: "0.5.0" as const,
+    adapter_version: "0.5.1" as const,
   };
   let seq = 0;
   const event = (kind: string, payload: Record<string, unknown>): ProtocolEvent => ({

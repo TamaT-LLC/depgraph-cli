@@ -1,6 +1,6 @@
 {
   "name": "@tamat-llc/depgraph",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "Explainable dependency graph CLI for Rust, Go, TypeScript, and JavaScript",
   "type": "module",

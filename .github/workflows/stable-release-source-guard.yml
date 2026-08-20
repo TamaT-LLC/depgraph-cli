@@ -12,13 +12,14 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'push' &&
       (github.event.workflow_run.head_branch == 'v0.4.0' ||
-       github.event.workflow_run.head_branch == 'v0.5.0')
+       github.event.workflow_run.head_branch == 'v0.5.0' ||
+       github.event.workflow_run.head_branch == 'v0.5.1')
     runs-on: ubuntu-24.04
     permissions:
       actions: write
       contents: write
     steps:
-      - name: Guard v0.4 and v0.5 stable tag sources
+      - name: Guard immutable historical and current stable tag sources
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -28,7 +29,9 @@ jobs:
           RELEASE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
           EXPECTED_RELEASE_TAG: v0.4.0
           EXPECTED_RELEASE_SOURCE_SHA: d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f
-          STABLE_RELEASE_TAG: v0.5.0
+          V0_5_0_RELEASE_TAG: v0.5.0
+          V0_5_0_RELEASE_SOURCE_SHA: f1071178d3888503b6e02d4aec5e058f0b87d035
+          STABLE_RELEASE_TAG: v0.5.1
           STABLE_MAINTENANCE_REF: heads/release/0.5
           STABLE_MAIN_REF: heads/main
           STABLE_BASELINE_STATUS: maintenance-ref-pinned
@@ -78,12 +81,18 @@ jobs:
               "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel"
             gh api --method DELETE \
               "repos/$REPOSITORY/git/refs/tags/$STABLE_RELEASE_TAG"
-            echo "::error::v0.5.0 source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline ($STABLE_BASELINE_STATUS; main=$main_sha maintenance=$maintenance_sha)"
+            echo "::error::$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline ($STABLE_BASELINE_STATUS; main=$main_sha maintenance=$maintenance_sha)"
             exit 1
           fi
 
-          if [[ "$RELEASE_TAG" == "$EXPECTED_RELEASE_TAG" &&
-                "$RELEASE_SOURCE_SHA" == "$EXPECTED_RELEASE_SOURCE_SHA" ]]; then
+          historical_source_sha=""
+          if [[ "$RELEASE_TAG" == "$EXPECTED_RELEASE_TAG" ]]; then
+            historical_source_sha="$EXPECTED_RELEASE_SOURCE_SHA"
+          elif [[ "$RELEASE_TAG" == "$V0_5_0_RELEASE_TAG" ]]; then
+            historical_source_sha="$V0_5_0_RELEASE_SOURCE_SHA"
+          fi
+          if [[ -n "$historical_source_sha" &&
+                "$RELEASE_SOURCE_SHA" == "$historical_source_sha" ]]; then
             echo "$RELEASE_TAG source is the immutable release baseline"
             exit 0
           fi
@@ -91,6 +100,6 @@ jobs:
           gh api --method POST \
             "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel"
           gh api --method DELETE \
-            "repos/$REPOSITORY/git/refs/tags/$EXPECTED_RELEASE_TAG"
-          echo "::error::$RELEASE_TAG source $RELEASE_SOURCE_SHA is not $EXPECTED_RELEASE_SOURCE_SHA"
+            "repos/$REPOSITORY/git/refs/tags/$RELEASE_TAG"
+          echo "::error::$RELEASE_TAG source $RELEASE_SOURCE_SHA is not its immutable release baseline"
           exit 1

@@ -63,14 +63,17 @@ access review in the same change.
 Releases come from immutable reviewed commits and must pass the complete local
 and GitHub Actions quality gates, five-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
-maintainer plus an independent approver. `v0.5.0` is the supported stable line
-only when the official Release and matching post-publish evidence exist; until
-then there is no supported stable line. The existing `release/0.4` ref and
-v0.4 tags are preserved historical anchors, not a current maintenance promise.
-The initial `release/0.5` ref, stable tag, and remote `main` must identify the
-same reviewed, exact-Full-CI-green source. Compatible fixes then land on
-`main` first and are cherry-picked with provenance. Breaking defaults do not
-enter a maintenance line.
+maintainer plus an independent approver. The supported stable line is the
+newest stable version whose official Release and matching post-publish evidence
+exist. During the `v0.5.1` rollout, `v0.5.0` remains supported until that
+condition is satisfied for `v0.5.1`. The existing `release/0.4` ref and v0.4
+tags are preserved historical anchors, not a current maintenance promise.
+For each stable v0.5 patch, the signed tag, remote `main`, and `release/0.5`
+must identify the same reviewed, exact-Full-CI-green source at publication.
+Compatible fixes land on `main` first. After Full CI fixes the release
+candidate, `release/0.5` advances to that exact commit by fast-forward only.
+Force-pushes, history rewrites, and breaking defaults are forbidden on the
+maintenance line.
 
 Release support is best effort and has no implied SLA. Security fixes follow
 [SECURITY.md](SECURITY.md); other support follows [SUPPORT.md](SUPPORT.md).

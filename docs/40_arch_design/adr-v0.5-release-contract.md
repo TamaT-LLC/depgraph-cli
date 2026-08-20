@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-13
-- Updated: 2026-08-16
+- Updated: 2026-08-20
 - Decision ID: `PROJ-ARC-001-ADR-007`
 - Issue: `PROJ-ARC-003-TASK-001` / #355
 - Contract: `stable-release-gate-v2`
@@ -95,9 +95,22 @@ The runtime gate records the selected commit, tree, canonical
 `release-baseline-v1` digest, and Full CI identity in `stable-release-gate.json`.
 The post-publish record then binds those values to the signed tag object,
 Release run, and exact public asset closure. This external record avoids
-attempting to embed a commit SHA in its own source tree. Later compatible fixes
-land on `main` first and are cherry-picked with `-x`; force-pushes, history
-rewrites, and wholesale merges are forbidden.
+attempting to embed a commit SHA in its own source tree.
+
+### 2026-08-20 patch-release amendment
+
+`v0.5.1` is the first patch release under the npm distribution contract.
+Compatible fixes still land on `main` first through reviewed pull requests.
+After the exact `main` candidate passes Full CI, `release/0.5` advances from
+the previous stable baseline to that same commit by fast-forward only. The
+signed patch tag, remote `main`, and `release/0.5` therefore share one source
+SHA when publication begins.
+
+The earlier instruction to cherry-pick fixes into `release/0.5` is superseded.
+A cherry-pick creates a different commit SHA and cannot satisfy the existing
+exact-source gate. Force-pushes and history rewrites remain forbidden. Main is
+frozen between candidate selection and completion of the source-identity
+check.
 
 ## Consequences
 
