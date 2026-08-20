@@ -3233,7 +3233,11 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
         }
         verify_local_markdown_links(&root, path, &content)?;
     }
-    let codeowners = fs::read_to_string(root.join(".github/CODEOWNERS"))
+    verify_codeowners(&root.join(".github/CODEOWNERS"))
+}
+
+fn verify_codeowners(path: &Path) -> Result<()> {
+    let codeowners = read_lf_normalized_text(path)
         .context("public community profile is missing .github/CODEOWNERS")?;
     if codeowners
         != "# Require an owner review for every change in this repository.\n* @TakehiroT @Fuelda\n"
@@ -14889,7 +14893,7 @@ mod tests {
         rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, validate_full_ci_run,
-        verify_agent_dogfood_release_gate, verify_checksum_sidecar,
+        verify_agent_dogfood_release_gate, verify_checksum_sidecar, verify_codeowners,
         verify_cross_language_package_smoke, verify_github_actions_security,
         verify_local_markdown_links, verify_mcp_dependencies,
         verify_mcp_tasks_architecture_decision, verify_packaged_cross_language,
@@ -15179,6 +15183,21 @@ mod tests {
 
         fs::write(&source, [0xff])?;
         assert!(super::copy_lf_normalized_text(&source, &destination).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn codeowners_verification_accepts_crlf_and_rejects_owner_drift() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codeowners = temp.path().join("CODEOWNERS");
+        fs::write(
+            &codeowners,
+            b"# Require an owner review for every change in this repository.\r\n* @TakehiroT @Fuelda\r\n",
+        )?;
+        verify_codeowners(&codeowners)?;
+
+        fs::write(&codeowners, b"* @unexpected-owner\r\n")?;
+        assert!(verify_codeowners(&codeowners).is_err());
         Ok(())
     }
 
