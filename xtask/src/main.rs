@@ -177,11 +177,11 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:d664b46af73b184714ed57a828fc56e65d2b0f2cf837de9f953f926a2e992648",
-        query_result_digest: "bounded-query-result:sha256:998496968a872291847d5d9d73b61e63c92377e76e2fb9895577d1643d4c368a",
-        query_output_sha256: "4f8637e6b0bf350036c1cbebdca4b177b1f74360e1e65f33905f995817b55704",
-        profile_plan_digest: "profile-selection-plan:sha256:f44bce61595b71869cac635acc4256a269e04b7849020766c2c308d5ab4e6632",
-        profile_plan_output_sha256: "90e0c0aa6f453cf5277051ef7385ddee047a45d522b955292a179020a3dc1cf6",
+        query_plan_digest: "bounded-query-plan:sha256:e5f3e61eae2260cfe2eda9df6e929be51014a072dc7a8b0c0f87bd22e47d359b",
+        query_result_digest: "bounded-query-result:sha256:2aba2ea467632c2d6e3d8cd020362000bb137ac8c0176c4d9c49f0a36f3709af",
+        query_output_sha256: "692dd5d411d70dccfa8486c19a78223dbdc615581cdde0e20ebc6fca3acb879d",
+        profile_plan_digest: "profile-selection-plan:sha256:a7baf17298bac1ee71953ca377b45f98baec8cc96567e67413426c7a188f94e2",
+        profile_plan_output_sha256: "51a80ac358e5959dbcc3be732e635c7294769f04937ee000e9b61ccbc09f2a98",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
