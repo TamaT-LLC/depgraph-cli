@@ -624,8 +624,6 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "guard-stable-tags:",
         "github.event.workflow_run.head_branch == 'v0.5.0'",
         "V0_5_0_RELEASE_SOURCE_SHA: f1071178d3888503b6e02d4aec5e058f0b87d035",
-        "github.event.workflow_run.head_branch == 'v0.5.1'",
-        "STABLE_RELEASE_TAG: v0.5.1",
         "STABLE_MAINTENANCE_REF: heads/release/0.5",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
@@ -635,6 +633,14 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
     ] {
         if !source_guard.contains(required) {
             bail!("stable release source guard is missing v0.5 contract {required:?}");
+        }
+    }
+    for required in [
+        format!("github.event.workflow_run.head_branch == 'v{STABLE_RELEASE_VERSION}'"),
+        format!("STABLE_RELEASE_TAG: v{STABLE_RELEASE_VERSION}"),
+    ] {
+        if !source_guard.contains(&required) {
+            bail!("stable release source guard is missing current contract {required:?}");
         }
     }
     Ok(())

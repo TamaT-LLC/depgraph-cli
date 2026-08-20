@@ -24,7 +24,6 @@ updated: 2026-08-20
 > 2026-08-20: `v0.5.1`を最初のnpm stableとし、製品versionを`0.5.1`へ更新した。
 > protocol `1.0`、Store schema `17`、operation journal schema `5`、MCP DTOは変更しない。
 > stable tag、remote `main`、`release/0.5`は公開開始時に同一SHAを指し、保守refはFull CI済みcandidateへfast-forwardだけで進める。
-
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
 > Inline inputまたはrepository-relative regular fileの一方だけを受理し、size/confinement、credential policy、parse/type、query output admissionをstore access前にfail closedで検証する。
 > CLIとMCPは同じpinned completed snapshotを読み、MCPはclosed/paged DTOとinput-bound cursorを返す。validationはstore、snapshot、source treeを変更せず、raw query/trace/pathをerrorへ反射しない。

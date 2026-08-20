@@ -51,10 +51,16 @@ gh run list \
   --limit 5
 run_id=123456789 # 表示されたdatabase IDへ置き換える
 gh run watch "$run_id" --exit-status
+test "$(gh run view "$run_id" --json headSha --jq .headSha)" = "$candidate"
 gh run view "$run_id" --json headSha,conclusion,url
+
+candidate_record="$(git rev-parse --git-path depgraph-release-candidate)"
+test ! -L "$candidate_record"
+(umask 077; printf '%s\n' "$candidate" > "$candidate_record")
 ```
 
-表示された`headSha`が`candidate`と一致し、全ジョブが成功したことを確認する。
+全ジョブの成功と`headSha`の一致を確認した`candidate`だけを、Git管理領域内のrelease candidate記録へ保存する。
+後続のshellはこの記録を読み、`origin/main`から候補SHAを再計算しない。
 確認が終わるまで`main`へ別の変更をマージしない。
 
 post-publish evidenceはGitHub Actions APIが返すjob表示名を完全一致で検証する。
@@ -76,44 +82,49 @@ publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIか�
 `actions/checkout`の既定shallow tag checkoutはpeeled commitを同名のlocal tag refへ
 配置するため、local `git rev-parse <tag>^{tag}`では正しいremote annotated tagを検証
 できない。署名payloadとpeeled commitの検証にはremote tag object SHAだけを使う。
+v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。
+push済みtagを移動・再利用しない。
+初回stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、exact Full CIを通過した同一SHAで`refs/heads/release/0.5`を作成した。
+`v0.5.1`以降のpatch releaseでは、同じexact-source条件を維持したまま、既存の`release/0.5`をcandidateへfast-forwardする。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
 release_tag="vX.Y.Z-rc.N" # 現行stableでは v0.5.1
+candidate_record="$(git rev-parse --git-path depgraph-release-candidate)"
+test -f "$candidate_record"
+test ! -L "$candidate_record"
+test "$(wc -l < "$candidate_record" | tr -d ' ')" = "1"
+IFS= read -r candidate < "$candidate_record"
+test -n "$candidate"
+test "$(git rev-parse --verify "$candidate^{commit}")" = "$candidate"
 
 git fetch origin main
-test "$(git rev-parse origin/main)" = "$candidate"
+test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 test -f "docs/releases/${release_tag}.md"
+
+if [[ "$release_tag" == "v0.5.1" ]]; then
+  git fetch origin release/0.5
+  maintenance="$(git rev-parse origin/release/0.5)"
+  git merge-base --is-ancestor "$maintenance" "$candidate"
+  git push origin "$candidate:refs/heads/release/0.5"
+  test "$candidate" = "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
+  git rev-parse "$candidate^{tree}"
+  printf '%s\n' \
+    release-baseline-v1 \
+    repository=TamaT-LLC/depgraph-cli \
+    version=0.5.1 \
+    commit="$candidate" |
+    shasum -a 256
+fi
 
 git tag -s "$release_tag" "$candidate" -m "depgraph $release_tag"
 git verify-tag "$release_tag"
 git push origin "refs/tags/$release_tag"
 ```
 
-v0.5の最初の候補は`v0.5.0-rc.1`とし、修正後はRC番号を増やす。
-push済みtagを移動・再利用しない。
-初回stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、exact Full CIを通過した同一SHAで`refs/heads/release/0.5`を作成した。
-`v0.5.1`以降のpatch releaseでは、同じexact-source条件を維持したまま、既存の`release/0.5`をcandidateへfast-forwardする。
-
-```bash
-git fetch origin main release/0.5
-test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-maintenance="$(git rev-parse origin/release/0.5)"
-git merge-base --is-ancestor "$maintenance" "$candidate"
-git push origin "$candidate:refs/heads/release/0.5"
-test "$candidate" = "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
-git rev-parse "$candidate^{tree}"
-printf '%s\n' \
-  release-baseline-v1 \
-  repository=TamaT-LLC/depgraph-cli \
-  version=0.5.1 \
-  commit="$candidate" |
-  shasum -a 256
-```
-
 このfast-forwardは、review済みでFull CIを通過した`main`のexact commitだけを対象にする。
 `release/0.5`側で新しいmerge commitやcherry-pickを作らず、force-pushや履歴書き換えも行わない。
-その後だけsigned annotated `v0.5.1` tagを同じSHAへpushする。
+stableではfast-forwardと一致確認の後だけsigned annotated tagを同じSHAへpushする。
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
 tag側のstable gateはGitHub APIから`main` headのexact eight-job Full CIを再取得し、`agent-dogfood-report-v1`の固定SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`と全14 gateを再計算する。
