@@ -1,6 +1,6 @@
 # npmリリース手順
 
-この手順は、検証済みGitHub Releaseを`depgraph-cli`と5つのnative packageへ
+この手順は、検証済みGitHub Releaseを`@tamat-llc/depgraph`と5つのnative packageへ
 変換し、npm Trusted Publishingで公開する境界を定める。
 アーキテクチャ上の決定は
 [`PROJ-ARC-001-ADR-008`](../40_arch_design/adr-npm-distribution.md)を参照する。
@@ -9,12 +9,12 @@
 
 npmへ公開するpackageは次の6つである。
 
-- `depgraph-cli`
-- `depgraph-cli-darwin-arm64`
-- `depgraph-cli-darwin-x64`
-- `depgraph-cli-linux-arm64-gnu`
-- `depgraph-cli-linux-x64-gnu`
-- `depgraph-cli-win32-x64`
+- `@tamat-llc/depgraph`
+- `@tamat-llc/depgraph-darwin-arm64`
+- `@tamat-llc/depgraph-darwin-x64`
+- `@tamat-llc/depgraph-linux-arm64-gnu`
+- `@tamat-llc/depgraph-linux-x64-gnu`
+- `@tamat-llc/depgraph-win32-x64`
 
 `@depgraph/web-worker`はnative archiveへ組み込む内部Workerであり、npmへ
 直接公開しない。
@@ -49,7 +49,7 @@ draft/prerelease GitHub Release、post-publish evidenceがないRelease、eviden
 このjobはcheckoutせず、repository scriptも実行せず、同一runのpackage-set
 artifactだけを入力にする。
 各tarballのSHA-256、package名、version、repository、`private`と`scripts`の
-不存在を再確認し、5つのnative packageを先に、`depgraph-cli`を最後に公開する。
+不存在を再確認し、5つのnative packageを先に、`@tamat-llc/depgraph`を最後に公開する。
 同じversionがすでに存在する場合はregistry上のintegrityとrepositoryが一致する
 ときだけskipするため、部分失敗後の再実行は安全である。
 
@@ -85,8 +85,8 @@ npm install \
   --ignore-scripts \
   --no-audit \
   --no-fund \
-  ./npm-dist/depgraph-cli-linux-x64-gnu-VERSION.tgz \
-  ./npm-dist/depgraph-cli-VERSION.tgz
+  ./npm-dist/tamat-llc-depgraph-linux-x64-gnu-VERSION.tgz \
+  ./npm-dist/tamat-llc-depgraph-VERSION.tgz
 ./node_modules/.bin/depgraph --version
 ./node_modules/.bin/depgraph-mcp --version
 ```
@@ -99,6 +99,7 @@ npmは存在しないpackageへTrusted Publisherを設定できない。
 各bootstrap packageに含めるのは`package.json`、`README.md`、2種類のlicenseだけ
 とし、`bin`、`scripts`、`dependencies`、`optionalDependencies`は定義しない。
 名前、repository、license、公開範囲はstable packageと一致させる。
+package名はすべて`@tamat-llc` scopeに置き、`--access public`を明示する。
 長期tokenやGitHub Actions secretは作成しない。
 
 次の生成器は既存の出力directoryを上書きせず、6つのpackageとSHA-256付き
@@ -154,6 +155,12 @@ npm trust github PACKAGE_NAME \
 
 6 packageすべてについて設定し、`npm trust list PACKAGE_NAME`でrepository、
 workflow、environment、permissionを確認する。
+`tamat-llc:developers` teamが6 packageへread-write accessを持つことも確認する。
+
+```sh
+npm access list packages tamat-llc:developers
+```
+
 その後、npmのpackage settingsでtraditional token publicationを禁止する。
 同じ作業時間内に、通常の公開フローから最初のsupported stable versionをOIDCで
 公開する。
@@ -164,6 +171,19 @@ metadata変更による回避を試みない。
 成功済みpackageのintegrityを照合し、bootstrap versionをdeprecateしてTrusted
 Publisherを設定したうえで、未作成package名をnpm Supportへ解除依頼する。
 5つのnative packageが揃うまでroot packageは未公開のまま維持する。
+
+## 旧unscoped bootstrap package
+
+組織所有を決定する前に、次の4 packageへbootstrap versionを公開した。
+
+- `depgraph-cli-darwin-arm64`
+- `depgraph-cli-darwin-x64`
+- `depgraph-cli-linux-arm64-gnu`
+- `depgraph-cli-linux-x64-gnu`
+
+これらのpackageへstable versionは公開しない。
+`0.0.0-bootstrap.0`はdeprecatedのまま維持し、案内文をorganization scopeの`@tamat-llc/depgraph`へ向ける。
+unscopedのroot packageとWindows packageは公開していないため、新たに予約しない。
 
 ## 失敗時
 

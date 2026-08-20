@@ -109,7 +109,8 @@ depgraph export --format mermaid > graph.mmd
 
 `v0.5.0`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
 `v0.5.0`の正式な配布先はGitHub Releaseであり、npm版はこの配布契約を含む次のstable versionから提供する。
-npm版では`npm install --global depgraph-cli`により同じ5 targetの検証済みnative packageを導入でき、install scriptによる外部downloadは行わない。
+npm版はTamaT LLCのorganization scopeである`@tamat-llc`から公開する。
+`npm i -g @tamat-llc/depgraph`により同じ5 targetの検証済みnative packageを導入でき、install scriptによる外部downloadは行わない。
 公開状態と初回bootstrapは[npmリリース手順](docs/50_test/npm-release-procedure.md)で確認する。
 対象に対応する`TARGET`は次の値から選ぶ。
 

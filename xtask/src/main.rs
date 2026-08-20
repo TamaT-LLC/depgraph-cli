@@ -1794,8 +1794,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("Web package version/runtime metadata is not synchronized with release {VERSION}");
     }
     let npm_package: Value =
-        serde_json::from_slice(&fs::read(root.join("npm/depgraph-cli/package.json"))?)?;
-    if npm_package["name"] != "depgraph-cli"
+        serde_json::from_slice(&fs::read(root.join("npm/depgraph/package.json"))?)?;
+    if npm_package["name"] != "@tamat-llc/depgraph"
         || npm_package["version"] != VERSION
         || npm_package["private"] != true
         || npm_package["engines"]["node"] != ">=24.0.0"

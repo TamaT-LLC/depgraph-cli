@@ -100,7 +100,8 @@ artifact, rechecks every tarball digest and manifest, publishes the five native
 packages before the root CLI package, and requires npm provenance. No npm token
 or environment secret is available. The npm Trusted Publisher subject must
 bind `TamaT-LLC/depgraph-cli`, `npm-release.yml`, and environment `npm` with
-publish-only permission. Each name is reserved interactively with an inert,
+publish-only permission. Every supported package belongs to the `@tamat-llc`
+organization scope. Each name is reserved interactively with an inert,
 deprecated bootstrap version and an npm account protected by 2FA because npm
 cannot configure trust before a package exists.
 The root name is reserved only after all native names exist.

@@ -1,11 +1,11 @@
-# depgraph-cli
+# @tamat-llc/depgraph
 
-`depgraph-cli` is the npm distribution of
+`@tamat-llc/depgraph` is the organization-owned npm distribution of
 [`TamaT-LLC/depgraph-cli`](https://github.com/TamaT-LLC/depgraph-cli).
 It installs the `depgraph` CLI and the `depgraph-mcp` stdio server.
 
 ```sh
-npm install --global depgraph-cli
+npm i -g @tamat-llc/depgraph
 depgraph --version
 ```
 

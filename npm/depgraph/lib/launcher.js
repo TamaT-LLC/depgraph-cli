@@ -11,27 +11,27 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 const PLATFORM_PACKAGES = Object.freeze({
   "darwin:arm64": Object.freeze({
-    packageName: "depgraph-cli-darwin-arm64",
+    packageName: "@tamat-llc/depgraph-darwin-arm64",
     target: "aarch64-apple-darwin",
     executableSuffix: "",
   }),
   "darwin:x64": Object.freeze({
-    packageName: "depgraph-cli-darwin-x64",
+    packageName: "@tamat-llc/depgraph-darwin-x64",
     target: "x86_64-apple-darwin",
     executableSuffix: "",
   }),
   "linux:arm64": Object.freeze({
-    packageName: "depgraph-cli-linux-arm64-gnu",
+    packageName: "@tamat-llc/depgraph-linux-arm64-gnu",
     target: "aarch64-unknown-linux-gnu",
     executableSuffix: "",
   }),
   "linux:x64": Object.freeze({
-    packageName: "depgraph-cli-linux-x64-gnu",
+    packageName: "@tamat-llc/depgraph-linux-x64-gnu",
     target: "x86_64-unknown-linux-gnu",
     executableSuffix: "",
   }),
   "win32:x64": Object.freeze({
-    packageName: "depgraph-cli-win32-x64",
+    packageName: "@tamat-llc/depgraph-win32-x64",
     target: "x86_64-pc-windows-msvc",
     executableSuffix: ".exe",
   }),
@@ -141,7 +141,7 @@ async function installedCommand(command) {
     platformPackageJson = require.resolve(`${descriptor.packageName}/package.json`);
   } catch (error) {
     throw new Error(
-      `required optional package ${descriptor.packageName} is missing; reinstall depgraph-cli without omitting optional dependencies`,
+      `required optional package ${descriptor.packageName} is missing; reinstall @tamat-llc/depgraph without omitting optional dependencies`,
       { cause: error },
     );
   }

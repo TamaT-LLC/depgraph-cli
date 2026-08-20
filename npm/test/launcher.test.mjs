@@ -5,10 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { selectPlatform, verifyPackageCommand } from "../depgraph-cli/lib/launcher.js";
+import { selectPlatform, verifyPackageCommand } from "../depgraph/lib/launcher.js";
 
 const version = JSON.parse(
-  await readFile(new URL("../depgraph-cli/package.json", import.meta.url), "utf8"),
+  await readFile(new URL("../depgraph/package.json", import.meta.url), "utf8"),
 ).version;
 
 function digest(bytes) {
@@ -32,11 +32,14 @@ async function fixture() {
 }
 
 test("selectPlatform maps every supported npm target", () => {
-  assert.equal(selectPlatform({ platform: "darwin", arch: "arm64" }).packageName, "depgraph-cli-darwin-arm64");
+  assert.equal(
+    selectPlatform({ platform: "darwin", arch: "arm64" }).packageName,
+    "@tamat-llc/depgraph-darwin-arm64",
+  );
   assert.equal(selectPlatform({ platform: "darwin", arch: "x64" }).target, "x86_64-apple-darwin");
   assert.equal(
     selectPlatform({ platform: "linux", arch: "arm64", glibcVersionRuntime: "2.39" }).packageName,
-    "depgraph-cli-linux-arm64-gnu",
+    "@tamat-llc/depgraph-linux-arm64-gnu",
   );
   assert.equal(selectPlatform({ platform: "win32", arch: "x64" }).executableSuffix, ".exe");
 });
