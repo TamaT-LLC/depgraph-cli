@@ -15557,6 +15557,31 @@ jobs:
             )
             .is_err()
         );
+        let package_node_then_pnpm = "      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version: 24.18.0\n      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10\n        with:\n          version: 10.33.0\n          standalone: false\n";
+        let package_pnpm_then_node = "      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10\n        with:\n          version: 10.33.0\n          standalone: false\n      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n        with:\n          node-version: 24.18.0\n";
+        for package_setup_drift in [
+            release.replacen(package_node_then_pnpm, package_pnpm_then_node, 1),
+            release.replacen(
+                "          standalone: false",
+                "          standalone: true",
+                1,
+            ),
+            release.replacen(
+                "          standalone: false",
+                "          standalone: false\n          standalone: false",
+                1,
+            ),
+        ] {
+            assert!(
+                verify_workflow_policy_text(
+                    "release.yml",
+                    &package_setup_drift,
+                    &pins,
+                    &mut BTreeSet::new(),
+                )
+                .is_err()
+            );
+        }
         for linker_policy_drift in [
             release.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
             release.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
