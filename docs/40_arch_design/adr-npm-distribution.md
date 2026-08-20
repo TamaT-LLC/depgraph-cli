@@ -96,7 +96,7 @@ Immediately afterward, each package is bound to repository
 publish-only permission; traditional token publication is then disabled and
 the first supported stable version is published through OIDC.
 
-Four unscoped native bootstrap packages were reserved before organization
+Four unscoped native bootstrap packages were published before organization
 ownership was selected.
 They remain deprecated placeholders and never receive a supported stable
 version; the supported package set is exclusively under `@tamat-llc`.
