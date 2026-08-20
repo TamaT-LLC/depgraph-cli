@@ -18,27 +18,27 @@ import {
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const ROOT_PACKAGE_NAME = "depgraph-cli";
+export const ROOT_PACKAGE_NAME = "@tamat-llc/depgraph";
 export const PACKAGE_SET_SCHEMA = "depgraph-npm-package-set-v1";
 export const TARGETS = Object.freeze([
   Object.freeze({
     target: "aarch64-apple-darwin",
     extension: "tar.gz",
-    packageName: "depgraph-cli-darwin-arm64",
+    packageName: "@tamat-llc/depgraph-darwin-arm64",
     os: "darwin",
     cpu: "arm64",
   }),
   Object.freeze({
     target: "x86_64-apple-darwin",
     extension: "tar.gz",
-    packageName: "depgraph-cli-darwin-x64",
+    packageName: "@tamat-llc/depgraph-darwin-x64",
     os: "darwin",
     cpu: "x64",
   }),
   Object.freeze({
     target: "aarch64-unknown-linux-gnu",
     extension: "tar.gz",
-    packageName: "depgraph-cli-linux-arm64-gnu",
+    packageName: "@tamat-llc/depgraph-linux-arm64-gnu",
     os: "linux",
     cpu: "arm64",
     libc: "glibc",
@@ -46,7 +46,7 @@ export const TARGETS = Object.freeze([
   Object.freeze({
     target: "x86_64-unknown-linux-gnu",
     extension: "tar.gz",
-    packageName: "depgraph-cli-linux-x64-gnu",
+    packageName: "@tamat-llc/depgraph-linux-x64-gnu",
     os: "linux",
     cpu: "x64",
     libc: "glibc",
@@ -54,7 +54,7 @@ export const TARGETS = Object.freeze([
   Object.freeze({
     target: "x86_64-pc-windows-msvc",
     extension: "zip",
-    packageName: "depgraph-cli-win32-x64",
+    packageName: "@tamat-llc/depgraph-win32-x64",
     os: "win32",
     cpu: "x64",
   }),
@@ -68,7 +68,7 @@ const LICENSE = "MIT OR Apache-2.0";
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-const ROOT_TEMPLATE = path.join(REPOSITORY_ROOT, "npm", "depgraph-cli");
+const ROOT_TEMPLATE = path.join(REPOSITORY_ROOT, "npm", "depgraph");
 
 function parseArguments(argv) {
   const values = new Map();
@@ -192,8 +192,8 @@ export function validateReleaseManifestDigest(actualDigest, expectedDigest, arch
 function platformReadme(target) {
   return `# ${target.packageName}\n\n` +
     `Native depgraph release package for \`${target.target}\`. This package is selected by ` +
-    "[`depgraph-cli`](https://www.npmjs.com/package/depgraph-cli) through an exact-version " +
-    "optional dependency. Install `depgraph-cli` instead of depending on this package directly.\n\n" +
+    "[`@tamat-llc/depgraph`](https://www.npmjs.com/package/@tamat-llc/depgraph) through an exact-version " +
+    "optional dependency. Install `@tamat-llc/depgraph` instead of depending on this package directly.\n\n" +
     "The package preserves the verified GitHub Release layout, release manifest, project licenses, " +
     "third-party notices, and SPDX SBOM.\n";
 }

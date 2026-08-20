@@ -86,7 +86,7 @@ function bootstrapReadme(name) {
   return `# ${name}\n\n` +
     "This inert package reserves an official npm name for the depgraph distribution.\n" +
     "It contains no executable, dependency, or lifecycle script and is not a supported release.\n" +
-    "Install a stable version of [`depgraph-cli`](https://www.npmjs.com/package/depgraph-cli) instead.\n";
+    "Install a stable version of [`@tamat-llc/depgraph`](https://www.npmjs.com/package/@tamat-llc/depgraph) instead.\n";
 }
 
 async function packPackage({ name, stagingRoot, output }) {

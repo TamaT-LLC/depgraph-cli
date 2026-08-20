@@ -16,7 +16,7 @@ import {
   createBootstrapManifest,
 } from "../scripts/build-bootstrap-packages.mjs";
 
-const template = JSON.parse(await readFile(new URL("../depgraph-cli/package.json", import.meta.url), "utf8"));
+const template = JSON.parse(await readFile(new URL("../depgraph/package.json", import.meta.url), "utf8"));
 
 test("the source CLI package is private until release packaging", () => {
   assert.equal(template.name, ROOT_PACKAGE_NAME);
@@ -45,6 +45,7 @@ test("platform package constraints cover the five native release targets exactly
   assert.equal(new Set(TARGETS.map((target) => target.target)).size, 5);
   assert.equal(new Set(TARGETS.map((target) => target.packageName)).size, 5);
   for (const target of TARGETS) {
+    assert.match(target.packageName, /^@tamat-llc\/depgraph-/u);
     const manifest = createPlatformManifest(target, template.version);
     assert.equal(manifest.name, target.packageName);
     assert.equal(manifest.version, template.version);
@@ -74,7 +75,7 @@ test("release packaging rejects release manifest digest drift", () => {
   );
 });
 
-test("bootstrap packages are inert, non-latest name reservations", () => {
+test("bootstrap packages are inert scoped name reservations", () => {
   assert.deepEqual(BOOTSTRAP_PACKAGE_NAMES, [
     ...TARGETS.map((target) => target.packageName),
     ROOT_PACKAGE_NAME,
@@ -103,5 +104,5 @@ test("bootstrap packages are inert, non-latest name reservations", () => {
 });
 
 test("bootstrap manifest rejects a name outside the closed package set", () => {
-  assert.throws(() => createBootstrapManifest("depgraph-cli-unknown"), /unknown bootstrap package/u);
+  assert.throws(() => createBootstrapManifest("@tamat-llc/depgraph-unknown"), /unknown bootstrap package/u);
 });

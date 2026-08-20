@@ -3,6 +3,7 @@
 - ID: `PROJ-ARC-001-ADR-008`
 - Status: Accepted
 - Date: 2026-08-19
+- Updated: 2026-08-20
 - Parent: `PROJ-ARC-001`
 
 ## Context
@@ -20,18 +21,23 @@ A lifecycle script that downloads an executable from GitHub would introduce a
 second network trust boundary, fail under `--ignore-scripts`, and make offline
 or registry-proxied installation unreliable.
 
+The public package set must belong to the npm organization `tamat-llc` instead
+of an individual maintainer account.
+npm organizations can manage scoped packages but cannot own unscoped package
+names, so every supported package uses the `@tamat-llc` scope.
+
 ## Decision
 
 Publish one root package and five exact-version native packages.
 
 | npm package | Native target | Constraint |
 | --- | --- | --- |
-| `depgraph-cli` | Platform selector and launch shim | Node.js 24 or later |
-| `depgraph-cli-darwin-arm64` | `aarch64-apple-darwin` | macOS ARM64 |
-| `depgraph-cli-darwin-x64` | `x86_64-apple-darwin` | macOS x64 |
-| `depgraph-cli-linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | Linux ARM64 with glibc |
-| `depgraph-cli-linux-x64-gnu` | `x86_64-unknown-linux-gnu` | Linux x64 with glibc |
-| `depgraph-cli-win32-x64` | `x86_64-pc-windows-msvc` | Windows x64 |
+| `@tamat-llc/depgraph` | Platform selector and launch shim | Node.js 24 or later |
+| `@tamat-llc/depgraph-darwin-arm64` | `aarch64-apple-darwin` | macOS ARM64 |
+| `@tamat-llc/depgraph-darwin-x64` | `x86_64-apple-darwin` | macOS x64 |
+| `@tamat-llc/depgraph-linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | Linux ARM64 with glibc |
+| `@tamat-llc/depgraph-linux-x64-gnu` | `x86_64-unknown-linux-gnu` | Linux x64 with glibc |
+| `@tamat-llc/depgraph-win32-x64` | `x86_64-pc-windows-msvc` | Windows x64 |
 
 The root package exposes `depgraph`, `depgraph-cli`, and `depgraph-mcp` through
 its `bin` map.
@@ -90,6 +96,11 @@ Immediately afterward, each package is bound to repository
 publish-only permission; traditional token publication is then disabled and
 the first supported stable version is published through OIDC.
 
+Four unscoped native bootstrap packages were published before organization
+ownership was selected.
+They remain deprecated placeholders and never receive a supported stable
+version; the supported package set is exclusively under `@tamat-llc`.
+
 ## Compatibility
 
 The npm version always equals the stable native release version.
@@ -107,7 +118,7 @@ and documentation update in the same release.
 
 ## Consequences
 
-- `npm install --global depgraph-cli` does not execute a lifecycle script or
+- `npm install --global @tamat-llc/depgraph` does not execute a lifecycle script or
   fetch executable bytes outside the npm registry.
 - npm registry integrity, npm provenance, the package-set SHA-256 inventory,
   and the native release manifest form layered verification.

@@ -216,7 +216,15 @@ jobs:
               .release_version == $version and
               .npm_tag == "latest" and
               ([.packages[] | select(.role == "platform")] | length) == 5 and
-              ([.packages[] | select(.role == "root" and .name == "depgraph-cli")] | length) == 1 and
+              (.packages | map(.name)) == [
+                "@tamat-llc/depgraph-darwin-arm64",
+                "@tamat-llc/depgraph-darwin-x64",
+                "@tamat-llc/depgraph-linux-arm64-gnu",
+                "@tamat-llc/depgraph-linux-x64-gnu",
+                "@tamat-llc/depgraph-win32-x64",
+                "@tamat-llc/depgraph"
+              ] and
+              ([.packages[] | select(.role == "root" and .name == "@tamat-llc/depgraph")] | length) == 1 and
               .packages[-1].role == "root"
             ' "$inventory" >/dev/null
 
