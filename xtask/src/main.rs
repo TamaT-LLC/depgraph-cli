@@ -15196,7 +15196,10 @@ mod tests {
         )?;
         verify_codeowners(&codeowners)?;
 
-        fs::write(&codeowners, b"* @unexpected-owner\r\n")?;
+        fs::write(
+            &codeowners,
+            b"# Require an owner review for every change in this repository.\r\n* @unexpected-owner @Fuelda\r\n",
+        )?;
         assert!(verify_codeowners(&codeowners).is_err());
         Ok(())
     }
