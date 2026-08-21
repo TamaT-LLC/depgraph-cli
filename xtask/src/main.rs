@@ -1152,6 +1152,32 @@ const RECOVERY_PINNED_NODE_SETUP_HEADER: &str =
 const RECOVERY_VERIFIER_HEADER: &str =
     "      - name: Verify the immutable v0.5.0 public closure and recover its Agent host canary";
 const RECOVERY_VERIFIER_RUN: &str = "        run: scripts/release-post-publish-recovery.sh";
+const NPM_POST_PUBLISH_RETRY_BLOCK: &str = concat!(
+    "            published=false\n",
+    "            for attempt in {1..60}; do\n",
+    "              if npm view \"${package}@${version}\" dist.integrity --json >\"$view_output\" 2>\"$view_error\"; then\n",
+    "                actual_integrity=\"$(jq -er '.' \"$view_output\")\"\n",
+    "                if test \"$actual_integrity\" != \"$expected_integrity\"; then\n",
+    "                  echo \"published npm integrity differs for ${package}@${version}\" >&2\n",
+    "                  exit 1\n",
+    "                fi\n",
+    "                published=true\n",
+    "                break\n",
+    "              fi\n",
+    "              if ! grep -q 'E404' \"$view_error\"; then\n",
+    "                cat \"$view_error\" >&2\n",
+    "                exit 1\n",
+    "              fi\n",
+    "              if test \"$attempt\" -lt 60; then\n",
+    "                echo \"waiting for npm registry visibility: ${package}@${version} (${attempt}/60)\" >&2\n",
+    "                sleep 30\n",
+    "              fi\n",
+    "            done\n",
+    "            if test \"$published\" != \"true\"; then\n",
+    "              echo \"npm registry did not expose ${package}@${version} within 30 minutes\" >&2\n",
+    "              exit 1\n",
+    "            fi\n",
+);
 
 fn verify_workflow_policy_text(
     name: &str,
@@ -1319,6 +1345,16 @@ fn verify_workflow_policy_text(
             let prepare_permissions = job_permissions(prepare)?;
             let publish = workflow_job_block(workflow, "publish")?;
             let publish_permissions = job_permissions(publish)?;
+            let retry_order_is_closed = match (
+                publish.find("npm publish \"./${file}\" --access public --tag latest --provenance"),
+                publish.find(NPM_POST_PUBLISH_RETRY_BLOCK),
+                publish.find("          done < <(jq -r '.packages[]"),
+            ) {
+                (Some(publish_offset), Some(retry_offset), Some(loop_end_offset)) => {
+                    publish_offset < retry_offset && retry_offset < loop_end_offset
+                }
+                _ => false,
+            };
             if top_level_trigger_keys(workflow)? != ["workflow_dispatch"]
                 || !workflow.contains("\n  workflow_dispatch:\n")
                 || !top_permissions.is_empty()
@@ -1338,15 +1374,22 @@ fn verify_workflow_policy_text(
                 || !prepare.contains("--ignore-scripts")
                 || !publish.contains("if: startsWith(github.ref, 'refs/tags/v')")
                 || !publish.contains("    environment: npm\n")
+                || publish.matches("    timeout-minutes: 210\n").count() != 1
                 || publish.contains("actions/checkout@")
                 || publish.contains("run: cargo")
                 || publish.contains("npm/scripts/")
                 || publish.matches("npm publish").count() != 1
                 || !publish.contains("--provenance")
+                || publish.matches(NPM_POST_PUBLISH_RETRY_BLOCK).count() != 1
+                || !retry_order_is_closed
+                || publish.matches("grep -q 'E404'").count() != 2
+                || !publish.contains("sleep 30")
+                || !publish.contains("npm registry did not expose")
+                || publish.contains("actual_integrity=\"$(npm view")
                 || !publish.contains("needs: prepare")
             {
                 bail!(
-                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, and publish provenance from a tag-guarded environment-protected no-checkout OIDC job"
+                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, publish provenance from a tag-guarded environment-protected no-checkout OIDC job, and tolerate bounded post-publish registry propagation"
                 );
             }
         }
@@ -14880,8 +14923,9 @@ mod tests {
         CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, FullCiJobEvidence,
         FullCiRunEvidence, GithubActionsPolicy, MCP_OPERATION_CONTRACT_VERSION,
         MCP_PROTOCOL_REVISION, MCP_SDK_VERSION, MCP_TOOL_CONTRACT_VERSION,
-        PROJECT_LICENSE_EXPRESSION, RECOVERY_PINNED_NODE_SETUP_STEP, RECOVERY_VERIFIER_RUN,
-        RELEASE_CARGO_BUILD_TARGETS, RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
+        NPM_POST_PUBLISH_RETRY_BLOCK, PROJECT_LICENSE_EXPRESSION, RECOVERY_PINNED_NODE_SETUP_STEP,
+        RECOVERY_VERIFIER_RUN, RELEASE_CARGO_BUILD_TARGETS,
+        RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
         RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleasePostPublishEvidence, ReleasePostPublishEvidenceRequest, ReleaseVerificationReport,
         STABLE_BENCHMARK_METRICS, STABLE_RELEASE_GATE_CHECK_IDS,
@@ -15598,6 +15642,15 @@ jobs:
         }
 
         let npm_release = fs::read_to_string(root.join(".github/workflows/npm-release.yml"))?;
+        let relocated_npm_retry = npm_release
+            .replacen(NPM_POST_PUBLISH_RETRY_BLOCK, "", 1)
+            .replacen(
+                "          done < <(jq -r '.packages[] | [.name, .version, .tarball, .sha256, .integrity] | @tsv' \"$inventory\")\n",
+                &format!(
+                    "          done < <(jq -r '.packages[] | [.name, .version, .tarball, .sha256, .integrity] | @tsv' \"$inventory\")\n{NPM_POST_PUBLISH_RETRY_BLOCK}"
+                ),
+                1,
+            );
         for drifted_npm_release in [
             npm_release.replacen("      actions: read\n", "", 1),
             npm_release.replacen("      id-token: write", "      contents: write", 1),
@@ -15613,6 +15666,19 @@ jobs:
                 1,
             ),
             npm_release.replacen(" --provenance", "", 1),
+            npm_release.replacen("    timeout-minutes: 210", "    timeout-minutes: 180", 1),
+            npm_release.replacen(
+                "            for attempt in {1..60}; do",
+                "            for attempt in 1 2 3 4 5; do",
+                1,
+            ),
+            npm_release.replacen(
+                "              if npm view \"${package}@${version}\" dist.integrity --json >\"$view_output\" 2>\"$view_error\"; then",
+                "              actual_integrity=\"$(npm view \"${package}@${version}\" dist.integrity --json 2>/dev/null | jq -r '.')\"\n              if test -n \"$actual_integrity\"; then",
+                1,
+            ),
+            npm_release.replacen("                sleep 30", "                sleep 1", 1),
+            relocated_npm_retry,
             format!("{npm_release}\n# ${{{{ secrets.NPM_TOKEN }}}}\n"),
         ] {
             assert!(

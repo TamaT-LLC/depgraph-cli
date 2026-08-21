@@ -111,6 +111,9 @@ depgraph export --format mermaid > graph.mmd
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCのorganization scopeである`@tamat-llc`から公開する。
 `npm i -g @tamat-llc/depgraph`により同じ5 targetの検証済みnative packageを導入でき、install scriptによる外部downloadは行わない。
+npm版のランチャーにはNode.js 24以上が必要である。
+`depgraph` CLIはnpmから導入したpackageだけで実行できる。
+`depgraph-mcp`も同じnpm packageから導入されるが、MCPサーバーの起動には同じversionとtargetのGitHub Releaseにあるcompiler packを検証して展開し、そのrequirement fileを追加で指定する。
 公開状態と初回bootstrapは[npmリリース手順](docs/50_test/npm-release-procedure.md)で確認する。
 対象に対応する`TARGET`は次の値から選ぶ。
 

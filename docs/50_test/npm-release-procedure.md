@@ -52,6 +52,12 @@ artifactだけを入力にする。
 不存在を再確認し、5つのnative packageを先に、`@tamat-llc/depgraph`を最後に公開する。
 同じversionがすでに存在する場合はregistry上のintegrityとrepositoryが一致する
 ときだけskipするため、部分失敗後の再実行は安全である。
+`npm publish`の成功後にregistryのread APIが一時的に`E404`を返す場合がある。
+workflowは約30分を上限に同じversionの可視化を待ち、integrityが一致してから次の
+packageへ進む。
+6 packageの待機と処理時間を含む`publish` job全体は210分で終了する。
+待機中は同じversionを再公開しない。
+`E404`以外の参照失敗とintegrity不一致は直ちに失敗させる。
 
 GitHub Environment `npm`は`repo-knowledge-mcp`と同じ保護設定にする。
 `TakehiroT`または`Fuelda`のいずれか1名の承認を必要とし、self-reviewを禁止する。
@@ -190,6 +196,7 @@ unscopedのroot packageとWindows packageは公開していないため、新た
 native packageの途中で失敗した場合はroot packageを公開しない。
 workflowを再実行すると、公開済みtarballはintegrity一致時だけskipされ、残りから
 再開する。
+ただし、`npm publish`が成功してregistryの可視化を待っている間は再実行しない。
 同じname/versionのintegrityが異なる場合、削除や上書きを試みず、新しいpatch
 versionで作り直す。
 
