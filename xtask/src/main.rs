@@ -1969,7 +1969,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         );
     }
 
-    let readme = read_lf_normalized_text(&root.join("README.md"))?;
+    let readme = read_lf_normalized_text(&root.join("README.en.md"))?;
     let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
     let design = read_lf_normalized_text(
         &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
@@ -2698,11 +2698,14 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
-    if !git_attributes
-        .lines()
-        .any(|line| line.trim() == "README.md text eol=lf")
-    {
-        bail!("README release metadata is not pinned to LF in .gitattributes");
+    for readme_path in ["README.md", "README.en.md"] {
+        let required_attribute = format!("{readme_path} text eol=lf");
+        if !git_attributes
+            .lines()
+            .any(|line| line.trim() == required_attribute)
+        {
+            bail!("{readme_path} is not pinned to LF in .gitattributes");
+        }
     }
     for (path, expected) in PROJECT_LICENSES {
         let required_attribute = format!("{path} text eol=lf");
@@ -3168,6 +3171,20 @@ fn verify_public_community_surface(root: &Path) -> Result<()> {
         (
             "README.md",
             &[
+                "日本語 | [English](README.en.md)",
+                "## プロジェクトの状況と公開コラボレーション",
+                "サポート対象は、検証済みの`v0.5.1`リリースを条件として確定する",
+                "[SUPPORT.md](SUPPORT.md)",
+                "[CONTRIBUTING.md](CONTRIBUTING.md)",
+                "[GOVERNANCE.md](GOVERNANCE.md)",
+                "[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)",
+                "[SECURITY.md](SECURITY.md)",
+            ],
+        ),
+        (
+            "README.en.md",
+            &[
+                "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
                 "The supported line is conditionally anchored by the verified `v0.5.1` Release",
                 "[SUPPORT.md](SUPPORT.md)",

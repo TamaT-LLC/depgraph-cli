@@ -52,7 +52,7 @@ This project uses the [Developer Certificate of Origin 1.1](https://developercer
 for inbound contributions. Use `git commit -s` to add your own `Signed-off-by`
 line to every commit. The sign-off certifies that you have the right to submit
 the work under this repository's
-[MIT OR Apache-2.0](README.md#license) terms. A GitHub-provided no-reply address
+[MIT OR Apache-2.0](README.en.md#license) terms. A GitHub-provided no-reply address
 is acceptable. The DCO is the active policy; no CLA is required unless
 TamaT-LLC completes a documented legal review and updates this file before
 accepting contributions under a CLA.

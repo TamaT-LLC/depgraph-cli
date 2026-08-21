@@ -2,7 +2,7 @@
 
 This runbook is for an Agent host that launches the packaged `depgraph-mcp`
 stdio server. Start with the read-only example in the
-[README](../../README.md#mcp-stdio-server-experimental). Copy one privileged
+[English README](../../README.en.md#mcp-stdio-server). Copy one privileged
 profile below only when its effects are required; do not register several
 profiles for the same repository as an accidental privilege fallback.
 
