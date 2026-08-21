@@ -55,6 +55,7 @@ artifactだけを入力にする。
 `npm publish`の成功後にregistryのread APIが一時的に`E404`を返す場合がある。
 workflowは約30分を上限に同じversionの可視化を待ち、integrityが一致してから次の
 packageへ進む。
+6 packageの待機と処理時間を含む`publish` job全体は210分で終了する。
 待機中は同じversionを再公開しない。
 `E404`以外の参照失敗とintegrity不一致は直ちに失敗させる。
 
