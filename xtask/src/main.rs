@@ -1343,10 +1343,18 @@ fn verify_workflow_policy_text(
                 || publish.contains("npm/scripts/")
                 || publish.matches("npm publish").count() != 1
                 || !publish.contains("--provenance")
+                || !publish.contains("for attempt in {1..60}; do")
+                || !publish.contains(
+                    "if npm view \"${package}@${version}\" dist.integrity --json >\"$view_output\" 2>\"$view_error\"; then",
+                )
+                || publish.matches("grep -q 'E404'").count() != 2
+                || !publish.contains("sleep 30")
+                || !publish.contains("npm registry did not expose")
+                || publish.contains("actual_integrity=\"$(npm view")
                 || !publish.contains("needs: prepare")
             {
                 bail!(
-                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, and publish provenance from a tag-guarded environment-protected no-checkout OIDC job"
+                    "npm release must dispatch against an evidence-bound stable tag, prepare without OIDC, publish provenance from a tag-guarded environment-protected no-checkout OIDC job, and tolerate bounded post-publish registry propagation"
                 );
             }
         }
@@ -15613,6 +15621,17 @@ jobs:
                 1,
             ),
             npm_release.replacen(" --provenance", "", 1),
+            npm_release.replacen(
+                "            for attempt in {1..60}; do",
+                "            for attempt in 1 2 3 4 5; do",
+                1,
+            ),
+            npm_release.replacen(
+                "              if npm view \"${package}@${version}\" dist.integrity --json >\"$view_output\" 2>\"$view_error\"; then",
+                "              actual_integrity=\"$(npm view \"${package}@${version}\" dist.integrity --json 2>/dev/null | jq -r '.')\"\n              if test -n \"$actual_integrity\"; then",
+                1,
+            ),
+            npm_release.replacen("                sleep 30", "                sleep 1", 1),
             format!("{npm_release}\n# ${{{{ secrets.NPM_TOKEN }}}}\n"),
         ] {
             assert!(

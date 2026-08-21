@@ -20,5 +20,11 @@ including `release-manifest.json`, project licenses, third-party notices, and
 the SPDX SBOM. Before launch, the JavaScript shim checks the package identity,
 target, native executable path, and SHA-256 recorded in the release manifest.
 
+The npm package alone is sufficient for the `depgraph` CLI. Starting
+`depgraph-mcp` also requires the matching compiler-pack archive from the same
+GitHub Release to be checksum-verified and extracted beside its requirement
+file. The MCP server validates that evidence-bound input before accepting a
+connection.
+
 See the [project README](https://github.com/TamaT-LLC/depgraph-cli#readme) for
 usage, safety boundaries, MCP configuration, and release verification.

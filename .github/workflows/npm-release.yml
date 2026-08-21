@@ -255,13 +255,27 @@ jobs:
             npm publish "./${file}" --access public --tag latest --provenance
 
             published=false
-            for attempt in 1 2 3 4 5; do
-              actual_integrity="$(npm view "${package}@${version}" dist.integrity --json 2>/dev/null | jq -r '.')"
-              if test "$actual_integrity" = "$expected_integrity"; then
+            for attempt in {1..60}; do
+              if npm view "${package}@${version}" dist.integrity --json >"$view_output" 2>"$view_error"; then
+                actual_integrity="$(jq -er '.' "$view_output")"
+                if test "$actual_integrity" != "$expected_integrity"; then
+                  echo "published npm integrity differs for ${package}@${version}" >&2
+                  exit 1
+                fi
                 published=true
                 break
               fi
-              sleep $((attempt * 2))
+              if ! grep -q 'E404' "$view_error"; then
+                cat "$view_error" >&2
+                exit 1
+              fi
+              if test "$attempt" -lt 60; then
+                echo "waiting for npm registry visibility: ${package}@${version} (${attempt}/60)" >&2
+                sleep 30
+              fi
             done
-            test "$published" = "true"
+            if test "$published" != "true"; then
+              echo "npm registry did not expose ${package}@${version} within 30 minutes" >&2
+              exit 1
+            fi
           done < <(jq -r '.packages[] | [.name, .version, .tarball, .sha256, .integrity] | @tsv' "$inventory")
