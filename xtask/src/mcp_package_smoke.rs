@@ -36,6 +36,7 @@ const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSI
 const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const RELEASE_EVIDENCE_CONTRACT_VERSION: &str = "release-post-publish-evidence-v1";
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
+const README_PATH: &str = "README.en.md";
 const DOCUMENTATION_PATH: &str = "docs/50_test/mcp-agent-host-operations.md";
 const DOCUMENTATION_MARKER_PREFIX: &str = "<!-- depgraph-mcp-package-smoke:";
 const ONBOARDING_MARKER_PREFIX: &str = "<!-- depgraph-agent-config:";
@@ -169,7 +170,7 @@ pub fn verify_documentation(workspace: &Path, release_version: &str) -> Result<(
 }
 
 fn verify_host_quickstarts(workspace: &Path, release_version: &str) -> Result<()> {
-    let readme = crate::read_lf_normalized_text(&workspace.join("README.md"))?;
+    let readme = crate::read_lf_normalized_text(&workspace.join(README_PATH))?;
     let runbook = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
     if runbook.matches(ONBOARDING_MARKER_PREFIX).count() != 2 {
         bail!("Agent onboarding documentation must contain exact Codex and VS Code markers");
@@ -219,7 +220,7 @@ fn documented_launch_profiles(
     workspace: &Path,
     release_version: &str,
 ) -> Result<BTreeMap<String, DocumentedLaunchProfile>> {
-    let readme = crate::read_lf_normalized_text(&workspace.join("README.md"))?;
+    let readme = crate::read_lf_normalized_text(&workspace.join(README_PATH))?;
     let runbook = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
     let marker_count = readme.matches(DOCUMENTATION_MARKER_PREFIX).count()
         + runbook.matches(DOCUMENTATION_MARKER_PREFIX).count();
@@ -1976,7 +1977,7 @@ mod tests {
         let workspace = crate::workspace_root();
         let temporary = tempfile::tempdir()?;
         fs::create_dir_all(temporary.path().join("docs/50_test"))?;
-        for path in ["README.md", DOCUMENTATION_PATH] {
+        for path in [README_PATH, DOCUMENTATION_PATH] {
             let content = crate::read_lf_normalized_text(&workspace.join(path))?;
             fs::write(temporary.path().join(path), content.replace('\n', "\r\n"))?;
         }
@@ -2034,10 +2035,10 @@ mod tests {
         let workspace = crate::workspace_root();
         let temporary = tempfile::tempdir()?;
         fs::create_dir_all(temporary.path().join("docs/50_test"))?;
-        let readme = fs::read_to_string(workspace.join("README.md"))?;
+        let readme = fs::read_to_string(workspace.join(README_PATH))?;
         let runbook = fs::read_to_string(workspace.join(DOCUMENTATION_PATH))?;
         fs::write(
-            temporary.path().join("README.md"),
+            temporary.path().join(README_PATH),
             readme.replacen(
                 "\"--capability\", \"read\",",
                 "\"--capability\", \"store-write\",",
@@ -2047,7 +2048,7 @@ mod tests {
         fs::write(temporary.path().join(DOCUMENTATION_PATH), &runbook)?;
         assert!(verify_documentation(temporary.path(), crate::VERSION).is_err());
 
-        fs::write(temporary.path().join("README.md"), &readme)?;
+        fs::write(temporary.path().join(README_PATH), &readme)?;
         fs::write(
             temporary.path().join(DOCUMENTATION_PATH),
             format!(
