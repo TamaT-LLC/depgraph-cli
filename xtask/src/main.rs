@@ -1825,7 +1825,15 @@ fn is_lower_hex_len(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn verify_japanese_readme_contract(readme: &str) -> Result<()> {
+fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
+    readme
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("depgraph "))
+        .collect()
+}
+
+fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
     let release_package = format!(
         "`v{VERSION}`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。"
@@ -1860,7 +1868,7 @@ fn verify_japanese_readme_contract(readme: &str) -> Result<()> {
         "depgraph runtime validate --file runtime-trace.json --json",
         "depgraph export --format graphml --output graph.graphml",
         "`project_code_executed`は`false`",
-        "| 4 | プロジェクトコード実行権限またはセキュリティポリシーの失敗 |",
+        "[コンパイラーパックとリリース検証](README.en.md#compiler-pack-and-release-verification)",
         "[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)",
     ] {
         if !readme.contains(required) {
@@ -1871,6 +1879,40 @@ fn verify_japanese_readme_contract(readme: &str) -> Result<()> {
         if !readme.contains(target) {
             bail!("Japanese README release target matrix is missing {target:?}");
         }
+    }
+
+    let japanese_examples = readme_cli_examples(readme);
+    let english_examples = readme_cli_examples(english_readme);
+    if japanese_examples.is_empty() {
+        bail!("Japanese README must contain CLI examples");
+    }
+    if let Some(example) = japanese_examples.difference(&english_examples).next() {
+        bail!("Japanese README CLI example is not synchronized with English README: {example:?}");
+    }
+
+    let exit_code_section = readme
+        .split_once("## 厳格ポリシーと終了コード\n")
+        .map(|(_, section)| section)
+        .context("Japanese README is missing the strict policy and exit codes section")?;
+    let exit_code_section = exit_code_section
+        .split_once("\n## ")
+        .map_or(exit_code_section, |(section, _)| section);
+    let actual_exit_code_table = exit_code_section
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|'))
+        .collect::<Vec<_>>();
+    let expected_exit_code_table = [
+        "| コード | 意味 |",
+        "| ---: | --- |",
+        "| 0 | ポリシー違反なしで処理が完了した |",
+        "| 1 | グラフまたはカバレッジのポリシー違反 |",
+        "| 2 | CLIの使用方法、セレクター、設定のエラー |",
+        "| 3 | ワーカー、ツールチェーン、グラフ検証、プロトコルの失敗 |",
+        "| 4 | プロジェクトコード実行権限またはセキュリティポリシーの失敗 |",
+    ];
+    if actual_exit_code_table != expected_exit_code_table {
+        bail!("Japanese README exit code table is not synchronized with the CLI contract");
     }
     Ok(())
 }
@@ -2021,7 +2063,7 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
 
     let english_readme = read_lf_normalized_text(&root.join("README.en.md"))?;
     let japanese_readme = read_lf_normalized_text(&root.join("README.md"))?;
-    verify_japanese_readme_contract(&japanese_readme)?;
+    verify_japanese_readme_contract(&japanese_readme, &english_readme)?;
     let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
     let design = read_lf_normalized_text(
         &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
@@ -2066,6 +2108,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
         "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
         "depgraph runtime validate --file runtime-trace.json --json",
+        "## Compiler pack and release verification",
+        "gh release download \"$release_tag\" \\\n  --repo TamaT-LLC/depgraph-cli",
         "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
         "no `v0.4.0` stable GitHub",
@@ -15196,24 +15240,38 @@ mod tests {
     #[test]
     fn japanese_readme_shared_contract_drift_is_rejected() -> Result<()> {
         let readme = super::read_lf_normalized_text(&workspace_root().join("README.md"))?;
-        super::verify_japanese_readme_contract(&readme)?;
+        let english_readme =
+            super::read_lf_normalized_text(&workspace_root().join("README.en.md"))?;
+        super::verify_japanese_readme_contract(&readme, &english_readme)?;
 
         let store_schema = format!("ストアスキーマは`{}`", depgraph_store::STORE_SCHEMA_VERSION);
         let drifted_schema = readme.replacen(&store_schema, "ストアスキーマは`999`", 1);
         assert_ne!(drifted_schema, readme);
-        assert!(super::verify_japanese_readme_contract(&drifted_schema).is_err());
+        assert!(super::verify_japanese_readme_contract(&drifted_schema, &english_readme).is_err());
 
-        let drifted_command = readme.replacen(
-            "depgraph runtime validate --file runtime-trace.json --json",
-            "depgraph runtime validate --file runtime-trace.json --yaml",
+        for example in super::readme_cli_examples(&readme) {
+            let drifted_example = format!("{example} --invalid-readme-contract");
+            let drifted_readme = readme.replacen(example, &drifted_example, 1);
+            assert_ne!(drifted_readme, readme);
+            assert!(
+                super::verify_japanese_readme_contract(&drifted_readme, &english_readme).is_err(),
+                "Japanese README CLI drift was accepted: {example}"
+            );
+        }
+
+        let drifted_exit_code = readme.replacen(
+            "| 0 | ポリシー違反なしで処理が完了した |",
+            "| 0 | 常に失敗する |",
             1,
         );
-        assert_ne!(drifted_command, readme);
-        assert!(super::verify_japanese_readme_contract(&drifted_command).is_err());
+        assert_ne!(drifted_exit_code, readme);
+        assert!(
+            super::verify_japanese_readme_contract(&drifted_exit_code, &english_readme).is_err()
+        );
 
         let drifted_target = readme.replacen("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu", 1);
         assert_ne!(drifted_target, readme);
-        assert!(super::verify_japanese_readme_contract(&drifted_target).is_err());
+        assert!(super::verify_japanese_readme_contract(&drifted_target, &english_readme).is_err());
         Ok(())
     }
 

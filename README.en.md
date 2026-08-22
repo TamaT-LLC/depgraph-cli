@@ -858,6 +858,8 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 
+## Compiler pack and release verification
+
 The opt-in Rust compiler-precise toolchain is distributed separately from the
 normal archive. `cargo xtask compiler-pack SOURCE OUTPUT --spec SPEC.json`
 builds one target-specific, closed-tree pack from pre-extracted official
@@ -892,6 +894,7 @@ target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_targe
 name="depgraph-compiler-pack-${version}-${target}"
 
 gh release download "$release_tag" \
+  --repo TamaT-LLC/depgraph-cli \
   --pattern "$name.tar.gz" \
   --pattern "$name.tar.gz.sha256" \
   --pattern "$name.requirement.json" \

@@ -371,7 +371,7 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 - [実行時トレースの取り込み契約](README.en.md#runtime-trace-import-contract)
 - [安全なスキャンの完全な境界](README.en.md#safe-scan-boundary)
 - [ビルドモードの完全な同意境界](README.en.md#build-mode-consent-boundary)
-- [コンパイラーパックとリリース検証](README.en.md#repository-layout)
+- [コンパイラーパックとリリース検証](README.en.md#compiler-pack-and-release-verification)
 
 <a id="license"></a>
 ## ライセンス
