@@ -1825,6 +1825,56 @@ fn is_lower_hex_len(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn verify_japanese_readme_contract(readme: &str) -> Result<()> {
+    let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
+    let release_package = format!(
+        "`v{VERSION}`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。"
+    );
+    let release_version_assignment = format!("VERSION={VERSION}");
+    let compatibility = format!(
+        "v0.5のワーカープロトコルは`{}`、ストアスキーマは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
+        depgraph_protocol::PROTOCOL_VERSION,
+        depgraph_store::STORE_SCHEMA_VERSION,
+        depgraph_operation::JOURNAL_SCHEMA_VERSION,
+        MCP_TOOL_CONTRACT_VERSION,
+        MCP_OPERATION_CONTRACT_VERSION,
+    );
+    for required in [
+        "日本語 | [English](README.en.md)",
+        "Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0",
+        release_note.as_str(),
+        release_package.as_str(),
+        release_version_assignment.as_str(),
+        "`npm i -g @tamat-llc/depgraph`",
+        "すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。",
+        compatibility.as_str(),
+        "`v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。",
+        "[`v0.4.0`の契約](docs/releases/v0.4.0.md)",
+        "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
+        "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
+        "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
+        "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
+        "depgraph scan /path/to/repository --strict",
+        "depgraph profiles plan /path/to/repository --profiles-file profiles.json --json",
+        "depgraph resolve --build /path/to/repository --allow-project-code",
+        "depgraph runtime validate --file runtime-trace.json --json",
+        "depgraph export --format graphml --output graph.graphml",
+        "`project_code_executed`は`false`",
+        "| 4 | プロジェクトコード実行権限またはセキュリティポリシーの失敗 |",
+        "[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)",
+    ] {
+        if !readme.contains(required) {
+            bail!("Japanese README shared contract metadata is missing {required:?}");
+        }
+    }
+    for (target, _) in RELEASE_TARGETS {
+        if !readme.contains(target) {
+            bail!("Japanese README release target matrix is missing {target:?}");
+        }
+    }
+    Ok(())
+}
+
 fn verify_project_metadata(root: &Path) -> Result<()> {
     verify_github_actions_security(root)?;
     verify_mcp_tasks_architecture_decision(root)?;
@@ -1969,7 +2019,9 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         );
     }
 
-    let readme = read_lf_normalized_text(&root.join("README.en.md"))?;
+    let english_readme = read_lf_normalized_text(&root.join("README.en.md"))?;
+    let japanese_readme = read_lf_normalized_text(&root.join("README.md"))?;
+    verify_japanese_readme_contract(&japanese_readme)?;
     let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
     let design = read_lf_normalized_text(
         &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
@@ -2019,8 +2071,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
         "no `v0.4.0` stable GitHub",
         "Store\nschema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
     ] {
-        if !readme.contains(required) {
-            bail!("README release metadata is missing {required:?}");
+        if !english_readme.contains(required) {
+            bail!("English README release metadata is missing {required:?}");
         }
     }
     if !rc1_release.contains("depgraph runtime validate --file runtime-trace.json --json") {
@@ -2028,8 +2080,8 @@ fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     let release_note = format!("docs/releases/v{VERSION}.md");
     let release_link = format!("[`v{VERSION}` release notes]({release_note})");
-    if !readme.contains(&release_link) || !root.join(&release_note).is_file() {
-        bail!("README release note link is not synchronized with {VERSION}");
+    if !english_readme.contains(&release_link) || !root.join(&release_note).is_file() {
+        bail!("English README release note link is not synchronized with {VERSION}");
     }
     for required in [
         "updated: 2026-08-20",
@@ -15139,6 +15191,30 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn japanese_readme_shared_contract_drift_is_rejected() -> Result<()> {
+        let readme = super::read_lf_normalized_text(&workspace_root().join("README.md"))?;
+        super::verify_japanese_readme_contract(&readme)?;
+
+        let store_schema = format!("ストアスキーマは`{}`", depgraph_store::STORE_SCHEMA_VERSION);
+        let drifted_schema = readme.replacen(&store_schema, "ストアスキーマは`999`", 1);
+        assert_ne!(drifted_schema, readme);
+        assert!(super::verify_japanese_readme_contract(&drifted_schema).is_err());
+
+        let drifted_command = readme.replacen(
+            "depgraph runtime validate --file runtime-trace.json --json",
+            "depgraph runtime validate --file runtime-trace.json --yaml",
+            1,
+        );
+        assert_ne!(drifted_command, readme);
+        assert!(super::verify_japanese_readme_contract(&drifted_command).is_err());
+
+        let drifted_target = readme.replacen("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu", 1);
+        assert_ne!(drifted_target, readme);
+        assert!(super::verify_japanese_readme_contract(&drifted_target).is_err());
+        Ok(())
     }
 
     #[test]
