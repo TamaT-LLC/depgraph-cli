@@ -20,7 +20,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 ## リリース準備
 
 1. バージョン変更とrelease noteを一つのPRにまとめる。
-   現行契約ではbase versionは`0.5.2`である。
+   現行契約ではbase versionは`0.5.3`である。
 2. release noteを`docs/releases/<タグ名>.md`として追加する。
 3. タグ名をworkspace versionと一致する`vX.Y.Z`または`vX.Y.Z-rc.N`にする。
 4. `N`には先頭ゼロのない正整数を使う。
@@ -28,7 +28,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 
 Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
 `v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。
-現行の`v0.5.2` stableはbaseline statusを`maintenance-ref-pinned`とする。
+現行の`v0.5.3` stableはbaseline statusを`maintenance-ref-pinned`とする。
 tag source、remote `main`、`refs/heads/release/0.5`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければ、default-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
 公開済み`v0.5.0`のsource SHAは履歴検証用に固定し、現行candidateのSHAとして再利用しない。
 
@@ -89,7 +89,7 @@ push済みtagを移動・再利用しない。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
-release_tag="vX.Y.Z-rc.N" # 現行stableでは v0.5.2
+release_tag="vX.Y.Z-rc.N" # 現行stableでは v0.5.3
 candidate_record="$(git rev-parse --git-path depgraph-release-candidate)"
 test -f "$candidate_record"
 test ! -L "$candidate_record"
@@ -102,7 +102,7 @@ git fetch origin main
 test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 test -f "docs/releases/${release_tag}.md"
 
-if [[ "$release_tag" == "v0.5.2" ]]; then
+if [[ "$release_tag" == "v0.5.3" ]]; then
   git fetch origin release/0.5
   maintenance="$(git rev-parse origin/release/0.5)"
   git merge-base --is-ancestor "$maintenance" "$candidate"
@@ -112,7 +112,7 @@ if [[ "$release_tag" == "v0.5.2" ]]; then
   printf '%s\n' \
     release-baseline-v1 \
     repository=TamaT-LLC/depgraph-cli \
-    version=0.5.2 \
+    version=0.5.3 \
     commit="$candidate" |
     shasum -a 256
 fi
@@ -128,7 +128,7 @@ stableではfast-forwardと一致確認の後だけsigned annotated tagを同じ
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
 tag側のstable gateはGitHub APIから`main` headのexact eight-job Full CIを再取得し、`agent-dogfood-report-v1`の固定SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`と全14 gateを再計算する。
-exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.5.2.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
+exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.5.3.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。

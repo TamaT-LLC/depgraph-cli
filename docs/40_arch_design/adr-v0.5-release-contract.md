@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-13
-- Updated: 2026-08-24
+- Updated: 2026-08-25
 - Decision ID: `PROJ-ARC-001-ADR-007`
 - Issue: `PROJ-ARC-003-TASK-001` / #355
 - Contract: `stable-release-gate-v2`
@@ -124,6 +124,19 @@ The stable source rule remains exact-source and fail-closed. The signed
 Full-CI-green commit at publication. The source guard preserves the published
 `v0.5.1` source as immutable history while treating `v0.5.2` as the current
 stable candidate.
+
+### 2026-08-25 Windows post-publish canary patch amendment
+
+`v0.5.3` fixes only the Windows orchestration used to exercise repository-scoped
+MCP onboarding after publication. GNU tar must treat the absolute drive-letter
+archive path as local by using `--force-local`; otherwise the colon in `D:` is
+parsed as a remote archive separator. This patch does not change the worker
+protocol, Store schema, operation journal schema, MCP DTOs, CLI defaults, or
+release artifact formats.
+
+The signed `v0.5.3` tag, remote `main`, and `release/0.5` remain bound to one
+reviewed Full-CI-green commit. The published `v0.5.2` tag, source, Release,
+assets, and post-publish evidence remain immutable history.
 
 ## Consequences
 
