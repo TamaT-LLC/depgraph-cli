@@ -56,6 +56,7 @@ mod service_repository;
 mod service_snapshot;
 mod service_store_write;
 pub mod worker;
+mod worker_web_semantic;
 
 use std::{
     collections::BTreeMap,
