@@ -364,11 +364,72 @@ depgraph export --format graphml --output graph.graphml
 `read` capability: no store mutation, repository write, daemon control, or
 project-code execution is enabled. It requires an existing fixed repository
 root, an explicit absolute store-file path, and the validated compiler-pack
-requirement published for the host. Replace the path placeholders below with
-canonical absolute paths and `TARGET_TRIPLE` with the release host target; Agent
-hosts must not rely on shell or environment expansion.
+requirement published for the host.
 
-The recommended onboarding command authenticates the downloaded inputs against
+#### Repository-scoped Codex setup
+
+After installing an official stable `depgraph` release, run this command from
+any directory inside the Git repository that Codex should inspect:
+
+```sh
+depgraph mcp setup --host codex
+```
+
+The command resolves and seals the nearest canonical Git root before making a
+network request or write. It downloads the exact stable release and compiler
+pack for the invoking CLI version and native target, verifies GitHub's asset
+digests, checksum sidecars, release manifest, compiler-pack closure, and
+post-publish evidence, and stores the verified runtime and compiler pack in a
+version/target shared OS cache. It derives a separate Store outside the
+repository, creates the initial snapshot with the non-executing safe scan,
+performs the packaged `initialize`, `tools/list`, and `get_context` preflight,
+then atomically merges only `mcp_servers.depgraph` into
+`.codex/config.toml`. Existing unrelated TOML settings are retained. The
+installed entry contains absolute paths and fixes the server to this root,
+Store, compiler-pack requirement, and read-only capability.
+
+Restart Codex after setup so it reloads the trusted project's configuration.
+Rerunning setup is idempotent: verified shared artifacts and a valid current
+snapshot are reused. Use the lifecycle commands from the same repository:
+
+```sh
+depgraph mcp status --host codex
+depgraph mcp update --host codex
+depgraph mcp uninstall --host codex
+```
+
+`status` independently rechecks the official release metadata, cached bytes,
+package closure, Store/root snapshot, exact project entry, and live MCP
+preflight. `update` reconciles to the invoking CLI version and refreshes the
+safe snapshot. `uninstall` removes only the matching project entry and that
+repository's Store/journal/lock state; the shared verified artifacts remain for
+other repositories. Pass `--root /absolute/path/to/repository` when running
+outside the checkout. If you choose a custom Store with the global
+`--store /absolute/path/to/graph.db` option, put it before `mcp` and repeat the
+same option for every lifecycle command.
+
+Setup requires a real `curl` executable outside the repository and an exact
+published stable release for the CLI version. An invalid/ambiguous Git root,
+home or filesystem root, unexpected symlink, changed GitHub asset, malformed
+existing Codex TOML, or failed package/MCP preflight stops without publishing a
+partial host entry. After an interrupted download or extraction, rerun the
+same command; process-held cache locks are released on exit and incomplete
+temporary content is ignored. If `status` reports drift or a missing snapshot,
+run `update`; if Codex still shows the old entry after a successful check,
+restart Codex. See the
+[MCP Agent host operations runbook](docs/50_test/mcp-agent-host-operations.md)
+for the ownership model and detailed recovery table.
+
+#### Low-level host configuration generation
+
+`agent-config` remains the low-level workflow for other Agent hosts, custom
+capability profiles, or operators who manage host files themselves. It prints
+a verified entry to stdout and never edits a host file or creates/migrates the
+Store. Replace the path placeholders below with canonical absolute paths and
+`TARGET_TRIPLE` with the release host target; Agent hosts must not rely on shell
+or environment expansion.
+
+The command authenticates the supplied inputs against
 the official release's closed post-publish evidence, verifies the archive and
 exact checksum sidecar, binds the extracted manifest to that archive, checks
 every MCP/runner/schema/worker sibling, validates the compiler pack and fixed

@@ -513,3 +513,90 @@ jobs:
             "$trusted_evidence_sha256" \
             workers/web/test/fixtures/polyglot \
             post-publish/canary
+
+  mcp-repository-setup:
+    needs: publish
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+            executable_suffix: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: tar.gz
+            executable_suffix: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: tar.gz
+            executable_suffix: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extension: tar.gz
+            executable_suffix: ""
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            extension: zip
+            executable_suffix: .exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Exercise clean repository-scoped MCP onboarding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPGRAPH_E2E_TARGET: ${{ matrix.target }}
+          DEPGRAPH_E2E_EXTENSION: ${{ matrix.extension }}
+          DEPGRAPH_E2E_EXECUTABLE_SUFFIX: ${{ matrix.executable_suffix }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="depgraph-${version}-${DEPGRAPH_E2E_TARGET}"
+          archive="${package}.${DEPGRAPH_E2E_EXTENSION}"
+          release_root="${RUNNER_TEMP}/depgraph-mcp-release"
+          repository="${RUNNER_TEMP}/depgraph-mcp-repository"
+          test_home="${RUNNER_TEMP}/depgraph-mcp-home"
+          mkdir -p "$release_root" "$repository/src" "$test_home/cache" "$test_home/local"
+          gh release download "$GITHUB_REF_NAME" --pattern "$archive" --dir "$release_root"
+          tar -xf "$release_root/$archive" -C "$release_root"
+          binary="$release_root/$package/bin/depgraph${DEPGRAPH_E2E_EXECUTABLE_SUFFIX}"
+          test -x "$binary"
+
+          git init --quiet --initial-branch=main "$repository"
+          printf 'export const answer = 42;\n' > "$repository/src/index.ts"
+          export HOME="$test_home"
+          export XDG_CACHE_HOME="$test_home/cache"
+          export LOCALAPPDATA="$test_home/local"
+          export APPDATA="$test_home/local"
+
+          first="$("$binary" mcp setup --host codex --root "$repository")"
+          printf '%s\n' "$first"
+          grep -Fq 'artifacts: 0 reused, 6 downloaded' <<<"$first"
+          test -f "$repository/.codex/config.toml"
+          grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"
+
+          second="$("$binary" mcp setup --host codex --root "$repository")"
+          printf '%s\n' "$second"
+          grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$second"
+          grep -Fq 'Codex config:' <<<"$second"
+          grep -Fq '(unchanged)' <<<"$second"
+
+          "$binary" mcp status --host codex --root "$repository"
+          update="$("$binary" mcp update --host codex --root "$repository")"
+          printf '%s\n' "$update"
+          grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$update"
+          "$binary" mcp uninstall --host codex --root "$repository"
+          if grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"; then
+            echo 'uninstall retained the repository-scoped depgraph entry' >&2
+            exit 1
+          fi
+          if "$binary" mcp status --host codex --root "$repository"; then
+            echo 'status unexpectedly succeeded after repository state removal' >&2
+            exit 1
+          fi

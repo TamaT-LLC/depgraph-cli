@@ -6334,3 +6334,29 @@ fn profiles_plan_rejects_outside_and_traversing_files_without_disclosure() {
     }
     assert!(!root.path().join(".depgraph").exists());
 }
+
+#[test]
+fn mcp_setup_rejects_a_non_repository_before_network_or_state_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let default_store = depgraph_core::default_store_path(root.path()).unwrap();
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .env("PATH", "")
+        .args([
+            "mcp",
+            "setup",
+            "--host",
+            "codex",
+            "--root",
+            root.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "requires a directory inside a Git repository",
+        ));
+
+    assert!(!root.path().join(".codex").exists());
+    assert!(!default_store.exists());
+}

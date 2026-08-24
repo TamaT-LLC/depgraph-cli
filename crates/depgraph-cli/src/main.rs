@@ -35,9 +35,11 @@ use depgraph_store::CoverageRecord;
 use serde::Serialize;
 
 mod agent_config;
+mod mcp_setup;
 mod snapshot_diff;
 
 use agent_config::{AgentConfigRequest, generate as generate_agent_config};
+use mcp_setup::McpWorkflowRequest;
 use snapshot_diff::render_service_human_diff;
 
 #[derive(Debug, Parser)]
@@ -78,6 +80,11 @@ struct InteractiveOutputArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Set up and operate a project-scoped MCP Agent host binding.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
     /// Verify one packaged MCP launch tuple and print an Agent host configuration.
     AgentConfig {
         /// Existing canonical repository directory bound to this server.
@@ -380,6 +387,38 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+enum McpCommands {
+    /// Download verified artifacts, create a safe snapshot, and install the project entry.
+    Setup {
+        #[arg(long, value_enum)]
+        host: McpHostArg,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        root: PathBuf,
+    },
+    /// Verify artifacts, Store binding, snapshot, project entry, and MCP connectivity.
+    Status {
+        #[arg(long, value_enum)]
+        host: McpHostArg,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        root: PathBuf,
+    },
+    /// Reconcile this repository with the invoking CLI version and refresh its safe snapshot.
+    Update {
+        #[arg(long, value_enum)]
+        host: McpHostArg,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        root: PathBuf,
+    },
+    /// Remove the project entry and repository-specific state while retaining shared artifacts.
+    Uninstall {
+        #[arg(long, value_enum)]
+        host: McpHostArg,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        root: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DaemonCommands {
     /// Run the watcher daemon in the foreground until stopped or interrupted.
     Start {
@@ -404,6 +443,11 @@ enum DaemonCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum McpHostArg {
+    Codex,
 }
 
 #[derive(Debug, Subcommand)]
@@ -498,6 +542,7 @@ enum RuntimeCommands {
 #[allow(dead_code)]
 fn catalog_action_for_command(command: &Commands) -> Option<CliAction> {
     match command {
+        Commands::Mcp { .. } => None,
         Commands::AgentConfig { .. } => None,
         Commands::Init { .. } => Some(CliAction::Init),
         Commands::Scan { .. } => Some(CliAction::Scan),
@@ -729,8 +774,93 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
     3
 }
 
+fn run_mcp_setup_workflow(
+    root: PathBuf,
+    store: Option<PathBuf>,
+    refresh_snapshot: bool,
+    operation: &str,
+) -> Result<()> {
+    let request = McpWorkflowRequest {
+        requested_root: root,
+        explicit_store: store,
+    };
+    let output = mcp_setup::setup(&request, refresh_snapshot)?;
+    println!("MCP {operation}: ready");
+    println!("root: {}", output.root.display());
+    println!("store: {}", output.store.display());
+    println!("runtime: {}", output.runtime.display());
+    println!("compiler pack: {}", output.compiler_pack.display());
+    println!("snapshot: {}", output.snapshot_id);
+    println!("MCP tools: {}", output.tool_count);
+    println!(
+        "artifacts: {} reused, {} downloaded",
+        output.reused_assets, output.downloaded_assets
+    );
+    println!(
+        "Codex config: {} ({})",
+        output.config.display(),
+        if output.config_changed {
+            "updated"
+        } else {
+            "unchanged"
+        }
+    );
+    println!("restart Codex to connect the project-scoped depgraph server");
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<u8> {
     match cli.command {
+        Commands::Mcp { command } => {
+            match command {
+                McpCommands::Setup { host: _, root } => {
+                    run_mcp_setup_workflow(root, cli.store, false, "setup")?;
+                }
+                McpCommands::Update { host: _, root } => {
+                    run_mcp_setup_workflow(root, cli.store, true, "update")?;
+                }
+                McpCommands::Status { host: _, root } => {
+                    let request = McpWorkflowRequest {
+                        requested_root: root,
+                        explicit_store: cli.store,
+                    };
+                    let output = mcp_setup::status(&request)?;
+                    println!("MCP status: ready");
+                    println!("root: {}", output.root.display());
+                    println!("store: {}", output.store.display());
+                    println!("runtime: {}", output.runtime.display());
+                    println!("compiler pack: {}", output.compiler_pack.display());
+                    println!("snapshot: {}", output.snapshot_id);
+                    println!("MCP tools: {}", output.tool_count);
+                    println!("Codex config: {} (verified)", output.config.display());
+                }
+                McpCommands::Uninstall { host: _, root } => {
+                    let request = McpWorkflowRequest {
+                        requested_root: root,
+                        explicit_store: cli.store,
+                    };
+                    let output = mcp_setup::uninstall(&request)?;
+                    println!("MCP uninstall: complete");
+                    println!("root: {}", output.root.display());
+                    println!("store: {}", output.store.display());
+                    println!(
+                        "Codex config: {} ({})",
+                        output.config.display(),
+                        if output.config_changed {
+                            "depgraph entry removed"
+                        } else {
+                            "already absent"
+                        }
+                    );
+                    println!(
+                        "repository state files removed: {}",
+                        output.removed_state_files
+                    );
+                    println!("shared verified artifacts were retained");
+                }
+            }
+            Ok(0)
+        }
         Commands::AgentConfig {
             root,
             release_archive,
@@ -2962,6 +3092,17 @@ mod tests {
         ])
         .expect("Agent host control-plane command parses");
         assert_eq!(catalog_action_for_command(&control_plane.command), None);
+
+        for arguments in [
+            ["depgraph", "mcp", "setup", "--host", "codex"],
+            ["depgraph", "mcp", "status", "--host", "codex"],
+            ["depgraph", "mcp", "update", "--host", "codex"],
+            ["depgraph", "mcp", "uninstall", "--host", "codex"],
+        ] {
+            let control_plane = <Cli as clap::Parser>::try_parse_from(arguments)
+                .expect("MCP repository control-plane command parses");
+            assert_eq!(catalog_action_for_command(&control_plane.command), None);
+        }
 
         let capabilities = DepgraphCapabilitySet::try_new([
             DepgraphCapability::Read,
