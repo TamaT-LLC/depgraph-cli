@@ -18,16 +18,17 @@ Fixes land on `main` first.
 For a stable patch release, `release/0.5` advances by fast-forward to the exact
 reviewed `main` commit that passed Full CI; it is not advanced by cherry-pick.
 The pinned toolchains, five native archive targets, compatibility contract,
-known limitations, and verified release links are listed in [README.md](README.md).
+known limitations, and verified release links are listed in the
+[English README](README.en.md).
 
 ## Where to ask
 
 - For a reproducible defect in a supported release, use the bug report form.
 - For a scoped enhancement, use the feature request form.
-- For usage help, first search [README.md](README.md), release notes, and
-  existing issues. If the documentation is insufficient, file a bug when the
-  documented behavior is wrong or a feature request when new behavior is
-  needed.
+- For usage help, first search the [English README](README.en.md), release
+  notes, and existing issues. If the documentation is insufficient, file a bug
+  when the documented behavior is wrong or a feature request when new behavior
+  is needed.
 - For suspected vulnerabilities, use the private route in
   [SECURITY.md](SECURITY.md). Never use a public issue.
 - For conduct or moderation concerns, follow
