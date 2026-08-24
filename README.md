@@ -315,6 +315,30 @@ depgraph export --format graphml --output graph.graphml
 既定の`read`権限では、ストアの変更、リポジトリへの書き込み、デーモン制御、プロジェクトコードの実行を許可しない。
 固定したリポジトリルート、絶対パスで指定したストア、検証済みコンパイラーパックの要件ファイルが必要になる。
 
+公式stable版の`depgraph`を導入した後、対象Gitリポジトリ内で次を実行すると、artifactの取得と検証、安全な初回スキャン、package/MCP preflight、project-scopedなCodex設定のatomic mergeまでを一括して行える。
+
+```sh
+depgraph mcp setup --host codex
+```
+
+既定ではruntimeとcompiler packをversion／target単位で共有し、ストアと`.codex/config.toml`はcanonical repository rootごとに分離する。
+設定はread-onlyで固定され、既存の無関係なCodex設定、コメント、書式を保持する。
+完了後はCodexを再起動する。
+再実行はidempotentであり、運用には次のコマンドを使う。
+
+```sh
+depgraph mcp status --host codex
+depgraph mcp update --host codex
+depgraph mcp uninstall --host codex
+```
+
+`status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
+`update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
+`setup`／`update`／`uninstall`は同じrepository lifecycle lockで直列化される。
+`uninstall`は管理cache配下の完全なread-only起動tupleを所有権として検証し、state未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してからrepository固有の設定とstateだけを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
+中断後は同じ`setup`を再実行する。
+root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。
+
 リリース証跡の検証、`agent-config`によるホスト設定、権限プロファイル、再接続、キャンセルの詳細は、[英語版のMCP stdioサーバー節](README.en.md#mcp-stdio-server)と[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)を参照する。
 
 ## 安全なスキャンの境界

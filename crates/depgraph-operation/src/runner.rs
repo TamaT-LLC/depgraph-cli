@@ -26,7 +26,8 @@ use depgraph_mcp_tools::{
 use crate::{
     CanonicalInput, CanonicalJson, CompletionDecision, CompletionIntent, DaemonExecutableLauncher,
     JournalDigest, JournalError, LeaseOwner, MAX_OPERATION_INPUT_BYTES, OperationJournal,
-    OperationKind, OperationStatus, RunnerLaunchError,
+    OperationKind, OperationStatus, RunnerLaunchError, operation_journal_path,
+    try_acquire_runner_purge_guard,
 };
 
 pub const UNSUPPORTED_OPERATION_ERROR_JSON: &str = r#"{"code":"OPERATION_EXECUTION_UNSUPPORTED"}"#;
@@ -50,7 +51,6 @@ impl RunnerStartupConfig {
             compiler_pack_requirement: None,
             compiler_pack_requirement_path: None,
         };
-        OperationJournal::open(&startup.service)?;
         Ok(startup)
     }
 
@@ -73,7 +73,6 @@ impl RunnerStartupConfig {
             compiler_pack_requirement: Some(requirement),
             compiler_pack_requirement_path: Some(requirement_path),
         };
-        OperationJournal::open(&startup.service)?;
         Ok(startup)
     }
 
@@ -712,11 +711,13 @@ impl<D: OperationDispatcher> OperationRunner<D> {
             LogicalRepositoryId::parse(self.startup.service.logical_repository_id())
                 .map_err(|_| RunnerError::InvalidStartupAuthority)?;
         let owner = new_lease_owner()?;
-        let mut journal = OperationJournal::open(&self.startup.service)?;
         let mut report = RunnerReport::default();
-        let Some(runner_purge_guard) = journal.try_acquire_runner_purge_guard()? else {
+        let journal_path = operation_journal_path(&self.startup.service);
+        let Some(runner_purge_guard) = try_acquire_runner_purge_guard(journal_path.as_path())?
+        else {
             return Ok(report);
         };
+        let mut journal = OperationJournal::open(&self.startup.service)?;
         let mut cleanup_after_operation_id = None;
         loop {
             cleanup_after_operation_id = self.reconcile_cleanup_acknowledgements(

@@ -223,8 +223,25 @@ struct VerifiedReleaseTrust {
     evidence_sha256: String,
 }
 
+pub(crate) struct VerifiedAgentPackage {
+    release_root: PathBuf,
+    core: PathBuf,
+    mcp: PathBuf,
+    requirement_path: PathBuf,
+    release_version: String,
+    target: String,
+    archive_sha256: String,
+    release_tag: String,
+    release_evidence_sha256: String,
+}
+
+impl VerifiedAgentPackage {
+    pub(crate) fn core(&self) -> &Path {
+        &self.core
+    }
+}
+
 pub fn generate(request: &AgentConfigRequest<'_>) -> Result<AgentConfigOutput> {
-    validate_acknowledgements(request)?;
     let executable = std::env::current_exe()
         .context("Agent host preflight cannot locate the running depgraph executable")?;
     generate_for_executable(request, &executable)
@@ -234,6 +251,15 @@ fn generate_for_executable(
     request: &AgentConfigRequest<'_>,
     current_executable: &Path,
 ) -> Result<AgentConfigOutput> {
+    let package = verify_package_for_executable(request, current_executable)?;
+    generate_with_verified_package(request, package)
+}
+
+pub(crate) fn verify_package_for_executable(
+    request: &AgentConfigRequest<'_>,
+    current_executable: &Path,
+) -> Result<VerifiedAgentPackage> {
+    validate_acknowledgements(request)?;
     let manifest_path = verified_regular_file(
         request.release_manifest,
         MAX_MANIFEST_BYTES,
@@ -316,6 +342,22 @@ fn generate_for_executable(
         security_bail("compiler-pack host/target differs from the release manifest")?;
     }
 
+    Ok(VerifiedAgentPackage {
+        release_root,
+        core,
+        mcp,
+        requirement_path,
+        release_version: manifest.release_version,
+        target: manifest.target,
+        archive_sha256: archive.archive.sha256,
+        release_tag: release_trust.tag,
+        release_evidence_sha256: release_trust.evidence_sha256,
+    })
+}
+
+pub(crate) fn validated_binding(request: &AgentConfigRequest<'_>) -> Result<DepgraphServiceConfig> {
+    validate_acknowledgements(request)?;
+
     let capabilities =
         DepgraphCapabilitySet::try_new(request.profile.capabilities().iter().copied())
             .context("Agent host preflight capability closure is invalid")?;
@@ -329,16 +371,24 @@ fn generate_for_executable(
     if config.store_path().starts_with(config.canonical_root()) {
         security_bail("private Agent Store must be outside the repository root")?;
     }
+    Ok(config)
+}
+
+pub(crate) fn generate_with_verified_package(
+    request: &AgentConfigRequest<'_>,
+    package: VerifiedAgentPackage,
+) -> Result<AgentConfigOutput> {
+    let config = validated_binding(request)?;
     let root_seal = config.repository_root_seal();
     if !root_seal.matches_live_root() {
         security_bail("repository root seal changed during preflight")?;
     }
-    let current_snapshot_id = verify_store_binding(&config, &core)?;
+    let current_snapshot_id = verify_store_binding(&config, &package.core)?;
 
-    let mcp_string = utf8_path(&mcp, "MCP executable")?;
+    let mcp_string = utf8_path(&package.mcp, "MCP executable")?;
     let root_string = utf8_path(config.canonical_root(), "repository root")?;
     let store_string = utf8_path(config.store_path(), "Store")?;
-    let requirement_string = utf8_path(&requirement_path, "compiler-pack requirement")?;
+    let requirement_string = utf8_path(&package.requirement_path, "compiler-pack requirement")?;
     let arguments = agent_host_launch_arguments(
         request.profile,
         root_string,
@@ -346,8 +396,8 @@ fn generate_for_executable(
         requirement_string,
     );
     let tool_count = probe_connection(
-        &release_root,
-        &mcp,
+        &package.release_root,
+        &package.mcp,
         &arguments,
         request.profile,
         config.logical_repository_id(),
@@ -368,11 +418,11 @@ fn generate_for_executable(
     .context("Agent host configuration rendering failed")?;
     Ok(AgentConfigOutput {
         configuration,
-        release_version: manifest.release_version,
-        target: manifest.target,
-        archive_sha256: archive.archive.sha256,
-        release_tag: release_trust.tag,
-        release_evidence_sha256: release_trust.evidence_sha256,
+        release_version: package.release_version,
+        target: package.target,
+        archive_sha256: package.archive_sha256,
+        release_tag: package.release_tag,
+        release_evidence_sha256: package.release_evidence_sha256,
         canonical_root: config.canonical_root().to_path_buf(),
         canonical_store: config.store_path().to_path_buf(),
         current_snapshot_id,
@@ -533,19 +583,31 @@ fn verify_mcp_closure(
 }
 
 fn verify_store_binding(config: &DepgraphServiceConfig, core: &Path) -> Result<String> {
-    let store = match Store::open_read_only(config.store_path()) {
-        Ok(store) => store,
+    match current_snapshot_if_valid(config) {
+        Ok(Some(snapshot_id)) => Ok(snapshot_id),
+        Ok(None) => bail!(
+            "no current completed snapshot is available from the private Store; {}",
+            safe_scan_remediation(core, config.canonical_root(), config.store_path())?
+        ),
         Err(error) => bail!(
             "no current completed snapshot is available from the private Store: {error:#}; {}",
             safe_scan_remediation(core, config.canonical_root(), config.store_path())?
         ),
-    };
-    let current_snapshot_id = match store.current_snapshot_id()? {
-        Some(snapshot_id) => snapshot_id,
-        None => bail!(
-            "no current completed snapshot is available from the private Store; {}",
-            safe_scan_remediation(core, config.canonical_root(), config.store_path())?
-        ),
+    }
+}
+
+pub(crate) fn current_snapshot_if_valid(config: &DepgraphServiceConfig) -> Result<Option<String>> {
+    match fs::symlink_metadata(config.store_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            security_bail("private Agent Store must be a regular non-symlink file")?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Agent host preflight cannot inspect the Store"),
+    }
+    let store = Store::open_read_only(config.store_path())?;
+    let Some(current_snapshot_id) = store.current_snapshot_id()? else {
+        return Ok(None);
     };
     let details = store.completed_snapshot_details(&current_snapshot_id)?;
     let scan = store
@@ -557,7 +619,7 @@ fn verify_store_binding(config: &DepgraphServiceConfig, core: &Path) -> Result<S
     if stored_root != config.canonical_root() {
         security_bail("private Store current snapshot belongs to a different repository root")?;
     }
-    Ok(current_snapshot_id)
+    Ok(Some(current_snapshot_id))
 }
 
 fn safe_scan_remediation(core: &Path, root: &Path, store: &Path) -> Result<String> {

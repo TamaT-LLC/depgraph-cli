@@ -2118,7 +2118,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-16\n\
+updated: 2026-08-24\n\
 open_questions: 0\n\
 ---\n";
 
