@@ -60,12 +60,17 @@ depgraph mcp uninstall --host codex
 cached asset/evidence chain, extracted package, fixed Store/current snapshot,
 exact Codex entry, and MCP connection. `update` performs the same reconciliation
 as setup for the invoking CLI version and always refreshes the safe snapshot.
-`uninstall` first confirms that the installed entry names the same canonical
-root and Store, then always acquires the durable-operation runner exclusion
-followed by the Store writer exclusion. It fails before changing the host file while a
-runner, scan, daemon, or Store writer is active. Missing state directories and
-persistent lock sentinels are created first, closing the race before initial
-Store or journal creation. With both guards held, it
+Setup, update, and uninstall hold the same repository lifecycle lock in the
+validated Git metadata directory through the host configuration mutation, so
+setup cannot publish a binding after concurrent cleanup. `uninstall` first
+confirms that the installed entry is the exact generated read-only launch tuple
+under the managed artifact cache, then always acquires the durable-operation
+runner exclusion followed by the Store writer exclusion. It fails before
+changing the host file while another lifecycle command, runner, scan, daemon,
+or Store writer is active. The operation runner acquires its exclusion before
+its first journal open. Missing state directories and persistent lock sentinels
+are created first, closing the race before initial Store or journal creation.
+With both state guards held, it
 removes only that table from the format-preserving TOML document and deletes
 the exact Store/journal/SQLite/daemon sidecar family. Empty writer and runner
 lock sentinels remain in place so cleanup never unlinks a coordination inode;

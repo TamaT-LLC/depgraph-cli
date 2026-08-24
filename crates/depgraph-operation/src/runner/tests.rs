@@ -17,6 +17,7 @@ use serde_json::json;
 use super::*;
 use crate::{
     CapabilitySet, OperationManager, OperationOutcome, SubmitRequest, TERMINAL_RETENTION_MS,
+    try_acquire_operation_runner_exclusion,
 };
 
 const NOW: i64 = 1_800_000_000_000;
@@ -32,6 +33,35 @@ fn config(root: &Path) -> DepgraphServiceConfig {
         DepgraphServiceLimits::default(),
     )
     .unwrap()
+}
+
+#[test]
+fn runner_defers_the_first_journal_open_until_after_exclusion() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let journal_path = operation_journal_path(&config);
+    std::fs::write(journal_path.as_path(), b"not a sqlite journal").unwrap();
+    let cleanup = try_acquire_operation_runner_exclusion(&journal_path)
+        .unwrap()
+        .unwrap();
+
+    let startup = RunnerStartupConfig::new(config.clone()).unwrap();
+    let report = OperationRunner::new(startup, ScanOperationDispatcher::new(config.clone()))
+        .run_until_idle()
+        .unwrap();
+    assert_eq!(report.completed(), 0);
+    assert_eq!(report.failed(), 0);
+    assert_eq!(report.cancelled(), 0);
+    assert_eq!(report.lease_lost(), 0);
+
+    drop(cleanup);
+    let error = OperationRunner::new(
+        RunnerStartupConfig::new(config.clone()).unwrap(),
+        ScanOperationDispatcher::new(config),
+    )
+    .run_until_idle()
+    .unwrap_err();
+    assert!(matches!(error, RunnerError::Journal(_)));
 }
 
 fn daemon_config(root: &Path) -> DepgraphServiceConfig {

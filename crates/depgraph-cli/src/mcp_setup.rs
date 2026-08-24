@@ -12,7 +12,9 @@ use depgraph_core::{
     DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, acquire_store_writer_lock,
     compiler_pack_host_target, default_store_path,
 };
-use depgraph_mcp_tools::{AgentHostCapabilityProfile, AgentHostFormat};
+use depgraph_mcp_tools::{
+    AgentHostCapabilityProfile, AgentHostFormat, agent_host_launch_arguments,
+};
 use depgraph_operation::{
     OperationRunnerExclusionGuard, operation_journal_path, try_acquire_operation_runner_exclusion,
 };
@@ -75,8 +77,9 @@ pub(crate) fn setup(
     refresh_snapshot: bool,
 ) -> Result<McpSetupOutput> {
     let binding = resolve_binding(request)?;
-    preflight_codex_ownership(&binding.config)?;
+    let _lifecycle = acquire_repository_lifecycle_exclusion(&binding.config)?;
     let mut layout = ArtifactLayout::for_current_host()?;
+    preflight_codex_ownership(&binding.config, &layout.cache_base)?;
     let curl = CurlClient::discover(binding.config.canonical_root())?;
     let release = fetch_release_metadata(&curl, &layout)?;
     layout.prepare_directories()?;
@@ -109,8 +112,12 @@ pub(crate) fn setup(
     }
     let generated = generate_with_verified_package(&agent_request, package)?;
     let config_path = codex_config_path(verified_binding.canonical_root());
-    let config_changed =
-        install_codex_configuration(&verified_binding, &config_path, &generated.configuration)?;
+    let config_changed = install_codex_configuration(
+        &verified_binding,
+        &config_path,
+        &layout.cache_base,
+        &generated.configuration,
+    )?;
 
     Ok(McpSetupOutput {
         root: generated.canonical_root,
@@ -154,7 +161,9 @@ pub(crate) fn status(request: &McpWorkflowRequest) -> Result<McpStatusOutput> {
 
 pub(crate) fn uninstall(request: &McpWorkflowRequest) -> Result<McpUninstallOutput> {
     let binding = resolve_binding(request)?;
-    preflight_codex_ownership(&binding.config)?;
+    let _lifecycle = acquire_repository_lifecycle_exclusion(&binding.config)?;
+    let layout = ArtifactLayout::for_current_host()?;
+    preflight_codex_ownership(&binding.config, &layout.cache_base)?;
     let _state_exclusion = acquire_repository_state_exclusion(&binding.config)?;
     let config_path = codex_config_path(binding.config.canonical_root());
     let config_changed = remove_codex_configuration(
@@ -162,6 +171,7 @@ pub(crate) fn uninstall(request: &McpWorkflowRequest) -> Result<McpUninstallOutp
         &config_path,
         binding.config.canonical_root(),
         binding.config.store_path(),
+        &layout.cache_base,
     )?;
     if !binding.config.repository_root_seal().matches_live_root() {
         security_bail("repository root changed before repository state cleanup")?;
@@ -243,26 +253,33 @@ fn discover_git_repository_root(requested: &Path) -> Result<PathBuf> {
 }
 
 fn valid_git_marker(root: &Path) -> Result<bool> {
+    Ok(validated_git_directory(root)?.is_some())
+}
+
+fn validated_git_directory(root: &Path) -> Result<Option<PathBuf>> {
     let marker = root.join(".git");
     let metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("MCP setup cannot inspect the Git marker"),
     };
     if metadata.file_type().is_symlink() {
-        return Ok(false);
+        return Ok(None);
     }
     let git_directory = if metadata.is_dir() {
-        marker
+        match marker.canonicalize() {
+            Ok(directory) => directory,
+            Err(_) => return Ok(None),
+        }
     } else if metadata.is_file() && metadata.len() <= 4096 {
         let text = fs::read_to_string(&marker).context("Git worktree marker is not UTF-8")?;
         let line = text.strip_suffix('\n').unwrap_or(&text);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let Some(value) = line.strip_prefix("gitdir: ") else {
-            return Ok(false);
+            return Ok(None);
         };
         if value.is_empty() || value.contains('\n') || value.contains('\r') {
-            return Ok(false);
+            return Ok(None);
         }
         let declared = Path::new(value);
         let candidate = if declared.is_absolute() {
@@ -272,14 +289,19 @@ fn valid_git_marker(root: &Path) -> Result<bool> {
         };
         match candidate.canonicalize() {
             Ok(candidate) if candidate.is_dir() => candidate,
-            _ => return Ok(false),
+            _ => return Ok(None),
         }
     } else {
-        return Ok(false);
+        return Ok(None);
     };
     let head = git_directory.join("HEAD");
-    Ok(fs::symlink_metadata(head)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()))
+    if fs::symlink_metadata(head)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        Ok(Some(git_directory))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -459,6 +481,43 @@ fn ensure_real_child_directory(parent: &Path, component: &str) -> Result<PathBuf
         .context("MCP setup cannot canonicalize its artifact cache")
 }
 
+#[derive(Debug)]
+struct RepositoryLifecycleGuard {
+    _file: File,
+}
+
+fn acquire_repository_lifecycle_exclusion(
+    config: &DepgraphServiceConfig,
+) -> Result<RepositoryLifecycleGuard> {
+    let git_directory = validated_git_directory(config.canonical_root())?
+        .context("the repository Git marker changed before MCP lifecycle exclusion")?;
+    let lock_path = git_directory.join(".depgraph-mcp-lifecycle.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("MCP setup cannot open its repository lifecycle lock")?;
+    let file = validate_open_regular_lock(file, &lock_path, "repository lifecycle lock")?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another MCP setup/update/uninstall is active for this repository; retry after it completes"
+        ),
+        Err(fs::TryLockError::Error(error)) => {
+            return Err(error).context("MCP setup cannot lock its repository lifecycle");
+        }
+    }
+    if !config.repository_root_seal().matches_live_root()
+        || validated_git_directory(config.canonical_root())?.as_deref()
+            != Some(git_directory.as_path())
+    {
+        security_bail("repository identity changed while MCP lifecycle exclusion was acquired")?;
+    }
+    Ok(RepositoryLifecycleGuard { _file: file })
+}
+
 struct CacheLock {
     _file: File,
 }
@@ -487,20 +546,22 @@ fn open_cache_lock(path: &Path) -> Result<File> {
         .truncate(false)
         .open(path)
         .context("MCP setup cannot open its shared artifact cache lock")?;
-    validate_open_cache_lock(file, path)
+    validate_open_regular_lock(file, path, "shared artifact cache lock")
 }
 
-fn validate_open_cache_lock(file: File, path: &Path) -> Result<File> {
+fn validate_open_regular_lock(file: File, path: &Path, description: &str) -> Result<File> {
     let opened = file.metadata()?;
     let linked = fs::symlink_metadata(path)?;
     if !opened.is_file() || linked.file_type().is_symlink() || !linked.is_file() {
-        security_bail("the shared artifact cache lock is not a regular non-symlink file")?;
+        security_bail(&format!(
+            "the {description} is not a regular non-symlink file"
+        ))?;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if opened.dev() != linked.dev() || opened.ino() != linked.ino() {
-            security_bail("the shared artifact cache lock changed while it was opened")?;
+            security_bail(&format!("the {description} changed while it was opened"))?;
         }
     }
     Ok(file)
@@ -1202,6 +1263,7 @@ fn codex_config_path(root: &Path) -> PathBuf {
 fn install_codex_configuration(
     binding: &DepgraphServiceConfig,
     config_path: &Path,
+    managed_cache_base: &Path,
     generated: &str,
 ) -> Result<bool> {
     let generated_value = parse_toml(generated, "generated Codex MCP configuration")?;
@@ -1216,9 +1278,14 @@ fn install_codex_configuration(
         if current == &desired_value {
             return Ok(false);
         }
-        if !entry_matches_binding(current, binding.canonical_root(), binding.store_path()) {
+        if !entry_matches_binding(
+            current,
+            binding.canonical_root(),
+            binding.store_path(),
+            managed_cache_base,
+        ) {
             security_bail(
-                "the existing Codex depgraph entry belongs to a different root or Store",
+                "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
             )?;
         }
     }
@@ -1257,6 +1324,7 @@ fn remove_codex_configuration(
     config_path: &Path,
     expected_root: &Path,
     expected_store: &Path,
+    managed_cache_base: &Path,
 ) -> Result<bool> {
     let Some(bytes) = read_optional_bounded_config(config_path)? else {
         return Ok(false);
@@ -1265,8 +1333,10 @@ fn remove_codex_configuration(
     let Some(entry) = checked_depgraph_entry(&existing)? else {
         return Ok(false);
     };
-    if !entry_matches_binding(entry, expected_root, expected_store) {
-        security_bail("the existing Codex depgraph entry belongs to a different root or Store")?;
+    if !entry_matches_binding(entry, expected_root, expected_store, managed_cache_base) {
+        security_bail(
+            "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
+        )?;
     }
     let mut document = parse_edit_toml_bytes(&bytes, "existing Codex project configuration")?;
     remove_editable_depgraph_entry(&mut document)?;
@@ -1334,16 +1404,26 @@ fn checked_depgraph_entry(value: &toml::Value) -> Result<Option<&toml::Value>> {
     Ok(servers.get("depgraph"))
 }
 
-fn preflight_codex_ownership(binding: &DepgraphServiceConfig) -> Result<()> {
+fn preflight_codex_ownership(
+    binding: &DepgraphServiceConfig,
+    managed_cache_base: &Path,
+) -> Result<()> {
     let path = codex_config_path(binding.canonical_root());
     let Some(bytes) = read_optional_bounded_config(&path)? else {
         return Ok(());
     };
     let existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
     if let Some(entry) = checked_depgraph_entry(&existing)?
-        && !entry_matches_binding(entry, binding.canonical_root(), binding.store_path())
+        && !entry_matches_binding(
+            entry,
+            binding.canonical_root(),
+            binding.store_path(),
+            managed_cache_base,
+        )
     {
-        security_bail("the existing Codex depgraph entry belongs to a different root or Store")?;
+        security_bail(
+            "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
+        )?;
     }
     Ok(())
 }
@@ -1372,32 +1452,125 @@ fn remove_editable_depgraph_entry(document: &mut DocumentMut) -> Result<()> {
     Ok(())
 }
 
-fn entry_matches_binding(entry: &toml::Value, root: &Path, store: &Path) -> bool {
+fn entry_matches_binding(
+    entry: &toml::Value,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
     let Some(table) = entry.as_table() else {
         return false;
     };
-    let Some(command) = table.get("command").and_then(toml::Value::as_str) else {
-        return false;
-    };
-    if !Path::new(command).is_absolute()
-        || Path::new(command).file_name() != Some(OsStr::new(&executable_name("depgraph-mcp")))
+    const GENERATED_KEYS: [&str; 5] = [
+        "command",
+        "args",
+        "enabled",
+        "required",
+        "default_tools_approval_mode",
+    ];
+    if table.len() != GENERATED_KEYS.len()
+        || !GENERATED_KEYS.iter().all(|key| table.contains_key(*key))
+        || table.get("enabled").and_then(toml::Value::as_bool) != Some(true)
+        || table.get("required").and_then(toml::Value::as_bool) != Some(true)
+        || table
+            .get("default_tools_approval_mode")
+            .and_then(toml::Value::as_str)
+            != Some("approve")
     {
         return false;
     }
+    let Some(command) = table.get("command").and_then(toml::Value::as_str) else {
+        return false;
+    };
     let Some(arguments) = table.get("args").and_then(toml::Value::as_array) else {
         return false;
     };
-    argument_value(arguments, "--root") == root.to_str()
-        && argument_value(arguments, "--store") == store.to_str()
-        && argument_value(arguments, "--capability") == Some("read")
+    let Some(arguments) = arguments
+        .iter()
+        .map(toml::Value::as_str)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if arguments.len() != 10 {
+        return false;
+    }
+    let (Some(root), Some(store)) = (root.to_str(), store.to_str()) else {
+        return false;
+    };
+    let requirement = arguments[7];
+    let expected_arguments =
+        agent_host_launch_arguments(AgentHostCapabilityProfile::Read, root, store, requirement);
+    arguments
+        .iter()
+        .copied()
+        .eq(expected_arguments.iter().map(String::as_str))
+        && managed_launch_paths_match(
+            Path::new(command),
+            Path::new(requirement),
+            managed_cache_base,
+        )
 }
 
-fn argument_value<'a>(arguments: &'a [toml::Value], name: &str) -> Option<&'a str> {
-    arguments.windows(2).find_map(|pair| {
-        (pair[0].as_str() == Some(name))
-            .then(|| pair[1].as_str())
-            .flatten()
-    })
+fn managed_launch_paths_match(
+    command: &Path,
+    requirement: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    managed_launch_paths_match_under(command, requirement, managed_cache_base)
+        || managed_cache_base
+            .canonicalize()
+            .ok()
+            .is_some_and(|canonical| {
+                canonical != managed_cache_base
+                    && managed_launch_paths_match_under(command, requirement, &canonical)
+            })
+}
+
+fn managed_launch_paths_match_under(
+    command: &Path,
+    requirement: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    if !command.is_absolute() || !requirement.is_absolute() || !managed_cache_base.is_absolute() {
+        return false;
+    }
+    let Ok(relative) = command.strip_prefix(managed_cache_base) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (
+        Some(Component::Normal(mcp)),
+        Some(Component::Normal(artifacts)),
+        Some(Component::Normal(version)),
+        Some(Component::Normal(target)),
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+    let (Some(version), Some(target)) = (version.to_str(), target.to_str()) else {
+        return false;
+    };
+    if mcp != OsStr::new("mcp")
+        || artifacts != OsStr::new("artifacts")
+        || compiler_pack_host_target() != Some(target)
+    {
+        return false;
+    }
+    let Ok(layout) = ArtifactLayout::new(managed_cache_base, version, target) else {
+        return false;
+    };
+    command
+        == layout
+            .runtime_root()
+            .join("bin")
+            .join(executable_name("depgraph-mcp"))
+        && requirement == layout.requirement_path()
 }
 
 fn ensure_codex_directory(root: &Path) -> Result<PathBuf> {
@@ -1572,24 +1745,22 @@ mod tests {
         .unwrap()
     }
 
-    fn codex_entry(root: &Path, store: &Path) -> String {
-        let command = if cfg!(windows) {
-            format!(r"C:\verified\bin\{}", executable_name("depgraph-mcp"))
-        } else {
-            format!("/verified/bin/{}", executable_name("depgraph-mcp"))
-        };
-        format!(
-            "[mcp_servers.depgraph]\ncommand = {:?}\nargs = [{:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}]\nenabled = true\nrequired = true\n",
-            command,
-            "--root",
+    fn codex_entry(cache_base: &Path, root: &Path, store: &Path) -> String {
+        let target = compiler_pack_host_target().unwrap();
+        let layout = ArtifactLayout::new(cache_base, env!("CARGO_PKG_VERSION"), target).unwrap();
+        let command = layout
+            .runtime_root()
+            .join("bin")
+            .join(executable_name("depgraph-mcp"));
+        depgraph_mcp_tools::render_agent_host_configuration(
+            AgentHostFormat::Codex,
+            AgentHostCapabilityProfile::Read,
+            command.to_str().unwrap(),
             root.to_str().unwrap(),
-            "--store",
             store.to_str().unwrap(),
-            "--capability",
-            "read",
-            "--log-level",
-            "warn",
+            layout.requirement_path().to_str().unwrap(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -1776,10 +1947,10 @@ mod tests {
         let path = codex.join("config.toml");
         let original = "# keep project model\nmodel = \"gpt-5\" # keep inline model note\n\n# keep unrelated server notes\n[mcp_servers.other]\ncommand = \"other\" # keep inline server note\nargs = []\n";
         fs::write(&path, original).unwrap();
-        let generated = codex_entry(repository.path(), &store);
+        let generated = codex_entry(state.path(), repository.path(), &store);
 
-        assert!(install_codex_configuration(&binding, &path, &generated).unwrap());
-        assert!(!install_codex_configuration(&binding, &path, &generated).unwrap());
+        assert!(install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
+        assert!(!install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
         verify_codex_configuration(&path, &generated).unwrap();
         let merged_bytes = fs::read(&path).unwrap();
         let merged_text = std::str::from_utf8(&merged_bytes).unwrap();
@@ -1798,7 +1969,10 @@ mod tests {
             Some("other")
         );
 
-        assert!(remove_codex_configuration(&binding, &path, repository.path(), &store).unwrap());
+        assert!(
+            remove_codex_configuration(&binding, &path, repository.path(), &store, state.path(),)
+                .unwrap()
+        );
         let removed_bytes = fs::read(&path).unwrap();
         let removed_text = std::str::from_utf8(&removed_bytes).unwrap();
         for preserved in [
@@ -1828,14 +2002,93 @@ mod tests {
         let codex = repository.path().join(".codex");
         fs::create_dir(&codex).unwrap();
         let path = codex.join("config.toml");
-        let existing = codex_entry(repository.path(), &other_store);
+        let existing = codex_entry(state.path(), repository.path(), &other_store);
         fs::write(&path, &existing).unwrap();
 
-        let error =
-            install_codex_configuration(&binding, &path, &codex_entry(repository.path(), &store))
-                .unwrap_err();
-        assert!(error.to_string().contains("different root or Store"));
+        let error = install_codex_configuration(
+            &binding,
+            &path,
+            state.path(),
+            &codex_entry(state.path(), repository.path(), &store),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is not owned"));
         assert_eq!(fs::read_to_string(path).unwrap(), existing);
+    }
+
+    #[test]
+    fn codex_lifecycle_rejects_same_binding_with_a_modified_launch_tuple() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("graph.db");
+        let binding = read_binding(repository.path(), &store);
+        let codex = repository.path().join(".codex");
+        fs::create_dir(&codex).unwrap();
+        let path = codex.join("config.toml");
+        let desired = codex_entry(state.path(), repository.path(), &store);
+        let generated = parse_toml(&desired, "fixture").unwrap();
+
+        let mut alternate_command = generated.clone();
+        alternate_command["mcp_servers"]["depgraph"]["command"] = toml::Value::String(
+            state
+                .path()
+                .join("manual")
+                .join(executable_name("depgraph-mcp"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let mut extra_capability = generated.clone();
+        extra_capability["mcp_servers"]["depgraph"]["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                toml::Value::String("--capability".to_owned()),
+                toml::Value::String("store-write".to_owned()),
+            ]);
+
+        let mut alternate_requirement = generated.clone();
+        alternate_requirement["mcp_servers"]["depgraph"]["args"]
+            .as_array_mut()
+            .unwrap()[7] = toml::Value::String(
+            state
+                .path()
+                .join("manual.requirement.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let mut additional_setting = generated;
+        additional_setting["mcp_servers"]["depgraph"]
+            .as_table_mut()
+            .unwrap()
+            .insert("env".to_owned(), toml::Value::Table(toml::Table::new()));
+
+        for modified in [
+            alternate_command,
+            extra_capability,
+            alternate_requirement,
+            additional_setting,
+        ] {
+            let existing = toml::to_string(&modified).unwrap();
+            fs::write(&path, &existing).unwrap();
+
+            let install_error =
+                install_codex_configuration(&binding, &path, state.path(), &desired).unwrap_err();
+            assert!(install_error.to_string().contains("is not owned"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), existing);
+
+            let remove_error = remove_codex_configuration(
+                &binding,
+                &path,
+                repository.path(),
+                &store,
+                state.path(),
+            )
+            .unwrap_err();
+            assert!(remove_error.to_string().contains("is not owned"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), existing);
+        }
     }
 
     #[test]
@@ -1849,9 +2102,9 @@ mod tests {
         let path = codex.join("config.toml");
         let original = "mcp_servers = { other = { command = \"other\", args = [] } } # keep inline server table\n";
         fs::write(&path, original).unwrap();
-        let generated = codex_entry(repository.path(), &store);
+        let generated = codex_entry(state.path(), repository.path(), &store);
 
-        assert!(install_codex_configuration(&binding, &path, &generated).unwrap());
+        assert!(install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
         verify_codex_configuration(&path, &generated).unwrap();
         assert!(
             fs::read_to_string(&path)
@@ -1859,7 +2112,10 @@ mod tests {
                 .contains("# keep inline server table")
         );
 
-        assert!(remove_codex_configuration(&binding, &path, repository.path(), &store).unwrap());
+        assert!(
+            remove_codex_configuration(&binding, &path, repository.path(), &store, state.path(),)
+                .unwrap()
+        );
         let removed = fs::read_to_string(&path).unwrap();
         assert!(removed.contains("# keep inline server table"));
         let parsed = parse_toml(&removed, "fixture").unwrap();
@@ -1908,6 +2164,49 @@ mod tests {
     }
 
     #[test]
+    fn repository_lifecycle_lock_is_shared_across_store_bindings() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let first = read_binding(repository.path(), &state.path().join("first.db"));
+        let second = read_binding(repository.path(), &state.path().join("second.db"));
+
+        let setup = acquire_repository_lifecycle_exclusion(&first).unwrap();
+        let error = acquire_repository_lifecycle_exclusion(&second).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("setup/update/uninstall is active")
+        );
+        drop(setup);
+        acquire_repository_lifecycle_exclusion(&second).unwrap();
+    }
+
+    #[test]
+    fn uninstall_fails_before_mutation_while_setup_lifecycle_is_active() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("graph.db");
+        let binding = read_binding(repository.path(), &store);
+        fs::write(&store, b"owned").unwrap();
+        let codex = repository.path().join(".codex");
+        fs::create_dir(&codex).unwrap();
+        let config_path = codex.join("config.toml");
+        let layout = ArtifactLayout::for_current_host().unwrap();
+        let installed = codex_entry(&layout.cache_base, repository.path(), &store);
+        fs::write(&config_path, &installed).unwrap();
+        let setup = acquire_repository_lifecycle_exclusion(&binding).unwrap();
+
+        let result = uninstall(&McpWorkflowRequest {
+            requested_root: repository.path().to_path_buf(),
+            explicit_store: Some(store.clone()),
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(config_path).unwrap(), installed);
+        assert!(store.is_file());
+        drop(setup);
+    }
+
+    #[test]
     fn uninstall_fails_before_mutation_while_a_store_writer_is_active() {
         let repository = git_repository();
         let state = tempfile::tempdir().unwrap();
@@ -1916,7 +2215,8 @@ mod tests {
         let codex = repository.path().join(".codex");
         fs::create_dir(&codex).unwrap();
         let config_path = codex.join("config.toml");
-        let installed = codex_entry(repository.path(), &store);
+        let layout = ArtifactLayout::for_current_host().unwrap();
+        let installed = codex_entry(&layout.cache_base, repository.path(), &store);
         fs::write(&config_path, &installed).unwrap();
         let writer = acquire_store_writer_lock(&store).unwrap();
 

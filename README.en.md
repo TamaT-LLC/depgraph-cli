@@ -401,10 +401,12 @@ depgraph mcp uninstall --host codex
 
 `status` independently rechecks the official release metadata, cached bytes,
 package closure, Store/root snapshot, exact project entry, and live MCP
-preflight. `update` reconciles to the invoking CLI version and refreshes the
-safe snapshot. `uninstall` always establishes exclusions for scans, daemons,
-and durable operation runners, then removes only the matching project entry and that
-repository's Store, journal, and ephemeral sidecars. Empty writer/runner lock
+preflight. Setup, update, and uninstall are serialized by one repository
+lifecycle lock. `update` reconciles to the invoking CLI version and refreshes
+the safe snapshot. `uninstall` requires the complete managed read-only launch
+tuple, always establishes exclusions for scans, daemons, and durable operation
+runners, then removes only the matching project entry and that repository's
+Store, journal, and ephemeral sidecars. Empty writer/runner lock
 sentinels remain so a live coordination file is never unlinked; shared verified
 artifacts remain for other repositories. Pass `--root /absolute/path/to/repository` when running
 outside the checkout. If you choose a custom Store with the global

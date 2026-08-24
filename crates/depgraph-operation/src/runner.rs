@@ -51,7 +51,6 @@ impl RunnerStartupConfig {
             compiler_pack_requirement: None,
             compiler_pack_requirement_path: None,
         };
-        OperationJournal::open(&startup.service)?;
         Ok(startup)
     }
 
@@ -74,7 +73,6 @@ impl RunnerStartupConfig {
             compiler_pack_requirement: Some(requirement),
             compiler_pack_requirement_path: Some(requirement_path),
         };
-        OperationJournal::open(&startup.service)?;
         Ok(startup)
     }
 
