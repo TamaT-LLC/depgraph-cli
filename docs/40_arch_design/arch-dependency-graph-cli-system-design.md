@@ -24,7 +24,6 @@ updated: 2026-08-24
 > 2026-08-20: `v0.5.1`を最初のnpm stableとし、製品versionを`0.5.1`へ更新した。
 > protocol `1.0`、Store schema `17`、operation journal schema `5`、MCP DTOは変更しない。
 > stable tag、remote `main`、`release/0.5`は公開開始時に同一SHAを指し、保守refはFull CI済みcandidateへfast-forwardだけで進める。
-
 > 2026-08-24: `v0.5.2`でリポジトリ単位のMCPセットアップを追加し、製品versionを`0.5.2`へ更新した。
 > protocol `1.0`、Store schema `17`、operation journal schema `5`、MCP DTO、既存CLIの既定値は変更しない。
 > `v0.5.1`のsourceを履歴として固定し、現行stable tag、remote `main`、`release/0.5`のexact-source条件を維持する。

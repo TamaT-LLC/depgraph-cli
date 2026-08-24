@@ -81,7 +81,7 @@ jobs:
             fi
 
             gh api --method POST \
-              "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel"
+              "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel" || true
             gh api --method DELETE \
               "repos/$REPOSITORY/git/refs/tags/$STABLE_RELEASE_TAG"
             echo "::error::$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline ($STABLE_BASELINE_STATUS; main=$main_sha maintenance=$maintenance_sha)"
