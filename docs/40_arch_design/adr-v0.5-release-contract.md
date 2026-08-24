@@ -128,11 +128,12 @@ stable candidate.
 ### 2026-08-25 Windows post-publish canary patch amendment
 
 `v0.5.3` fixes only the Windows orchestration used to exercise repository-scoped
-MCP onboarding after publication. GNU tar must treat the absolute drive-letter
-archive path as local by using `--force-local`; otherwise the colon in `D:` is
-parsed as a remote archive separator. This patch does not change the worker
-protocol, Store schema, operation journal schema, MCP DTOs, CLI defaults, or
-release artifact formats.
+MCP onboarding after publication. The Windows artifact is a ZIP archive and is
+extracted with PowerShell `Expand-Archive`; only Linux and macOS tar archives
+are passed to `tar`. This avoids both the GNU tar remote-path interpretation of
+the colon in `D:` and the incompatible ZIP input. This patch does not change
+the worker protocol, Store schema, operation journal schema, MCP DTOs, CLI
+defaults, or release artifact formats.
 
 The signed `v0.5.3` tag, remote `main`, and `release/0.5` remain bound to one
 reviewed Full-CI-green commit. The published `v0.5.2` tag, source, Release,

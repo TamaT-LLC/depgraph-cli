@@ -123,10 +123,11 @@ evaluated separately.
 
 ## Install official packages
 
-`v0.5.3` provides native packages for Linux x86-64, Linux ARM64, macOS Intel,
-macOS Apple Silicon, and Windows x86-64. `v0.5.0` was distributed only through
-GitHub Releases; npm distribution starts with `v0.5.1` under TamaT LLC's
-`@tamat-llc` organization scope.
+The following installation guidance applies after the official Release and
+post-publish evidence exist. `v0.5.3` provides native packages for Linux x86-64,
+Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x86-64. `v0.5.0` was
+distributed only through GitHub Releases; npm distribution starts with `v0.5.1`
+under TamaT LLC's `@tamat-llc` organization scope.
 
 `npm i -g @tamat-llc/depgraph` installs the verified native package for the
 same five targets without an install-time external download. The npm launcher
@@ -147,7 +148,7 @@ environment below.
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
-On macOS or Linux, use GitHub CLI to download the archive and checksum.
+After publication, use GitHub CLI on macOS or Linux to download the archive and checksum.
 
 ```sh
 VERSION=0.5.3

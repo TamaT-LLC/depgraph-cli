@@ -1930,7 +1930,6 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
         "name: Bind the stable candidate to main, release/0.5, and exact Full CI",
         "if [[ \"$GITHUB_REF_NAME\" == \"v0.5.3\" ]]",
-        "tar --force-local -xf \"$release_root/$archive\" -C \"$release_root\"",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -1971,6 +1970,19 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");
         }
+    }
+    let repository_onboarding_extraction = r#"          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            DEPGRAPH_ARCHIVE_PATH="$release_root/$archive" \
+              DEPGRAPH_RELEASE_ROOT="$release_root" \
+              pwsh -NoLogo -NoProfile -NonInteractive -Command \
+                'Expand-Archive -LiteralPath $env:DEPGRAPH_ARCHIVE_PATH -DestinationPath $env:DEPGRAPH_RELEASE_ROOT'
+          else
+            tar -xf "$release_root/$archive" -C "$release_root"
+          fi"#;
+    if !release_workflow.contains(repository_onboarding_extraction) {
+        bail!(
+            "release workflow does not bind ZIP extraction to Windows and tar extraction to non-Windows runners"
+        );
     }
     let canary_script = fs::read_to_string(root.join("scripts/release-post-publish-canary.sh"))?;
     for required in [

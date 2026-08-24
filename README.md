@@ -109,6 +109,7 @@ depgraph export --format mermaid > graph.mmd
 
 ## 公式パッケージの導入
 
+以下は、公式Releaseと公開後証跡が揃った後に適用される導入案内である。
 `v0.5.3`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
@@ -130,7 +131,7 @@ npm版のランチャーにはNode.js 24以上が必要である。
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
-macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
+公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
 
 ```sh
 VERSION=0.5.3

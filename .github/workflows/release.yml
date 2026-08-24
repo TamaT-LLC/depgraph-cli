@@ -565,7 +565,10 @@ jobs:
           mkdir -p "$release_root" "$repository/src" "$test_home/cache" "$test_home/local"
           gh release download "$GITHUB_REF_NAME" --pattern "$archive" --dir "$release_root"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            tar --force-local -xf "$release_root/$archive" -C "$release_root"
+            DEPGRAPH_ARCHIVE_PATH="$release_root/$archive" \
+              DEPGRAPH_RELEASE_ROOT="$release_root" \
+              pwsh -NoLogo -NoProfile -NonInteractive -Command \
+                'Expand-Archive -LiteralPath $env:DEPGRAPH_ARCHIVE_PATH -DestinationPath $env:DEPGRAPH_RELEASE_ROOT'
           else
             tar -xf "$release_root/$archive" -C "$release_root"
           fi

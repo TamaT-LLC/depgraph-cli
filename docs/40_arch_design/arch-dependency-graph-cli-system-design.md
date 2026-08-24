@@ -27,7 +27,7 @@ updated: 2026-08-25
 > 2026-08-24: `v0.5.2`でリポジトリ単位のMCPセットアップを追加し、製品versionを`0.5.2`へ更新した。
 > protocol `1.0`、Store schema `17`、operation journal schema `5`、MCP DTO、既存CLIの既定値は変更しない。
 > `v0.5.1`のsourceを履歴として固定し、現行stable tag、remote `main`、`release/0.5`のexact-source条件を維持する。
-> 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがdrive-letter pathをlocal archiveとして展開するよう修正した。
+> 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
 > Inline inputまたはrepository-relative regular fileの一方だけを受理し、size/confinement、credential policy、parse/type、query output admissionをstore access前にfail closedで検証する。

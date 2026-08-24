@@ -692,6 +692,70 @@ jobs:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
 
+  # Temporary branch-only validation for the Windows post-publish onboarding
+  # fix. Remove after the v0.5.2 public ZIP passes the full lifecycle.
+  windows-onboarding-probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Exercise the corrected Windows public-ZIP onboarding path
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_tag=v0.5.2
+          version=0.5.2
+          target=x86_64-pc-windows-msvc
+          package="depgraph-${version}-${target}"
+          archive="${package}.zip"
+          release_root="${RUNNER_TEMP}/depgraph-mcp-release"
+          repository="${RUNNER_TEMP}/depgraph-mcp-repository"
+          test_home="${RUNNER_TEMP}/depgraph-mcp-home"
+          mkdir -p "$release_root" "$repository/src" "$test_home/cache" "$test_home/local"
+          gh release download "$release_tag" --pattern "$archive" --dir "$release_root"
+          DEPGRAPH_ARCHIVE_PATH="$release_root/$archive" \
+            DEPGRAPH_RELEASE_ROOT="$release_root" \
+            pwsh -NoLogo -NoProfile -NonInteractive -Command \
+              'Expand-Archive -LiteralPath $env:DEPGRAPH_ARCHIVE_PATH -DestinationPath $env:DEPGRAPH_RELEASE_ROOT'
+          binary="$release_root/$package/bin/depgraph.exe"
+          test -x "$binary"
+
+          git init --quiet --initial-branch=main "$repository"
+          printf 'export const answer = 42;\n' > "$repository/src/index.ts"
+          export HOME="$test_home"
+          export XDG_CACHE_HOME="$test_home/cache"
+          export LOCALAPPDATA="$test_home/local"
+          export APPDATA="$test_home/local"
+
+          first="$("$binary" mcp setup --host codex --root "$repository")"
+          printf '%s\n' "$first"
+          grep -Fq 'artifacts: 0 reused, 6 downloaded' <<<"$first"
+          test -f "$repository/.codex/config.toml"
+          grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"
+          second="$("$binary" mcp setup --host codex --root "$repository")"
+          printf '%s\n' "$second"
+          grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$second"
+          grep -Fq 'Codex config:' <<<"$second"
+          grep -Fq '(unchanged)' <<<"$second"
+          "$binary" mcp status --host codex --root "$repository"
+          update="$("$binary" mcp update --host codex --root "$repository")"
+          printf '%s\n' "$update"
+          grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$update"
+          "$binary" mcp uninstall --host codex --root "$repository"
+          if grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"; then
+            echo 'uninstall retained the repository-scoped depgraph entry' >&2
+            exit 1
+          fi
+          if "$binary" mcp status --host codex --root "$repository"; then
+            echo 'status unexpectedly succeeded after repository state removal' >&2
+            exit 1
+          fi
+
   windows-smoke:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
