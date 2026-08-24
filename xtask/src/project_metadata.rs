@@ -1898,7 +1898,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     {
         bail!("protocol schema compatibility reference is not synchronized with 1.0");
     }
-    let release_workflow = fs::read_to_string(root.join(".github/workflows/release.yml"))?;
+    let release_workflow = read_lf_normalized_text(&root.join(".github/workflows/release.yml"))?;
     for (target, _) in RELEASE_TARGETS {
         if !release_workflow.contains(target) {
             bail!("release workflow is missing target {target}");
