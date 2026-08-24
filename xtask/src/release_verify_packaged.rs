@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use super::sbom::{
+    dependency_inventory, legal_document_section, manifest_framework_build_artifact_checksums,
+    normalized_spdx_license, third_party_licenses, verify_bounded_query_sbom,
+    verify_cross_language_sbom, verify_framework_build_sbom, verify_runtime_collector_sbom,
+    verify_rust_sysroot_sbom, web_legal_documents,
+};
 use super::{
     Artifact, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION, BOUNDED_QUERY_SBOM_PACKAGE_NAME,
     BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION,
@@ -27,17 +33,13 @@ use super::{
     SBOM_SCOPE, STABLE_UPGRADE_SOURCE_FIXTURE_PATH, STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
     TYPESCRIPT_VERSION, V0_2_RC1_STORE_SCHEMA_VERSION, VERSION, WEB_DEFINITION_SELECTOR,
     WEB_RUNTIME_ARTIFACTS, WebSemanticAttestation, WorkerArtifact, WorkerBackend, copy_directory,
-    dependency_inventory, executable_name, extract_archive, go_semantic_e2e, is_executable,
-    legal_document_section, manifest_framework_build_artifact_checksums, mcp_package_smoke,
-    normalized_spdx_license, parse_worker_handshake, prefixed_lowercase_sha256,
-    process_argument_path, release_compatibility, rust_backend_from_handshake, rust_semantic_e2e,
-    sha256_file, sha256_tree, third_party_licenses, validate_bounded_query_package_smoke,
-    verified_release_path, verify_bounded_query_sbom, verify_cross_language_sbom,
-    verify_framework_build_sbom, verify_mcp_tool_schema_bytes, verify_release_artifact,
-    verify_runtime_collector_module, verify_runtime_collector_sbom, verify_rust_backend,
-    verify_rust_sysroot_sbom, verify_rust_sysroot_tree, verify_typescript_compiler,
-    verify_web_semantic_attestation, web_legal_documents, web_semantic_from_handshake,
-    workspace_root,
+    executable_name, extract_archive, go_semantic_e2e, is_executable, mcp_package_smoke,
+    parse_worker_handshake, prefixed_lowercase_sha256, process_argument_path,
+    release_compatibility, rust_backend_from_handshake, rust_semantic_e2e, sha256_file,
+    sha256_tree, validate_bounded_query_package_smoke, verified_release_path,
+    verify_mcp_tool_schema_bytes, verify_release_artifact, verify_runtime_collector_module,
+    verify_rust_backend, verify_rust_sysroot_tree, verify_typescript_compiler,
+    verify_web_semantic_attestation, web_semantic_from_handshake, workspace_root,
 };
 
 fn materialize_cross_language_fixture(
@@ -6625,7 +6627,7 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             bail!("third-party license inventory is missing {label}");
         }
     }
-    if sbom != crate::sbom(&manifest.target, &rust_sysroot_sha256)? {
+    if sbom != crate::sbom::sbom(&manifest.target, &rust_sysroot_sha256)? {
         bail!("release SBOM differs from the locked package dependency inventory");
     }
     if license_inventory != third_party_licenses(&manifest.target)? {
