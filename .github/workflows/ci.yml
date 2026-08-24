@@ -692,6 +692,19 @@ jobs:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
 
+  # Temporary branch-only regression probe for Windows CRLF checkout behavior.
+  # Remove after project metadata verification passes on windows-2025.
+  windows-metadata-crlf-probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - name: Verify release workflow metadata after a Windows checkout
+        run: cargo test -p xtask --locked repository_release_metadata_is_synchronized
+
   windows-smoke:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
