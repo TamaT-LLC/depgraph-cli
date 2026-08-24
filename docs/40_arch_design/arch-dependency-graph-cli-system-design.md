@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-08-24
+updated: 2026-08-25
 ---
 
 > 2026-08-13: Issue #355として、GitHub上で公開済みなのは
@@ -27,6 +27,8 @@ updated: 2026-08-24
 > 2026-08-24: `v0.5.2`でリポジトリ単位のMCPセットアップを追加し、製品versionを`0.5.2`へ更新した。
 > protocol `1.0`、Store schema `17`、operation journal schema `5`、MCP DTO、既存CLIの既定値は変更しない。
 > `v0.5.1`のsourceを履歴として固定し、現行stable tag、remote `main`、`release/0.5`のexact-source条件を維持する。
+> 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
+> 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
 > Inline inputまたはrepository-relative regular fileの一方だけを受理し、size/confinement、credential policy、parse/type、query output admissionをstore access前にfail closedで検証する。
 > CLIとMCPは同じpinned completed snapshotを読み、MCPはclosed/paged DTOとinput-bound cursorを返す。validationはstore、snapshot、source treeを変更せず、raw query/trace/pathをerrorへ反射しない。
@@ -47,7 +49,7 @@ updated: 2026-08-24
 
 | Compatibility unit | Version |
 | --- | --- |
-| Product / Rust / Go / Web adapter | `0.5.2` |
+| Product / Rust / Go / Web adapter | `0.5.3` |
 | NDJSON protocol / graph schema | `1.0` |
 | SQLite store / scan cache / impact query cache | `17` / `2` / `1` |
 | Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
@@ -71,9 +73,9 @@ Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable
 MCPを含む最初のv0.5 stableは`v0.5.0`である。
 `stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。
 `v0.5.0`はsigned tag、remote `main`、初期`release/0.5`、source tree、exact eight-job Full CI、固定Agent dogfood reportが一致する場合だけ公開した。
-現行mainは、この互換性境界を変えずにリポジトリ単位のMCPセットアップを追加した`v0.5.2`である。
-`v0.5.2`はsigned tag、remote `main`、fast-forward済み`release/0.5`、source tree、exact eight-job Full CIが一致する場合だけ許可し、選択したbaselineをruntime evidenceへ記録する。
-compatibility、tag、migration、maintenance contractは[ADR](adr-v0.5-release-contract.md)、[v0.5.0 release contract](../releases/v0.5.0.md)、[v0.5.2 release note](../releases/v0.5.2.md)をcanonicalとする。
+現行mainは、この互換性境界を変えずにWindowsの公開後onboarding canaryを修正した`v0.5.3`である。
+`v0.5.3`はsigned tag、remote `main`、fast-forward済み`release/0.5`、source tree、exact eight-job Full CIが一致する場合だけ許可し、選択したbaselineをruntime evidenceへ記録する。
+compatibility、tag、migration、maintenance contractは[ADR](adr-v0.5-release-contract.md)、[v0.5.0 release contract](../releases/v0.5.0.md)、[v0.5.3 release note](../releases/v0.5.3.md)をcanonicalとする。
 
 Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`として固定し、初期`release/0.4` maintenance refと`v0.4.0` tag sourceを同じexact commitへ結び付けた。canonical baseline digest、tree、再現手順、main-first cherry-pick / stable-first forward-portの観測可能な変更フロー、force-push / wholesale merge禁止は[stable release note](../releases/v0.4.0.md)に定める。mainの次版機能は既存defaultへ影響する間default無効または明示opt-inとし、breaking defaultはminor releaseとmigration contractを要求する。baseline sourceはimmutableで新しい自己検証を含められないため、default branchの`workflow_run(requested)` guardが`Release` runのtag / source SHAを照合し、mismatch時はrunをcancelしてinvalid tagを削除する。
 

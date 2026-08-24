@@ -4,8 +4,9 @@
 
 | Version | Security fixes |
 | --- | --- |
-| `v0.5.2` | Supported after the official GitHub Release and matching post-publish evidence exist |
-| `v0.5.1` | Supported until the verified `v0.5.2` publication; unsupported afterward |
+| `v0.5.3` | Supported after the official GitHub Release and matching post-publish evidence exist |
+| `v0.5.2` | Supported until the verified `v0.5.3` publication; unsupported afterward |
+| `v0.5.1` | Unsupported |
 | `v0.5.0` | Unsupported |
 | `main` and release candidates | Evaluation only; fixes land on `main` first |
 | v0.4 candidates and older versions | Unsupported |

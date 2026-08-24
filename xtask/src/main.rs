@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.5.2";
+const STABLE_RELEASE_VERSION: &str = "0.5.3";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -162,43 +162,43 @@ struct TargetNativeSmokeExpectation {
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:8f67090876a2f19623748441778b1dd098214873007df7f0bc284e1d3d2f323b",
-        query_result_digest: "bounded-query-result:sha256:c23b683189bc7132497799eac966af09a3d5cf27c6397e06fd9ccf526ff97fb1",
-        query_output_sha256: "5180d8fa5698601b0c55ce7124d45bd67310698980e847513882a74ba8c97b92",
-        profile_plan_digest: "profile-selection-plan:sha256:8c7ac66f901fb04f5a80bb1bb7af3f89617094ac58160772d81a9503ea5af442",
-        profile_plan_output_sha256: "5fde96984efc8b38548e07431aeb5ccaa19fe224a9cacc68b1f91d5570603a47",
+        query_plan_digest: "bounded-query-plan:sha256:d68359cc79795a21dafbd006a102fb812421621588bd463829549526d3215742",
+        query_result_digest: "bounded-query-result:sha256:5edc8a434499db0c01b2929d087fb319bf0bd871fae6370b6a1f3f0fb80e4d2b",
+        query_output_sha256: "d9538cf126d7667695dcfedf44b7555085266a7a73e382368470c7c185c544b1",
+        profile_plan_digest: "profile-selection-plan:sha256:1a904d1b65eef14ff1839b05eefa164864284bd2782984624d7ab00c28688376",
+        profile_plan_output_sha256: "eb7780d850f02291e81f68442669dc5ba1bd0db51fcd933f3fe828bf1d6b07a5",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:4b9794145d78e70e10b69544c58797ca20af1365ccbd6f15195820579620346e",
-        query_result_digest: "bounded-query-result:sha256:c7154f0f5cdf71d5a7e1d5871eb649443a98c534c26c80f892d15f1aa026c94f",
-        query_output_sha256: "1527bf8751691fae1ad7930b5f7e2cb1ed9c59f968ef30f9159354b9282f17b6",
-        profile_plan_digest: "profile-selection-plan:sha256:1ef4bc4efeb712fedbe89ad4ab8b8723a46a3911923b7897a5769c9fcd5238ae",
-        profile_plan_output_sha256: "50088e245ca8638d3b7a48ac8fb4c7981b5dbd1ab3bf974be7f84e9fa8d362fd",
+        query_plan_digest: "bounded-query-plan:sha256:cf0aedb73ea83c9a2df95fd62b9b0154e6359b4f065a6c890c8c2b2d00ec7a3d",
+        query_result_digest: "bounded-query-result:sha256:643a38ceea4442426e0b9ba5007773689a28b1b82ce21961b55877fc9c992e85",
+        query_output_sha256: "3cdf1755721ccf59e4567dc4e01c4ceb24758008a3d7083437c2adeab8b5901f",
+        profile_plan_digest: "profile-selection-plan:sha256:040ea2d2439951e464f981f744300e94dafc02332f6487587e9eed3d29611133",
+        profile_plan_output_sha256: "9151a62d9b004b1eb875ca2656417ab873fab58f7c3b871039653f52d9a28919",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:b21aaa639ba2705673a90376e7653cb57664b98f4b7276581035d6a27ff6448a",
-        query_result_digest: "bounded-query-result:sha256:8417caedd2cb42097bcdc58cc933c8593ba79e0d3fbd6488f28bd72020192377",
-        query_output_sha256: "ed21e21b3ae01978d019183e73edcdd590ade6f479cc7a386ad87e40ec1971fb",
-        profile_plan_digest: "profile-selection-plan:sha256:afaa8c162ce519b8b9d3229c570e412e1d1aae88797b4421bd9b2c529455ecb5",
-        profile_plan_output_sha256: "6cc4ea39cec4e49490586004d0a0e7fa4238d89ac1d069b6c0cd9a1777ff0544",
+        query_plan_digest: "bounded-query-plan:sha256:43bae64bc8fc668f3e2dfe5e8b45c13fd241b9c1471e10bf5d1e21bdf73c3443",
+        query_result_digest: "bounded-query-result:sha256:531fe9bb862b10cf3ff1ca71fb6b93fe98d4f86b383ae2a7078eef919257f26c",
+        query_output_sha256: "a8a68c840a12b2415e3e3ea9cecdee6976c072b4547e242414841dfe205a3f23",
+        profile_plan_digest: "profile-selection-plan:sha256:bce16db4a7a11fd7a8c7280d63fc1bc5f8da9f7d7886019cd1b62d3b5b189878",
+        profile_plan_output_sha256: "0cdd1c03c6d941b3fc87d51d49a412395e53a53661e69228ee7963886a832988",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:794299a6d4aa8f8b1764608759166ce47a68b7fb08424d53a97acdaed518f13f",
-        query_result_digest: "bounded-query-result:sha256:7b524c5e5139440f734516fb7a4b08e9a92a988e6e8cce572a473ba7f27d7f84",
-        query_output_sha256: "bccc379e8884d1d462fb9f3ed97fa33b96efa48a0d8702ec49554a94e3e688d8",
-        profile_plan_digest: "profile-selection-plan:sha256:d1bf8a850b40958ceaf82a54c4b77e64cec470c7800cf7580c07fbcbccfe2b13",
-        profile_plan_output_sha256: "3ce5a583505de11c0cd69ee6a08908de36295e8be504167c03cfdf728358f032",
+        query_plan_digest: "bounded-query-plan:sha256:a51af29beddd8d52d9c728a15625b2e7d08f8827f942386775a46adb248acb63",
+        query_result_digest: "bounded-query-result:sha256:b4ee83383486efeb4c2ae5a856d8c65845ed3a29b5dedabbba70d480b0ed4518",
+        query_output_sha256: "52feacd64a9de0f549d8afe68560693ccbd3e36bf6d8b089980f0c5bd14d5ee4",
+        profile_plan_digest: "profile-selection-plan:sha256:67f750952b3654fdc79d845a041e5fd1efd91c3daed834854386e700b9129014",
+        profile_plan_output_sha256: "703e1dec109e47693ebfdb022dbeef67779ffb5fb061805f57251e0361bfaf1d",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:b5242623bff9013820a06845e4a669a5c8ec6fd43414a9ba6b9197a86365716d",
-        query_result_digest: "bounded-query-result:sha256:af188a81d4cf286594193935df160453c0f59d750b7c5f7d3c83e3e17736da39",
-        query_output_sha256: "195f7a4b9d9e96f2e20c98c8d4025af16e6273f3dd50dc76bfa1ddc40c15f92b",
-        profile_plan_digest: "profile-selection-plan:sha256:03661db8854c3a1924e13d85b089310db166e6313a5769d573a13a19103e8b0e",
-        profile_plan_output_sha256: "2ca5cef5a705183a50646194fff7ed325e7664c833223ea0d2c49e22f620ca8b",
+        query_plan_digest: "bounded-query-plan:sha256:bbbe6ec9bfc32b20053306c8c9992a4a59de40cc5ba00582204b6ccbed46c3e6",
+        query_result_digest: "bounded-query-result:sha256:b9d3c7ba0b2867d4ceb5b6fec32f9ca8a601fb5994031a25fa8f7881bb244bd7",
+        query_output_sha256: "8ac798bae924448a27f2854adf4de2f6bc8a8f1f9e88960d02699645ab86d341",
+        profile_plan_digest: "profile-selection-plan:sha256:c046ed3938b4c542d07c0b564132380e83991a1691730ecd42e46a9076f59697",
+        profile_plan_output_sha256: "6a546806cf502a42cb71a3f9afd85e3d6fc0f96a09d496bec211548858a25ead",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -619,6 +619,8 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "V0_5_0_RELEASE_SOURCE_SHA: f1071178d3888503b6e02d4aec5e058f0b87d035",
         "github.event.workflow_run.head_branch == 'v0.5.1'",
         "V0_5_1_RELEASE_SOURCE_SHA: 87f3f54d7568b1302be4c15c5377f669ec161396",
+        "github.event.workflow_run.head_branch == 'v0.5.2'",
+        "V0_5_2_RELEASE_SOURCE_SHA: 08e077b9b2f7dbe6dd919ae75e0c20f559b14cbb",
         "STABLE_MAINTENANCE_REF: heads/release/0.5",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",

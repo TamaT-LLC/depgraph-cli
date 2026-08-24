@@ -123,10 +123,11 @@ evaluated separately.
 
 ## Install official packages
 
-`v0.5.2` provides native packages for Linux x86-64, Linux ARM64, macOS Intel,
-macOS Apple Silicon, and Windows x86-64. `v0.5.0` was distributed only through
-GitHub Releases; npm distribution starts with `v0.5.1` under TamaT LLC's
-`@tamat-llc` organization scope.
+The following installation guidance applies after the official Release and
+post-publish evidence exist. `v0.5.3` provides native packages for Linux x86-64,
+Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x86-64. `v0.5.0` was
+distributed only through GitHub Releases; npm distribution starts with `v0.5.1`
+under TamaT LLC's `@tamat-llc` organization scope.
 
 `npm i -g @tamat-llc/depgraph` installs the verified native package for the
 same five targets without an install-time external download. The npm launcher
@@ -147,10 +148,10 @@ environment below.
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
-On macOS or Linux, use GitHub CLI to download the archive and checksum.
+After publication, use GitHub CLI on macOS or Linux to download the archive and checksum.
 
 ```sh
-VERSION=0.5.2
+VERSION=0.5.3
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -195,10 +196,10 @@ tests together. Development workflow and command details are in
 
 ## Releases and compatibility
 
-`main` implements the `0.5.2` contract documented in the
-[`v0.5.2` release notes](docs/releases/v0.5.2.md). A stable release is valid
+`main` implements the `0.5.3` contract documented in the
+[`v0.5.3` release notes](docs/releases/v0.5.3.md). A stable release is valid
 only when the
-[`v0.5.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.2)
+[`v0.5.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.3)
 and its post-publish evidence exist and agree.
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
@@ -216,14 +217,14 @@ documented as [`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
-See the [`v0.5.2` release notes](docs/releases/v0.5.2.md) for the complete
+See the [`v0.5.3` release notes](docs/releases/v0.5.3.md) for the complete
 compatibility tuple, Store migrations, rollback procedure, and known limits.
 
 ## Project status and public collaboration
 
-The supported line is conditionally anchored by the verified `v0.5.2` Release.
-`v0.5.2` becomes the current stable release after the official Release and its
-post-publish evidence are public. Until then, `v0.5.1` remains stable and
+The supported line is conditionally anchored by the verified `v0.5.3` Release.
+`v0.5.3` becomes the current stable release after the official Release and its
+post-publish evidence are public. Until then, `v0.5.2` remains stable and
 release candidates are historical evaluation artifacts. Product support is
 best effort, without response-time or resolution-time SLAs.
 
@@ -457,15 +458,15 @@ gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
 ```
 
 ```sh
-/absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE/bin/depgraph agent-config \
+/absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE/bin/depgraph agent-config \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
-  --release-archive /absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE.tar.gz \
-  --release-checksum /absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-archive /absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE.tar.gz.sha256 \
   --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
   --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --release-manifest /absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE/release-manifest.json \
-  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.5.2-TARGET_TRIPLE.requirement.json \
+  --release-manifest /absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.5.3-TARGET_TRIPLE.requirement.json \
   --host codex
 ```
 
@@ -480,7 +481,7 @@ profiles are selected explicitly with `--profile store-write`,
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -496,7 +497,7 @@ form to copy unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.2-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.5.3-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -954,8 +955,8 @@ example below becomes downloadable only after that candidate is published;
 the normal depgraph archive and compiler pack must come from one release run.
 
 ```bash
-version=0.5.2
-release_tag=v0.5.2
+version=0.5.3
+release_tag=v0.5.3
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 

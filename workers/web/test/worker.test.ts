@@ -3256,7 +3256,7 @@ test("worker exposes the release and protocol handshake", async () => {
   const result = await execute(process.execPath, [worker, "--version"]);
   assert.equal(
     result.stdout,
-    "depgraph-web-worker 0.5.2 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)\n",
+    "depgraph-web-worker 0.5.3 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)\n",
   );
   assert.equal(result.stderr, "");
 });
