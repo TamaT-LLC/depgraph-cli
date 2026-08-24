@@ -692,6 +692,44 @@ jobs:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
 
+  # Temporary branch-only probe used to refresh the two native package-smoke
+  # identities not covered by Full CI for v0.5.2. Remove after log capture.
+  native-smoke-probe:
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    strategy:
+      fail-fast: ${{ false }}
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rustflags: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "${{ matrix.rustflags }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
+      - run: rustup default 1.93.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.1
+          cache-dependency-path: workers/go/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.0
+          standalone: false
+      - name: Capture native package-smoke identity
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask package
+
   windows-smoke:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
