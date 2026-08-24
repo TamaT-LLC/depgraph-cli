@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-13
-- Updated: 2026-08-20
+- Updated: 2026-08-24
 - Decision ID: `PROJ-ARC-001-ADR-007`
 - Issue: `PROJ-ARC-003-TASK-001` / #355
 - Contract: `stable-release-gate-v2`
@@ -111,6 +111,19 @@ A cherry-pick creates a different commit SHA and cannot satisfy the existing
 exact-source gate. Force-pushes and history rewrites remain forbidden. Main is
 frozen between candidate selection and completion of the source-identity
 check.
+
+### 2026-08-24 repository-onboarding patch amendment
+
+`v0.5.2` adds the opt-in `depgraph mcp setup`, `status`, `update`, and
+`uninstall` commands without changing the v0.5 compatibility tuple. The
+worker protocol, Store schema, operation journal schema, MCP DTOs, existing
+CLI defaults, and release artifact formats remain unchanged.
+
+The stable source rule remains exact-source and fail-closed. The signed
+`v0.5.2` tag, remote `main`, and `release/0.5` identify the same reviewed
+Full-CI-green commit at publication. The source guard preserves the published
+`v0.5.1` source as immutable history while treating `v0.5.2` as the current
+stable candidate.
 
 ## Consequences
 

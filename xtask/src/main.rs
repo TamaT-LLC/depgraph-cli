@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.5.1";
+const STABLE_RELEASE_VERSION: &str = "0.5.2";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -617,6 +617,8 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "guard-stable-tags:",
         "github.event.workflow_run.head_branch == 'v0.5.0'",
         "V0_5_0_RELEASE_SOURCE_SHA: f1071178d3888503b6e02d4aec5e058f0b87d035",
+        "github.event.workflow_run.head_branch == 'v0.5.1'",
+        "V0_5_1_RELEASE_SOURCE_SHA: 87f3f54d7568b1302be4c15c5377f669ec161396",
         "STABLE_MAINTENANCE_REF: heads/release/0.5",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
