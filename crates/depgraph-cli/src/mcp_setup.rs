@@ -1481,21 +1481,7 @@ struct RepositoryStateExclusion {
 
 fn acquire_repository_state_exclusion(
     config: &DepgraphServiceConfig,
-) -> Result<Option<RepositoryStateExclusion>> {
-    let mut state_exists = false;
-    for path in all_repository_state_paths(config) {
-        match fs::symlink_metadata(&path) {
-            Ok(_) => state_exists = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).context("cannot inspect repository-specific MCP state");
-            }
-        }
-    }
-    if !state_exists {
-        return Ok(None);
-    }
-
+) -> Result<RepositoryStateExclusion> {
     let journal = operation_journal_path(config);
     let operation_runner = try_acquire_operation_runner_exclusion(&journal)?
         .context("MCP uninstall cannot run while a durable operation runner is active")?;
@@ -1504,10 +1490,10 @@ fn acquire_repository_state_exclusion(
     if !config.repository_root_seal().matches_live_root() {
         security_bail("repository root changed while MCP state exclusion was acquired")?;
     }
-    Ok(Some(RepositoryStateExclusion {
+    Ok(RepositoryStateExclusion {
         _operation_runner: operation_runner,
         _store_writer: store_writer,
-    }))
+    })
 }
 
 fn remove_repository_state(config: &DepgraphServiceConfig) -> Result<usize> {
@@ -1552,14 +1538,6 @@ fn removable_repository_state_paths(config: &DepgraphServiceConfig) -> Vec<PathB
         candidates.push(with_suffix(&journal, suffix));
     }
     candidates
-}
-
-fn all_repository_state_paths(config: &DepgraphServiceConfig) -> Vec<PathBuf> {
-    let mut paths = removable_repository_state_paths(config);
-    paths.push(with_suffix(config.store_path(), ".writer-lock"));
-    let journal = operation_journal_path(config);
-    paths.push(with_suffix(journal.as_path(), ".runner-purge-lock"));
-    paths
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1966,11 +1944,22 @@ mod tests {
 
         assert!(acquire_repository_state_exclusion(&binding).is_err());
         drop(runner);
-        assert!(
-            acquire_repository_state_exclusion(&binding)
-                .unwrap()
-                .is_some()
-        );
+        assert!(acquire_repository_state_exclusion(&binding).is_ok());
+    }
+
+    #[test]
+    fn state_cleanup_exclusion_exists_before_repository_state_is_created() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("not-created/graph.db");
+        let binding = read_binding(repository.path(), &store);
+        assert!(!store.exists());
+
+        let exclusion = acquire_repository_state_exclusion(&binding).unwrap();
+        assert!(with_suffix(&store, ".writer-lock").is_file());
+        assert!(with_suffix(&store, ".operations.sqlite.runner-purge-lock").is_file());
+        assert!(!store.exists());
+        drop(exclusion);
     }
 
     #[test]

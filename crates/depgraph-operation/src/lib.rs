@@ -1308,12 +1308,21 @@ pub struct OperationRunnerExclusionGuard {
 
 /// Try to exclude the operation runner associated with a validated journal identity.
 ///
+/// The validated journal parent and persistent lock sentinel are created when
+/// absent so a cleanup caller can establish exclusion before any journal state
+/// exists.
+///
 /// `Ok(None)` means a runner currently owns the cleanup/terminal acknowledgement
 /// window. The lock file is a persistent coordination sentinel and must not be
 /// removed by the caller while this guard is alive.
 pub fn try_acquire_operation_runner_exclusion(
     journal_path: &OperationJournalPath,
 ) -> Result<Option<OperationRunnerExclusionGuard>, JournalError> {
+    let parent = journal_path
+        .as_path()
+        .parent()
+        .ok_or(JournalError::InvalidArgument)?;
+    std::fs::create_dir_all(parent)?;
     Ok(try_acquire_runner_purge_guard(journal_path.as_path())?
         .map(|guard| OperationRunnerExclusionGuard { _guard: guard }))
 }

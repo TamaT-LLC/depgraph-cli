@@ -334,7 +334,7 @@ depgraph mcp uninstall --host codex
 
 `status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
 `update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
-`uninstall`はscan、daemon、durable operation runnerの排他を取得してからrepository固有の設定とstateだけを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
+`uninstall`はstate未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してからrepository固有の設定とstateだけを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
 中断後は同じ`setup`を再実行する。
 root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。
 

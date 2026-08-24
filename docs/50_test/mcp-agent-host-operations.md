@@ -61,9 +61,11 @@ cached asset/evidence chain, extracted package, fixed Store/current snapshot,
 exact Codex entry, and MCP connection. `update` performs the same reconciliation
 as setup for the invoking CLI version and always refreshes the safe snapshot.
 `uninstall` first confirms that the installed entry names the same canonical
-root and Store, then acquires the durable-operation runner exclusion followed
-by the Store writer exclusion. It fails before changing the host file while a
-runner, scan, daemon, or Store writer is active. With both guards held, it
+root and Store, then always acquires the durable-operation runner exclusion
+followed by the Store writer exclusion. It fails before changing the host file while a
+runner, scan, daemon, or Store writer is active. Missing state directories and
+persistent lock sentinels are created first, closing the race before initial
+Store or journal creation. With both guards held, it
 removes only that table from the format-preserving TOML document and deletes
 the exact Store/journal/SQLite/daemon sidecar family. Empty writer and runner
 lock sentinels remain in place so cleanup never unlinks a coordination inode;
