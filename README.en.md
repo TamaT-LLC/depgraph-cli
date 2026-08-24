@@ -385,6 +385,7 @@ repository, creates the initial snapshot with the non-executing safe scan,
 performs the packaged `initialize`, `tools/list`, and `get_context` preflight,
 then atomically merges only `mcp_servers.depgraph` into
 `.codex/config.toml`. Existing unrelated TOML settings are retained. The
+format-preserving edit also retains their comments and layout. The
 installed entry contains absolute paths and fixes the server to this root,
 Store, compiler-pack requirement, and read-only capability.
 
@@ -401,9 +402,11 @@ depgraph mcp uninstall --host codex
 `status` independently rechecks the official release metadata, cached bytes,
 package closure, Store/root snapshot, exact project entry, and live MCP
 preflight. `update` reconciles to the invoking CLI version and refreshes the
-safe snapshot. `uninstall` removes only the matching project entry and that
-repository's Store/journal/lock state; the shared verified artifacts remain for
-other repositories. Pass `--root /absolute/path/to/repository` when running
+safe snapshot. `uninstall` first excludes active scans, daemons, and durable
+operation runners, then removes only the matching project entry and that
+repository's Store, journal, and ephemeral sidecars. Empty writer/runner lock
+sentinels remain so a live coordination file is never unlinked; shared verified
+artifacts remain for other repositories. Pass `--root /absolute/path/to/repository` when running
 outside the checkout. If you choose a custom Store with the global
 `--store /absolute/path/to/graph.db` option, put it before `mcp` and repeat the
 same option for every lifecycle command.

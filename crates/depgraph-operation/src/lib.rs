@@ -1298,6 +1298,26 @@ pub(crate) struct RunnerPurgeGuard {
     _file: File,
 }
 
+/// Cross-process exclusion held for the complete lifetime of an operation runner.
+///
+/// Cleanup workflows must retain this guard while removing a repository's
+/// durable-operation state so they fail closed instead of racing a live runner.
+pub struct OperationRunnerExclusionGuard {
+    _guard: RunnerPurgeGuard,
+}
+
+/// Try to exclude the operation runner associated with a validated journal identity.
+///
+/// `Ok(None)` means a runner currently owns the cleanup/terminal acknowledgement
+/// window. The lock file is a persistent coordination sentinel and must not be
+/// removed by the caller while this guard is alive.
+pub fn try_acquire_operation_runner_exclusion(
+    journal_path: &OperationJournalPath,
+) -> Result<Option<OperationRunnerExclusionGuard>, JournalError> {
+    Ok(try_acquire_runner_purge_guard(journal_path.as_path())?
+        .map(|guard| OperationRunnerExclusionGuard { _guard: guard }))
+}
+
 fn runner_purge_lock_path(journal_path: &Path) -> PathBuf {
     let mut path = journal_path.as_os_str().to_os_string();
     path.push(RUNNER_PURGE_LOCK_SUFFIX);

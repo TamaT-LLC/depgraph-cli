@@ -322,7 +322,7 @@ depgraph mcp setup --host codex
 ```
 
 既定ではruntimeとcompiler packをversion／target単位で共有し、ストアと`.codex/config.toml`はcanonical repository rootごとに分離する。
-設定はread-onlyで固定され、既存の無関係なCodex設定を保持する。
+設定はread-onlyで固定され、既存の無関係なCodex設定、コメント、書式を保持する。
 完了後はCodexを再起動する。
 再実行はidempotentであり、運用には次のコマンドを使う。
 
@@ -333,7 +333,8 @@ depgraph mcp uninstall --host codex
 ```
 
 `status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
-`update`は実行中CLIのversionへ整合させてsafe snapshotを更新し、`uninstall`はrepository固有の設定とstateだけを削除して共有artifactを残す。
+`update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
+`uninstall`はscan、daemon、durable operation runnerの排他を取得してからrepository固有の設定とstateだけを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
 中断後は同じ`setup`を再実行する。
 root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。
 

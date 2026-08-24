@@ -9,13 +9,17 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use depgraph_core::{
-    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, compiler_pack_host_target,
-    default_store_path,
+    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, acquire_store_writer_lock,
+    compiler_pack_host_target, default_store_path,
 };
 use depgraph_mcp_tools::{AgentHostCapabilityProfile, AgentHostFormat};
+use depgraph_operation::{
+    OperationRunnerExclusionGuard, operation_journal_path, try_acquire_operation_runner_exclusion,
+};
 use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use toml_edit::{DocumentMut, Item as TomlItem, Table as TomlTable};
 
 use crate::agent_config::{
     AgentConfigRequest, current_snapshot_if_valid, generate_with_verified_package,
@@ -150,6 +154,8 @@ pub(crate) fn status(request: &McpWorkflowRequest) -> Result<McpStatusOutput> {
 
 pub(crate) fn uninstall(request: &McpWorkflowRequest) -> Result<McpUninstallOutput> {
     let binding = resolve_binding(request)?;
+    preflight_codex_ownership(&binding.config)?;
+    let _state_exclusion = acquire_repository_state_exclusion(&binding.config)?;
     let config_path = codex_config_path(binding.config.canonical_root());
     let config_changed = remove_codex_configuration(
         &binding.config,
@@ -1198,15 +1204,16 @@ fn install_codex_configuration(
     config_path: &Path,
     generated: &str,
 ) -> Result<bool> {
-    let generated = parse_toml(generated, "generated Codex MCP configuration")?;
-    let desired = depgraph_entry(&generated)?.clone();
+    let generated_value = parse_toml(generated, "generated Codex MCP configuration")?;
+    let desired_value = depgraph_entry(&generated_value)?.clone();
+    let desired_item = editable_depgraph_entry(generated)?;
     let existing_bytes = read_optional_bounded_config(config_path)?;
-    let mut existing = match &existing_bytes {
+    let existing = match &existing_bytes {
         Some(bytes) => parse_toml_bytes(bytes, "existing Codex project configuration")?,
         None => toml::Value::Table(toml::Table::new()),
     };
     if let Some(current) = checked_depgraph_entry(&existing)? {
-        if current == &desired {
+        if current == &desired_value {
             return Ok(false);
         }
         if !entry_matches_binding(current, binding.canonical_root(), binding.store_path()) {
@@ -1215,8 +1222,12 @@ fn install_codex_configuration(
             )?;
         }
     }
-    set_depgraph_entry(&mut existing, desired)?;
-    let rendered = render_toml(&existing)?;
+    let mut document = match &existing_bytes {
+        Some(bytes) => parse_edit_toml_bytes(bytes, "existing Codex project configuration")?,
+        None => DocumentMut::new(),
+    };
+    set_editable_depgraph_entry(&mut document, desired_item)?;
+    let rendered = document.to_string();
     if !binding.repository_root_seal().matches_live_root() {
         security_bail("repository root changed before Codex configuration update")?;
     }
@@ -1250,15 +1261,16 @@ fn remove_codex_configuration(
     let Some(bytes) = read_optional_bounded_config(config_path)? else {
         return Ok(false);
     };
-    let mut existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
+    let existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
     let Some(entry) = checked_depgraph_entry(&existing)? else {
         return Ok(false);
     };
     if !entry_matches_binding(entry, expected_root, expected_store) {
         security_bail("the existing Codex depgraph entry belongs to a different root or Store")?;
     }
-    remove_depgraph_entry(&mut existing)?;
-    let rendered = render_toml(&existing)?;
+    let mut document = parse_edit_toml_bytes(&bytes, "existing Codex project configuration")?;
+    remove_editable_depgraph_entry(&mut document)?;
+    let rendered = document.to_string();
     if !binding.repository_root_seal().matches_live_root() {
         security_bail("repository root changed before Codex configuration removal")?;
     }
@@ -1276,12 +1288,32 @@ fn parse_toml_bytes(input: &[u8], description: &str) -> Result<toml::Value> {
     parse_toml(input, description)
 }
 
-fn render_toml(value: &toml::Value) -> Result<String> {
-    let mut rendered = toml::to_string_pretty(value).context("cannot render Codex TOML")?;
-    if !rendered.is_empty() && !rendered.ends_with('\n') {
-        rendered.push('\n');
+fn parse_edit_toml(input: &str, description: &str) -> Result<DocumentMut> {
+    input
+        .parse::<DocumentMut>()
+        .with_context(|| format!("{description} is invalid editable TOML"))
+}
+
+fn parse_edit_toml_bytes(input: &[u8], description: &str) -> Result<DocumentMut> {
+    let input =
+        std::str::from_utf8(input).with_context(|| format!("{description} is not UTF-8"))?;
+    parse_edit_toml(input, description)
+}
+
+fn editable_depgraph_entry(generated: &str) -> Result<TomlItem> {
+    let document = parse_edit_toml(generated, "generated Codex MCP configuration")?;
+    let servers = document
+        .get("mcp_servers")
+        .and_then(TomlItem::as_table_like)
+        .context("generated Codex MCP configuration has no mcp_servers table")?;
+    let mut entry = servers
+        .get("depgraph")
+        .cloned()
+        .context("generated Codex MCP configuration has no depgraph entry")?;
+    if let Some(table) = entry.as_table_mut() {
+        table.set_position(None);
     }
-    Ok(rendered)
+    Ok(entry)
 }
 
 fn depgraph_entry(value: &toml::Value) -> Result<&toml::Value> {
@@ -1316,34 +1348,27 @@ fn preflight_codex_ownership(binding: &DepgraphServiceConfig) -> Result<()> {
     Ok(())
 }
 
-fn set_depgraph_entry(value: &mut toml::Value, entry: toml::Value) -> Result<()> {
-    let root = value
-        .as_table_mut()
-        .context("Codex project configuration root must be a TOML table")?;
+fn set_editable_depgraph_entry(document: &mut DocumentMut, entry: TomlItem) -> Result<()> {
+    let root = document.as_table_mut();
     let servers = root
         .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
+        .or_insert_with(|| {
+            let mut table = TomlTable::new();
+            table.set_implicit(true);
+            TomlItem::Table(table)
+        })
+        .as_table_like_mut()
         .context("Codex mcp_servers must be a TOML table")?;
-    servers.insert("depgraph".to_owned(), entry);
+    servers.insert("depgraph", entry);
     Ok(())
 }
 
-fn remove_depgraph_entry(value: &mut toml::Value) -> Result<()> {
-    let root = value
-        .as_table_mut()
-        .context("Codex project configuration root must be a TOML table")?;
-    let remove_servers = {
-        let servers = root
-            .get_mut("mcp_servers")
-            .and_then(toml::Value::as_table_mut)
-            .context("Codex mcp_servers must be a TOML table")?;
-        servers.remove("depgraph");
-        servers.is_empty()
-    };
-    if remove_servers {
-        root.remove("mcp_servers");
-    }
+fn remove_editable_depgraph_entry(document: &mut DocumentMut) -> Result<()> {
+    let servers = document
+        .get_mut("mcp_servers")
+        .and_then(TomlItem::as_table_like_mut)
+        .context("Codex mcp_servers must be a TOML table")?;
+    servers.remove("depgraph");
     Ok(())
 }
 
@@ -1449,27 +1474,45 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .context("cannot atomically replace Codex project configuration")
 }
 
+struct RepositoryStateExclusion {
+    _operation_runner: OperationRunnerExclusionGuard,
+    _store_writer: File,
+}
+
+fn acquire_repository_state_exclusion(
+    config: &DepgraphServiceConfig,
+) -> Result<Option<RepositoryStateExclusion>> {
+    let mut state_exists = false;
+    for path in all_repository_state_paths(config) {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => state_exists = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("cannot inspect repository-specific MCP state");
+            }
+        }
+    }
+    if !state_exists {
+        return Ok(None);
+    }
+
+    let journal = operation_journal_path(config);
+    let operation_runner = try_acquire_operation_runner_exclusion(&journal)?
+        .context("MCP uninstall cannot run while a durable operation runner is active")?;
+    let store_writer = acquire_store_writer_lock(config.store_path())
+        .context("MCP uninstall cannot run while a scan, daemon, or Store writer is active")?;
+    if !config.repository_root_seal().matches_live_root() {
+        security_bail("repository root changed while MCP state exclusion was acquired")?;
+    }
+    Ok(Some(RepositoryStateExclusion {
+        _operation_runner: operation_runner,
+        _store_writer: store_writer,
+    }))
+}
+
 fn remove_repository_state(config: &DepgraphServiceConfig) -> Result<usize> {
-    let store = config.store_path();
-    let mut candidates = Vec::new();
-    for suffix in [
-        "",
-        "-wal",
-        "-shm",
-        "-journal",
-        ".writer-lock",
-        ".daemon-status.json",
-        ".daemon-stop",
-        ".daemon-lock",
-    ] {
-        candidates.push(with_suffix(store, suffix));
-    }
-    let journal = with_suffix(store, ".operations.sqlite");
-    for suffix in ["", "-wal", "-shm", "-journal", ".runner-purge-lock"] {
-        candidates.push(with_suffix(&journal, suffix));
-    }
     let mut removed = 0_usize;
-    for candidate in candidates {
+    for candidate in removable_repository_state_paths(config) {
         let metadata = match fs::symlink_metadata(&candidate) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1486,16 +1529,37 @@ fn remove_repository_state(config: &DepgraphServiceConfig) -> Result<usize> {
         })?;
         removed += 1;
     }
-    let default_store = default_store_path(config.canonical_root())?;
-    if store == default_store
-        && let Some(parent) = store.parent()
-        && parent
-            .read_dir()
-            .is_ok_and(|mut entries| entries.next().is_none())
-    {
-        let _ = fs::remove_dir(parent);
-    }
     Ok(removed)
+}
+
+fn removable_repository_state_paths(config: &DepgraphServiceConfig) -> Vec<PathBuf> {
+    let store = config.store_path();
+    let mut candidates = Vec::new();
+    for suffix in [
+        "",
+        "-wal",
+        "-shm",
+        "-journal",
+        ".daemon-status.json",
+        ".daemon-stop",
+        ".daemon-stop.lock",
+        ".daemon-lock",
+    ] {
+        candidates.push(with_suffix(store, suffix));
+    }
+    let journal = with_suffix(store, ".operations.sqlite");
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        candidates.push(with_suffix(&journal, suffix));
+    }
+    candidates
+}
+
+fn all_repository_state_paths(config: &DepgraphServiceConfig) -> Vec<PathBuf> {
+    let mut paths = removable_repository_state_paths(config);
+    paths.push(with_suffix(config.store_path(), ".writer-lock"));
+    let journal = operation_journal_path(config);
+    paths.push(with_suffix(journal.as_path(), ".runner-purge-lock"));
+    paths
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1732,17 +1796,24 @@ mod tests {
         let codex = repository.path().join(".codex");
         fs::create_dir(&codex).unwrap();
         let path = codex.join("config.toml");
-        fs::write(
-            &path,
-            "model = \"gpt-5\"\n[mcp_servers.other]\ncommand = \"other\"\nargs = []\n",
-        )
-        .unwrap();
+        let original = "# keep project model\nmodel = \"gpt-5\" # keep inline model note\n\n# keep unrelated server notes\n[mcp_servers.other]\ncommand = \"other\" # keep inline server note\nargs = []\n";
+        fs::write(&path, original).unwrap();
         let generated = codex_entry(repository.path(), &store);
 
         assert!(install_codex_configuration(&binding, &path, &generated).unwrap());
         assert!(!install_codex_configuration(&binding, &path, &generated).unwrap());
         verify_codex_configuration(&path, &generated).unwrap();
-        let merged = parse_toml_bytes(&fs::read(&path).unwrap(), "fixture").unwrap();
+        let merged_bytes = fs::read(&path).unwrap();
+        let merged_text = std::str::from_utf8(&merged_bytes).unwrap();
+        for preserved in [
+            "# keep project model",
+            "model = \"gpt-5\" # keep inline model note",
+            "# keep unrelated server notes",
+            "command = \"other\" # keep inline server note",
+        ] {
+            assert!(merged_text.contains(preserved), "missing {preserved}");
+        }
+        let merged = parse_toml_bytes(&merged_bytes, "fixture").unwrap();
         assert_eq!(merged["model"].as_str(), Some("gpt-5"));
         assert_eq!(
             merged["mcp_servers"]["other"]["command"].as_str(),
@@ -1750,7 +1821,17 @@ mod tests {
         );
 
         assert!(remove_codex_configuration(&binding, &path, repository.path(), &store).unwrap());
-        let removed = parse_toml_bytes(&fs::read(&path).unwrap(), "fixture").unwrap();
+        let removed_bytes = fs::read(&path).unwrap();
+        let removed_text = std::str::from_utf8(&removed_bytes).unwrap();
+        for preserved in [
+            "# keep project model",
+            "model = \"gpt-5\" # keep inline model note",
+            "# keep unrelated server notes",
+            "command = \"other\" # keep inline server note",
+        ] {
+            assert!(removed_text.contains(preserved), "missing {preserved}");
+        }
+        let removed = parse_toml_bytes(&removed_bytes, "fixture").unwrap();
         assert!(checked_depgraph_entry(&removed).unwrap().is_none());
         assert_eq!(removed["model"].as_str(), Some("gpt-5"));
         assert_eq!(
@@ -1777,6 +1858,37 @@ mod tests {
                 .unwrap_err();
         assert!(error.to_string().contains("different root or Store"));
         assert_eq!(fs::read_to_string(path).unwrap(), existing);
+    }
+
+    #[test]
+    fn codex_merge_preserves_an_unrelated_inline_server_table() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("graph.db");
+        let binding = read_binding(repository.path(), &store);
+        let codex = repository.path().join(".codex");
+        fs::create_dir(&codex).unwrap();
+        let path = codex.join("config.toml");
+        let original = "mcp_servers = { other = { command = \"other\", args = [] } } # keep inline server table\n";
+        fs::write(&path, original).unwrap();
+        let generated = codex_entry(repository.path(), &store);
+
+        assert!(install_codex_configuration(&binding, &path, &generated).unwrap());
+        verify_codex_configuration(&path, &generated).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("# keep inline server table")
+        );
+
+        assert!(remove_codex_configuration(&binding, &path, repository.path(), &store).unwrap());
+        let removed = fs::read_to_string(&path).unwrap();
+        assert!(removed.contains("# keep inline server table"));
+        let parsed = parse_toml(&removed, "fixture").unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
     }
 
     #[cfg(unix)]
@@ -1809,8 +1921,56 @@ mod tests {
         }
         let unrelated = state.path().join("keep.txt");
         fs::write(&unrelated, b"keep").unwrap();
-        assert_eq!(remove_repository_state(&binding).unwrap(), 4);
+        let exclusion = acquire_repository_state_exclusion(&binding).unwrap();
+        assert_eq!(remove_repository_state(&binding).unwrap(), 3);
+        drop(exclusion);
         assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert!(with_suffix(&store, ".writer-lock").is_file());
+        assert!(with_suffix(&store, ".operations.sqlite.runner-purge-lock").is_file());
+    }
+
+    #[test]
+    fn uninstall_fails_before_mutation_while_a_store_writer_is_active() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("graph.db");
+        fs::write(&store, b"owned").unwrap();
+        let codex = repository.path().join(".codex");
+        fs::create_dir(&codex).unwrap();
+        let config_path = codex.join("config.toml");
+        let installed = codex_entry(repository.path(), &store);
+        fs::write(&config_path, &installed).unwrap();
+        let writer = acquire_store_writer_lock(&store).unwrap();
+
+        let result = uninstall(&McpWorkflowRequest {
+            requested_root: repository.path().to_path_buf(),
+            explicit_store: Some(store.clone()),
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(config_path).unwrap(), installed);
+        assert!(store.is_file());
+        drop(writer);
+    }
+
+    #[test]
+    fn state_cleanup_refuses_an_active_durable_operation_runner() {
+        let repository = git_repository();
+        let state = tempfile::tempdir().unwrap();
+        let store = state.path().join("graph.db");
+        let binding = read_binding(repository.path(), &store);
+        fs::write(&store, b"owned").unwrap();
+        let journal = operation_journal_path(&binding);
+        let runner = try_acquire_operation_runner_exclusion(&journal)
+            .unwrap()
+            .unwrap();
+
+        assert!(acquire_repository_state_exclusion(&binding).is_err());
+        drop(runner);
+        assert!(
+            acquire_repository_state_exclusion(&binding)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1820,7 +1980,9 @@ mod tests {
         let store = state.path().join("graph.db");
         let binding = read_binding(repository.path(), &store);
         fs::write(&store, b"owned").unwrap();
+        let exclusion = acquire_repository_state_exclusion(&binding).unwrap();
         assert_eq!(remove_repository_state(&binding).unwrap(), 1);
+        drop(exclusion);
         assert!(state.path().is_dir());
     }
 }
