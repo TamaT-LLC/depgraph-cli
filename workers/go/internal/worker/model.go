@@ -12,7 +12,7 @@ import (
 const (
 	ProtocolVersion = "1.0"
 	AdapterName     = "go"
-	AdapterVersion  = "0.5.1"
+	AdapterVersion  = "0.5.2"
 )
 
 type Condition struct {
