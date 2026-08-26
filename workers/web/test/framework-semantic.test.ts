@@ -2,16 +2,59 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildFrameworkCompleteness,
+  emitFrameworkSemanticRelation,
   mergeFrameworkSemanticDelta,
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
   type FrameworkSemanticDelta,
+  type FrameworkSemanticRelationInput,
 } from "../src/framework-semantic";
 import { stableId } from "../src/ids";
 import { canonicalizeCondition, type DependencySite, type Evidence, type GraphEdge, type GraphNode } from "../src/types";
 
 const profileId = "profile:framework-test";
 const packageLocator = "npm:workspace:web-app@1.0.0#.";
+
+function relationInput(): FrameworkSemanticRelationInput {
+  const evidence: Evidence[] = [{
+    kind: "semantic",
+    extractor: "fixture-static-adapter",
+    extractor_version: "0.1.0",
+    path: "src/fixture.tsx",
+    start_line: 3,
+    start_column: 5,
+    end_line: 3,
+    end_column: 12,
+  }];
+  return {
+    source: { id: "component:source" },
+    targets: [{ id: "route:z" }, { id: "route:a" }, { id: "route:z" }],
+    kind: "renders",
+    specifier: "./fixture",
+    relativePath: "src/fixture.tsx",
+    span: { start_line: 3, start_column: 5, end_line: 3, end_column: 12 },
+    condition: {
+      op: "all",
+      conditions: [
+        { op: "eq", key: "mode", value: "production" },
+        { op: "eq", key: "environment", value: "server" },
+        { op: "eq", key: "mode", value: "production" },
+      ],
+    },
+    environment: "server",
+    profileId,
+    resolutionStatus: "candidates",
+    precision: null,
+    reason: "fixture_candidates",
+    evidence,
+    generated: true,
+  };
+}
+
+const relationContext = {
+  conflictSubject: "Fixture semantic collector",
+  emptyTargetSubject: "Fixture semantic relation",
+};
 
 function fixture(): FrameworkSemanticDelta {
   const componentIdentity = {
@@ -107,6 +150,84 @@ test("framework semantic capability is versioned and starts without an emitted d
     web_framework_completeness_issue_count: "0",
     web_framework_completeness_ledger: "[]",
   });
+});
+
+test("shared framework relation emission owns canonical identity and target expansion", () => {
+  const input = relationInput();
+  const inputBytes = JSON.stringify(input);
+  const sites = new Map<string, DependencySite>();
+  const edges = new Map<string, GraphEdge>();
+
+  emitFrameworkSemanticRelation({ sites, edges }, input, relationContext);
+
+  assert.equal(JSON.stringify(input), inputBytes);
+  assert.equal(sites.size, 1);
+  assert.equal(edges.size, 2);
+  const site = [...sites.values()][0]!;
+  const expectedCondition = canonicalizeCondition(input.condition);
+  const expectedSiteId = stableId("site", {
+    condition: expectedCondition,
+    kind: input.kind,
+    path: input.relativePath,
+    profile_id: profileId,
+    source: input.source.id,
+    span: input.span,
+  });
+  assert.equal(site.id, expectedSiteId);
+  assert.deepEqual(site.target_ids, ["route:a", "route:z"]);
+  assert.deepEqual(site.condition, expectedCondition);
+  assert.equal(site.precision, "overapprox");
+  assert.deepEqual([...edges.values()].map((edge) => edge.target), ["route:a", "route:z"]);
+  for (const edge of edges.values()) {
+    assert.equal(edge.id, stableId("edge", { kind: input.kind, site_id: expectedSiteId, target: edge.target }));
+    assert.equal(edge.precision, "overapprox");
+    assert.equal(edge.generated, true);
+    assert.deepEqual(edge.evidence, site.evidence);
+  }
+});
+
+test("shared framework relation emission reuses equivalent bytes and rejects conflicts atomically", () => {
+  const input = relationInput();
+  const sites = new Map<string, DependencySite>();
+  const edges = new Map<string, GraphEdge>();
+  emitFrameworkSemanticRelation({ sites, edges }, input, relationContext);
+  const originalSite = [...sites.values()][0]!;
+  const originalEdges = [...edges.values()];
+
+  emitFrameworkSemanticRelation({ sites, edges }, input, relationContext);
+  assert.strictEqual([...sites.values()][0], originalSite);
+  assert.deepEqual([...edges.values()], originalEdges);
+  for (const [index, edge] of [...edges.values()].entries()) assert.strictEqual(edge, originalEdges[index]);
+
+  const beforeSiteConflict = JSON.stringify({ sites: [...sites], edges: [...edges] });
+  assert.throws(() => emitFrameworkSemanticRelation(
+    { sites, edges },
+    { ...input, specifier: "./conflicting-fixture" },
+    relationContext,
+  ), /Fixture semantic collector produced conflicting site/u);
+  assert.equal(JSON.stringify({ sites: [...sites], edges: [...edges] }), beforeSiteConflict);
+
+  const conflictingEdge = { ...originalEdges[0]!, environment: "browser" };
+  const edgeConflictSites = new Map<string, DependencySite>();
+  const edgeConflictEdges = new Map([[conflictingEdge.id, conflictingEdge]]);
+  const beforeEdgeConflict = JSON.stringify([...edgeConflictEdges]);
+  assert.throws(() => emitFrameworkSemanticRelation(
+    { sites: edgeConflictSites, edges: edgeConflictEdges },
+    input,
+    relationContext,
+  ), /Fixture semantic collector produced conflicting edge/u);
+  assert.equal(edgeConflictSites.size, 0);
+  assert.equal(JSON.stringify([...edgeConflictEdges]), beforeEdgeConflict);
+
+  const emptySites = new Map<string, DependencySite>();
+  const emptyEdges = new Map<string, GraphEdge>();
+  assert.throws(() => emitFrameworkSemanticRelation(
+    { sites: emptySites, edges: emptyEdges },
+    { ...input, targets: [] },
+    relationContext,
+  ), /Fixture semantic relation renders has no target/u);
+  assert.equal(emptySites.size, 0);
+  assert.equal(emptyEdges.size, 0);
 });
 
 test("framework completeness requires only detected slices and preserves partial failures", () => {
