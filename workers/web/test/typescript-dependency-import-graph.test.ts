@@ -8,6 +8,13 @@ const SOURCE_DIRECTORY = new URL("../src/", import.meta.url);
 const EXTRACTION_MODULE = "typescript-dependencies.ts";
 const VALIDATION_MODULE = "typescript-dependency-validation.ts";
 const CONTRACT_MODULE = "typescript-dependency-contract.ts";
+const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
+const RUNTIME_TO_SOURCE_EXTENSIONS = new Map<string, readonly string[]>([
+  [".js", [".ts", ".tsx"]],
+  [".jsx", [".tsx"]],
+  [".mjs", [".mts"]],
+  [".cjs", [".cts"]],
+]);
 
 function staticRelativeSpecifiers(source: string): string[] {
   const tokens = scanTypeScriptSyntaxTokens(source);
@@ -43,7 +50,18 @@ function resolvedSourceModule(
   sourceModules: ReadonlySet<string>,
 ): string | null {
   const base = path.posix.normalize(path.posix.join(path.posix.dirname(importer), specifier));
-  for (const candidate of [base, `${base}.ts`, path.posix.join(base, "index.ts")]) {
+  const extension = path.posix.extname(base);
+  const candidates = [base];
+  for (const sourceExtension of RUNTIME_TO_SOURCE_EXTENSIONS.get(extension) ?? []) {
+    candidates.push(`${base.slice(0, -extension.length)}${sourceExtension}`);
+  }
+  if (extension === "") {
+    for (const sourceExtension of SOURCE_EXTENSIONS) candidates.push(`${base}${sourceExtension}`);
+    for (const sourceExtension of SOURCE_EXTENSIONS) {
+      candidates.push(path.posix.join(base, `index${sourceExtension}`));
+    }
+  }
+  for (const candidate of candidates) {
     if (sourceModules.has(candidate)) return candidate;
   }
   return null;
@@ -69,10 +87,25 @@ function cycleFrom(
   return visit(start, []);
 }
 
+test("runtime JavaScript specifiers resolve to TypeScript source modules", () => {
+  const sourceModules = new Set([
+    "runtime-collector.ts",
+    "component.tsx",
+    "module.mts",
+    "common.cts",
+    "nested/index.ts",
+  ]);
+  assert.equal(resolvedSourceModule("entry.ts", "./runtime-collector.js", sourceModules), "runtime-collector.ts");
+  assert.equal(resolvedSourceModule("entry.ts", "./component.jsx", sourceModules), "component.tsx");
+  assert.equal(resolvedSourceModule("entry.ts", "./module.mjs", sourceModules), "module.mts");
+  assert.equal(resolvedSourceModule("entry.ts", "./common.cjs", sourceModules), "common.cts");
+  assert.equal(resolvedSourceModule("entry.ts", "./nested", sourceModules), "nested/index.ts");
+});
+
 test("TypeScript dependency extraction and validation imports stay acyclic", async () => {
   const sourceModules = new Set(
     (await readdir(SOURCE_DIRECTORY, { recursive: true }))
-      .filter((entry) => entry.endsWith(".ts"))
+      .filter((entry) => SOURCE_EXTENSIONS.some((extension) => entry.endsWith(extension)))
       .map((entry) => entry.split(path.sep).join(path.posix.sep))
       .sort(),
   );
@@ -91,11 +124,8 @@ test("TypeScript dependency extraction and validation imports stay acyclic", asy
   const validationImports = graph.get(VALIDATION_MODULE);
   assert.ok(extractionImports?.has(CONTRACT_MODULE), "extraction must use the neutral dependency contract");
   assert.ok(validationImports?.has(CONTRACT_MODULE), "validation must use the neutral dependency contract");
-  assert.equal(
-    extractionImports?.has(VALIDATION_MODULE) && validationImports?.has(EXTRACTION_MODULE),
-    false,
-    "extraction and validation must not import each other",
-  );
+  assert.ok(extractionImports?.has(VALIDATION_MODULE), "extraction must own validation orchestration");
+  assert.equal(validationImports?.has(EXTRACTION_MODULE), false, "validation must not import extraction");
   for (const module of [EXTRACTION_MODULE, VALIDATION_MODULE]) {
     const cycle = cycleFrom(graph, module);
     assert.equal(cycle, null, `production import cycle: ${cycle?.join(" -> ")}`);
