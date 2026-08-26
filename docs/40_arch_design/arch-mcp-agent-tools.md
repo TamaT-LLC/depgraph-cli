@@ -7,7 +7,7 @@ status: Active
 upstream: [PROJ-ARC-001]
 downstream: []
 owner: TakehiroT
-updated: 2026-08-24
+updated: 2026-08-26
 open_questions: 0
 ---
 
@@ -41,7 +41,19 @@ additive extensionとして採用するかを決定する。
 | Agent host operations | read-only default, privileged profiles, confirmation, recovery, upgrade/rollback | Issue #320 documented in README and the package-smoked operations runbook |
 | Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v2` |
 | Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
+| Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
 | Open questions | `0` | Resolved |
+
+### Code-health host guidance
+
+These five tools are READ-only. They never write the Store, snapshot, or source tree.
+
+- **Confidence**: `confirmed` means unused across every applicable analyzed profile, those profiles are `semantic-complete`, and no hard blocker remains. `probable` has no hard blocker but applicable profiles are only `syntax-complete`. `indeterminate` means a blocker prevents confirmation (missing coverage or surface evidence, public surface, entry point, dynamic loading, candidate, unresolved, generated artifact, profile-not-analyzed, manifest-drift, missing/mismatched base snapshot, or similar).
+- **`health_summary_get` / `health_findings_list` / `health_finding_get`** cover snapshot-scoped kinds only (`unused-file`, `unused-export`, `unused-type`, `unused-dependency`, `test-only-dependency`, `manifest-mismatch`). They do not include audit or hotspot findings.
+- **`health_finding_get`** accepts snapshot-scoped stable finding IDs. Input-scoped audit or hotspot IDs return a deterministic `INVALID_ARGUMENT`; use `health_audit_get` or `health_hotspots_list` instead.
+- **`health_audit_get`**: `--changed` / `changed` is resolved to a commit OID at request start. Without a comparable base snapshot, blast radius remains evaluable while new-cycle / new-boundary / public-api checks return `indeterminate` placeholders with blocker `missing-base-snapshot`.
+- **`health_hotspots_list`**: scores use integer basis points. A missing Git-churn or runtime layer contributes 0 and does not renormalize weights.
+- Read blockers before treating any finding as safe to delete or unexport. Source is never changed automatically.
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
 tools、Tasks adapterの実装は後続taskで行い、この文書のnegotiationとrecovery
@@ -102,6 +114,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#320` | Agent host設定、権限、timeout、reconnect、upgrade policyを運用文書へ固定する | READMEのpackaged read-only default、全privileged profileのcomplete host entry、人間確認/acknowledgement/isolationの責任分離、baseline/Tasks recovery、deadline/TTL/idempotency、whole-package upgrade/byte-consistent rollbackをdocumentation parserと抽出archive smokeで固定する |
 | `#358` | verified release archiveからAgent host onboardingを自動化する | `depgraph-agent-host-config-v1` golden、fail-closed package/root/Store/compiler-pack preflight、read-only default、privileged acknowledgement、clean-home initialize/catalog/context probe、`mcp-package-smoke-v2`で固定する |
 | `#387` | repository別のMCP setupを1 commandへ閉じる | canonical Git rootのwrite/download前検証、GitHub API digestとpost-publish evidenceに閉じたversion/target共有cache、repository固有Storeとnon-executing safe scan、既存`agent-config` preflight、Codex／Claude Code／Cursor／Grokのproject/user設定へのatomic semantic merge、repository固有名を使うuser scope、status/update/uninstallの所有権分離、および公開後5 target clean-home E2Eで固定する |
+| `#423` | 説明可能なコードヘルス解析をCLIとMCPへ同じ契約で公開する | `depgraph-health-finding-v1`、共有`health_*` service、5 read-only MCP tool、CLI `health` / `cleanup` / `audit` / `hotspots`、baseline遷移gate、catalog/schema golden、CLI/MCP parityとread-only/redaction E2Eで固定する |
 
 ## Upstream and API evidence
 

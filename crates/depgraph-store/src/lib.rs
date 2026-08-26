@@ -384,6 +384,21 @@ impl Store {
         load_completed_snapshot_record(&self.connection, snapshot_id)
     }
 
+    pub fn completed_snapshot_ids_for_source_revision(
+        &self,
+        source_revision: &str,
+    ) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM completed_snapshots
+              WHERE source_revision=?1 AND status='completed'
+              ORDER BY id ASC",
+        )?;
+        let ids = statement
+            .query_map([source_revision], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
     pub fn create_snapshot_name(
         &mut self,
         name: &str,

@@ -44,6 +44,11 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "graph_path_get",
     "graph_query",
     "graph_unresolved_list",
+    "health_audit_get",
+    "health_finding_get",
+    "health_findings_list",
+    "health_hotspots_list",
+    "health_summary_get",
     "operation_cancel",
     "operation_get",
     "operation_result",
@@ -78,7 +83,7 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
-    assert_eq!(catalog.tools().len(), 33);
+    assert_eq!(catalog.tools().len(), 38);
 }
 
 #[test]
@@ -262,7 +267,7 @@ fn repository_write_catalog_exposes_only_fixed_root_init_and_durable_export_file
 
 #[test]
 fn every_cli_leaf_action_has_a_catalog_mapping() {
-    assert_eq!(ALL_CLI_ACTIONS.len(), 23);
+    assert_eq!(ALL_CLI_ACTIONS.len(), 28);
     let capabilities = DepgraphCapabilitySet::try_new([
         DepgraphCapability::Read,
         DepgraphCapability::StoreWrite,

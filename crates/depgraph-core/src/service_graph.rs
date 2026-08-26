@@ -712,7 +712,7 @@ fn cycles_bounded_cancellable(
     cycles_bounded_with_cancellation(snapshot, request, &mut || cancellation.is_cancelled())
 }
 
-fn cycles_bounded_with_cancellation(
+pub(crate) fn cycles_bounded_with_cancellation(
     snapshot: &GraphSnapshot,
     request: &CyclesRequest,
     is_cancelled: &mut impl FnMut() -> bool,

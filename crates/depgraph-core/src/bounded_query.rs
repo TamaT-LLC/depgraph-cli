@@ -303,7 +303,7 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
     })
 }
 
-pub(crate) fn read_bounded_repository_file(
+pub fn read_bounded_repository_file(
     repository_root: &Path,
     file: &Path,
     max_bytes: usize,

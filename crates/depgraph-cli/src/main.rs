@@ -11,23 +11,26 @@ use depgraph_core::service::{
     DependenciesRequest, DependencyDirection, DepgraphCapability, DepgraphCapabilitySet,
     DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
     DoctorRequest, ExplainPathRequest, ExportFileRequest, GraphExportFormat, GraphExportRequest,
-    ImpactRequest, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, PolicyEvaluateRequest,
-    ProfilePlanRequest, RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy,
-    RepositoryRelativePath, ResolveBuildRequest, RuntimeValidateRequest, ScanRequest,
-    ServiceSnapshotSelector, SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator,
-    SnapshotNameCreateRequest, SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
+    HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest, HealthHotspotsRequest,
+    HealthSummaryRequest, ImpactRequest, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES,
+    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest, ProfilePlanRequest,
+    RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy, RepositoryRelativePath,
+    ResolveBuildRequest, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
+    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
+    SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
     CancellationToken, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
     DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
-    ExportFormat, GraphQueryFilter, ImpactFilters, ImpactResult, InteractiveQueryPage,
-    InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic, QueryFailureClass,
-    RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem, TypedProjection,
-    UnresolvedResult, default_store_path, export_filtered, export_graphml_filtered_to_writer,
-    open_store, paginate_interactive_query, profile_selection_human_summary,
-    read_compiler_pack_requirement, render_condition, render_github_annotations, traversal_summary,
-    unresolved_summary, validate_interactive_query_bounds,
+    ExportFormat, GraphQueryFilter, HotspotWeights, ImpactFilters, ImpactResult,
+    InteractiveQueryPage, InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic,
+    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
+    TypedProjection, UnresolvedResult, default_store_path, export_filtered,
+    export_graphml_filtered_to_writer, open_store, paginate_interactive_query,
+    profile_selection_human_summary, read_compiler_pack_requirement, render_condition,
+    render_github_annotations, traversal_summary, unresolved_summary,
+    validate_interactive_query_bounds,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
 use depgraph_protocol::canonical_json;
@@ -35,6 +38,7 @@ use depgraph_store::CoverageRecord;
 use serde::Serialize;
 
 mod agent_config;
+mod health_render;
 mod mcp_setup;
 mod snapshot_diff;
 
@@ -369,6 +373,76 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         github_annotations: bool,
     },
+    /// Summarize snapshot-scoped unused-code and unused-dependency findings.
+    #[command(long_about = health_render::HEALTH_LONG_HELP)]
+    Health {
+        #[command(subcommand)]
+        command: Option<HealthNested>,
+        /// Emit the canonical versioned JSON envelope.
+        #[arg(long)]
+        json: bool,
+        /// Restrict summary counts to these snapshot-scoped kinds.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+    },
+    /// List unused-code or unused-dependency findings for cleanup review.
+    #[command(long_about = health_render::CLEANUP_LONG_HELP)]
+    Cleanup {
+        /// Restrict findings to these snapshot-scoped kinds.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+        #[arg(long, value_name = "SEVERITY")]
+        severity: Vec<String>,
+        #[arg(long, value_name = "CONFIDENCE")]
+        confidence: Vec<String>,
+        /// Baseline file with id, fingerprint, severity, confidence, and resolved records.
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
+        #[arg(long, value_name = "SEVERITY")]
+        min_severity: Option<String>,
+        #[arg(long, value_name = "CONFIDENCE")]
+        min_confidence: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
+    },
+    /// Audit changed code against a snapshot pair.
+    #[command(long_about = health_render::AUDIT_LONG_HELP)]
+    Audit {
+        /// Resolve this Git ref to an immutable commit OID at request start.
+        #[arg(long, value_name = "GIT_REF")]
+        changed: String,
+        /// Optional completed snapshot selector used as the before graph.
+        #[arg(long, value_name = "SELECTOR")]
+        base_snapshot: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
+    },
+    /// Rank graph hotspots with integer basis-point scores.
+    #[command(long_about = health_render::HOTSPOTS_LONG_HELP)]
+    Hotspots {
+        #[arg(long, value_name = "N", default_value_t = MAX_HEALTH_CHURN_COMMITS as u32)]
+        churn_commit_limit: u32,
+        #[arg(long, value_name = "PATH")]
+        churn_path: Vec<String>,
+        #[arg(long, default_value_t = 2500)]
+        weight_fan_in: u32,
+        #[arg(long, default_value_t = 1500)]
+        weight_fan_out: u32,
+        #[arg(long, default_value_t = 2500)]
+        weight_reverse_impact: u32,
+        #[arg(long, default_value_t = 2000)]
+        weight_git_churn: u32,
+        #[arg(long, default_value_t = 1500)]
+        weight_runtime: u32,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
+    },
     /// Export the selected scan in a deterministic format.
     Export {
         #[arg(long, value_enum)]
@@ -528,6 +602,35 @@ enum SnapshotCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum HealthNested {
+    /// List snapshot-scoped health findings.
+    List {
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+        #[arg(long, value_name = "SEVERITY")]
+        severity: Vec<String>,
+        #[arg(long, value_name = "CONFIDENCE")]
+        confidence: Vec<String>,
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
+        #[arg(long, value_name = "SEVERITY")]
+        min_severity: Option<String>,
+        #[arg(long, value_name = "CONFIDENCE")]
+        min_confidence: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        output: InteractiveOutputArgs,
+    },
+    /// Explain one snapshot-scoped finding by stable ID.
+    Show {
+        finding_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RuntimeCommands {
     /// Validate a versioned trace and match its locators to the selected snapshot.
     Validate {
@@ -613,6 +716,14 @@ fn catalog_action_for_command(command: &Commands) -> Option<CliAction> {
         Commands::Diff { .. } => Some(CliAction::Diff),
         Commands::Policy { .. } => Some(CliAction::Policy),
         Commands::Export { .. } => Some(CliAction::Export),
+        Commands::Health { command, .. } => match command {
+            None => Some(CliAction::HealthSummary),
+            Some(HealthNested::List { .. }) => Some(CliAction::HealthFindings),
+            Some(HealthNested::Show { .. }) => Some(CliAction::HealthFindingGet),
+        },
+        Commands::Cleanup { .. } => Some(CliAction::HealthFindings),
+        Commands::Audit { .. } => Some(CliAction::Audit),
+        Commands::Hotspots { .. } => Some(CliAction::Hotspots),
     }
 }
 
@@ -1899,6 +2010,214 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(result.exit_code)
         }
+        Commands::Health {
+            command,
+            json,
+            kind,
+        } => match command {
+            None => {
+                let kinds = if kind.is_empty() {
+                    None
+                } else {
+                    Some(health_render::parse_snapshot_kinds(&kind)?)
+                };
+                let (service, mut snapshot) =
+                    graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                let result = service.health_summary(
+                    &mut snapshot,
+                    &HealthSummaryRequest::try_new(kinds)?,
+                    &CancellationToken::new(),
+                )?;
+                print_structured(
+                    "health",
+                    result.scan_id().to_owned(),
+                    &health_render::CliHealthSummaryView {
+                        snapshot_id: result.snapshot_id().as_str(),
+                        scan_id: result.scan_id(),
+                        collection_digest: result.collection_digest(),
+                        counts_by_kind: result.counts_by_kind(),
+                        counts_by_confidence: result.counts_by_confidence(),
+                        coverage: result.coverage(),
+                    },
+                    json,
+                )?;
+                if !json {
+                    health_render::print_health_summary_human(&result);
+                }
+                Ok(0)
+            }
+            Some(HealthNested::List {
+                kind,
+                severity,
+                confidence,
+                baseline,
+                min_severity,
+                min_confidence,
+                json,
+                output,
+            }) => run_health_findings(
+                cli.store,
+                cli.scan_id.as_deref(),
+                &kind,
+                &severity,
+                &confidence,
+                baseline.as_deref(),
+                min_severity.as_deref(),
+                min_confidence.as_deref(),
+                json,
+                &output,
+            ),
+            Some(HealthNested::Show { finding_id, json }) => {
+                let (service, mut snapshot) =
+                    graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                let result = service.health_finding_get(
+                    &mut snapshot,
+                    &HealthFindingGetRequest::try_new(finding_id)?,
+                    &CancellationToken::new(),
+                )?;
+                print_structured(
+                    "health.show",
+                    snapshot.snapshot_id().as_str().to_owned(),
+                    &result.finding,
+                    json,
+                )?;
+                if !json {
+                    health_render::print_findings_human(std::slice::from_ref(&result.finding));
+                }
+                Ok(0)
+            }
+        },
+        Commands::Cleanup {
+            kind,
+            severity,
+            confidence,
+            baseline,
+            min_severity,
+            min_confidence,
+            json,
+            output,
+        } => {
+            if kind.is_empty() {
+                anyhow::bail!("cleanup requires --kind");
+            }
+            run_health_findings(
+                cli.store,
+                cli.scan_id.as_deref(),
+                &kind,
+                &severity,
+                &confidence,
+                baseline.as_deref(),
+                min_severity.as_deref(),
+                min_confidence.as_deref(),
+                json,
+                &output,
+            )
+        }
+        Commands::Audit {
+            changed,
+            base_snapshot,
+            json,
+            output,
+        } => {
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let scope = service.start_health_audit_scope(
+                &mut snapshot,
+                &HealthAuditRequest::try_new(changed, base_snapshot)?,
+                &CancellationToken::new(),
+            )?;
+            let result = service.health_audit(&scope, &CancellationToken::new())?;
+            if output.all {
+                print_structured(
+                    "audit",
+                    result.after_snapshot_id().as_str().to_owned(),
+                    &health_render::CliHealthAuditView {
+                        after_snapshot_id: result.after_snapshot_id().as_str(),
+                        before_snapshot_id: result.before_snapshot_id().map(|id| id.as_str()),
+                        changed_oid: result.changed_oid(),
+                        collection_digest: result.collection_digest(),
+                        findings: result.findings(),
+                    },
+                    json,
+                )?;
+                if !json {
+                    health_render::print_findings_human(result.findings());
+                }
+            } else {
+                print_health_finding_page(
+                    "audit",
+                    result.after_snapshot_id().as_str(),
+                    result.after_snapshot_id().as_str(),
+                    result.findings(),
+                    &serde_json::json!({
+                        "after_snapshot_id": result.after_snapshot_id().as_str(),
+                        "before_snapshot_id": result.before_snapshot_id().map(|id| id.as_str()),
+                        "changed_oid": result.changed_oid(),
+                        "collection_digest": result.collection_digest(),
+                    }),
+                    &output,
+                    json,
+                )?;
+            }
+            Ok(0)
+        }
+        Commands::Hotspots {
+            churn_commit_limit,
+            churn_path,
+            weight_fan_in,
+            weight_fan_out,
+            weight_reverse_impact,
+            weight_git_churn,
+            weight_runtime,
+            json,
+            output,
+        } => {
+            let weights = HotspotWeights::try_new(
+                weight_fan_in,
+                weight_fan_out,
+                weight_reverse_impact,
+                weight_git_churn,
+                weight_runtime,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            let (service, mut snapshot) =
+                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?;
+            let result =
+                service.health_hotspots(&mut snapshot, &request, &CancellationToken::new())?;
+            if output.all {
+                print_structured(
+                    "hotspots",
+                    result.scan_id().to_owned(),
+                    &health_render::CliHealthFindingsView {
+                        snapshot_id: result.snapshot_id().as_str(),
+                        scan_id: result.scan_id(),
+                        collection_digest: result.collection_digest(),
+                        findings: result.findings(),
+                    },
+                    json,
+                )?;
+                if !json {
+                    health_render::print_findings_human(result.findings());
+                }
+            } else {
+                print_health_finding_page(
+                    "hotspots",
+                    result.scan_id(),
+                    result.snapshot_id().as_str(),
+                    result.findings(),
+                    &serde_json::json!({
+                        "collection_digest": result.collection_digest(),
+                        "churn_commit_limit": request.churn_commit_limit(),
+                        "churn_path_filter": request.churn_path_filter(),
+                        "weights": request.weights().as_map(),
+                    }),
+                    &output,
+                    json,
+                )?;
+            }
+            Ok(0)
+        }
         Commands::Export {
             format,
             output,
@@ -2265,6 +2584,110 @@ fn graph_snapshot_request(
             .start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?,
     };
     Ok((service, request))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_health_findings(
+    store: Option<PathBuf>,
+    scan_id: Option<&str>,
+    kind: &[String],
+    severity: &[String],
+    confidence: &[String],
+    baseline: Option<&std::path::Path>,
+    min_severity: Option<&str>,
+    min_confidence: Option<&str>,
+    json: bool,
+    output: &InteractiveOutputArgs,
+) -> Result<u8> {
+    let kinds = health_render::parse_snapshot_kinds(kind)?;
+    let severities = health_render::parse_severities(severity)?;
+    let confidences = health_render::parse_confidences(confidence)?;
+    let (service, mut snapshot) = graph_snapshot_request(store, scan_id)?;
+    let request =
+        HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?;
+    let result = service.health_findings(&mut snapshot, &request, &CancellationToken::new())?;
+    if output.all {
+        print_structured(
+            "health.list",
+            result.scan_id().to_owned(),
+            &health_render::CliHealthFindingsView {
+                snapshot_id: result.snapshot_id().as_str(),
+                scan_id: result.scan_id(),
+                collection_digest: result.collection_digest(),
+                findings: result.findings(),
+            },
+            json,
+        )?;
+        if !json {
+            health_render::print_findings_human(result.findings());
+        }
+    } else {
+        print_health_finding_page(
+            "health.list",
+            result.scan_id(),
+            result.snapshot_id().as_str(),
+            result.findings(),
+            &serde_json::json!({
+                "collection_digest": result.collection_digest(),
+                "kinds": request.kinds().iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+                "severities": request.severities().iter().map(|severity| severity.as_str()).collect::<Vec<_>>(),
+                "confidences": request.confidences().iter().map(|confidence| confidence.as_str()).collect::<Vec<_>>(),
+            }),
+            output,
+            json,
+        )?;
+    }
+    if health_render::evaluate_baseline_gate(
+        baseline,
+        result.findings(),
+        min_severity,
+        min_confidence,
+        json,
+    )? {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+fn print_health_finding_page(
+    command: &'static str,
+    scan_id: &str,
+    snapshot_id: &str,
+    findings: &[depgraph_core::HealthFinding],
+    context: &serde_json::Value,
+    output: &InteractiveOutputArgs,
+    json: bool,
+) -> Result<()> {
+    let max_items = output
+        .max_items
+        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
+    let max_bytes = output
+        .max_bytes
+        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
+    validate_interactive_query_bounds(max_items, max_bytes, None)?;
+    let page = paginate_interactive_query(
+        findings,
+        health_render::findings_page_summary(findings),
+        InteractiveQueryPageRequest {
+            command,
+            scan_id,
+            snapshot_id,
+            context,
+            cursor: output.cursor.as_deref(),
+            max_items,
+            max_bytes,
+            traversal_complete: true,
+            traversed_items: findings.len().try_into().unwrap_or(u64::MAX),
+            root: None,
+            diagnostics: Vec::new(),
+        },
+    )?;
+    print_interactive_page(&page, json)?;
+    if !json {
+        health_render::print_findings_human(&page.items);
+    }
+    Ok(())
 }
 
 fn print_profile_plan(preview: &RepositoryProfilePlanPreview, json: bool) -> Result<()> {
@@ -3129,6 +3552,22 @@ mod tests {
                 &["depgraph", "export", "--format", "json"],
                 CliAction::Export,
             ),
+            (&["depgraph", "health"], CliAction::HealthSummary),
+            (&["depgraph", "health", "list"], CliAction::HealthFindings),
+            (
+                &[
+                    "depgraph",
+                    "health",
+                    "show",
+                    "finding:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                CliAction::HealthFindingGet,
+            ),
+            (
+                &["depgraph", "audit", "--changed", "HEAD"],
+                CliAction::Audit,
+            ),
+            (&["depgraph", "hotspots"], CliAction::Hotspots),
         ];
 
         let mut parsed_actions = cases
@@ -3144,6 +3583,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         parsed_actions.sort_unstable();
+
+        let cleanup =
+            <Cli as clap::Parser>::try_parse_from(["depgraph", "cleanup", "--kind", "unused-file"])
+                .expect("cleanup parses");
+        assert_eq!(
+            catalog_action_for_command(&cleanup.command),
+            Some(CliAction::HealthFindings)
+        );
 
         let mut expected_actions = ALL_CLI_ACTIONS.to_vec();
         expected_actions.sort_unstable();

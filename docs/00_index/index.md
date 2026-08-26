@@ -17,6 +17,7 @@
 | PROJ-ARC-001-ADR-006 | PROJ-ARC-001 | [Public OSS readiness and release governance](../40_arch_design/adr-public-oss-release-governance.md) | Accepted |
 | PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |
 | PROJ-ARC-001-ADR-008 | PROJ-ARC-001 | [npm distribution for the native CLI](../40_arch_design/adr-npm-distribution.md) | Accepted |
+| PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |
 
 ## 運用手順
 
@@ -56,6 +57,7 @@
 
 ## 更新履歴
 
+- 2026-08-26: `PROJ-ARC-001-ADR-009` と説明可能なコードヘルス解析（CLI / MCP）を追加
 - 2026-08-26: `v0.5.4`のリリースノートとCodex／Claude Code／Cursor／Grokのproject/user scope自動MCPセットアップを追加
 - 2026-08-25: `v0.5.3`のリリースノートとWindows公開後canary修正を追加
 - 2026-08-24: `v0.5.2`のリリースノートと現行release contractを追加

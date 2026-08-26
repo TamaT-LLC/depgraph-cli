@@ -3,6 +3,7 @@
 mod catalog;
 mod contract;
 mod dto;
+mod health_dto;
 mod host_config;
 mod lifecycle;
 mod operation;
@@ -45,6 +46,13 @@ pub use dto::{
     MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES,
     MAX_AGENT_QUERY_TEXT_BYTES, MAX_AGENT_QUERY_VALUES, MAX_AGENT_SNAPSHOT_METADATA_ITEMS,
     MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows, project_bounded_query_rows_cancellable,
+};
+pub use health_dto::{
+    AgentFindingKind, AgentFindingKindScope, AgentHealthAudit, AgentHealthBlocker,
+    AgentHealthBlockerKind, AgentHealthConfidence, AgentHealthCoverage, AgentHealthEvidenceRef,
+    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
+    AgentHealthNamedCount, AgentHealthRemediation, AgentHealthSeverity, AgentHealthSourceLocation,
+    AgentHealthSummary, AgentHealthSuppression,
 };
 pub use host_config::{
     AGENT_HOST_CONFIG_CONTRACT_VERSION, AgentHostCapabilityProfile, AgentHostFormat,

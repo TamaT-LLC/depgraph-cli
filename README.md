@@ -78,7 +78,12 @@ depgraph export --format mermaid > graph.mmd
 | アーキテクチャ規則 | `policy` | 禁止依存、境界違反、公開API変更 |
 | 実行時依存 | `runtime validate`、`runtime import` | 検証済みトレースと静的グラフの統合結果 |
 | グラフ出力 | `export` | JSON、DOT、Mermaid、GraphML |
-| エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定 |
+| 未使用のfile / export / type / dependency | `health`、`health list`、`cleanup` | snapshot-scoped finding、confidence、blocker。summaryはaudit / hotspotを含まない |
+| 変更差分のリスク | `audit --changed <GIT_REF>` | 新規cycle、境界違反、公開API変更、blast radius。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
+| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位 |
+| エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
+
+`health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` はhard blockerが無く、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
 `id:`、`path:`、`package:`、`route:`、`symbol:`、`type:`を受け付ける。

@@ -87,7 +87,12 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | Do architecture rules pass? | `policy` | Forbidden dependencies, boundary violations, and public API changes |
 | What was observed at runtime? | `runtime validate`, `runtime import` | Integration of validated traces with the static graph |
 | How can I export the graph? | `export` | JSON, DOT, Mermaid, or GraphML |
-| How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package |
+| Which files, exports, types, or dependencies look unused? | `health`, `health list`, `cleanup` | Snapshot-scoped findings with confidence and blockers. Summary excludes audit and hotspot results |
+| What risk did a Git change introduce? | `audit --changed <GIT_REF>` | New cycles, boundary violations, public API changes, and blast radius. Without a base snapshot, the three comparison checks are indeterminate while blast radius remains evaluable |
+| Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation |
+| How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
+
+**Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Source is never changed automatically.
 
 A **selector** identifies a graph node on the CLI. The accepted prefixes are
 `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:`. If more than one

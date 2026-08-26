@@ -29,6 +29,7 @@ updated: 2026-08-26
 > `v0.5.1`のsourceを履歴として固定し、現行stable tag、remote `main`、`release/0.5`のexact-source条件を維持する。
 > 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
+> 2026-08-26: Issue #423として説明可能なコードヘルス解析を共有serviceと`depgraph-health-finding-v1`へ実装し、CLI `health` / `cleanup` / `audit` / `hotspots` と MCP 5 toolを同じ契約で公開した。
 > 2026-08-26: `v0.5.4`でCodex、Claude Code、Cursor、Grokのproject／user scope MCPセットアップを追加した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.3`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
@@ -57,6 +58,7 @@ updated: 2026-08-26
 | Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
+| Code-health finding | `depgraph-health-finding-v1` |
 | Worker incremental request / delta | `worker-delta-request-v1` / `worker-delta-v1` |
 | Rust / Cargo baseline | `1.93.1` |
 | Rust sysroot source data-tree | `rust-src-data-tree-v1` / rustc `01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` |
@@ -1363,6 +1365,12 @@ depgraph snapshot list [--json]
 depgraph snapshot show <NAME|STABLE_ID|current> [--json]
 depgraph diff <FROM> <TO> [--json] [--kind KIND] [--profile ID] [--phase PHASE] [--status STATUS]
 depgraph export --format json|dot|mermaid|graphml [--phase PHASE] [--profile ID] [--session ID] [--environment NAME]
+depgraph health [--kind KIND] [--json]
+depgraph health list [--kind KIND] [--severity SEVERITY] [--confidence CONFIDENCE] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
+depgraph health show <FINDING_ID> [--json]
+depgraph cleanup --kind KIND [--severity SEVERITY] [--confidence CONFIDENCE] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
+depgraph audit --changed <GIT_REF> [--base-snapshot SELECTOR] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
+depgraph hotspots [--churn-commit-limit N] [--weight-fan-in N] [--weight-fan-out N] [--weight-reverse-impact N] [--weight-git-churn N] [--weight-runtime N] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 ```
 
 selector は path、stable ID、package、symbol、route pattern を受け付ける。曖昧な selector は候補を返し、暗黙に先頭を選択しない。
@@ -2001,9 +2009,11 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 - [`PROJ-ARC-001-ADR-004`: Default profile selection and exploration budget](adr-default-profile-selection-budget.md)
 - [`PROJ-ARC-001-ADR-005`: Bounded read-only graph query language](adr-bounded-graph-query-language.md)
 - [`PROJ-ARC-001-ADR-006`: Public OSS readiness and release governance](adr-public-oss-release-governance.md)
+- [`PROJ-ARC-001-ADR-009`: Explainable code-health finding contract](adr-code-health-finding-contract.md)
 
 ## 26. 更新履歴
 
+- 2026-08-26: Issue #423として`depgraph-health-finding-v1`の共有read-only service、unused / dependency / audit / hotspot analyzer、CLI `health` / `cleanup` / `audit` / `hotspots`、MCP 5 tool、baseline遷移gate、CLI/MCP parityを実装した。`health` summaryはsnapshot-scoped kindだけを集計し、audit / hotspotは含めない。`confirmed`は適用対象profile全部がsemantic-completeでhard blockerが無い場合に限る。
 - 2026-08-07: Issue #304としてbounded query/runtime validationの共有read-only service、CLI migration、`graph_query` / `runtime_trace_validate` MCP handlerを実装した。query/traceはinlineまたはconfined repository-relative fileのexactly oneとし、absolute/traversal/symlink/nonregular/oversizeを拒否する。queryのparse/credential/type/output pre-admissionとtrace shape/credential validationをstore前に完了し、query plan cap超過はexecution前の`QUERY_REJECTED`とする。両操作はpinned completed snapshotだけを読み、store/snapshot/source treeを不変に保つ。MCPはclosed query/runtime DTO、canonical byte/item pagination、snapshot/input-bound cursor、Read runtime controlを使い、CLI/MCP parity、non-echo security、catalog/schema/contract goldenで固定した。
 - 2026-08-02: PRとmain pushのCIをRust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmark、Linux / macOS integration、Windows smokeは手動dispatchだけで実行する構成へ変更した。`v*` tagのRelease workflowはquality、hostile E2E、benchmark、全5 targetのarchive / compiler pack、aggregate verificationを実行し、全gate成功後だけ公開する。
 - 2026-08-01: Issue #279として通常のRust / Web build cacheをpre-execution input identityへ変更した。source、manifest / lock / config、profile、adapter artifact / version、toolchain executable / version、command / environment contract、target、protocol、base snapshotをkeyに含め、completed snapshot、current snapshot、base binding、payload、audit、入力の再計算が一致した場合だけproject codeを実行せず既存graphを返す。miss / reject / stored / hitをattemptへ記録し、corrupt / stale entryはfail closedに再実行してvalidated outputで置換する。RustとNext.jsのcold / warm testはsnapshot、audit、cache entry、exportが増減・変化しないことを検証する。

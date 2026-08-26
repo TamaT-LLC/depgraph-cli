@@ -1106,6 +1106,9 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     )?;
     let v0_5_release_adr =
         read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
+    let health_finding_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-code-health-finding-contract.md"),
+    )?;
     verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
@@ -1194,6 +1197,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-006` を追加",
         "| PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |",
         "2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加",
+        "| PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |",
+        "2026-08-26: `PROJ-ARC-001-ADR-009` と説明可能なコードヘルス解析（CLI / MCP）を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -1492,6 +1497,19 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !v0_5_release_adr.contains(required) {
             bail!("v0.5 release ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-009`",
+        "- Contract: `depgraph-health-finding-v1`",
+        "`confirmed` / `probable` / `indeterminate`",
+        "missing-base-snapshot",
+        "All arithmetic uses integer basis points in `0..=10_000`.",
+        "`indeterminate → confirmed` is therefore `regressed`",
+    ] {
+        if !health_finding_adr.contains(required) {
+            bail!("code-health finding ADR is missing required contract {required:?}");
         }
     }
     let migration_rehearsal =
@@ -1864,6 +1882,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/40_arch_design/adr-v0.5-release-contract.md",
+        "docs/40_arch_design/adr-code-health-finding-contract.md",
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/50_test/agent-dogfood-benchmark.md",
         "docs/releases/v0.4.0.md",
@@ -2139,7 +2158,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-24\n\
+updated: 2026-08-26\n\
 open_questions: 0\n\
 ---\n";
 

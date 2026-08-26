@@ -96,6 +96,12 @@ pub struct GitChangedSet {
     pub changes: Vec<GitChange>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitChurn {
+    pub head: String,
+    pub counts_by_path: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedNodeMapping {
     pub change: GitChange,
@@ -397,6 +403,117 @@ pub(crate) fn read_git_changed_set_cancellable(
         repository_prefix: prefix,
         changes: finalized_changes,
     })
+}
+
+pub(crate) fn read_git_churn_cancellable(
+    root: &Path,
+    maximum_commits: u32,
+    path_filters: &[String],
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<GitChurn> {
+    if maximum_commits == 0 {
+        bail!("Git churn commit limit must be greater than zero");
+    }
+    let normalized_filters = path_filters
+        .iter()
+        .map(|path| normalize_git_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    check_cancelled(&mut is_cancelled)?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("scan root {} is unavailable", root.display()))?;
+    let git = resolve_safe_executable("git", &root)?;
+    let prefix = git_text_cancellable(
+        &git,
+        &root,
+        ["rev-parse", "--show-prefix"],
+        &mut is_cancelled,
+    )?;
+    let prefix = normalize_repository_prefix(&prefix)?;
+    let repository_root = git_text_cancellable(
+        &git,
+        &root,
+        ["rev-parse", "--show-toplevel"],
+        &mut is_cancelled,
+    )?;
+    let repository_root = Path::new(&repository_root)
+        .canonicalize()
+        .context("Git repository root is unavailable")?;
+    if !root.starts_with(&repository_root) {
+        bail!("security policy violation: Git repository root does not contain the scan root");
+    }
+    let head = resolve_commit_cancellable(&git, &repository_root, "HEAD", &mut is_cancelled)?;
+    let maximum = format!("--max-count={maximum_commits}");
+    let commit_bytes = git_bytes_cancellable(
+        &git,
+        &repository_root,
+        [
+            "log",
+            "-z",
+            "--format=%H",
+            maximum.as_str(),
+            "--end-of-options",
+            head.as_str(),
+        ],
+        &mut is_cancelled,
+    )?;
+    let mut commits = Vec::new();
+    for field in nul_fields(&commit_bytes) {
+        check_cancelled(&mut is_cancelled)?;
+        let oid = parse_utf8_field(field, "Git commit ID")?;
+        validate_object_id("Git commit", &oid)?;
+        commits.push(oid);
+    }
+
+    let mut counts_by_path = BTreeMap::<String, u64>::new();
+    let mut path_occurrences = 0_usize;
+    for oid in commits {
+        check_cancelled(&mut is_cancelled)?;
+        let paths = git_bytes_cancellable(
+            &git,
+            &repository_root,
+            [
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                oid.as_str(),
+            ],
+            &mut is_cancelled,
+        )?;
+        parse_nul_paths(&paths, &prefix, &mut is_cancelled, |path| {
+            if path_occurrences >= MAX_CHANGED_PATHS {
+                return Err(ImpactChangedSetPreprocessingExhausted.into());
+            }
+            path_occurrences += 1;
+            if normalized_filters.is_empty()
+                || normalized_filters
+                    .iter()
+                    .any(|filter| path_matches_filter(&path, filter))
+            {
+                let count = counts_by_path.entry(path).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(GitChurn {
+        head,
+        counts_by_path,
+    })
+}
+
+fn path_matches_filter(path: &str, filter: &str) -> bool {
+    path == filter
+        || path
+            .strip_prefix(filter)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_git_ref(value: &str) -> Result<()> {
@@ -804,7 +921,7 @@ pub fn map_changed_set(
     map_changed_set_cancellable(snapshot, changed_set, &mut || false)
 }
 
-fn map_changed_set_cancellable(
+pub(crate) fn map_changed_set_cancellable(
     snapshot: &GraphSnapshot,
     changed_set: &GitChangedSet,
     is_cancelled: &mut impl FnMut() -> bool,

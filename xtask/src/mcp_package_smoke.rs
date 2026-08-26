@@ -17,8 +17,9 @@ use depgraph_core::{
 };
 use depgraph_mcp_tools::{
     AGENT_HOST_CONFIG_CONTRACT_VERSION, AgentContext, AgentDependenciesResponse,
-    AgentHostCapabilityProfile, AgentHostFormat, OperationId, PortableTerminalOutputContract,
-    SuccessEnvelope, ToolCatalog, agent_host_launch_arguments, render_agent_host_configuration,
+    AgentHealthFindingsPage, AgentHostCapabilityProfile, AgentHostFormat, OperationId,
+    PortableTerminalOutputContract, SuccessEnvelope, ToolCatalog, agent_host_launch_arguments,
+    render_agent_host_configuration,
 };
 use depgraph_store::Store;
 use serde::{Deserialize, Serialize};
@@ -453,6 +454,7 @@ pub fn verify(
 
     let mut context_projection = None;
     let mut dependencies_result = None;
+    let mut health_findings_verified = false;
     for (index, profile) in CAPABILITY_PROFILES.iter().copied().enumerate() {
         let profile_name = profile.as_str();
         let capabilities = profile.capabilities();
@@ -513,6 +515,26 @@ pub fn verify(
             .context("packaged dependencies result violates its closed contract")?;
             verify_dependencies_fixture(&dependencies_structured)?;
             dependencies_result = Some(dependencies_structured);
+
+            let health = mcp.call_tool(
+                14,
+                "health_findings_list",
+                json!({
+                    "contract_version":TOOL_CONTRACT_VERSION,
+                    "repository_id":"repository",
+                    "snapshot":"current",
+                    "kinds":["unused-file"],
+                    "limit":100
+                }),
+            )?;
+            let health_structured =
+                successful_structured_tool_result(&health, "health_findings_list")?;
+            serde_json::from_value::<SuccessEnvelope<AgentHealthFindingsPage>>(
+                health_structured.clone(),
+            )
+            .context("packaged health findings result violates its closed contract")?;
+            verify_health_fixture(&health_structured)?;
+            health_findings_verified = true;
         }
         mcp.finish()?;
     }
@@ -520,11 +542,15 @@ pub fn verify(
     let context_projection = context_projection.context("read profile did not run get_context")?;
     let dependencies_result =
         dependencies_result.context("read profile did not run graph_dependencies_list")?;
+    if !health_findings_verified {
+        bail!("read profile did not run health_findings_list");
+    }
     let context_result_sha256 = canonical_sha256(&context_projection);
     let dependencies_result_sha256 = canonical_sha256(&dependencies_result);
     let fixture_result_sha256 = canonical_sha256(&json!({
         "context_result_sha256":context_result_sha256,
-        "dependencies_result_sha256":dependencies_result_sha256
+        "dependencies_result_sha256":dependencies_result_sha256,
+        "health_findings_verified":true
     }));
     let discovery_sha256 = canonical_sha256(&json!({
         "initialization_sha256":initialization_sha256,
@@ -663,7 +689,8 @@ pub fn validate(
     }
     let expected_fixture = canonical_sha256(&json!({
         "context_result_sha256":report.context_result_sha256,
-        "dependencies_result_sha256":report.dependencies_result_sha256
+        "dependencies_result_sha256":report.dependencies_result_sha256,
+        "health_findings_verified":true
     }));
     if report.fixture_result_sha256 != expected_fixture {
         bail!("packaged MCP fixture digest is not bound to its context/dependencies evidence");
@@ -1355,6 +1382,26 @@ fn verify_dependencies_fixture(structured: &Value) -> Result<()> {
         || items[0]["target_id"] != "node:mcp-target"
     {
         bail!("packaged dependencies fixture result is incompatible");
+    }
+    Ok(())
+}
+
+fn verify_health_fixture(structured: &Value) -> Result<()> {
+    let result = &structured["result"];
+    let items = result["findings"]["items"]
+        .as_array()
+        .context("packaged health fixture has no finding page")?;
+    if structured["repository_id"] != "repository"
+        || !result["collection_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("collection:sha256:"))
+        || items.len() != 1
+        || items[0]["kind"] != "unused-file"
+        || items[0]["subject_id"] != "node:mcp-source"
+        || items[0]["confidence"] != "probable"
+        || !items[0]["blockers"].as_array().is_some_and(Vec::is_empty)
+    {
+        bail!("packaged health fixture result is incompatible");
     }
     Ok(())
 }
@@ -2136,7 +2183,8 @@ mod tests {
             dependencies_result_sha256: "5".repeat(64),
             fixture_result_sha256: canonical_sha256(&json!({
                 "context_result_sha256":"4".repeat(64),
-                "dependencies_result_sha256":"5".repeat(64)
+                "dependencies_result_sha256":"5".repeat(64),
+                "health_findings_verified":true
             })),
             safe_scan_submit_deadline_ms: SUBMIT_DEADLINE_MS,
             safe_scan_submit_elapsed_ms: SUBMIT_DEADLINE_MS - 1,

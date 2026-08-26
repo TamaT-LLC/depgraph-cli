@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
     AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
-    AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
+    AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
+    AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
     AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRuntimeValidationResponse,
     AgentSite, AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
     LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
@@ -79,6 +80,11 @@ define_cli_actions! {
     Diff => "diff",
     Policy => "policy",
     Export => "export",
+    HealthSummary => "health_summary",
+    HealthFindings => "health_findings",
+    HealthFindingGet => "health_finding_get",
+    Audit => "audit",
+    Hotspots => "hotspots",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +573,69 @@ const TOOL_SPECS: &[ToolSpec] = &[
         OperationBehavior::Immediate
     ),
     tool_spec!(
+        "health_summary_get",
+        "Summarize snapshot-scoped code-health findings. Confidence is confirmed, probable, or indeterminate. Summary excludes audit and hotspot findings. confirmed requires every applicable profile to be semantic-complete and to lack public-surface, entry-point, dynamic-loading, candidate, unresolved, coverage, profile-not-analyzed, and manifest-drift blockers.",
+        ["snapshot", "kinds"],
+        [CliAction::HealthSummary],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "health_findings_list",
+        "List snapshot-scoped unused-file, unused-export, unused-type, unused-dependency, test-only-dependency, and manifest-mismatch findings. Read blockers before treating a finding as confirmed unused.",
+        [
+            "snapshot",
+            "kinds",
+            "severities",
+            "confidences",
+            "cursor",
+            "limit"
+        ],
+        [CliAction::HealthFindings],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "health_finding_get",
+        "Explain one snapshot-scoped health finding by stable ID. Input-scoped audit or hotspot IDs return a deterministic invalid-input error; use health_audit_get or health_hotspots_list instead.",
+        ["snapshot", "finding_id"],
+        [CliAction::HealthFindingGet],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "health_audit_get",
+        "Audit changed code against a snapshot pair. Without a comparable base snapshot, blast radius remains evaluable while new-cycle, new-boundary, and public-api checks return indeterminate placeholders.",
+        ["snapshot", "changed", "base_snapshot", "cursor", "limit"],
+        [CliAction::Audit],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "health_hotspots_list",
+        "Rank graph hotspots with integer basis-point scores. Missing Git churn or runtime observation contributes 0 without renormalizing weights.",
+        [
+            "snapshot",
+            "churn_commit_limit",
+            "churn_path_filter",
+            "weight_fan_in",
+            "weight_fan_out",
+            "weight_reverse_impact",
+            "weight_git_churn",
+            "weight_runtime",
+            "cursor",
+            "limit"
+        ],
+        [CliAction::Hotspots],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
         "operation_get",
         "Read durable operation state and progress.",
         ["operation_id"],
@@ -832,6 +901,21 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "graph_export" => {
             return exact_success_output_schema::<AgentGraphExportResponse>(spec.name);
         }
+        "health_summary_get" => {
+            return exact_success_output_schema::<AgentHealthSummary>(spec.name);
+        }
+        "health_findings_list" => {
+            return exact_success_output_schema::<AgentHealthFindingsPage>(spec.name);
+        }
+        "health_finding_get" => {
+            return exact_success_output_schema::<AgentHealthFindingDetail>(spec.name);
+        }
+        "health_audit_get" => {
+            return exact_success_output_schema::<AgentHealthAudit>(spec.name);
+        }
+        "health_hotspots_list" => {
+            return exact_success_output_schema::<AgentHealthHotspots>(spec.name);
+        }
         "repository_init" => {
             return exact_success_output_schema::<AgentRepositoryInitOutcome>(spec.name);
         }
@@ -1081,11 +1165,23 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": 1024,
             "items": scalar_schema::<AgentLocator>()
         }),
-        "kinds" | "profiles" | "conditions" | "phases" | "sessions" | "environments" => json!({
+        "kinds" | "profiles" | "conditions" | "phases" | "sessions" | "environments"
+        | "severities" | "confidences" | "churn_path_filter" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}
         }),
+        "finding_id" => scalar_schema::<AgentId>(),
+        "changed" => scalar_schema::<AgentLabel>(),
+        "base_snapshot" => snapshot_selector_schema(),
+        "churn_commit_limit" => json!({"type": "integer", "minimum": 1, "maximum": 512}),
+        "weight_fan_in"
+        | "weight_fan_out"
+        | "weight_reverse_impact"
+        | "weight_git_churn"
+        | "weight_runtime" => {
+            json!({"type": "integer", "minimum": 0, "maximum": 10000})
+        }
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
     }
 }
@@ -1125,6 +1221,8 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         ],
         "export_file" => &["idempotency_key", "output_path", "format"],
         "snapshot_name_create" => &["name"],
+        "health_finding_get" => &["finding_id"],
+        "health_audit_get" => &["changed"],
         _ => &[],
     }
 }
