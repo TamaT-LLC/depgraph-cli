@@ -1704,13 +1704,211 @@ function hasIncompatibleVisibleBindingOrigins(
   return provenOrigins.size > 1;
 }
 
-export function validateTypeScriptRawDependencyDelta(
-  delta: TypeScriptRawDependencyDelta,
-  definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
+interface TypeScriptDependencyValidationContext {
+  readonly sourceLengths: ReadonlyMap<string, number>;
+  readonly sourceTexts: ReadonlyMap<string, string>;
+  readonly sourceSyntaxValidity: ReadonlyMap<string, boolean>;
+  readonly importTypeModuleSpans: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly moduleCallSpans: ReadonlyMap<string, ReadonlyMap<string, string>>;
+  readonly nonLiteralModuleSpans: ReadonlyMap<
+    string,
+    ReadonlyMap<string, TypeScriptNonLiteralModuleValidationSpan>
+  >;
+  readonly typeUseSpans: ReadonlyMap<string, ReadonlyMap<string, TypeScriptTypeUseValidationSpan>>;
+  readonly callSpans: ReadonlyMap<string, ReadonlyMap<string, TypeScriptCallValidationSpan>>;
+}
+
+function buildImportTypeModuleSpanIndex(
+  source: Readonly<TypeScriptDependencyValidationSource>,
+): ReadonlySet<string> {
+  if (!Array.isArray(source.importTypeModuleSpans)) {
+    throw new DependencyContractError("raw dependency import-type validation spans are missing");
+  }
+  const spans = new Set<string>();
+  for (const spanValue of source.importTypeModuleSpans) {
+    if (
+      !Number.isSafeInteger(spanValue.startOffset)
+      || !Number.isSafeInteger(spanValue.endOffset)
+      || spanValue.startOffset < 0
+      || spanValue.endOffset <= spanValue.startOffset
+      || spanValue.endOffset > source.text.length
+    ) throw new DependencyContractError("raw dependency import-type validation span is invalid");
+    const key = `${spanValue.startOffset}\0${spanValue.endOffset}`;
+    if (spans.has(key)) throw new DependencyContractError("raw dependency import-type validation span is duplicated");
+    spans.add(key);
+  }
+  return spans;
+}
+
+function buildModuleCallSpanIndex(
+  source: Readonly<TypeScriptDependencyValidationSource>,
+): ReadonlyMap<string, string> {
+  if (!Array.isArray(source.moduleCallSpans)) {
+    throw new DependencyContractError("raw dependency module-call validation spans are missing");
+  }
+  const calls = new Map<string, string>();
+  for (const spanValue of source.moduleCallSpans) {
+    if (
+      !Number.isSafeInteger(spanValue.startOffset)
+      || !Number.isSafeInteger(spanValue.endOffset)
+      || spanValue.startOffset < 0
+      || spanValue.endOffset <= spanValue.startOffset
+      || spanValue.endOffset > source.text.length
+      || (spanValue.occurrenceKind !== "require_call" && spanValue.occurrenceKind !== "dynamic_import")
+      || !["literal", "computed", "missing"].includes(spanValue.syntax)
+      || typeof spanValue.moduleSpecifier !== "string"
+      || spanValue.moduleSpecifier.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(spanValue.moduleSpecifier)
+    ) throw new DependencyContractError("raw dependency module-call validation span is invalid");
+    const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}\0${spanValue.syntax}`;
+    if (calls.has(key)) throw new DependencyContractError("raw dependency module-call validation span is duplicated");
+    calls.set(key, spanValue.moduleSpecifier);
+  }
+  return calls;
+}
+
+function buildNonLiteralModuleSpanIndex(
+  source: Readonly<TypeScriptDependencyValidationSource>,
+): ReadonlyMap<string, TypeScriptNonLiteralModuleValidationSpan> {
+  if (!Array.isArray(source.nonLiteralModuleSpans)) {
+    throw new DependencyContractError("raw dependency non-literal module validation spans are missing");
+  }
+  const nonLiteralModules = new Map<string, TypeScriptNonLiteralModuleValidationSpan>();
+  for (const spanValue of source.nonLiteralModuleSpans) {
+    const bindingScope = spanValue.bindingScope;
+    const proof = spanValue.resolutionModeProof;
+    if (
+      !Number.isSafeInteger(spanValue.startOffset)
+      || !Number.isSafeInteger(spanValue.endOffset)
+      || spanValue.startOffset < 0
+      || spanValue.endOffset <= spanValue.startOffset
+      || spanValue.endOffset > source.text.length
+      || !["web_import", "web_reexport"].includes(spanValue.siteKind)
+      || !["dynamic_import", "import_type", "export_star", "import_equals"].includes(spanValue.occurrenceKind)
+      || typeof spanValue.moduleSpecifier !== "string"
+      || spanValue.moduleSpecifier.length === 0
+      || spanValue.moduleSpecifier.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(spanValue.moduleSpecifier)
+      || source.text.slice(spanValue.startOffset, spanValue.endOffset) !== spanValue.moduleSpecifier
+      || typeof spanValue.typeOnly !== "boolean"
+      || (spanValue.resolutionMode !== null
+        && spanValue.resolutionMode !== "import"
+        && spanValue.resolutionMode !== "require")
+      || (spanValue.resolutionModeError !== null
+        && !RESOLUTION_MODE_ERRORS.has(spanValue.resolutionModeError))
+      || (
+        spanValue.occurrenceKind === "import_equals"
+          ? spanValue.siteKind !== "web_import"
+            || spanValue.importedName !== "="
+            || spanValue.bindingKind !== "import_equals"
+            || bindingScope === null
+            || !Number.isSafeInteger(bindingScope.startOffset)
+            || !Number.isSafeInteger(bindingScope.endOffset)
+            || bindingScope.startOffset < 0
+            || bindingScope.endOffset <= bindingScope.startOffset
+            || bindingScope.endOffset > source.text.length
+            || bindingScope.startOffset > spanValue.startOffset
+            || bindingScope.endOffset < spanValue.endOffset
+          : spanValue.importedName !== null
+            || spanValue.bindingKind !== null
+            || bindingScope !== null
+      )
+      || (spanValue.siteKind === "web_reexport" && spanValue.occurrenceKind !== "export_star")
+      || (spanValue.siteKind === "web_import" && spanValue.occurrenceKind === "export_star")
+      || (
+        spanValue.resolutionMode === null
+          ? proof !== null
+          : proof === null
+            || !resolutionModeProofCorrelates(source.text, spanValue.resolutionMode, proof)
+      )
+      || (spanValue.resolutionModeError !== null
+        && (spanValue.resolutionMode !== null || proof !== null))
+    ) throw new DependencyContractError("raw dependency non-literal module validation span is invalid");
+    const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.siteKind}\0${spanValue.occurrenceKind}`;
+    if (nonLiteralModules.has(key)) {
+      throw new DependencyContractError("raw dependency non-literal module validation span is duplicated");
+    }
+    nonLiteralModules.set(key, {
+      ...spanValue,
+      bindingScope: bindingScope === null ? null : { ...bindingScope },
+      resolutionModeProof: proof === null ? null : { ...proof },
+    });
+  }
+  return nonLiteralModules;
+}
+
+function buildTypeUseSpanIndex(
+  source: Readonly<TypeScriptDependencyValidationSource>,
+  importTypeModuleSpans: ReadonlySet<string>,
+): ReadonlyMap<string, TypeScriptTypeUseValidationSpan> {
+  if (!Array.isArray(source.typeUseSpans)) {
+    throw new DependencyContractError("raw dependency type-use validation spans are missing");
+  }
+  const typeUses = new Map<string, TypeScriptTypeUseValidationSpan>();
+  for (const spanValue of source.typeUseSpans) {
+    if (
+      !Number.isSafeInteger(spanValue.startOffset)
+      || !Number.isSafeInteger(spanValue.endOffset)
+      || spanValue.startOffset < 0
+      || spanValue.endOffset <= spanValue.startOffset
+      || spanValue.endOffset > source.text.length
+      || !["type_reference", "heritage_type", "jsdoc_type"].includes(spanValue.occurrenceKind)
+      || typeof spanValue.terminalName !== "string"
+      || spanValue.terminalName.length === 0
+      || spanValue.terminalName.length > 512
+      || hasUnpairedSurrogate(spanValue.terminalName)
+      || identifierValueAt(source.text, spanValue.startOffset, spanValue.endOffset) !== spanValue.terminalName
+      || !(
+        (spanValue.inlineImportModuleStartOffset === null && spanValue.inlineImportModuleEndOffset === null)
+        || (
+          Number.isSafeInteger(spanValue.inlineImportModuleStartOffset)
+          && Number.isSafeInteger(spanValue.inlineImportModuleEndOffset)
+          && spanValue.inlineImportModuleStartOffset! >= 0
+          && spanValue.inlineImportModuleEndOffset! > spanValue.inlineImportModuleStartOffset!
+          && spanValue.inlineImportModuleEndOffset! <= source.text.length
+          && importTypeModuleSpans.has(
+            `${spanValue.inlineImportModuleStartOffset}\0${spanValue.inlineImportModuleEndOffset}`,
+          )
+        )
+      )
+    ) throw new DependencyContractError("raw dependency type-use validation span is invalid");
+    const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}`;
+    if (typeUses.has(key)) throw new DependencyContractError("raw dependency type-use validation span is duplicated");
+    typeUses.set(key, { ...spanValue });
+  }
+  return typeUses;
+}
+
+function buildCallSpanIndex(
+  source: Readonly<TypeScriptDependencyValidationSource>,
+): ReadonlyMap<string, TypeScriptCallValidationSpan> {
+  if (!Array.isArray(source.callSpans)) {
+    throw new DependencyContractError("raw dependency call validation spans are missing");
+  }
+  const sourceCalls = new Map<string, TypeScriptCallValidationSpan>();
+  for (const spanValue of source.callSpans) {
+    if (
+      !Number.isSafeInteger(spanValue.startOffset)
+      || !Number.isSafeInteger(spanValue.endOffset)
+      || spanValue.startOffset < 0
+      || spanValue.endOffset <= spanValue.startOffset
+      || spanValue.endOffset > source.text.length
+      || !["call_expression", "new_expression", "tagged_template"].includes(spanValue.occurrenceKind)
+      || typeof spanValue.specifier !== "string"
+      || spanValue.specifier.length === 0
+      || spanValue.specifier.length > MAX_SPECIFIER_CHARS
+      || hasUnpairedSurrogate(spanValue.specifier)
+    ) throw new DependencyContractError("raw dependency call validation span is invalid");
+    const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}`;
+    if (sourceCalls.has(key)) throw new DependencyContractError("raw dependency call validation span is duplicated");
+    sourceCalls.set(key, { ...spanValue });
+  }
+  return sourceCalls;
+}
+
+function buildTypeScriptDependencyValidationContext(
   sources: readonly TypeScriptDependencyValidationSource[],
-): void {
-  if (!Array.isArray(delta.calls)) throw new DependencyContractError("raw dependency call ledger is missing");
-  if (delta.sites.length + delta.calls.length > MAX_SITES) throw new DependencyContractError("raw dependency site limit exceeded");
+): TypeScriptDependencyValidationContext {
   const sourceLengths = new Map<string, number>();
   const sourceTexts = new Map<string, string>();
   const sourceSyntaxValidity = new Map<string, boolean>();
@@ -1720,175 +1918,54 @@ export function validateTypeScriptRawDependencyDelta(
   const typeUseSpans = new Map<string, ReadonlyMap<string, TypeScriptTypeUseValidationSpan>>();
   const callSpans = new Map<string, ReadonlyMap<string, TypeScriptCallValidationSpan>>();
   for (const source of sources) {
-    if (!isCanonicalRelativePath(source.relativePath)) throw new DependencyContractError("raw dependency source path is not canonical");
-    if (sourceLengths.has(source.relativePath)) throw new DependencyContractError("raw dependency source path is duplicated");
+    if (!isCanonicalRelativePath(source.relativePath)) {
+      throw new DependencyContractError("raw dependency source path is not canonical");
+    }
+    if (sourceLengths.has(source.relativePath)) {
+      throw new DependencyContractError("raw dependency source path is duplicated");
+    }
     sourceLengths.set(source.relativePath, source.text.length);
     sourceTexts.set(source.relativePath, source.text);
     if (typeof source.syntacticallyValid !== "boolean") {
       throw new DependencyContractError("raw dependency source syntax validity is invalid");
     }
     sourceSyntaxValidity.set(source.relativePath, source.syntacticallyValid);
-    if (!Array.isArray(source.importTypeModuleSpans)) {
-      throw new DependencyContractError("raw dependency import-type validation spans are missing");
-    }
-    const spans = new Set<string>();
-    for (const spanValue of source.importTypeModuleSpans) {
-      if (
-        !Number.isSafeInteger(spanValue.startOffset)
-        || !Number.isSafeInteger(spanValue.endOffset)
-        || spanValue.startOffset < 0
-        || spanValue.endOffset <= spanValue.startOffset
-        || spanValue.endOffset > source.text.length
-      ) throw new DependencyContractError("raw dependency import-type validation span is invalid");
-      const key = `${spanValue.startOffset}\0${spanValue.endOffset}`;
-      if (spans.has(key)) throw new DependencyContractError("raw dependency import-type validation span is duplicated");
-      spans.add(key);
-    }
-    importTypeModuleSpans.set(source.relativePath, spans);
-    if (!Array.isArray(source.moduleCallSpans)) {
-      throw new DependencyContractError("raw dependency module-call validation spans are missing");
-    }
-    const calls = new Map<string, string>();
-    for (const spanValue of source.moduleCallSpans) {
-      if (
-        !Number.isSafeInteger(spanValue.startOffset)
-        || !Number.isSafeInteger(spanValue.endOffset)
-        || spanValue.startOffset < 0
-        || spanValue.endOffset <= spanValue.startOffset
-        || spanValue.endOffset > source.text.length
-        || (spanValue.occurrenceKind !== "require_call" && spanValue.occurrenceKind !== "dynamic_import")
-        || !["literal", "computed", "missing"].includes(spanValue.syntax)
-        || typeof spanValue.moduleSpecifier !== "string"
-        || spanValue.moduleSpecifier.length > MAX_SPECIFIER_CHARS
-        || hasUnpairedSurrogate(spanValue.moduleSpecifier)
-      ) throw new DependencyContractError("raw dependency module-call validation span is invalid");
-      const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}\0${spanValue.syntax}`;
-      if (calls.has(key)) throw new DependencyContractError("raw dependency module-call validation span is duplicated");
-      calls.set(key, spanValue.moduleSpecifier);
-    }
-    moduleCallSpans.set(source.relativePath, calls);
-    if (!Array.isArray(source.nonLiteralModuleSpans)) {
-      throw new DependencyContractError("raw dependency non-literal module validation spans are missing");
-    }
-    const nonLiteralModules = new Map<string, TypeScriptNonLiteralModuleValidationSpan>();
-    for (const spanValue of source.nonLiteralModuleSpans) {
-      const bindingScope = spanValue.bindingScope;
-      const proof = spanValue.resolutionModeProof;
-      if (
-        !Number.isSafeInteger(spanValue.startOffset)
-        || !Number.isSafeInteger(spanValue.endOffset)
-        || spanValue.startOffset < 0
-        || spanValue.endOffset <= spanValue.startOffset
-        || spanValue.endOffset > source.text.length
-        || !["web_import", "web_reexport"].includes(spanValue.siteKind)
-        || !["dynamic_import", "import_type", "export_star", "import_equals"].includes(spanValue.occurrenceKind)
-        || typeof spanValue.moduleSpecifier !== "string"
-        || spanValue.moduleSpecifier.length === 0
-        || spanValue.moduleSpecifier.length > MAX_SPECIFIER_CHARS
-        || hasUnpairedSurrogate(spanValue.moduleSpecifier)
-        || source.text.slice(spanValue.startOffset, spanValue.endOffset) !== spanValue.moduleSpecifier
-        || typeof spanValue.typeOnly !== "boolean"
-        || (spanValue.resolutionMode !== null
-          && spanValue.resolutionMode !== "import"
-          && spanValue.resolutionMode !== "require")
-        || (spanValue.resolutionModeError !== null
-          && !RESOLUTION_MODE_ERRORS.has(spanValue.resolutionModeError))
-        || (
-          spanValue.occurrenceKind === "import_equals"
-            ? spanValue.siteKind !== "web_import"
-              || spanValue.importedName !== "="
-              || spanValue.bindingKind !== "import_equals"
-              || bindingScope === null
-              || !Number.isSafeInteger(bindingScope.startOffset)
-              || !Number.isSafeInteger(bindingScope.endOffset)
-              || bindingScope.startOffset < 0
-              || bindingScope.endOffset <= bindingScope.startOffset
-              || bindingScope.endOffset > source.text.length
-              || bindingScope.startOffset > spanValue.startOffset
-              || bindingScope.endOffset < spanValue.endOffset
-            : spanValue.importedName !== null
-              || spanValue.bindingKind !== null
-              || bindingScope !== null
-        )
-        || (spanValue.siteKind === "web_reexport" && spanValue.occurrenceKind !== "export_star")
-        || (spanValue.siteKind === "web_import" && spanValue.occurrenceKind === "export_star")
-        || (
-          spanValue.resolutionMode === null
-            ? proof !== null
-            : proof === null
-              || !resolutionModeProofCorrelates(source.text, spanValue.resolutionMode, proof)
-        )
-        || (spanValue.resolutionModeError !== null
-          && (spanValue.resolutionMode !== null || proof !== null))
-      ) throw new DependencyContractError("raw dependency non-literal module validation span is invalid");
-      const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.siteKind}\0${spanValue.occurrenceKind}`;
-      if (nonLiteralModules.has(key)) {
-        throw new DependencyContractError("raw dependency non-literal module validation span is duplicated");
-      }
-      nonLiteralModules.set(key, {
-        ...spanValue,
-        bindingScope: bindingScope === null ? null : { ...bindingScope },
-        resolutionModeProof: proof === null ? null : { ...proof },
-      });
-    }
-    nonLiteralModuleSpans.set(source.relativePath, nonLiteralModules);
-    if (!Array.isArray(source.typeUseSpans)) {
-      throw new DependencyContractError("raw dependency type-use validation spans are missing");
-    }
-    const typeUses = new Map<string, TypeScriptTypeUseValidationSpan>();
-    for (const spanValue of source.typeUseSpans) {
-      if (
-        !Number.isSafeInteger(spanValue.startOffset)
-        || !Number.isSafeInteger(spanValue.endOffset)
-        || spanValue.startOffset < 0
-        || spanValue.endOffset <= spanValue.startOffset
-        || spanValue.endOffset > source.text.length
-        || !["type_reference", "heritage_type", "jsdoc_type"].includes(spanValue.occurrenceKind)
-        || typeof spanValue.terminalName !== "string"
-        || spanValue.terminalName.length === 0
-        || spanValue.terminalName.length > 512
-        || hasUnpairedSurrogate(spanValue.terminalName)
-        || identifierValueAt(source.text, spanValue.startOffset, spanValue.endOffset) !== spanValue.terminalName
-        || !(
-          (spanValue.inlineImportModuleStartOffset === null && spanValue.inlineImportModuleEndOffset === null)
-          || (
-            Number.isSafeInteger(spanValue.inlineImportModuleStartOffset)
-            && Number.isSafeInteger(spanValue.inlineImportModuleEndOffset)
-            && spanValue.inlineImportModuleStartOffset! >= 0
-            && spanValue.inlineImportModuleEndOffset! > spanValue.inlineImportModuleStartOffset!
-            && spanValue.inlineImportModuleEndOffset! <= source.text.length
-            && spans.has(`${spanValue.inlineImportModuleStartOffset}\0${spanValue.inlineImportModuleEndOffset}`)
-          )
-        )
-      ) throw new DependencyContractError("raw dependency type-use validation span is invalid");
-      const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}`;
-      if (typeUses.has(key)) throw new DependencyContractError("raw dependency type-use validation span is duplicated");
-      typeUses.set(key, { ...spanValue });
-    }
-    typeUseSpans.set(source.relativePath, typeUses);
-    if (!Array.isArray(source.callSpans)) {
-      throw new DependencyContractError("raw dependency call validation spans are missing");
-    }
-    const sourceCalls = new Map<string, TypeScriptCallValidationSpan>();
-    for (const spanValue of source.callSpans) {
-      if (
-        !Number.isSafeInteger(spanValue.startOffset)
-        || !Number.isSafeInteger(spanValue.endOffset)
-        || spanValue.startOffset < 0
-        || spanValue.endOffset <= spanValue.startOffset
-        || spanValue.endOffset > source.text.length
-        || !["call_expression", "new_expression", "tagged_template"].includes(spanValue.occurrenceKind)
-        || typeof spanValue.specifier !== "string"
-        || spanValue.specifier.length === 0
-        || spanValue.specifier.length > MAX_SPECIFIER_CHARS
-        || hasUnpairedSurrogate(spanValue.specifier)
-      ) throw new DependencyContractError("raw dependency call validation span is invalid");
-      const key = `${spanValue.startOffset}\0${spanValue.endOffset}\0${spanValue.occurrenceKind}`;
-      if (sourceCalls.has(key)) throw new DependencyContractError("raw dependency call validation span is duplicated");
-      sourceCalls.set(key, { ...spanValue });
-    }
-    callSpans.set(source.relativePath, sourceCalls);
+    const importTypeSpans = buildImportTypeModuleSpanIndex(source);
+    importTypeModuleSpans.set(source.relativePath, importTypeSpans);
+    moduleCallSpans.set(source.relativePath, buildModuleCallSpanIndex(source));
+    nonLiteralModuleSpans.set(source.relativePath, buildNonLiteralModuleSpanIndex(source));
+    typeUseSpans.set(source.relativePath, buildTypeUseSpanIndex(source, importTypeSpans));
+    callSpans.set(source.relativePath, buildCallSpanIndex(source));
   }
+  return Object.freeze({
+    sourceLengths,
+    sourceTexts,
+    sourceSyntaxValidity,
+    importTypeModuleSpans,
+    moduleCallSpans,
+    nonLiteralModuleSpans,
+    typeUseSpans,
+    callSpans,
+  });
+}
+
+export function validateTypeScriptRawDependencyDelta(
+  delta: TypeScriptRawDependencyDelta,
+  definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
+  sources: readonly TypeScriptDependencyValidationSource[],
+): void {
+  if (!Array.isArray(delta.calls)) throw new DependencyContractError("raw dependency call ledger is missing");
+  if (delta.sites.length + delta.calls.length > MAX_SITES) throw new DependencyContractError("raw dependency site limit exceeded");
+  const {
+    sourceLengths,
+    sourceTexts,
+    sourceSyntaxValidity,
+    importTypeModuleSpans,
+    moduleCallSpans,
+    nonLiteralModuleSpans,
+    typeUseSpans,
+    callSpans,
+  } = buildTypeScriptDependencyValidationContext(sources);
   const sitesByKey = new Map(delta.sites.map((site) => [site.key, site]));
   const definitions = new Map(definitionsDelta.definitions.map((definition) => [definition.key, definition]));
   const validationTokensBySource = new Map([...sourceTexts].map(([relativePath, sourceText]) => [
