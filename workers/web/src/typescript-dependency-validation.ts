@@ -59,7 +59,7 @@ import {
   terminalIdentifier,
   TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM,
   TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM,
-} from "./typescript-dependencies";
+} from "./typescript-dependency-contract";
 import type {
   QueryCounter,
   TypeScriptBindingKind,
@@ -67,7 +67,7 @@ import type {
   TypeScriptRawDependencySite,
   TypeScriptRawDependencySiteKind,
   TypeScriptResolutionMode,
-} from "./typescript-dependencies";
+} from "./typescript-dependency-contract";
 
 export interface TypeScriptDependencyValidationSource {
   relativePath: string;
