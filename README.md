@@ -316,15 +316,28 @@ depgraph export --format graphml --output graph.graphml
 既定の`read`権限では、ストアの変更、リポジトリへの書き込み、デーモン制御、プロジェクトコードの実行を許可しない。
 固定したリポジトリルート、絶対パスで指定したストア、検証済みコンパイラーパックの要件ファイルが必要になる。
 
-公式stable版の`depgraph`を導入した後、対象Gitリポジトリ内で次を実行すると、artifactの取得と検証、安全な初回スキャン、package/MCP preflight、project-scopedなCodex設定のatomic mergeまでを一括して行える。
+公式stable版の`depgraph`を導入した後、対象Gitリポジトリ内で次を実行すると、artifactの取得と検証、安全な初回スキャン、package/MCP preflight、ホスト設定のatomic mergeまでを一括して行える。
 
 ```sh
 depgraph mcp setup --host codex
 ```
 
-既定ではruntimeとcompiler packをversion／target単位で共有し、ストアと`.codex/config.toml`はcanonical repository rootごとに分離する。
-設定はread-onlyで固定され、既存の無関係なCodex設定、コメント、書式を保持する。
-完了後はCodexを再起動する。
+`--host`には`codex`、`claude`、`cursor`、`grok`を指定できる。
+既定はproject scopeであり、設定先は順に`.codex/config.toml`、`.mcp.json`、`.cursor/mcp.json`、`.grok/config.toml`となる。
+user scopeへ設定する場合は`--scope user`を付ける。
+
+```sh
+depgraph mcp setup --host cursor --scope user
+```
+
+user scopeの設定先は順に`~/.codex/config.toml`、`~/.claude.json`、`~/.cursor/mcp.json`、`~/.grok/config.toml`となる。
+複数リポジトリを共存させるため、user scopeでは`depgraph-<repository-id>`という決定的なサーバー名を使う。
+project scopeのサーバー名は従来どおり`depgraph`である。
+
+runtimeとcompiler packはversion／target単位で共有し、ストアはcanonical repository rootごとに分離する。
+設定はread-onlyで固定され、既存の無関係な設定を保持する。
+CodexとGrokのTOMLではコメントと書式も保持する。
+完了後は対象ホストを再起動または再読み込みする。
 再実行はidempotentであり、運用には次のコマンドを使う。
 
 ```sh
@@ -333,10 +346,16 @@ depgraph mcp update --host codex
 depgraph mcp uninstall --host codex
 ```
 
+user scopeのbindingには、各コマンドで同じ`--host`と`--scope user`を指定する。
+
 `status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
 `update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
 `setup`／`update`／`uninstall`は同じrepository lifecycle lockで直列化される。
-`uninstall`は管理cache配下の完全なread-only起動tupleを所有権として検証し、state未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してからrepository固有の設定とstateだけを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
+user homeの`.depgraph-mcp-locks`にhost設定ファイルごとのlockを置き、異なるリポジトリやCLI versionによるuser scope設定の同時更新を直列化する。
+`uninstall`は管理cache配下の完全なread-only起動tupleを所有権として検証し、state未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してから指定したhost／scopeの設定だけを削除する。
+同じリポジトリを参照し、実行中CLIのversion／host targetと一致する所有済みのhost／scope設定が残っている場合だけ、repository固有のstateを保持する。
+過去releaseや、同名でも起動tupleが一致しない設定は残存bindingとして扱わない。
+最後の設定を削除した時点でstateを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
 中断後は同じ`setup`を再実行する。
 root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。
 

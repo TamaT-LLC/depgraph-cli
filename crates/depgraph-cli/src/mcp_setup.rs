@@ -20,6 +20,7 @@ use depgraph_operation::{
 };
 use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, Item as TomlItem, Table as TomlTable};
 
@@ -34,9 +35,131 @@ const MAX_RELEASE_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_RELEASE_ARCHIVE_ENTRIES: usize = 250_000;
 const MAX_RELEASE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_SMALL_ASSET_BYTES: u64 = 1024 * 1024;
-const MAX_CODEX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_HOST_CONFIG_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpHost {
+    Codex,
+    Claude,
+    Cursor,
+    Grok,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpScope {
+    Project,
+    User,
+}
+
+impl McpScope {
+    const ALL: [Self; 2] = [Self::Project, Self::User];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+        }
+    }
+
+    fn configuration_root(self, repository_root: &Path) -> Result<PathBuf> {
+        match self {
+            Self::Project => Ok(repository_root.to_path_buf()),
+            Self::User => BaseDirs::new()
+                .context("MCP user scope has no home directory")?
+                .home_dir()
+                .canonicalize()
+                .context("MCP user-scope home directory is unavailable"),
+        }
+    }
+
+    fn server_name(self, repository_root: &Path) -> Result<String> {
+        if self == Self::Project {
+            return Ok("depgraph".to_owned());
+        }
+        let root = repository_root
+            .to_str()
+            .context("MCP user scope requires a UTF-8 repository path")?;
+        let digest = hex::encode(Sha256::digest(root.as_bytes()));
+        Ok(format!("depgraph-{}", &digest[..16]))
+    }
+}
+
+impl McpHost {
+    const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Cursor, Self::Grok];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Grok => "grok",
+        }
+    }
+
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+            Self::Grok => "Grok",
+        }
+    }
+
+    pub(crate) const fn activation_hint(self, scope: McpScope) -> &'static str {
+        match (self, scope) {
+            (Self::Codex, McpScope::Project) => {
+                "restart Codex to connect the project-scoped depgraph server"
+            }
+            (Self::Codex, McpScope::User) => {
+                "restart Codex to connect the user-scoped depgraph server"
+            }
+            (Self::Claude, McpScope::Project) => {
+                "restart Claude Code and approve the project-scoped depgraph server when prompted"
+            }
+            (Self::Claude, McpScope::User) => {
+                "restart Claude Code to connect the user-scoped depgraph server"
+            }
+            (Self::Cursor, McpScope::Project) => {
+                "restart Cursor to connect the project-scoped depgraph server"
+            }
+            (Self::Cursor, McpScope::User) => {
+                "restart Cursor to connect the user-scoped depgraph server"
+            }
+            (Self::Grok, McpScope::Project) => {
+                "refresh Grok MCP servers to connect the project-scoped depgraph server"
+            }
+            (Self::Grok, McpScope::User) => {
+                "refresh Grok MCP servers to connect the user-scoped depgraph server"
+            }
+        }
+    }
+
+    const fn agent_format(self) -> AgentHostFormat {
+        match self {
+            Self::Codex | Self::Grok => AgentHostFormat::Codex,
+            Self::Claude | Self::Cursor => AgentHostFormat::ClaudeDesktop,
+        }
+    }
+
+    fn config_path(self, scope: McpScope, repository_root: &Path) -> Result<PathBuf> {
+        let root = scope.configuration_root(repository_root)?;
+        match self {
+            Self::Codex => Ok(root.join(".codex").join("config.toml")),
+            Self::Claude if scope == McpScope::Project => Ok(root.join(".mcp.json")),
+            Self::Claude => Ok(root.join(".claude.json")),
+            Self::Cursor => Ok(root.join(".cursor").join("mcp.json")),
+            Self::Grok => Ok(root.join(".grok").join("config.toml")),
+        }
+    }
+
+    const fn is_json(self) -> bool {
+        matches!(self, Self::Claude | Self::Cursor)
+    }
+}
 
 pub(crate) struct McpWorkflowRequest {
+    pub(crate) host: McpHost,
+    pub(crate) scope: McpScope,
     pub(crate) requested_root: PathBuf,
     pub(crate) explicit_store: Option<PathBuf>,
 }
@@ -47,6 +170,7 @@ pub(crate) struct McpSetupOutput {
     pub(crate) runtime: PathBuf,
     pub(crate) compiler_pack: PathBuf,
     pub(crate) config: PathBuf,
+    pub(crate) server_name: String,
     pub(crate) snapshot_id: String,
     pub(crate) tool_count: usize,
     pub(crate) reused_assets: usize,
@@ -60,6 +184,7 @@ pub(crate) struct McpStatusOutput {
     pub(crate) runtime: PathBuf,
     pub(crate) compiler_pack: PathBuf,
     pub(crate) config: PathBuf,
+    pub(crate) server_name: String,
     pub(crate) snapshot_id: String,
     pub(crate) tool_count: usize,
 }
@@ -68,8 +193,10 @@ pub(crate) struct McpUninstallOutput {
     pub(crate) root: PathBuf,
     pub(crate) store: PathBuf,
     pub(crate) config: PathBuf,
+    pub(crate) server_name: String,
     pub(crate) config_changed: bool,
     pub(crate) removed_state_files: usize,
+    pub(crate) state_retained_for_other_hosts: bool,
 }
 
 pub(crate) fn setup(
@@ -79,7 +206,14 @@ pub(crate) fn setup(
     let binding = resolve_binding(request)?;
     let _lifecycle = acquire_repository_lifecycle_exclusion(&binding.config)?;
     let mut layout = ArtifactLayout::for_current_host()?;
-    preflight_codex_ownership(&binding.config, &layout.cache_base)?;
+    let server_name = request.scope.server_name(binding.config.canonical_root())?;
+    preflight_host_ownership(
+        request.host,
+        request.scope,
+        &server_name,
+        &binding.config,
+        &layout.cache_base,
+    )?;
     let curl = CurlClient::discover(binding.config.canonical_root())?;
     let release = fetch_release_metadata(&curl, &layout)?;
     layout.prepare_directories()?;
@@ -89,7 +223,7 @@ pub(crate) fn setup(
     prepare_extractions(&layout, false)?;
 
     let agent_inputs = AgentInputPaths::new(&layout);
-    let agent_request = agent_inputs.request(&binding, &release, &layout)?;
+    let agent_request = agent_inputs.request(request.host, &binding, &release, &layout)?;
     let package = match verify_package_for_executable(&agent_request, &layout.core_path()) {
         Ok(package) => package,
         Err(first_error) => {
@@ -111,12 +245,19 @@ pub(crate) fn setup(
         run_safe_scan(package.core(), &layout.runtime_root(), &verified_binding)?;
     }
     let generated = generate_with_verified_package(&agent_request, package)?;
-    let config_path = codex_config_path(verified_binding.canonical_root());
-    let config_changed = install_codex_configuration(
+    let configuration =
+        lifecycle_configuration(request.host, &server_name, &generated.configuration)?;
+    let config_path = request
+        .host
+        .config_path(request.scope, verified_binding.canonical_root())?;
+    let config_changed = install_host_configuration(
+        request.host,
+        request.scope,
+        &server_name,
         &verified_binding,
         &config_path,
         &layout.cache_base,
-        &generated.configuration,
+        &configuration,
     )?;
 
     Ok(McpSetupOutput {
@@ -125,6 +266,7 @@ pub(crate) fn setup(
         runtime: layout.runtime_root(),
         compiler_pack: layout.compiler_root(),
         config: config_path,
+        server_name,
         snapshot_id: generated.current_snapshot_id,
         tool_count: generated.tool_count,
         reused_assets,
@@ -143,17 +285,29 @@ pub(crate) fn status(request: &McpWorkflowRequest) -> Result<McpStatusOutput> {
     verify_cached_assets(&layout, &release)?;
     verify_checksum_sidecars(&layout, &release)?;
     let agent_inputs = AgentInputPaths::new(&layout);
-    let agent_request = agent_inputs.request(&binding, &release, &layout)?;
+    let agent_request = agent_inputs.request(request.host, &binding, &release, &layout)?;
     let package = verify_package_for_executable(&agent_request, &layout.core_path())?;
     let generated = generate_with_verified_package(&agent_request, package)?;
-    let config_path = codex_config_path(&generated.canonical_root);
-    verify_codex_configuration(&config_path, &generated.configuration)?;
+    let server_name = request.scope.server_name(&generated.canonical_root)?;
+    let configuration =
+        lifecycle_configuration(request.host, &server_name, &generated.configuration)?;
+    let config_path = request
+        .host
+        .config_path(request.scope, &generated.canonical_root)?;
+    verify_host_configuration(
+        request.host,
+        request.scope,
+        &server_name,
+        &config_path,
+        &configuration,
+    )?;
     Ok(McpStatusOutput {
         root: generated.canonical_root,
         store: generated.canonical_store,
         runtime: layout.runtime_root(),
         compiler_pack: layout.compiler_root(),
         config: config_path,
+        server_name,
         snapshot_id: generated.current_snapshot_id,
         tool_count: generated.tool_count,
     })
@@ -163,26 +317,48 @@ pub(crate) fn uninstall(request: &McpWorkflowRequest) -> Result<McpUninstallOutp
     let binding = resolve_binding(request)?;
     let _lifecycle = acquire_repository_lifecycle_exclusion(&binding.config)?;
     let layout = ArtifactLayout::for_current_host()?;
-    preflight_codex_ownership(&binding.config, &layout.cache_base)?;
+    let server_name = request.scope.server_name(binding.config.canonical_root())?;
+    preflight_host_ownership(
+        request.host,
+        request.scope,
+        &server_name,
+        &binding.config,
+        &layout.cache_base,
+    )?;
     let _state_exclusion = acquire_repository_state_exclusion(&binding.config)?;
-    let config_path = codex_config_path(binding.config.canonical_root());
-    let config_changed = remove_codex_configuration(
+    let config_path = request
+        .host
+        .config_path(request.scope, binding.config.canonical_root())?;
+    let state_retained_for_other_hosts = other_configuration_exists(
+        request.host,
+        request.scope,
+        &binding.config,
+        &layout.cache_base,
+    )?;
+    let config_changed = remove_host_configuration(
+        request.host,
+        request.scope,
+        &server_name,
         &binding.config,
         &config_path,
-        binding.config.canonical_root(),
-        binding.config.store_path(),
         &layout.cache_base,
     )?;
     if !binding.config.repository_root_seal().matches_live_root() {
         security_bail("repository root changed before repository state cleanup")?;
     }
-    let removed_state_files = remove_repository_state(&binding.config)?;
+    let removed_state_files = if state_retained_for_other_hosts {
+        0
+    } else {
+        remove_repository_state(&binding.config)?
+    };
     Ok(McpUninstallOutput {
         root: binding.config.canonical_root().to_path_buf(),
         store: binding.config.store_path().to_path_buf(),
         config: config_path,
+        server_name,
         config_changed,
         removed_state_files,
+        state_retained_for_other_hosts,
     })
 }
 
@@ -536,6 +712,65 @@ impl CacheLock {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct HostConfigurationLock {
+    _file: File,
+}
+
+impl HostConfigurationLock {
+    fn acquire(host: McpHost, scope: McpScope, config_path: &Path) -> Result<Option<Self>> {
+        if scope == McpScope::Project {
+            return Ok(None);
+        }
+        let lock_root = prepare_host_configuration_lock_root(host, config_path)?;
+        let rendered_path = config_path.as_os_str().to_string_lossy();
+        let mut digest = Sha256::new();
+        digest.update(b"depgraph-mcp-host-configuration-lock-v1");
+        digest.update((rendered_path.len() as u64).to_le_bytes());
+        digest.update(rendered_path.as_bytes());
+        let path = lock_root.join(format!("{}.lock", hex::encode(digest.finalize())));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .context("MCP setup cannot open its Agent host configuration lock")?;
+        let file = validate_open_regular_lock(file, &path, "Agent host configuration lock")?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => bail!(
+                "another MCP setup/update/uninstall is modifying this Agent host configuration; retry after it completes"
+            ),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).context("MCP setup cannot lock its Agent host configuration")
+            }
+        }
+    }
+}
+
+fn prepare_host_configuration_lock_root(host: McpHost, config_path: &Path) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .context("user-scoped Agent host configuration has no parent")?;
+    let home = if host == McpHost::Claude {
+        parent
+    } else {
+        parent
+            .parent()
+            .context("user-scoped Agent host configuration has no home directory")?
+    };
+    let metadata = fs::symlink_metadata(home)
+        .context("MCP setup cannot inspect the user configuration home")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || home.parent().is_none() {
+        return security_bail("the user configuration home must be a real bounded directory");
+    }
+    let current = home
+        .canonicalize()
+        .context("MCP setup cannot canonicalize the user configuration home")?;
+    ensure_real_child_directory(&current, ".depgraph-mcp-locks")
 }
 
 fn open_cache_lock(path: &Path) -> Result<File> {
@@ -1200,6 +1435,7 @@ impl AgentInputPaths {
 
     fn request<'a>(
         &'a self,
+        host: McpHost,
         binding: &'a Binding,
         release: &'a ReleaseMetadata,
         layout: &ArtifactLayout,
@@ -1213,7 +1449,7 @@ impl AgentInputPaths {
             trusted_release_evidence_sha256: release.trusted_evidence_sha256(layout)?,
             release_manifest: &self.release_manifest,
             compiler_pack_requirement: &self.compiler_pack_requirement,
-            format: AgentHostFormat::Codex,
+            format: host.agent_format(),
             profile: AgentHostCapabilityProfile::Read,
             acknowledge_privileged_effects: false,
             acknowledge_project_exec_human_confirmation: false,
@@ -1256,95 +1492,304 @@ fn run_safe_scan(core: &Path, release_root: &Path, config: &DepgraphServiceConfi
     Ok(())
 }
 
-fn codex_config_path(root: &Path) -> PathBuf {
-    root.join(".codex").join("config.toml")
+fn lifecycle_configuration(host: McpHost, server_name: &str, generated: &str) -> Result<String> {
+    if host.is_json() {
+        let mut value = parse_json(generated, "generated MCP configuration")?;
+        let entry = value
+            .as_object_mut()
+            .and_then(|root| root.get_mut("mcpServers"))
+            .and_then(JsonValue::as_object_mut)
+            .and_then(|servers| servers.remove("depgraph"))
+            .context("generated MCP configuration has no depgraph entry")?;
+        set_json_server_entry(&mut value, server_name, entry)?;
+        return serde_json::to_string_pretty(&value)
+            .context("generated MCP configuration rendering failed");
+    }
+    let mut document = parse_edit_toml(generated, "generated MCP configuration")?;
+    let mut entry = document
+        .get_mut("mcp_servers")
+        .and_then(TomlItem::as_table_like_mut)
+        .and_then(|servers| servers.remove("depgraph"))
+        .context("generated Grok MCP configuration has no depgraph entry")?;
+    if host == McpHost::Grok {
+        let table = entry
+            .as_table_like_mut()
+            .context("generated Grok MCP entry must be a TOML table")?;
+        table.remove("required");
+        table.remove("default_tools_approval_mode");
+    }
+    set_editable_server_entry(&mut document, server_name, entry)?;
+    Ok(document.to_string())
 }
 
-fn install_codex_configuration(
+fn install_host_configuration(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
     binding: &DepgraphServiceConfig,
     config_path: &Path,
     managed_cache_base: &Path,
     generated: &str,
 ) -> Result<bool> {
-    let generated_value = parse_toml(generated, "generated Codex MCP configuration")?;
-    let desired_value = depgraph_entry(&generated_value)?.clone();
-    let desired_item = editable_depgraph_entry(generated)?;
-    let existing_bytes = read_optional_bounded_config(config_path)?;
+    let _configuration_lock = HostConfigurationLock::acquire(host, scope, config_path)?;
+    if host.is_json() {
+        install_json_configuration(
+            host,
+            scope,
+            server_name,
+            binding,
+            config_path,
+            managed_cache_base,
+            generated,
+        )
+    } else {
+        install_toml_configuration(
+            host,
+            scope,
+            server_name,
+            binding,
+            config_path,
+            managed_cache_base,
+            generated,
+        )
+    }
+}
+
+fn install_toml_configuration(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
+    binding: &DepgraphServiceConfig,
+    config_path: &Path,
+    managed_cache_base: &Path,
+    generated: &str,
+) -> Result<bool> {
+    let generated_value = parse_toml(generated, "generated MCP configuration")?;
+    let desired_value = server_entry(&generated_value, server_name)?.clone();
+    let desired_item = editable_server_entry(generated, server_name)?;
+    let existing_bytes = read_optional_bounded_config(host, config_path)?;
     let existing = match &existing_bytes {
-        Some(bytes) => parse_toml_bytes(bytes, "existing Codex project configuration")?,
+        Some(bytes) => parse_toml_bytes(bytes, "existing project MCP configuration")?,
         None => toml::Value::Table(toml::Table::new()),
     };
-    if let Some(current) = checked_depgraph_entry(&existing)? {
+    if let Some(current) = checked_server_entry(&existing, server_name)? {
         if current == &desired_value {
             return Ok(false);
         }
-        if !entry_matches_binding(
+        if !toml_entry_matches_binding(
+            host,
             current,
             binding.canonical_root(),
             binding.store_path(),
             managed_cache_base,
         ) {
-            security_bail(
-                "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
-            )?;
+            return security_bail(&format!(
+                "the existing {} depgraph entry is not owned by this scoped MCP setup",
+                host.display_name()
+            ));
         }
     }
     let mut document = match &existing_bytes {
-        Some(bytes) => parse_edit_toml_bytes(bytes, "existing Codex project configuration")?,
+        Some(bytes) => parse_edit_toml_bytes(bytes, "existing project MCP configuration")?,
         None => DocumentMut::new(),
     };
-    set_editable_depgraph_entry(&mut document, desired_item)?;
+    set_editable_server_entry(&mut document, server_name, desired_item)?;
     let rendered = document.to_string();
     if !binding.repository_root_seal().matches_live_root() {
-        security_bail("repository root changed before Codex configuration update")?;
+        security_bail("repository root changed before MCP configuration update")?;
     }
-    ensure_codex_directory(binding.canonical_root())?;
-    atomic_write(config_path, rendered.as_bytes())?;
+    ensure_config_directory(host, scope, binding.canonical_root(), config_path)?;
+    atomic_write(host, config_path, rendered.as_bytes())?;
     if !binding.repository_root_seal().matches_live_root() {
-        security_bail("repository root changed after Codex configuration update")?;
+        security_bail("repository root changed after MCP configuration update")?;
     }
     Ok(true)
 }
 
-fn verify_codex_configuration(config_path: &Path, generated: &str) -> Result<()> {
-    let bytes = read_optional_bounded_config(config_path)?
-        .context("project-scoped .codex/config.toml is not installed")?;
-    let existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
-    let generated = parse_toml(generated, "generated Codex MCP configuration")?;
-    if checked_depgraph_entry(&existing)? != Some(depgraph_entry(&generated)?) {
+fn install_json_configuration(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
+    binding: &DepgraphServiceConfig,
+    config_path: &Path,
+    managed_cache_base: &Path,
+    generated: &str,
+) -> Result<bool> {
+    let generated_value = parse_json(generated, "generated MCP configuration")?;
+    let desired_value = json_server_entry(&generated_value, server_name)?.clone();
+    let existing_bytes = read_optional_bounded_config(host, config_path)?;
+    let mut existing = match &existing_bytes {
+        Some(bytes) => parse_json_bytes(bytes, "existing project MCP configuration")?,
+        None => JsonValue::Object(JsonMap::new()),
+    };
+    if let Some(current) = checked_json_server_entry(&existing, server_name)? {
+        if current == &desired_value {
+            return Ok(false);
+        }
+        if !json_entry_matches_binding(
+            current,
+            binding.canonical_root(),
+            binding.store_path(),
+            managed_cache_base,
+        ) {
+            return security_bail(&format!(
+                "the existing {} depgraph entry is not owned by this scoped MCP setup",
+                host.display_name()
+            ));
+        }
+    }
+    set_json_server_entry(&mut existing, server_name, desired_value)?;
+    let mut rendered = serde_json::to_vec_pretty(&existing)
+        .context("project MCP configuration rendering failed")?;
+    rendered.push(b'\n');
+    if !binding.repository_root_seal().matches_live_root() {
+        security_bail("repository root changed before MCP configuration update")?;
+    }
+    ensure_config_directory(host, scope, binding.canonical_root(), config_path)?;
+    atomic_write(host, config_path, &rendered)?;
+    if !binding.repository_root_seal().matches_live_root() {
+        security_bail("repository root changed after MCP configuration update")?;
+    }
+    Ok(true)
+}
+
+fn verify_host_configuration(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
+    config_path: &Path,
+    generated: &str,
+) -> Result<()> {
+    let bytes = read_optional_bounded_config(host, config_path)?.with_context(|| {
+        format!(
+            "{}-scoped {} configuration is not installed",
+            scope.as_str(),
+            config_path.display()
+        )
+    })?;
+    let matches = if host.is_json() {
+        let existing = parse_json_bytes(&bytes, "existing project MCP configuration")?;
+        let generated = parse_json(generated, "generated MCP configuration")?;
+        checked_json_server_entry(&existing, server_name)?
+            == Some(json_server_entry(&generated, server_name)?)
+    } else {
+        let existing = parse_toml_bytes(&bytes, "existing project MCP configuration")?;
+        let generated = parse_toml(generated, "generated MCP configuration")?;
+        checked_server_entry(&existing, server_name)?
+            == Some(server_entry(&generated, server_name)?)
+    };
+    if !matches {
         bail!(
-            "project-scoped Codex MCP entry differs from the verified binding; rerun `depgraph mcp update --host codex`"
+            "{}-scoped {} MCP entry differs from the verified binding; rerun `depgraph mcp update --host {} --scope {}`",
+            scope.as_str(),
+            host.display_name(),
+            host.as_str(),
+            scope.as_str()
         );
     }
     Ok(())
 }
 
-fn remove_codex_configuration(
+fn remove_host_configuration(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
+    binding: &DepgraphServiceConfig,
+    config_path: &Path,
+    managed_cache_base: &Path,
+) -> Result<bool> {
+    let _configuration_lock = HostConfigurationLock::acquire(host, scope, config_path)?;
+    if host.is_json() {
+        remove_json_configuration(
+            host,
+            server_name,
+            binding,
+            config_path,
+            binding.canonical_root(),
+            binding.store_path(),
+            managed_cache_base,
+        )
+    } else {
+        remove_toml_configuration(
+            host,
+            server_name,
+            binding,
+            config_path,
+            binding.canonical_root(),
+            binding.store_path(),
+            managed_cache_base,
+        )
+    }
+}
+
+fn remove_toml_configuration(
+    host: McpHost,
+    server_name: &str,
     binding: &DepgraphServiceConfig,
     config_path: &Path,
     expected_root: &Path,
     expected_store: &Path,
     managed_cache_base: &Path,
 ) -> Result<bool> {
-    let Some(bytes) = read_optional_bounded_config(config_path)? else {
+    let Some(bytes) = read_optional_bounded_config(host, config_path)? else {
         return Ok(false);
     };
-    let existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
-    let Some(entry) = checked_depgraph_entry(&existing)? else {
+    let existing = parse_toml_bytes(&bytes, "existing project MCP configuration")?;
+    let Some(entry) = checked_server_entry(&existing, server_name)? else {
         return Ok(false);
     };
-    if !entry_matches_binding(entry, expected_root, expected_store, managed_cache_base) {
-        security_bail(
-            "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
-        )?;
+    if !toml_entry_matches_binding(
+        host,
+        entry,
+        expected_root,
+        expected_store,
+        managed_cache_base,
+    ) {
+        return security_bail(&format!(
+            "the existing {} depgraph entry is not owned by this scoped MCP setup",
+            host.display_name()
+        ));
     }
-    let mut document = parse_edit_toml_bytes(&bytes, "existing Codex project configuration")?;
-    remove_editable_depgraph_entry(&mut document)?;
+    let mut document = parse_edit_toml_bytes(&bytes, "existing project MCP configuration")?;
+    remove_editable_server_entry(&mut document, server_name)?;
     let rendered = document.to_string();
     if !binding.repository_root_seal().matches_live_root() {
-        security_bail("repository root changed before Codex configuration removal")?;
+        security_bail("repository root changed before MCP configuration removal")?;
     }
-    atomic_write(config_path, rendered.as_bytes())?;
+    atomic_write(host, config_path, rendered.as_bytes())?;
+    Ok(true)
+}
+
+fn remove_json_configuration(
+    host: McpHost,
+    server_name: &str,
+    binding: &DepgraphServiceConfig,
+    config_path: &Path,
+    expected_root: &Path,
+    expected_store: &Path,
+    managed_cache_base: &Path,
+) -> Result<bool> {
+    let Some(bytes) = read_optional_bounded_config(host, config_path)? else {
+        return Ok(false);
+    };
+    let mut existing = parse_json_bytes(&bytes, "existing project MCP configuration")?;
+    let Some(entry) = checked_json_server_entry(&existing, server_name)? else {
+        return Ok(false);
+    };
+    if !json_entry_matches_binding(entry, expected_root, expected_store, managed_cache_base) {
+        return security_bail(&format!(
+            "the existing {} depgraph entry is not owned by this scoped MCP setup",
+            host.display_name()
+        ));
+    }
+    remove_json_server_entry(&mut existing, server_name)?;
+    let mut rendered = serde_json::to_vec_pretty(&existing)
+        .context("project MCP configuration rendering failed")?;
+    rendered.push(b'\n');
+    if !binding.repository_root_seal().matches_live_root() {
+        security_bail("repository root changed before MCP configuration removal")?;
+    }
+    atomic_write(host, config_path, &rendered)?;
     Ok(true)
 }
 
@@ -1356,6 +1801,16 @@ fn parse_toml_bytes(input: &[u8], description: &str) -> Result<toml::Value> {
     let input =
         std::str::from_utf8(input).with_context(|| format!("{description} is not UTF-8"))?;
     parse_toml(input, description)
+}
+
+fn parse_json(input: &str, description: &str) -> Result<JsonValue> {
+    serde_json::from_str(input).with_context(|| format!("{description} is invalid JSON"))
+}
+
+fn parse_json_bytes(input: &[u8], description: &str) -> Result<JsonValue> {
+    let input =
+        std::str::from_utf8(input).with_context(|| format!("{description} is not UTF-8"))?;
+    parse_json(input, description)
 }
 
 fn parse_edit_toml(input: &str, description: &str) -> Result<DocumentMut> {
@@ -1370,65 +1825,169 @@ fn parse_edit_toml_bytes(input: &[u8], description: &str) -> Result<DocumentMut>
     parse_edit_toml(input, description)
 }
 
-fn editable_depgraph_entry(generated: &str) -> Result<TomlItem> {
-    let document = parse_edit_toml(generated, "generated Codex MCP configuration")?;
+fn editable_server_entry(generated: &str, server_name: &str) -> Result<TomlItem> {
+    let document = parse_edit_toml(generated, "generated MCP configuration")?;
     let servers = document
         .get("mcp_servers")
         .and_then(TomlItem::as_table_like)
-        .context("generated Codex MCP configuration has no mcp_servers table")?;
+        .context("generated MCP configuration has no mcp_servers table")?;
     let mut entry = servers
-        .get("depgraph")
+        .get(server_name)
         .cloned()
-        .context("generated Codex MCP configuration has no depgraph entry")?;
+        .with_context(|| format!("generated MCP configuration has no {server_name} entry"))?;
     if let Some(table) = entry.as_table_mut() {
         table.set_position(None);
     }
     Ok(entry)
 }
 
-fn depgraph_entry(value: &toml::Value) -> Result<&toml::Value> {
-    checked_depgraph_entry(value)?
-        .context("generated Codex MCP configuration has no mcp_servers.depgraph table")
+fn server_entry<'a>(value: &'a toml::Value, server_name: &str) -> Result<&'a toml::Value> {
+    checked_server_entry(value, server_name)?.with_context(|| {
+        format!("generated MCP configuration has no mcp_servers.{server_name} table")
+    })
 }
 
-fn checked_depgraph_entry(value: &toml::Value) -> Result<Option<&toml::Value>> {
+fn checked_server_entry<'a>(
+    value: &'a toml::Value,
+    server_name: &str,
+) -> Result<Option<&'a toml::Value>> {
     let root = value
         .as_table()
-        .context("Codex project configuration root must be a TOML table")?;
+        .context("project MCP configuration root must be a TOML table")?;
     let Some(servers) = root.get("mcp_servers") else {
         return Ok(None);
     };
     let servers = servers
         .as_table()
-        .context("Codex mcp_servers must be a TOML table")?;
-    Ok(servers.get("depgraph"))
+        .context("project MCP mcp_servers must be a TOML table")?;
+    Ok(servers.get(server_name))
 }
 
-fn preflight_codex_ownership(
+fn json_server_entry<'a>(value: &'a JsonValue, server_name: &str) -> Result<&'a JsonValue> {
+    checked_json_server_entry(value, server_name)?.with_context(|| {
+        format!("generated MCP configuration has no mcpServers.{server_name} object")
+    })
+}
+
+fn checked_json_server_entry<'a>(
+    value: &'a JsonValue,
+    server_name: &str,
+) -> Result<Option<&'a JsonValue>> {
+    let root = value
+        .as_object()
+        .context("project MCP configuration root must be a JSON object")?;
+    let Some(servers) = root.get("mcpServers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_object()
+        .context("project MCP mcpServers must be a JSON object")?;
+    Ok(servers.get(server_name))
+}
+
+fn preflight_host_ownership(
+    host: McpHost,
+    scope: McpScope,
+    server_name: &str,
     binding: &DepgraphServiceConfig,
     managed_cache_base: &Path,
 ) -> Result<()> {
-    let path = codex_config_path(binding.canonical_root());
-    let Some(bytes) = read_optional_bounded_config(&path)? else {
+    let path = host.config_path(scope, binding.canonical_root())?;
+    let Some(bytes) = read_optional_bounded_config(host, &path)? else {
         return Ok(());
     };
-    let existing = parse_toml_bytes(&bytes, "existing Codex project configuration")?;
-    if let Some(entry) = checked_depgraph_entry(&existing)?
-        && !entry_matches_binding(
-            entry,
-            binding.canonical_root(),
-            binding.store_path(),
-            managed_cache_base,
-        )
-    {
-        security_bail(
-            "the existing Codex depgraph entry is not owned by this repository-scoped MCP setup",
-        )?;
+    let owned = if host.is_json() {
+        let existing = parse_json_bytes(&bytes, "existing project MCP configuration")?;
+        checked_json_server_entry(&existing, server_name)?.is_none_or(|entry| {
+            json_entry_matches_binding(
+                entry,
+                binding.canonical_root(),
+                binding.store_path(),
+                managed_cache_base,
+            )
+        })
+    } else {
+        let existing = parse_toml_bytes(&bytes, "existing project MCP configuration")?;
+        checked_server_entry(&existing, server_name)?.is_none_or(|entry| {
+            toml_entry_matches_binding(
+                host,
+                entry,
+                binding.canonical_root(),
+                binding.store_path(),
+                managed_cache_base,
+            )
+        })
+    };
+    if !owned {
+        return security_bail(&format!(
+            "the existing {} depgraph entry is not owned by this scoped MCP setup",
+            host.display_name()
+        ));
     }
     Ok(())
 }
 
-fn set_editable_depgraph_entry(document: &mut DocumentMut, entry: TomlItem) -> Result<()> {
+fn other_configuration_exists(
+    removed_host: McpHost,
+    removed_scope: McpScope,
+    binding: &DepgraphServiceConfig,
+    managed_cache_base: &Path,
+) -> Result<bool> {
+    let root = binding.canonical_root();
+    for scope in McpScope::ALL {
+        let server_name = scope.server_name(root)?;
+        for host in McpHost::ALL {
+            if host == removed_host && scope == removed_scope {
+                continue;
+            }
+            let path = host.config_path(scope, root)?;
+            let Some(bytes) = read_optional_bounded_config(host, &path)? else {
+                continue;
+            };
+            if configuration_contains_current_owned_binding(
+                host,
+                &bytes,
+                &server_name,
+                root,
+                binding.store_path(),
+                managed_cache_base,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn configuration_contains_current_owned_binding(
+    host: McpHost,
+    bytes: &[u8],
+    server_name: &str,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> Result<bool> {
+    if host.is_json() {
+        let existing = parse_json_bytes(bytes, "existing MCP configuration")?;
+        return Ok(
+            checked_json_server_entry(&existing, server_name)?.is_some_and(|entry| {
+                json_entry_matches_current_binding(entry, root, store, managed_cache_base)
+            }),
+        );
+    }
+    let existing = parse_toml_bytes(bytes, "existing MCP configuration")?;
+    Ok(
+        checked_server_entry(&existing, server_name)?.is_some_and(|entry| {
+            toml_entry_matches_current_binding(host, entry, root, store, managed_cache_base)
+        }),
+    )
+}
+
+fn set_editable_server_entry(
+    document: &mut DocumentMut,
+    server_name: &str,
+    entry: TomlItem,
+) -> Result<()> {
     let root = document.as_table_mut();
     let servers = root
         .entry("mcp_servers")
@@ -1438,45 +1997,108 @@ fn set_editable_depgraph_entry(document: &mut DocumentMut, entry: TomlItem) -> R
             TomlItem::Table(table)
         })
         .as_table_like_mut()
-        .context("Codex mcp_servers must be a TOML table")?;
-    servers.insert("depgraph", entry);
+        .context("project MCP mcp_servers must be a TOML table")?;
+    servers.insert(server_name, entry);
     Ok(())
 }
 
-fn remove_editable_depgraph_entry(document: &mut DocumentMut) -> Result<()> {
+fn remove_editable_server_entry(document: &mut DocumentMut, server_name: &str) -> Result<()> {
     let servers = document
         .get_mut("mcp_servers")
         .and_then(TomlItem::as_table_like_mut)
-        .context("Codex mcp_servers must be a TOML table")?;
-    servers.remove("depgraph");
+        .context("project MCP mcp_servers must be a TOML table")?;
+    servers.remove(server_name);
     Ok(())
 }
 
-fn entry_matches_binding(
+fn set_json_server_entry(value: &mut JsonValue, server_name: &str, entry: JsonValue) -> Result<()> {
+    let root = value
+        .as_object_mut()
+        .context("project MCP configuration root must be a JSON object")?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()))
+        .as_object_mut()
+        .context("project MCP mcpServers must be a JSON object")?;
+    servers.insert(server_name.to_owned(), entry);
+    Ok(())
+}
+
+fn remove_json_server_entry(value: &mut JsonValue, server_name: &str) -> Result<()> {
+    let servers = value
+        .as_object_mut()
+        .and_then(|root| root.get_mut("mcpServers"))
+        .and_then(JsonValue::as_object_mut)
+        .context("project MCP mcpServers must be a JSON object")?;
+    servers.remove(server_name);
+    Ok(())
+}
+
+fn toml_entry_matches_binding(
+    host: McpHost,
     entry: &toml::Value,
     root: &Path,
     store: &Path,
     managed_cache_base: &Path,
 ) -> bool {
+    toml_entry_matches_binding_version(host, entry, root, store, managed_cache_base, None)
+}
+
+fn toml_entry_matches_current_binding(
+    host: McpHost,
+    entry: &toml::Value,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    toml_entry_matches_binding_version(
+        host,
+        entry,
+        root,
+        store,
+        managed_cache_base,
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn toml_entry_matches_binding_version(
+    host: McpHost,
+    entry: &toml::Value,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+    required_version: Option<&str>,
+) -> bool {
     let Some(table) = entry.as_table() else {
         return false;
     };
-    const GENERATED_KEYS: [&str; 5] = [
+    const CODEX_KEYS: [&str; 5] = [
         "command",
         "args",
         "enabled",
         "required",
         "default_tools_approval_mode",
     ];
-    if table.len() != GENERATED_KEYS.len()
-        || !GENERATED_KEYS.iter().all(|key| table.contains_key(*key))
-        || table.get("enabled").and_then(toml::Value::as_bool) != Some(true)
-        || table.get("required").and_then(toml::Value::as_bool) != Some(true)
-        || table
-            .get("default_tools_approval_mode")
-            .and_then(toml::Value::as_str)
-            != Some("approve")
-    {
+    const GROK_KEYS: [&str; 3] = ["command", "args", "enabled"];
+    let policy_matches = match host {
+        McpHost::Codex => {
+            table.len() == CODEX_KEYS.len()
+                && CODEX_KEYS.iter().all(|key| table.contains_key(*key))
+                && table.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+                && table.get("required").and_then(toml::Value::as_bool) == Some(true)
+                && table
+                    .get("default_tools_approval_mode")
+                    .and_then(toml::Value::as_str)
+                    == Some("approve")
+        }
+        McpHost::Grok => {
+            table.len() == GROK_KEYS.len()
+                && GROK_KEYS.iter().all(|key| table.contains_key(*key))
+                && table.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+        }
+        McpHost::Claude | McpHost::Cursor => false,
+    };
+    if !policy_matches {
         return false;
     }
     let Some(command) = table.get("command").and_then(toml::Value::as_str) else {
@@ -1492,6 +2114,87 @@ fn entry_matches_binding(
     else {
         return false;
     };
+    launch_tuple_matches_binding(
+        command,
+        &arguments,
+        root,
+        store,
+        managed_cache_base,
+        required_version,
+    )
+}
+
+fn json_entry_matches_binding(
+    entry: &JsonValue,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    json_entry_matches_binding_version(entry, root, store, managed_cache_base, None)
+}
+
+fn json_entry_matches_current_binding(
+    entry: &JsonValue,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    json_entry_matches_binding_version(
+        entry,
+        root,
+        store,
+        managed_cache_base,
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn json_entry_matches_binding_version(
+    entry: &JsonValue,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+    required_version: Option<&str>,
+) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    const GENERATED_KEYS: [&str; 2] = ["command", "args"];
+    if object.len() != GENERATED_KEYS.len()
+        || !GENERATED_KEYS.iter().all(|key| object.contains_key(*key))
+    {
+        return false;
+    }
+    let Some(command) = object.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(arguments) = object.get("args").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    let Some(arguments) = arguments
+        .iter()
+        .map(JsonValue::as_str)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    launch_tuple_matches_binding(
+        command,
+        &arguments,
+        root,
+        store,
+        managed_cache_base,
+        required_version,
+    )
+}
+
+fn launch_tuple_matches_binding(
+    command: &str,
+    arguments: &[&str],
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+    required_version: Option<&str>,
+) -> bool {
     if arguments.len() != 10 {
         return false;
     }
@@ -1509,6 +2212,7 @@ fn entry_matches_binding(
             Path::new(command),
             Path::new(requirement),
             managed_cache_base,
+            required_version,
         )
 }
 
@@ -1516,14 +2220,20 @@ fn managed_launch_paths_match(
     command: &Path,
     requirement: &Path,
     managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
-    managed_launch_paths_match_under(command, requirement, managed_cache_base)
+    managed_launch_paths_match_under(command, requirement, managed_cache_base, required_version)
         || managed_cache_base
             .canonicalize()
             .ok()
             .is_some_and(|canonical| {
                 canonical != managed_cache_base
-                    && managed_launch_paths_match_under(command, requirement, &canonical)
+                    && managed_launch_paths_match_under(
+                        command,
+                        requirement,
+                        &canonical,
+                        required_version,
+                    )
             })
 }
 
@@ -1531,6 +2241,7 @@ fn managed_launch_paths_match_under(
     command: &Path,
     requirement: &Path,
     managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
     if !command.is_absolute() || !requirement.is_absolute() || !managed_cache_base.is_absolute() {
         return false;
@@ -1558,6 +2269,7 @@ fn managed_launch_paths_match_under(
     };
     if mcp != OsStr::new("mcp")
         || artifacts != OsStr::new("artifacts")
+        || required_version.is_some_and(|required| version != required)
         || compiler_pack_host_target() != Some(target)
     {
         return false;
@@ -1573,51 +2285,100 @@ fn managed_launch_paths_match_under(
         && requirement == layout.requirement_path()
 }
 
-fn ensure_codex_directory(root: &Path) -> Result<PathBuf> {
-    let path = root.join(".codex");
-    match fs::create_dir(&path) {
+fn ensure_config_directory(
+    host: McpHost,
+    scope: McpScope,
+    root: &Path,
+    config_path: &Path,
+) -> Result<PathBuf> {
+    let path = config_path
+        .parent()
+        .context("scoped MCP configuration has no parent")?;
+    if scope == McpScope::Project && path == root {
+        return Ok(root.to_path_buf());
+    }
+    match fs::create_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).context("cannot create project-scoped .codex directory"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot create {}-scoped {} configuration directory",
+                    scope.as_str(),
+                    host.display_name()
+                )
+            });
+        }
     }
-    let metadata = fs::symlink_metadata(&path)?;
+    let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        security_bail("project-scoped .codex must be a real directory")?;
+        return security_bail(&format!(
+            "{}-scoped {} configuration directory must be a real directory",
+            scope.as_str(),
+            host.display_name()
+        ));
     }
-    path.canonicalize()
-        .context("cannot canonicalize project-scoped .codex directory")
+    path.canonicalize().with_context(|| {
+        format!(
+            "cannot canonicalize {}-scoped {} configuration directory",
+            scope.as_str(),
+            host.display_name()
+        )
+    })
 }
 
-fn read_optional_bounded_config(path: &Path) -> Result<Option<Vec<u8>>> {
+fn read_optional_bounded_config(host: McpHost, path: &Path) -> Result<Option<Vec<u8>>> {
     if let Some(parent) = path.parent() {
         match fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                security_bail("project-scoped .codex must be a real directory")?;
+                return security_bail(&format!(
+                    "{} configuration directory must be a real directory",
+                    host.display_name()
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("cannot inspect project-scoped .codex"),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect {} configuration directory",
+                        host.display_name()
+                    )
+                });
+            }
         }
     }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("cannot inspect Codex project configuration"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect {} project configuration",
+                    host.display_name()
+                )
+            });
+        }
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || metadata.len() > MAX_CODEX_CONFIG_BYTES
+        || metadata.len() > MAX_HOST_CONFIG_BYTES
     {
-        security_bail("Codex project configuration must be a bounded regular non-symlink file")?;
+        return security_bail(&format!(
+            "{} project configuration must be a bounded regular non-symlink file",
+            host.display_name()
+        ));
     }
     Ok(Some(fs::read(path)?))
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+fn atomic_write(host: McpHost, path: &Path, contents: &[u8]) -> Result<()> {
     let permissions = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            security_bail("Codex project configuration cannot be atomically replaced")?;
-            unreachable!()
+            return security_bail(&format!(
+                "{} project configuration cannot be atomically replaced",
+                host.display_name()
+            ));
         }
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1625,7 +2386,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     };
     let parent = path
         .parent()
-        .context("Codex project configuration has no parent")?;
+        .context("project MCP configuration has no parent")?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".depgraph-mcp-config-");
     #[cfg(unix)]
@@ -1644,7 +2405,12 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .persist(path)
         .map(|_| ())
         .map_err(|error| error.error)
-        .context("cannot atomically replace Codex project configuration")
+        .with_context(|| {
+            format!(
+                "cannot atomically replace {} project configuration",
+                host.display_name()
+            )
+        })
 }
 
 struct RepositoryStateExclusion {
@@ -1746,6 +2512,7 @@ mod tests {
     }
 
     fn codex_entry(cache_base: &Path, root: &Path, store: &Path) -> String {
+        let binding = read_binding(root, store);
         let target = compiler_pack_host_target().unwrap();
         let layout = ArtifactLayout::new(cache_base, env!("CARGO_PKG_VERSION"), target).unwrap();
         let command = layout
@@ -1756,11 +2523,421 @@ mod tests {
             AgentHostFormat::Codex,
             AgentHostCapabilityProfile::Read,
             command.to_str().unwrap(),
-            root.to_str().unwrap(),
-            store.to_str().unwrap(),
+            binding.canonical_root().to_str().unwrap(),
+            binding.store_path().to_str().unwrap(),
             layout.requirement_path().to_str().unwrap(),
         )
         .unwrap()
+    }
+
+    fn host_entry(
+        host: McpHost,
+        scope: McpScope,
+        cache_base: &Path,
+        root: &Path,
+        store: &Path,
+    ) -> (String, String) {
+        host_entry_for_version(
+            host,
+            scope,
+            cache_base,
+            env!("CARGO_PKG_VERSION"),
+            root,
+            store,
+        )
+    }
+
+    fn host_entry_for_version(
+        host: McpHost,
+        scope: McpScope,
+        cache_base: &Path,
+        version: &str,
+        root: &Path,
+        store: &Path,
+    ) -> (String, String) {
+        let binding = read_binding(root, store);
+        let target = compiler_pack_host_target().unwrap();
+        let layout = ArtifactLayout::new(cache_base, version, target).unwrap();
+        let command = layout
+            .runtime_root()
+            .join("bin")
+            .join(executable_name("depgraph-mcp"));
+        let generated = depgraph_mcp_tools::render_agent_host_configuration(
+            host.agent_format(),
+            AgentHostCapabilityProfile::Read,
+            command.to_str().unwrap(),
+            binding.canonical_root().to_str().unwrap(),
+            binding.store_path().to_str().unwrap(),
+            layout.requirement_path().to_str().unwrap(),
+        )
+        .unwrap();
+        let server_name = scope.server_name(binding.canonical_root()).unwrap();
+        let configuration = lifecycle_configuration(host, &server_name, &generated).unwrap();
+        (server_name, configuration)
+    }
+
+    #[test]
+    fn host_scope_paths_and_user_server_names_are_deterministic() {
+        let repository = git_repository();
+        let root = repository.path().canonicalize().unwrap();
+        assert_eq!(
+            McpHost::Codex
+                .config_path(McpScope::Project, &root)
+                .unwrap(),
+            root.join(".codex/config.toml")
+        );
+        assert_eq!(
+            McpHost::Claude
+                .config_path(McpScope::Project, &root)
+                .unwrap(),
+            root.join(".mcp.json")
+        );
+        assert_eq!(
+            McpHost::Cursor
+                .config_path(McpScope::Project, &root)
+                .unwrap(),
+            root.join(".cursor/mcp.json")
+        );
+        assert_eq!(
+            McpHost::Grok.config_path(McpScope::Project, &root).unwrap(),
+            root.join(".grok/config.toml")
+        );
+
+        let home = McpScope::User.configuration_root(&root).unwrap();
+        for (host, expected) in [
+            (McpHost::Codex, home.join(".codex/config.toml")),
+            (McpHost::Claude, home.join(".claude.json")),
+            (McpHost::Cursor, home.join(".cursor/mcp.json")),
+            (McpHost::Grok, home.join(".grok/config.toml")),
+        ] {
+            assert_eq!(host.config_path(McpScope::User, &root).unwrap(), expected);
+        }
+        let first = McpScope::User.server_name(&root).unwrap();
+        assert!(first.starts_with("depgraph-"));
+        assert_eq!(first.len(), "depgraph-".len() + 16);
+        assert_eq!(first, McpScope::User.server_name(&root).unwrap());
+        let other = git_repository();
+        assert_ne!(
+            first,
+            McpScope::User
+                .server_name(&other.path().canonicalize().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn claude_cursor_and_grok_project_configuration_lifecycle_is_safe_and_idempotent() {
+        for host in [McpHost::Claude, McpHost::Cursor, McpHost::Grok] {
+            let repository = git_repository();
+            let state = tempfile::tempdir().unwrap();
+            let store = state.path().join("graph.db");
+            let binding = read_binding(repository.path(), &store);
+            let path = host
+                .config_path(McpScope::Project, repository.path())
+                .unwrap();
+            if let Some(parent) = path.parent()
+                && parent != repository.path()
+            {
+                fs::create_dir(parent).unwrap();
+            }
+            if host.is_json() {
+                fs::write(
+                    &path,
+                    br#"{"keep":"unchanged","mcpServers":{"other":{"command":"other","args":[]}}}"#,
+                )
+                .unwrap();
+            } else {
+                fs::write(
+                    &path,
+                    "# keep Grok settings\ntheme = \"dark\"\n\n[mcp_servers.other]\ncommand = \"other\"\nargs = []\n",
+                )
+                .unwrap();
+            }
+            let (server_name, generated) = host_entry(
+                host,
+                McpScope::Project,
+                state.path(),
+                repository.path(),
+                &store,
+            );
+
+            assert!(
+                install_host_configuration(
+                    host,
+                    McpScope::Project,
+                    &server_name,
+                    &binding,
+                    &path,
+                    state.path(),
+                    &generated,
+                )
+                .unwrap()
+            );
+            assert!(
+                !install_host_configuration(
+                    host,
+                    McpScope::Project,
+                    &server_name,
+                    &binding,
+                    &path,
+                    state.path(),
+                    &generated,
+                )
+                .unwrap()
+            );
+            verify_host_configuration(host, McpScope::Project, &server_name, &path, &generated)
+                .unwrap();
+
+            if host.is_json() {
+                let value = parse_json_bytes(&fs::read(&path).unwrap(), "fixture").unwrap();
+                assert_eq!(value["keep"], "unchanged");
+                assert_eq!(value["mcpServers"]["other"]["command"], "other");
+                assert_eq!(
+                    value["mcpServers"][&server_name].as_object().unwrap().len(),
+                    2
+                );
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("# keep Grok settings"));
+                let value = parse_toml_bytes(&bytes, "fixture").unwrap();
+                assert_eq!(value["theme"].as_str(), Some("dark"));
+                assert_eq!(
+                    value["mcp_servers"]["other"]["command"].as_str(),
+                    Some("other")
+                );
+                assert_eq!(
+                    value["mcp_servers"][&server_name].as_table().unwrap().len(),
+                    3
+                );
+            }
+
+            assert!(
+                remove_host_configuration(
+                    host,
+                    McpScope::Project,
+                    &server_name,
+                    &binding,
+                    &path,
+                    state.path(),
+                )
+                .unwrap()
+            );
+            if host.is_json() {
+                let value = parse_json_bytes(&fs::read(&path).unwrap(), "fixture").unwrap();
+                assert!(
+                    checked_json_server_entry(&value, &server_name)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(value["mcpServers"]["other"]["command"], "other");
+            } else {
+                let value = parse_toml_bytes(&fs::read(&path).unwrap(), "fixture").unwrap();
+                assert!(
+                    checked_server_entry(&value, &server_name)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    value["mcp_servers"]["other"]["command"].as_str(),
+                    Some("other")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_scope_keeps_repository_specific_entries_side_by_side() {
+        for host in McpHost::ALL {
+            let configuration_home = tempfile::tempdir().unwrap();
+            let config_path = match host {
+                McpHost::Codex => configuration_home.path().join(".codex/config.toml"),
+                McpHost::Claude => configuration_home.path().join(".claude.json"),
+                McpHost::Cursor => configuration_home.path().join(".cursor/mcp.json"),
+                McpHost::Grok => configuration_home.path().join(".grok/config.toml"),
+            };
+            let cache = tempfile::tempdir().unwrap();
+            let first_repository = git_repository();
+            let second_repository = git_repository();
+            let first_store = cache.path().join("first.db");
+            let second_store = cache.path().join("second.db");
+            let first_binding = read_binding(first_repository.path(), &first_store);
+            let second_binding = read_binding(second_repository.path(), &second_store);
+            let (first_name, first_configuration) = host_entry(
+                host,
+                McpScope::User,
+                cache.path(),
+                first_repository.path(),
+                &first_store,
+            );
+            let (second_name, second_configuration) = host_entry(
+                host,
+                McpScope::User,
+                cache.path(),
+                second_repository.path(),
+                &second_store,
+            );
+            assert_ne!(first_name, second_name);
+
+            assert!(
+                install_host_configuration(
+                    host,
+                    McpScope::User,
+                    &first_name,
+                    &first_binding,
+                    &config_path,
+                    cache.path(),
+                    &first_configuration,
+                )
+                .unwrap()
+            );
+            assert!(
+                install_host_configuration(
+                    host,
+                    McpScope::User,
+                    &second_name,
+                    &second_binding,
+                    &config_path,
+                    cache.path(),
+                    &second_configuration,
+                )
+                .unwrap()
+            );
+            verify_host_configuration(
+                host,
+                McpScope::User,
+                &first_name,
+                &config_path,
+                &first_configuration,
+            )
+            .unwrap();
+            verify_host_configuration(
+                host,
+                McpScope::User,
+                &second_name,
+                &config_path,
+                &second_configuration,
+            )
+            .unwrap();
+
+            assert!(
+                remove_host_configuration(
+                    host,
+                    McpScope::User,
+                    &first_name,
+                    &first_binding,
+                    &config_path,
+                    cache.path(),
+                )
+                .unwrap()
+            );
+            verify_host_configuration(
+                host,
+                McpScope::User,
+                &second_name,
+                &config_path,
+                &second_configuration,
+            )
+            .unwrap();
+            let first_absent = if host.is_json() {
+                let value = parse_json_bytes(&fs::read(&config_path).unwrap(), "fixture").unwrap();
+                checked_json_server_entry(&value, &first_name)
+                    .unwrap()
+                    .is_none()
+            } else {
+                let value = parse_toml_bytes(&fs::read(&config_path).unwrap(), "fixture").unwrap();
+                checked_server_entry(&value, &first_name).unwrap().is_none()
+            };
+            assert!(first_absent);
+        }
+    }
+
+    #[test]
+    fn state_retention_requires_a_current_owned_launch_tuple() {
+        for host in McpHost::ALL {
+            let repository = git_repository();
+            let cache = tempfile::tempdir().unwrap();
+            let store = cache.path().join("graph.db");
+            let binding = read_binding(repository.path(), &store);
+            let (server_name, configuration) = host_entry(
+                host,
+                McpScope::Project,
+                cache.path(),
+                binding.canonical_root(),
+                binding.store_path(),
+            );
+            assert!(
+                configuration_contains_current_owned_binding(
+                    host,
+                    configuration.as_bytes(),
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
+
+            let (_, stale_configuration) = host_entry_for_version(
+                host,
+                McpScope::Project,
+                cache.path(),
+                "0.0.0",
+                binding.canonical_root(),
+                binding.store_path(),
+            );
+            let stale_is_owned = if host.is_json() {
+                let value = parse_json(&stale_configuration, "fixture").unwrap();
+                json_entry_matches_binding(
+                    json_server_entry(&value, &server_name).unwrap(),
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+            } else {
+                let value = parse_toml(&stale_configuration, "fixture").unwrap();
+                toml_entry_matches_binding(
+                    host,
+                    server_entry(&value, &server_name).unwrap(),
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+            };
+            assert!(stale_is_owned);
+            assert!(
+                !configuration_contains_current_owned_binding(
+                    host,
+                    stale_configuration.as_bytes(),
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
+
+            let tampered = if host.is_json() {
+                let mut value = parse_json(&configuration, "fixture").unwrap();
+                value["mcpServers"][&server_name]["command"] = JsonValue::String("other".into());
+                serde_json::to_vec(&value).unwrap()
+            } else {
+                let mut value = parse_toml(&configuration, "fixture").unwrap();
+                value["mcp_servers"][&server_name]["command"] = toml::Value::String("other".into());
+                toml::to_string(&value).unwrap().into_bytes()
+            };
+            assert!(
+                !configuration_contains_current_owned_binding(
+                    host,
+                    &tampered,
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1812,6 +2989,24 @@ mod tests {
         assert!(CacheLock::acquire(cache.path()).is_err());
         drop(lock);
         CacheLock::acquire(cache.path()).unwrap();
+    }
+
+    #[test]
+    fn host_configuration_lock_serializes_a_shared_user_file() {
+        let configuration_home = tempfile::tempdir().unwrap();
+        let shared = configuration_home.path().join(".cursor/mcp.json");
+        let other = configuration_home.path().join(".claude.json");
+
+        let lock = HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared)
+            .unwrap()
+            .unwrap();
+        let error =
+            HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared).unwrap_err();
+        assert!(error.to_string().contains("Agent host configuration"));
+        HostConfigurationLock::acquire(McpHost::Claude, McpScope::User, &other).unwrap();
+
+        drop(lock);
+        HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared).unwrap();
     }
 
     #[test]
@@ -1949,9 +3144,38 @@ mod tests {
         fs::write(&path, original).unwrap();
         let generated = codex_entry(state.path(), repository.path(), &store);
 
-        assert!(install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
-        assert!(!install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
-        verify_codex_configuration(&path, &generated).unwrap();
+        assert!(
+            install_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+                &generated,
+            )
+            .unwrap()
+        );
+        assert!(
+            !install_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+                &generated,
+            )
+            .unwrap()
+        );
+        verify_host_configuration(
+            McpHost::Codex,
+            McpScope::Project,
+            "depgraph",
+            &path,
+            &generated,
+        )
+        .unwrap();
         let merged_bytes = fs::read(&path).unwrap();
         let merged_text = std::str::from_utf8(&merged_bytes).unwrap();
         for preserved in [
@@ -1970,8 +3194,15 @@ mod tests {
         );
 
         assert!(
-            remove_codex_configuration(&binding, &path, repository.path(), &store, state.path(),)
-                .unwrap()
+            remove_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+            )
+            .unwrap()
         );
         let removed_bytes = fs::read(&path).unwrap();
         let removed_text = std::str::from_utf8(&removed_bytes).unwrap();
@@ -1984,7 +3215,11 @@ mod tests {
             assert!(removed_text.contains(preserved), "missing {preserved}");
         }
         let removed = parse_toml_bytes(&removed_bytes, "fixture").unwrap();
-        assert!(checked_depgraph_entry(&removed).unwrap().is_none());
+        assert!(
+            checked_server_entry(&removed, "depgraph")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(removed["model"].as_str(), Some("gpt-5"));
         assert_eq!(
             removed["mcp_servers"]["other"]["command"].as_str(),
@@ -2005,7 +3240,10 @@ mod tests {
         let existing = codex_entry(state.path(), repository.path(), &other_store);
         fs::write(&path, &existing).unwrap();
 
-        let error = install_codex_configuration(
+        let error = install_host_configuration(
+            McpHost::Codex,
+            McpScope::Project,
+            "depgraph",
             &binding,
             &path,
             state.path(),
@@ -2073,16 +3311,25 @@ mod tests {
             let existing = toml::to_string(&modified).unwrap();
             fs::write(&path, &existing).unwrap();
 
-            let install_error =
-                install_codex_configuration(&binding, &path, state.path(), &desired).unwrap_err();
+            let install_error = install_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+                &desired,
+            )
+            .unwrap_err();
             assert!(install_error.to_string().contains("is not owned"));
             assert_eq!(fs::read_to_string(&path).unwrap(), existing);
 
-            let remove_error = remove_codex_configuration(
+            let remove_error = remove_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
                 &binding,
                 &path,
-                repository.path(),
-                &store,
                 state.path(),
             )
             .unwrap_err();
@@ -2104,8 +3351,26 @@ mod tests {
         fs::write(&path, original).unwrap();
         let generated = codex_entry(state.path(), repository.path(), &store);
 
-        assert!(install_codex_configuration(&binding, &path, state.path(), &generated).unwrap());
-        verify_codex_configuration(&path, &generated).unwrap();
+        assert!(
+            install_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+                &generated,
+            )
+            .unwrap()
+        );
+        verify_host_configuration(
+            McpHost::Codex,
+            McpScope::Project,
+            "depgraph",
+            &path,
+            &generated,
+        )
+        .unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
@@ -2113,8 +3378,15 @@ mod tests {
         );
 
         assert!(
-            remove_codex_configuration(&binding, &path, repository.path(), &store, state.path(),)
-                .unwrap()
+            remove_host_configuration(
+                McpHost::Codex,
+                McpScope::Project,
+                "depgraph",
+                &binding,
+                &path,
+                state.path(),
+            )
+            .unwrap()
         );
         let removed = fs::read_to_string(&path).unwrap();
         assert!(removed.contains("# keep inline server table"));
@@ -2135,13 +3407,41 @@ mod tests {
         let outside_config = outside.path().join("config.toml");
         fs::write(&outside_config, "secret = \"unchanged\"\n").unwrap();
         symlink(outside.path(), repository.path().join(".codex")).unwrap();
-        let error =
-            read_optional_bounded_config(&codex_config_path(repository.path())).unwrap_err();
+        let error = read_optional_bounded_config(
+            McpHost::Codex,
+            &McpHost::Codex
+                .config_path(McpScope::Project, repository.path())
+                .unwrap(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("real directory"));
         assert_eq!(
             fs::read_to_string(outside_config).unwrap(),
             "secret = \"unchanged\"\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_claude_cursor_and_grok_configs_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        for host in [McpHost::Claude, McpHost::Cursor, McpHost::Grok] {
+            let repository = git_repository();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_config = outside.path().join("config");
+            fs::write(&outside_config, b"unchanged").unwrap();
+            let path = host
+                .config_path(McpScope::Project, repository.path())
+                .unwrap();
+            if host == McpHost::Claude {
+                symlink(&outside_config, &path).unwrap();
+            } else {
+                symlink(outside.path(), path.parent().unwrap()).unwrap();
+            }
+            assert!(read_optional_bounded_config(host, &path).is_err());
+            assert_eq!(fs::read(&outside_config).unwrap(), b"unchanged");
+        }
     }
 
     #[test]
@@ -2197,6 +3497,8 @@ mod tests {
         let setup = acquire_repository_lifecycle_exclusion(&binding).unwrap();
 
         let result = uninstall(&McpWorkflowRequest {
+            host: McpHost::Codex,
+            scope: McpScope::Project,
             requested_root: repository.path().to_path_buf(),
             explicit_store: Some(store.clone()),
         });
@@ -2221,6 +3523,8 @@ mod tests {
         let writer = acquire_store_writer_lock(&store).unwrap();
 
         let result = uninstall(&McpWorkflowRequest {
+            host: McpHost::Codex,
+            scope: McpScope::Project,
             requested_root: repository.path().to_path_buf(),
             explicit_store: Some(store.clone()),
         });

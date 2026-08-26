@@ -6340,23 +6340,32 @@ fn mcp_setup_rejects_a_non_repository_before_network_or_state_changes() {
     let root = tempfile::tempdir().unwrap();
     let default_store = depgraph_core::default_store_path(root.path()).unwrap();
 
-    Command::cargo_bin("depgraph")
-        .unwrap()
-        .env("PATH", "")
-        .args([
-            "mcp",
-            "setup",
-            "--host",
-            "codex",
-            "--root",
-            root.path().to_str().unwrap(),
-        ])
-        .assert()
-        .code(4)
-        .stderr(predicate::str::contains(
-            "requires a directory inside a Git repository",
-        ));
+    for host in ["codex", "claude", "cursor", "grok"] {
+        for scope in ["project", "user"] {
+            Command::cargo_bin("depgraph")
+                .unwrap()
+                .env("PATH", "")
+                .args([
+                    "mcp",
+                    "setup",
+                    "--host",
+                    host,
+                    "--scope",
+                    scope,
+                    "--root",
+                    root.path().to_str().unwrap(),
+                ])
+                .assert()
+                .code(4)
+                .stderr(predicate::str::contains(
+                    "requires a directory inside a Git repository",
+                ));
+        }
+    }
 
     assert!(!root.path().join(".codex").exists());
+    assert!(!root.path().join(".mcp.json").exists());
+    assert!(!root.path().join(".cursor").exists());
+    assert!(!root.path().join(".grok").exists());
     assert!(!default_store.exists());
 }

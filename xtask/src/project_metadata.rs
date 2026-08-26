@@ -1966,6 +1966,11 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "trusted_evidence_sha256",
         "scripts/release-post-publish-canary.sh",
         "post-publish/canary",
+        "for host in claude cursor grok",
+        "for host in codex claude cursor grok",
+        "--scope user --root",
+        "server name: depgraph-",
+        "repository state was retained",
     ] {
         if !release_workflow.contains(required) {
             bail!("release workflow is missing {required:?}");

@@ -547,7 +547,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Exercise clean repository-scoped MCP onboarding
+      - name: Exercise clean scoped MCP onboarding
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -561,8 +561,9 @@ jobs:
           archive="${package}.${DEPGRAPH_E2E_EXTENSION}"
           release_root="${RUNNER_TEMP}/depgraph-mcp-release"
           repository="${RUNNER_TEMP}/depgraph-mcp-repository"
+          other_repository="${RUNNER_TEMP}/depgraph-mcp-other-repository"
           test_home="${RUNNER_TEMP}/depgraph-mcp-home"
-          mkdir -p "$release_root" "$repository/src" "$test_home/cache" "$test_home/local"
+          mkdir -p "$release_root" "$repository/src" "$other_repository/src" "$test_home/cache" "$test_home/local"
           gh release download "$GITHUB_REF_NAME" --pattern "$archive" --dir "$release_root"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             DEPGRAPH_ARCHIVE_PATH="$release_root/$archive" \
@@ -577,6 +578,8 @@ jobs:
 
           git init --quiet --initial-branch=main "$repository"
           printf 'export const answer = 42;\n' > "$repository/src/index.ts"
+          git init --quiet --initial-branch=main "$other_repository"
+          printf 'export const answer = 43;\n' > "$other_repository/src/index.ts"
           export HOME="$test_home"
           export XDG_CACHE_HOME="$test_home/cache"
           export LOCALAPPDATA="$test_home/local"
@@ -595,10 +598,62 @@ jobs:
           grep -Fq '(unchanged)' <<<"$second"
 
           "$binary" mcp status --host codex --root "$repository"
+
+          for host in claude cursor grok; do
+            project_setup="$("$binary" mcp setup --host "$host" --root "$repository")"
+            printf '%s\n' "$project_setup"
+            grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$project_setup"
+            grep -Fq 'server name: depgraph' <<<"$project_setup"
+            "$binary" mcp status --host "$host" --root "$repository"
+          done
+
+          for host in codex claude cursor grok; do
+            user_setup="$("$binary" mcp setup --host "$host" --scope user --root "$repository")"
+            printf '%s\n' "$user_setup"
+            grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$user_setup"
+            user_server_line="$(grep -E '^server name: depgraph-[0-9a-f]{16}$' <<<"$user_setup")"
+            user_setup_repeat="$("$binary" mcp setup --host "$host" --scope user --root "$repository")"
+            repeat_user_server_line="$(grep -E '^server name: depgraph-[0-9a-f]{16}$' <<<"$user_setup_repeat")"
+            test "$user_server_line" = "$repeat_user_server_line"
+            if [[ "$host" == "codex" ]]; then
+              repository_user_server_line="$user_server_line"
+            fi
+            "$binary" mcp status --host "$host" --scope user --root "$repository"
+          done
+
+          other_user_setup="$("$binary" mcp setup --host codex --scope user --root "$other_repository")"
+          printf '%s\n' "$other_user_setup"
+          grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$other_user_setup"
+          other_user_server_line="$(grep -E '^server name: depgraph-[0-9a-f]{16}$' <<<"$other_user_setup")"
+          test "$repository_user_server_line" != "$other_user_server_line"
+          "$binary" mcp status --host codex --scope user --root "$other_repository"
+
+          other_removed="$("$binary" mcp uninstall --host codex --scope user --root "$other_repository")"
+          printf '%s\n' "$other_removed"
+          grep -Eq '^repository state files removed: [1-9][0-9]*$' <<<"$other_removed"
+          if "$binary" mcp status --host codex --scope user --root "$other_repository"; then
+            echo 'status unexpectedly succeeded after other repository state removal' >&2
+            exit 1
+          fi
+
           update="$("$binary" mcp update --host codex --root "$repository")"
           printf '%s\n' "$update"
           grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$update"
-          "$binary" mcp uninstall --host codex --root "$repository"
+
+          for host in claude cursor grok; do
+            removed="$("$binary" mcp uninstall --host "$host" --root "$repository")"
+            grep -Fq 'repository state was retained' <<<"$removed"
+            "$binary" mcp status --host codex --root "$repository"
+          done
+          for host in codex claude cursor grok; do
+            removed="$("$binary" mcp uninstall --host "$host" --scope user --root "$repository")"
+            grep -Fq 'repository state was retained' <<<"$removed"
+            "$binary" mcp status --host codex --root "$repository"
+          done
+
+          final_removed="$("$binary" mcp uninstall --host codex --root "$repository")"
+          printf '%s\n' "$final_removed"
+          grep -Eq '^repository state files removed: [1-9][0-9]*$' <<<"$final_removed"
           if grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"; then
             echo 'uninstall retained the repository-scoped depgraph entry' >&2
             exit 1

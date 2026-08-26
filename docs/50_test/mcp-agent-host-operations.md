@@ -6,18 +6,29 @@ stdio server. Start with the read-only example in the
 profile below only when its effects are required; do not register several
 profiles for the same repository as an accidental privilege fallback.
 
-## Repository-scoped Codex onboarding
+## Scoped Agent host onboarding
 
-For the read-only Codex default, use the released CLI from inside the target
-Git repository:
+The lifecycle command supports Codex, Claude Code, Cursor, and Grok. Run it
+from inside the target Git repository:
 
 ```sh
 depgraph mcp setup --host codex
 ```
 
-This is the only workflow in this runbook that owns a host-file mutation. It
-must complete the following sequence before atomically replacing
-`.codex/config.toml`:
+`--host` accepts `codex`, `claude`, `cursor`, and `grok`. The default
+`--scope project` writes the host's repository configuration. `--scope user`
+writes its user configuration.
+
+| Host | Project scope | User scope |
+|---|---|---|
+| Codex | `.codex/config.toml` | `~/.codex/config.toml` |
+| Claude Code | `.mcp.json` | `~/.claude.json` |
+| Cursor | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+| Grok | `.grok/config.toml` | `~/.grok/config.toml` |
+
+This lifecycle is the only workflow in this runbook that owns a host-file
+mutation. It must complete the following sequence before atomically replacing
+the selected configuration:
 
 1. Resolve the nearest canonical Git root and reject an invalid worktree
    marker, ambiguous symlink, home directory, or filesystem root before any
@@ -36,17 +47,22 @@ must complete the following sequence before atomically replacing
    the checkout, run only the default safe scan, and require
    `project_code_executed: false` plus a current completed root-bound snapshot.
 6. Run the package preflight again through `initialize`, `tools/list`, and
-   `get_context`, then merge the exact read-only entry. No shell expansion,
-   ambient executable lookup, mutation capability, or project-exec capability
-   is installed.
+   `get_context`, then merge the exact read-only entry. Project scope names the
+   server `depgraph`. User scope uses a deterministic
+   `depgraph-<repository-id>` name so repository bindings do not replace each
+   other. No shell expansion, ambient executable lookup, mutation capability,
+   or project-exec capability is installed.
 
 Setup is idempotent. A process-held cache file lock serializes setup/update,
 does not become stale after termination, and leaves incomplete download and
 extraction staging invisible. Repeating setup revalidates the public identity
-and cached bytes, reuses a valid snapshot, and leaves an exact existing Codex
-entry unchanged. Two repositories share only the verified version/target
-runtime and compiler pack; their root, Store, journal, and project config stay
-separate.
+and cached bytes, reuses a valid snapshot, and leaves an exact existing host
+entry unchanged. A path-keyed host configuration lock under the canonical user
+home's `.depgraph-mcp-locks` directory is shared across repositories and CLI
+versions. It covers each read/merge/write or read/remove/write sequence, so
+concurrent user-scope commands cannot overwrite another repository's entry. Two
+repositories otherwise share only the verified version/target runtime and
+compiler pack; their root, Store, journal, and scoped entries stay separate.
 
 Operate the binding with:
 
@@ -56,31 +72,38 @@ depgraph mcp update --host codex
 depgraph mcp uninstall --host codex
 ```
 
+For a user-scoped binding, repeat `--scope user` on `status`, `update`, and
+`uninstall`. Omitting it selects project scope and therefore a different entry.
+
 `status` is non-repairing: it re-fetches official metadata and verifies the
 cached asset/evidence chain, extracted package, fixed Store/current snapshot,
-exact Codex entry, and MCP connection. `update` performs the same reconciliation
+exact scoped entry, and MCP connection. `update` performs the same reconciliation
 as setup for the invoking CLI version and always refreshes the safe snapshot.
 Setup, update, and uninstall hold the same repository lifecycle lock in the
 validated Git metadata directory through the host configuration mutation, so
-setup cannot publish a binding after concurrent cleanup. `uninstall` first
+setup cannot publish a binding after concurrent cleanup. Configuration mutation
+also requires the shared path-keyed lock described above. `uninstall` first
 confirms that the installed entry is the exact generated read-only launch tuple
 under the managed artifact cache, then always acquires the durable-operation
 runner exclusion followed by the Store writer exclusion. It fails before
-changing the host file while another lifecycle command, runner, scan, daemon,
-or Store writer is active. The operation runner acquires its exclusion before
-its first journal open. Missing state directories and persistent lock sentinels
-are created first, closing the race before initial Store or journal creation.
-With both state guards held, it
-removes only that table from the format-preserving TOML document and deletes
-the exact Store/journal/SQLite/daemon sidecar family. Empty writer and runner
-lock sentinels remain in place so cleanup never unlinks a coordination inode;
-the shared artifact cache is retained. A custom global `--store` must be absolute, outside the
-repository, and repeated before `mcp` for setup, status, update, and uninstall.
+changing the host file while another lifecycle command, conflicting host-file
+mutation, runner, scan, daemon, or Store writer is active. The operation runner
+acquires its exclusion before its first journal open. Missing state directories
+and persistent lock sentinels are created first, closing the race before initial
+Store or journal creation. With both state guards held, it removes only that
+host/scope entry. State remains only when another entry has the complete owned
+launch tuple for the same root and Store and the invoking CLI version and host
+target. A past-release or same-named unrelated entry does not count. Removing
+the last current owned entry deletes the exact Store/journal/SQLite/daemon
+sidecar family. Empty writer and runner lock sentinels remain in place so
+cleanup never unlinks a coordination inode; the shared artifact cache is
+retained. A custom global `--store` must be absolute, outside the repository,
+and repeated before `mcp` for setup, status, update, and uninstall.
 
-The stable release workflow runs this complete setup, repeated setup, status,
-update, and uninstall sequence in clean temporary homes on macOS arm64/x86_64,
-Linux arm64/x86_64, and Windows x86_64 after the public post-publish evidence is
-available.
+The stable release workflow exercises every supported host in project and user
+scope in clean temporary homes on macOS arm64/x86_64, Linux arm64/x86_64, and
+Windows x86_64 after the public post-publish evidence is available. It also
+runs repeated setup, status, update, shared-state retention, and final cleanup.
 
 ## Fixed trust boundary
 
@@ -449,8 +472,9 @@ an older package or copy individual SQLite tables between versions.
 | `mcp setup` rejects the root before downloading | Run inside a real Git worktree or pass `--root` to one. Do not use home/filesystem roots, symlinked `.git` markers, or malformed worktree pointers. Correct the root rather than bypassing validation. |
 | The exact stable release or one of six setup assets is unavailable | Confirm that the invoking `depgraph --version` has a published non-prerelease GitHub Release with post-publish evidence and a compiler pack for this native target. Upgrade to a published stable CLI; do not substitute a nightly/local archive. |
 | Setup was interrupted or the cache failed verification | Rerun the same setup command. Unlocked stale lock files are reusable; partial temporary downloads/extractions are ignored. A digest, evidence, or package-closure mismatch must be repaired with the official release, never by editing cached metadata. |
-| `mcp status` reports drift or no current snapshot | Run `depgraph mcp update --host codex` with the same root and optional global Store. It revalidates artifacts/config and refreshes only the safe snapshot. |
-| Setup/status succeeds but Codex has no depgraph tools | Mark the checkout trusted so Codex loads project-scoped `.codex/config.toml`, then restart Codex. Inspect the exact file reported by setup; do not copy the entry to an unrelated repository. |
+| `mcp status` reports drift or no current snapshot | Run `depgraph mcp update` with the same `--host`, `--scope`, root, and optional global Store. It revalidates artifacts/config and refreshes only the safe snapshot. |
+| Setup/status succeeds but the host has no depgraph tools | Restart or refresh the selected host and inspect the exact configuration path and server name reported by setup. For project-scoped Claude Code, trust the checkout when prompted. Do not copy a repository-bound entry to another root. |
+| `status` cannot find a user-scoped entry | Repeat `--scope user`. User scope uses `depgraph-<repository-id>` in the host's user configuration; omitting the option checks the project-scoped `depgraph` entry instead. |
 | Server exits before initialize | Confirm every path is absolute, root exists, store is fixed to that root, at least `read` is granted, capability dependencies are complete, and the compiler-pack requirement is regular and release-compatible. |
 | A privileged tool is absent from `tools/list` | The startup profile lacks its exact capability closure. Edit host configuration and restart; a tool call cannot self-elevate. |
 | `CAPABILITY_DENIED` on cancel | Reconnect with the same or a strict superset of the operation's original capability set. Do not modify the journal. |
