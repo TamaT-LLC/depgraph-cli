@@ -224,7 +224,7 @@ compatibility tuple, Store migrations, rollback procedure, and known limits.
 
 The supported line is conditionally anchored by the verified `v0.5.4` Release.
 `v0.5.4` becomes the current stable release after the official Release and its
-post-publish evidence are public. Until then, `v0.5.2` remains stable and
+post-publish evidence are public. Until then, `v0.5.3` remains stable and
 release candidates are historical evaluation artifacts. Product support is
 best effort, without response-time or resolution-time SLAs.
 
