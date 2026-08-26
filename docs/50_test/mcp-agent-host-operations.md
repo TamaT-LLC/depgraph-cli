@@ -57,9 +57,12 @@ Setup is idempotent. A process-held cache file lock serializes setup/update,
 does not become stale after termination, and leaves incomplete download and
 extraction staging invisible. Repeating setup revalidates the public identity
 and cached bytes, reuses a valid snapshot, and leaves an exact existing host
-entry unchanged. Two repositories share only the verified version/target
-runtime and compiler pack; their root, Store, journal, and scoped entries stay
-separate.
+entry unchanged. A path-keyed host configuration lock under the canonical user
+home's `.depgraph-mcp-locks` directory is shared across repositories and CLI
+versions. It covers each read/merge/write or read/remove/write sequence, so
+concurrent user-scope commands cannot overwrite another repository's entry. Two
+repositories otherwise share only the verified version/target runtime and
+compiler pack; their root, Store, journal, and scoped entries stay separate.
 
 Operate the binding with:
 
@@ -78,21 +81,23 @@ exact scoped entry, and MCP connection. `update` performs the same reconciliatio
 as setup for the invoking CLI version and always refreshes the safe snapshot.
 Setup, update, and uninstall hold the same repository lifecycle lock in the
 validated Git metadata directory through the host configuration mutation, so
-setup cannot publish a binding after concurrent cleanup. `uninstall` first
+setup cannot publish a binding after concurrent cleanup. Configuration mutation
+also requires the shared path-keyed lock described above. `uninstall` first
 confirms that the installed entry is the exact generated read-only launch tuple
 under the managed artifact cache, then always acquires the durable-operation
 runner exclusion followed by the Store writer exclusion. It fails before
-changing the host file while another lifecycle command, runner, scan, daemon,
-or Store writer is active. The operation runner acquires its exclusion before
-its first journal open. Missing state directories and persistent lock sentinels
-are created first, closing the race before initial Store or journal creation.
-With both state guards held, it removes only that host/scope entry. If another
-entry still references the repository, its Store and journal remain available.
-Removing the last entry deletes the exact Store/journal/SQLite/daemon sidecar
-family. Empty writer and runner lock sentinels remain in place so cleanup never
-unlinks a coordination inode; the shared artifact cache is retained. A custom
-global `--store` must be absolute, outside the repository, and repeated before
-`mcp` for setup, status, update, and uninstall.
+changing the host file while another lifecycle command, conflicting host-file
+mutation, runner, scan, daemon, or Store writer is active. The operation runner
+acquires its exclusion before its first journal open. Missing state directories
+and persistent lock sentinels are created first, closing the race before initial
+Store or journal creation. With both state guards held, it removes only that
+host/scope entry. State remains only when another entry has the complete owned
+launch tuple for the same root and Store; a same-named unrelated entry does not
+count. Removing the last owned entry deletes the exact Store/journal/SQLite/
+daemon sidecar family. Empty writer and runner lock sentinels remain in place so
+cleanup never unlinks a coordination inode; the shared artifact cache is
+retained. A custom global `--store` must be absolute, outside the repository,
+and repeated before `mcp` for setup, status, update, and uninstall.
 
 The stable release workflow exercises every supported host in project and user
 scope in clean temporary homes on macOS arm64/x86_64, Linux arm64/x86_64, and

@@ -425,12 +425,15 @@ Repeat both `--host` and `--scope user` for a user-scoped binding. Omitting
 `status` independently rechecks the official release metadata, cached bytes,
 package closure, Store/root snapshot, exact project entry, and live MCP
 preflight. Setup, update, and uninstall are serialized by one repository
-lifecycle lock. `update` reconciles to the invoking CLI version and refreshes
-the safe snapshot. `uninstall` requires the complete managed read-only launch
-tuple, always establishes exclusions for scans, daemons, and durable operation
-runners, then removes only the matching scoped entry. Repository state is
-removed after the last managed host/scope entry is gone; otherwise it is
-retained for the remaining binding. Empty writer/runner lock
+lifecycle lock. A separate per-file lock under the canonical user home
+serializes host configuration changes across repositories and CLI versions,
+preventing concurrent user-scope merges from replacing each other. `update`
+reconciles to the invoking CLI version and refreshes the safe snapshot.
+`uninstall` requires the complete managed read-only launch tuple, always
+establishes exclusions for scans, daemons, and durable operation runners, then
+removes only the matching scoped entry. Repository state is removed after the
+last entry with an owned launch tuple is gone; same-named unrelated entries do
+not retain it. Empty writer/runner lock
 sentinels remain so a live coordination file is never unlinked; shared verified
 artifacts remain for other repositories. Pass `--root /absolute/path/to/repository` when running
 outside the checkout. If you choose a custom Store with the global

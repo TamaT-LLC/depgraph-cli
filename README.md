@@ -351,8 +351,10 @@ user scopeのbindingには、各コマンドで同じ`--host`と`--scope user`�
 `status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
 `update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
 `setup`／`update`／`uninstall`は同じrepository lifecycle lockで直列化される。
+user homeの`.depgraph-mcp-locks`にhost設定ファイルごとのlockを置き、異なるリポジトリやCLI versionによるuser scope設定の同時更新を直列化する。
 `uninstall`は管理cache配下の完全なread-only起動tupleを所有権として検証し、state未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してから指定したhost／scopeの設定だけを削除する。
-同じリポジトリを参照する別のhost／scope設定が残っている場合、repository固有のstateは保持する。
+同じリポジトリを参照する所有済みのhost／scope設定が残っている場合だけ、repository固有のstateを保持する。
+同名でも起動tupleが一致しない設定は残存bindingとして扱わない。
 最後の設定を削除した時点でstateを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
 中断後は同じ`setup`を再実行する。
 root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。

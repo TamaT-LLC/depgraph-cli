@@ -329,15 +329,18 @@ pub(crate) fn uninstall(request: &McpWorkflowRequest) -> Result<McpUninstallOutp
     let config_path = request
         .host
         .config_path(request.scope, binding.config.canonical_root())?;
-    let state_retained_for_other_hosts =
-        other_configuration_exists(request.host, request.scope, binding.config.canonical_root())?;
+    let state_retained_for_other_hosts = other_configuration_exists(
+        request.host,
+        request.scope,
+        &binding.config,
+        &layout.cache_base,
+    )?;
     let config_changed = remove_host_configuration(
         request.host,
+        request.scope,
         &server_name,
         &binding.config,
         &config_path,
-        binding.config.canonical_root(),
-        binding.config.store_path(),
         &layout.cache_base,
     )?;
     if !binding.config.repository_root_seal().matches_live_root() {
@@ -709,6 +712,65 @@ impl CacheLock {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct HostConfigurationLock {
+    _file: File,
+}
+
+impl HostConfigurationLock {
+    fn acquire(host: McpHost, scope: McpScope, config_path: &Path) -> Result<Option<Self>> {
+        if scope == McpScope::Project {
+            return Ok(None);
+        }
+        let lock_root = prepare_host_configuration_lock_root(host, config_path)?;
+        let rendered_path = config_path.as_os_str().to_string_lossy();
+        let mut digest = Sha256::new();
+        digest.update(b"depgraph-mcp-host-configuration-lock-v1");
+        digest.update((rendered_path.len() as u64).to_le_bytes());
+        digest.update(rendered_path.as_bytes());
+        let path = lock_root.join(format!("{}.lock", hex::encode(digest.finalize())));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .context("MCP setup cannot open its Agent host configuration lock")?;
+        let file = validate_open_regular_lock(file, &path, "Agent host configuration lock")?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => bail!(
+                "another MCP setup/update/uninstall is modifying this Agent host configuration; retry after it completes"
+            ),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).context("MCP setup cannot lock its Agent host configuration")
+            }
+        }
+    }
+}
+
+fn prepare_host_configuration_lock_root(host: McpHost, config_path: &Path) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .context("user-scoped Agent host configuration has no parent")?;
+    let home = if host == McpHost::Claude {
+        parent
+    } else {
+        parent
+            .parent()
+            .context("user-scoped Agent host configuration has no home directory")?
+    };
+    let metadata = fs::symlink_metadata(home)
+        .context("MCP setup cannot inspect the user configuration home")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || home.parent().is_none() {
+        return security_bail("the user configuration home must be a real bounded directory");
+    }
+    let current = home
+        .canonicalize()
+        .context("MCP setup cannot canonicalize the user configuration home")?;
+    ensure_real_child_directory(&current, ".depgraph-mcp-locks")
 }
 
 fn open_cache_lock(path: &Path) -> Result<File> {
@@ -1469,6 +1531,7 @@ fn install_host_configuration(
     managed_cache_base: &Path,
     generated: &str,
 ) -> Result<bool> {
+    let _configuration_lock = HostConfigurationLock::acquire(host, scope, config_path)?;
     if host.is_json() {
         install_json_configuration(
             host,
@@ -1629,21 +1692,21 @@ fn verify_host_configuration(
 
 fn remove_host_configuration(
     host: McpHost,
+    scope: McpScope,
     server_name: &str,
     binding: &DepgraphServiceConfig,
     config_path: &Path,
-    expected_root: &Path,
-    expected_store: &Path,
     managed_cache_base: &Path,
 ) -> Result<bool> {
+    let _configuration_lock = HostConfigurationLock::acquire(host, scope, config_path)?;
     if host.is_json() {
         remove_json_configuration(
             host,
             server_name,
             binding,
             config_path,
-            expected_root,
-            expected_store,
+            binding.canonical_root(),
+            binding.store_path(),
             managed_cache_base,
         )
     } else {
@@ -1652,8 +1715,8 @@ fn remove_host_configuration(
             server_name,
             binding,
             config_path,
-            expected_root,
-            expected_store,
+            binding.canonical_root(),
+            binding.store_path(),
             managed_cache_base,
         )
     }
@@ -1867,8 +1930,10 @@ fn preflight_host_ownership(
 fn other_configuration_exists(
     removed_host: McpHost,
     removed_scope: McpScope,
-    root: &Path,
+    binding: &DepgraphServiceConfig,
+    managed_cache_base: &Path,
 ) -> Result<bool> {
+    let root = binding.canonical_root();
     for scope in McpScope::ALL {
         let server_name = scope.server_name(root)?;
         for host in McpHost::ALL {
@@ -1879,19 +1944,43 @@ fn other_configuration_exists(
             let Some(bytes) = read_optional_bounded_config(host, &path)? else {
                 continue;
             };
-            let has_entry = if host.is_json() {
-                let existing = parse_json_bytes(&bytes, "existing MCP configuration")?;
-                checked_json_server_entry(&existing, &server_name)?.is_some()
-            } else {
-                let existing = parse_toml_bytes(&bytes, "existing MCP configuration")?;
-                checked_server_entry(&existing, &server_name)?.is_some()
-            };
-            if has_entry {
+            if configuration_contains_owned_binding(
+                host,
+                &bytes,
+                &server_name,
+                root,
+                binding.store_path(),
+                managed_cache_base,
+            )? {
                 return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+fn configuration_contains_owned_binding(
+    host: McpHost,
+    bytes: &[u8],
+    server_name: &str,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> Result<bool> {
+    if host.is_json() {
+        let existing = parse_json_bytes(bytes, "existing MCP configuration")?;
+        return Ok(
+            checked_json_server_entry(&existing, server_name)?.is_some_and(|entry| {
+                json_entry_matches_binding(entry, root, store, managed_cache_base)
+            }),
+        );
+    }
+    let existing = parse_toml_bytes(bytes, "existing MCP configuration")?;
+    Ok(
+        checked_server_entry(&existing, server_name)?.is_some_and(|entry| {
+            toml_entry_matches_binding(host, entry, root, store, managed_cache_base)
+        }),
+    )
 }
 
 fn set_editable_server_entry(
@@ -2346,6 +2435,7 @@ mod tests {
     }
 
     fn codex_entry(cache_base: &Path, root: &Path, store: &Path) -> String {
+        let binding = read_binding(root, store);
         let target = compiler_pack_host_target().unwrap();
         let layout = ArtifactLayout::new(cache_base, env!("CARGO_PKG_VERSION"), target).unwrap();
         let command = layout
@@ -2356,8 +2446,8 @@ mod tests {
             AgentHostFormat::Codex,
             AgentHostCapabilityProfile::Read,
             command.to_str().unwrap(),
-            root.to_str().unwrap(),
-            store.to_str().unwrap(),
+            binding.canonical_root().to_str().unwrap(),
+            binding.store_path().to_str().unwrap(),
             layout.requirement_path().to_str().unwrap(),
         )
         .unwrap()
@@ -2370,6 +2460,7 @@ mod tests {
         root: &Path,
         store: &Path,
     ) -> (String, String) {
+        let binding = read_binding(root, store);
         let target = compiler_pack_host_target().unwrap();
         let layout = ArtifactLayout::new(cache_base, env!("CARGO_PKG_VERSION"), target).unwrap();
         let command = layout
@@ -2380,12 +2471,12 @@ mod tests {
             host.agent_format(),
             AgentHostCapabilityProfile::Read,
             command.to_str().unwrap(),
-            root.to_str().unwrap(),
-            store.to_str().unwrap(),
+            binding.canonical_root().to_str().unwrap(),
+            binding.store_path().to_str().unwrap(),
             layout.requirement_path().to_str().unwrap(),
         )
         .unwrap();
-        let server_name = scope.server_name(root).unwrap();
+        let server_name = scope.server_name(binding.canonical_root()).unwrap();
         let configuration = lifecycle_configuration(host, &server_name, &generated).unwrap();
         (server_name, configuration)
     }
@@ -2529,11 +2620,10 @@ mod tests {
             assert!(
                 remove_host_configuration(
                     host,
+                    McpScope::Project,
                     &server_name,
                     &binding,
                     &path,
-                    repository.path(),
-                    &store,
                     state.path(),
                 )
                 .unwrap()
@@ -2638,11 +2728,10 @@ mod tests {
             assert!(
                 remove_host_configuration(
                     host,
+                    McpScope::User,
                     &first_name,
                     &first_binding,
                     &config_path,
-                    first_repository.path(),
-                    &first_store,
                     cache.path(),
                 )
                 .unwrap()
@@ -2665,6 +2754,55 @@ mod tests {
                 checked_server_entry(&value, &first_name).unwrap().is_none()
             };
             assert!(first_absent);
+        }
+    }
+
+    #[test]
+    fn state_retention_requires_an_owned_launch_tuple() {
+        for host in McpHost::ALL {
+            let repository = git_repository();
+            let cache = tempfile::tempdir().unwrap();
+            let store = cache.path().join("graph.db");
+            let binding = read_binding(repository.path(), &store);
+            let (server_name, configuration) = host_entry(
+                host,
+                McpScope::Project,
+                cache.path(),
+                binding.canonical_root(),
+                binding.store_path(),
+            );
+            assert!(
+                configuration_contains_owned_binding(
+                    host,
+                    configuration.as_bytes(),
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
+
+            let tampered = if host.is_json() {
+                let mut value = parse_json(&configuration, "fixture").unwrap();
+                value["mcpServers"][&server_name]["command"] = JsonValue::String("other".into());
+                serde_json::to_vec(&value).unwrap()
+            } else {
+                let mut value = parse_toml(&configuration, "fixture").unwrap();
+                value["mcp_servers"][&server_name]["command"] = toml::Value::String("other".into());
+                toml::to_string(&value).unwrap().into_bytes()
+            };
+            assert!(
+                !configuration_contains_owned_binding(
+                    host,
+                    &tampered,
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
         }
     }
 
@@ -2717,6 +2855,24 @@ mod tests {
         assert!(CacheLock::acquire(cache.path()).is_err());
         drop(lock);
         CacheLock::acquire(cache.path()).unwrap();
+    }
+
+    #[test]
+    fn host_configuration_lock_serializes_a_shared_user_file() {
+        let configuration_home = tempfile::tempdir().unwrap();
+        let shared = configuration_home.path().join(".cursor/mcp.json");
+        let other = configuration_home.path().join(".claude.json");
+
+        let lock = HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared)
+            .unwrap()
+            .unwrap();
+        let error =
+            HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared).unwrap_err();
+        assert!(error.to_string().contains("Agent host configuration"));
+        HostConfigurationLock::acquire(McpHost::Claude, McpScope::User, &other).unwrap();
+
+        drop(lock);
+        HostConfigurationLock::acquire(McpHost::Cursor, McpScope::User, &shared).unwrap();
     }
 
     #[test]
@@ -2906,11 +3062,10 @@ mod tests {
         assert!(
             remove_host_configuration(
                 McpHost::Codex,
+                McpScope::Project,
                 "depgraph",
                 &binding,
                 &path,
-                repository.path(),
-                &store,
                 state.path(),
             )
             .unwrap()
@@ -3037,11 +3192,10 @@ mod tests {
 
             let remove_error = remove_host_configuration(
                 McpHost::Codex,
+                McpScope::Project,
                 "depgraph",
                 &binding,
                 &path,
-                repository.path(),
-                &store,
                 state.path(),
             )
             .unwrap_err();
@@ -3092,11 +3246,10 @@ mod tests {
         assert!(
             remove_host_configuration(
                 McpHost::Codex,
+                McpScope::Project,
                 "depgraph",
                 &binding,
                 &path,
-                repository.path(),
-                &store,
                 state.path(),
             )
             .unwrap()
