@@ -40,7 +40,7 @@ additive extensionとして採用するかを決定する。
 | Cross-cutting security E2E | CLI/catalog, capability, path, operation recovery, hostile project execution | Issue #317 implemented through the live stdio profile/path/cancel corpus and the dedicated Linux hostile gate |
 | Agent host operations | read-only default, privileged profiles, confirmation, recovery, upgrade/rollback | Issue #320 documented in README and the package-smoked operations runbook |
 | Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v2` |
-| Repository-scoped Codex onboarding | verified shared artifacts, repository-specific safe snapshot/Store/config, lifecycle commands | Issue #387 implemented through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
+| Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
 | Open questions | `0` | Resolved |
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
@@ -101,7 +101,7 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#319` | 抽出済みarchiveのMCP stdio smokeと5 target digest gateを追加する | legacy/modern initialize、profile別catalog、固定graph result、safe scan submit/EOF recovery、cancel認可、clean EOF/stdout purityをnative jobで実行し、共通digestをaggregate gateで固定する |
 | `#320` | Agent host設定、権限、timeout、reconnect、upgrade policyを運用文書へ固定する | READMEのpackaged read-only default、全privileged profileのcomplete host entry、人間確認/acknowledgement/isolationの責任分離、baseline/Tasks recovery、deadline/TTL/idempotency、whole-package upgrade/byte-consistent rollbackをdocumentation parserと抽出archive smokeで固定する |
 | `#358` | verified release archiveからAgent host onboardingを自動化する | `depgraph-agent-host-config-v1` golden、fail-closed package/root/Store/compiler-pack preflight、read-only default、privileged acknowledgement、clean-home initialize/catalog/context probe、`mcp-package-smoke-v2`で固定する |
-| `#387` | repository別のCodex MCP setupを1 commandへ閉じる | canonical Git rootのwrite/download前検証、GitHub API digestとpost-publish evidenceに閉じたversion/target共有cache、repository固有Storeとnon-executing safe scan、既存`agent-config` preflight、project-scoped TOMLのatomic semantic merge、status/update/uninstallの所有権分離、および公開後5 target clean-home E2Eで固定する |
+| `#387` | repository別のMCP setupを1 commandへ閉じる | canonical Git rootのwrite/download前検証、GitHub API digestとpost-publish evidenceに閉じたversion/target共有cache、repository固有Storeとnon-executing safe scan、既存`agent-config` preflight、Codex／Claude Code／Cursor／Grokのproject/user設定へのatomic semantic merge、repository固有名を使うuser scope、status/update/uninstallの所有権分離、および公開後5 target clean-home E2Eで固定する |
 
 ## Upstream and API evidence
 

@@ -367,14 +367,29 @@ project-code execution is enabled. It requires an existing fixed repository
 root, an explicit absolute store-file path, and the validated compiler-pack
 requirement published for the host.
 
-#### Repository-scoped Codex setup
+#### Scoped setup for Codex, Claude Code, Cursor, and Grok
 
 After installing an official stable `depgraph` release, run this command from
-any directory inside the Git repository that Codex should inspect:
+any directory inside the Git repository that the Agent host should inspect:
 
 ```sh
 depgraph mcp setup --host codex
 ```
+
+`--host` accepts `codex`, `claude`, `cursor`, and `grok`. Project scope is the
+default. Use `--scope user` when the entry should live in the user's host
+configuration instead:
+
+```sh
+depgraph mcp setup --host cursor --scope user
+```
+
+| Host | Project scope (default) | User scope |
+|---|---|---|
+| Codex | `.codex/config.toml` | `~/.codex/config.toml` |
+| Claude Code | `.mcp.json` | `~/.claude.json` |
+| Cursor | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+| Grok | `.grok/config.toml` | `~/.grok/config.toml` |
 
 The command resolves and seals the nearest canonical Git root before making a
 network request or write. It downloads the exact stable release and compiler
@@ -384,13 +399,17 @@ post-publish evidence, and stores the verified runtime and compiler pack in a
 version/target shared OS cache. It derives a separate Store outside the
 repository, creates the initial snapshot with the non-executing safe scan,
 performs the packaged `initialize`, `tools/list`, and `get_context` preflight,
-then atomically merges only `mcp_servers.depgraph` into
-`.codex/config.toml`. Existing unrelated TOML settings are retained. The
-format-preserving edit also retains their comments and layout. The
-installed entry contains absolute paths and fixes the server to this root,
-Store, compiler-pack requirement, and read-only capability.
+then atomically merges only the selected host entry. Existing unrelated
+settings are retained. Codex and Grok TOML edits also retain comments and
+layout. The installed entry contains absolute paths and fixes the server to
+this root, Store, compiler-pack requirement, and read-only capability.
 
-Restart Codex after setup so it reloads the trusted project's configuration.
+Project scope uses the server name `depgraph`. User scope uses a deterministic
+`depgraph-<repository-id>` name, so several repository-bound servers can share
+one user configuration without replacing each other.
+
+Restart or refresh the selected host after setup. Claude Code asks for trust
+before loading a project-scoped `.mcp.json` entry.
 Rerunning setup is idempotent: verified shared artifacts and a valid current
 snapshot are reused. Use the lifecycle commands from the same repository:
 
@@ -400,14 +419,18 @@ depgraph mcp update --host codex
 depgraph mcp uninstall --host codex
 ```
 
+Repeat both `--host` and `--scope user` for a user-scoped binding. Omitting
+`--scope` always selects project scope.
+
 `status` independently rechecks the official release metadata, cached bytes,
 package closure, Store/root snapshot, exact project entry, and live MCP
 preflight. Setup, update, and uninstall are serialized by one repository
 lifecycle lock. `update` reconciles to the invoking CLI version and refreshes
 the safe snapshot. `uninstall` requires the complete managed read-only launch
 tuple, always establishes exclusions for scans, daemons, and durable operation
-runners, then removes only the matching project entry and that repository's
-Store, journal, and ephemeral sidecars. Empty writer/runner lock
+runners, then removes only the matching scoped entry. Repository state is
+removed after the last managed host/scope entry is gone; otherwise it is
+retained for the remaining binding. Empty writer/runner lock
 sentinels remain so a live coordination file is never unlinked; shared verified
 artifacts remain for other repositories. Pass `--root /absolute/path/to/repository` when running
 outside the checkout. If you choose a custom Store with the global
@@ -417,19 +440,19 @@ same option for every lifecycle command.
 Setup requires a real `curl` executable outside the repository and an exact
 published stable release for the CLI version. An invalid/ambiguous Git root,
 home or filesystem root, unexpected symlink, changed GitHub asset, malformed
-existing Codex TOML, or failed package/MCP preflight stops without publishing a
+host configuration, or failed package/MCP preflight stops without publishing a
 partial host entry. After an interrupted download or extraction, rerun the
 same command; process-held cache locks are released on exit and incomplete
 temporary content is ignored. If `status` reports drift or a missing snapshot,
-run `update`; if Codex still shows the old entry after a successful check,
-restart Codex. See the
+run `update`; if the host still shows the old entry after a successful check,
+restart or refresh it. See the
 [MCP Agent host operations runbook](docs/50_test/mcp-agent-host-operations.md)
 for the ownership model and detailed recovery table.
 
 #### Low-level host configuration generation
 
-`agent-config` remains the low-level workflow for other Agent hosts, custom
-capability profiles, or operators who manage host files themselves. It prints
+`agent-config` remains the low-level workflow for custom capability profiles or
+operators who manage host files themselves. It prints
 a verified entry to stdout and never edits a host file or creates/migrates the
 Store. Replace the path placeholders below with canonical absolute paths and
 `TARGET_TRIPLE` with the release host target; Agent hosts must not rely on shell

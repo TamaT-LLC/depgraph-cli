@@ -547,7 +547,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Exercise clean repository-scoped MCP onboarding
+      - name: Exercise clean scoped MCP onboarding
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -595,9 +595,36 @@ jobs:
           grep -Fq '(unchanged)' <<<"$second"
 
           "$binary" mcp status --host codex --root "$repository"
+
+          for host in claude cursor grok; do
+            project_setup="$("$binary" mcp setup --host "$host" --root "$repository")"
+            printf '%s\n' "$project_setup"
+            grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$project_setup"
+            grep -Fq 'server name: depgraph' <<<"$project_setup"
+            "$binary" mcp status --host "$host" --root "$repository"
+          done
+
+          for host in codex claude cursor grok; do
+            user_setup="$("$binary" mcp setup --host "$host" --scope user --root "$repository")"
+            printf '%s\n' "$user_setup"
+            grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$user_setup"
+            grep -Eq '^server name: depgraph-[0-9a-f]{16}$' <<<"$user_setup"
+            "$binary" mcp status --host "$host" --scope user --root "$repository"
+          done
+
           update="$("$binary" mcp update --host codex --root "$repository")"
           printf '%s\n' "$update"
           grep -Fq 'artifacts: 6 reused, 0 downloaded' <<<"$update"
+
+          for host in claude cursor grok; do
+            removed="$("$binary" mcp uninstall --host "$host" --root "$repository")"
+            grep -Fq 'repository state was retained' <<<"$removed"
+          done
+          for host in codex claude cursor grok; do
+            removed="$("$binary" mcp uninstall --host "$host" --scope user --root "$repository")"
+            grep -Fq 'repository state was retained' <<<"$removed"
+          done
+
           "$binary" mcp uninstall --host codex --root "$repository"
           if grep -Fq '[mcp_servers.depgraph]' "$repository/.codex/config.toml"; then
             echo 'uninstall retained the repository-scoped depgraph entry' >&2

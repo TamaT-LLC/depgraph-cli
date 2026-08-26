@@ -173,6 +173,9 @@ Store不変性はmain databaseとWALのbyte完全一致で判定する。read co
 journal、そのWAL/SHM/rollback journal、runner purge lockはすべて不存在でなければならない。
 すべてのpre-publish gateが成功した後だけ、最終`publish`ジョブがGitHub Releaseと検証済みassetを公開する。
 同じjobの公開後再取得・Agent host canaryまで成功しなければRelease workflow全体はsuccessにならない。
+公開後のnative onboarding jobは、Codex／Claude Code／Cursor／Grokをproject scopeと
+user scopeの両方で設定する。各entryのstatus、共有stateの保持、最後のuninstallによる
+state削除までをclean home上で5 targetすべて検証する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
 Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 17へのtransactional migration、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-17 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。

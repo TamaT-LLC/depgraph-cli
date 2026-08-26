@@ -39,7 +39,7 @@ mod mcp_setup;
 mod snapshot_diff;
 
 use agent_config::{AgentConfigRequest, generate as generate_agent_config};
-use mcp_setup::McpWorkflowRequest;
+use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
 use snapshot_diff::render_service_human_diff;
 
 #[derive(Debug, Parser)]
@@ -80,7 +80,7 @@ struct InteractiveOutputArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Set up and operate a project-scoped MCP Agent host binding.
+    /// Set up and operate a project- or user-scoped MCP Agent host binding.
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
@@ -388,17 +388,21 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum McpCommands {
-    /// Download verified artifacts, create a safe snapshot, and install the project entry.
+    /// Download verified artifacts, create a safe snapshot, and install the scoped host entry.
     Setup {
         #[arg(long, value_enum)]
         host: McpHostArg,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: McpScopeArg,
         #[arg(long, value_name = "PATH", default_value = ".")]
         root: PathBuf,
     },
-    /// Verify artifacts, Store binding, snapshot, project entry, and MCP connectivity.
+    /// Verify artifacts, Store binding, snapshot, scoped host entry, and MCP connectivity.
     Status {
         #[arg(long, value_enum)]
         host: McpHostArg,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: McpScopeArg,
         #[arg(long, value_name = "PATH", default_value = ".")]
         root: PathBuf,
     },
@@ -406,13 +410,17 @@ enum McpCommands {
     Update {
         #[arg(long, value_enum)]
         host: McpHostArg,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: McpScopeArg,
         #[arg(long, value_name = "PATH", default_value = ".")]
         root: PathBuf,
     },
-    /// Remove the project entry and repository-specific state while retaining shared artifacts.
+    /// Remove the scoped host entry and unused repository state while retaining shared artifacts.
     Uninstall {
         #[arg(long, value_enum)]
         host: McpHostArg,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: McpScopeArg,
         #[arg(long, value_name = "PATH", default_value = ".")]
         root: PathBuf,
     },
@@ -448,6 +456,36 @@ enum DaemonCommands {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum McpHostArg {
     Codex,
+    #[value(alias = "claude-code")]
+    Claude,
+    Cursor,
+    Grok,
+}
+
+impl From<McpHostArg> for McpHost {
+    fn from(value: McpHostArg) -> Self {
+        match value {
+            McpHostArg::Codex => Self::Codex,
+            McpHostArg::Claude => Self::Claude,
+            McpHostArg::Cursor => Self::Cursor,
+            McpHostArg::Grok => Self::Grok,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum McpScopeArg {
+    Project,
+    User,
+}
+
+impl From<McpScopeArg> for McpScope {
+    fn from(value: McpScopeArg) -> Self {
+        match value {
+            McpScopeArg::Project => Self::Project,
+            McpScopeArg::User => Self::User,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -775,29 +813,36 @@ fn error_exit_code(error: &anyhow::Error) -> u8 {
 }
 
 fn run_mcp_setup_workflow(
+    host: McpHost,
+    scope: McpScope,
     root: PathBuf,
     store: Option<PathBuf>,
     refresh_snapshot: bool,
     operation: &str,
 ) -> Result<()> {
     let request = McpWorkflowRequest {
+        host,
+        scope,
         requested_root: root,
         explicit_store: store,
     };
     let output = mcp_setup::setup(&request, refresh_snapshot)?;
     println!("MCP {operation}: ready");
+    println!("scope: {}", scope.as_str());
     println!("root: {}", output.root.display());
     println!("store: {}", output.store.display());
     println!("runtime: {}", output.runtime.display());
     println!("compiler pack: {}", output.compiler_pack.display());
     println!("snapshot: {}", output.snapshot_id);
     println!("MCP tools: {}", output.tool_count);
+    println!("server name: {}", output.server_name);
     println!(
         "artifacts: {} reused, {} downloaded",
         output.reused_assets, output.downloaded_assets
     );
     println!(
-        "Codex config: {} ({})",
+        "{} config: {} ({})",
+        host.display_name(),
         output.config.display(),
         if output.config_changed {
             "updated"
@@ -805,7 +850,7 @@ fn run_mcp_setup_workflow(
             "unchanged"
         }
     );
-    println!("restart Codex to connect the project-scoped depgraph server");
+    println!("{}", host.activation_hint(scope));
     Ok(())
 }
 
@@ -813,38 +858,69 @@ async fn run(cli: Cli) -> Result<u8> {
     match cli.command {
         Commands::Mcp { command } => {
             match command {
-                McpCommands::Setup { host: _, root } => {
-                    run_mcp_setup_workflow(root, cli.store, false, "setup")?;
+                McpCommands::Setup { host, scope, root } => {
+                    run_mcp_setup_workflow(
+                        host.into(),
+                        scope.into(),
+                        root,
+                        cli.store,
+                        false,
+                        "setup",
+                    )?;
                 }
-                McpCommands::Update { host: _, root } => {
-                    run_mcp_setup_workflow(root, cli.store, true, "update")?;
+                McpCommands::Update { host, scope, root } => {
+                    run_mcp_setup_workflow(
+                        host.into(),
+                        scope.into(),
+                        root,
+                        cli.store,
+                        true,
+                        "update",
+                    )?;
                 }
-                McpCommands::Status { host: _, root } => {
+                McpCommands::Status { host, scope, root } => {
+                    let host = McpHost::from(host);
+                    let scope = McpScope::from(scope);
                     let request = McpWorkflowRequest {
+                        host,
+                        scope,
                         requested_root: root,
                         explicit_store: cli.store,
                     };
                     let output = mcp_setup::status(&request)?;
                     println!("MCP status: ready");
+                    println!("scope: {}", scope.as_str());
                     println!("root: {}", output.root.display());
                     println!("store: {}", output.store.display());
                     println!("runtime: {}", output.runtime.display());
                     println!("compiler pack: {}", output.compiler_pack.display());
                     println!("snapshot: {}", output.snapshot_id);
                     println!("MCP tools: {}", output.tool_count);
-                    println!("Codex config: {} (verified)", output.config.display());
+                    println!("server name: {}", output.server_name);
+                    println!(
+                        "{} config: {} (verified)",
+                        host.display_name(),
+                        output.config.display()
+                    );
                 }
-                McpCommands::Uninstall { host: _, root } => {
+                McpCommands::Uninstall { host, scope, root } => {
+                    let host = McpHost::from(host);
+                    let scope = McpScope::from(scope);
                     let request = McpWorkflowRequest {
+                        host,
+                        scope,
                         requested_root: root,
                         explicit_store: cli.store,
                     };
                     let output = mcp_setup::uninstall(&request)?;
                     println!("MCP uninstall: complete");
+                    println!("scope: {}", scope.as_str());
                     println!("root: {}", output.root.display());
                     println!("store: {}", output.store.display());
+                    println!("server name: {}", output.server_name);
                     println!(
-                        "Codex config: {} ({})",
+                        "{} config: {} ({})",
+                        host.display_name(),
                         output.config.display(),
                         if output.config_changed {
                             "depgraph entry removed"
@@ -856,6 +932,11 @@ async fn run(cli: Cli) -> Result<u8> {
                         "repository state files removed: {}",
                         output.removed_state_files
                     );
+                    if output.state_retained_for_other_hosts {
+                        println!(
+                            "repository state was retained because another scoped host entry remains"
+                        );
+                    }
                     println!("shared verified artifacts were retained");
                 }
             }
