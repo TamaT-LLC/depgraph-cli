@@ -1072,8 +1072,26 @@ test("validateTypeScriptRawDependencyDelta validates source context and span ind
     /raw dependency source path is not canonical/u,
   );
   rejectSources(
+    (sources) => {
+      sources[0] = null as unknown as TypeScriptDependencyValidationSource;
+    },
+    /raw dependency source is invalid/u,
+  );
+  rejectSources(
+    (sources) => {
+      (sources[0] as unknown as { relativePath: unknown }).relativePath = null;
+    },
+    /raw dependency source path is not canonical/u,
+  );
+  rejectSources(
     (sources) => { sources.push(structuredClone(sources[0]!)) },
     /raw dependency source path is duplicated/u,
+  );
+  rejectSources(
+    (sources) => {
+      (sources[0] as unknown as { text: unknown }).text = null;
+    },
+    /raw dependency source text is invalid/u,
   );
   rejectSources(
     (sources) => {
@@ -1109,6 +1127,14 @@ test("validateTypeScriptRawDependencyDelta validates source context and span ind
       const source = sourceWithSpan(sources, field);
       (source as unknown as Record<SpanField, unknown>)[field] = null;
     }, new RegExp(`raw dependency ${errorName} validation spans are missing`, "u"));
+    rejectSources((sources) => {
+      const source = sourceWithSpan(sources, field);
+      const spans = source[field];
+      (source as unknown as Record<SpanField, unknown>)[field] = [
+        null,
+        ...spans.slice(1),
+      ];
+    }, new RegExp(`raw dependency ${errorName} validation span is invalid`, "u"));
     rejectSources((sources) => {
       const source = sourceWithSpan(sources, field);
       const spanValue = source[field][0]!;

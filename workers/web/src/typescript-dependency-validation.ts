@@ -1704,6 +1704,10 @@ function hasIncompatibleVisibleBindingOrigins(
   return provenOrigins.size > 1;
 }
 
+function isValidationRecord(value: unknown): boolean {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 interface TypeScriptDependencyValidationContext {
   readonly sourceLengths: ReadonlyMap<string, number>;
   readonly sourceTexts: ReadonlyMap<string, string>;
@@ -1727,7 +1731,8 @@ function buildImportTypeModuleSpanIndex(
   const spans = new Set<string>();
   for (const spanValue of source.importTypeModuleSpans) {
     if (
-      !Number.isSafeInteger(spanValue.startOffset)
+      !isValidationRecord(spanValue)
+      || !Number.isSafeInteger(spanValue.startOffset)
       || !Number.isSafeInteger(spanValue.endOffset)
       || spanValue.startOffset < 0
       || spanValue.endOffset <= spanValue.startOffset
@@ -1749,7 +1754,8 @@ function buildModuleCallSpanIndex(
   const calls = new Map<string, string>();
   for (const spanValue of source.moduleCallSpans) {
     if (
-      !Number.isSafeInteger(spanValue.startOffset)
+      !isValidationRecord(spanValue)
+      || !Number.isSafeInteger(spanValue.startOffset)
       || !Number.isSafeInteger(spanValue.endOffset)
       || spanValue.startOffset < 0
       || spanValue.endOffset <= spanValue.startOffset
@@ -1775,6 +1781,9 @@ function buildNonLiteralModuleSpanIndex(
   }
   const nonLiteralModules = new Map<string, TypeScriptNonLiteralModuleValidationSpan>();
   for (const spanValue of source.nonLiteralModuleSpans) {
+    if (!isValidationRecord(spanValue)) {
+      throw new DependencyContractError("raw dependency non-literal module validation span is invalid");
+    }
     const bindingScope = spanValue.bindingScope;
     const proof = spanValue.resolutionModeProof;
     if (
@@ -1847,7 +1856,8 @@ function buildTypeUseSpanIndex(
   const typeUses = new Map<string, TypeScriptTypeUseValidationSpan>();
   for (const spanValue of source.typeUseSpans) {
     if (
-      !Number.isSafeInteger(spanValue.startOffset)
+      !isValidationRecord(spanValue)
+      || !Number.isSafeInteger(spanValue.startOffset)
       || !Number.isSafeInteger(spanValue.endOffset)
       || spanValue.startOffset < 0
       || spanValue.endOffset <= spanValue.startOffset
@@ -1888,7 +1898,8 @@ function buildCallSpanIndex(
   const sourceCalls = new Map<string, TypeScriptCallValidationSpan>();
   for (const spanValue of source.callSpans) {
     if (
-      !Number.isSafeInteger(spanValue.startOffset)
+      !isValidationRecord(spanValue)
+      || !Number.isSafeInteger(spanValue.startOffset)
       || !Number.isSafeInteger(spanValue.endOffset)
       || spanValue.startOffset < 0
       || spanValue.endOffset <= spanValue.startOffset
@@ -1918,11 +1929,17 @@ function buildTypeScriptDependencyValidationContext(
   const typeUseSpans = new Map<string, ReadonlyMap<string, TypeScriptTypeUseValidationSpan>>();
   const callSpans = new Map<string, ReadonlyMap<string, TypeScriptCallValidationSpan>>();
   for (const source of sources) {
-    if (!isCanonicalRelativePath(source.relativePath)) {
+    if (!isValidationRecord(source)) {
+      throw new DependencyContractError("raw dependency source is invalid");
+    }
+    if (typeof source.relativePath !== "string" || !isCanonicalRelativePath(source.relativePath)) {
       throw new DependencyContractError("raw dependency source path is not canonical");
     }
     if (sourceLengths.has(source.relativePath)) {
       throw new DependencyContractError("raw dependency source path is duplicated");
+    }
+    if (typeof source.text !== "string") {
+      throw new DependencyContractError("raw dependency source text is invalid");
     }
     sourceLengths.set(source.relativePath, source.text.length);
     sourceTexts.set(source.relativePath, source.text);
