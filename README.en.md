@@ -432,8 +432,9 @@ reconciles to the invoking CLI version and refreshes the safe snapshot.
 `uninstall` requires the complete managed read-only launch tuple, always
 establishes exclusions for scans, daemons, and durable operation runners, then
 removes only the matching scoped entry. Repository state is removed after the
-last entry with an owned launch tuple is gone; same-named unrelated entries do
-not retain it. Empty writer/runner lock
+last entry with an owned launch tuple for the invoking CLI version and host
+target is gone; older-release and same-named unrelated entries do not retain it.
+Empty writer/runner lock
 sentinels remain so a live coordination file is never unlinked; shared verified
 artifacts remain for other repositories. Pass `--root /absolute/path/to/repository` when running
 outside the checkout. If you choose a custom Store with the global

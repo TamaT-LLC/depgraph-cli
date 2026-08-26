@@ -1944,7 +1944,7 @@ fn other_configuration_exists(
             let Some(bytes) = read_optional_bounded_config(host, &path)? else {
                 continue;
             };
-            if configuration_contains_owned_binding(
+            if configuration_contains_current_owned_binding(
                 host,
                 &bytes,
                 &server_name,
@@ -1959,7 +1959,7 @@ fn other_configuration_exists(
     Ok(false)
 }
 
-fn configuration_contains_owned_binding(
+fn configuration_contains_current_owned_binding(
     host: McpHost,
     bytes: &[u8],
     server_name: &str,
@@ -1971,14 +1971,14 @@ fn configuration_contains_owned_binding(
         let existing = parse_json_bytes(bytes, "existing MCP configuration")?;
         return Ok(
             checked_json_server_entry(&existing, server_name)?.is_some_and(|entry| {
-                json_entry_matches_binding(entry, root, store, managed_cache_base)
+                json_entry_matches_current_binding(entry, root, store, managed_cache_base)
             }),
         );
     }
     let existing = parse_toml_bytes(bytes, "existing MCP configuration")?;
     Ok(
         checked_server_entry(&existing, server_name)?.is_some_and(|entry| {
-            toml_entry_matches_binding(host, entry, root, store, managed_cache_base)
+            toml_entry_matches_current_binding(host, entry, root, store, managed_cache_base)
         }),
     )
 }
@@ -2041,6 +2041,34 @@ fn toml_entry_matches_binding(
     store: &Path,
     managed_cache_base: &Path,
 ) -> bool {
+    toml_entry_matches_binding_version(host, entry, root, store, managed_cache_base, None)
+}
+
+fn toml_entry_matches_current_binding(
+    host: McpHost,
+    entry: &toml::Value,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    toml_entry_matches_binding_version(
+        host,
+        entry,
+        root,
+        store,
+        managed_cache_base,
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn toml_entry_matches_binding_version(
+    host: McpHost,
+    entry: &toml::Value,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+    required_version: Option<&str>,
+) -> bool {
     let Some(table) = entry.as_table() else {
         return false;
     };
@@ -2086,7 +2114,14 @@ fn toml_entry_matches_binding(
     else {
         return false;
     };
-    launch_tuple_matches_binding(command, &arguments, root, store, managed_cache_base)
+    launch_tuple_matches_binding(
+        command,
+        &arguments,
+        root,
+        store,
+        managed_cache_base,
+        required_version,
+    )
 }
 
 fn json_entry_matches_binding(
@@ -2094,6 +2129,31 @@ fn json_entry_matches_binding(
     root: &Path,
     store: &Path,
     managed_cache_base: &Path,
+) -> bool {
+    json_entry_matches_binding_version(entry, root, store, managed_cache_base, None)
+}
+
+fn json_entry_matches_current_binding(
+    entry: &JsonValue,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+) -> bool {
+    json_entry_matches_binding_version(
+        entry,
+        root,
+        store,
+        managed_cache_base,
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn json_entry_matches_binding_version(
+    entry: &JsonValue,
+    root: &Path,
+    store: &Path,
+    managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
     let Some(object) = entry.as_object() else {
         return false;
@@ -2117,7 +2177,14 @@ fn json_entry_matches_binding(
     else {
         return false;
     };
-    launch_tuple_matches_binding(command, &arguments, root, store, managed_cache_base)
+    launch_tuple_matches_binding(
+        command,
+        &arguments,
+        root,
+        store,
+        managed_cache_base,
+        required_version,
+    )
 }
 
 fn launch_tuple_matches_binding(
@@ -2126,6 +2193,7 @@ fn launch_tuple_matches_binding(
     root: &Path,
     store: &Path,
     managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
     if arguments.len() != 10 {
         return false;
@@ -2144,6 +2212,7 @@ fn launch_tuple_matches_binding(
             Path::new(command),
             Path::new(requirement),
             managed_cache_base,
+            required_version,
         )
 }
 
@@ -2151,14 +2220,20 @@ fn managed_launch_paths_match(
     command: &Path,
     requirement: &Path,
     managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
-    managed_launch_paths_match_under(command, requirement, managed_cache_base)
+    managed_launch_paths_match_under(command, requirement, managed_cache_base, required_version)
         || managed_cache_base
             .canonicalize()
             .ok()
             .is_some_and(|canonical| {
                 canonical != managed_cache_base
-                    && managed_launch_paths_match_under(command, requirement, &canonical)
+                    && managed_launch_paths_match_under(
+                        command,
+                        requirement,
+                        &canonical,
+                        required_version,
+                    )
             })
 }
 
@@ -2166,6 +2241,7 @@ fn managed_launch_paths_match_under(
     command: &Path,
     requirement: &Path,
     managed_cache_base: &Path,
+    required_version: Option<&str>,
 ) -> bool {
     if !command.is_absolute() || !requirement.is_absolute() || !managed_cache_base.is_absolute() {
         return false;
@@ -2193,6 +2269,7 @@ fn managed_launch_paths_match_under(
     };
     if mcp != OsStr::new("mcp")
         || artifacts != OsStr::new("artifacts")
+        || required_version.is_some_and(|required| version != required)
         || compiler_pack_host_target() != Some(target)
     {
         return false;
@@ -2460,9 +2537,27 @@ mod tests {
         root: &Path,
         store: &Path,
     ) -> (String, String) {
+        host_entry_for_version(
+            host,
+            scope,
+            cache_base,
+            env!("CARGO_PKG_VERSION"),
+            root,
+            store,
+        )
+    }
+
+    fn host_entry_for_version(
+        host: McpHost,
+        scope: McpScope,
+        cache_base: &Path,
+        version: &str,
+        root: &Path,
+        store: &Path,
+    ) -> (String, String) {
         let binding = read_binding(root, store);
         let target = compiler_pack_host_target().unwrap();
-        let layout = ArtifactLayout::new(cache_base, env!("CARGO_PKG_VERSION"), target).unwrap();
+        let layout = ArtifactLayout::new(cache_base, version, target).unwrap();
         let command = layout
             .runtime_root()
             .join("bin")
@@ -2758,7 +2853,7 @@ mod tests {
     }
 
     #[test]
-    fn state_retention_requires_an_owned_launch_tuple() {
+    fn state_retention_requires_a_current_owned_launch_tuple() {
         for host in McpHost::ALL {
             let repository = git_repository();
             let cache = tempfile::tempdir().unwrap();
@@ -2772,9 +2867,48 @@ mod tests {
                 binding.store_path(),
             );
             assert!(
-                configuration_contains_owned_binding(
+                configuration_contains_current_owned_binding(
                     host,
                     configuration.as_bytes(),
+                    &server_name,
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+                .unwrap()
+            );
+
+            let (_, stale_configuration) = host_entry_for_version(
+                host,
+                McpScope::Project,
+                cache.path(),
+                "0.0.0",
+                binding.canonical_root(),
+                binding.store_path(),
+            );
+            let stale_is_owned = if host.is_json() {
+                let value = parse_json(&stale_configuration, "fixture").unwrap();
+                json_entry_matches_binding(
+                    json_server_entry(&value, &server_name).unwrap(),
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+            } else {
+                let value = parse_toml(&stale_configuration, "fixture").unwrap();
+                toml_entry_matches_binding(
+                    host,
+                    server_entry(&value, &server_name).unwrap(),
+                    binding.canonical_root(),
+                    binding.store_path(),
+                    cache.path(),
+                )
+            };
+            assert!(stale_is_owned);
+            assert!(
+                !configuration_contains_current_owned_binding(
+                    host,
+                    stale_configuration.as_bytes(),
                     &server_name,
                     binding.canonical_root(),
                     binding.store_path(),
@@ -2793,7 +2927,7 @@ mod tests {
                 toml::to_string(&value).unwrap().into_bytes()
             };
             assert!(
-                !configuration_contains_owned_binding(
+                !configuration_contains_current_owned_binding(
                     host,
                     &tampered,
                     &server_name,

@@ -92,9 +92,10 @@ acquires its exclusion before its first journal open. Missing state directories
 and persistent lock sentinels are created first, closing the race before initial
 Store or journal creation. With both state guards held, it removes only that
 host/scope entry. State remains only when another entry has the complete owned
-launch tuple for the same root and Store; a same-named unrelated entry does not
-count. Removing the last owned entry deletes the exact Store/journal/SQLite/
-daemon sidecar family. Empty writer and runner lock sentinels remain in place so
+launch tuple for the same root and Store and the invoking CLI version and host
+target. A past-release or same-named unrelated entry does not count. Removing
+the last current owned entry deletes the exact Store/journal/SQLite/daemon
+sidecar family. Empty writer and runner lock sentinels remain in place so
 cleanup never unlinks a coordination inode; the shared artifact cache is
 retained. A custom global `--store` must be absolute, outside the repository,
 and repeated before `mcp` for setup, status, update, and uninstall.
