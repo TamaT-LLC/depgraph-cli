@@ -125,7 +125,14 @@ fn is_public_surface(node: &NodeRecord, language: Option<&str>, reasons: &mut Ve
             Some("pub" | "public" | "exported")
         )
     {
-        reasons.push("exported/public property".to_owned());
+        if matches!(language, Some("typescript" | "javascript" | "ts" | "js"))
+            && (node.kind == "symbol" || node.kind == "type")
+            && bool_property(node, "exported")
+        {
+            reasons.push("TypeScript/JavaScript export".to_owned());
+        } else {
+            reasons.push("exported/public property".to_owned());
+        }
         return true;
     }
     if node.kind == "route" || node.kind == "component" {
@@ -134,13 +141,6 @@ fn is_public_surface(node: &NodeRecord, language: Option<&str>, reasons: &mut Ve
     }
     if language == Some("go") && exported_go_ident(node) {
         reasons.push("Go exported identifier".to_owned());
-        return true;
-    }
-    if matches!(language, Some("typescript" | "javascript" | "ts" | "js"))
-        && (node.kind == "symbol" || node.kind == "type")
-        && bool_property(node, "exported")
-    {
-        reasons.push("TypeScript/JavaScript export".to_owned());
         return true;
     }
     false

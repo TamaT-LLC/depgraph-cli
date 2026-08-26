@@ -80,15 +80,18 @@ fn analyze_subject(
     collect_site_blockers(index, &node.id, &mut blockers, budget, is_cancelled)?;
     collect_coverage_blockers(index, node, &mut blockers, budget, is_cancelled)?;
     let applicable = applicable_profiles(index, node, budget, is_cancelled)?;
-    if applicable.is_empty()
-        && let Some(language) = node
+    if applicable.is_empty() {
+        let detail = node
             .properties
             .get("language")
             .and_then(serde_json::Value::as_str)
-    {
+            .map_or_else(
+                || "no analyzed profile applies to this subject".to_owned(),
+                |language| format!("no analyzed profile applies to language {language}"),
+            );
         blockers.push(FindingBlocker {
             kind: BlockerKind::ProfileNotAnalyzed,
-            detail: format!("no analyzed profile applies to language {language}"),
+            detail,
         });
     }
     for profile in &applicable {
@@ -788,6 +791,35 @@ mod tests {
         assert_eq!(go.confidence, Confidence::Indeterminate);
         assert!(
             go.blockers
+                .iter()
+                .any(|blocker| blocker.kind == BlockerKind::ProfileNotAnalyzed)
+        );
+    }
+
+    #[test]
+    fn issue_423_missing_language_and_profiles_cannot_confirm_unused() {
+        let mut subject = node("file:unknown", "file", "rust", "src/unknown.txt", json!({}));
+        subject
+            .properties
+            .as_object_mut()
+            .expect("node properties")
+            .remove("language");
+        let graph = snapshot(
+            Vec::new(),
+            vec![subject],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "file:unknown")
+            .expect("unknown-language finding");
+        assert_eq!(finding.confidence, Confidence::Indeterminate);
+        assert!(
+            finding
+                .blockers
                 .iter()
                 .any(|blocker| blocker.kind == BlockerKind::ProfileNotAnalyzed)
         );

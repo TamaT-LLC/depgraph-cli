@@ -389,7 +389,7 @@ enum Commands {
     #[command(long_about = health_render::CLEANUP_LONG_HELP)]
     Cleanup {
         /// Restrict findings to these snapshot-scoped kinds.
-        #[arg(long, value_name = "KIND")]
+        #[arg(long, value_name = "KIND", required = true)]
         kind: Vec<String>,
         #[arg(long, value_name = "SEVERITY")]
         severity: Vec<String>,
@@ -2019,7 +2019,10 @@ async fn run(cli: Cli) -> Result<u8> {
                 let kinds = if kind.is_empty() {
                     None
                 } else {
-                    Some(health_render::parse_snapshot_kinds(&kind)?)
+                    Some(
+                        health_render::parse_snapshot_kinds(&kind)
+                            .map_err(|_| DepgraphServiceError::InvalidInput)?,
+                    )
                 };
                 let (service, mut snapshot) =
                     graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
@@ -2077,7 +2080,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 )?;
                 print_structured(
                     "health.show",
-                    snapshot.snapshot_id().as_str().to_owned(),
+                    snapshot.scan_id().to_owned(),
                     &result.finding,
                     json,
                 )?;
@@ -2096,23 +2099,18 @@ async fn run(cli: Cli) -> Result<u8> {
             min_confidence,
             json,
             output,
-        } => {
-            if kind.is_empty() {
-                anyhow::bail!("cleanup requires --kind");
-            }
-            run_health_findings(
-                cli.store,
-                cli.scan_id.as_deref(),
-                &kind,
-                &severity,
-                &confidence,
-                baseline.as_deref(),
-                min_severity.as_deref(),
-                min_confidence.as_deref(),
-                json,
-                &output,
-            )
-        }
+        } => run_health_findings(
+            cli.store,
+            cli.scan_id.as_deref(),
+            &kind,
+            &severity,
+            &confidence,
+            baseline.as_deref(),
+            min_severity.as_deref(),
+            min_confidence.as_deref(),
+            json,
+            &output,
+        ),
         Commands::Audit {
             changed,
             base_snapshot,
@@ -2127,10 +2125,11 @@ async fn run(cli: Cli) -> Result<u8> {
                 &CancellationToken::new(),
             )?;
             let result = service.health_audit(&scope, &CancellationToken::new())?;
+            let after_scan_id = scope.after().scan_id();
             if output.all {
                 print_structured(
                     "audit",
-                    result.after_snapshot_id().as_str().to_owned(),
+                    after_scan_id.to_owned(),
                     &health_render::CliHealthAuditView {
                         after_snapshot_id: result.after_snapshot_id().as_str(),
                         before_snapshot_id: result.before_snapshot_id().map(|id| id.as_str()),
@@ -2146,7 +2145,7 @@ async fn run(cli: Cli) -> Result<u8> {
             } else {
                 print_health_finding_page(
                     "audit",
-                    result.after_snapshot_id().as_str(),
+                    after_scan_id,
                     result.after_snapshot_id().as_str(),
                     result.findings(),
                     &serde_json::json!({
@@ -2599,9 +2598,12 @@ fn run_health_findings(
     json: bool,
     output: &InteractiveOutputArgs,
 ) -> Result<u8> {
-    let kinds = health_render::parse_snapshot_kinds(kind)?;
-    let severities = health_render::parse_severities(severity)?;
-    let confidences = health_render::parse_confidences(confidence)?;
+    let kinds = health_render::parse_snapshot_kinds(kind)
+        .map_err(|_| DepgraphServiceError::InvalidInput)?;
+    let severities = health_render::parse_severities(severity)
+        .map_err(|_| DepgraphServiceError::InvalidInput)?;
+    let confidences = health_render::parse_confidences(confidence)
+        .map_err(|_| DepgraphServiceError::InvalidInput)?;
     let (service, mut snapshot) = graph_snapshot_request(store, scan_id)?;
     let request =
         HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?;

@@ -6598,6 +6598,7 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
     assert!(shown.status.success(), "{:?}", shown.stderr);
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(shown["command"], "health.show");
+    assert_eq!(shown["scan_id"], "health-scan");
     assert_eq!(shown["data"]["id"], finding_id);
 
     Command::cargo_bin("depgraph")
@@ -6606,6 +6607,33 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
         .args(["--store", store, "health", "show", "not-a-finding"])
         .assert()
         .code(2);
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "cleanup"])
+        .assert()
+        .code(2);
+    for arguments in [
+        vec!["cleanup", "--kind", "invalid"],
+        vec!["cleanup", "--kind", "unused-file", "--severity", "invalid"],
+        vec![
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--confidence",
+            "invalid",
+        ],
+    ] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .arg("--store")
+            .arg(store)
+            .args(arguments)
+            .assert()
+            .code(2);
+    }
 
     let cleanup = Command::cargo_bin("depgraph")
         .unwrap()
@@ -6789,12 +6817,32 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
     assert!(audit.status.success(), "{:?}", audit.stderr);
     let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
     assert_eq!(audit["command"], "audit");
+    assert_eq!(audit["scan_id"], "health-scan");
     assert!(
         audit["data"]["collection_digest"]
             .as_str()
             .unwrap()
             .starts_with("collection:sha256:")
     );
+
+    let audit_page = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "audit",
+            "--changed",
+            "HEAD",
+            "--max-items",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(audit_page.status.success(), "{:?}", audit_page.stderr);
+    let audit_page: serde_json::Value = serde_json::from_slice(&audit_page.stdout).unwrap();
+    assert_eq!(audit_page["scan_id"], "health-scan");
 
     let hotspots = Command::cargo_bin("depgraph")
         .unwrap()

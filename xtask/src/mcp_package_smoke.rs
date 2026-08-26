@@ -13,7 +13,8 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use depgraph_core::{
     CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement, DepgraphCapability,
-    DepgraphCapabilitySet, build_compiler_pack, compiler_pack_host_target, verify_compiler_pack,
+    DepgraphCapabilitySet, FindingIdentity, FindingKind, build_compiler_pack,
+    compiler_pack_host_target, finding_id, verify_compiler_pack,
 };
 use depgraph_mcp_tools::{
     AGENT_HOST_CONFIG_CONTRACT_VERSION, AgentContext, AgentDependenciesResponse,
@@ -28,7 +29,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::executable_name;
 
-pub const MCP_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "mcp-package-smoke-v2";
+pub const MCP_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "mcp-package-smoke-v3";
 pub const SUBMIT_DEADLINE_MS: u64 = 2_000;
 pub const EOF_DEADLINE_MS: u64 = 5_000;
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
@@ -1266,7 +1267,7 @@ fn prepare_read_fixture(root: &Path, store_path: &Path) -> Result<Store> {
     let mut profile = common("profile_declared", 2);
     profile["profile"] = json!({
         "id":"release:mcp-smoke",
-        "language":"fixture",
+        "language":"typescript",
         "features":[],
         "environment":{},
         "properties":{"contract":"mcp-package-smoke-fixture-v1"}
@@ -1282,7 +1283,7 @@ fn prepare_read_fixture(root: &Path, store_path: &Path) -> Result<Store> {
             "kind":"file",
             "locator":format!("file:{path}"),
             "display_name":name,
-            "properties":{"path":path}
+            "properties":{"path":path, "language":"typescript"}
         });
         store.ingest_event(&node)?;
     }
@@ -1396,6 +1397,16 @@ fn verify_health_fixture(structured: &Value) -> Result<()> {
             .as_str()
             .is_some_and(|digest| digest.starts_with("collection:sha256:"))
         || items.len() != 1
+        || items[0]["id"]
+            != finding_id(&FindingIdentity {
+                kind: FindingKind::UnusedFile,
+                subject_id: "node:mcp-source".to_owned(),
+                profile_scope: None,
+                witness_key: json!({
+                    "path": "src/source.ts",
+                    "subject_id": "node:mcp-source"
+                }),
+            })
         || items[0]["kind"] != "unused-file"
         || items[0]["subject_id"] != "node:mcp-source"
         || items[0]["confidence"] != "probable"
@@ -2200,6 +2211,10 @@ mod tests {
             validate(report, "x86_64-unknown-linux-gnu", &"a".repeat(64), "0.5.0")
         };
         validate_report(&report)?;
+
+        let mut legacy_schema = report.clone();
+        legacy_schema.schema_version = "mcp-package-smoke-v2".to_owned();
+        assert!(validate_report(&legacy_schema).is_err());
 
         let mut timing = report.clone();
         timing.safe_scan_submit_elapsed_ms += 1;

@@ -83,7 +83,7 @@ depgraph export --format mermaid > graph.mmd
 | グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位 |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
 
-`health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` はhard blockerが無く、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。sourceは自動変更しない。
+`health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` は使用がなくhard blockerも無いが、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
 `id:`、`path:`、`package:`、`route:`、`symbol:`、`type:`を受け付ける。

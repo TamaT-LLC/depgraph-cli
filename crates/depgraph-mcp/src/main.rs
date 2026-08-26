@@ -16,8 +16,8 @@ use depgraph_core::service::{
     DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
     GraphExportRequest, GraphExportResult, HealthAuditRequest, HealthFindingGetRequest,
     HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest, ImpactRequest,
-    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FINDINGS, NodeMatchMode, PolicyEvaluateRequest,
-    PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
+    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, NodeMatchMode,
+    PolicyEvaluateRequest, PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
     RepositoryOutputPrecondition, RuntimeValidateRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
     UnresolvedRequest,
@@ -1688,6 +1688,23 @@ where
 {
     serde_json::from_value(serde_json::Value::Object(arguments))
         .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+}
+
+fn validate_array_argument_lengths(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Result<(), ToolExecutionFailure> {
+    if names.iter().any(|name| {
+        arguments
+            .get(*name)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.len() > MAX_HEALTH_FILTER_ITEMS)
+    }) {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    Ok(())
 }
 
 fn authorize_repository(
@@ -3568,6 +3585,7 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "health_summary_get" => {
+            validate_array_argument_lengths(&arguments, &["kinds"])?;
             let arguments = decode_arguments::<HealthSummaryArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
@@ -3604,6 +3622,7 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "health_findings_list" => {
+            validate_array_argument_lengths(&arguments, &["kinds", "severities", "confidences"])?;
             let arguments = decode_arguments::<HealthFindingsArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
@@ -3728,6 +3747,7 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "health_hotspots_list" => {
+            validate_array_argument_lengths(&arguments, &["churn_path_filter"])?;
             let arguments = decode_arguments::<HealthHotspotsArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,

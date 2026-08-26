@@ -416,7 +416,7 @@ pub(crate) fn read_git_churn_cancellable(
     }
     let normalized_filters = path_filters
         .iter()
-        .map(|path| normalize_git_path(path))
+        .map(|path| normalize_git_path(path.trim_end_matches('/')))
         .collect::<Result<Vec<_>>>()?;
     check_cancelled(&mut is_cancelled)?;
     let root = root
@@ -2010,6 +2010,16 @@ mod tests {
             change.old_path.as_deref() == Some("side.rs")
                 || change.new_path.as_deref() == Some("side.rs")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn churn_path_filters_ignore_trailing_separators() -> Result<()> {
+        assert_eq!(
+            normalize_git_path("src/".trim_end_matches('/'))?,
+            normalize_git_path("src")?
+        );
+        assert!(path_matches_filter("src/lib.rs", "src"));
         Ok(())
     }
 

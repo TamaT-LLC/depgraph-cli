@@ -6609,12 +6609,16 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
             .map(|(tool_name, _, _)| *tool_name)
             .collect::<Vec<_>>();
         assert_eq!(called_names, advertised_names, "{protocol_version}");
+        let split_at = usize::try_from(depgraph_mcp::runtime::READ_RATE_BURST)
+            .expect("read burst fits usize")
+            .saturating_sub(8)
+            .max(1);
         for (offset, (tool_name, arguments, expected_error)) in
             read_only_calls.into_iter().enumerate()
         {
             // Keep the catalog-wide contract probe below the product's fixed
-            // 32-request read burst even as the read-only catalog grows.
-            if offset == 24 {
+            // read burst even as the read-only catalog grows.
+            if offset > 0 && offset % split_at == 0 {
                 mcp.finish();
                 mcp = InteractiveMcp::start(&root, &store_path);
                 let initialized = initialize_tasks_mcp(&mut mcp, 90, protocol_version, false);
@@ -7283,6 +7287,24 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
         tamper["structuredContent"]["error"]["code"],
         "CURSOR_MISMATCH"
     );
+
+    let oversized = vec!["unused-file"; 1_025];
+    for (id, tool, field) in [
+        (10, "health_summary_get", "kinds"),
+        (11, "health_findings_list", "kinds"),
+        (12, "health_hotspots_list", "churn_path_filter"),
+    ] {
+        let rejected = interactive_tool_call(&mut mcp, id, tool, {
+            let mut arguments = common.clone();
+            arguments[field] = json!(oversized.clone());
+            arguments
+        });
+        assert_eq!(rejected["isError"], true, "{tool}: {rejected}");
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"], "INVALID_ARGUMENT",
+            "{tool}: {rejected}"
+        );
+    }
 
     for result in [&summary, &findings, &detail, &audit, &hotspots] {
         let encoded = result.to_string();

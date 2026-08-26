@@ -279,6 +279,11 @@ impl PinnedHealthSnapshot {
     pub const fn snapshot(&self) -> &GraphSnapshot {
         &self.snapshot
     }
+
+    #[must_use]
+    pub fn scan_id(&self) -> &str {
+        &self.snapshot.scan.id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -930,7 +935,19 @@ fn load_manifests(
                     drifted,
                 });
             }
-            Err(diagnostic) if diagnostic.code == "query_file_unavailable" => {
+            Err(diagnostic)
+                if matches!(
+                    diagnostic.code,
+                    "query_file_unavailable"
+                        | "query_file_not_regular"
+                        | "query_file_changed_during_open"
+                        | "query_file_changed_during_read"
+                        | "query_file_metadata_unavailable"
+                        | "query_file_read_failed"
+                        | "query_file_symlink_rejected"
+                        | "query_file_open_failed"
+                ) =>
+            {
                 manifests.push(ManifestIdentity {
                     path,
                     digest: "unavailable".to_owned(),
@@ -1112,14 +1129,14 @@ fn resolve_before_snapshot(
     }
     let target_oid = target_oid.to_owned();
     let cancellation_check = cancellation.clone();
-    let ids = after_request
+    let id = after_request
         .store()
         .interruptible_read(
             move || cancellation_check.is_cancelled(),
-            |store| store.completed_snapshot_ids_for_source_revision(&target_oid),
+            |store| store.first_completed_snapshot_id_for_source_revision(&target_oid),
         )
         .map_err(DepgraphServiceError::store_operation)?;
-    let Some(id) = ids.into_iter().next() else {
+    let Some(id) = id else {
         return Ok(None);
     };
     let loaded = load_snapshot_by_id(after_request, &id, cancellation)?;

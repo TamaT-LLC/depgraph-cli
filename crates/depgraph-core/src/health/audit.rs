@@ -237,7 +237,8 @@ pub fn analyze_changed_code_cancellable(
         let impacted_count = impacted.len();
         let impacted = impacted.into_iter().collect::<Vec<_>>();
         let subject = changed_node_ids
-            .first()
+            .iter()
+            .min()
             .cloned()
             .unwrap_or_else(|| "changed-set".to_owned());
         let blast_blockers = shared_blockers
@@ -662,5 +663,27 @@ mod tests {
             .find(|finding| finding.kind == FindingKind::WideBlastRadius)
             .expect("blast radius from deleted subject");
         assert!(blast.reason.contains("2 nodes from 1 changed nodes"));
+
+        let first = analyze_changed_code(
+            &after,
+            Some(&before),
+            &["file:deleted".to_owned(), "file:z-absent".to_owned()],
+            &AuditComparability::default(),
+        );
+        let reversed = analyze_changed_code(
+            &after,
+            Some(&before),
+            &["file:z-absent".to_owned(), "file:deleted".to_owned()],
+            &AuditComparability::default(),
+        );
+        let blast_id = |findings: &[HealthFinding]| {
+            findings
+                .iter()
+                .find(|finding| finding.kind == FindingKind::WideBlastRadius)
+                .expect("wide blast radius")
+                .id
+                .clone()
+        };
+        assert_eq!(blast_id(&first), blast_id(&reversed));
     }
 }

@@ -205,7 +205,7 @@ fn issue_423_health_service_pins_snapshot_and_rejects_invalid_requests() -> Resu
 
     let summary = service.health_summary(
         &mut request,
-        &HealthSummaryRequest::try_new(None)?,
+        &HealthSummaryRequest::try_new(Some(vec![FindingKind::UnusedFile]))?,
         &cancellation,
     )?;
     assert_eq!(summary.snapshot_id().as_str(), snapshot_id);
@@ -263,6 +263,36 @@ fn issue_423_health_service_pins_snapshot_and_rejects_invalid_requests() -> Resu
         ),
         Err(DepgraphServiceError::Cancelled)
     ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn issue_423_unreadable_manifest_degrades_health_instead_of_failing() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let revision = init_git(&root);
+    let outside_manifest = temporary.path().join("outside-Cargo.toml");
+    fs::write(&outside_manifest, "[dependencies]\nserde = \"1\"\n")?;
+    symlink(&outside_manifest, root.join("Cargo.toml"))?;
+    let store_path = temporary.path().join("graph.sqlite");
+    let mut store = Store::open(&store_path)?;
+    seed_health_snapshot(&mut store, &root, "health-symlink", &revision)?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut request =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let summary = service.health_summary(
+        &mut request,
+        &HealthSummaryRequest::try_new(None)?,
+        &cancellation,
+    )?;
+    assert!(summary.manifest_digest().is_some());
     Ok(())
 }
 
