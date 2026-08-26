@@ -1966,45 +1966,46 @@ function buildTypeScriptDependencyValidationContext(
   });
 }
 
-export function validateTypeScriptRawDependencyDelta(
-  delta: TypeScriptRawDependencyDelta,
-  definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
-  sources: readonly TypeScriptDependencyValidationSource[],
-): void {
+function validateTypeScriptDependencyPreflight(delta: Readonly<TypeScriptRawDependencyDelta>): void {
   if (!Array.isArray(delta.calls)) throw new DependencyContractError("raw dependency call ledger is missing");
   if (delta.sites.length + delta.calls.length > MAX_SITES) throw new DependencyContractError("raw dependency site limit exceeded");
-  const {
-    sourceLengths,
-    sourceTexts,
-    sourceSyntaxValidity,
-    importTypeModuleSpans,
-    moduleCallSpans,
-    nonLiteralModuleSpans,
-    typeUseSpans,
-    callSpans,
-  } = buildTypeScriptDependencyValidationContext(sources);
+}
+
+interface TypeScriptDependencyLedgerValidationContext extends TypeScriptDependencyValidationContext {
+  readonly sitesByKey: ReadonlyMap<string, TypeScriptRawDependencySite>;
+  readonly definitions: ReadonlyMap<string, TypeScriptRawDefinitionDelta["definitions"][number]>;
+  readonly validationTokensBySource: ReadonlyMap<string, readonly DependencyValidationToken[]>;
+}
+
+function buildTypeScriptDependencyLedgerValidationContext(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  definitionsDelta: Readonly<Pick<TypeScriptRawDefinitionDelta, "definitions">>,
+  sourceContext: Readonly<TypeScriptDependencyValidationContext>,
+): TypeScriptDependencyLedgerValidationContext {
   const sitesByKey = new Map(delta.sites.map((site) => [site.key, site]));
   const definitions = new Map(definitionsDelta.definitions.map((definition) => [definition.key, definition]));
+  const { sourceTexts } = sourceContext;
   const validationTokensBySource = new Map([...sourceTexts].map(([relativePath, sourceText]) => [
     relativePath,
     dependencyValidationTokens(sourceText, 0, sourceText.length, false, /\.(?:jsx|tsx)$/iu.test(relativePath)),
   ]));
+  return Object.freeze({
+    ...sourceContext,
+    sitesByKey,
+    definitions,
+    validationTokensBySource,
+  });
+}
+
+function validateTypeScriptModuleExportProofs(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyLedgerValidationContext>,
+): void {
+  const { definitions, sourceLengths } = context;
   if (delta.moduleExports.length > MAX_MODULE_EXPORT_BINDINGS) {
     throw new DependencyContractError("raw module export proof limit exceeded");
   }
-  let previousModuleExport: { relativePath: string; exportPathKey: string } | null = null;
   for (const proof of delta.moduleExports) {
-    const exportPathKey = JSON.stringify(proof.exportPath);
-    if (
-      previousModuleExport !== null
-      && (
-        compareStrings(previousModuleExport.relativePath, proof.relativePath)
-        || compareStrings(previousModuleExport.exportPathKey, exportPathKey)
-      ) >= 0
-    ) {
-      throw new DependencyContractError("raw module export proofs are not strictly sorted");
-    }
-    previousModuleExport = { relativePath: proof.relativePath, exportPathKey };
     if (
       !sourceLengths.has(proof.relativePath)
       || !Array.isArray(proof.exportPath)
@@ -2013,18 +2014,32 @@ export function validateTypeScriptRawDependencyDelta(
       || proof.definitionKeys.length === 0
       || proof.definitionKeys.length > MAX_EXPORTS_PER_MODULE
     ) throw new DependencyContractError("raw module export proof is invalid");
-    let previousDefinition = "";
     for (const key of proof.definitionKeys) {
-      if (previousDefinition !== "" && compareStrings(previousDefinition, key) >= 0) {
-        throw new DependencyContractError("raw module export targets are not strictly sorted");
-      }
-      previousDefinition = key;
       const definition = definitions.get(key);
       if (definition === undefined || definition.semanticKind === "generic_instance") {
         throw new DependencyContractError("raw module export target is not a canonical definition");
       }
     }
   }
+}
+
+interface TypeScriptDependencyBindingValidationContext extends TypeScriptDependencyLedgerValidationContext {
+  readonly moduleLevelOccurrences: ReadonlySet<string>;
+  readonly occurrencesByKind: ReadonlyMap<TypeScriptRawDependencySiteKind, ReadonlySet<string>>;
+  readonly namedBindingOccurrences: ReadonlySet<string>;
+  readonly namespaceBindingOccurrences: ReadonlySet<string>;
+  readonly moduleOnlyOccurrences: ReadonlySet<string>;
+  readonly originOccurrences: ReadonlyMap<TypeScriptBindingKind, ReadonlySet<string>>;
+  readonly inlineImportsByModule: ReadonlyMap<string, readonly TypeScriptRawDependencySite[]>;
+  readonly inlineImportsByEvidence: ReadonlyMap<string, TypeScriptRawDependencySite>;
+  readonly directBindingsByName: ReadonlyMap<string, readonly TypeScriptRawDependencySite[]>;
+}
+
+function buildTypeScriptDependencyBindingValidationContext(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyLedgerValidationContext>,
+): TypeScriptDependencyBindingValidationContext {
+  const { sourceTexts } = context;
   const moduleLevelOccurrences = new Set([
     "namespace_import", "side_effect_import", "empty_import", "import_equals", "require_call", "dynamic_import", "import_type",
     "namespace_reexport", "empty_reexport", "export_star",
@@ -2058,10 +2073,7 @@ export function validateTypeScriptRawDependencyDelta(
   for (const site of delta.sites) {
     if (site.kind !== "web_import" || site.evidence.occurrenceKind !== "import_type") continue;
     const key = `${site.evidence.relativePath}\0${site.evidence.startOffset}\0${site.evidence.endOffset}`;
-    if (inlineImportsByEvidence.has(key)) {
-      throw new DependencyContractError("raw inline import evidence is duplicated");
-    }
-    inlineImportsByEvidence.set(key, site);
+    if (!inlineImportsByEvidence.has(key)) inlineImportsByEvidence.set(key, site);
   }
   for (const sites of inlineImportsByModule.values()) {
     sites.sort((left, right) => left.evidence.endOffset - right.evidence.endOffset);
@@ -2079,6 +2091,36 @@ export function validateTypeScriptRawDependencyDelta(
     const key = JSON.stringify([site.evidence.relativePath, localName]);
     directBindingsByName.set(key, [...(directBindingsByName.get(key) ?? []), site]);
   }
+  return Object.freeze({
+    ...context,
+    moduleLevelOccurrences,
+    occurrencesByKind,
+    namedBindingOccurrences,
+    namespaceBindingOccurrences,
+    moduleOnlyOccurrences,
+    originOccurrences,
+    inlineImportsByModule,
+    inlineImportsByEvidence,
+    directBindingsByName,
+  });
+}
+
+function validateTypeScriptDependencySiteAttestations(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyBindingValidationContext>,
+): void {
+  const {
+    directBindingsByName,
+    importTypeModuleSpans,
+    moduleCallSpans,
+    nonLiteralModuleSpans,
+    sitesByKey,
+    sourceLengths,
+    sourceSyntaxValidity,
+    sourceTexts,
+    typeUseSpans,
+    validationTokensBySource,
+  } = context;
   for (const site of delta.sites) {
     const attestationSourceLength = sourceLengths.get(site.evidence.relativePath);
     if (
@@ -2285,13 +2327,29 @@ export function validateTypeScriptRawDependencyDelta(
       site.resolutionMode,
     ])})`);
   }
-  let previousKey = "";
+}
+
+function validateTypeScriptDependencyBindingClosure(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyBindingValidationContext>,
+): void {
+  const {
+    directBindingsByName,
+    inlineImportsByEvidence,
+    inlineImportsByModule,
+    namedBindingOccurrences,
+    namespaceBindingOccurrences,
+    occurrencesByKind,
+    originOccurrences,
+    sitesByKey,
+    sourceLengths,
+    sourceTexts,
+    typeUseSpans,
+  } = context;
   for (const site of delta.sites) {
     if (!(site.kind === "web_import" || site.kind === "web_reexport" || site.kind === "type_use")) throw new DependencyContractError("raw dependency site kind is invalid");
     if (!(site.status === "resolved" || site.status === "candidates" || site.status === "external" || site.status === "unresolved")) throw new DependencyContractError("raw dependency status is invalid");
     if (!(site.precision === "exact" || site.precision === "overapprox" || site.precision === "heuristic")) throw new DependencyContractError("raw dependency precision is invalid");
-    if (previousKey !== "" && compareStrings(previousKey, site.key) >= 0) throw new DependencyContractError("raw dependency sites are not strictly sorted");
-    previousKey = site.key;
     const expectedEdge = site.kind === "web_import" ? "imports" : site.kind === "web_reexport" ? "reexports" : "type_uses";
     if (site.edgeKind !== expectedEdge) throw new DependencyContractError("raw dependency site/edge kind mapping is invalid");
     if (!occurrencesByKind.get(site.kind)?.has(site.evidence.occurrenceKind)) throw new DependencyContractError("raw dependency occurrence kind is invalid for its site kind");
@@ -2528,6 +2586,22 @@ export function validateTypeScriptRawDependencyDelta(
     } else if (site.bindingKind === "import_equals" && site.evidence.occurrenceKind !== "import_equals") {
       throw new DependencyContractError("raw dependency import-equals origin is missing");
     }
+  }
+}
+
+function validateTypeScriptDependencySites(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyBindingValidationContext>,
+): void {
+  const {
+    definitions,
+    moduleLevelOccurrences,
+    moduleOnlyOccurrences,
+    namedBindingOccurrences,
+    namespaceBindingOccurrences,
+    sourceLengths,
+  } = context;
+  for (const site of delta.sites) {
     if (
       ((site.kind === "type_use" || site.evidence.occurrenceKind === "import_type") && !site.typeOnly)
       || (["side_effect_import", "require_call", "dynamic_import"].includes(site.evidence.occurrenceKind) && site.typeOnly)
@@ -2629,8 +2703,6 @@ export function validateTypeScriptRawDependencyDelta(
       throw new DependencyContractError("raw dependency source kind is invalid");
     }
     if (sourcePath !== site.evidence.relativePath) throw new DependencyContractError("raw dependency source and evidence paths disagree");
-    const expectedKey = siteKey(site.source, site.kind, site.evidence.relativePath, site.evidence.startOffset, site.evidence.endOffset);
-    if (site.key !== expectedKey) throw new DependencyContractError("raw dependency site key is not canonical");
     if (site.targets.length === 0) throw new DependencyContractError("raw dependency site has no targets");
     if (!Array.isArray(site.targetConditions) || site.targetConditions.length !== site.targets.length) {
       throw new DependencyContractError("raw dependency target conditions do not align with targets");
@@ -2640,11 +2712,7 @@ export function validateTypeScriptRawDependencyDelta(
     if (JSON.stringify(site.condition) !== JSON.stringify(aggregateConditions(site.targetConditions))) {
       throw new DependencyContractError("raw dependency site condition is not the aggregate of its target conditions");
     }
-    let previousTarget = "";
     for (const target of site.targets) {
-      const targetKey = targetSortKey(target);
-      if (previousTarget !== "" && compareStrings(previousTarget, targetKey) >= 0) throw new DependencyContractError("raw dependency targets are not strictly sorted");
-      previousTarget = targetKey;
       if (target.kind === "definition") {
         const definition = definitions.get(target.key);
         if (definition === undefined) throw new DependencyContractError("raw dependency target definition is missing");
@@ -2683,14 +2751,14 @@ export function validateTypeScriptRawDependencyDelta(
     const expectedBasis = basisForTargets(site.targets);
     if (site.evidence.targetBasis !== expectedBasis) throw new DependencyContractError("raw dependency target basis is invalid");
   }
+}
 
-  const seenCallSpans = new Set<string>();
-  let previousCallKey = "";
+function validateTypeScriptCallLedger(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyLedgerValidationContext>,
+): void {
+  const { callSpans, definitions, sourceLengths } = context;
   for (const call of delta.calls) {
-    if (previousCallKey !== "" && compareStrings(previousCallKey, call.key) >= 0) {
-      throw new DependencyContractError("raw call sites are not strictly sorted");
-    }
-    previousCallKey = call.key;
     const sourceLength = sourceLengths.get(call.evidence.relativePath);
     if (
       sourceLength === undefined
@@ -2708,10 +2776,6 @@ export function validateTypeScriptRawDependencyDelta(
     const validationSpan = callSpans.get(call.evidence.relativePath)?.get(validationKey);
     if (validationSpan === undefined || validationSpan.specifier !== call.specifier) {
       throw new DependencyContractError("raw call site does not correlate with its parser occurrence");
-    }
-    const globalValidationKey = `${call.evidence.relativePath}\0${validationKey}`;
-    if (!seenCallSpans.add(globalValidationKey)) {
-      throw new DependencyContractError("raw call occurrence is duplicated");
     }
     if (
       call.specifier.length === 0
@@ -2755,8 +2819,6 @@ export function validateTypeScriptRawDependencyDelta(
     if (sourcePath !== call.evidence.relativePath) {
       throw new DependencyContractError("raw call caller and evidence paths disagree");
     }
-    const expectedKey = siteKey(call.source, "call", call.evidence.relativePath, call.evidence.startOffset, call.evidence.endOffset);
-    if (call.key !== expectedKey) throw new DependencyContractError("raw call site key is not canonical");
     if (call.targets.length === 0 || call.targetConditions.length !== call.targets.length) {
       throw new DependencyContractError("raw call site has no target or unaligned target conditions");
     }
@@ -2795,10 +2857,6 @@ export function validateTypeScriptRawDependencyDelta(
       }
     }
     const targetKinds = new Set(call.targets.map((target) => target.kind));
-    const targetKeys = call.targets.map(targetSortKey);
-    if (targetKeys.some((key, index) => index > 0 && targetKeys[index - 1]! >= key)) {
-      throw new DependencyContractError("raw call targets are not unique and canonical-sorted");
-    }
     if (
       (!["resolved", "candidates", "external", "unresolved"].includes(call.status)
         || !["exact", "overapprox", "heuristic"].includes(call.precision))
@@ -2859,6 +2917,94 @@ export function validateTypeScriptRawDependencyDelta(
       throw new DependencyContractError("raw call target basis is invalid");
     }
   }
+}
+
+function validateTypeScriptDependencyClosure(
+  delta: Readonly<TypeScriptRawDependencyDelta>,
+  context: Readonly<TypeScriptDependencyBindingValidationContext>,
+): void {
+  const { callSpans } = context;
+  let previousModuleExport: { relativePath: string; exportPathKey: string } | null = null;
+  for (const proof of delta.moduleExports) {
+    const exportPathKey = JSON.stringify(proof.exportPath);
+    if (
+      previousModuleExport !== null
+      && (
+        compareStrings(previousModuleExport.relativePath, proof.relativePath)
+        || compareStrings(previousModuleExport.exportPathKey, exportPathKey)
+      ) >= 0
+    ) {
+      throw new DependencyContractError("raw module export proofs are not strictly sorted");
+    }
+    previousModuleExport = { relativePath: proof.relativePath, exportPathKey };
+    let previousDefinition = "";
+    for (const key of proof.definitionKeys) {
+      if (previousDefinition !== "" && compareStrings(previousDefinition, key) >= 0) {
+        throw new DependencyContractError("raw module export targets are not strictly sorted");
+      }
+      previousDefinition = key;
+    }
+  }
+
+  const inlineImportEvidence = new Set<string>();
+  let previousSiteKey = "";
+  for (const site of delta.sites) {
+    if (site.kind === "web_import" && site.evidence.occurrenceKind === "import_type") {
+      const evidenceKey = `${site.evidence.relativePath}\0${site.evidence.startOffset}\0${site.evidence.endOffset}`;
+      if (!inlineImportEvidence.add(evidenceKey)) {
+        throw new DependencyContractError("raw inline import evidence is duplicated");
+      }
+    }
+    if (previousSiteKey !== "" && compareStrings(previousSiteKey, site.key) >= 0) {
+      throw new DependencyContractError("raw dependency sites are not strictly sorted");
+    }
+    previousSiteKey = site.key;
+    const expectedKey = siteKey(
+      site.source,
+      site.kind,
+      site.evidence.relativePath,
+      site.evidence.startOffset,
+      site.evidence.endOffset,
+    );
+    if (site.key !== expectedKey) {
+      throw new DependencyContractError("raw dependency site key is not canonical");
+    }
+    let previousTarget = "";
+    for (const target of site.targets) {
+      const targetKey = targetSortKey(target);
+      if (previousTarget !== "" && compareStrings(previousTarget, targetKey) >= 0) {
+        throw new DependencyContractError("raw dependency targets are not strictly sorted");
+      }
+      previousTarget = targetKey;
+    }
+  }
+
+  const seenCallSpans = new Set<string>();
+  let previousCallKey = "";
+  for (const call of delta.calls) {
+    if (previousCallKey !== "" && compareStrings(previousCallKey, call.key) >= 0) {
+      throw new DependencyContractError("raw call sites are not strictly sorted");
+    }
+    previousCallKey = call.key;
+    const expectedKey = siteKey(
+      call.source,
+      "call",
+      call.evidence.relativePath,
+      call.evidence.startOffset,
+      call.evidence.endOffset,
+    );
+    if (call.key !== expectedKey) {
+      throw new DependencyContractError("raw call site key is not canonical");
+    }
+    const validationKey = `${call.evidence.startOffset}\0${call.evidence.endOffset}\0${call.evidence.occurrenceKind}`;
+    if (!seenCallSpans.add(`${call.evidence.relativePath}\0${validationKey}`)) {
+      throw new DependencyContractError("raw call occurrence is duplicated");
+    }
+    const targetKeys = call.targets.map(targetSortKey);
+    if (targetKeys.some((key, index) => index > 0 && targetKeys[index - 1]! >= key)) {
+      throw new DependencyContractError("raw call targets are not unique and canonical-sorted");
+    }
+  }
   for (const [relativePath, spans] of callSpans) {
     for (const key of spans.keys()) {
       if (!seenCallSpans.has(`${relativePath}\0${key}`)) {
@@ -2866,4 +3012,25 @@ export function validateTypeScriptRawDependencyDelta(
       }
     }
   }
+}
+
+export function validateTypeScriptRawDependencyDelta(
+  delta: TypeScriptRawDependencyDelta,
+  definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
+  sources: readonly TypeScriptDependencyValidationSource[],
+): void {
+  validateTypeScriptDependencyPreflight(delta);
+  const sourceContext = buildTypeScriptDependencyValidationContext(sources);
+  const ledgerContext = buildTypeScriptDependencyLedgerValidationContext(
+    delta,
+    definitionsDelta,
+    sourceContext,
+  );
+  validateTypeScriptModuleExportProofs(delta, ledgerContext);
+  const bindingContext = buildTypeScriptDependencyBindingValidationContext(delta, ledgerContext);
+  validateTypeScriptDependencySiteAttestations(delta, bindingContext);
+  validateTypeScriptDependencyBindingClosure(delta, bindingContext);
+  validateTypeScriptDependencySites(delta, bindingContext);
+  validateTypeScriptCallLedger(delta, ledgerContext);
+  validateTypeScriptDependencyClosure(delta, bindingContext);
 }
