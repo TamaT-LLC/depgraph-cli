@@ -1030,3 +1030,123 @@ test("validateTypeScriptRawDependencyDelta accepts the extracted delta and rejec
     site.importedName = "missing";
   }, /raw dependency re-export syntax does not correlate/u);
 });
+
+test("validateTypeScriptRawDependencyDelta validates source context and span indexes independently", async () => {
+  const fixture = await extractDependencyDelta(DELTA_SOURCES, "__depgraph_ts_deps_context_delta__");
+  const contextFixtureSources = Object.fromEntries(
+    Object.entries({ ...SPAN_SOURCES, ...IRREGULAR_SOURCES })
+      .map(([relativePath, text]) => [`validation/${relativePath}`, text]),
+  );
+  const snapshots = await collectSpanSnapshots(
+    contextFixtureSources,
+    "__depgraph_ts_deps_context_spans__",
+  );
+  const contextSources: TypeScriptDependencyValidationSource[] = [...snapshots]
+    .map(([relativePath, snapshot]) => ({
+      relativePath,
+      text: snapshot.text,
+      syntacticallyValid: snapshot.syntacticallyValid,
+      importTypeModuleSpans: snapshot.importTypeModuleSpans,
+      moduleCallSpans: snapshot.moduleCallSpans,
+      nonLiteralModuleSpans: snapshot.nonLiteralModuleSpans,
+      typeUseSpans: snapshot.typeUseSpans,
+      callSpans: snapshot.callSpans,
+    }));
+  const validationSources = [...fixture.validationSources, ...contextSources];
+
+  const rejectSources = (
+    mutate: (sources: TypeScriptDependencyValidationSource[]) => void,
+    pattern: RegExp,
+  ): void => {
+    const sources = structuredClone(validationSources) as TypeScriptDependencyValidationSource[];
+    mutate(sources);
+    assert.throws(() => validateTypeScriptRawDependencyDelta(
+      fixture.dependencies,
+      fixture.definitions,
+      sources,
+    ), pattern);
+  };
+
+  rejectSources(
+    (sources) => { sources[0]!.relativePath = "../outside.ts" },
+    /raw dependency source path is not canonical/u,
+  );
+  rejectSources(
+    (sources) => {
+      sources[0] = null as unknown as TypeScriptDependencyValidationSource;
+    },
+    /raw dependency source is invalid/u,
+  );
+  rejectSources(
+    (sources) => {
+      (sources[0] as unknown as { relativePath: unknown }).relativePath = null;
+    },
+    /raw dependency source path is not canonical/u,
+  );
+  rejectSources(
+    (sources) => { sources.push(structuredClone(sources[0]!)) },
+    /raw dependency source path is duplicated/u,
+  );
+  rejectSources(
+    (sources) => {
+      (sources[0] as unknown as { text: unknown }).text = null;
+    },
+    /raw dependency source text is invalid/u,
+  );
+  rejectSources(
+    (sources) => {
+      (sources[0] as unknown as { syntacticallyValid: unknown }).syntacticallyValid = "true";
+    },
+    /raw dependency source syntax validity is invalid/u,
+  );
+
+  type SpanField =
+    | "importTypeModuleSpans"
+    | "moduleCallSpans"
+    | "nonLiteralModuleSpans"
+    | "typeUseSpans"
+    | "callSpans";
+  const spanCases: readonly { field: SpanField; errorName: string }[] = [
+    { field: "importTypeModuleSpans", errorName: "import-type" },
+    { field: "moduleCallSpans", errorName: "module-call" },
+    { field: "nonLiteralModuleSpans", errorName: "non-literal module" },
+    { field: "typeUseSpans", errorName: "type-use" },
+    { field: "callSpans", errorName: "call" },
+  ];
+  const sourceWithSpan = (
+    sources: TypeScriptDependencyValidationSource[],
+    field: SpanField,
+  ): TypeScriptDependencyValidationSource => {
+    const source = sources.find((candidate) => candidate[field].length > 0);
+    assert.ok(source, `missing ${field} fixture`);
+    return source;
+  };
+
+  for (const { field, errorName } of spanCases) {
+    rejectSources((sources) => {
+      const source = sourceWithSpan(sources, field);
+      (source as unknown as Record<SpanField, unknown>)[field] = null;
+    }, new RegExp(`raw dependency ${errorName} validation spans are missing`, "u"));
+    rejectSources((sources) => {
+      const source = sourceWithSpan(sources, field);
+      const spans = source[field];
+      (source as unknown as Record<SpanField, unknown>)[field] = [
+        null,
+        ...spans.slice(1),
+      ];
+    }, new RegExp(`raw dependency ${errorName} validation span is invalid`, "u"));
+    rejectSources((sources) => {
+      const source = sourceWithSpan(sources, field);
+      const spanValue = source[field][0]!;
+      spanValue.endOffset = source.text.length + 1;
+    }, new RegExp(`raw dependency ${errorName} validation span is invalid`, "u"));
+    rejectSources((sources) => {
+      const source = sourceWithSpan(sources, field);
+      const spans = source[field];
+      (source as unknown as Record<SpanField, unknown>)[field] = [
+        ...spans,
+        structuredClone(spans[0]!),
+      ];
+    }, new RegExp(`raw dependency ${errorName} validation span is duplicated`, "u"));
+  }
+});
