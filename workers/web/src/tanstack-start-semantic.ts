@@ -24,6 +24,7 @@ import {
 import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
+  emitFrameworkSemanticRelation,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -37,13 +38,10 @@ import {
   preferredWebEnvironment,
   PROFILE_ID,
   type Condition,
-  type DependencySite,
   type Diagnostic,
   type Evidence,
-  type GraphEdge,
   type GraphNode,
   type JsonValue,
-  type Precision,
   type ResolutionStatus,
 } from "./types";
 import type { PackageRecord } from "./workspace";
@@ -488,47 +486,17 @@ export function collectTanStackStartSemanticDelta(
     algorithm: string | null = null,
     properties: Record<string, JsonValue> = {},
   ): void => {
-    const targets = [...targetsValue].sort((left, right) => compareUtf8(left.id, right.id));
-    const precision: Precision = status === "candidates" ? "overapprox" : status === "unresolved" ? "heuristic" : "exact";
-    const canonicalCondition = canonicalizeCondition(relationCondition);
     const relationEvidence = evidence(relativePath, span, occurrenceKind, { ...properties, ...(algorithm ? { algorithm } : {}) });
-    const siteId = stableId("site", { condition: canonicalCondition, kind, path: relativePath, profile_id: PROFILE_ID, source: source.id, span });
-    const site: DependencySite = {
-      id: siteId,
-      source: source.id,
-      kind,
-      specifier,
-      resolution_status: status,
-      target_ids: targets.map((target) => target.id),
-      profile_id: PROFILE_ID,
-      condition: canonicalCondition,
-      precision,
-      reason,
-      evidence: relationEvidence,
-    };
-    const existingSite = sites.get(site.id);
-    if (existingSite && JSON.stringify(existingSite) !== JSON.stringify(site)) throw new Error(`TanStack Start collector produced conflicting site ${site.id}`);
-    sites.set(site.id, existingSite ?? site);
-    for (const target of targets) {
-      const edge: GraphEdge = {
-        id: stableId("edge", { kind, site_id: site.id, target: target.id }),
-        source: source.id,
-        target: target.id,
-        kind,
-        site_id: site.id,
-        phase: "semantic",
-        environment: preferredWebEnvironment(environment),
-        profile_id: PROFILE_ID,
-        condition: canonicalCondition,
-        resolution_status: status,
-        precision,
-        generated: false,
-        evidence: relationEvidence,
-      };
-      const existingEdge = edges.get(edge.id);
-      if (existingEdge && JSON.stringify(existingEdge) !== JSON.stringify(edge)) throw new Error(`TanStack Start collector produced conflicting edge ${edge.id}`);
-      edges.set(edge.id, existingEdge ?? edge);
-    }
+    emitFrameworkSemanticRelation(
+      { sites, edges },
+      {
+        source, targets: targetsValue, kind, specifier, relativePath, span,
+        condition: relationCondition, environment: preferredWebEnvironment(environment),
+        profileId: PROFILE_ID, resolutionStatus: status, precision: null, reason,
+        evidence: relationEvidence, generated: false,
+      },
+      { conflictSubject: "TanStack Start collector", emptyTargetSubject: "TanStack Start relation" },
+    );
   };
 
   const definitionsByPath = new Map<string, TypeScriptRawDefinition[]>();

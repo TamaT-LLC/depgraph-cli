@@ -10,6 +10,8 @@ import {
   type FrameworkCompletenessEntry,
   type FrameworkSemanticSummary,
   type JsonValue,
+  type Precision,
+  type ResolutionStatus,
 } from "./types";
 
 export const WEB_FRAMEWORK_SEMANTIC_CAPABILITY = "framework-semantic-graph-v1" as const;
@@ -134,6 +136,108 @@ export interface FrameworkSemanticDelta {
 export interface FrameworkSemanticDeltaOptions {
   profileId: string;
   capability: string;
+}
+
+export interface FrameworkSemanticRelationStore {
+  readonly sites: Map<string, DependencySite>;
+  readonly edges: Map<string, GraphEdge>;
+}
+
+export interface FrameworkSemanticRelationContext {
+  readonly conflictSubject: string;
+  readonly emptyTargetSubject: string;
+}
+
+export interface FrameworkSemanticRelationInput {
+  readonly source: Readonly<Pick<GraphNode, "id">>;
+  readonly targets: readonly Readonly<Pick<GraphNode, "id">>[];
+  readonly kind: string;
+  readonly specifier: string;
+  readonly relativePath: string;
+  readonly span: {
+    readonly start_line: number;
+    readonly start_column: number;
+    readonly end_line: number;
+    readonly end_column: number;
+  };
+  readonly condition: Condition;
+  readonly environment: string;
+  readonly profileId: string;
+  readonly resolutionStatus: ResolutionStatus;
+  readonly precision: Precision | null;
+  readonly reason: string | null;
+  readonly evidence: readonly Evidence[];
+  readonly generated: boolean;
+}
+
+function defaultPrecision(status: ResolutionStatus): Precision {
+  return status === "candidates" ? "overapprox"
+    : status === "unresolved" ? "heuristic"
+      : "exact";
+}
+
+/** Emit one complete site and its target edges after checking every identity conflict. */
+export function emitFrameworkSemanticRelation(
+  store: FrameworkSemanticRelationStore,
+  input: FrameworkSemanticRelationInput,
+  context: FrameworkSemanticRelationContext,
+): void {
+  const targetIds = [...new Set(input.targets.map((target) => target.id))].sort(compareUtf8);
+  if (targetIds.length === 0) throw new Error(`${context.emptyTargetSubject} ${input.kind} has no target`);
+
+  const condition = canonicalizeCondition(input.condition);
+  const precision = input.precision ?? defaultPrecision(input.resolutionStatus);
+  const evidence = [...input.evidence];
+  const siteId = stableId("site", {
+    condition,
+    kind: input.kind,
+    path: input.relativePath,
+    profile_id: input.profileId,
+    source: input.source.id,
+    span: input.span,
+  });
+  const site: DependencySite = {
+    id: siteId,
+    source: input.source.id,
+    kind: input.kind,
+    specifier: input.specifier,
+    resolution_status: input.resolutionStatus,
+    target_ids: targetIds,
+    profile_id: input.profileId,
+    condition,
+    precision,
+    reason: input.reason,
+    evidence,
+  };
+  const relationEdges: GraphEdge[] = targetIds.map((target) => ({
+    id: stableId("edge", { kind: input.kind, site_id: site.id, target }),
+    source: input.source.id,
+    target,
+    kind: input.kind,
+    site_id: site.id,
+    phase: "semantic",
+    environment: input.environment,
+    profile_id: input.profileId,
+    condition,
+    resolution_status: input.resolutionStatus,
+    precision,
+    generated: input.generated,
+    evidence,
+  }));
+
+  const existingSite = store.sites.get(site.id);
+  if (existingSite !== undefined && JSON.stringify(existingSite) !== JSON.stringify(site)) {
+    throw new Error(`${context.conflictSubject} produced conflicting site ${site.id}`);
+  }
+  for (const edge of relationEdges) {
+    const existingEdge = store.edges.get(edge.id);
+    if (existingEdge !== undefined && JSON.stringify(existingEdge) !== JSON.stringify(edge)) {
+      throw new Error(`${context.conflictSubject} produced conflicting edge ${edge.id}`);
+    }
+  }
+
+  store.sites.set(site.id, existingSite ?? site);
+  for (const edge of relationEdges) store.edges.set(edge.id, store.edges.get(edge.id) ?? edge);
 }
 
 function objectValue(value: JsonValue | undefined, field: string): Record<string, JsonValue> {
