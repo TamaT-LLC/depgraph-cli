@@ -1,0 +1,3259 @@
+{
+  "finding_counts": {
+    "scripts/build.mjs": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-integration-entry.ts": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts": {
+      "complexity_critical": {
+        "count": 3
+      },
+      "crap_critical": {
+        "count": 11
+      },
+      "crap_high": {
+        "count": 9
+      },
+      "crap_moderate": {
+        "count": 11
+      }
+    },
+    "src/astro-semantic.ts": {
+      "complexity_critical": {
+        "count": 4
+      },
+      "crap_critical": {
+        "count": 6
+      },
+      "crap_high": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 4
+      }
+    },
+    "src/build-evidence-entry.ts": {
+      "crap_moderate": {
+        "count": 3
+      }
+    },
+    "src/framework-build-contract.ts": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 4
+      },
+      "crap_high": {
+        "count": 3
+      },
+      "crap_moderate": {
+        "count": 5
+      }
+    },
+    "src/framework-semantic.ts": {
+      "complexity_critical": {
+        "count": 4
+      },
+      "crap_critical": {
+        "count": 9
+      },
+      "crap_high": {
+        "count": 4
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/fs.ts": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 2
+      },
+      "crap_moderate": {
+        "count": 2
+      }
+    },
+    "src/imports.ts": {
+      "complexity_critical": {
+        "count": 23
+      },
+      "complexity_high": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 31
+      },
+      "crap_high": {
+        "count": 8
+      },
+      "crap_moderate": {
+        "count": 8
+      }
+    },
+    "src/incremental.ts": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 3
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 3
+      }
+    },
+    "src/next-build-adapter-entry.ts": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts": {
+      "complexity_critical": {
+        "count": 6
+      },
+      "crap_critical": {
+        "count": 13
+      },
+      "crap_high": {
+        "count": 4
+      },
+      "crap_moderate": {
+        "count": 6
+      }
+    },
+    "src/next-semantic.ts": {
+      "complexity_critical": {
+        "count": 4
+      },
+      "crap_critical": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 8
+      }
+    },
+    "src/routes.ts": {
+      "complexity_critical": {
+        "count": 6
+      },
+      "crap_critical": {
+        "count": 6
+      },
+      "crap_high": {
+        "count": 3
+      },
+      "crap_moderate": {
+        "count": 3
+      }
+    },
+    "src/runtime-collector.ts": {
+      "complexity_critical": {
+        "count": 5
+      },
+      "crap_critical": {
+        "count": 8
+      },
+      "crap_high": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 3
+      }
+    },
+    "src/scanner.ts": {
+      "complexity_critical": {
+        "count": 4
+      },
+      "crap_critical": {
+        "count": 5
+      },
+      "crap_high": {
+        "count": 7
+      },
+      "crap_moderate": {
+        "count": 9
+      }
+    },
+    "src/semantic-delta.ts": {
+      "complexity_critical": {
+        "count": 3
+      },
+      "crap_critical": {
+        "count": 3
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 2
+      }
+    },
+    "src/source-fingerprint.ts": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer-entry.ts": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts": {
+      "complexity_critical": {
+        "count": 7
+      },
+      "crap_critical": {
+        "count": 14
+      },
+      "crap_high": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 8
+      }
+    },
+    "src/tanstack-router-semantic.ts": {
+      "complexity_critical": {
+        "count": 7
+      },
+      "crap_critical": {
+        "count": 9
+      },
+      "crap_high": {
+        "count": 2
+      },
+      "crap_moderate": {
+        "count": 8
+      }
+    },
+    "src/tanstack-start-build-observer-entry.ts": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts": {
+      "complexity_critical": {
+        "count": 6
+      },
+      "crap_critical": {
+        "count": 12
+      },
+      "crap_high": {
+        "count": 8
+      },
+      "crap_moderate": {
+        "count": 11
+      }
+    },
+    "src/tanstack-start-semantic.ts": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 5
+      },
+      "crap_high": {
+        "count": 4
+      },
+      "crap_moderate": {
+        "count": 5
+      }
+    },
+    "src/types.ts": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 2
+      }
+    },
+    "src/typescript-compiler.ts": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 8
+      },
+      "crap_high": {
+        "count": 2
+      },
+      "crap_moderate": {
+        "count": 5
+      }
+    },
+    "src/typescript-dependencies.ts": {
+      "complexity_critical": {
+        "count": 21
+      },
+      "crap_critical": {
+        "count": 31
+      },
+      "crap_high": {
+        "count": 11
+      },
+      "crap_moderate": {
+        "count": 12
+      }
+    },
+    "src/typescript-dependency-contract.ts": {
+      "complexity_critical": {
+        "count": 3
+      },
+      "crap_critical": {
+        "count": 3
+      },
+      "crap_high": {
+        "count": 4
+      },
+      "crap_moderate": {
+        "count": 5
+      }
+    },
+    "src/typescript-dependency-validation.ts": {
+      "complexity_critical": {
+        "count": 23
+      },
+      "crap_critical": {
+        "count": 37
+      },
+      "crap_high": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 4
+      }
+    },
+    "src/typescript-semantic.ts": {
+      "complexity_critical": {
+        "count": 9
+      },
+      "crap_critical": {
+        "count": 11
+      },
+      "crap_high": {
+        "count": 11
+      },
+      "crap_moderate": {
+        "count": 9
+      }
+    },
+    "src/worker.ts": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 2
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts": {
+      "complexity_critical": {
+        "count": 8
+      },
+      "crap_critical": {
+        "count": 8
+      },
+      "crap_high": {
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 8
+      }
+    }
+  },
+  "identity_finding_counts": {
+    "scripts/build.mjs\u0000bundledPackageName": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-integration-entry.ts\u0000depgraphAstroBuildObserver": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000<arrow>": {
+      "crap_moderate": {
+        "count": 4
+      }
+    },
+    "src/astro-build-observer.ts\u0000boundedString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000buildAstroObservedGraph": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000canonicalPathname": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000canonicalRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000confinedDistArtifact": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000createAstroBuildObserverIntegration": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000finalObservation": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000generateBundle": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000indexAstroRoutes": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000logicalId": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000manifestEntryModules": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000modules": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000normalizeConfig": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000observedOutput": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000outputs": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000params": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000patternDigest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000routeAssetRows": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000routeParams": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000routeType": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000sanitizeRoute": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000timeoutMs": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000upsert": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000validateAstroBuildObservationContract": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000validateExpectedChain": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000viteEnvironment": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-build-observer.ts\u0000viteOutDir": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000<arrow>": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000addNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000collectAstroSemanticDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000componentTargets": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000contentBinding": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000dottedName": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000flowReferences": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000matchingToken": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000parseFrontmatter": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000resolveReference": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000resolveTag": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000spanFromNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000statementEnd": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000symbolComponent": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000tagSpan": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/astro-semantic.ts\u0000topLevelToken": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/build-evidence-entry.ts\u0000boundedString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/build-evidence-entry.ts\u0000convert": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/build-evidence-entry.ts\u0000parseInput": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000canonicalRelativePath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000conditionAllowsEnvironment": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000evidenceProvenance": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000frameworkBuildCoverage": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000frameworkBuildProtocolEvents": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000frameworkBuildRelation": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000frameworkBuildUnresolvedTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000nodes": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000nonempty": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000record": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000validateFrameworkBuildDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-build-contract.ts\u0000validateGeneratedNode": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000completionLedger": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000conditionAllowsEnvironment": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000emitFrameworkSemanticRelation": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000mergeFrameworkSemanticDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000objectValue": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000sameAnchor": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000support": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validSourceKind": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validTargetKind": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validateEdge": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validateEvidence": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validateFrameworkNode": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validateResolution": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/framework-semantic.ts\u0000validateSite": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/fs.ts\u0000inventoryFilesFromManifest": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/fs.ts\u0000isRelevantFileName": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/fs.ts\u0000readJson": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/fs.ts\u0000visit": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000<anonymous>": {
+      "complexity_critical": {
+        "count": 8
+      },
+      "complexity_high": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 11
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000checkSegment": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000collect": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000compareVersions": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000conditionIsSatisfiable": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000declaredPackageEntry": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000evaluate": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000extractDependencies": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000extractPotentialTypeScriptModuleSpecifiers": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000fileBaseCandidates": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000loading": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000looksLikeJsxElementStart": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000matches": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000matchesComparator": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000matchesTypeScriptVersionRange": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000matchingParen": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000namedBindingsAreEntirelyTypeOnly": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000packageEntrySelection": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000packageImportSelection": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000packageTargetIsSyntacticallyValid": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000parseComparator": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000parseHyphenRange": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000parsePartialVersion": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000parseStaticJsonc": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000prepareSource": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000quotedCommentValues": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000resolvePortableRepositoryPath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000resolveTarget": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000scanTokens": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000searchConditionalTarget": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000selectPackageMapEntry": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000selectorState": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000typeScriptPathPatternsOverlap": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000typeScriptStaticConfig": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/imports.ts\u0000typescriptParseDiagnostics": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000deltaEventsFor": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000evidenceIsScoped": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000finalAggregateCoverage": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000parseWorkerDeltaRequest": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000scopedEdges": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000scopedNodes": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/incremental.ts\u0000semanticNoopDeltaEventsFor": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-adapter-entry.ts\u0000loadExistingAdapter": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000artifactRole": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000assetRole": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000boundedString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000buildNextObservedGraph": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000canonicalPathname": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000canonicalRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000canonicalRoutePattern": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000canonicalSourcePage": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000collectNextBuildObservation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000compatibleSemantic": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000defaultArtifactReader": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000digestArtifact": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000logicalFromAbsolute": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000outputVariant": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000preflightNextBuildObserver": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000routeCandidates": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000routePatternWithBasePath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000routeVariant": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000sanitizeNextConfig": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000sanitizeOutput": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000sanitizeRouting": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000validateAdapter": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-build-observer.ts\u0000validateNextBuildObservation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000<arrow>": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000addNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000collectNextSemanticDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000componentFor": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000componentForImportedDefinition": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000directDynamicImport": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000frameworkComponent": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000nextCondition": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000routeSyntax": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000routerKind": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000sourceMetadata": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000spanFromNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/next-semantic.ts\u0000syntaxExportDefinitionKeys": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000add": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000canonicalBasePath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000discoverAstro": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000discoverNext": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000discoverRoutes": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000discoverTanStack": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000literalGeneratedRoutes": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000literalProperty": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000literalStringArrayProperty": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000normalizePattern": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000staticRouteConfig": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/routes.ts\u0000withoutComments": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000boundedInteger": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000canonicalizeHttpObservation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000canonicalizeHttpTarget": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000canonicalizeLocator": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000canonicalizeTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000countFor": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000createDescriptor": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000createRuntimeCollector": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000deliver": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000looksLikeAbsolutePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000looksLikeSecret": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000normalizeConfiguration": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000normalizeNames": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000normalizeRedaction": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000normalizeRepositoryPath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000record": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/runtime-collector.ts\u0000write": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000<arrow>": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000addEdge": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000addNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000callSourcePath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000canonicalResolver": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000canonicalTypeArgument": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000dependency": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000dependencyTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000fileNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000identityPackage": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000insertNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000lineEvidence": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000localTypeScriptVersion": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000materializeDefinition": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000mergeFrameworkResult": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000mergeFrameworkSemanticGraph": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000mergeTypeScriptSemanticGraph": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000packageDependencyResolution": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000rawDependencyTargetKey": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000refineTypeScriptDependencyDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000scan": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000mergeTypeScriptDefinitionDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000objectValue": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000positiveInteger": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000validateRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000validateSemanticEdge": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/semantic-delta.ts\u0000validateSemanticNode": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/source-fingerprint.ts\u0000analysisContentHash": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer-entry.ts\u0000depgraphTanStackRouterBuildObserver": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000<arrow>": {
+      "crap_critical": {
+        "count": 1
+      },
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000boundedString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000buildTanStackRouterObservedGraph": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000canonicalRelativePath": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000configuredBasePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000configuredPath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000createTanStackRouterBuildObserverPlugin": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000finalObservation": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000interfaceEntries": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000logicalModule": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000matchingDelimiter": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000mergeModules": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000normalizeRoutePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000objectAfterCall": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000observedOutput": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000parseCodeRoutes": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000parseGeneratedRouteTree": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000parseMasks": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000quotedAt": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000readGeneratedArtifact": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000routes": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000skipTrivia": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000staticCandidates": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000timeoutValue": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000validateFinalPluginChain": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000validateModule": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-build-observer.ts\u0000validateTanStackRouterBuildObservation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000<arrow>": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 2
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000addNavigation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000addNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000addVirtualChildren": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000appendRoute": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000basePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000collectTanStackRouterSemanticDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000componentFor": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000componentNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000declarationPattern": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000definitionFor": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000importBindings": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000property": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000propertyExpression": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000returnedIdentifier": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-router-semantic.ts\u0000routeFactory": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer-entry.ts\u0000depgraphTanStackStartBuildObserver": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000<arrow>": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      },
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000base": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000boundedModuleString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000boundedString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000buildTanStackStartObservedGraph": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000canonicalRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000canonicalStringList": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000createTanStackStartBuildObserverPlugin": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000finalObservation": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000jsString": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000logicalModule": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000mergeModules": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000moduleRole": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000normalizedModuleId": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000observedOutput": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000providerEnvironmentName": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000reachesOutput": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000tanStackStartBuildFailureDiagnostic": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000timeoutValue": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000upsertServerFunction": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateFinalPluginChain": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedBuild": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedConfig": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedModule": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedOutput": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedServerFunction": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateObservedStub": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateRpcManifest": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-build-observer.ts\u0000validateTanStackStartBuildObservation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000<arrow>": {
+      "crap_critical": {
+        "count": 1
+      },
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000addNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000allImportBindings": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000callChain": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000collectTanStackStartSemanticDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000importBindings": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000middlewareForImport": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000middlewareNode": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000parseAlternative": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000propertyExpression": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000serverFunctionForImport": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000serverFunctionNode": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/tanstack-start-semantic.ts\u0000supportedVersion": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/types.ts\u0000canonicalizeCondition": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/types.ts\u0000readWebEnvironments": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000<arrow>": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000addDirectory": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000analyzeTypeScriptProjectInner": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000attach": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000closeCompiler": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000exerciseTypeScriptCompilerLifecycleForTest": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000isConfinedTypeScriptInputPath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000isEntirelyTypeOnlyExport": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000isEntirelyTypeOnlyImport": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000loadBundledStandardLibrary": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000neutralEnvironment": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000operation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000projectFailure": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000semanticDiagnostic": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-compiler.ts\u0000visit": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000<arrow>": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000add": {
+      "crap_high": {
+        "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000addTypeUse": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000bindingTargets": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000callBindingProvenance": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000callExecutionOwner": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000callKindForDefinition": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000closedFreshInstanceMethodTargets": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000closedLocalCallableTargets": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000closedLocalFreshInstanceCallTargets": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000closedLocalFunctionCallTargets": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectCallImport": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectExportDeclaration": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectImportDeclaration": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectImportType": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectInvalidOccurrences": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectJSDocImportTag": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectModuleExportProofs": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectSemanticCall": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectTypeReference": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000collectValidation": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000compilerSymbolTargets": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000createCallSite": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000createSite": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000definitionIndex": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000directCallDispatch": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000directCallableTargetsForIdentifier": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000externalTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000extractTypeScriptRawDependencyDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000hasConservativelyClosedFreshReceiverUses": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000hasConservativelySafeFreshInstanceClass": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000hasConservativelySafeFreshInstanceClassShape": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000isAmbiguousImportBindingAt": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000isDirectClosedFreshInstanceCallUse": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000localConstBindingForIdentifier": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000moduleTargets": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000nearestDirectImportBindingOrigins": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000ownerAtNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000queryExports": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000queryProperties": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000queryTypeAtLocation": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000queryTypeOfSymbol": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000record": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000recordClause": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000recordSymbolProof": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000resolvedSignatureDeclaration": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000sourcePathMap": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000visit": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 3
+      },
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000visitExports": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependencies.ts\u0000visitTypeProperties": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000bindingNameMatches": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000bindingScopeSpan": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000directScopeDeclarationMatches": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000hasUnpairedSurrogate": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000isAmbientRequireSymbol": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000isCanonicalRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000isLexicallyShadowedBinding": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000isModuleLoaderCall": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000querySymbol": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000resolutionModeDirective": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000stringLiteralText": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-contract.ts\u0000targetSortKey": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000<arrow>": {
+      "crap_moderate": {
+        "count": 2
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000add": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000ambiguousLocalReexportSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000ambiguousTypeUseSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000bindingReferenceCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000bindingScopeCorrelates": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildCallSpanIndex": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildImportTypeModuleSpanIndex": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildModuleCallSpanIndex": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildNonLiteralModuleSpanIndex": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildTypeScriptDependencyBindingValidationContext": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildTypeScriptDependencyValidationContext": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000buildTypeUseSpanIndex": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000dependencyValidationTokens": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000directBindingSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000identifierValueAt": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000importTypeResolutionMode": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000inlineImportReferenceCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000jsDocBindingSyntaxCorrelates": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000jsDocImportTagTokens": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000jsDocImportTypeSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000jsDocModuleImportSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000moduleCallValidationOccurrence": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000moduleLiteralSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000namedBindingSyntax": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000reexportSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000resolutionModeInAttributeObject": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000resolutionModeProofCorrelates": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000staticResolutionMode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000tokenValue": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000topLevelTokenSegments": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000typeOnlyImportClause": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000unresolvedCallModuleSyntaxCorrelates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateRawCondition": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptCallLedger": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptDependencyBindingClosure": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptDependencyClosure": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptDependencySiteAttestations": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptDependencySites": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000validateTypeScriptModuleExportProofs": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-dependency-validation.ts\u0000visit": {
+      "complexity_critical": {
+        "count": 2
+      },
+      "crap_critical": {
+        "count": 5
+      },
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000candidateIdentityKind": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000candidateResolver": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000candidateSemanticKind": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000collectSources": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000collectTypeArgument": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000createGroups": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000declarationCandidate": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000deduplicateIssues": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000extractTypeScriptRawDefinitionDeltaUnchecked": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000hasCanonicalMemberOwner": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000hasDescendantExplicitTypeArguments": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000hasUnpairedSurrogate": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000intrinsicTypeDescriptor": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000isCanonicalRelativePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000lookupSymbolDefinition": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000namedTypeDescriptor": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000propertyName": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000querySymbols": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000queryTypes": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000resolveMatchingDeclaration": {
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000semanticKindForGroup": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000sortIssues": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000sortRelations": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000sourceMatchesInventory": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000symbolDeclaresTypeParameter": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000terminalReferenceName": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000typeDescriptor": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000validateTypeArgument": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000validateTypeScriptRawDefinitionDelta": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000visit": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/typescript-semantic.ts\u0000wellFormedDiagnosticText": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/worker.ts\u0000eventsFor": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/worker.ts\u0000main": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/worker.ts\u0000parseArgs": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/worker.ts\u0000typeScriptProfileProperties": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000addLockInstance": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000collectJsonLockInstances": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000collectPnpInstances": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000compareSemver": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000dependenciesOf": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000detectManager": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000discoverWorkspace": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000expanded": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000explicitLocalPackages": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000flush": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000globRegex": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000isWorkspacePath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000loadLockInstances": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000loadManifest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000normalizeRemote": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000parseSemver": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000repositoryIdentity": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000selectPackageInstallCandidates": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000semverSatisfies": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000semverSatisfiesAlternative": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000unquoteLockScalar": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000workspacePatterns": {
+      "complexity_critical": {
+        "count": 1
+      },
+      "crap_critical": {
+        "count": 1
+      }
+    }
+  },
+  "runtime_coverage_findings": [],
+  "target_keys": []
+}

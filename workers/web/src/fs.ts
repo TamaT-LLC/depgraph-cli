@@ -1,3 +1,4 @@
+import type { Dirent, Stats } from "node:fs";
 import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { compareUtf8 } from "./types";
@@ -139,7 +140,7 @@ export async function inventoryFiles(root: string): Promise<FileInventory> {
       issue(directory, "unreadable_path", "directory could not be resolved within the repository boundary");
       return;
     }
-    let entries;
+    let entries: Dirent[];
     try {
       entries = await readdir(resolvedDirectory, { withFileTypes: true });
     } catch {
@@ -248,7 +249,7 @@ export async function inventoryFilesFromManifest(
   const issues: FileInventoryIssue[] = [];
   for (const relative of relativePaths) {
     const absolute = path.join(canonicalRoot, ...relative.split("/"));
-    let metadata;
+    let metadata: Stats;
     try {
       metadata = await lstat(absolute);
     } catch {

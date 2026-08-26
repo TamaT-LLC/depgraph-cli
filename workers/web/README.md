@@ -8,6 +8,37 @@ node dist/worker.mjs --root <repository> --scan-id <id>
 
 The worker writes protocol `1.0` NDJSON to stdout and operational logs to stderr. It performs a safe, read-only scan and reports `project_code_executed=false` in both the scan and profile metadata.
 
+## Development quality gate
+
+Install the pinned dependencies and run the same Web checks as CI:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm quality && pnpm check && pnpm test
+```
+
+`pnpm quality` runs the repository-local Biome linter and formatter check,
+verifies that Fallow finds no production unused entry files, unresolved
+imports, or import cycles, and rejects duplication or complexity identities
+added after WEB-REFACTOR-TASK-001 through WEB-REFACTOR-TASK-004. To avoid an
+unrelated rewrite of legacy source, formatting initially covers the new
+quality-gate script and its regression test; linting still covers all TypeScript
+source, build scripts, and top-level tests. Use `pnpm format` to apply the pinned
+formatter to that reviewed scope.
+
+`.fallowrc.jsonc` lists all seven bundle roots consumed by
+`scripts/build.mjs`. Only `test/fixtures/**` is excluded because those files
+deliberately model malformed, missing, and manager-specific projects. The four
+ignored `../dist/*` specifiers are generated build outputs referenced before a
+build exists; other missing imports still fail. The configuration has no
+remote inheritance and the quality workflow does not enable telemetry.
+
+Existing production clones and complex functions are stored by identity under
+`fallow-baselines/`. A matching identity is tolerated, while a new clone group
+or complex function fails. Review the finding before updating either baseline;
+the regeneration commands and rationale are in
+`fallow-baselines/README.md`.
+
 ## Dynamic framework build graph contract
 
 The checksum-attested Next.js, Astro, TanStack Router, and TanStack Start
