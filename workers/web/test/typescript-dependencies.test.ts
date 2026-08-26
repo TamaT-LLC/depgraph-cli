@@ -1150,3 +1150,65 @@ test("validateTypeScriptRawDependencyDelta validates source context and span ind
     }, new RegExp(`raw dependency ${errorName} validation span is duplicated`, "u"));
   }
 });
+
+test("validateTypeScriptRawDependencyDelta preserves phased validation and final closure", async () => {
+  const fixture = await extractDependencyDelta(DELTA_SOURCES, "__depgraph_ts_deps_phases__");
+  const validate = (delta: TypeScriptRawDependencyDelta): void => {
+    validateTypeScriptRawDependencyDelta(delta, fixture.definitions, fixture.validationSources);
+  };
+  const reject = (mutate: (delta: TypeScriptRawDependencyDelta) => void, pattern: RegExp): void => {
+    const delta = structuredClone(fixture.dependencies);
+    mutate(delta);
+    assert.throws(() => validate(delta), pattern);
+  };
+
+  const accepted = structuredClone(fixture.dependencies);
+  const acceptedBeforeValidation = structuredClone(accepted);
+  assert.doesNotThrow(() => validate(accepted));
+  assert.deepStrictEqual(accepted, acceptedBeforeValidation);
+
+  reject((delta) => {
+    delta.moduleExports[0]!.definitionKeys[0] = "missing-definition";
+  }, /raw module export target is not a canonical definition/u);
+  reject((delta) => {
+    delta.sites[0]!.evidence.startOffset += 1;
+  }, /raw dependency type-use occurrence contradicts parser context/u);
+  reject((delta) => {
+    const site = delta.sites.find((candidate) => candidate.bindingOrigin !== null);
+    assert.ok(site?.bindingOrigin);
+    site.bindingOrigin.siteKey = "missing-binding-origin";
+  }, /raw dependency binding origin does not correlate/u);
+  reject((delta) => {
+    delta.sites[0]!.targetConditions = [];
+  }, /raw dependency target conditions do not align with targets/u);
+  reject((delta) => {
+    delta.calls[0]!.dispatch = "open";
+  }, /raw call status\/precision\/target contract is invalid/u);
+
+  reject((delta) => {
+    delta.moduleExports.reverse();
+  }, /raw module export proofs are not strictly sorted/u);
+  reject((delta) => {
+    delta.sites.reverse();
+  }, /raw dependency sites are not strictly sorted/u);
+  reject((delta) => {
+    delta.calls[0]!.key = "noncanonical-call-key";
+  }, /raw call site key is not canonical/u);
+  reject((delta) => {
+    delta.calls = [];
+  }, /parser-confirmed call occurrence is missing from the raw ledger/u);
+
+  // Earlier phases must still win when later ledgers are malformed too.
+  reject((delta) => {
+    delta.moduleExports[0]!.definitionKeys[0] = "missing-definition";
+    delta.calls = [];
+  }, /raw module export target is not a canonical definition/u);
+  reject((delta) => {
+    delta.sites[0]!.targetConditions = [];
+    delta.calls = [];
+  }, /raw dependency target conditions do not align with targets/u);
+  reject((delta) => {
+    delta.calls[0]!.targets = [];
+    delta.calls[0]!.key = "noncanonical-call-key";
+  }, /raw call site has no target or unaligned target conditions/u);
+});
