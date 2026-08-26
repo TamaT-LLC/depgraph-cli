@@ -17,7 +17,10 @@ interface CommandResult {
   stderr: string;
 }
 
-async function command(args: readonly string[], options: { cwd: string; env?: NodeJS.ProcessEnv }): Promise<CommandResult> {
+async function command(
+  args: readonly string[],
+  options: { cwd: string; env?: NodeJS.ProcessEnv },
+): Promise<CommandResult> {
   try {
     const result = await execute(process.execPath, [...args], {
       cwd: options.cwd,
@@ -50,51 +53,73 @@ async function createQualityFixture(): Promise<{
   await mkdir(path.join(root, "node_modules"));
   await writeFile(path.join(root, "package.json"), `${JSON.stringify({ type: "module" }, null, 2)}\n`);
   await writeFile(path.join(source, "index.ts"), "export const baselineValue = 1;\n");
-  await writeFile(path.join(root, "biome.json"), `${JSON.stringify({
-    files: { includes: ["src/**/*.ts"] },
-    linter: { enabled: true, rules: { preset: "recommended" } },
-  }, null, 2)}\n`);
+  await writeFile(
+    path.join(root, "biome.json"),
+    `${JSON.stringify(
+      {
+        files: { includes: ["src/**/*.ts"] },
+        formatter: { enabled: false },
+        linter: { enabled: true, rules: { preset: "recommended" } },
+      },
+      null,
+      2,
+    )}\n`,
+  );
   const config = path.join(root, ".fallowrc.json");
-  await writeFile(config, `${JSON.stringify({
-    entry: ["src/index.ts"],
-    rules: {
-      "unused-files": "off",
-      "unused-exports": "off",
-      "unused-types": "off",
-      "unused-dependencies": "off",
-      "unused-dev-dependencies": "off",
-      "unlisted-dependencies": "off",
-      "duplicate-exports": "off",
-      "unresolved-imports": "error",
-      "circular-dependencies": "error",
-    },
-    duplicates: {
-      minTokens: 20,
-      minLines: 4,
-    },
-    health: {
-      maxCyclomatic: 3,
-      maxCognitive: 3,
-      maxCrap: 0,
-      maxUnitSize: 200,
-    },
-  }, null, 2)}\n`);
+  await writeFile(
+    config,
+    `${JSON.stringify(
+      {
+        entry: ["src/index.ts"],
+        rules: {
+          "unused-files": "off",
+          "unused-exports": "off",
+          "unused-types": "off",
+          "unused-dependencies": "off",
+          "unused-dev-dependencies": "off",
+          "unlisted-dependencies": "off",
+          "duplicate-exports": "off",
+          "unresolved-imports": "error",
+          "circular-dependencies": "error",
+        },
+        duplicates: {
+          minTokens: 20,
+          minLines: 4,
+        },
+        health: {
+          maxCyclomatic: 3,
+          maxCognitive: 3,
+          maxCrap: 0,
+          maxUnitSize: 200,
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
 
   for (const [analysis, baseline, extra] of [
     ["dupes", "dupes.json", []],
     ["health", "health.json", ["--complexity", "--baseline-mode", "identity"]],
   ] as const) {
-    const result = await command([
-      fallowBin,
-      analysis,
-      "--root", root,
-      "--config", config,
-      "--production",
-      ...extra,
-      "--save-baseline", path.join(baselines, baseline),
-      "--format", "json",
-      "--quiet",
-    ], { cwd: root });
+    const result = await command(
+      [
+        fallowBin,
+        analysis,
+        "--root",
+        root,
+        "--config",
+        config,
+        "--production",
+        ...extra,
+        "--save-baseline",
+        path.join(baselines, baseline),
+        "--format",
+        "json",
+        "--quiet",
+      ],
+      { cwd: root },
+    );
     assert.equal(result.code, 0, result.stderr || result.stdout);
   }
 
@@ -102,17 +127,42 @@ async function createQualityFixture(): Promise<{
     root,
     config,
     baselines,
-    runQuality: () => command([qualityScript], {
-      cwd: root,
-      env: {
-        ...process.env,
-        DEPGRAPH_WEB_QUALITY_ROOT: root,
-        DEPGRAPH_WEB_FALLOW_CONFIG: config,
-        DEPGRAPH_WEB_FALLOW_BASELINES: baselines,
-      },
-    }),
+    runQuality: () =>
+      command([qualityScript], {
+        cwd: root,
+        env: {
+          ...process.env,
+          DEPGRAPH_WEB_QUALITY_ROOT: root,
+          DEPGRAPH_WEB_FALLOW_CONFIG: config,
+          DEPGRAPH_WEB_FALLOW_BASELINES: baselines,
+        },
+      }),
   };
 }
+
+test("quality rejects formatting drift in the checked scope", async () => {
+  const fixture = await createQualityFixture();
+  try {
+    await writeFile(
+      path.join(fixture.root, "biome.json"),
+      `${JSON.stringify(
+        {
+          files: { includes: ["src/**/*.ts"] },
+          formatter: { enabled: true },
+          linter: { enabled: true, rules: { preset: "recommended" } },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await writeFile(path.join(fixture.root, "src/index.ts"), "export const baselineValue={ value:1 };\n");
+    const result = await fixture.runQuality();
+    assert.equal(result.code, 1, result.stdout + result.stderr);
+    assert.match(result.stdout + result.stderr, /Biome lint and format failed/u);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("quality rejects a new unresolved import", async () => {
   const fixture = await createQualityFixture();

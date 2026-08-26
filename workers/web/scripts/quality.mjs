@@ -4,9 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const qualityRoot = path.resolve(process.env.DEPGRAPH_WEB_QUALITY_ROOT ?? packageRoot);
-const fallowConfig = path.resolve(
-  process.env.DEPGRAPH_WEB_FALLOW_CONFIG ?? path.join(qualityRoot, ".fallowrc.jsonc"),
-);
+const fallowConfig = path.resolve(process.env.DEPGRAPH_WEB_FALLOW_CONFIG ?? path.join(qualityRoot, ".fallowrc.jsonc"));
 const baselineDirectory = path.resolve(
   process.env.DEPGRAPH_WEB_FALLOW_BASELINES ?? path.join(qualityRoot, "fallow-baselines"),
 );
@@ -19,9 +17,9 @@ const fallowBin = fileURLToPath(import.meta.resolve("fallow/bin/fallow"));
 
 const gates = [
   {
-    name: "Biome lint",
+    name: "Biome lint and format",
     executable: biomeBin,
-    args: ["lint", ".", "--diagnostic-level=error"],
+    args: ["check", ".", "--assist-enabled=false", "--diagnostic-level=error"],
   },
   {
     name: "Fallow import graph",
@@ -29,11 +27,14 @@ const gates = [
     captureJson: "import-graph",
     args: [
       "dead-code",
-      "--root", qualityRoot,
-      "--config", fallowConfig,
+      "--root",
+      qualityRoot,
+      "--config",
+      fallowConfig,
       "--production",
       "--summary",
-      "--format", "json",
+      "--format",
+      "json",
       "--quiet",
     ],
   },
@@ -42,14 +43,19 @@ const gates = [
     executable: fallowBin,
     args: [
       "dupes",
-      "--root", qualityRoot,
-      "--config", fallowConfig,
+      "--root",
+      qualityRoot,
+      "--config",
+      fallowConfig,
       "--production",
-      "--baseline", path.join(baselineDirectory, "dupes.json"),
+      "--baseline",
+      path.join(baselineDirectory, "dupes.json"),
       // A baseline-filtered report has 0% duplication. This smallest
       // practical positive ceiling therefore rejects every new clone group.
-      "--threshold", "0.000001",
-      "--format", "compact",
+      "--threshold",
+      "0.000001",
+      "--format",
+      "compact",
       "--quiet",
     ],
   },
@@ -58,14 +64,19 @@ const gates = [
     executable: fallowBin,
     args: [
       "health",
-      "--root", qualityRoot,
-      "--config", fallowConfig,
+      "--root",
+      qualityRoot,
+      "--config",
+      fallowConfig,
       "--production",
       "--complexity",
-      "--baseline", path.join(baselineDirectory, "health.json"),
-      "--baseline-mode", "identity",
+      "--baseline",
+      path.join(baselineDirectory, "health.json"),
+      "--baseline-mode",
+      "identity",
       "--fail-on-issues",
-      "--format", "compact",
+      "--format",
+      "compact",
       "--quiet",
     ],
   },
@@ -86,10 +97,10 @@ function renderCapturedFallback(captured) {
 function renderImportSummary(report) {
   const { entry_points: entryPoints, summary } = report;
   process.stdout.write(
-    `[quality] import graph: ${entryPoints.total} entries, `
-    + `${summary.unused_files} unused files, `
-    + `${summary.unresolved_imports} unresolved imports, `
-    + `${summary.circular_dependencies} cycles\n`,
+    `[quality] import graph: ${entryPoints.total} entries, ` +
+      `${summary.unused_files} unused files, ` +
+      `${summary.unresolved_imports} unresolved imports, ` +
+      `${summary.circular_dependencies} cycles\n`,
   );
 }
 
@@ -106,8 +117,7 @@ function renderCircularDependencies(report) {
 }
 
 function importGraphFailed(summary) {
-  return [summary.unused_files, summary.unresolved_imports, summary.circular_dependencies]
-    .some((count) => count > 0);
+  return [summary.unused_files, summary.unresolved_imports, summary.circular_dependencies].some((count) => count > 0);
 }
 
 function renderImportGraph(captured) {
@@ -150,7 +160,7 @@ function runGate(gate) {
       captured += chunk;
     });
     child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (signal !== null) {
         reject(new Error(`${gate.name} terminated by ${signal}`));
         return;

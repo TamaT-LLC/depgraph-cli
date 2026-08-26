@@ -17,11 +17,14 @@ pnpm install --frozen-lockfile
 pnpm quality && pnpm check && pnpm test
 ```
 
-`pnpm quality` runs the repository-local Biome linter, verifies that Fallow
-finds no production unused entry files, unresolved imports, or import cycles,
-and rejects duplication or complexity identities added after
-WEB-REFACTOR-TASK-001 through WEB-REFACTOR-TASK-004. Use `pnpm format` to apply
-the pinned Biome formatter when formatting a focused change.
+`pnpm quality` runs the repository-local Biome linter and formatter check,
+verifies that Fallow finds no production unused entry files, unresolved
+imports, or import cycles, and rejects duplication or complexity identities
+added after WEB-REFACTOR-TASK-001 through WEB-REFACTOR-TASK-004. To avoid an
+unrelated rewrite of legacy source, formatting initially covers the new
+quality-gate script and its regression test; linting still covers all TypeScript
+source, build scripts, and top-level tests. Use `pnpm format` to apply the pinned
+formatter to that reviewed scope.
 
 `.fallowrc.jsonc` lists all seven bundle roots consumed by
 `scripts/build.mjs`. Only `test/fixtures/**` is excluded because those files

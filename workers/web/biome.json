@@ -4,6 +4,7 @@
   },
   "formatter": {
     "enabled": true,
+    "includes": ["scripts/quality.mjs", "test/quality-gate.test.ts"],
     "indentStyle": "space",
     "indentWidth": 2,
     "lineWidth": 120
