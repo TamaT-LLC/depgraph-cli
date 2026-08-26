@@ -9,10 +9,10 @@ repository.
 The supported stable line is the newest stable version whose official GitHub
 Release and matching `release-post-publish-evidence-<tag>.json` asset exist and
 agree.
-During the `v0.5.3` rollout, the
-[`v0.5.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.2)
+During the `v0.5.4` rollout, the
+[`v0.5.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.3)
 remains supported until the same condition is satisfied for
-[`v0.5.3`](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.3).
+[`v0.5.4`](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4).
 Release candidates and older stable versions are unsupported.
 Fixes land on `main` first.
 For a stable patch release, `release/0.5` advances by fast-forward to the exact

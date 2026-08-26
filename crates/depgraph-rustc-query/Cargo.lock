@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-rustc-query"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "hex",

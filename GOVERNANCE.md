@@ -65,8 +65,8 @@ and GitHub Actions quality gates, five-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
 maintainer plus an independent approver. The supported stable line is the
 newest stable version whose official Release and matching post-publish evidence
-exist. During the `v0.5.3` rollout, `v0.5.2` remains supported until that
-condition is satisfied for `v0.5.3`. The existing `release/0.4` ref and v0.4
+exist. During the `v0.5.4` rollout, `v0.5.3` remains supported until that
+condition is satisfied for `v0.5.4`. The existing `release/0.4` ref and v0.4
 tags are preserved historical anchors, not a current maintenance promise.
 For each stable v0.5 patch, the signed tag, remote `main`, and `release/0.5`
 must identify the same reviewed, exact-Full-CI-green source at publication.

@@ -110,7 +110,7 @@ depgraph export --format mermaid > graph.mmd
 ## 公式パッケージの導入
 
 以下は、公式Releaseと公開後証跡が揃った後に適用される導入案内である。
-`v0.5.3`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
+`v0.5.4`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
 
@@ -134,7 +134,7 @@ npm版のランチャーにはNode.js 24以上が必要である。
 公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
 
 ```sh
-VERSION=0.5.3
+VERSION=0.5.4
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -176,8 +176,8 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-`main`は[`v0.5.3`リリースノート](docs/releases/v0.5.3.md)に記載した`0.5.3`契約を実装している。
-正式版は、[`v0.5.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.3)と公開後証跡が一致するときに限り有効である。
+`main`は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に記載した`0.5.4`契約を実装している。
+正式版は、[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
@@ -187,13 +187,13 @@ v0.5のワーカープロトコルは`1.0`、ストアスキーマは`17`、操�
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
 過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
-完全な互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.5.3`リリースノート](docs/releases/v0.5.3.md)を参照する。
+完全な互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)を参照する。
 
 ## プロジェクトの状況と公開コラボレーション
 
-サポート対象は、検証済みの`v0.5.3`リリースを条件として確定する。
-`v0.5.3`は、公式リリースと公開後証跡の公開後に現在の安定版となる。
-それまでは`v0.5.2`が安定版であり、リリース候補は評価用の過去の配布物である。
+サポート対象は、検証済みの`v0.5.4`リリースを条件として確定する。
+`v0.5.4`は、公式リリースと公開後証跡の公開後に現在の安定版となる。
+それまでは`v0.5.3`が安定版であり、リリース候補は評価用の過去の配布物である。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
 
 利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従う。

@@ -56,7 +56,7 @@
 
 ## 更新履歴
 
-- 2026-08-26: Codex／Claude Code／Cursor／Grokのproject/user scope自動MCPセットアップを追加
+- 2026-08-26: `v0.5.4`のリリースノートとCodex／Claude Code／Cursor／Grokのproject/user scope自動MCPセットアップを追加
 - 2026-08-25: `v0.5.3`のリリースノートとWindows公開後canary修正を追加
 - 2026-08-24: `v0.5.2`のリリースノートと現行release contractを追加
 - 2026-08-19: `PROJ-ARC-001-ADR-008` とnpmリリース手順を追加
