@@ -303,7 +303,7 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
         first.before_snapshot_id().map(|id| id.as_str()),
         Some(base_id.as_str())
     );
-    assert_eq!(first.changed_oid(), base_revision);
+    assert_eq!(first.changed_oid(), head_revision);
     assert!(first.collection_digest().starts_with("collection:sha256:"));
 
     fs::write(root.join("src/late-change.rs"), "pub fn late() {}\n")?;

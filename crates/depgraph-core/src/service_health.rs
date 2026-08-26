@@ -308,7 +308,7 @@ impl HealthAuditReadScope {
 
     #[must_use]
     pub fn changed_oid(&self) -> &str {
-        &self.changed_set.resolved_ref
+        &self.changed_set.head
     }
 }
 
@@ -691,12 +691,12 @@ impl DepgraphService {
         Ok(HealthAuditResult {
             after_snapshot_id: scope.after.id.clone(),
             before_snapshot_id: scope.before.as_ref().map(|before| before.id.clone()),
-            changed_oid: scope.changed_set.resolved_ref.clone(),
+            changed_oid: scope.changed_set.head.clone(),
             collection_digest: collection_digest(
                 &CollectionIdentity {
                     snapshot_ids,
                     manifest_digest: None,
-                    changed_oid: Some(scope.changed_set.resolved_ref.clone()),
+                    changed_oid: Some(scope.changed_set.head.clone()),
                     changed_set_digest: Some(scope.changed_set_digest.clone()),
                     churn_start_oid: None,
                     churn_commit_limit: None,

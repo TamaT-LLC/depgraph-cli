@@ -410,7 +410,7 @@ enum Commands {
     /// Audit changed code against a snapshot pair.
     #[command(long_about = health_render::AUDIT_LONG_HELP)]
     Audit {
-        /// Resolve this Git ref to an immutable commit OID at request start.
+        /// Compare request-start HEAD with the merge base of this Git ref.
         #[arg(long, value_name = "GIT_REF")]
         changed: String,
         /// Optional completed snapshot selector used as the before graph.

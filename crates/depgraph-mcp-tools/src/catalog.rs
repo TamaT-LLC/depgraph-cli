@@ -608,7 +608,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_audit_get",
-        "Audit changed code against a snapshot pair. Without a comparable base snapshot, blast radius remains evaluable while new-cycle, new-boundary, and public-api checks return indeterminate placeholders.",
+        "Audit merge-base(changed, HEAD)..HEAD against a snapshot pair. The changed input is the comparison base and changed_oid identifies request-start HEAD. Without a comparable base snapshot, blast radius remains evaluable while new-cycle, new-boundary, and public-api checks return indeterminate placeholders.",
         ["snapshot", "changed", "base_snapshot", "cursor", "limit"],
         [CliAction::Audit],
         READ,

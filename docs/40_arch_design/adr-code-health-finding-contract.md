@@ -209,9 +209,11 @@ fail closed. The digest enters the collection digest and pagination cursor.
 
 ### Audit snapshot pair
 
-`health_audit` resolves `--changed`, HEAD, and their merge base, and reads the
-normalized committed/worktree/untracked changed set exactly once at request
-start. It then pins after (current snapshot) and before (explicit selector or
+`health_audit` treats `--changed` as the comparison base, resolves it together
+with HEAD and their merge base, and reads the normalized
+`merge-base(--changed, HEAD)..HEAD` committed/worktree/untracked changed set
+exactly once at request start. `changed_oid` identifies that request-start HEAD,
+not the comparison-base ref. It then pins after (current snapshot) and before (explicit selector or
 deterministic `source_revision == merge-base` lookup) in one read scope.
 Comparison functions accept only that pinned scope; they never rerun Git.
 The before/after role order and a canonical changed-set digest bind the result,

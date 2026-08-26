@@ -42,7 +42,8 @@ reappeared at severity warning+ and confidence probable+.";
 pub const AUDIT_LONG_HELP: &str = "\
 Audit changed code against a before/after snapshot pair.
 
-`--changed` is resolved to an immutable commit OID at request start.
+`--changed` is the comparison base for merge-base(GIT_REF, HEAD)..HEAD.
+Both refs are resolved at request start; changed_oid identifies that HEAD.
 Without a comparable base snapshot, blast radius remains evaluable while
 new-cycle / new-boundary / public-api checks return indeterminate placeholders
 with blocker missing-base-snapshot.";

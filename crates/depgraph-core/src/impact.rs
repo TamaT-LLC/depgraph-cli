@@ -1971,6 +1971,49 @@ mod tests {
     }
 
     #[test]
+    fn changed_ref_is_a_comparison_base_and_head_is_the_audited_commit() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        run_git(root.path(), &["init", "--quiet"]);
+        run_git(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git(root.path(), &["config", "user.name", "Test"]);
+        fs::write(root.path().join("base.rs"), "pub fn base() {}\n")?;
+        run_git(root.path(), &["add", "base.rs"]);
+        run_git(root.path(), &["commit", "--quiet", "-m", "base"]);
+        let base = run_git(root.path(), &["rev-parse", "HEAD"]);
+        let original_branch = run_git(root.path(), &["branch", "--show-current"]);
+
+        run_git(root.path(), &["checkout", "--quiet", "-b", "side"]);
+        fs::write(root.path().join("side.rs"), "pub fn side() {}\n")?;
+        run_git(root.path(), &["add", "side.rs"]);
+        run_git(root.path(), &["commit", "--quiet", "-m", "side"]);
+        let side = run_git(root.path(), &["rev-parse", "HEAD"]);
+
+        run_git(root.path(), &["checkout", "--quiet", &original_branch]);
+        fs::write(root.path().join("head.rs"), "pub fn head() {}\n")?;
+        run_git(root.path(), &["add", "head.rs"]);
+        run_git(root.path(), &["commit", "--quiet", "-m", "head"]);
+        let head = run_git(root.path(), &["rev-parse", "HEAD"]);
+
+        let changed_set = read_git_changed_set(root.path(), &side)?;
+        assert_eq!(changed_set.resolved_ref, side);
+        assert_eq!(changed_set.merge_base, base);
+        assert_eq!(changed_set.head, head);
+        assert!(changed_set.changes.iter().any(|change| {
+            change.status == "added"
+                && change.new_path.as_deref() == Some("head.rs")
+                && change.sources == ["committed"]
+        }));
+        assert!(!changed_set.changes.iter().any(|change| {
+            change.old_path.as_deref() == Some("side.rs")
+                || change.new_path.as_deref() == Some("side.rs")
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn changed_path_parsing_enforces_one_cumulative_distinct_key_limit() -> Result<()> {
         let mut changes = BTreeMap::new();
         let mut never_cancelled = || false;

@@ -88,7 +88,7 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | What was observed at runtime? | `runtime validate`, `runtime import` | Integration of validated traces with the static graph |
 | How can I export the graph? | `export` | JSON, DOT, Mermaid, or GraphML |
 | Which files, exports, types, or dependencies look unused? | `health`, `health list`, `cleanup` | Snapshot-scoped findings with confidence and blockers. Summary excludes audit and hotspot results |
-| What risk did a Git change introduce? | `audit --changed <GIT_REF>` | New cycles, boundary violations, public API changes, and blast radius. Without a base snapshot, the three comparison checks are indeterminate while blast radius remains evaluable |
+| What risk did a Git change introduce? | `audit --changed <GIT_REF>` | New cycles, boundary violations, public API changes, and blast radius in `merge-base(GIT_REF, HEAD)..HEAD`; `changed_oid` identifies the audited HEAD. Without a base snapshot, the three comparison checks are indeterminate while blast radius remains evaluable |
 | Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 

@@ -79,7 +79,7 @@ depgraph export --format mermaid > graph.mmd
 | 実行時依存 | `runtime validate`、`runtime import` | 検証済みトレースと静的グラフの統合結果 |
 | グラフ出力 | `export` | JSON、DOT、Mermaid、GraphML |
 | 未使用のfile / export / type / dependency | `health`、`health list`、`cleanup` | snapshot-scoped finding、confidence、blocker。summaryはaudit / hotspotを含まない |
-| 変更差分のリスク | `audit --changed <GIT_REF>` | 新規cycle、境界違反、公開API変更、blast radius。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
+| 変更差分のリスク | `audit --changed <GIT_REF>` | `merge-base(GIT_REF, HEAD)..HEAD` の新規cycle、境界違反、公開API変更、blast radius。`changed_oid`は監査対象HEADを示す。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
 | グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位 |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
 
