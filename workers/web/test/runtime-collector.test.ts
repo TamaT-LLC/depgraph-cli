@@ -142,7 +142,9 @@ test("Next.js, Astro, and TanStack observations produce redacted trace v1 metada
   const fixture = await readFixture("next");
   const sink = memorySink();
   const collector = createFixtureCollector(fixture, sink);
-  fixture.observations.forEach((observation) => assert(collector.record(observation)));
+  fixture.observations.forEach((observation) => {
+    assert(collector.record(observation));
+  });
   await collector.flush();
   const expected = JSON.parse(
     await readFile(
@@ -641,7 +643,9 @@ test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async 
       fixture,
       createFileRuntimeCollectorSink(destination),
     );
-    fixture.observations.forEach((observation) => assert(fileCollector.record(observation)));
+    fixture.observations.forEach((observation) => {
+      assert(fileCollector.record(observation));
+    });
     assert.equal((await fileCollector.flush()).status, "flushed");
     const filePayload = await readFile(destination);
 
@@ -652,7 +656,9 @@ test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async 
       fixture,
       createStdoutRuntimeCollectorSink(output),
     );
-    fixture.observations.forEach((observation) => assert(stdoutCollector.record(observation)));
+    fixture.observations.forEach((observation) => {
+      assert(stdoutCollector.record(observation));
+    });
     assert.equal((await stdoutCollector.flush()).status, "flushed");
     const stdoutPayload = Buffer.concat(chunks).subarray(0, -1);
 
@@ -665,7 +671,9 @@ test("file, stdout, and OTLP sinks carry the same canonical trace bytes", async 
         otlpAttributes = { ...record.attributes };
       }),
     );
-    fixture.observations.forEach((observation) => assert(otlpCollector.record(observation)));
+    fixture.observations.forEach((observation) => {
+      assert(otlpCollector.record(observation));
+    });
     assert.equal((await otlpCollector.flush()).status, "flushed");
 
     assert(filePayload.equals(stdoutPayload));

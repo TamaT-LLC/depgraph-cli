@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/fallow/schema.json",
+  // scripts/build.mjs passes these files to esbuild at runtime, so the static
+  // import graph cannot discover them as release roots on its own.
+  "dynamicallyLoaded": [
+    "src/worker.ts",
+    "src/astro-build-integration-entry.ts",
+    "src/next-build-adapter-entry.ts",
+    "src/tanstack-router-build-observer-entry.ts",
+    "src/tanstack-start-build-observer-entry.ts",
+    "src/build-evidence-entry.ts",
+    "src/runtime-collector-entry.ts"
+  ],
+  "ignorePatterns": [
+    // These projects intentionally contain malformed and missing imports so
+    // worker tests can exercise conservative parsing and diagnostics.
+    "test/fixtures/**"
+  ],
+  "ignoreUnresolvedImports": [
+    // build.mjs writes these generated release files; quality runs before the
+    // build and must not require checked-in dist output.
+    "../dist/worker.mjs",
+    "../dist/depgraph-runtime-collector.mjs",
+    "../dist/astro/astro.wasm",
+    "../dist/runtime-packages.json"
+  ],
+  "rules": {
+    // Existing cleanup opportunities remain visible without widening this
+    // issue into a dead-code rewrite. Import graph integrity remains gating.
+    "unused-files": "warn",
+    "unused-exports": "warn",
+    "unused-types": "warn",
+    "unused-dependencies": "warn",
+    "unused-class-members": "warn",
+    "unlisted-dependencies": "warn",
+    "unresolved-imports": "error",
+    "circular-dependencies": "error"
+  }
+}

@@ -33,6 +33,21 @@ versions:
 cargo xtask test
 ```
 
+Web worker changes must also pass the repository-local Node.js gate from
+`workers/web` before the full workspace gate:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm quality && pnpm check && pnpm test
+```
+
+`pnpm quality` uses the exact Biome and Fallow versions in the worker lockfile.
+It rejects lint errors, broken import graphs, and duplication or complexity
+findings not present in the reviewed baselines. Do not regenerate a baseline
+as a routine CI fix; inspect the finding and explain accepted debt in the pull
+request first. See `workers/web/fallow-baselines/README.md` for the scoped
+commands.
+
 Add tests that fail before the fix and cover malformed, boundary, deterministic,
 and tamper cases when relevant. Update documentation and release notes for
 user-visible behavior. Generated files and dependency updates must identify

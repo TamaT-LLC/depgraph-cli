@@ -2530,9 +2530,11 @@ async function closedFreshInstanceMethodTargets(
   }
   if (current.kind !== SyntaxKind.NewExpression) return null;
   if (((current as NewExpression).arguments?.length ?? 0) !== 0) return null;
-  const constructor = transparentCallExpression(callCallee(current as NewExpression));
-  if (constructor.kind !== SyntaxKind.Identifier) return null;
-  const constructorSymbol = await querySymbol(checker, constructor, counter, "closed fresh-instance constructor");
+  const constructorExpression = transparentCallExpression(callCallee(current as NewExpression));
+  if (constructorExpression.kind !== SyntaxKind.Identifier) return null;
+  const constructorSymbol = await querySymbol(
+    checker, constructorExpression, counter, "closed fresh-instance constructor",
+  );
   if (constructorSymbol === undefined) return null;
   if (!await hasConservativelySafeFreshInstanceClass(constructorSymbol, checker, counter)) return null;
   const constructorTargets = (await compilerSymbolTargets(

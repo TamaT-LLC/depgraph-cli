@@ -10,18 +10,25 @@
   "scripts": {
     "build": "tsc --noEmit && node scripts/build.mjs",
     "test": "pnpm run build && tsx --test --test-concurrency=1 test/*.test.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "quality": "node scripts/quality.mjs"
   },
   "dependencies": {
     "@astrojs/compiler": "4.0.0",
     "typescript": "7.0.2"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.10",
     "@types/node": "24.10.1",
     "esbuild": "0.28.1",
+    "fallow": "3.19.0",
     "tsx": "4.21.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

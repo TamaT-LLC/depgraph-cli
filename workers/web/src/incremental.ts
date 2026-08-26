@@ -367,12 +367,14 @@ function splitModelEvidence(model: ScanModel): {
 } {
   const evidence: DeltaEvidenceRecord[] = [];
   const sites = model.sites.map((site) => {
-    site.evidence.forEach((item, ordinal) => evidence.push({
-      owner_type: "site",
-      owner_id: site.id,
-      ordinal,
-      evidence: wireEvidence(item),
-    }));
+    site.evidence.forEach((item, ordinal) => {
+      evidence.push({
+        owner_type: "site",
+        owner_id: site.id,
+        ordinal,
+        evidence: wireEvidence(item),
+      });
+    });
     const { reason, ...payload } = site;
     return {
       ...payload,
@@ -382,12 +384,14 @@ function splitModelEvidence(model: ScanModel): {
     };
   });
   const edges = model.edges.map((edge) => {
-    edge.evidence.forEach((item, ordinal) => evidence.push({
-      owner_type: "edge",
-      owner_id: edge.id,
-      ordinal,
-      evidence: wireEvidence(item),
-    }));
+    edge.evidence.forEach((item, ordinal) => {
+      evidence.push({
+        owner_type: "edge",
+        owner_id: edge.id,
+        ordinal,
+        evidence: wireEvidence(item),
+      });
+    });
     const { site_id: siteId, environment, ...payload } = edge;
     return {
       ...payload,

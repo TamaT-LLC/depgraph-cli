@@ -1,4 +1,4 @@
-import { lstat, open, rename, unlink } from "node:fs/promises";
+import { lstat, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { Writable } from "node:stream";
 
@@ -1217,7 +1217,7 @@ export function createFileRuntimeCollectorSink(destination: string): RuntimeColl
         path.dirname(destination),
         `.${path.basename(destination)}.depgraph-${process.pid}-${temporaryFileOrdinal}.tmp`,
       );
-      let handle;
+      let handle: FileHandle | undefined;
       try {
         handle = await open(temporary, "wx", 0o600);
         await handle.writeFile(payload);
