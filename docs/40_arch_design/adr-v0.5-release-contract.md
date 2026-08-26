@@ -139,6 +139,23 @@ The signed `v0.5.3` tag, remote `main`, and `release/0.5` remain bound to one
 reviewed Full-CI-green commit. The published `v0.5.2` tag, source, Release,
 assets, and post-publish evidence remain immutable history.
 
+### 2026-08-26 multi-host MCP setup patch amendment
+
+`v0.5.4` extends managed MCP setup to Codex, Claude Code, Cursor, and Grok.
+Each host supports project and user scopes. Project scope keeps the existing
+`depgraph` server name, while user scope uses a deterministic repository-bound
+name so several repositories can coexist in one user configuration.
+
+The lifecycle remains read-only and ownership-checked. Host configuration
+updates are serialized per file, and repository state remains until the final
+owned binding for the current version and target is removed. This patch does
+not change the worker protocol, Store schema, operation journal schema, MCP
+DTOs, release artifact formats, or existing CLI defaults.
+
+The signed `v0.5.4` tag, remote `main`, and `release/0.5` remain bound to one
+reviewed Full-CI-green commit. The published `v0.5.3` tag, source, Release,
+assets, and post-publish evidence remain immutable history.
+
 ## Consequences
 
 - v0.4 remains reproducible history without claiming a release that does not

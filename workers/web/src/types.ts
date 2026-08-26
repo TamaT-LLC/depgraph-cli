@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 export const PROTOCOL_VERSION = "1.0" as const;
 export const ADAPTER = "web" as const;
-export const ADAPTER_VERSION = "0.5.3" as const;
+export const ADAPTER_VERSION = "0.5.4" as const;
 
 const DEFAULT_WEB_ENVIRONMENTS = ["browser", "server"] as const;
 

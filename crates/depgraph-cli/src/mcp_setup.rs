@@ -3013,12 +3013,12 @@ mod tests {
     fn artifact_layout_is_shared_by_version_and_target_but_stores_are_repository_scoped() {
         let cache = tempfile::tempdir().unwrap();
         let layout =
-            ArtifactLayout::new(cache.path(), "0.5.3", "x86_64-unknown-linux-gnu").unwrap();
+            ArtifactLayout::new(cache.path(), "0.5.4", "x86_64-unknown-linux-gnu").unwrap();
         let first = git_repository();
         let second = git_repository();
         assert_eq!(
             layout.target_root,
-            ArtifactLayout::new(cache.path(), "0.5.3", "x86_64-unknown-linux-gnu")
+            ArtifactLayout::new(cache.path(), "0.5.4", "x86_64-unknown-linux-gnu")
                 .unwrap()
                 .target_root
         );
@@ -3032,7 +3032,7 @@ mod tests {
     fn github_metadata_closes_the_exact_setup_asset_set() {
         let cache = tempfile::tempdir().unwrap();
         let layout =
-            ArtifactLayout::new(cache.path(), "0.5.3", "x86_64-unknown-linux-gnu").unwrap();
+            ArtifactLayout::new(cache.path(), "0.5.4", "x86_64-unknown-linux-gnu").unwrap();
         let assets = layout
             .expected_asset_names()
             .into_iter()
@@ -3068,20 +3068,20 @@ mod tests {
     fn archive_paths_reject_traversal_and_cross_package_entries() {
         assert_eq!(
             safe_archive_path(
-                Path::new("depgraph-0.5.3-target/bin/depgraph"),
-                "depgraph-0.5.3-target"
+                Path::new("depgraph-0.5.4-target/bin/depgraph"),
+                "depgraph-0.5.4-target"
             )
             .unwrap(),
-            Path::new("depgraph-0.5.3-target/bin/depgraph")
+            Path::new("depgraph-0.5.4-target/bin/depgraph")
         );
         for unsafe_path in [
             "../outside",
             "/absolute",
-            "depgraph-0.5.3-target/../outside",
+            "depgraph-0.5.4-target/../outside",
             "other-package/bin/depgraph",
         ] {
             assert!(
-                safe_archive_path(Path::new(unsafe_path), "depgraph-0.5.3-target").is_err(),
+                safe_archive_path(Path::new(unsafe_path), "depgraph-0.5.4-target").is_err(),
                 "{unsafe_path}"
             );
         }
@@ -3091,7 +3091,7 @@ mod tests {
     fn tar_extraction_materializes_a_bounded_package_tree() {
         let temporary = tempfile::tempdir().unwrap();
         let archive_path = temporary.path().join("package.tar.gz");
-        let package_root = "depgraph-0.5.3-target";
+        let package_root = "depgraph-0.5.4-target";
         {
             let archive_file = File::create(&archive_path).unwrap();
             let encoder =
