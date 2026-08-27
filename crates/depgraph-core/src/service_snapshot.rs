@@ -67,6 +67,7 @@ impl std::fmt::Display for ResolvedSnapshotId {
 
 pub struct SnapshotReadRequest {
     snapshot_id: ResolvedSnapshotId,
+    scan_id: String,
     locator: SnapshotLocator,
     read_store: RequestReadStore,
 }
@@ -75,6 +76,11 @@ impl SnapshotReadRequest {
     #[must_use]
     pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
         &self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn scan_id(&self) -> &str {
+        &self.scan_id
     }
 
     #[must_use]
@@ -177,6 +183,7 @@ impl DepgraphService {
         }
         Ok(SnapshotReadRequest {
             snapshot_id: ResolvedSnapshotId(snapshot_id),
+            scan_id: snapshot.scan_id,
             locator: SnapshotLocator::StableId(snapshot.id),
             read_store,
         })
@@ -248,6 +255,7 @@ impl DepgraphService {
 
         Ok(SnapshotReadRequest {
             snapshot_id: ResolvedSnapshotId(snapshot_id),
+            scan_id: snapshot.scan_id,
             locator: locator.clone(),
             read_store,
         })

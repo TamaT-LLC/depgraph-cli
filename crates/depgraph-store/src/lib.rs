@@ -384,6 +384,23 @@ impl Store {
         load_completed_snapshot_record(&self.connection, snapshot_id)
     }
 
+    pub fn first_completed_snapshot_id_for_source_revision(
+        &self,
+        source_revision: &str,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM completed_snapshots
+                  WHERE source_revision=?1 AND status='completed'
+                  ORDER BY id ASC
+                  LIMIT 1",
+                [source_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to resolve the first completed snapshot for a source revision")
+    }
+
     pub fn create_snapshot_name(
         &mut self,
         name: &str,

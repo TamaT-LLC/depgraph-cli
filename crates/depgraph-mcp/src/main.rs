@@ -14,26 +14,30 @@ use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
     DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
     DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
-    GraphExportRequest, GraphExportResult, ImpactRequest, NodeMatchMode, PolicyEvaluateRequest,
-    PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
+    GraphExportRequest, GraphExportResult, HealthAuditRequest, HealthFindingGetRequest,
+    HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest, ImpactRequest,
+    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, NodeMatchMode,
+    PolicyEvaluateRequest, PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
     RepositoryOutputPrecondition, RuntimeValidateRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
     UnresolvedRequest,
 };
 use depgraph_core::{
-    CancellationToken, CycleLevel, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
-    DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits, GraphQueryFilter,
-    ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, SnapshotLocator, VerifiedCompilerPack,
-    read_compiler_pack_requirement, verify_compiler_pack,
+    CancellationToken, Confidence, CycleLevel, DEFAULT_HOTSPOT_WEIGHTS, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
+    DepgraphServiceLimits, FindingKind, GraphQueryFilter, HealthFinding, HotspotWeights,
+    ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity, SnapshotLocator,
+    VerifiedCompilerPack, read_compiler_pack_requirement, verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType,
-    AgentGraphExportResponse, AgentId, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentOperationStatus, AgentPathResponse,
-    AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
+    AgentGraphExportResponse, AgentHealthAudit, AgentHealthFinding, AgentHealthFindingDetail,
+    AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary, AgentId, AgentLocator,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
+    AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
     AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
     AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
     AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeTraceEvent,
@@ -42,7 +46,7 @@ use depgraph_mcp_tools::{
     AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
     ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope, IdempotencyKey,
     LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult,
-    OperationAccepted, OperationId, PageByteLimit, PageRequest, PageSize, PaginationContext,
+    OperationAccepted, OperationId, Page, PageByteLimit, PageRequest, PageSize, PaginationContext,
     PortableTerminalOutputContract, RepositoryRelativePath, ResponseMappingError, SnapshotId,
     SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS, ToolCatalog,
     project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
@@ -594,6 +598,89 @@ struct PolicyEvaluateArguments {
     repository_id: LogicalRepositoryId,
     from: String,
     to: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthSummaryArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    kinds: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthFindingsArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default)]
+    severities: Vec<String>,
+    #[serde(default)]
+    confidences: Vec<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthFindingGetArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    finding_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthAuditArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    changed: String,
+    #[serde(default)]
+    base_snapshot: Option<String>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthHotspotsArguments {
+    contract_version: ContractVersion,
+    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    churn_commit_limit: Option<u32>,
+    #[serde(default)]
+    churn_path_filter: Vec<String>,
+    #[serde(default)]
+    weight_fan_in: Option<u32>,
+    #[serde(default)]
+    weight_fan_out: Option<u32>,
+    #[serde(default)]
+    weight_reverse_impact: Option<u32>,
+    #[serde(default)]
+    weight_git_churn: Option<u32>,
+    #[serde(default)]
+    weight_runtime: Option<u32>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -1283,6 +1370,11 @@ impl ServerHandler for DepgraphMcpServer {
                 | "policy_evaluate"
                 | "graph_export"
                 | "graph_query"
+                | "health_summary_get"
+                | "health_findings_list"
+                | "health_finding_get"
+                | "health_audit_get"
+                | "health_hotspots_list"
                 | "runtime_trace_validate"
                 | "operation_get"
                 | "operation_result"
@@ -1596,6 +1688,23 @@ where
 {
     serde_json::from_value(serde_json::Value::Object(arguments))
         .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+}
+
+fn validate_array_argument_lengths(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Result<(), ToolExecutionFailure> {
+    if names.iter().any(|name| {
+        arguments
+            .get(*name)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.len() > MAX_HEALTH_FILTER_ITEMS)
+    }) {
+        return Err(ToolExecutionFailure::Service(
+            DepgraphServiceError::InvalidInput,
+        ));
+    }
+    Ok(())
 }
 
 fn authorize_repository(
@@ -3475,6 +3584,229 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "health_summary_get" => {
+            validate_array_argument_lengths(&arguments, &["kinds"])?;
+            let arguments = decode_arguments::<HealthSummaryArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let kinds = if arguments.kinds.is_empty() {
+                None
+            } else {
+                Some(parse_snapshot_scoped_kinds(&arguments.kinds)?)
+            };
+            let request = HealthSummaryRequest::try_new(kinds)?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let found = service.health_summary(&mut snapshot_request, &request, cancellation)?;
+            let result = AgentHealthSummary::try_new(
+                found.collection_digest(),
+                found.counts_by_kind().clone(),
+                found.counts_by_confidence().clone(),
+                &found.coverage().completeness,
+                found.coverage().files_skipped,
+                found.coverage().unresolved,
+                found.coverage().candidates,
+            )
+            .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "health_findings_list" => {
+            validate_array_argument_lengths(&arguments, &["kinds", "severities", "confidences"])?;
+            let arguments = decode_arguments::<HealthFindingsArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = HealthFindingsRequest::try_new(
+                parse_snapshot_scoped_kinds(&arguments.kinds)?,
+                parse_health_severities(&arguments.severities)?,
+                parse_health_confidences(&arguments.confidences)?,
+                MAX_HEALTH_FINDINGS,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let found = service.health_findings(&mut snapshot_request, &request, cancellation)?;
+            let normalized = serde_json::json!({
+                "kinds": request.kinds().iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+                "severities": request.severities().iter().map(|severity| severity.as_str()).collect::<Vec<_>>(),
+                "confidences": request.confidences().iter().map(|confidence| confidence.as_str()).collect::<Vec<_>>(),
+                "manifest_digest": found.manifest_digest(),
+                "collection_digest": found.collection_digest(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let page = project_health_findings_page(
+                found.findings(),
+                &pagination,
+                &page_request,
+                cancellation,
+            )?;
+            let result = AgentHealthFindingsPage::try_new(found.collection_digest(), page)
+                .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "health_finding_get" => {
+            let arguments = decode_arguments::<HealthFindingGetArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = HealthFindingGetRequest::try_new(arguments.finding_id)?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let found =
+                service.health_finding_get(&mut snapshot_request, &request, cancellation)?;
+            let result =
+                AgentHealthFindingDetail::try_from_core(&found).map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "health_audit_get" => {
+            let arguments = decode_arguments::<HealthAuditArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let request = HealthAuditRequest::try_new(arguments.changed, arguments.base_snapshot)?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let scope =
+                service.start_health_audit_scope(&mut snapshot_request, &request, cancellation)?;
+            let found = service.health_audit(&scope, cancellation)?;
+            let snapshot_id = parse_snapshot_id(found.after_snapshot_id().as_str())?;
+            let normalized = serde_json::json!({
+                "after_snapshot_id": found.after_snapshot_id().as_str(),
+                "before_snapshot_id": found.before_snapshot_id().map(|id| id.as_str()),
+                "changed_oid": found.changed_oid(),
+                "collection_digest": found.collection_digest(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let page = project_health_findings_page(
+                found.findings(),
+                &pagination,
+                &page_request,
+                cancellation,
+            )?;
+            let result = AgentHealthAudit::try_new(
+                found.after_snapshot_id().as_str(),
+                found.before_snapshot_id().map(|id| id.as_str()),
+                found.changed_oid(),
+                found.collection_digest(),
+                page,
+            )
+            .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
+        "health_hotspots_list" => {
+            validate_array_argument_lengths(&arguments, &["churn_path_filter"])?;
+            let arguments = decode_arguments::<HealthHotspotsArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                &arguments.repository_id,
+                repository_id,
+            )?;
+            let defaults = DEFAULT_HOTSPOT_WEIGHTS;
+            let weights = HotspotWeights::try_new(
+                arguments.weight_fan_in.unwrap_or(defaults.fan_in),
+                arguments.weight_fan_out.unwrap_or(defaults.fan_out),
+                arguments
+                    .weight_reverse_impact
+                    .unwrap_or(defaults.reverse_impact),
+                arguments.weight_git_churn.unwrap_or(defaults.git_churn),
+                arguments.weight_runtime.unwrap_or(defaults.runtime),
+            )
+            .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            let request = HealthHotspotsRequest::try_new(
+                arguments
+                    .churn_commit_limit
+                    .unwrap_or(MAX_HEALTH_CHURN_COMMITS),
+                arguments.churn_path_filter,
+                weights,
+            )?;
+            let locator =
+                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let mut snapshot_request =
+                service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
+            let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
+            let found = service.health_hotspots(&mut snapshot_request, &request, cancellation)?;
+            let normalized = serde_json::json!({
+                "churn_commit_limit": request.churn_commit_limit(),
+                "churn_path_filter": request.churn_path_filter(),
+                "weights": request.weights().as_map(),
+                "collection_digest": found.collection_digest(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
+            let page = project_health_findings_page(
+                found.findings(),
+                &pagination,
+                &page_request,
+                cancellation,
+            )?;
+            let result = AgentHealthHotspots::try_new(found.collection_digest(), page)
+                .map_err(contract_mapping_error)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                result,
+            ))
+            .map_err(Into::into)
+        }
         "graph_export" => {
             let arguments = decode_arguments::<GraphExportArguments>(arguments)?;
             authorize_repository(
@@ -3671,6 +4003,59 @@ fn agent_condition_limit_error(maximum: u64) -> ToolExecutionFailure {
             maximum,
         }),
     ))
+}
+
+fn parse_snapshot_scoped_kinds(
+    values: &[String],
+) -> Result<Vec<FindingKind>, ToolExecutionFailure> {
+    values
+        .iter()
+        .map(|value| {
+            FindingKind::parse(value)
+                .filter(|kind| kind.is_snapshot_scoped())
+                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+        })
+        .collect()
+}
+
+fn parse_health_severities(values: &[String]) -> Result<Vec<Severity>, ToolExecutionFailure> {
+    values
+        .iter()
+        .map(|value| {
+            Severity::parse(value)
+                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+        })
+        .collect()
+}
+
+fn parse_health_confidences(values: &[String]) -> Result<Vec<Confidence>, ToolExecutionFailure> {
+    values
+        .iter()
+        .map(|value| {
+            Confidence::parse(value)
+                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+        })
+        .collect()
+}
+
+fn project_health_findings_page(
+    findings: &[HealthFinding],
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<Page<AgentHealthFinding>, ToolExecutionFailure> {
+    let mut items = Vec::with_capacity(findings.len());
+    for finding in findings {
+        if cancellation.is_cancelled() {
+            return Err(ToolExecutionFailure::Service(
+                DepgraphServiceError::Cancelled,
+            ));
+        }
+        items.push(AgentHealthFinding::try_from_core(finding).map_err(contract_mapping_error)?);
+    }
+    pagination
+        .paginate_cancellable(&items, request, cancellation)
+        .map_err(ToolExecutionFailure::Agent)
 }
 
 fn contract_mapping_error(error: ContractBuildError) -> ToolExecutionFailure {

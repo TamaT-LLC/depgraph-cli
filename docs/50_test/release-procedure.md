@@ -157,7 +157,7 @@ Releaseはquality、benchmark、hostile E2E、通常archive、compiler pack、ag
 Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-target` checkは、
 欠損、改変、version drift、target間schema driftを拒否する。
 
-各native jobのMCP sidecarは`mcp-package-smoke-v2`である。従来のprotocol/catalog、
+各native jobのMCP sidecarは`mcp-package-smoke-v3`である。従来のprotocol/catalog、
 durable recovery、stdio purityに加え、`depgraph-agent-host-config-v1`からCodex、
 Claude Desktop、VS Codeのread-only設定をclean temporary homeで生成する。公開前smokeは
 closed synthetic `release-post-publish-evidence-v1`と別計算したtrusted digestを用い、

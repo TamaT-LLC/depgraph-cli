@@ -5340,7 +5340,7 @@ fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
     let store_write_tools = {
         let mut command = command(&root, &store_path, requirement().path());
         command.args(["--capability", "store-write"]);
-        tools_list(command, 28)
+        tools_list(command, 33)
     };
     assert!(!store_write_tools.contains(&"daemon_start_submit".to_owned()));
     assert!(!store_write_tools.contains(&"daemon_stop".to_owned()));
@@ -6133,6 +6133,11 @@ const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[
     "graph_path_get",
     "graph_query",
     "graph_unresolved_list",
+    "health_audit_get",
+    "health_finding_get",
+    "health_findings_list",
+    "health_hotspots_list",
+    "health_summary_get",
     "operation_cancel",
     "operation_get",
     "operation_result",
@@ -6525,6 +6530,31 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                 None,
             ),
             (
+                "health_audit_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "changed":"HEAD", "snapshot":pinned_snapshot, "limit":1}),
+                Some(true),
+            ),
+            (
+                "health_finding_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "finding_id":"finding:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "snapshot":pinned_snapshot}),
+                Some(true),
+            ),
+            (
+                "health_findings_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "health_hotspots_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
+            ),
+            (
+                "health_summary_get",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot}),
+                Some(false),
+            ),
+            (
                 "operation_cancel",
                 json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "operation_id":"op_00000000000000000000000000000000"}),
                 None,
@@ -6579,9 +6609,21 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
             .map(|(tool_name, _, _)| *tool_name)
             .collect::<Vec<_>>();
         assert_eq!(called_names, advertised_names, "{protocol_version}");
+        let split_at = usize::try_from(depgraph_mcp::runtime::READ_RATE_BURST)
+            .expect("read burst fits usize")
+            .saturating_sub(8)
+            .max(1);
         for (offset, (tool_name, arguments, expected_error)) in
             read_only_calls.into_iter().enumerate()
         {
+            // Keep the catalog-wide contract probe below the product's fixed
+            // read burst even as the read-only catalog grows.
+            if offset > 0 && offset % split_at == 0 {
+                mcp.finish();
+                mcp = InteractiveMcp::start(&root, &store_path);
+                let initialized = initialize_tasks_mcp(&mut mcp, 90, protocol_version, false);
+                assert_eq!(initialized["result"]["protocolVersion"], protocol_version);
+            }
             let response =
                 interactive_tool_call(&mut mcp, 100 + offset as u64, tool_name, arguments);
             assert!(response["isError"].is_boolean(), "{tool_name}: {response}");
@@ -6980,4 +7022,298 @@ fn real_eof_exits_successfully_before_five_second_deadline() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+}
+
+fn seed_issue_423_health_store(path: &Path, root: &Path, scan_id: &str, revision: &str) {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision(scan_id, root, false, Some(revision))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {"secret": "PROCESS_423_PROFILE_SECRET"},
+        "properties": {"compiler_command": "/usr/bin/rustc --crate-name process-secret"}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (seq, (id, path)) in [
+        ("file:src/unused.rs", "src/unused.rs"),
+        ("file:src/used.rs", "src/used.rs"),
+        ("file:src/lib.rs", "src/lib.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut node = common("node_upsert", seq as u64 + 3);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://{path}"),
+            "display_name": path,
+            "properties": {
+                "path": path,
+                "language": "rust",
+                "secret": "PROCESS_423_NODE_SECRET",
+                "root": root
+            }
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut edge = common("edge_upsert", 6);
+    edge["edge"] = json!({
+        "id": "edge:lib-used",
+        "source": "file:src/lib.rs",
+        "target": "file:src/used.rs",
+        "kind": "imports",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "fixture:rust",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false
+    });
+    store.ingest_event(&edge).unwrap();
+    let mut profile_completed = common("profile_completed", 7);
+    profile_completed["profile_id"] = json!("fixture:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 8);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
+#[test]
+fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "health")
+            .env("GIT_AUTHOR_EMAIL", "health@example.test")
+            .env("GIT_COMMITTER_NAME", "health")
+            .env("GIT_COMMITTER_EMAIL", "health@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "health"]);
+    run(&["config", "user.email", "health@example.test"]);
+    fs::write(root.join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
+    fs::write(root.join("src/used.rs"), "pub fn used() {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "mod used;\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "seed"]);
+    let revision = run(&["rev-parse", "HEAD"]);
+    seed_issue_423_health_store(&store_path, &root, "health-scan", &revision);
+    let store_before = store_invariant(&store_path);
+    let source_before = source_tree_digest(&root);
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let cli_summary = cli(&["health", "--json"]);
+    let cli_findings = cli(&["health", "list", "--kind", "unused-file", "--all", "--json"]);
+    let cli_audit = cli(&["audit", "--changed", "HEAD", "--all", "--json"]);
+    let cli_hotspots = cli(&["hotspots", "--all", "--json"]);
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "snapshot": "current"
+    });
+    let summary = interactive_tool_call(&mut mcp, 2, "health_summary_get", common.clone());
+    let findings = interactive_tool_call(&mut mcp, 3, "health_findings_list", {
+        let mut arguments = common.clone();
+        arguments["kinds"] = json!(["unused-file"]);
+        arguments["limit"] = json!(100);
+        arguments
+    });
+    let unused_id = findings["structuredContent"]["result"]["findings"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["subject_id"] == "file:src/unused.rs")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let detail = interactive_tool_call(&mut mcp, 4, "health_finding_get", {
+        let mut arguments = common.clone();
+        arguments["finding_id"] = json!(unused_id);
+        arguments
+    });
+    let audit = interactive_tool_call(&mut mcp, 5, "health_audit_get", {
+        let mut arguments = common.clone();
+        arguments["changed"] = json!("HEAD");
+        arguments["limit"] = json!(100);
+        arguments
+    });
+    let hotspots = interactive_tool_call(&mut mcp, 6, "health_hotspots_list", {
+        let mut arguments = common.clone();
+        arguments["limit"] = json!(100);
+        arguments
+    });
+    assert_eq!(summary["isError"], false, "{summary}");
+    assert_eq!(findings["isError"], false, "{findings}");
+    assert_eq!(detail["isError"], false, "{detail}");
+    assert_eq!(audit["isError"], false, "{audit}");
+    assert_eq!(hotspots["isError"], false, "{hotspots}");
+    assert_eq!(
+        summary["structuredContent"]["result"]["collection_digest"],
+        cli_summary["data"]["collection_digest"]
+    );
+    assert_eq!(
+        findings["structuredContent"]["result"]["collection_digest"],
+        cli_findings["data"]["collection_digest"]
+    );
+    assert_eq!(
+        findings["structuredContent"]["result"]["findings"]["items"][0]["id"],
+        unused_id
+    );
+    assert_eq!(
+        detail["structuredContent"]["result"]["finding"]["id"],
+        unused_id
+    );
+    assert_eq!(
+        audit["structuredContent"]["result"]["collection_digest"],
+        cli_audit["data"]["collection_digest"]
+    );
+    assert_eq!(
+        hotspots["structuredContent"]["result"]["collection_digest"],
+        cli_hotspots["data"]["collection_digest"]
+    );
+
+    let hotspot_id = hotspots["structuredContent"]["result"]["findings"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let input_scoped = interactive_tool_call(&mut mcp, 7, "health_finding_get", {
+        let mut arguments = common.clone();
+        arguments["finding_id"] = json!(hotspot_id);
+        arguments
+    });
+    assert_eq!(input_scoped["isError"], true, "{input_scoped}");
+    assert_eq!(
+        input_scoped["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+
+    let paged = interactive_tool_call(&mut mcp, 8, "health_hotspots_list", {
+        let mut arguments = common.clone();
+        arguments["limit"] = json!(1);
+        arguments
+    });
+    assert_eq!(paged["isError"], false, "{paged}");
+    let cursor = paged["structuredContent"]["result"]["findings"]["next_cursor"]
+        .as_str()
+        .expect("hotspot page has a continuation cursor")
+        .to_owned();
+    let mut tampered = cursor.chars().collect::<Vec<_>>();
+    if let Some(ch) = tampered.last_mut() {
+        *ch = if *ch == 'A' { 'B' } else { 'A' };
+    }
+    let tampered = tampered.into_iter().collect::<String>();
+    let tamper = interactive_tool_call(&mut mcp, 9, "health_hotspots_list", {
+        let mut arguments = common.clone();
+        arguments["limit"] = json!(1);
+        arguments["cursor"] = json!(tampered);
+        arguments
+    });
+    assert_eq!(tamper["isError"], true, "{tamper}");
+    assert_eq!(
+        tamper["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+
+    let oversized = vec!["unused-file"; 1_025];
+    for (id, tool, field) in [
+        (10, "health_summary_get", "kinds"),
+        (11, "health_findings_list", "kinds"),
+        (12, "health_hotspots_list", "churn_path_filter"),
+    ] {
+        let rejected = interactive_tool_call(&mut mcp, id, tool, {
+            let mut arguments = common.clone();
+            arguments[field] = json!(oversized.clone());
+            arguments
+        });
+        assert_eq!(rejected["isError"], true, "{tool}: {rejected}");
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"], "INVALID_ARGUMENT",
+            "{tool}: {rejected}"
+        );
+    }
+
+    for result in [&summary, &findings, &detail, &audit, &hotspots] {
+        let encoded = result.to_string();
+        assert!(!encoded.contains("PROCESS_423_PROFILE_SECRET"), "{encoded}");
+        assert!(!encoded.contains("PROCESS_423_NODE_SECRET"), "{encoded}");
+        assert!(!encoded.contains("/usr/bin/rustc"), "{encoded}");
+        assert_tool_text_matches_structured(result);
+    }
+    mcp.finish();
+    assert_eq!(store_invariant(&store_path), store_before);
+    assert_eq!(source_tree_digest(&root), source_before);
 }

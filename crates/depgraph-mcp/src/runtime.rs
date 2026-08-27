@@ -17,6 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const READ_CONCURRENCY: usize = 4;
 pub const SUBMIT_CONCURRENCY: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 16;
+pub const READ_RATE_BURST: u64 = 32;
 pub const AUDIT_LINE_BYTES: usize = 16 * 1024;
 pub const AUDIT_REQUEST_BYTES: usize = 64 * 1024;
 const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(30);
@@ -74,7 +75,7 @@ impl Default for RuntimeConfig {
             read_concurrency: READ_CONCURRENCY,
             submit_concurrency: SUBMIT_CONCURRENCY,
             read_queue_capacity: READ_QUEUE_CAPACITY,
-            read_rate: RateLimit::per_minute(240, 32),
+            read_rate: RateLimit::per_minute(240, READ_RATE_BURST),
             submit_rate: RateLimit::per_hour(30, 3),
             read_deadline: DEFAULT_READ_DEADLINE,
             submit_deadline: DEFAULT_SUBMIT_DEADLINE,

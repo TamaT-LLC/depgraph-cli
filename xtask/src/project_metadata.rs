@@ -1106,6 +1106,9 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     )?;
     let v0_5_release_adr =
         read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
+    let health_finding_adr = read_lf_normalized_text(
+        &root.join("docs/40_arch_design/adr-code-health-finding-contract.md"),
+    )?;
     verify_public_community_surface(root)?;
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
@@ -1194,6 +1197,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-07-25: `PROJ-ARC-001-ADR-006` を追加",
         "| PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |",
         "2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加",
+        "| PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |",
+        "2026-08-26: `PROJ-ARC-001-ADR-009` と説明可能なコードヘルス解析（CLI / MCP）を追加",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -1483,7 +1488,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "| Operation DTO | `depgraph-operation-v1` |",
         "| Agent host configuration | `depgraph-agent-host-config-v1` |",
         "| Agent onboarding release evidence | `release-post-publish-evidence-v1` |",
-        "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
+        "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         V0_4_RC6_TAG_COMMIT,
         V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
@@ -1492,6 +1497,19 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !v0_5_release_adr.contains(required) {
             bail!("v0.5 release ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-009`",
+        "- Contract: `depgraph-health-finding-v1`",
+        "`confirmed` / `probable` / `indeterminate`",
+        "missing-base-snapshot",
+        "All arithmetic uses integer basis points in `0..=10_000`.",
+        "`indeterminate → confirmed` is therefore `regressed`",
+    ] {
+        if !health_finding_adr.contains(required) {
+            bail!("code-health finding ADR is missing required contract {required:?}");
         }
     }
     let migration_rehearsal =
@@ -1568,7 +1586,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "npm Trusted Publishing",
         "release-post-publish-evidence-v0.5.4.json",
         "stable-v0.5.0-packaged-smoke-v1",
-        "mcp-package-smoke-v2",
+        "mcp-package-smoke-v3",
         "Node.js 24",
         "musl",
     ] {
@@ -1762,7 +1780,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "計51点",
         "checkout内のproduct binaryや未公開package artifact",
         "non-empty matrix値をすべて含む",
-        "`mcp-package-smoke-v2`",
+        "`mcp-package-smoke-v3`",
         "`depgraph-agent-host-config-v1`",
         "`maintenance-ref-pinned`",
         AGENT_DOGFOOD_REPORT_SHA256,
@@ -1864,6 +1882,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/40_arch_design/adr-v0.5-release-contract.md",
+        "docs/40_arch_design/adr-code-health-finding-contract.md",
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/50_test/agent-dogfood-benchmark.md",
         "docs/releases/v0.4.0.md",
@@ -2139,7 +2158,7 @@ status: Active\n\
 upstream: [PROJ-ARC-001]\n\
 downstream: []\n\
 owner: TakehiroT\n\
-updated: 2026-08-24\n\
+updated: 2026-08-26\n\
 open_questions: 0\n\
 ---\n";
 
@@ -2205,7 +2224,7 @@ open_questions: 0\n\
         "| `#358` | verified release archiveからAgent host onboardingを自動化する |",
         "## Issue #358 verified Agent host onboarding",
         "`depgraph-agent-host-config-v1`",
-        "`mcp-package-smoke-v2`",
+        "`mcp-package-smoke-v3`",
         "`flate2`/`tar`/`zip`",
         "### Issue #358 acceptance mapping",
         "## Issue #292 acceptance mapping",

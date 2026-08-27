@@ -6369,3 +6369,494 @@ fn mcp_setup_rejects_a_non_repository_before_network_or_state_changes() {
     assert!(!root.path().join(".grok").exists());
     assert!(!default_store.exists());
 }
+
+fn seed_issue_423_health_store(store_path: &Path, root: &Path, scan_id: &str, revision: &str) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision(scan_id, root, false, Some(revision))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (seq, (id, path)) in [
+        ("file:src/unused.rs", "src/unused.rs"),
+        ("file:src/used.rs", "src/used.rs"),
+        ("file:src/lib.rs", "src/lib.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut node = common("node_upsert", seq as u64 + 3);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://{path}"),
+            "display_name": path,
+            "properties": {"path": path, "language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut edge = common("edge_upsert", 6);
+    edge["edge"] = json!({
+        "id": "edge:lib-used",
+        "source": "file:src/lib.rs",
+        "target": "file:src/used.rs",
+        "kind": "imports",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "fixture:rust",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false
+    });
+    store.ingest_event(&edge).unwrap();
+    let mut profile_completed = common("profile_completed", 7);
+    profile_completed["profile_id"] = json!("fixture:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 8);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
+fn issue_423_health_repo() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    run_git(root.path(), &["init"]);
+    run_git(root.path(), &["config", "user.name", "health"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "health@example.test"],
+    );
+    fs::write(root.path().join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
+    fs::write(root.path().join("src/used.rs"), "pub fn used() {}\n").unwrap();
+    fs::write(root.path().join("src/lib.rs"), "mod used;\n").unwrap();
+    run_git(root.path(), &["add", "."]);
+    run_git(root.path(), &["commit", "-m", "seed"]);
+    let revision = run_git(root.path(), &["rev-parse", "HEAD"]);
+    seed_issue_423_health_store(&store_path, root.path(), "health-scan", &revision);
+    (root, cache, store_path, revision)
+}
+
+#[test]
+fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["health", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("confirmed"))
+        .stdout(predicate::str::contains("probable"))
+        .stdout(predicate::str::contains("indeterminate"))
+        .stdout(predicate::str::contains("do not include audit or hotspot"));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("new / changed / regressed"));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["audit", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("missing-base-snapshot"));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["hotspots", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("basis-point"));
+
+    let (root, _cache, store_path, _revision) = issue_423_health_repo();
+    let store = store_path.to_str().unwrap();
+    let summary = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "health", "--json"])
+        .output()
+        .unwrap();
+    assert!(summary.status.success(), "{:?}", summary.stderr);
+    let summary: serde_json::Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(summary["schema_version"], "1.0");
+    assert_eq!(summary["command"], "health");
+    assert!(
+        summary["data"]["collection_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("collection:sha256:")
+    );
+    assert!(
+        summary["data"]["counts_by_kind"]["unused-file"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+
+    let listed = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "health",
+            "list",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{:?}", listed.stderr);
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["command"], "health.list");
+    assert_eq!(
+        listed["data"]["collection_digest"],
+        summary["data"]["collection_digest"]
+    );
+    let findings = listed["data"]["findings"].as_array().unwrap();
+    let unused = findings
+        .iter()
+        .find(|finding| finding["subject_id"] == "file:src/unused.rs")
+        .expect("unused file finding");
+    let finding_id = unused["id"].as_str().unwrap();
+    let fingerprint = unused["fingerprint"].as_str().unwrap();
+
+    let page = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "health",
+            "list",
+            "--kind",
+            "unused-file",
+            "--max-items",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(page.status.success(), "{:?}", page.stderr);
+    let page: serde_json::Value = serde_json::from_slice(&page.stdout).unwrap();
+    assert_eq!(page["command"], "health.list");
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+
+    let shown = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "health", "show", finding_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{:?}", shown.stderr);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["command"], "health.show");
+    assert_eq!(shown["scan_id"], "health-scan");
+    assert_eq!(shown["data"]["id"], finding_id);
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "health", "show", "not-a-finding"])
+        .assert()
+        .code(2);
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "cleanup"])
+        .assert()
+        .code(2);
+    for arguments in [
+        vec!["cleanup", "--kind", "invalid"],
+        vec!["cleanup", "--kind", "unused-file", "--severity", "invalid"],
+        vec![
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--confidence",
+            "invalid",
+        ],
+    ] {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .arg("--store")
+            .arg(store)
+            .args(arguments)
+            .assert()
+            .code(2);
+    }
+
+    let cleanup = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(cleanup.status.success(), "{:?}", cleanup.stderr);
+    let cleanup: serde_json::Value = serde_json::from_slice(&cleanup.stdout).unwrap();
+    assert_eq!(
+        cleanup["data"]["collection_digest"],
+        listed["data"]["collection_digest"]
+    );
+
+    let baseline = root.path().join("baseline.json");
+    let write_baseline = |records: serde_json::Value| {
+        fs::write(
+            &baseline,
+            serde_json::to_vec_pretty(&json!({ "findings": records })).unwrap(),
+        )
+        .unwrap();
+    };
+
+    write_baseline(json!([]));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("new"));
+
+    let json_gate = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(json_gate.status.code(), Some(1));
+    let json_gate: serde_json::Value =
+        serde_json::from_slice(&json_gate.stdout).expect("baseline JSON stays one document");
+    assert_eq!(json_gate["command"], "health.list");
+
+    write_baseline(json!([{
+        "id": finding_id,
+        "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "severity": unused["severity"],
+        "confidence": unused["confidence"],
+        "resolved": false
+    }]));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed"));
+
+    write_baseline(json!([{
+        "id": finding_id,
+        "fingerprint": fingerprint,
+        "severity": "info",
+        "confidence": "indeterminate",
+        "resolved": false
+    }]));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("regressed"));
+
+    write_baseline(json!([{
+        "id": finding_id,
+        "fingerprint": fingerprint,
+        "severity": unused["severity"],
+        "confidence": unused["confidence"],
+        "resolved": false
+    }]));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-type",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resolved"));
+
+    write_baseline(json!([{
+        "id": finding_id,
+        "fingerprint": fingerprint,
+        "severity": unused["severity"],
+        "confidence": unused["confidence"],
+        "resolved": true
+    }]));
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "cleanup",
+            "--kind",
+            "unused-file",
+            "--all",
+            "--baseline",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("reappeared"));
+
+    let audit = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "audit",
+            "--changed",
+            "HEAD",
+            "--all",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(audit.status.success(), "{:?}", audit.stderr);
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(audit["command"], "audit");
+    assert_eq!(audit["scan_id"], "health-scan");
+    assert!(
+        audit["data"]["collection_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("collection:sha256:")
+    );
+
+    let audit_page = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store,
+            "audit",
+            "--changed",
+            "HEAD",
+            "--max-items",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(audit_page.status.success(), "{:?}", audit_page.stderr);
+    let audit_page: serde_json::Value = serde_json::from_slice(&audit_page.stdout).unwrap();
+    assert_eq!(audit_page["scan_id"], "health-scan");
+
+    let hotspots = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store, "hotspots", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(hotspots.status.success(), "{:?}", hotspots.stderr);
+    let hotspots: serde_json::Value = serde_json::from_slice(&hotspots.stdout).unwrap();
+    assert_eq!(hotspots["command"], "hotspots");
+    assert!(
+        hotspots["data"]["collection_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("collection:sha256:")
+    );
+}

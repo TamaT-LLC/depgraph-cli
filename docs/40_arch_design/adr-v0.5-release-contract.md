@@ -41,7 +41,7 @@ The v0.5 compatibility tuple is:
 | Operation DTO | `depgraph-operation-v1` |
 | Agent host configuration | `depgraph-agent-host-config-v1` |
 | Agent onboarding release evidence | `release-post-publish-evidence-v1` |
-| Packaged MCP smoke | `mcp-package-smoke-v2` |
+| Packaged MCP smoke | `mcp-package-smoke-v3` |
 | Release gate | `stable-release-gate-v2` |
 | Packaged smoke | `stable-v0.5.0-packaged-smoke-v1` |
 

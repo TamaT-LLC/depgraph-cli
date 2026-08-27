@@ -20,6 +20,7 @@ pub mod ffi_link;
 pub mod github_settings;
 mod graphml;
 pub mod graphql;
+pub mod health;
 pub mod http_operation_correlation;
 pub mod impact;
 pub mod incremental;
@@ -50,6 +51,7 @@ mod service_artifacts;
 mod service_bounded;
 mod service_build;
 mod service_graph;
+mod service_health;
 mod service_lifecycle;
 mod service_limits;
 mod service_repository;
@@ -81,7 +83,7 @@ pub use bounded_query::{
     OrderItem, Projection, QuantifierKind, QuantifierPredicate, QueryAst, QueryDiagnostic,
     QueryDirection, QueryFailureClass, QueryOrigin, RelationshipPattern, ReturnClause,
     ScalarOperator, ScalarPredicate, SortDirection, parse_bounded_query, parse_bounded_query_bytes,
-    parse_bounded_query_file, read_bounded_query_file,
+    parse_bounded_query_file, read_bounded_query_file, read_bounded_repository_file,
 };
 pub use bounded_query_execute::{
     BOUNDED_QUERY_RESULT_SCHEMA_VERSION, BoundedQueryExecutionError, BoundedQueryExecutionMetrics,
@@ -298,6 +300,14 @@ pub use graphql::{
     MAX_GRAPHQL_FILE_BYTES, MAX_GRAPHQL_FILES, MAX_GRAPHQL_SELECTIONS, MAX_GRAPHQL_TOKENS,
     MAX_GRAPHQL_TOTAL_BYTES, scan_graphql_repository,
 };
+pub use health::{
+    BaselineFindingRecord, BaselineTransition, BlockerKind, CollectionIdentity, Confidence,
+    DEFAULT_HOTSPOT_WEIGHTS, FindingBlocker, FindingEvidenceRef, FindingIdentity, FindingKind,
+    FindingKindScope, FindingSuppression, HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION,
+    HealthFinding, HealthFindingDetail, HealthGateConfig, HealthGateDecision, HotspotWeights,
+    Remediation, Severity, SourceLocation, classify_baseline_transition, collection_digest,
+    evaluate_health_gate, finding_fingerprint, finding_id,
+};
 pub use http_operation_correlation::{
     HTTP_OPERATION_CORRELATION_VERSION, HttpOperationCorrelationOutcome,
     HttpOperationCorrelationResult, correlate_http_operations,
@@ -429,11 +439,14 @@ pub use service::{
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
     DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, DoctorRequest,
-    DoctorResponse, ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult,
-    OpenedRepositoryFile, ProfilePlanRequest, RepositoryFileError, RepositoryPathError,
-    RepositoryPathSelector, RepositoryRelativePath, RequestReadStore, RequestReadStoreFactory,
-    ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest, UnresolvedRequest,
-    UnresolvedServiceResult,
+    DoctorResponse, ExplainPathRequest, ExplainPathResult, HealthAuditReadScope,
+    HealthAuditRequest, HealthAuditResult, HealthCoverageOverview, HealthFindingGetRequest,
+    HealthFindingsRequest, HealthFindingsResult, HealthHotspotsRequest, HealthHotspotsResult,
+    HealthSummaryRequest, HealthSummaryResult, ImpactRequest, ImpactServiceResult,
+    OpenedRepositoryFile, PinnedHealthSnapshot, ProfilePlanRequest, RepositoryFileError,
+    RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath, RequestReadStore,
+    RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
+    UnresolvedRequest, UnresolvedServiceResult,
 };
 
 use worker::{

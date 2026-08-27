@@ -7,7 +7,7 @@ status: Active
 upstream: [PROJ-ARC-001]
 downstream: []
 owner: TakehiroT
-updated: 2026-08-24
+updated: 2026-08-26
 open_questions: 0
 ---
 
@@ -39,9 +39,21 @@ additive extensionとして採用するかを決定する。
 | Project execution | `resolve_build_submit` | Issue #316 implemented through the shared build service, verified compiler-pack startup authority, and the existing supervised staging boundary |
 | Cross-cutting security E2E | CLI/catalog, capability, path, operation recovery, hostile project execution | Issue #317 implemented through the live stdio profile/path/cancel corpus and the dedicated Linux hostile gate |
 | Agent host operations | read-only default, privileged profiles, confirmation, recovery, upgrade/rollback | Issue #320 documented in README and the package-smoked operations runbook |
-| Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v2` |
+| Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v3` |
 | Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
+| Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
 | Open questions | `0` | Resolved |
+
+### Code-health host guidance
+
+These five tools are READ-only. They never write the Store, snapshot, or source tree.
+
+- **Confidence**: `confirmed` means unused across every applicable analyzed profile, those profiles are `semantic-complete`, and no hard blocker remains. `probable` has no observed usage and no hard blocker but applicable profiles are only `syntax-complete`. `indeterminate` means a blocker prevents confirmation (missing coverage or surface evidence, public surface, entry point, dynamic loading, candidate, unresolved, generated artifact, profile-not-analyzed, manifest-drift, missing/mismatched base snapshot, or similar).
+- **`health_summary_get` / `health_findings_list` / `health_finding_get`** cover snapshot-scoped kinds only (`unused-file`, `unused-export`, `unused-type`, `unused-dependency`, `test-only-dependency`, `manifest-mismatch`). They do not include audit or hotspot findings.
+- **`health_finding_get`** accepts snapshot-scoped stable finding IDs. Input-scoped audit or hotspot IDs return a deterministic `INVALID_ARGUMENT`; use `health_audit_get` or `health_hotspots_list` instead.
+- **`health_audit_get`**: `--changed` / `changed` is the comparison base for `merge-base(changed, HEAD)..HEAD`; both refs are resolved at request start and `changed_oid` identifies that HEAD. Without a comparable base snapshot, blast radius remains evaluable while new-cycle / new-boundary / public-api checks return `indeterminate` placeholders with blocker `missing-base-snapshot`.
+- **`health_hotspots_list`**: scores use integer basis points. A missing Git-churn or runtime layer contributes 0 and does not renormalize weights.
+- Read blockers before treating any finding as safe to delete or unexport. Source is never changed automatically.
 
 Stage 1ではcontractをfreezeする。operation journal、runner、baseline operation
 tools、Tasks adapterの実装は後続taskで行い、この文書のnegotiationとrecovery
@@ -100,8 +112,9 @@ schema/Serde差分は回帰testで意図的に固定する。
 | `#318` | MCP server、operation runner、schema、SDK/legal metadataを5 target release closureへ含める | `depgraph-mcp`とrunnerのnative binary、`depgraph-mcp-tools-v1` schema、rmcp compatibility unit、SPDX/license/Apache notice、archive digest、aggregate attestationをfail-closed verifierで固定する |
 | `#319` | 抽出済みarchiveのMCP stdio smokeと5 target digest gateを追加する | legacy/modern initialize、profile別catalog、固定graph result、safe scan submit/EOF recovery、cancel認可、clean EOF/stdout purityをnative jobで実行し、共通digestをaggregate gateで固定する |
 | `#320` | Agent host設定、権限、timeout、reconnect、upgrade policyを運用文書へ固定する | READMEのpackaged read-only default、全privileged profileのcomplete host entry、人間確認/acknowledgement/isolationの責任分離、baseline/Tasks recovery、deadline/TTL/idempotency、whole-package upgrade/byte-consistent rollbackをdocumentation parserと抽出archive smokeで固定する |
-| `#358` | verified release archiveからAgent host onboardingを自動化する | `depgraph-agent-host-config-v1` golden、fail-closed package/root/Store/compiler-pack preflight、read-only default、privileged acknowledgement、clean-home initialize/catalog/context probe、`mcp-package-smoke-v2`で固定する |
+| `#358` | verified release archiveからAgent host onboardingを自動化する | `depgraph-agent-host-config-v1` golden、fail-closed package/root/Store/compiler-pack preflight、read-only default、privileged acknowledgement、clean-home initialize/catalog/context probe、`mcp-package-smoke-v3`で固定する |
 | `#387` | repository別のMCP setupを1 commandへ閉じる | canonical Git rootのwrite/download前検証、GitHub API digestとpost-publish evidenceに閉じたversion/target共有cache、repository固有Storeとnon-executing safe scan、既存`agent-config` preflight、Codex／Claude Code／Cursor／Grokのproject/user設定へのatomic semantic merge、repository固有名を使うuser scope、status/update/uninstallの所有権分離、および公開後5 target clean-home E2Eで固定する |
+| `#423` | 説明可能なコードヘルス解析をCLIとMCPへ同じ契約で公開する | `depgraph-health-finding-v1`、共有`health_*` service、5 read-only MCP tool、CLI `health` / `cleanup` / `audit` / `hotspots`、baseline遷移gate、catalog/schema golden、CLI/MCP parityとread-only/redaction E2Eで固定する |
 
 ## Upstream and API evidence
 
@@ -781,7 +794,7 @@ commandはhost設定fileを変更せず、成功した設定だけをstdoutへ�
 | Package preflight | trusted evidence digestを最初の外部trust anchorとし、official repository、canonical stable/RC tag、署名tag判定、exact Full CI/release workflow、sorted 51-asset closureとaggregate bindingを閉じて検証する。選択したarchive/checksum/compiler-pack requirementはpublic assetのexact name/size/SHA-256へ一致させ、archive内manifestと抽出manifestのbyte一致、target/version/protocol/schema、MCP server/runner/schema/三workerのpath・digest・実行属性をserver起動前に検査する。異なるrelease/targetのartifact混在、ローカルで自己署名したevidence、symlink、unbounded/nonregular inputを拒否する。CLIへ昇格した`flate2`/`tar`/`zip`とtransitive runtime closureはSBOMとthird-party license inventoryへ含める |
 | Repository and Store binding | canonical fixed rootとroot seal、repository外のprivate Store、current snapshotのscan root一致を検査する。Storeまたはcurrent snapshotがない場合は、設定を生成せず、同じroot/store/package tupleを使う安全な`scan` argvをJSONで返す。preflight自身はrepository、Store、host設定、operation journalを変更しない |
 | Connection probe | verified packageの`depgraph-mcp`をambient PATH、checkout artifact、worker overrideなしで起動し、`initialize`、profile exact `tools/list`、`get_context`を実行する。responseのcurrent snapshot/root binding、stdio purity、正常EOFを確認してから設定をstdoutへ出す |
-| Five-target package gate | native package jobはclean temporary homeでCodex、Claude Desktop、VS Codeの生成設定をparseし、同じverified launch tupleへ接続する。公開前package smokeはclosed synthetic evidenceと別計算したdigestを使って同じ認証経路を実行する。sidecarをclosed `mcp-package-smoke-v2`へ拡張し、config/evidence contract version、release trust=true、三format、read default、preflight/connection/clean environment、repository/Store/home/journal不変をtargetごとにattestする。Store dataはmain DBとWALのbyte一致で固定し、SQLite reader lockが更新する`-shm`は存在とsizeだけを比較する。operation journalは全sidecarを含め不存在を要求する |
+| Five-target package gate | native package jobはclean temporary homeでCodex、Claude Desktop、VS Codeの生成設定をparseし、同じverified launch tupleへ接続する。公開前package smokeはclosed synthetic evidenceと別計算したdigestを使って同じ認証経路を実行する。sidecarをclosed `mcp-package-smoke-v3`へ拡張し、config/evidence contract version、release trust=true、三format、read default、preflight/connection/clean environment、repository/Store/home/journal不変をtargetごとにattestする。Store dataはmain DBとWALのbyte一致で固定し、SQLite reader lockが更新する`-shm`は存在とsizeだけを比較する。operation journalは全sidecarを含め不存在を要求する |
 | Dogfood finding | setup blockerはP1の手作業tuple混在、privileged profile/ack誤用、空Storeとし、command/preflight/remediationで閉じる。P2の過剰context/tool misuseはhost側allowlistで追加抑制できるがrelease blockerではない。read profileでもcompiler-pack requirementはstartup authority tupleの一部であり、3/3 dogfood setupで阻害が観測されなかったため現行境界を維持し、新ADRは追加しない |
 | Documentation drift | READMEのdefault invocationとrunbookのhost別quickstartをgolden rendererへexact比較する。docs marker欠損/重複、default profileの昇格、host構文・launch args driftは`cargo xtask test`で拒否する |
 
@@ -793,7 +806,7 @@ commandはhost設定fileを変更せず、成功した設定だけをstdoutへ�
 | default workflowがrepository、Store、host設定を変更しない | read-only Store open、pre/post source/Store digest、clean HOME、operation journal不存在、stdout-only configuration assertion |
 | artifact混在をserver起動前に拒否 | trusted evidence digest、official repository/tag/workflow/51-asset closure、checksum、archive manifest byte identity、target/version/path/digest/executable/schema/requirement/root-seal mutation tests |
 | privileged effectとhuman responsibilityを明示 | exact profile capability closure、effect summary、二段階acknowledgement parser/unit tests |
-| 5 targetのclean environment接続 | release native matrixの`mcp-package-smoke-v2`、生成config parse、initialize/catalog/context probe、ambient dependency denial |
+| 5 targetのclean environment接続 | release native matrixの`mcp-package-smoke-v3`、生成config parse、initialize/catalog/context probe、ambient dependency denial |
 | documentationと生成結果を同期 | shared `depgraph-agent-host-config-v1` renderer、README/runbook marker parser、format/profile mutation tests |
 | dogfood blockerのresolution | runbookのP0/P1/P2分類、safe scan remediation、compiler-pack boundary再評価記録 |
 | repository validation | Rust 1.93.1 format、focused CLI/MCP/xtask suites、native package smoke、workspace Clippy `-D warnings`、`cargo xtask test` |
