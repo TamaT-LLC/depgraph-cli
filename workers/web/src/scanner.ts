@@ -415,6 +415,7 @@ class GraphBuilder {
             source_path: definition.relativePath,
             source_span: span,
             generated: file.properties.generated === true,
+            ...(definition.exported === true ? { exported: true } : {}),
             typescript_provenance: "typescript-native-typechecker",
             ...(resolverIdentity === null ? {} : { resolver_identity: resolverIdentity }),
             ...(definition.genericOrigin === undefined ? {} : {
@@ -1106,6 +1107,7 @@ class GraphBuilder {
         path: relative,
         extension,
         language: extension === ".astro" ? "astro" : [".ts", ".tsx", ".mts", ".cts"].includes(extension) ? "typescript" : [".js", ".jsx", ".mjs", ".cjs"].includes(extension) ? "javascript" : "data",
+        profile_id: PROFILE_ID,
         package_id: owner.id,
         package_locator: owner.locator,
         generated,

@@ -325,6 +325,29 @@ function top<T>(input: T): T {
 const exported = <T,>(input: T): T => input;
 `;
 
+test("direct TypeScript and JavaScript exports retain public-surface evidence", async () => {
+  const delta = await extractFixture({
+    "src/exports.ts": [
+      "export const unusedValue = 1;",
+      "const internalValue = 2;",
+      "export interface PublicShape { readonly value: number }",
+      "interface PrivateShape { readonly value: number }",
+    ].join("\n"),
+    "src/exports.js": [
+      "export function publicFunction() { return true; }",
+      "function privateFunction() { return false; }",
+    ].join("\n"),
+  }, "__depgraph_ts_semantic_exports__");
+
+  const byName = new Map(delta.definitions.map((definition) => [definition.displayName, definition]));
+  assert.equal(byName.get("unusedValue")?.exported, true);
+  assert.equal(byName.get("PublicShape")?.exported, true);
+  assert.equal(byName.get("publicFunction")?.exported, true);
+  assert.equal(byName.get("internalValue")?.exported, undefined);
+  assert.equal(byName.get("PrivateShape")?.exported, undefined);
+  assert.equal(byName.get("privateFunction")?.exported, undefined);
+});
+
 function literalValidationDelta(
   descriptor: TypeScriptRawTypeArgumentDescriptor,
 ): Pick<TypeScriptRawDefinitionDelta, "definitions" | "relations"> {

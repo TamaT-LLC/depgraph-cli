@@ -204,6 +204,12 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(semanticNodes.some((node) => node.kind === "symbol" && node.properties.symbol_kind === "variable"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "class"));
   assert.ok(semanticNodes.some((node) => node.kind === "type" && node.properties.type_kind === "generic_instance"));
+  assert.ok(semanticNodes.some((node) => node.properties.exported === true));
+  assert.ok(semanticNodes.every((node) => node.properties.exported === undefined || node.properties.exported === true));
+  assert.deepEqual(
+    nodes.filter((node) => node.kind === "file" && node.properties.profile_id !== profile.id).map((node) => node.display_name),
+    [],
+  );
   assert.deepEqual([...new Set(definitionEdges.map((edge) => edge.kind))].sort(), ["declares", "extends", "implements", "instantiates"]);
   assert.deepEqual([...new Set(semanticSites.map((site) => site.kind))].sort(), ["call", "type_use", "web_import", "web_reexport"]);
   assert.deepEqual([...new Set(dependencySemanticEdges.map((edge) => edge.kind))].sort(), ["calls", "imports", "may_call", "reexports", "type_uses"]);

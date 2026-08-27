@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const HEALTH_FINDING_CONTRACT_VERSION: &str = "depgraph-health-finding-v1";
-pub const HEALTH_ANALYZER_VERSION: &str = "1.0.0";
+pub const HEALTH_ANALYZER_VERSION: &str = "1.0.1";
 pub const BASIS_POINTS_MAX: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

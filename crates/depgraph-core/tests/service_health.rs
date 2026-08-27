@@ -26,6 +26,7 @@ fn seed_health_snapshot(
     root: &Path,
     scan_id: &str,
     revision: &str,
+    add_changed_usage: bool,
 ) -> Result<String> {
     store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
     let coverage = json!({
@@ -118,11 +119,30 @@ fn seed_health_snapshot(
         "generated": false
     });
     store.ingest_event(&edge)?;
-    let mut profile_completed = common("profile_completed", 7);
+    let mut next_seq = 7;
+    if add_changed_usage {
+        let mut changed_edge = common("edge_upsert", next_seq);
+        changed_edge["edge"] = json!({
+            "id": "edge:used-unused",
+            "source": "file:src/used.rs",
+            "target": "file:src/unused.rs",
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&changed_edge)?;
+        next_seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", next_seq);
     profile_completed["profile_id"] = json!("fixture:rust");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed)?;
-    let mut completed = common("scan_completed", 8);
+    let mut completed = common("scan_completed", next_seq + 1);
     completed["coverage"] = coverage;
     store.ingest_event(&completed)?;
     store.finish_scan(scan_id, "completed", None, true)?;
@@ -172,7 +192,7 @@ fn issue_423_health_service_pins_snapshot_and_rejects_invalid_requests() -> Resu
     let revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    let snapshot_id = seed_health_snapshot(&mut store, &root, "health-scan", &revision)?;
+    let snapshot_id = seed_health_snapshot(&mut store, &root, "health-scan", &revision, false)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -280,7 +300,7 @@ fn issue_423_unreadable_manifest_degrades_health_instead_of_failing() -> Result<
     symlink(&outside_manifest, root.join("Cargo.toml"))?;
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    seed_health_snapshot(&mut store, &root, "health-symlink", &revision)?;
+    seed_health_snapshot(&mut store, &root, "health-symlink", &revision, false)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -304,7 +324,7 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     let base_revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    let base_id = seed_health_snapshot(&mut store, &root, "health-base", &base_revision)?;
+    let base_id = seed_health_snapshot(&mut store, &root, "health-base", &base_revision, false)?;
     fs::write(
         root.join("src/unused.rs"),
         "pub fn unused() { println!(\"changed\"); }\n",
@@ -312,7 +332,7 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "change unused"]);
     let head_revision = run_git(&root, &["rev-parse", "HEAD"]);
-    let after_id = seed_health_snapshot(&mut store, &root, "health-after", &head_revision)?;
+    let after_id = seed_health_snapshot(&mut store, &root, "health-after", &head_revision, true)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -335,6 +355,12 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     );
     assert_eq!(first.changed_oid(), head_revision);
     assert!(first.collection_digest().starts_with("collection:sha256:"));
+    assert!(first.findings().iter().all(|finding| {
+        finding
+            .blockers
+            .iter()
+            .all(|blocker| blocker.kind != depgraph_core::BlockerKind::IncomparableProfileMatrix)
+    }));
 
     fs::write(root.join("src/late-change.rs"), "pub fn late() {}\n")?;
     let second = service.health_audit(&scope, &cancellation)?;
@@ -351,7 +377,7 @@ fn issue_423_health_hotspots_degrade_missing_layers_deterministically() -> Resul
     let revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    seed_health_snapshot(&mut store, &root, "health-hotspots", &revision)?;
+    seed_health_snapshot(&mut store, &root, "health-hotspots", &revision, false)?;
     drop(store);
 
     let service = service(&root, &store_path)?;

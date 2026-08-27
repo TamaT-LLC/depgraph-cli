@@ -114,7 +114,40 @@ fn is_entry_point(node: &NodeRecord, reasons: &mut Vec<String>) -> bool {
         reasons.push(format!("path {path} is an entry-point convention"));
         return true;
     }
+    if let Some(path) = path_of(node)
+        && is_project_metadata_path(&path)
+    {
+        reasons.push(format!(
+            "path {path} is a project manifest or compiler configuration"
+        ));
+        return true;
+    }
     false
+}
+
+fn is_project_metadata_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        file_name,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "go.mod"
+            | "go.sum"
+            | "go.work"
+            | "go.work.sum"
+            | "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.json"
+            | "deno.jsonc"
+            | "jsconfig.json"
+            | "tsconfig.json"
+    ) || file_name.starts_with("tsconfig.") && file_name.ends_with(".json")
+        || file_name.starts_with("jsconfig.") && file_name.ends_with(".json")
 }
 
 fn is_public_surface(node: &NodeRecord, language: Option<&str>, reasons: &mut Vec<String>) -> bool {
@@ -269,5 +302,24 @@ mod tests {
 
         let internal = node("file", "rust", json!({"path": "src/helper.rs"}));
         assert_eq!(classify_surface(&internal).role, SurfaceRole::Internal);
+    }
+
+    #[test]
+    fn issue_423_project_manifests_and_compiler_configs_are_protected_surfaces() {
+        for path in [
+            "Cargo.toml",
+            "go.mod",
+            "package.json",
+            "pnpm-lock.yaml",
+            "tsconfig.json",
+            "configs/tsconfig.build.json",
+        ] {
+            let metadata = node("file", "data", json!({"path": path}));
+            assert_eq!(
+                classify_surface(&metadata).role,
+                SurfaceRole::EntryPoint,
+                "{path}"
+            );
+        }
     }
 }

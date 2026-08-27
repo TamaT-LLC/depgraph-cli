@@ -118,6 +118,8 @@ export interface TypeScriptRawDefinition {
   startOffset: number;
   endOffset: number;
   owner: TypeScriptRawDefinitionEndpoint;
+  /** Present only when module-scope syntax directly exports this definition. */
+  exported?: true;
   genericOrigin?: string;
   typeArguments?: TypeScriptRawTypeArgumentDescriptor[];
 }
@@ -162,6 +164,7 @@ interface Candidate {
   readonly owner: Candidate | null;
   readonly lexicalPath: readonly string[];
   readonly moduleScoped: boolean;
+  readonly exported: boolean;
   readonly startOffset: number;
   readonly endOffset: number;
   readonly depth: number;
@@ -381,6 +384,23 @@ function typeParametersOf(node: Node): readonly TypeParameterDeclaration[] {
   return (node as Node & { readonly typeParameters?: readonly TypeParameterDeclaration[] }).typeParameters ?? [];
 }
 
+function hasExportModifier(node: Node): boolean {
+  const modifierFlags = (node as Node & { readonly modifierFlags?: ModifierFlags }).modifierFlags
+    ?? ModifierFlags.None;
+  return (modifierFlags & (ModifierFlags.Export | ModifierFlags.Default)) !== 0;
+}
+
+function isDirectModuleExport(
+  node: Node,
+  moduleScoped: boolean,
+  lexicalPath: readonly string[],
+): boolean {
+  if (!moduleScoped) return false;
+  if (lexicalPath.length > 0) return false;
+  const declaration = node.kind === SyntaxKind.VariableDeclaration ? node.parent.parent : node;
+  return hasExportModifier(declaration);
+}
+
 function declarationCandidate(
   node: Node,
   source: TypeScriptSemanticSource,
@@ -398,6 +418,7 @@ function declarationCandidate(
     owner,
     lexicalPath,
     moduleScoped,
+    exported: isDirectModuleExport(node, moduleScoped, lexicalPath),
     startOffset: nodeStart(node, sourceFile),
     endOffset: nodeEnd(node, sourceFile),
     depth: owner === null ? 0 : owner.depth + 1,
@@ -1465,6 +1486,12 @@ export function validateTypeScriptRawDefinitionDelta(
     if (definition.language !== "typescript" && definition.language !== "javascript") {
       throw new DeltaValidationError(`raw definition ${definition.key} has an unsupported language`);
     }
+    if (definition.exported !== undefined && definition.exported !== true) {
+      throw new DeltaValidationError(`raw definition ${definition.key} has invalid export evidence`);
+    }
+    if (definition.exported === true && definition.owner.kind !== "file") {
+      throw new DeltaValidationError(`raw definition ${definition.key} exports a non-module definition`);
+    }
     if (
       definition.displayName.length === 0
       || definition.displayName.length > MAX_DISPLAY_NAME_CHARS
@@ -1971,6 +1998,7 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
       startOffset: group.primary.startOffset,
       endOffset: group.primary.endOffset,
       owner,
+      ...(group.candidates.some((candidate) => candidate.exported) ? { exported: true as const } : {}),
     };
     definitions.push(definition);
     for (const candidate of group.candidates) {
