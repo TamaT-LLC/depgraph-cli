@@ -325,13 +325,18 @@ function top<T>(input: T): T {
 const exported = <T,>(input: T): T => input;
 `;
 
-test("direct TypeScript and JavaScript exports retain public-surface evidence", async () => {
+test("TypeScript and JavaScript module exports retain public-surface evidence", async () => {
   const delta = await extractFixture({
     "src/exports.ts": [
       "export const unusedValue = 1;",
       "const internalValue = 2;",
+      "const listedValue = 3;",
+      "const defaultValue = 4;",
       "export interface PublicShape { readonly value: number }",
       "interface PrivateShape { readonly value: number }",
+      "interface ListedShape { readonly value: number }",
+      "export { listedValue as publicAlias, type ListedShape };",
+      "export default defaultValue;",
     ].join("\n"),
     "src/exports.js": [
       "export function publicFunction() { return true; }",
@@ -343,6 +348,9 @@ test("direct TypeScript and JavaScript exports retain public-surface evidence", 
   assert.equal(byName.get("unusedValue")?.exported, true);
   assert.equal(byName.get("PublicShape")?.exported, true);
   assert.equal(byName.get("publicFunction")?.exported, true);
+  assert.equal(byName.get("listedValue")?.exported, true);
+  assert.equal(byName.get("ListedShape")?.exported, true);
+  assert.equal(byName.get("defaultValue")?.exported, true);
   assert.equal(byName.get("internalValue")?.exported, undefined);
   assert.equal(byName.get("PrivateShape")?.exported, undefined);
   assert.equal(byName.get("privateFunction")?.exported, undefined);
