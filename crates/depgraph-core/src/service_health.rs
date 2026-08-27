@@ -612,8 +612,10 @@ impl DepgraphService {
             cancellation,
         )?;
         if let Some(before) = &before {
-            comparability.profile_matrix_changed = before.snapshot.profile_matrix
-                != after.profile_matrix
+            comparability.profile_matrix_changed = before.snapshot.profile_matrix.schema_version
+                != after.profile_matrix.schema_version
+                || profile_matrix_identities(&before.snapshot, cancellation)?
+                    != profile_matrix_identities(&after, cancellation)?
                 || profile_identities(&before.snapshot, cancellation)?
                     != profile_identities(&after, cancellation)?;
             comparability.coverage_retreated = completeness_rank(&after.coverage.completeness)
@@ -1198,6 +1200,42 @@ fn profile_identities(
             cancellation,
         )?;
         identities.insert((profile.id.clone(), profile.language.clone()));
+    }
+    Ok(identities)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProfileMatrixIdentity {
+    entry_id: String,
+    effective_input_id: String,
+    language: String,
+    profile_ids: Vec<String>,
+    parent_profile_ids: Vec<String>,
+    phases: Vec<String>,
+    selection_reasons: Vec<String>,
+}
+
+fn profile_matrix_identities(
+    snapshot: &GraphSnapshot,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<BTreeSet<ProfileMatrixIdentity>> {
+    let mut identities = BTreeSet::new();
+    let mut work = 0_usize;
+    for entry in &snapshot.profile_matrix.entries {
+        health_service_step(
+            &mut work,
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            cancellation,
+        )?;
+        identities.insert(ProfileMatrixIdentity {
+            entry_id: entry.id.clone(),
+            effective_input_id: entry.effective_input_id.clone(),
+            language: entry.language.clone(),
+            profile_ids: entry.profile_ids.clone(),
+            parent_profile_ids: entry.parent_profile_ids.clone(),
+            phases: entry.phases.clone(),
+            selection_reasons: entry.selection_reasons.clone(),
+        });
     }
     Ok(identities)
 }

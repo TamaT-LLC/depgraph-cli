@@ -78,6 +78,9 @@ function validateSemanticNode(node: GraphNode, options: TypeScriptDefinitionDelt
   if (stringValue(node.properties.profile_id, `${node.id}.properties.profile_id`) !== options.profileId) {
     throw new Error(`${node.id} belongs to a different profile`);
   }
+  if (node.properties.exported !== undefined && node.properties.exported !== true) {
+    throw new Error(`${node.id}.properties.exported must be true when present`);
+  }
   const packageLocator = stringValue(node.properties.package_locator, `${node.id}.properties.package_locator`);
   const kindProperty = node.kind === "symbol" ? "symbol_kind" : "type_kind";
   const semanticKind = stringValue(node.properties[kindProperty], `${node.id}.properties.${kindProperty}`);

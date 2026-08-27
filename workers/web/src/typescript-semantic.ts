@@ -13,12 +13,16 @@ import {
   type ClassDeclaration,
   type EnumDeclaration,
   type ExpressionWithTypeArguments,
+  type ExportAssignment,
+  type ExportDeclaration,
+  type ExportSpecifier,
   type FunctionDeclaration,
   type FunctionExpression,
   type InterfaceDeclaration,
   type MethodDeclaration,
   type MethodSignatureDeclaration,
   type ModuleDeclaration,
+  type NamedExports,
   type Node,
   type PropertyName,
   type SourceFile,
@@ -118,6 +122,8 @@ export interface TypeScriptRawDefinition {
   startOffset: number;
   endOffset: number;
   owner: TypeScriptRawDefinitionEndpoint;
+  /** Present only when module-scope syntax exports this definition. */
+  exported?: true;
   genericOrigin?: string;
   typeArguments?: TypeScriptRawTypeArgumentDescriptor[];
 }
@@ -162,6 +168,7 @@ interface Candidate {
   readonly owner: Candidate | null;
   readonly lexicalPath: readonly string[];
   readonly moduleScoped: boolean;
+  exported: boolean;
   readonly startOffset: number;
   readonly endOffset: number;
   readonly depth: number;
@@ -170,6 +177,12 @@ interface Candidate {
   resolverIdentity: string | null;
   identityKind: TypeScriptRawSymbolIdentityKind | null;
   semanticKind: string;
+}
+
+interface LocalExportReference {
+  readonly reference: Node;
+  readonly specifier: ExportSpecifier | null;
+  readonly typeOnly: boolean;
 }
 
 interface CandidateGroup {
@@ -202,6 +215,7 @@ interface TypeParameterCandidate {
 interface Collection {
   readonly candidates: Candidate[];
   readonly heritage: HeritageCandidate[];
+  readonly localExports: LocalExportReference[];
   readonly typeParameters: TypeParameterCandidate[];
   astNodes: number;
   limitIssue: TypeScriptSemanticIssue | null;
@@ -381,6 +395,73 @@ function typeParametersOf(node: Node): readonly TypeParameterDeclaration[] {
   return (node as Node & { readonly typeParameters?: readonly TypeParameterDeclaration[] }).typeParameters ?? [];
 }
 
+function hasExportModifier(node: Node): boolean {
+  const modifierFlags = (node as Node & { readonly modifierFlags?: ModifierFlags }).modifierFlags
+    ?? ModifierFlags.None;
+  return (modifierFlags & (ModifierFlags.Export | ModifierFlags.Default)) !== 0;
+}
+
+function collectExportAssignmentReference(
+  assignment: ExportAssignment,
+  references: LocalExportReference[],
+): void {
+  const expression = assignment.expression;
+  if (expression.kind === SyntaxKind.Identifier) {
+    references.push({ reference: expression, specifier: null, typeOnly: false });
+  }
+}
+
+function exportSpecifierIsTypeOnly(
+  declaration: ExportDeclaration,
+  specifier: ExportSpecifier,
+): boolean {
+  if (declaration.isTypeOnly) return true;
+  return specifier.isTypeOnly;
+}
+
+function localNamedExports(declaration: ExportDeclaration): NamedExports | null {
+  if (declaration.moduleSpecifier !== undefined) return null;
+  if (declaration.exportClause === undefined) return null;
+  if (declaration.exportClause.kind !== SyntaxKind.NamedExports) return null;
+  return declaration.exportClause;
+}
+
+function collectExportDeclarationReferences(
+  declaration: ExportDeclaration,
+  references: LocalExportReference[],
+): void {
+  const exportClause = localNamedExports(declaration);
+  if (exportClause === null) return;
+  for (const specifier of exportClause.elements) {
+    references.push({
+      reference: specifier.propertyName ?? specifier.name,
+      specifier,
+      typeOnly: exportSpecifierIsTypeOnly(declaration, specifier),
+    });
+  }
+}
+
+function collectLocalExportReferences(node: Node, references: LocalExportReference[]): void {
+  if (node.kind === SyntaxKind.ExportAssignment) {
+    collectExportAssignmentReference(node as ExportAssignment, references);
+    return;
+  }
+  if (node.kind !== SyntaxKind.ExportDeclaration) return;
+  const declaration = node as ExportDeclaration;
+  collectExportDeclarationReferences(declaration, references);
+}
+
+function isDirectModuleExport(
+  node: Node,
+  moduleScoped: boolean,
+  lexicalPath: readonly string[],
+): boolean {
+  if (!moduleScoped) return false;
+  if (lexicalPath.length > 0) return false;
+  const declaration = node.kind === SyntaxKind.VariableDeclaration ? node.parent.parent : node;
+  return hasExportModifier(declaration);
+}
+
 function declarationCandidate(
   node: Node,
   source: TypeScriptSemanticSource,
@@ -398,6 +479,7 @@ function declarationCandidate(
     owner,
     lexicalPath,
     moduleScoped,
+    exported: isDirectModuleExport(node, moduleScoped, lexicalPath),
     startOffset: nodeStart(node, sourceFile),
     endOffset: nodeEnd(node, sourceFile),
     depth: owner === null ? 0 : owner.depth + 1,
@@ -583,6 +665,7 @@ function collectSources(
   const collection: Collection = {
     candidates: [],
     heritage: [],
+    localExports: [],
     typeParameters: [],
     astNodes: 0,
     limitIssue: null,
@@ -625,6 +708,7 @@ function collectSources(
       );
       return;
     }
+    collectLocalExportReferences(node, collection.localExports);
 
     // Members can only inherit a semantic owner when it represents their
     // actual syntax container. A direct type-literal body is also the public
@@ -1165,6 +1249,130 @@ async function unwrapAlias(
   return await checker.isUnknownSymbol(target) ? null : target;
 }
 
+interface CandidateExportIndex {
+  readonly byDeclaration: ReadonlyMap<string, readonly Candidate[]>;
+  readonly byId: ReadonlyMap<number, readonly Candidate[]>;
+}
+
+function appendCandidate<Key>(
+  index: Map<Key, Candidate[]>,
+  key: Key,
+  candidate: Candidate,
+): void {
+  index.set(key, [...(index.get(key) ?? []), candidate]);
+}
+
+function candidateExportIndex(candidates: readonly Candidate[]): CandidateExportIndex {
+  const byDeclaration = new Map<string, Candidate[]>();
+  const byId = new Map<number, Candidate[]>();
+  for (const candidate of candidates) {
+    if (candidate.symbol === null) continue;
+    appendCandidate(byId, candidate.symbol.id, candidate);
+    for (const declaration of candidate.symbol.declarations) {
+      appendCandidate(byDeclaration, compilerDeclarationKey(declaration), candidate);
+    }
+  }
+  return { byDeclaration, byId };
+}
+
+async function resolvedExportSymbol(
+  checker: Checker,
+  symbol: CompilerSymbol | undefined,
+  counter: QueryCounter,
+): Promise<CompilerSymbol | null> {
+  if (symbol === undefined) return null;
+  return await unwrapAlias(checker, symbol, counter);
+}
+
+async function exportSpecifierTarget(
+  checker: Checker,
+  specifier: ExportSpecifier,
+  counter: QueryCounter,
+): Promise<CompilerSymbol | null> {
+  beginTypeCheckerQuery(counter);
+  const symbol = await checker.getExportSpecifierLocalTargetSymbol(specifier);
+  return await resolvedExportSymbol(checker, symbol, counter);
+}
+
+function assertSameExportTarget(
+  syntaxTarget: CompilerSymbol | null,
+  specifierTarget: CompilerSymbol | null,
+  counter: QueryCounter,
+): void {
+  if (syntaxTarget === null) return;
+  if (specifierTarget === null) return;
+  if (syntaxTarget.id === specifierTarget.id) return;
+  throw new TypeCheckerContractError("local export target did not correlate with its syntax binding", counter.value);
+}
+
+async function localExportTarget(
+  checker: Checker,
+  reference: LocalExportReference,
+  syntaxSymbol: CompilerSymbol | undefined,
+  counter: QueryCounter,
+): Promise<CompilerSymbol | null> {
+  const syntaxTarget = await resolvedExportSymbol(checker, syntaxSymbol, counter);
+  if (reference.specifier === null) return syntaxTarget;
+  const specifierTarget = await exportSpecifierTarget(checker, reference.specifier, counter);
+  assertSameExportTarget(syntaxTarget, specifierTarget, counter);
+  if (specifierTarget !== null) return specifierTarget;
+  return syntaxTarget;
+}
+
+function addExportMatches(
+  matches: Set<Candidate>,
+  candidates: readonly Candidate[] | undefined,
+): void {
+  if (candidates === undefined) return;
+  for (const candidate of candidates) matches.add(candidate);
+}
+
+function exportedCandidates(
+  symbol: CompilerSymbol,
+  index: CandidateExportIndex,
+): ReadonlySet<Candidate> {
+  const matches = new Set<Candidate>();
+  addExportMatches(matches, index.byId.get(symbol.id));
+  for (const declaration of symbol.declarations) {
+    addExportMatches(matches, index.byDeclaration.get(compilerDeclarationKey(declaration)));
+  }
+  return matches;
+}
+
+function candidateReceivesExport(candidate: Candidate, typeOnly: boolean): boolean {
+  if (!typeOnly) return true;
+  return candidate.graphKind === "type";
+}
+
+function markExportedCandidates(
+  symbol: CompilerSymbol,
+  typeOnly: boolean,
+  index: CandidateExportIndex,
+): void {
+  for (const candidate of exportedCandidates(symbol, index)) {
+    if (candidateReceivesExport(candidate, typeOnly)) candidate.exported = true;
+  }
+}
+
+async function applyLocalExportEvidence(
+  checker: Checker,
+  references: readonly LocalExportReference[],
+  candidates: readonly Candidate[],
+  counter: QueryCounter,
+): Promise<void> {
+  const syntaxSymbols = await querySymbols(
+    checker,
+    references.map((reference) => reference.reference),
+    counter,
+    "local export",
+  );
+  const index = candidateExportIndex(candidates);
+  for (const [referenceIndex, reference] of references.entries()) {
+    const target = await localExportTarget(checker, reference, syntaxSymbols[referenceIndex], counter);
+    if (target !== null) markExportedCandidates(target, reference.typeOnly, index);
+  }
+}
+
 function intrinsicTypeDescriptor(type: CompilerType): TypeScriptRawTypeArgumentDescriptor | null {
   if (type.isLiteralType()) {
     const value = type.value;
@@ -1464,6 +1672,12 @@ export function validateTypeScriptRawDefinitionDelta(
     }
     if (definition.language !== "typescript" && definition.language !== "javascript") {
       throw new DeltaValidationError(`raw definition ${definition.key} has an unsupported language`);
+    }
+    if (definition.exported !== undefined && definition.exported !== true) {
+      throw new DeltaValidationError(`raw definition ${definition.key} has invalid export evidence`);
+    }
+    if (definition.exported === true && definition.owner.kind !== "file") {
+      throw new DeltaValidationError(`raw definition ${definition.key} exports a non-module definition`);
     }
     if (
       definition.displayName.length === 0
@@ -1849,6 +2063,7 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
       throw new TypeCheckerContractError("definition symbol did not declare the requested node", counter.value);
     }
   }
+  await applyLocalExportEvidence(checker, collection.localExports, collection.candidates, counter);
 
   const types = await queryTypes(
     checker,
@@ -1971,6 +2186,7 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
       startOffset: group.primary.startOffset,
       endOffset: group.primary.endOffset,
       owner,
+      ...(group.candidates.some((candidate) => candidate.exported) ? { exported: true as const } : {}),
     };
     definitions.push(definition);
     for (const candidate of group.candidates) {

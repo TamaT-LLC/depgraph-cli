@@ -210,10 +210,10 @@ struct SnapshotIndex<'a> {
     targetless_dynamic: bool,
     coverage_omitted_paths: HashSet<&'a str>,
     profiles_by_id: HashMap<&'a str, &'a depgraph_store::ProfileRecord>,
-    profile_ids_by_language: HashMap<&'a str, Vec<&'a str>>,
+    profile_ids_by_language: HashMap<String, Vec<&'a str>>,
     fixture_profile_ids: Vec<&'a str>,
     all_profile_ids: Vec<&'a str>,
-    matrix_profile_ids_by_language: HashMap<&'a str, Vec<&'a str>>,
+    matrix_profile_ids_by_language: HashMap<String, Vec<&'a str>>,
     fixture_matrix_profile_ids: Vec<&'a str>,
     all_matrix_profile_ids: Vec<&'a str>,
 }
@@ -271,7 +271,7 @@ impl<'a> SnapshotIndex<'a> {
             }
         }
         let mut profiles_by_id = HashMap::new();
-        let mut profile_ids_by_language = HashMap::<&str, Vec<&str>>::new();
+        let mut profile_ids_by_language = HashMap::<String, Vec<&str>>::new();
         let mut fixture_profile_ids = Vec::new();
         let mut all_profile_ids = Vec::new();
         for profile in &snapshot.profiles {
@@ -282,12 +282,12 @@ impl<'a> SnapshotIndex<'a> {
                 fixture_profile_ids.push(profile.id.as_str());
             } else {
                 profile_ids_by_language
-                    .entry(profile.language.as_str())
+                    .entry(health_language_family(&profile.language).to_owned())
                     .or_default()
                     .push(profile.id.as_str());
             }
         }
-        let mut matrix_profile_ids_by_language = HashMap::<&str, Vec<&str>>::new();
+        let mut matrix_profile_ids_by_language = HashMap::<String, Vec<&str>>::new();
         let mut fixture_matrix_profile_ids = Vec::new();
         let mut all_matrix_profile_ids = Vec::new();
         for entry in &snapshot.profile_matrix.entries {
@@ -299,7 +299,7 @@ impl<'a> SnapshotIndex<'a> {
                     fixture_matrix_profile_ids.push(profile_id.as_str());
                 } else {
                     matrix_profile_ids_by_language
-                        .entry(entry.language.as_str())
+                        .entry(health_language_family(&entry.language).to_owned())
                         .or_default()
                         .push(profile_id.as_str());
                 }
@@ -476,12 +476,21 @@ fn applicable_profiles(
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BTreeSet<String>, HealthAnalysisError> {
+    let explicit_profile = node
+        .properties
+        .get("profile_id")
+        .and_then(|value| value.as_str());
     let language = node
         .properties
         .get("language")
         .and_then(|value| value.as_str());
     let mut profiles = BTreeSet::new();
+    if let Some(profile_id) = explicit_profile {
+        budget.step(is_cancelled)?;
+        profiles.insert(profile_id.to_owned());
+    }
     if let Some(language) = language {
+        let language = health_language_family(language);
         for profile_id in index
             .profile_ids_by_language
             .get(language)
@@ -511,6 +520,13 @@ fn applicable_profiles(
         }
     }
     Ok(profiles)
+}
+
+fn health_language_family(language: &str) -> &str {
+    match language {
+        "typescript" | "javascript" | "ts" | "tsx" | "js" | "jsx" | "astro" | "web" => "web",
+        other => other,
+    }
 }
 
 fn profiles_satisfy(
@@ -761,6 +777,124 @@ mod tests {
             .find(|finding| finding.kind == FindingKind::UnusedFile)
             .expect("unused file");
         assert_eq!(file.confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn issue_423_real_web_profile_owns_typescript_javascript_and_metadata_nodes() {
+        let graph = snapshot(
+            vec![profile("profile:web", "web", true)],
+            vec![
+                node(
+                    "file:src/index.ts",
+                    "file",
+                    "typescript",
+                    "src/index.ts",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:src/used.ts",
+                    "file",
+                    "typescript",
+                    "src/used.ts",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:src/unused.ts",
+                    "file",
+                    "typescript",
+                    "src/unused.ts",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "symbol:unusedValue",
+                    "symbol",
+                    "typescript",
+                    "src/unused.ts",
+                    json!({"exported": true, "profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:package.json",
+                    "file",
+                    "data",
+                    "package.json",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:tsconfig.json",
+                    "file",
+                    "data",
+                    "tsconfig.json",
+                    json!({"profile_id": "profile:web"}),
+                ),
+            ],
+            vec![edge(
+                "edge:index-used",
+                "file:src/index.ts",
+                "file:src/used.ts",
+                "imports",
+                "profile:web",
+            )],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let findings = analyze_unused(&graph);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.subject_id != "file:src/used.ts"),
+            "an exact incoming Web-profile edge must prevent an unused-file finding"
+        );
+
+        let unused_file = findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:src/unused.ts")
+            .expect("unused TypeScript file");
+        assert_eq!(unused_file.confidence, Confidence::Confirmed);
+        assert!(
+            unused_file
+                .blockers
+                .iter()
+                .all(|blocker| { blocker.kind != BlockerKind::ProfileNotAnalyzed })
+        );
+
+        let unused_export = findings
+            .iter()
+            .find(|finding| finding.subject_id == "symbol:unusedValue")
+            .expect("unused TypeScript export");
+        assert!(
+            unused_export
+                .blockers
+                .iter()
+                .all(|blocker| { blocker.kind != BlockerKind::ProfileNotAnalyzed })
+        );
+        assert!(
+            unused_export
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.kind == BlockerKind::PublicSurface })
+        );
+
+        for subject in ["file:package.json", "file:tsconfig.json"] {
+            let metadata = findings
+                .iter()
+                .find(|finding| finding.subject_id == subject)
+                .expect("project metadata remains visible but blocked");
+            assert_eq!(metadata.confidence, Confidence::Indeterminate);
+            assert!(
+                metadata
+                    .blockers
+                    .iter()
+                    .any(|blocker| { blocker.kind == BlockerKind::EntryPoint })
+            );
+            assert!(
+                metadata
+                    .blockers
+                    .iter()
+                    .all(|blocker| { blocker.kind != BlockerKind::ProfileNotAnalyzed })
+            );
+        }
     }
 
     #[test]
