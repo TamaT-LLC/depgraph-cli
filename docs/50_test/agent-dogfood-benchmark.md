@@ -11,7 +11,7 @@ revalidates the checked-in raw artifacts, deterministic aggregate, schemas, and
 golden scoring. Rerun the live gate when the public Agent-facing package,
 corpus, host contract, or GA release decision changes.
 
-## Fixed corpus and controls
+## v1 corpus and controls
 
 [`spec.json`](../../fixtures/agent-dogfood-v1/spec.json) fixes 12 claims across
 Rust, Go, and TypeScript/Web: node/path discovery, outgoing and incoming
@@ -195,3 +195,68 @@ node --test scripts/tests/agent-dogfood.test.mjs
 directory. It does not discover, rank, or select samples. A canonical evidence
 update replaces the entire six-sample directory after review and a passing
 gate.
+
+## v2 corpus (code health)
+
+[`fixtures/agent-dogfood-v2/`](../../fixtures/agent-dogfood-v2/spec.json)
+adds four code-health claims to the v1 corpus (16 claims, 7 major) so a real
+Agent host can answer unused-file, hotspot, and audit questions from a
+health-capable packaged MCP server. v1 remains frozen: its spec, prompt,
+schemas, evidence, and report digest pin are not edited.
+
+| # | id | major | tool | value |
+| --- | --- | ---: | --- | --- |
+| 13 | `health_unused_findings` | yes | `health_findings_list` | `count=<n>;digest=collection:sha256:<hex>` |
+| 14 | `health_finding_detail` | yes | `health_finding_get` | `id=...;kind=...;confidence=...;blockers=...` |
+| 15 | `health_hotspots` | no | `health_hotspots_list` | `top=...;score=...;blockers=...` |
+| 16 | `health_audit_base` | no | `health_audit_get` | `base_present=...;changed_oid=...;digest=...` |
+
+`workers/web/src/dogfood/unused-health-probe.ts` is an intentionally
+unreferenced TypeScript file in the Web analysis profile. It exists so the
+candidate snapshot has at least one `unused-file` finding. Do not import it.
+
+### Pending → pinned lifecycle
+
+v2 ships with `release_status: "pending"` and every pin field set to the
+literal `PENDING-RELEASE`. `node scripts/agent-dogfood.mjs lint-spec` is the
+only command that accepts that authoring state. `run`, `verify`, `aggregate`,
+and scoring reject a pending spec.
+
+Phase 2, immediately after the next health-capable RC tag, pins the public
+archive digests, snapshot IDs, host identity, and golden values, sets
+`release_status: "pinned"`, and checks in six real Agent samples under
+`fixtures/agent-dogfood-v2/evidence/<rc-tag>/`. The tag must be a canonical
+`vX.Y.Z-rc.N`. Asset names are derived from that product version
+(`depgraph-X.Y.Z-aarch64-apple-darwin.tar.gz` and the matching compiler-pack
+and MCP smoke names), and the packaged manifest product version must equal
+`X.Y.Z`. `validateSpec` / `run` / `verify` / `aggregate` then require the
+unused-file kinds filter, `count>=1`, and a supported finding detail. The
+runner substitutes `{{repository.baseline_commit}}` in `prompt.md` with the
+pinned baseline OID, and `prompt_sha256` is the digest of those sent bytes. Until that pinning PR lands, Issue #436 stays open.
+
+v2 host identity is an exact tuple (`cli_version`, model, reasoning effort,
+sandbox `read-only`, approval policy `never`). Pin `cli_version` to the
+measured `codex --version` string (`codex-cli X.Y.Z`); a bare `X.Y.Z` is
+accepted as the same host. `verify` requires every sample identity and
+`environment.json` to match that tuple.
+
+### Code-health evaluation
+
+Read blockers before treating a finding as safe to delete. The engine, not
+the Agent, owns confidence:
+
+- `confirmed`: unused across every applicable analyzed profile, those profiles
+  are `semantic-complete`, and no hard blocker remains.
+- `probable`: no observed usage and no hard blocker, but applicable profiles
+  are only `syntax-complete`.
+- `indeterminate`: a hard blocker prevents confirmation.
+
+Hard blockers are the 21 kinds other than the two score-layer blockers
+`churn-unavailable` and `runtime-not-observed`. Score-layer blockers degrade
+that scoring layer to zero and do not, by themselves, forbid `confirmed`.
+Agents must report the tool's confidence without promotion.
+
+Primary definitions:
+
+- [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md)
+- [MCP Agent tools: Code-health host guidance](../40_arch_design/arch-mcp-agent-tools.md)

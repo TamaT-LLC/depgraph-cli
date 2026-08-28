@@ -898,6 +898,66 @@ mod tests {
     }
 
     #[test]
+    fn issue_436_unused_health_probe_equivalent_file_is_detected() {
+        const PROBE_PATH: &str = "workers/web/src/dogfood/unused-health-probe.ts";
+        let graph = snapshot(
+            vec![profile("profile:web", "web", true)],
+            vec![
+                node(
+                    "file:workers/web/src/worker.ts",
+                    "file",
+                    "typescript",
+                    "workers/web/src/worker.ts",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:workers/web/src/scanner.ts",
+                    "file",
+                    "typescript",
+                    "workers/web/src/scanner.ts",
+                    json!({"profile_id": "profile:web"}),
+                ),
+                node(
+                    "file:probe",
+                    "file",
+                    "typescript",
+                    PROBE_PATH,
+                    json!({"profile_id": "profile:web"}),
+                ),
+            ],
+            vec![edge(
+                "edge:worker-scanner",
+                "file:workers/web/src/worker.ts",
+                "file:workers/web/src/scanner.ts",
+                "imports",
+                "profile:web",
+            )],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let findings = analyze_unused(&graph);
+        let probe = findings
+            .iter()
+            .find(|finding| {
+                finding.kind == FindingKind::UnusedFile
+                    && finding
+                        .location
+                        .as_ref()
+                        .is_some_and(|location| location.path == PROBE_PATH)
+            })
+            .expect("probe-equivalent unreferenced file must produce unused-file");
+        assert_eq!(probe.confidence, Confidence::Confirmed);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.subject_id != "file:workers/web/src/scanner.ts"),
+            "a referenced TypeScript file must not be reported unused"
+        );
+    }
+
+    #[test]
     fn issue_423_syntax_coverage_is_probable_and_missing_language_profile_is_indeterminate() {
         let graph = snapshot(
             vec![profile("rust:lib", "rust", false)],

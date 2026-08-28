@@ -1,0 +1,277 @@
+{
+  "schema_version": "agent-dogfood-spec-v2",
+  "benchmark_id": "depgraph-agent-dogfood-v2",
+  "issue": 436,
+  "release_status": "pending",
+  "release": {
+    "repository": "TamaT-LLC/depgraph-cli",
+    "tag": "PENDING-RELEASE",
+    "candidate_commit": "PENDING-RELEASE",
+    "candidate_tree": "PENDING-RELEASE",
+    "host_target": "aarch64-apple-darwin",
+    "archive": {
+      "name": "depgraph-aarch64-apple-darwin.tar.gz",
+      "sha256": "PENDING-RELEASE"
+    },
+    "compiler_pack_archive": {
+      "name": "depgraph-compiler-pack-aarch64-apple-darwin.tar.gz",
+      "sha256": "PENDING-RELEASE"
+    },
+    "compiler_pack_requirement": {
+      "name": "depgraph-compiler-pack-aarch64-apple-darwin.requirement.json",
+      "sha256": "PENDING-RELEASE"
+    },
+    "mcp_smoke": {
+      "name": "depgraph-aarch64-apple-darwin.mcp-smoke.json",
+      "sha256": "PENDING-RELEASE",
+      "schema_version": "mcp-package-smoke-v3",
+      "read_catalog_sha256": "PENDING-RELEASE"
+    }
+  },
+  "repository": {
+    "baseline_commit": "PENDING-RELEASE",
+    "baseline_tree": "PENDING-RELEASE",
+    "candidate_commit": "PENDING-RELEASE",
+    "candidate_tree": "PENDING-RELEASE"
+  },
+  "snapshots": {
+    "baseline": {
+      "name": "agent-tools-baseline",
+      "id": "PENDING-RELEASE",
+      "source_revision": "PENDING-RELEASE"
+    },
+    "candidate": {
+      "name": "rc-candidate",
+      "id": "PENDING-RELEASE",
+      "source_revision": "PENDING-RELEASE"
+    }
+  },
+  "safety_baseline": {
+    "source_sha256": "PENDING-RELEASE",
+    "store_sha256": "PENDING-RELEASE",
+    "journal_sha256": "PENDING-RELEASE",
+    "daemon_state_sha256": "PENDING-RELEASE",
+    "relevant_processes": "PENDING-RELEASE"
+  },
+  "host": {
+    "program": "codex",
+    "cli_version": "PENDING-RELEASE",
+    "model": "PENDING-RELEASE",
+    "reasoning_effort": "PENDING-RELEASE",
+    "sandbox": "read-only",
+    "approval_policy": "never",
+    "ignore_user_config": true,
+    "ignore_rules": true,
+    "ephemeral": true,
+    "samples_per_arm": 3,
+    "maximum_tool_calls": 32,
+    "mcp_enabled_tools": [
+      "agent_edges_list",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list",
+      "health_summary_get"
+    ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list"
+    ],
+    "timeout_ms": 300000
+  },
+  "thresholds": {
+    "minimum_mcp_accuracy_percent": 90,
+    "minimum_mcp_major_recall_percent": 100,
+    "maximum_false_exact_claims": 0,
+    "maximum_candidate_or_unresolved_as_exact": 0,
+    "minimum_setup_successes_per_arm": 3,
+    "require_mcp_accuracy_not_below_baseline": true,
+    "maximum_mcp_median_tool_calls": 32,
+    "maximum_mcp_median_tool_result_bytes": 327680,
+    "maximum_mcp_median_elapsed_ms": 240000,
+    "maximum_mcp_median_effective_tokens": 100000,
+    "require_mcp_tool_contract": true,
+    "require_read_only_safety": true,
+    "require_packaged_reconnect": true
+  },
+  "claims": [
+    {
+      "id": "rust_path",
+      "category": "dependency_path",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "go_dependency",
+      "category": "dependency",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "web_dependency",
+      "category": "dependency",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "web_dependents",
+      "category": "dependents",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "rust_impact",
+      "category": "impact",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "rust_unresolved_type",
+      "category": "unresolved",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "unresolved",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "rust_candidate_import",
+      "category": "candidate",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "candidate",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "snapshot_package_diff",
+      "category": "snapshot_diff",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "snapshot_file_diff",
+      "category": "snapshot_diff",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "file_cycle",
+      "category": "cycle",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "package_cycles",
+      "category": "cycle",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "candidate_coverage",
+      "category": "snapshot",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "health_unused_findings",
+      "category": "health_finding",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "health_finding_detail",
+      "category": "health_finding",
+      "major": true,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "health_hotspots",
+      "category": "health_hotspot",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    },
+    {
+      "id": "health_audit_base",
+      "category": "health_audit",
+      "major": false,
+      "expected": {
+        "verdict": "supported",
+        "classification": "exact",
+        "value": "PENDING-RELEASE"
+      }
+    }
+  ]
+}
