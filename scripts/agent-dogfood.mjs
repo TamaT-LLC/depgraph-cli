@@ -2840,9 +2840,9 @@ export async function runBenchmark({ specPath, rawDir, output }) {
   output = resolve(output);
   const spec = validateSpec(jsonFile(specPath));
   if (existsSync(rawDir)) throw new Error("raw output directory already exists");
-  mkdirSync(rawDir, { recursive: true });
   const digests = sourceDigests(specPath, spec);
   validateCorpusPrompt(spec, readFileSync(digests.promptPath, "utf8"));
+  mkdirSync(rawDir, { recursive: true });
   const prompt = digests.sentPrompt;
   const runtime = requiredRuntime();
   const agentEnvironment = sanitizedAgentEnvironment(process.env, rawDir);

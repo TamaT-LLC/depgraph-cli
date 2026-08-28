@@ -892,6 +892,30 @@ test("v2 pinned unused-file invariants are enforced on validate and verify", () 
   } finally {
     rmSync(kindDir, { recursive: true, force: true });
   }
+
+  const runDir = writeTempV2Corpus(pinned, wrongKindPrompt);
+  try {
+    writeFileSync(
+      join(runDir, "answer.schema.json"),
+      readFileSync(join(v2FixtureDir, "answer.schema.json")),
+    );
+    writeFileSync(
+      join(runDir, "safety.schema.json"),
+      readFileSync(join(v2FixtureDir, "safety.schema.json")),
+    );
+    const rawDir = join(runDir, "raw");
+    const ran = runDogfood([
+      "run",
+      join(runDir, "spec.json"),
+      rawDir,
+      join(runDir, "report.json"),
+    ]);
+    assert.notEqual(ran.code, 0);
+    assert.match(`${ran.stdout}${ran.stderr}`, /does not pin unused-file/);
+    assert.equal(existsSync(rawDir), false);
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
 });
 
 test("v2 prompt pins baseline commit for runner injection", () => {
