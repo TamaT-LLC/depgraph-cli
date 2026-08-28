@@ -14,7 +14,11 @@
   "ignorePatterns": [
     // These projects intentionally contain malformed and missing imports so
     // worker tests can exercise conservative parsing and diagnostics.
-    "test/fixtures/**"
+    "test/fixtures/**",
+    // Agent dogfood v2 unused-file probe. Keep it out of the worker quality
+    // graph so an intentional unused file does not fail import-graph gates,
+    // while depgraph still scans the file as ordinary TypeScript source.
+    "src/dogfood/**"
   ],
   "ignoreUnresolvedImports": [
     // build.mjs writes these generated release files; quality runs before the

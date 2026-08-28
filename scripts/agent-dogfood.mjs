@@ -20,11 +20,19 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const SPEC_SCHEMA_VERSION = "agent-dogfood-spec-v1";
+export const SPEC_SCHEMA_VERSION_V2 = "agent-dogfood-spec-v2";
 export const ANSWER_SCHEMA_VERSION = "agent-dogfood-answer-v1";
 export const SAMPLE_SCHEMA_VERSION = "agent-dogfood-sample-v1";
 export const SAFETY_SCHEMA_VERSION = "agent-dogfood-safety-v1";
 export const ENVIRONMENT_SCHEMA_VERSION = "agent-dogfood-environment-v1";
 export const REPORT_SCHEMA_VERSION = "agent-dogfood-report-v1";
+export const PENDING_RELEASE_SENTINEL = "PENDING-RELEASE";
+export const UNUSED_HEALTH_PROBE_PATH =
+  "workers/web/src/dogfood/unused-health-probe.ts";
+export const PENDING_SPEC_ERROR =
+  "Agent dogfood spec is pending release pinning and cannot be executed or verified";
+export const BASELINE_COMMIT_PLACEHOLDER = "{{repository.baseline_commit}}";
+const V2_RC_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-rc\.([1-9]\d*)$/u;
 
 const ARM_NAMES = Object.freeze(["baseline", "mcp"]);
 const FAILURE_CODES = Object.freeze([
@@ -44,12 +52,6 @@ const CLAIM_CLASSIFICATIONS = new Set([
 ]);
 const CLAIM_VERDICTS = new Set(["supported", "refuted", "insufficient"]);
 const EVIDENCE_SOURCES = new Set(["mcp", "source", "git"]);
-const CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE = new Set([
-  "snapshot_package_diff",
-  "snapshot_file_diff",
-  "package_cycles",
-  "candidate_coverage",
-]);
 const TOOL_ITEM_TYPES = new Set(["command_execution", "mcp_tool_call"]);
 const PRIVILEGED_MCP_TOOLS = new Set([
   "daemon_start_submit",
@@ -82,6 +84,19 @@ const DOGFOOD_REQUIRED_MCP_TOOLS = Object.freeze([
   "graph_path_get",
   "snapshot_diff_get",
 ]);
+const DOGFOOD_HEALTH_MCP_TOOLS = Object.freeze([
+  "health_audit_get",
+  "health_finding_get",
+  "health_findings_list",
+  "health_hotspots_list",
+  "health_summary_get",
+]);
+const DOGFOOD_HEALTH_REQUIRED_MCP_TOOLS = Object.freeze([
+  "health_audit_get",
+  "health_finding_get",
+  "health_findings_list",
+  "health_hotspots_list",
+]);
 const DOGFOOD_SAFETY_BASELINE = Object.freeze({
   source_sha256: "ee7c2d70bff926657b091834fa5bc3a69a04f3d3573b116e1d8e3f194d9a9515",
   store_sha256: "9b03498b33abed475f7950aa865fb9d8c755f0cb0015dc923495b60792739f20",
@@ -99,19 +114,51 @@ const APPROVED_LOCAL_GIT_CONFIG = Object.freeze([
   /^submodule\.active$/u,
 ]);
 const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
-const DOGFOOD_CLAIM_IDS = Object.freeze([
-  "rust_path",
-  "go_dependency",
-  "web_dependency",
-  "web_dependents",
-  "rust_impact",
-  "rust_unresolved_type",
-  "rust_candidate_import",
+function freezeClaimDescriptors(descriptors) {
+  return Object.freeze(descriptors.map((descriptor) => Object.freeze({ ...descriptor })));
+}
+
+const DOGFOOD_CLAIM_DESCRIPTORS = freezeClaimDescriptors([
+  { id: "rust_path", category: "dependency_path", major: true, verdict: "supported", classification: "exact" },
+  { id: "go_dependency", category: "dependency", major: true, verdict: "supported", classification: "exact" },
+  { id: "web_dependency", category: "dependency", major: true, verdict: "supported", classification: "exact" },
+  { id: "web_dependents", category: "dependents", major: true, verdict: "supported", classification: "exact" },
+  { id: "rust_impact", category: "impact", major: true, verdict: "supported", classification: "exact" },
+  { id: "rust_unresolved_type", category: "unresolved", major: false, verdict: "supported", classification: "unresolved" },
+  { id: "rust_candidate_import", category: "candidate", major: false, verdict: "supported", classification: "candidate" },
+  { id: "snapshot_package_diff", category: "snapshot_diff", major: false, verdict: "supported", classification: "exact" },
+  { id: "snapshot_file_diff", category: "snapshot_diff", major: false, verdict: "supported", classification: "exact" },
+  { id: "file_cycle", category: "cycle", major: false, verdict: "supported", classification: "exact" },
+  { id: "package_cycles", category: "cycle", major: false, verdict: "supported", classification: "exact" },
+  { id: "candidate_coverage", category: "snapshot", major: false, verdict: "supported", classification: "exact" },
+]);
+const DOGFOOD_HEALTH_CLAIM_DESCRIPTORS = freezeClaimDescriptors([
+  { id: "health_unused_findings", category: "health_finding", major: true, verdict: "supported", classification: "exact" },
+  { id: "health_finding_detail", category: "health_finding", major: true, verdict: "supported", classification: "exact" },
+  { id: "health_hotspots", category: "health_hotspot", major: false, verdict: "supported", classification: "exact" },
+  { id: "health_audit_base", category: "health_audit", major: false, verdict: "supported", classification: "exact" },
+]);
+const V2_CLAIM_DESCRIPTORS = Object.freeze([
+  ...DOGFOOD_CLAIM_DESCRIPTORS,
+  ...DOGFOOD_HEALTH_CLAIM_DESCRIPTORS,
+]);
+const DOGFOOD_CLAIM_IDS = Object.freeze(
+  DOGFOOD_CLAIM_DESCRIPTORS.map((descriptor) => descriptor.id),
+);
+const DOGFOOD_HEALTH_CLAIM_IDS = Object.freeze(
+  DOGFOOD_HEALTH_CLAIM_DESCRIPTORS.map((descriptor) => descriptor.id),
+);
+const CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE = Object.freeze([
   "snapshot_package_diff",
   "snapshot_file_diff",
-  "file_cycle",
   "package_cycles",
   "candidate_coverage",
+]);
+const V2_CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE = Object.freeze([
+  ...CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE,
+  "health_unused_findings",
+  "health_hotspots",
+  "health_audit_base",
 ]);
 const DOGFOOD_THRESHOLDS = Object.freeze({
   minimum_mcp_accuracy_percent: 90,
@@ -127,6 +174,144 @@ const DOGFOOD_THRESHOLDS = Object.freeze({
   require_mcp_tool_contract: true,
   require_read_only_safety: true,
   require_packaged_reconnect: true,
+});
+const DOGFOOD_THRESHOLDS_V2 = Object.freeze({
+  ...DOGFOOD_THRESHOLDS,
+  maximum_mcp_median_tool_calls: 32,
+});
+const V2_PENDING_RELEASE_NAMES = Object.freeze({
+  archive: "depgraph-aarch64-apple-darwin.tar.gz",
+  compiler_pack_archive: "depgraph-compiler-pack-aarch64-apple-darwin.tar.gz",
+  compiler_pack_requirement:
+    "depgraph-compiler-pack-aarch64-apple-darwin.requirement.json",
+  mcp_smoke: "depgraph-aarch64-apple-darwin.mcp-smoke.json",
+});
+const PENDING_RELEASE_FIELD_PATHS = Object.freeze([
+  "release.tag",
+  "release.candidate_commit",
+  "release.candidate_tree",
+  "release.archive.sha256",
+  "release.compiler_pack_archive.sha256",
+  "release.compiler_pack_requirement.sha256",
+  "release.mcp_smoke.sha256",
+  "release.mcp_smoke.read_catalog_sha256",
+  "snapshots.baseline.id",
+  "snapshots.baseline.source_revision",
+  "snapshots.candidate.id",
+  "snapshots.candidate.source_revision",
+  "safety_baseline.source_sha256",
+  "safety_baseline.store_sha256",
+  "safety_baseline.journal_sha256",
+  "safety_baseline.daemon_state_sha256",
+  "safety_baseline.relevant_processes",
+  "repository.baseline_commit",
+  "repository.baseline_tree",
+  "repository.candidate_commit",
+  "repository.candidate_tree",
+  "host.cli_version",
+  "host.model",
+  "host.reasoning_effort",
+]);
+const THRESHOLD_KEYS = Object.freeze([
+  "minimum_mcp_accuracy_percent",
+  "minimum_mcp_major_recall_percent",
+  "maximum_false_exact_claims",
+  "maximum_candidate_or_unresolved_as_exact",
+  "minimum_setup_successes_per_arm",
+  "require_mcp_accuracy_not_below_baseline",
+  "maximum_mcp_median_tool_calls",
+  "maximum_mcp_median_tool_result_bytes",
+  "maximum_mcp_median_elapsed_ms",
+  "maximum_mcp_median_effective_tokens",
+  "require_mcp_tool_contract",
+  "require_read_only_safety",
+  "require_packaged_reconnect",
+]);
+const SPEC_KEYS_V1 = Object.freeze([
+  "schema_version",
+  "benchmark_id",
+  "issue",
+  "release",
+  "repository",
+  "snapshots",
+  "safety_baseline",
+  "host",
+  "thresholds",
+  "claims",
+]);
+const SPEC_KEYS_V2 = Object.freeze([...SPEC_KEYS_V1, "release_status"]);
+const HOST_KEYS_V1 = Object.freeze([
+  "program",
+  "minimum_cli_version",
+  "model",
+  "reasoning_effort",
+  "sandbox",
+  "approval_policy",
+  "ignore_user_config",
+  "ignore_rules",
+  "ephemeral",
+  "samples_per_arm",
+  "maximum_tool_calls",
+  "mcp_enabled_tools",
+  "mcp_required_tools",
+  "timeout_ms",
+]);
+const HOST_KEYS_V2 = Object.freeze([
+  "program",
+  "cli_version",
+  "model",
+  "reasoning_effort",
+  "sandbox",
+  "approval_policy",
+  "ignore_user_config",
+  "ignore_rules",
+  "ephemeral",
+  "samples_per_arm",
+  "maximum_tool_calls",
+  "mcp_enabled_tools",
+  "mcp_required_tools",
+  "timeout_ms",
+]);
+
+export const DOGFOOD_GENERATIONS = Object.freeze({
+  [SPEC_SCHEMA_VERSION]: Object.freeze({
+    schema_version: SPEC_SCHEMA_VERSION,
+    requires_release_status: false,
+    identity_includes_cli_version: false,
+    claim_descriptors: DOGFOOD_CLAIM_DESCRIPTORS,
+    claim_ids: DOGFOOD_CLAIM_IDS,
+    major_count: 5,
+    mcp_enabled_tools: DOGFOOD_MCP_TOOLS,
+    mcp_required_tools: DOGFOOD_REQUIRED_MCP_TOOLS,
+    thresholds: DOGFOOD_THRESHOLDS,
+    allowing_empty_supported_evidence: CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE,
+    maximum_tool_calls: 28,
+    issue: 357,
+    benchmark_id: "depgraph-v0.5.0-rc.7-agent-dogfood-v1",
+    health_unused_kinds: null,
+  }),
+  [SPEC_SCHEMA_VERSION_V2]: Object.freeze({
+    schema_version: SPEC_SCHEMA_VERSION_V2,
+    requires_release_status: true,
+    identity_includes_cli_version: true,
+    claim_descriptors: V2_CLAIM_DESCRIPTORS,
+    claim_ids: Object.freeze([...DOGFOOD_CLAIM_IDS, ...DOGFOOD_HEALTH_CLAIM_IDS]),
+    major_count: 7,
+    mcp_enabled_tools: Object.freeze([
+      ...DOGFOOD_MCP_TOOLS,
+      ...DOGFOOD_HEALTH_MCP_TOOLS,
+    ]),
+    mcp_required_tools: Object.freeze([
+      ...DOGFOOD_REQUIRED_MCP_TOOLS,
+      ...DOGFOOD_HEALTH_REQUIRED_MCP_TOOLS,
+    ]),
+    thresholds: DOGFOOD_THRESHOLDS_V2,
+    allowing_empty_supported_evidence: V2_CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE,
+    maximum_tool_calls: 32,
+    issue: 436,
+    benchmark_id: "depgraph-agent-dogfood-v2",
+    health_unused_kinds: Object.freeze(["unused-file"]),
+  }),
 });
 
 function isRecord(value) {
@@ -151,8 +336,88 @@ function sortedValue(value) {
   );
 }
 
-function canonicalJson(value) {
+export function canonicalJson(value) {
   return JSON.stringify(sortedValue(value));
+}
+
+export function generationFrozenContract(schemaVersion) {
+  const generation = DOGFOOD_GENERATIONS[schemaVersion];
+  if (!generation) {
+    throw new Error(`unknown Agent dogfood generation ${schemaVersion}`);
+  }
+  return {
+    schema_version: generation.schema_version,
+    requires_release_status: generation.requires_release_status,
+    identity_includes_cli_version: generation.identity_includes_cli_version,
+    claim_descriptors: generation.claim_descriptors.map((descriptor) => ({ ...descriptor })),
+    claim_ids: [...generation.claim_ids],
+    major_count: generation.major_count,
+    mcp_enabled_tools: [...generation.mcp_enabled_tools],
+    mcp_required_tools: [...generation.mcp_required_tools],
+    thresholds: { ...generation.thresholds },
+    allowing_empty_supported_evidence: [...generation.allowing_empty_supported_evidence],
+    maximum_tool_calls: generation.maximum_tool_calls,
+    issue: generation.issue,
+    benchmark_id: generation.benchmark_id,
+    health_unused_kinds: generation.health_unused_kinds === null
+      ? null
+      : [...generation.health_unused_kinds],
+  };
+}
+
+function generationOf(spec) {
+  if (!isRecord(spec) || typeof spec.schema_version !== "string") {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+  const generation = DOGFOOD_GENERATIONS[spec.schema_version];
+  if (!generation) {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+  return generation;
+}
+
+function visitLeaves(value, path, visit) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => visitLeaves(item, `${path}.${index}`, visit));
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      visitLeaves(child, path ? `${path}.${key}` : key, visit);
+    }
+    return;
+  }
+  visit(path, value);
+}
+
+function isPendingSentinelPath(path) {
+  return PENDING_RELEASE_FIELD_PATHS.includes(path)
+    || /^claims\.\d+\.expected\.value$/u.test(path);
+}
+
+function collectPendingSentinelViolations(spec) {
+  const missing = [];
+  const excess = [];
+  visitLeaves(spec, "", (path, value) => {
+    if (isPendingSentinelPath(path)) {
+      if (value !== PENDING_RELEASE_SENTINEL) missing.push(path);
+      return;
+    }
+    if (value === PENDING_RELEASE_SENTINEL) excess.push(path);
+  });
+  return { missing, excess };
+}
+
+function collectPinnedSentinelResidues(spec) {
+  const residues = [];
+  visitLeaves(spec, "", (path, value) => {
+    if (value === PENDING_RELEASE_SENTINEL) residues.push(path);
+  });
+  return residues;
+}
+
+function emptyEvidenceClaimIds(spec) {
+  return generationOf(spec).allowing_empty_supported_evidence;
 }
 
 function prettyJson(value) {
@@ -206,20 +471,25 @@ function validRelativePath(path) {
 }
 
 export function validateSpec(spec) {
+  if (!isRecord(spec)) {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+  if (spec.schema_version === SPEC_SCHEMA_VERSION) {
+    return validatePinnedSpecV1(spec);
+  }
+  if (spec.schema_version === SPEC_SCHEMA_VERSION_V2) {
+    if (spec.release_status !== "pinned") {
+      throw new Error(PENDING_SPEC_ERROR);
+    }
+    return validatePinnedSpecV2(spec);
+  }
+  throw new Error("Agent dogfood spec is incomplete or incompatible");
+}
+
+function validatePinnedSpecV1(spec) {
   if (
     !isRecord(spec)
-    || !exactKeys(spec, [
-      "schema_version",
-      "benchmark_id",
-      "issue",
-      "release",
-      "repository",
-      "snapshots",
-      "safety_baseline",
-      "host",
-      "thresholds",
-      "claims",
-    ])
+    || !exactKeys(spec, SPEC_KEYS_V1)
     || spec.schema_version !== SPEC_SCHEMA_VERSION
     || spec.benchmark_id !== "depgraph-v0.5.0-rc.7-agent-dogfood-v1"
     || spec.issue !== 357
@@ -259,22 +529,7 @@ export function validateSpec(spec) {
       "daemon_state_sha256",
       "relevant_processes",
     ])
-    || !exactKeys(spec.host, [
-      "program",
-      "minimum_cli_version",
-      "model",
-      "reasoning_effort",
-      "sandbox",
-      "approval_policy",
-      "ignore_user_config",
-      "ignore_rules",
-      "ephemeral",
-      "samples_per_arm",
-      "maximum_tool_calls",
-      "mcp_enabled_tools",
-      "mcp_required_tools",
-      "timeout_ms",
-    ])
+    || !exactKeys(spec.host, HOST_KEYS_V1)
     || !isRecord(spec.thresholds)
     || !Array.isArray(spec.claims)
     || spec.claims.length !== 12
@@ -383,11 +638,365 @@ export function validateSpec(spec) {
     }
     ids.add(claim.id);
   }
-  if (
-    canonicalJson([...ids]) !== canonicalJson(DOGFOOD_CLAIM_IDS)
-    || spec.claims.filter((claim) => claim.major).length !== 5
-  ) throw new Error("Agent dogfood task corpus drifted");
+  assertClaimDescriptors(spec, generationOf(spec));
   return spec;
+}
+
+function validateReleaseShape(release) {
+  return exactKeys(release, [
+    "repository",
+    "tag",
+    "candidate_commit",
+    "candidate_tree",
+    "host_target",
+    "archive",
+    "compiler_pack_archive",
+    "compiler_pack_requirement",
+    "mcp_smoke",
+  ])
+    && exactKeys(release.archive, ["name", "sha256"])
+    && exactKeys(release.compiler_pack_archive, ["name", "sha256"])
+    && exactKeys(release.compiler_pack_requirement, ["name", "sha256"])
+    && exactKeys(release.mcp_smoke, [
+      "name",
+      "sha256",
+      "schema_version",
+      "read_catalog_sha256",
+    ]);
+}
+
+function observedClaimDescriptors(spec) {
+  return spec.claims.map((claim) => ({
+    id: claim.id,
+    category: claim.category,
+    major: claim.major,
+    verdict: claim.expected.verdict,
+    classification: claim.expected.classification,
+  }));
+}
+
+function assertClaimDescriptors(spec, generation) {
+  if (canonicalJson(observedClaimDescriptors(spec))
+    !== canonicalJson(generation.claim_descriptors)) {
+    throw new Error("Agent dogfood task corpus drifted");
+  }
+}
+
+function validateClaimDefinitions(spec, generation, { allowSentinelValues }) {
+  const ids = new Set();
+  for (const claim of spec.claims) {
+    if (
+      !exactKeys(claim, ["id", "category", "major", "expected"])
+      || typeof claim.id !== "string"
+      || !/^[a-z][a-z0-9_]*$/u.test(claim.id)
+      || ids.has(claim.id)
+      || typeof claim.category !== "string"
+      || typeof claim.major !== "boolean"
+      || !exactKeys(claim.expected, ["verdict", "classification", "value"])
+      || !CLAIM_VERDICTS.has(claim.expected.verdict)
+      || !CLAIM_CLASSIFICATIONS.has(claim.expected.classification)
+      || typeof claim.expected.value !== "string"
+      || claim.expected.value.length === 0
+      || (!allowSentinelValues && claim.expected.value === PENDING_RELEASE_SENTINEL)
+    ) {
+      throw new Error("Agent dogfood golden claims are not closed and unique");
+    }
+    ids.add(claim.id);
+  }
+  assertClaimDescriptors(spec, generation);
+}
+
+function validateV2SharedIdentity(spec, generation) {
+  if (
+    spec.schema_version !== SPEC_SCHEMA_VERSION_V2
+    || spec.benchmark_id !== generation.benchmark_id
+    || spec.issue !== generation.issue
+    || spec.release.repository !== "TamaT-LLC/depgraph-cli"
+    || spec.release.host_target !== "aarch64-apple-darwin"
+    || spec.release.mcp_smoke.schema_version !== "mcp-package-smoke-v3"
+    || spec.snapshots.baseline.name !== "agent-tools-baseline"
+    || spec.snapshots.candidate.name !== "rc-candidate"
+    || spec.host.program !== "codex"
+    || spec.host.samples_per_arm !== 3
+    || spec.host.maximum_tool_calls !== generation.maximum_tool_calls
+    || canonicalJson(spec.host.mcp_enabled_tools)
+      !== canonicalJson(generation.mcp_enabled_tools)
+    || canonicalJson(spec.host.mcp_required_tools)
+      !== canonicalJson(generation.mcp_required_tools)
+    || spec.host.mcp_required_tools.some(
+      (tool) => !spec.host.mcp_enabled_tools.includes(tool),
+    )
+    || spec.host.timeout_ms !== 300_000
+    || spec.host.sandbox !== "read-only"
+    || spec.host.approval_policy !== "never"
+    || spec.host.ignore_user_config !== true
+    || spec.host.ignore_rules !== true
+    || spec.host.ephemeral !== true
+  ) {
+    throw new Error("Agent dogfood identity or host controls drifted");
+  }
+  if (!exactKeys(spec.thresholds, THRESHOLD_KEYS)) {
+    throw new Error("Agent dogfood thresholds are not the closed v2 set");
+  }
+  if (canonicalJson(spec.thresholds) !== canonicalJson(generation.thresholds)) {
+    throw new Error("Agent dogfood thresholds drifted after predeclaration");
+  }
+}
+
+function validateV2PendingReleaseNames(spec) {
+  if (
+    spec.release.archive.name !== V2_PENDING_RELEASE_NAMES.archive
+    || spec.release.compiler_pack_archive.name
+      !== V2_PENDING_RELEASE_NAMES.compiler_pack_archive
+    || spec.release.compiler_pack_requirement.name
+      !== V2_PENDING_RELEASE_NAMES.compiler_pack_requirement
+    || spec.release.mcp_smoke.name !== V2_PENDING_RELEASE_NAMES.mcp_smoke
+  ) {
+    throw new Error("Agent dogfood identity or host controls drifted");
+  }
+}
+
+export function productVersionFromRcTag(tag) {
+  const match = typeof tag === "string" ? V2_RC_TAG.exec(tag) : null;
+  if (!match) {
+    throw new Error("Agent dogfood v2 release tag is not a canonical RC tag");
+  }
+  return `${match[1]}.${match[2]}.${match[3]}`;
+}
+
+export function v2PinnedReleaseAssetNames(tag, hostTarget) {
+  const version = productVersionFromRcTag(tag);
+  if (typeof hostTarget !== "string" || hostTarget.length === 0) {
+    throw new Error("Agent dogfood v2 host target is not pinned");
+  }
+  return {
+    archive: `depgraph-${version}-${hostTarget}.tar.gz`,
+    compiler_pack_archive: `depgraph-compiler-pack-${version}-${hostTarget}.tar.gz`,
+    compiler_pack_requirement: `depgraph-compiler-pack-${version}-${hostTarget}.requirement.json`,
+    mcp_smoke: `depgraph-${version}-${hostTarget}.mcp-smoke.json`,
+  };
+}
+
+export function expectedPackagedProductVersion(spec) {
+  if (spec.schema_version === SPEC_SCHEMA_VERSION) return "0.5.0";
+  if (spec.schema_version === SPEC_SCHEMA_VERSION_V2) {
+    return productVersionFromRcTag(spec.release.tag);
+  }
+  throw new Error("Agent dogfood spec is incomplete or incompatible");
+}
+
+function validateV2PinnedReleaseNames(spec) {
+  const expected = v2PinnedReleaseAssetNames(spec.release.tag, spec.release.host_target);
+  if (
+    spec.release.archive.name !== expected.archive
+    || spec.release.compiler_pack_archive.name !== expected.compiler_pack_archive
+    || spec.release.compiler_pack_requirement.name !== expected.compiler_pack_requirement
+    || spec.release.mcp_smoke.name !== expected.mcp_smoke
+  ) {
+    throw new Error("Agent dogfood v2 release asset names do not match the RC tag");
+  }
+}
+
+function validateV2Shape(spec, generation) {
+  if (
+    !isRecord(spec)
+    || !exactKeys(spec, SPEC_KEYS_V2)
+    || !["pending", "pinned"].includes(spec.release_status)
+    || !validateReleaseShape(spec.release)
+    || !exactKeys(spec.repository, [
+      "baseline_commit",
+      "baseline_tree",
+      "candidate_commit",
+      "candidate_tree",
+    ])
+    || !exactKeys(spec.snapshots, ["baseline", "candidate"])
+    || !exactKeys(spec.snapshots.baseline, ["name", "id", "source_revision"])
+    || !exactKeys(spec.snapshots.candidate, ["name", "id", "source_revision"])
+    || !exactKeys(spec.safety_baseline, [
+      "source_sha256",
+      "store_sha256",
+      "journal_sha256",
+      "daemon_state_sha256",
+      "relevant_processes",
+    ])
+    || !exactKeys(spec.host, HOST_KEYS_V2)
+    || !isRecord(spec.thresholds)
+    || !Array.isArray(spec.claims)
+    || spec.claims.length !== generation.claim_ids.length
+  ) {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+}
+
+function validatePendingSpecV2(spec) {
+  const generation = generationOf(spec);
+  validateV2Shape(spec, generation);
+  if (spec.release_status !== "pending") {
+    throw new Error(PENDING_SPEC_ERROR);
+  }
+  const { missing, excess } = collectPendingSentinelViolations(spec);
+  if (missing.length > 0) {
+    throw new Error(
+      `Agent dogfood pending spec is missing PENDING-RELEASE sentinels: ${missing.join(", ")}`,
+    );
+  }
+  if (excess.length > 0) {
+    throw new Error(
+      `Agent dogfood pending spec has PENDING-RELEASE outside the pin set: ${excess.join(", ")}`,
+    );
+  }
+  validateV2SharedIdentity(spec, generation);
+  validateV2PendingReleaseNames(spec);
+  validateClaimDefinitions(spec, generation, { allowSentinelValues: true });
+  return spec;
+}
+
+function validatePinnedSpecV2(spec) {
+  const generation = generationOf(spec);
+  validateV2Shape(spec, generation);
+  if (spec.release_status !== "pinned") {
+    throw new Error(PENDING_SPEC_ERROR);
+  }
+  const residues = collectPinnedSentinelResidues(spec);
+  if (residues.length > 0) {
+    throw new Error(
+      `Agent dogfood pinned spec still contains PENDING-RELEASE sentinels: ${residues.join(", ")}`,
+    );
+  }
+  validateSafetySnapshot(spec.safety_baseline);
+  for (const [label, value] of [
+    ["release archive", spec.release.archive?.sha256],
+    ["compiler-pack archive", spec.release.compiler_pack_archive?.sha256],
+    ["compiler-pack requirement", spec.release.compiler_pack_requirement?.sha256],
+    ["MCP smoke", spec.release.mcp_smoke?.sha256],
+    ["MCP read catalog", spec.release.mcp_smoke?.read_catalog_sha256],
+  ]) assertDigest(value, label);
+  for (const [label, value] of [
+    ["baseline commit", spec.repository.baseline_commit],
+    ["baseline tree", spec.repository.baseline_tree],
+    ["candidate commit", spec.repository.candidate_commit],
+    ["candidate tree", spec.repository.candidate_tree],
+  ]) {
+    if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
+      throw new Error(`${label} is not a full Git object ID`);
+    }
+  }
+  if (
+    spec.release.candidate_commit !== spec.repository.candidate_commit
+    || spec.release.candidate_tree !== spec.repository.candidate_tree
+    || spec.snapshots.baseline?.source_revision !== spec.repository.baseline_commit
+    || spec.snapshots.candidate?.source_revision !== spec.repository.candidate_commit
+    || typeof spec.host.cli_version !== "string"
+    || spec.host.cli_version.length === 0
+    || typeof spec.host.model !== "string"
+    || spec.host.model.length === 0
+    || typeof spec.host.reasoning_effort !== "string"
+    || spec.host.reasoning_effort.length === 0
+    || typeof spec.snapshots.baseline.id !== "string"
+    || typeof spec.snapshots.candidate.id !== "string"
+    || !/^snapshot:sha256:[0-9a-f]{64}$/u.test(spec.snapshots.baseline.id)
+    || !/^snapshot:sha256:[0-9a-f]{64}$/u.test(spec.snapshots.candidate.id)
+  ) {
+    throw new Error("Agent dogfood identity or host controls drifted");
+  }
+  semverTuple(spec.host.cli_version);
+  productVersionFromRcTag(spec.release.tag);
+  validateV2SharedIdentity(spec, generation);
+  validateV2PinnedReleaseNames(spec);
+  validateClaimDefinitions(spec, generation, { allowSentinelValues: false });
+  validateUnusedFileSpecInvariants(spec);
+  return spec;
+}
+
+function unusedFindingsCount(value) {
+  const match = /^(?:count=(\d+);digest=collection:sha256:[0-9a-f]{64})$/u.exec(value);
+  return match ? Number(match[1]) : null;
+}
+
+function validateUnusedFileSpecInvariants(spec) {
+  const generation = generationOf(spec);
+  if (generation.health_unused_kinds === null) return;
+  const unused = spec.claims.find((claim) => claim.id === "health_unused_findings");
+  const detail = spec.claims.find((claim) => claim.id === "health_finding_detail");
+  const count = unusedFindingsCount(unused?.expected?.value);
+  if (count === null || count < 1) {
+    throw new Error("Agent dogfood pinned spec does not guarantee an unused-file finding");
+  }
+  if (detail?.expected?.verdict !== "supported") {
+    throw new Error("Agent dogfood pinned spec does not require a supported unused finding");
+  }
+}
+
+export function materializeDogfoodPrompt(spec, prompt) {
+  if (!isRecord(spec) || spec.schema_version !== SPEC_SCHEMA_VERSION_V2) return prompt;
+  if (typeof prompt !== "string" || !prompt.includes(BASELINE_COMMIT_PLACEHOLDER)) {
+    throw new Error("Agent dogfood v2 prompt must pin repository.baseline_commit");
+  }
+  return prompt.replaceAll(BASELINE_COMMIT_PLACEHOLDER, spec.repository.baseline_commit);
+}
+
+export function validateV2PromptContracts(spec, prompt) {
+  if (generationOf(spec).health_unused_kinds === null) return;
+  if (typeof prompt !== "string" || !/kinds:\s*\[\s*"unused-file"\s*\]/u.test(prompt)) {
+    throw new Error("Agent dogfood pinned spec does not pin unused-file for health claims");
+  }
+  const materialized = materializeDogfoodPrompt(spec, prompt);
+  if (
+    spec.release_status === "pinned"
+    && (
+      spec.repository.baseline_commit === PENDING_RELEASE_SENTINEL
+      || !materialized.includes(spec.repository.baseline_commit)
+    )
+  ) {
+    throw new Error("Agent dogfood materialized prompt does not match the pinned baseline commit");
+  }
+}
+
+function validateCorpusPrompt(spec, prompt) {
+  if (spec.schema_version !== SPEC_SCHEMA_VERSION_V2) return;
+  validateV2PromptContracts(spec, prompt);
+}
+
+export function lintSpec(spec, options = {}) {
+  const pinned = options.pinned === true;
+  if (!isRecord(spec)) {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+  if (spec.schema_version === SPEC_SCHEMA_VERSION) {
+    validatePinnedSpecV1(spec);
+    return spec;
+  }
+  if (spec.schema_version !== SPEC_SCHEMA_VERSION_V2) {
+    throw new Error("Agent dogfood spec is incomplete or incompatible");
+  }
+  if (pinned) {
+    if (spec.release_status !== "pinned") {
+      throw new Error(PENDING_SPEC_ERROR);
+    }
+    validatePinnedSpecV2(spec);
+    validateV2PromptContracts(spec, options.prompt);
+    return spec;
+  }
+  if (spec.release_status === "pending") {
+    validatePendingSpecV2(spec);
+    if (typeof options.prompt === "string") validateV2PromptContracts(spec, options.prompt);
+    return spec;
+  }
+  if (spec.release_status === "pinned") {
+    validatePinnedSpecV2(spec);
+    if (typeof options.prompt === "string") validateV2PromptContracts(spec, options.prompt);
+    return spec;
+  }
+  throw new Error("Agent dogfood spec is incomplete or incompatible");
+}
+
+export function lintSpecFile(specPath, options = {}) {
+  const resolved = resolve(specPath);
+  const promptPath = join(dirname(resolved), "prompt.md");
+  return lintSpec(jsonFile(resolved), {
+    ...options,
+    prompt: existsSync(promptPath) ? readFileSync(promptPath, "utf8") : "",
+  });
 }
 
 function validateFailure(failure) {
@@ -449,7 +1058,7 @@ export function validateAnswer(spec, answer) {
       || (result.verdict === "insufficient"
         && (result.classification !== "not_applicable" || result.value !== "unknown"))
       || (result.verdict !== "insufficient"
-        && !CLAIM_IDS_ALLOWING_EMPTY_SUPPORTED_EVIDENCE.has(claim.id)
+        && !emptyEvidenceClaimIds(spec).includes(claim.id)
         && result.evidence.length === 0)
     ) {
       throw new Error(`Agent dogfood claim ${claim.id} is invalid`);
@@ -912,8 +1521,8 @@ function derivedSafety(evidence, mcpTools) {
   };
 }
 
-function expectedSampleIdentity(spec, digests, environmentSha256) {
-  return {
+export function expectedSampleIdentity(spec, digests, environmentSha256) {
+  const identity = {
     benchmark_id: spec.benchmark_id,
     spec_sha256: digests.spec,
     prompt_sha256: digests.prompt,
@@ -931,6 +1540,10 @@ function expectedSampleIdentity(spec, digests, environmentSha256) {
     mcp_enabled_tools: spec.host.mcp_enabled_tools,
     mcp_required_tools: spec.host.mcp_required_tools,
   };
+  if (generationOf(spec).identity_includes_cli_version) {
+    identity.cli_version = spec.host.cli_version;
+  }
+  return identity;
 }
 
 function typedFailure(code, task, remediation) {
@@ -1365,7 +1978,9 @@ function validateEnvironment(spec, environment) {
     ])
     || environment.host.program !== spec.host.program
     || typeof environment.host.cli_version !== "string"
-    || !semverAtLeast(environment.host.cli_version, spec.host.minimum_cli_version)
+    || (generationOf(spec).identity_includes_cli_version
+      ? environment.host.cli_version !== spec.host.cli_version
+      : !semverAtLeast(environment.host.cli_version, spec.host.minimum_cli_version))
     || environment.host.platform !== "darwin"
     || environment.host.architecture !== "arm64"
     || environment.release.archive_sha256 !== spec.release.archive.sha256
@@ -1403,18 +2018,35 @@ function validateEnvironment(spec, environment) {
   return environment;
 }
 
-function sourceDigests(specPath) {
+export function sentDogfoodPrompt(spec, promptText) {
+  if (!isRecord(spec) || spec.schema_version !== SPEC_SCHEMA_VERSION_V2) {
+    return promptText;
+  }
+  return materializeDogfoodPrompt(spec, promptText);
+}
+
+export function sentDogfoodPromptSha256(spec, promptText) {
+  return sha256Bytes(sentDogfoodPrompt(spec, promptText));
+}
+
+export function sourceDigests(specPath, spec) {
   const fixtureDir = dirname(resolve(specPath));
   const promptPath = join(fixtureDir, "prompt.md");
   const answerSchemaPath = join(fixtureDir, "answer.schema.json");
   const safetySchemaPath = join(fixtureDir, "safety.schema.json");
+  const promptBytes = readFileSync(promptPath);
+  const promptText = promptBytes.toString("utf8");
+  const sentPrompt = sentDogfoodPrompt(spec, promptText);
   return {
     fixtureDir,
     promptPath,
     answerSchemaPath,
     safetySchemaPath,
+    sentPrompt,
     spec: sha256Bytes(readFileSync(specPath)),
-    prompt: sha256Bytes(readFileSync(promptPath)),
+    prompt: spec.schema_version === SPEC_SCHEMA_VERSION_V2
+      ? sha256Bytes(sentPrompt)
+      : sha256Bytes(promptBytes),
     answerSchema: sha256Bytes(readFileSync(answerSchemaPath)),
     safetySchema: sha256Bytes(readFileSync(safetySchemaPath)),
   };
@@ -1424,8 +2056,9 @@ export async function aggregateSamples({ specPath, rawDir }) {
   specPath = resolve(specPath);
   rawDir = resolve(rawDir);
   const spec = validateSpec(jsonFile(specPath));
+  const digests = sourceDigests(specPath, spec);
+  validateCorpusPrompt(spec, readFileSync(digests.promptPath, "utf8"));
   validateRawDirectory(rawDir, spec);
-  const digests = sourceDigests(specPath);
   const environmentPath = join(rawDir, "environment.json");
   const environment = validateEnvironment(spec, jsonFile(environmentPath));
   const environmentSha256 = await sha256File(environmentPath);
@@ -1805,7 +2438,7 @@ async function preflight(spec, runtime, agentEnvironment) {
     manifest.target !== spec.release.host_target
     || manifest.core?.path !== "bin/depgraph"
     || manifest.mcp_server?.path !== "bin/depgraph-mcp"
-    || manifest.mcp_server?.version !== "0.5.0"
+    || manifest.mcp_server?.version !== expectedPackagedProductVersion(spec)
     || manifest.mcp_server?.sdk_name !== "rmcp"
     || manifest.mcp_server?.sdk_version !== "3.1.0"
     || manifest.mcp_server?.protocol_revision !== "2026-07-28"
@@ -1847,7 +2480,11 @@ async function preflight(spec, runtime, agentEnvironment) {
   const codexVersion = commandOutput(spec.host.program, ["--version"], {
     env: agentEnvironment,
   });
-  if (!semverAtLeast(codexVersion, spec.host.minimum_cli_version)) {
+  if (generationOf(spec).identity_includes_cli_version) {
+    if (codexVersion !== spec.host.cli_version) {
+      throw new Error("Codex CLI does not match the pinned dogfood host version");
+    }
+  } else if (!semverAtLeast(codexVersion, spec.host.minimum_cli_version)) {
     throw new Error("Codex CLI does not meet the fixed dogfood host version");
   }
   if (process.platform !== "darwin" || process.arch !== "arm64") {
@@ -2186,10 +2823,12 @@ export async function runBenchmark({ specPath, rawDir, output }) {
   specPath = resolve(specPath);
   rawDir = resolve(rawDir);
   output = resolve(output);
+  const spec = validateSpec(jsonFile(specPath));
   if (existsSync(rawDir)) throw new Error("raw output directory already exists");
   mkdirSync(rawDir, { recursive: true });
-  const spec = validateSpec(jsonFile(specPath));
-  const digests = sourceDigests(specPath);
+  const digests = sourceDigests(specPath, spec);
+  validateCorpusPrompt(spec, readFileSync(digests.promptPath, "utf8"));
+  const prompt = digests.sentPrompt;
   const runtime = requiredRuntime();
   const agentEnvironment = sanitizedAgentEnvironment(process.env, rawDir);
   const ready = await preflight(spec, runtime, agentEnvironment);
@@ -2197,7 +2836,6 @@ export async function runBenchmark({ specPath, rawDir, output }) {
   writeJson(environmentPath, ready.environment);
   const environmentSha256 = await sha256File(environmentPath);
   const identity = expectedSampleIdentity(spec, digests, environmentSha256);
-  const prompt = readFileSync(digests.promptPath, "utf8");
   for (const arm of ARM_NAMES) {
     for (let ordinal = 1; ordinal <= spec.host.samples_per_arm; ordinal += 1) {
       const sample = await runCodex({
@@ -2231,6 +2869,16 @@ export async function runBenchmark({ specPath, rawDir, output }) {
 
 async function main(argv) {
   const [command, ...rest] = argv;
+  if (command === "lint-spec") {
+    const pinned = rest.includes("--pinned");
+    const args = rest.filter((argument) => argument !== "--pinned");
+    if (args.length !== 1) {
+      throw new Error("usage: agent-dogfood.mjs lint-spec [--pinned] <spec>");
+    }
+    lintSpecFile(args[0], { pinned });
+    process.stdout.write(`linted Agent dogfood spec: ${resolve(args[0])}\n`);
+    return;
+  }
   if (command === "run" && rest.length === 3) {
     const report = await runBenchmark({
       specPath: rest[0],
@@ -2241,14 +2889,20 @@ async function main(argv) {
     return;
   }
   if (command === "aggregate" && rest.length === 3) {
-    const report = await aggregateSamples({ specPath: rest[0], rawDir: rest[1] });
+    const specPath = resolve(rest[0]);
+    const spec = validateSpec(jsonFile(specPath));
+    validateCorpusPrompt(spec, readFileSync(join(dirname(specPath), "prompt.md"), "utf8"));
+    const report = await aggregateSamples({ specPath, rawDir: rest[1] });
     writeFileSync(resolve(rest[2]), prettyJson(report));
     process.stdout.write(`Agent dogfood report: ${resolve(rest[2])}\n`);
     return;
   }
   if (command === "verify" && rest.length === 3) {
+    const specPath = resolve(rest[0]);
+    const spec = validateSpec(jsonFile(specPath));
+    validateCorpusPrompt(spec, readFileSync(join(dirname(specPath), "prompt.md"), "utf8"));
     await verifyReport({
-      specPath: rest[0],
+      specPath,
       rawDir: rest[1],
       report: jsonFile(resolve(rest[2])),
     });
@@ -2256,7 +2910,7 @@ async function main(argv) {
     return;
   }
   throw new Error(
-    "usage: agent-dogfood.mjs run|aggregate|verify <spec> <raw-dir> <report>",
+    "usage: agent-dogfood.mjs lint-spec [--pinned] <spec> | run|aggregate|verify <spec> <raw-dir> <report>",
   );
 }
 

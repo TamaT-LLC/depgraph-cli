@@ -57,6 +57,7 @@
 
 ## 更新履歴
 
+- 2026-08-28: Agent dogfood v2 corpus（code health）と pending-release 契約を追加
 - 2026-08-26: `PROJ-ARC-001-ADR-009` と説明可能なコードヘルス解析（CLI / MCP）を追加
 - 2026-08-26: `v0.5.4`のリリースノートとCodex／Claude Code／Cursor／Grokのproject/user scope自動MCPセットアップを追加
 - 2026-08-25: `v0.5.3`のリリースノートとWindows公開後canary修正を追加

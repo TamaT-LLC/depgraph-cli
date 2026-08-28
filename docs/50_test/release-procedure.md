@@ -242,6 +242,44 @@ archiveとchecksum、同targetのcompiler-pack archiveとchecksum、compiler-pac
 `agent-config`、`initialize`、`tools/list`、`get_context`を完走する。GitHub Releaseへのmutation
 APIは呼ばず、green recovery runを元runとpost-publish evidenceに連結した復旧証明とする。
 
+## Agent dogfood v2（code health）Phase 2 pinning
+
+Issue #436 の受け入れ基準は、health 入り RC 配布物だけで実 Agent が 6 サンプルを
+完遂した evidence がチェックインされ、stable-release-gate が v2 report を必須検証
+することである。Phase 1 は `fixtures/agent-dogfood-v2/` を
+`release_status: "pending"` で追加するだけなので、次の RC タグ作成直後にこの手順を
+実施するまで Issue は open のまま維持する。実施者はオーナー実機
+`aarch64-apple-darwin` とする。shallow clone では hotspot の
+`churn-unavailable` が出るため、フルチェックアウトを使う。
+
+1. RC candidate commit のクリーンチェックアウトで
+   `depgraph health list --kind unused-file`（または同等の MCP 呼び出し）が
+   **1 件以上**であることを実測する。0 件なら Phase 2 を hard fail し、kind
+   差し替えや claim 降格は行わない。
+2. baseline / candidate snapshot を再生成し digest を採取する。
+3. 実走 host identity を exact に確定する: Codex CLI の実測
+   `cli_version`、model、`reasoning_effort`。sandbox は `read-only`、
+   approval_policy は `never` のまま。以後の全 6 サンプルはこの tuple で固定する。
+4. `gh release download` で RC 配布物を取得し sha256 を spec に pin する。
+   タグは canonical な `vX.Y.Z-rc.N` とし、archive / compiler-pack / MCP smoke
+   のファイル名をその product version（`X.Y.Z`）から導出した版付き名へ置換する。
+   `release_status` を `"pinned"` にし、全 `PENDING-RELEASE` を実値へ置換する。
+   `prompt.md` の `{{repository.baseline_commit}}` はそのまま残し、runner が
+   実走時に pinned baseline OID を注入する。
+5. `node scripts/agent-dogfood.mjs lint-spec --pinned fixtures/agent-dogfood-v2/spec.json`
+   が、kinds=`unused-file` 固定・claim 13 の `count>=1`・claim 14 の
+   `supported` を含めて通ることを確認する。`run` / `verify` / `aggregate` も
+   同じ unused-file 不変条件と RC タグ / 資産名 / manifest 版の一致を強制する。
+6. `agent-dogfood.mjs run` で baseline / mcp 各 3 サンプルを実走し、
+   `verify` が全 6 サンプルの host identity 完全一致と environment 整合を強制する
+   ことを確認する。gate 閾値（accuracy 90% / major recall 100%）を満たすこと。
+7. `fixtures/agent-dogfood-v2/evidence/<rc-tag>/` に 33 ファイルをチェックインする。
+8. `xtask/src/main.rs` へ v2 report path / sha256 pin と
+   `release_status == "pinned"` assert を追加し、
+   `.github/workflows/release.yml` の stable-release-gate へ v2 report を配線する。
+   Rust テストの v2 evidence 検証を有効化する。
+9. Phase 2 完了後に Issue #436 を close する。
+
 ## 失敗時の扱い
 
 runner障害や一時的なdownload失敗でsourceを変更しない場合は、同じRelease runの失敗jobを再実行できる。
