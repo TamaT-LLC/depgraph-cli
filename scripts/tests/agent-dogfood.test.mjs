@@ -30,6 +30,7 @@ import {
   expectedPackagedProductVersion,
   expectedSampleIdentity,
   generationFrozenContract,
+  hostCliVersionsMatch,
   lintSpec,
   lintSpecFile,
   localGitConfigAllowed,
@@ -517,7 +518,7 @@ function pinV2Spec(pending, expectedValues = {}) {
     daemon_state_sha256: DUMMY_SHA256,
     relevant_processes: 0,
   };
-  pinned.host.cli_version = "0.146.0";
+  pinned.host.cli_version = "codex-cli 0.146.0";
   pinned.host.model = "gpt-5.6-terra";
   pinned.host.reasoning_effort = "medium";
   const defaults = {
@@ -775,7 +776,7 @@ test("v2 expected sample identity pins the exact host cli_version tuple", () => 
     answerSchema: "33".repeat(32),
     safetySchema: "44".repeat(32),
   }, "55".repeat(32));
-  assert.equal(identity.cli_version, "0.146.0");
+  assert.equal(identity.cli_version, "codex-cli 0.146.0");
   assert.equal(identity.model, "gpt-5.6-terra");
   assert.equal(identity.reasoning_effort, "medium");
   assert.equal(identity.sandbox, "read-only");
@@ -792,8 +793,21 @@ test("v2 expected sample identity pins the exact host cli_version tuple", () => 
   assert.equal(Object.hasOwn(v1Identity, "cli_version"), false);
 
   const drifted = structuredClone(identity);
-  drifted.cli_version = "0.146.1";
+  drifted.cli_version = "codex-cli 0.146.1";
   assert.notEqual(canonicalJson(drifted), canonicalJson(identity));
+});
+
+test("v2 host cli_version accepts the measured Codex --version string", () => {
+  assert.equal(hostCliVersionsMatch("codex-cli 0.146.0", "0.146.0"), true);
+  assert.equal(hostCliVersionsMatch("codex-cli 0.146.0", "codex-cli 0.146.0"), true);
+  assert.equal(hostCliVersionsMatch("0.146.0", "0.146.0"), true);
+  assert.equal(hostCliVersionsMatch("codex-cli 0.146.1", "0.146.0"), false);
+  assert.equal(hostCliVersionsMatch("other-cli 0.146.0", "codex-cli 0.146.0"), false);
+
+  const numericPin = pinV2Spec(v2Spec);
+  numericPin.host.cli_version = "0.146.0";
+  assert.equal(validateSpec(numericPin), numericPin);
+  assert.equal(hostCliVersionsMatch("codex-cli 0.146.0", numericPin.host.cli_version), true);
 });
 
 function writeTempV2Corpus(spec, prompt = v2Prompt) {

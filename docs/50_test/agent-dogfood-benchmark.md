@@ -235,8 +235,10 @@ runner substitutes `{{repository.baseline_commit}}` in `prompt.md` with the
 pinned baseline OID, and `prompt_sha256` is the digest of those sent bytes. Until that pinning PR lands, Issue #436 stays open.
 
 v2 host identity is an exact tuple (`cli_version`, model, reasoning effort,
-sandbox `read-only`, approval policy `never`). `verify` requires every sample
-identity and `environment.json` to match that tuple.
+sandbox `read-only`, approval policy `never`). Pin `cli_version` to the
+measured `codex --version` string (`codex-cli X.Y.Z`); a bare `X.Y.Z` is
+accepted as the same host. `verify` requires every sample identity and
+`environment.json` to match that tuple.
 
 ### Code-health evaluation
 

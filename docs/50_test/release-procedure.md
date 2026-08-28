@@ -258,8 +258,10 @@ Issue #436 の受け入れ基準は、health 入り RC 配布物だけで実 Age
    差し替えや claim 降格は行わない。
 2. baseline / candidate snapshot を再生成し digest を採取する。
 3. 実走 host identity を exact に確定する: Codex CLI の実測
-   `cli_version`、model、`reasoning_effort`。sandbox は `read-only`、
-   approval_policy は `never` のまま。以後の全 6 サンプルはこの tuple で固定する。
+   `cli_version`（`codex --version` の実測文字列。例: `codex-cli 0.146.0`）、
+   model、`reasoning_effort`。sandbox は `read-only`、approval_policy は
+   `never` のまま。以後の全 6 サンプルはこの tuple で固定する。runner は
+   裸の `X.Y.Z` と `codex-cli X.Y.Z` を同一ホストとして照合する。
 4. `gh release download` で RC 配布物を取得し sha256 を spec に pin する。
    タグは canonical な `vX.Y.Z-rc.N` とし、archive / compiler-pack / MCP smoke
    のファイル名をその product version（`X.Y.Z`）から導出した版付き名へ置換する。

@@ -1979,7 +1979,7 @@ function validateEnvironment(spec, environment) {
     || environment.host.program !== spec.host.program
     || typeof environment.host.cli_version !== "string"
     || (generationOf(spec).identity_includes_cli_version
-      ? environment.host.cli_version !== spec.host.cli_version
+      ? !hostCliVersionsMatch(environment.host.cli_version, spec.host.cli_version)
       : !semverAtLeast(environment.host.cli_version, spec.host.minimum_cli_version))
     || environment.host.platform !== "darwin"
     || environment.host.architecture !== "arm64"
@@ -2219,6 +2219,21 @@ function semverAtLeast(actual, minimum) {
     if (left[index] !== right[index]) return left[index] > right[index];
   }
   return true;
+}
+
+export function hostCliVersionsMatch(actual, expected) {
+  if (typeof actual !== "string" || typeof expected !== "string") return false;
+  if (actual === expected) return true;
+  let actualTuple;
+  let expectedTuple;
+  try {
+    actualTuple = semverTuple(actual).join(".");
+    expectedTuple = semverTuple(expected).join(".");
+  } catch {
+    return false;
+  }
+  if (actualTuple !== expectedTuple) return false;
+  return actual.trim() === actualTuple || expected.trim() === expectedTuple;
 }
 
 function canonicalExisting(path, kind, expectedKind) {
@@ -2481,7 +2496,7 @@ async function preflight(spec, runtime, agentEnvironment) {
     env: agentEnvironment,
   });
   if (generationOf(spec).identity_includes_cli_version) {
-    if (codexVersion !== spec.host.cli_version) {
+    if (!hostCliVersionsMatch(codexVersion, spec.host.cli_version)) {
       throw new Error("Codex CLI does not match the pinned dogfood host version");
     }
   } else if (!semverAtLeast(codexVersion, spec.host.minimum_cli_version)) {
