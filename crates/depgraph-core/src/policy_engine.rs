@@ -1334,19 +1334,27 @@ fn admitted_edges_with_options_bounded<'a>(
             continue;
         }
 
-        let condition: PolicyCondition = serde_json::from_value(edge.condition.clone())
-            .with_context(|| format!("edge {:?} has an invalid policy condition", edge.id))?;
+        let condition = parse_condition_bounded(&edge.condition, &edge.id, work, is_cancelled)?;
         let mut context = edge_context_bounded(
             edge,
             profiles.get(edge.profile_id.as_str()).copied(),
             work,
             is_cancelled,
         )?;
-        if evaluate_edge_condition(&condition, &context) == Some(false) {
+        if evaluate_edge_condition_bounded(&condition, &context, work, is_cancelled)? == Some(false)
+        {
             continue;
         }
-        add_condition_facts(&condition, &mut context);
-        if apply_rule_condition && evaluate_condition(&rule.condition, &context) != Some(true) {
+        add_condition_facts_bounded(&condition, &mut context, work, is_cancelled)?;
+        if apply_rule_condition
+            && evaluate_condition_bounded_inner(
+                &rule.condition,
+                &context,
+                false,
+                work,
+                is_cancelled,
+            )? != Some(true)
+        {
             continue;
         }
 
@@ -1357,7 +1365,7 @@ fn admitted_edges_with_options_bounded<'a>(
         work.step(is_cancelled)?;
         admitted.push(AdmittedEdge {
             edge,
-            condition: canonical_condition(&condition)?,
+            condition: canonical_condition_bounded(&condition, work, is_cancelled)?,
             evidence: spans,
             context,
         });
@@ -1414,7 +1422,13 @@ fn evaluate_runtime_boundary(
                 item.edge.kind.as_str(),
                 "client_boundary" | "server_boundary"
             ) && target_ids.contains(item.edge.target.as_str())
-                && evaluate_condition(&rule.condition, &item.context) == Some(true)
+                && evaluate_condition_bounded_inner(
+                    &rule.condition,
+                    &item.context,
+                    false,
+                    work,
+                    is_cancelled,
+                )? == Some(true)
             {
                 boundaries.push(*item);
             }
@@ -2103,8 +2117,9 @@ fn applied_suppression_bounded(
             continue;
         }
         if let Some(condition) = &scope.condition {
-            work.step(is_cancelled)?;
-            if evaluate_condition(condition, context) != Some(true) {
+            if evaluate_condition_bounded_inner(condition, context, false, work, is_cancelled)?
+                != Some(true)
+            {
                 continue;
             }
         }
@@ -2283,14 +2298,24 @@ fn selector_matches_node_bounded(
     let Some(value) = selector_field(node, selector.field) else {
         return Ok(false);
     };
-    work.step(is_cancelled)?;
-    if !pattern_matches(selector.match_kind, &selector.value, value) {
+    if !pattern_matches_bounded(
+        selector.match_kind,
+        &selector.value,
+        value,
+        work,
+        is_cancelled,
+    )? {
         return Ok(false);
     }
     for exclude in &selector.exclude {
-        work.step(is_cancelled)?;
-        if selector_field(node, exclude.field)
-            .is_some_and(|value| pattern_matches(exclude.match_kind, &exclude.value, value))
+        if let Some(value) = selector_field(node, exclude.field)
+            && pattern_matches_bounded(
+                exclude.match_kind,
+                &exclude.value,
+                value,
+                work,
+                is_cancelled,
+            )?
         {
             return Ok(false);
         }
@@ -2439,8 +2464,13 @@ fn patterns_match_bounded(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<bool> {
     for pattern in patterns {
-        work.step(is_cancelled)?;
-        if pattern_matches(pattern.match_kind, &pattern.value, value) {
+        if pattern_matches_bounded(
+            pattern.match_kind,
+            &pattern.value,
+            value,
+            work,
+            is_cancelled,
+        )? {
             return Ok(true);
         }
     }
@@ -2479,6 +2509,21 @@ fn pattern_matches(kind: PolicyMatchKind, pattern: &str, value: &str) -> bool {
         PolicyMatchKind::Exact => value == pattern,
         PolicyMatchKind::Prefix => value.starts_with(pattern),
         PolicyMatchKind::Glob => glob_matches(pattern, value),
+    }
+}
+
+fn pattern_matches_bounded(
+    kind: PolicyMatchKind,
+    pattern: &str,
+    value: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    work.step(is_cancelled)?;
+    match kind {
+        PolicyMatchKind::Exact => Ok(value == pattern),
+        PolicyMatchKind::Prefix => Ok(value.starts_with(pattern)),
+        PolicyMatchKind::Glob => glob_matches_bounded(pattern, value, work, is_cancelled),
     }
 }
 
@@ -2523,6 +2568,61 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         0,
         &mut HashMap::new(),
     )
+}
+
+/// Match a policy glob without recursion and account for every character/state
+/// visited. RuntimeBoundary selectors use this function because a
+/// user-controlled locator can otherwise create an unbounded recursion and a
+/// quadratic search without any cancellation point.
+fn glob_matches_bounded(
+    pattern: &str,
+    value: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    let mut pattern_chars = Vec::new();
+    for character in pattern.chars() {
+        work.step(is_cancelled)?;
+        pattern_chars.push(character);
+    }
+    let mut value_chars = Vec::new();
+    for character in value.chars() {
+        work.step(is_cancelled)?;
+        value_chars.push(character);
+    }
+
+    let mut pending = vec![(0_usize, 0_usize)];
+    let mut visited = HashMap::new();
+    while let Some((pattern_index, value_index)) = pending.pop() {
+        work.step(is_cancelled)?;
+        if visited.insert((pattern_index, value_index), true).is_some() {
+            continue;
+        }
+        if pattern_index == pattern_chars.len() {
+            if value_index == value_chars.len() {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        if pattern_chars[pattern_index] == '*' {
+            let double = pattern_chars.get(pattern_index + 1) == Some(&'*');
+            let next_pattern = pattern_index + usize::from(double) + 1;
+            pending.push((next_pattern, value_index));
+            if double && pattern_chars.get(next_pattern) == Some(&'/') {
+                pending.push((next_pattern + 1, value_index));
+            }
+            if value_index < value_chars.len() && (double || value_chars[value_index] != '/') {
+                pending.push((pattern_index, value_index + 1));
+            }
+        } else if value_index < value_chars.len()
+            && ((pattern_chars[pattern_index] == '?' && value_chars[value_index] != '/')
+                || pattern_chars[pattern_index] == value_chars[value_index])
+        {
+            pending.push((pattern_index + 1, value_index + 1));
+        }
+    }
+    Ok(false)
 }
 
 fn edge_context_bounded(
@@ -2645,6 +2745,7 @@ fn evaluate_condition(
     }
 }
 
+#[allow(dead_code)]
 fn evaluate_edge_condition(
     condition: &PolicyCondition,
     context: &BTreeMap<String, Value>,
@@ -2680,6 +2781,769 @@ fn evaluate_edge_condition(
     }
 }
 
+enum ConditionParseFrame<'a> {
+    Visit(&'a Value),
+    Aggregate {
+        any: bool,
+        children: &'a [Value],
+        next: usize,
+        awaiting_child: bool,
+        values: Vec<PolicyCondition>,
+    },
+    Not,
+}
+
+/// Decode an edge condition without recursively walking attacker-controlled
+/// JSON.  Graph snapshots normally contain protocol-validated conditions, but
+/// policy evaluation also accepts snapshots loaded from older stores and test
+/// fixtures.  Keeping the parser iterative makes a malformed/deep condition
+/// consume the shared policy budget instead of growing the Rust call stack.
+fn parse_condition_bounded(
+    value: &Value,
+    edge_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyCondition> {
+    let mut frames = vec![ConditionParseFrame::Visit(value)];
+    let mut values = Vec::new();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ConditionParseFrame::Visit(value) => {
+                work.step(is_cancelled)?;
+                let object = value
+                    .as_object()
+                    .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+                let operation = object
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+                match operation {
+                    "all" | "any" => {
+                        require_condition_fields(
+                            object,
+                            &["op", "conditions"],
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        let children = object
+                            .get("conditions")
+                            .and_then(Value::as_array)
+                            .with_context(|| {
+                                format!("edge {edge_id:?} has an invalid policy condition")
+                            })?;
+                        frames.push(ConditionParseFrame::Aggregate {
+                            any: operation == "any",
+                            children,
+                            next: 0,
+                            awaiting_child: false,
+                            values: Vec::new(),
+                        });
+                    }
+                    "not" => {
+                        require_condition_fields(
+                            object,
+                            &["op", "condition"],
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        let child = object.get("condition").with_context(|| {
+                            format!("edge {edge_id:?} has an invalid policy condition")
+                        })?;
+                        frames.push(ConditionParseFrame::Not);
+                        frames.push(ConditionParseFrame::Visit(child));
+                    }
+                    "eq" => {
+                        require_condition_fields(
+                            object,
+                            &["op", "key", "value"],
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        let key = condition_key(object, edge_id)?;
+                        let value = condition_value_bounded(
+                            object.get("value").with_context(|| {
+                                format!("edge {edge_id:?} has an invalid policy condition")
+                            })?,
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        values.push(PolicyCondition::Eq { key, value });
+                    }
+                    "in" => {
+                        require_condition_fields(
+                            object,
+                            &["op", "key", "values"],
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        let key = condition_key(object, edge_id)?;
+                        let raw_values = object
+                            .get("values")
+                            .and_then(Value::as_array)
+                            .with_context(|| {
+                                format!("edge {edge_id:?} has an invalid policy condition")
+                            })?;
+                        let mut condition_values = Vec::with_capacity(raw_values.len());
+                        for value in raw_values {
+                            condition_values.push(condition_value_bounded(
+                                value,
+                                edge_id,
+                                work,
+                                is_cancelled,
+                            )?);
+                        }
+                        values.push(PolicyCondition::In {
+                            key,
+                            values: condition_values,
+                        });
+                    }
+                    "defined" => {
+                        require_condition_fields(
+                            object,
+                            &["op", "key"],
+                            edge_id,
+                            work,
+                            is_cancelled,
+                        )?;
+                        values.push(PolicyCondition::Defined {
+                            key: condition_key(object, edge_id)?,
+                        });
+                    }
+                    _ => {
+                        bail!("edge {edge_id:?} has an invalid policy condition")
+                    }
+                }
+            }
+            ConditionParseFrame::Aggregate {
+                any,
+                children,
+                mut next,
+                awaiting_child,
+                values: mut conditions,
+            } => {
+                if awaiting_child {
+                    conditions.push(values.pop().with_context(|| {
+                        format!("edge {edge_id:?} has an invalid policy condition")
+                    })?);
+                }
+                if next < children.len() {
+                    let child = &children[next];
+                    next += 1;
+                    frames.push(ConditionParseFrame::Aggregate {
+                        any,
+                        children,
+                        next,
+                        awaiting_child: true,
+                        values: conditions,
+                    });
+                    frames.push(ConditionParseFrame::Visit(child));
+                } else {
+                    values.push(if any {
+                        PolicyCondition::Any { conditions }
+                    } else {
+                        PolicyCondition::All { conditions }
+                    });
+                }
+            }
+            ConditionParseFrame::Not => {
+                let condition = values
+                    .pop()
+                    .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+                values.push(PolicyCondition::Not {
+                    condition: Box::new(condition),
+                });
+            }
+        }
+    }
+
+    values
+        .pop()
+        .filter(|_| values.is_empty())
+        .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))
+}
+
+fn require_condition_fields(
+    object: &serde_json::Map<String, Value>,
+    expected: &[&str],
+    edge_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if object.len() != expected.len() {
+        bail!("edge {edge_id:?} has an invalid policy condition");
+    }
+    for key in object.keys() {
+        work.step(is_cancelled)?;
+        if !expected.contains(&key.as_str()) {
+            bail!("edge {edge_id:?} has an invalid policy condition");
+        }
+    }
+    Ok(())
+}
+
+fn condition_key(object: &serde_json::Map<String, Value>, edge_id: &str) -> Result<String> {
+    object
+        .get("key")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))
+}
+
+fn condition_value_bounded(
+    value: &Value,
+    edge_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Value> {
+    work.step(is_cancelled)?;
+    if !(value.is_null() || value.is_boolean() || value.is_number() || value.is_string()) {
+        bail!("edge {edge_id:?} has an invalid policy condition");
+    }
+    Ok(value.clone())
+}
+
+enum ConditionEvalFrame<'a> {
+    Visit(&'a PolicyCondition),
+    Aggregate {
+        any: bool,
+        conditions: &'a [PolicyCondition],
+        next: usize,
+        awaiting_child: bool,
+        saw_true: bool,
+        saw_false: bool,
+        saw_unknown: bool,
+    },
+    Not,
+}
+
+fn evaluate_edge_condition_bounded(
+    condition: &PolicyCondition,
+    context: &BTreeMap<String, Value>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<bool>> {
+    evaluate_condition_bounded_inner(condition, context, true, work, is_cancelled)
+}
+
+fn evaluate_condition_bounded_inner(
+    condition: &PolicyCondition,
+    context: &BTreeMap<String, Value>,
+    edge_semantics: bool,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<bool>> {
+    let mut frames = vec![ConditionEvalFrame::Visit(condition)];
+    let mut values = Vec::new();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ConditionEvalFrame::Visit(condition) => {
+                work.step(is_cancelled)?;
+                match condition {
+                    PolicyCondition::All { conditions } | PolicyCondition::Any { conditions } => {
+                        frames.push(ConditionEvalFrame::Aggregate {
+                            any: matches!(condition, PolicyCondition::Any { .. }),
+                            conditions,
+                            next: 0,
+                            awaiting_child: false,
+                            saw_true: false,
+                            saw_false: false,
+                            saw_unknown: false,
+                        })
+                    }
+                    PolicyCondition::Not { condition } => {
+                        frames.push(ConditionEvalFrame::Not);
+                        frames.push(ConditionEvalFrame::Visit(condition));
+                    }
+                    PolicyCondition::Eq { key, value } => {
+                        values.push(
+                            lookup_context_bounded(context, key, work, is_cancelled)?
+                                .map(|actual| condition_values_equal(actual, value)),
+                        );
+                    }
+                    PolicyCondition::In {
+                        key,
+                        values: expected,
+                    } => {
+                        let Some(actual) =
+                            lookup_context_bounded(context, key, work, is_cancelled)?
+                        else {
+                            values.push(None);
+                            continue;
+                        };
+                        let mut matched = false;
+                        for value in expected {
+                            work.step(is_cancelled)?;
+                            if condition_values_equal(actual, value) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        values.push(Some(matched));
+                    }
+                    PolicyCondition::Defined { key } => {
+                        let value = lookup_context_bounded(context, key, work, is_cancelled)?;
+                        values.push(if edge_semantics {
+                            value.map(|value| !value.is_null())
+                        } else {
+                            Some(value.is_some_and(|value| !value.is_null()))
+                        });
+                    }
+                }
+            }
+            ConditionEvalFrame::Aggregate {
+                any,
+                conditions,
+                mut next,
+                awaiting_child,
+                mut saw_true,
+                mut saw_false,
+                mut saw_unknown,
+            } => {
+                if awaiting_child {
+                    match values
+                        .pop()
+                        .context("bounded condition evaluation lost a child")?
+                    {
+                        Some(true) => saw_true = true,
+                        Some(false) => saw_false = true,
+                        None => saw_unknown = true,
+                    }
+                }
+                if next < conditions.len() {
+                    let child = &conditions[next];
+                    next += 1;
+                    frames.push(ConditionEvalFrame::Aggregate {
+                        any,
+                        conditions,
+                        next,
+                        awaiting_child: true,
+                        saw_true,
+                        saw_false,
+                        saw_unknown,
+                    });
+                    frames.push(ConditionEvalFrame::Visit(child));
+                } else {
+                    values.push(if any {
+                        if saw_true {
+                            Some(true)
+                        } else if !saw_unknown && !saw_false {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    } else if saw_false {
+                        Some(false)
+                    } else if !saw_unknown && !saw_true {
+                        Some(true)
+                    } else {
+                        None
+                    });
+                }
+            }
+            ConditionEvalFrame::Not => {
+                let value = values
+                    .pop()
+                    .context("bounded condition evaluation lost a not child")?;
+                values.push(value.map(|value| !value));
+            }
+        }
+    }
+    values
+        .pop()
+        .filter(|_| values.is_empty())
+        .context("bounded condition evaluation did not produce one result")
+}
+
+fn lookup_context_bounded<'a>(
+    context: &'a BTreeMap<String, Value>,
+    key: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<&'a Value>> {
+    work.step(is_cancelled)?;
+    if let Some(value) = context.get(key) {
+        return Ok(Some(value));
+    }
+    let mut segments = key.split('.');
+    let Some(first) = segments.next() else {
+        return Ok(None);
+    };
+    let mut value = context.get(first);
+    for segment in segments {
+        work.step(is_cancelled)?;
+        value = value.and_then(|value| value.get(segment));
+    }
+    Ok(value)
+}
+
+enum ConditionFactsFrame<'a> {
+    Visit(&'a PolicyCondition),
+    All {
+        conditions: &'a [PolicyCondition],
+        next: usize,
+    },
+}
+
+fn add_condition_facts_bounded(
+    condition: &PolicyCondition,
+    context: &mut BTreeMap<String, Value>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut frames = vec![ConditionFactsFrame::Visit(condition)];
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ConditionFactsFrame::Visit(condition) => {
+                work.step(is_cancelled)?;
+                match condition {
+                    PolicyCondition::All { conditions } => {
+                        frames.push(ConditionFactsFrame::All {
+                            conditions,
+                            next: 0,
+                        });
+                    }
+                    PolicyCondition::Eq { key, value } => {
+                        context.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                    PolicyCondition::In { key, values } if values.len() == 1 => {
+                        context
+                            .entry(key.clone())
+                            .or_insert_with(|| values[0].clone());
+                    }
+                    PolicyCondition::Defined { key } => {
+                        context.entry(key.clone()).or_insert(Value::Bool(true));
+                    }
+                    PolicyCondition::Any { .. }
+                    | PolicyCondition::Not { .. }
+                    | PolicyCondition::In { .. } => {}
+                }
+            }
+            ConditionFactsFrame::All {
+                conditions,
+                mut next,
+            } => {
+                if next < conditions.len() {
+                    let child = &conditions[next];
+                    next += 1;
+                    frames.push(ConditionFactsFrame::All { conditions, next });
+                    frames.push(ConditionFactsFrame::Visit(child));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+enum ConditionCanonicalizeFrame<'a> {
+    Visit(&'a PolicyCondition),
+    Aggregate {
+        any: bool,
+        conditions: &'a [PolicyCondition],
+        next: usize,
+        awaiting_child: bool,
+        values: Vec<PolicyCondition>,
+    },
+    Not,
+}
+
+fn canonical_condition_bounded(
+    condition: &PolicyCondition,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyCondition> {
+    let mut frames = vec![ConditionCanonicalizeFrame::Visit(condition)];
+    let mut values = Vec::new();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ConditionCanonicalizeFrame::Visit(condition) => {
+                work.step(is_cancelled)?;
+                match condition {
+                    PolicyCondition::All { conditions } | PolicyCondition::Any { conditions } => {
+                        frames.push(ConditionCanonicalizeFrame::Aggregate {
+                            any: matches!(condition, PolicyCondition::Any { .. }),
+                            conditions,
+                            next: 0,
+                            awaiting_child: false,
+                            values: Vec::new(),
+                        });
+                    }
+                    PolicyCondition::Not { condition } => {
+                        frames.push(ConditionCanonicalizeFrame::Not);
+                        frames.push(ConditionCanonicalizeFrame::Visit(condition));
+                    }
+                    PolicyCondition::Eq { key, value } => {
+                        values.push(PolicyCondition::Eq {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                    PolicyCondition::In {
+                        key,
+                        values: expected,
+                    } => {
+                        let mut expected = expected.clone();
+                        for value in &expected {
+                            work.step(is_cancelled)?;
+                            if !(value.is_null()
+                                || value.is_boolean()
+                                || value.is_number()
+                                || value.is_string())
+                            {
+                                bail!("edge condition value must be a JSON primitive");
+                            }
+                        }
+                        expected.sort_by_cached_key(|value| {
+                            serde_json::to_string(value).expect("JSON values are serializable")
+                        });
+                        expected.dedup();
+                        if let [value] = expected.as_slice() {
+                            values.push(PolicyCondition::Eq {
+                                key: key.clone(),
+                                value: value.clone(),
+                            });
+                        } else {
+                            values.push(PolicyCondition::In {
+                                key: key.clone(),
+                                values: expected,
+                            });
+                        }
+                    }
+                    PolicyCondition::Defined { key } => {
+                        values.push(PolicyCondition::Defined { key: key.clone() });
+                    }
+                }
+            }
+            ConditionCanonicalizeFrame::Aggregate {
+                any,
+                conditions,
+                mut next,
+                awaiting_child,
+                values: mut children,
+            } => {
+                if awaiting_child {
+                    children.push(
+                        values
+                            .pop()
+                            .context("bounded condition canonicalization lost a child")?,
+                    );
+                }
+                if next < conditions.len() {
+                    let child = &conditions[next];
+                    next += 1;
+                    frames.push(ConditionCanonicalizeFrame::Aggregate {
+                        any,
+                        conditions,
+                        next,
+                        awaiting_child: true,
+                        values: children,
+                    });
+                    frames.push(ConditionCanonicalizeFrame::Visit(child));
+                } else {
+                    values.push(canonicalize_condition_operator_bounded(
+                        any,
+                        children,
+                        work,
+                        is_cancelled,
+                    )?);
+                }
+            }
+            ConditionCanonicalizeFrame::Not => {
+                let condition = values
+                    .pop()
+                    .context("bounded condition canonicalization lost a not child")?;
+                if let PolicyCondition::Not { condition } = condition {
+                    values.push(*condition);
+                } else {
+                    values.push(PolicyCondition::Not {
+                        condition: Box::new(condition),
+                    });
+                }
+            }
+        }
+    }
+    values
+        .pop()
+        .filter(|_| values.is_empty())
+        .context("bounded condition canonicalization did not produce one result")
+}
+
+fn canonicalize_condition_operator_bounded(
+    any: bool,
+    values: Vec<PolicyCondition>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyCondition> {
+    let mut flattened = Vec::new();
+    for condition in values {
+        work.step(is_cancelled)?;
+        match (any, condition) {
+            (false, PolicyCondition::All { conditions }) if conditions.is_empty() => {}
+            (true, PolicyCondition::All { conditions }) if conditions.is_empty() => {
+                return Ok(PolicyCondition::All {
+                    conditions: Vec::new(),
+                });
+            }
+            (false, PolicyCondition::All { conditions })
+            | (true, PolicyCondition::Any { conditions }) => flattened.extend(conditions),
+            (_, condition) => flattened.push(condition),
+        }
+    }
+
+    let mut keyed = Vec::with_capacity(flattened.len());
+    for condition in flattened {
+        let key = condition_sort_key_bounded(&condition, work, is_cancelled)?;
+        keyed.push((key, condition));
+    }
+    charge_condition_sort_work(keyed.len(), work, is_cancelled)?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    let conditions = keyed
+        .into_iter()
+        .map(|(_, condition)| condition)
+        .collect::<Vec<_>>();
+    match (any, conditions.len()) {
+        (_, 0) if any => Ok(PolicyCondition::Any {
+            conditions: Vec::new(),
+        }),
+        (_, 0) => Ok(PolicyCondition::All {
+            conditions: Vec::new(),
+        }),
+        (_, 1) => Ok(conditions.into_iter().next().expect("length checked")),
+        (true, _) => Ok(PolicyCondition::Any { conditions }),
+        (false, _) => Ok(PolicyCondition::All { conditions }),
+    }
+}
+
+fn charge_condition_sort_work(
+    len: usize,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if len <= 1 {
+        return Ok(());
+    }
+    let rounds = usize::BITS as usize - (len - 1).leading_zeros() as usize;
+    for _ in 0..len.saturating_mul(rounds) {
+        work.step(is_cancelled)?;
+    }
+    Ok(())
+}
+
+enum ConditionRenderFrame<'a> {
+    Visit(&'a PolicyCondition),
+    List {
+        conditions: &'a [PolicyCondition],
+        next: usize,
+    },
+    Close(&'static str),
+}
+
+/// Produce the same JSON ordering key used by `Condition::canonicalized`, but
+/// with an explicit stack.  Canonical ordering is observable in policy output,
+/// so replacing it with pointer/order-dependent sorting would be a regression.
+fn condition_sort_key_bounded(
+    condition: &PolicyCondition,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<String> {
+    let mut frames = vec![ConditionRenderFrame::Visit(condition)];
+    let mut output = String::new();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ConditionRenderFrame::Visit(condition) => {
+                work.step(is_cancelled)?;
+                match condition {
+                    PolicyCondition::All { conditions } => {
+                        output.push_str(r#"{"op":"all","conditions":["#);
+                        frames.push(ConditionRenderFrame::Close("]}"));
+                        frames.push(ConditionRenderFrame::List {
+                            conditions,
+                            next: 0,
+                        });
+                    }
+                    PolicyCondition::Any { conditions } => {
+                        output.push_str(r#"{"op":"any","conditions":["#);
+                        frames.push(ConditionRenderFrame::Close("]}"));
+                        frames.push(ConditionRenderFrame::List {
+                            conditions,
+                            next: 0,
+                        });
+                    }
+                    PolicyCondition::Not { condition } => {
+                        output.push_str(r#"{"op":"not","condition":"#);
+                        frames.push(ConditionRenderFrame::Close("}"));
+                        frames.push(ConditionRenderFrame::Visit(condition));
+                    }
+                    PolicyCondition::Eq { key, value } => {
+                        output.push_str(r#"{"op":"eq","key":"#);
+                        output.push_str(&serde_json::to_string(key)?);
+                        output.push_str(r#","value":"#);
+                        output.push_str(&serde_json::to_string(value)?);
+                        output.push('}');
+                    }
+                    PolicyCondition::In { key, values } => {
+                        output.push_str(r#"{"op":"in","key":"#);
+                        output.push_str(&serde_json::to_string(key)?);
+                        output.push_str(r#","values":["#);
+                        for (index, value) in values.iter().enumerate() {
+                            work.step(is_cancelled)?;
+                            if index > 0 {
+                                output.push(',');
+                            }
+                            output.push_str(&serde_json::to_string(value)?);
+                        }
+                        output.push_str("]}");
+                    }
+                    PolicyCondition::Defined { key } => {
+                        output.push_str(r#"{"op":"defined","key":"#);
+                        output.push_str(&serde_json::to_string(key)?);
+                        output.push('}');
+                    }
+                }
+            }
+            ConditionRenderFrame::List {
+                conditions,
+                mut next,
+            } => {
+                if next < conditions.len() {
+                    if next > 0 {
+                        output.push(',');
+                    }
+                    let child = &conditions[next];
+                    next += 1;
+                    frames.push(ConditionRenderFrame::List { conditions, next });
+                    frames.push(ConditionRenderFrame::Visit(child));
+                }
+            }
+            ConditionRenderFrame::Close(value) => output.push_str(value),
+        }
+    }
+    Ok(output)
+}
+
+fn combined_condition_bounded(
+    edges: &[&AdmittedEdge<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyCondition> {
+    let mut conditions = BTreeMap::<String, PolicyCondition>::new();
+    for edge in edges {
+        work.step(is_cancelled)?;
+        let condition = canonical_condition_bounded(&edge.condition, work, is_cancelled)?;
+        let key = condition_sort_key_bounded(&condition, work, is_cancelled)?;
+        conditions.insert(key, condition);
+    }
+    let conditions = conditions.into_values().collect::<Vec<_>>();
+    canonical_condition_bounded(&PolicyCondition::All { conditions }, work, is_cancelled)
+}
+
+#[allow(dead_code)]
 fn combine_all(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     let values: Vec<_> = values.collect();
     if values.contains(&Some(false)) {
@@ -2691,6 +3555,7 @@ fn combine_all(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     }
 }
 
+#[allow(dead_code)]
 fn combine_any(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     let values: Vec<_> = values.collect();
     if values.contains(&Some(true)) {
@@ -2730,6 +3595,7 @@ fn condition_values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn add_condition_facts(condition: &PolicyCondition, context: &mut BTreeMap<String, Value>) {
     match condition {
         PolicyCondition::All { conditions } => {
@@ -2936,28 +3802,6 @@ fn combined_condition(edges: &[&AdmittedEdge<'_>]) -> Result<PolicyCondition> {
         let canonical = canonical_condition(&edge.condition)?;
         conditions.insert(serde_json::to_string(&canonical)?, canonical);
     }
-    if conditions.len() == 1 {
-        Ok(conditions.into_values().next().expect("one condition"))
-    } else {
-        canonical_condition(&PolicyCondition::All {
-            conditions: conditions.into_values().collect(),
-        })
-    }
-}
-
-fn combined_condition_bounded(
-    edges: &[&AdmittedEdge<'_>],
-    work: &mut PolicyEvaluationWork,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<PolicyCondition> {
-    let mut conditions: BTreeMap<String, PolicyCondition> = BTreeMap::new();
-    for edge in edges {
-        work.step(is_cancelled)?;
-        let canonical = canonical_condition(&edge.condition)?;
-        work.step(is_cancelled)?;
-        conditions.insert(serde_json::to_string(&canonical)?, canonical);
-    }
-    work.steps(conditions.len(), is_cancelled)?;
     if conditions.len() == 1 {
         Ok(conditions.into_values().next().expect("one condition"))
     } else {
@@ -4609,5 +5453,178 @@ mod tests {
         assert!(!glob_matches("src/*/index.ts", "src/ui/deep/index.ts"));
         assert!(glob_matches("src/*/index.ts", "src/ui/index.ts"));
         assert!(condition_values_equal(&json!(1), &json!(1.0)));
+    }
+
+    #[test]
+    fn bounded_glob_preserves_path_semantics_and_charges_large_locators() -> Result<()> {
+        for (pattern, value, expected) in [
+            ("src/**/index.?s", "src/ui/deep/index.ts", true),
+            ("src/**/index.?s", "src/index.ts", true),
+            ("src/*/index.ts", "src/ui/deep/index.ts", false),
+            ("src/*/index.ts", "src/ui/index.ts", true),
+        ] {
+            let mut work = PolicyEvaluationWork::new(10_000);
+            assert_eq!(
+                glob_matches_bounded(pattern, value, &mut work, &mut || false)?,
+                expected
+            );
+        }
+
+        let huge_locator = format!("file://{}", "a/".repeat(2_048));
+        let node = NodeRecord {
+            id: "huge-locator".to_owned(),
+            kind: "file".to_owned(),
+            locator: huge_locator.clone(),
+            display_name: huge_locator,
+            properties: json!({}),
+        };
+        let selector = PolicySelector {
+            kind: PolicySelectorKind::File,
+            field: PolicySelectorField::Locator,
+            match_kind: PolicyMatchKind::Glob,
+            value: "file://**".to_owned(),
+            cardinality: PolicySelectorCardinality::Many,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        let mut work = PolicyEvaluationWork::new(32);
+        let exhausted =
+            selector_matches_node_bounded(&node, &selector, &mut work, &mut || false).unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled = selector_matches_node_bounded(&node, &selector, &mut work, &mut || {
+            checks += 1;
+            checks > 32
+        })
+        .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 33);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_admitted_edge_conditions_are_iterative_and_cancellable() -> Result<()> {
+        let mut deep_condition = json!({
+            "op": "eq",
+            "key": "mode",
+            "value": "production"
+        });
+        for _ in 0..2_048 {
+            let mut object = serde_json::Map::new();
+            object.insert("op".to_owned(), Value::String("not".to_owned()));
+            object.insert("condition".to_owned(), deep_condition);
+            deep_condition = Value::Object(object);
+        }
+        let mut deep_graph = snapshot(vec![edge("deep-condition", "a", "b", "profile:production")]);
+        deep_graph.edges[0].condition = deep_condition;
+        let policy = rule(PolicyRuleKind::RuntimeBoundary);
+
+        let mut work = PolicyEvaluationWork::new(64);
+        let exhausted = admitted_edges_with_options_bounded(
+            &deep_graph,
+            &policy,
+            false,
+            true,
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled = admitted_edges_with_options_bounded(
+            &deep_graph,
+            &policy,
+            false,
+            true,
+            &mut work,
+            &mut || {
+                checks += 1;
+                checks > 64
+            },
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 65);
+
+        // The deeply nested Value is intentionally kept alive until the
+        // bounded parser has returned, then leaked for this process-local
+        // regression test so its recursive Drop implementation cannot mask
+        // the evaluator's stack-safe behavior.
+        std::mem::forget(deep_graph);
+
+        let many_children = (0..2_048)
+            .map(|index| {
+                json!({
+                    "op":"eq",
+                    "key": format!("condition-{index}"),
+                    "value": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut graph = snapshot(vec![edge("wide-condition", "a", "b", "profile:production")]);
+        graph.edges[0].condition = json!({"op":"all","conditions":many_children});
+        let mut work = PolicyEvaluationWork::new(64);
+        let exhausted = admitted_edges_with_options_bounded(
+            &graph,
+            &policy,
+            false,
+            true,
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_condition_canonicalization_matches_protocol_semantics() -> Result<()> {
+        let conditions = [
+            PolicyCondition::All {
+                conditions: vec![
+                    PolicyCondition::Eq {
+                        key: "z".to_owned(),
+                        value: json!("last"),
+                    },
+                    PolicyCondition::All {
+                        conditions: vec![PolicyCondition::Eq {
+                            key: "a".to_owned(),
+                            value: json!("first"),
+                        }],
+                    },
+                    PolicyCondition::All {
+                        conditions: Vec::new(),
+                    },
+                ],
+            },
+            PolicyCondition::Any {
+                conditions: vec![
+                    PolicyCondition::Not {
+                        condition: Box::new(PolicyCondition::Not {
+                            condition: Box::new(PolicyCondition::In {
+                                key: "mode".to_owned(),
+                                values: vec![json!("production"), json!("production")],
+                            }),
+                        }),
+                    },
+                    PolicyCondition::Any {
+                        conditions: vec![PolicyCondition::Defined {
+                            key: "runtime".to_owned(),
+                        }],
+                    },
+                ],
+            },
+        ];
+        for condition in conditions {
+            let expected = canonical_condition(&condition)?;
+            let mut work = PolicyEvaluationWork::new(usize::MAX);
+            let actual = canonical_condition_bounded(&condition, &mut work, &mut || false)?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 }
