@@ -1,13 +1,14 @@
-//! The three NDJSON inputs are compact worker-golden extracts: their event
-//! envelopes and semantic fields follow the Rust, Go, and Web worker fixtures
-//! under `crates/depgraph-protocol/tests/fixtures/`. They intentionally keep
-//! only the small subgraph needed to prove that worker file, symbol, and type
-//! records reach the health analyzer.
+//! The three NDJSON inputs are worker-golden extracts: their event envelopes
+//! and semantic fields follow the Rust, Go, and Web worker output contracts.
+//! The Go input is captured from the real safe worker, including its package,
+//! file, semantic-site, semantic-edge, diagnostic, and coverage records, so
+//! this test does not invent source-path or visibility fields that the worker
+//! does not emit.
 
 use std::fs;
 
 use anyhow::Result;
-use depgraph_core::health::{FindingKind, analyze_unused};
+use depgraph_core::health::{BlockerKind, FindingKind, analyze_unused};
 use depgraph_protocol::validate_safe_semantic_ndjson;
 use depgraph_store::{GraphSnapshot, Store};
 use serde_json::{Value, json};
@@ -56,6 +57,32 @@ fn location_path(finding: &depgraph_core::HealthFinding) -> Option<&str> {
         .map(|location| location.path.as_str())
 }
 
+struct ExpectedFinding<'a> {
+    kind: FindingKind,
+    path: Option<&'a str>,
+    locator: Option<&'a str>,
+}
+
+fn fixture_node_id(fixture: &str, locator: &str) -> Option<String> {
+    fixture.lines().find_map(|line| {
+        let event: Value = serde_json::from_str(line).ok()?;
+        if event.get("event").and_then(Value::as_str) != Some("node_upsert")
+            || event
+                .get("node")
+                .and_then(|node| node.get("locator"))
+                .and_then(Value::as_str)
+                != Some(locator)
+        {
+            return None;
+        }
+        event
+            .get("node")
+            .and_then(|node| node.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
 #[test]
 fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web() -> Result<()> {
     let temporary = tempfile::tempdir()?;
@@ -63,56 +90,127 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
         (
             "rust",
             RUST_FIXTURE,
-            "src/unused.rs",
-            "src/public.rs",
-            "src/public.rs",
+            3,
+            [
+                ExpectedFinding {
+                    kind: FindingKind::UnusedFile,
+                    path: Some("src/unused.rs"),
+                    locator: None,
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedExport,
+                    path: Some("src/public.rs"),
+                    locator: None,
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedType,
+                    path: Some("src/public.rs"),
+                    locator: None,
+                },
+            ],
         ),
         (
             "go",
             GO_FIXTURE,
-            "pkg/unused.go",
-            "pkg/public.go",
-            "pkg/public.go",
+            6,
+            [
+                ExpectedFinding {
+                    kind: FindingKind::UnusedFile,
+                    path: None,
+                    locator: Some("file:pkg/unused.go"),
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedExport,
+                    path: None,
+                    locator: Some("go-symbol:example.com/issue437/pkg.UnusedExport"),
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedType,
+                    path: None,
+                    locator: Some("go-type:example.com/issue437/pkg.UnusedType"),
+                },
+            ],
         ),
         (
             "web",
             WEB_FIXTURE,
-            "src/unused.ts",
-            "src/public.ts",
-            "src/public.ts",
+            3,
+            [
+                ExpectedFinding {
+                    kind: FindingKind::UnusedFile,
+                    path: Some("src/unused.ts"),
+                    locator: None,
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedExport,
+                    path: Some("src/public.ts"),
+                    locator: None,
+                },
+                ExpectedFinding {
+                    kind: FindingKind::UnusedType,
+                    path: Some("src/public.ts"),
+                    locator: None,
+                },
+            ],
         ),
     ];
 
-    for (language, fixture, unused_file, unused_export, unused_type) in cases {
+    for (language, fixture, expected_count, expected_findings) in cases {
         let snapshot = load_protocol_fixture(&temporary, &format!("issue437-{language}"), fixture)?;
         let findings = analyze_unused(&snapshot);
 
-        for (kind, path) in [
-            (FindingKind::UnusedFile, unused_file),
-            (FindingKind::UnusedExport, unused_export),
-            (FindingKind::UnusedType, unused_type),
-        ] {
+        for expected in expected_findings {
+            let subject_id = expected.locator.map(|locator| {
+                fixture_node_id(fixture, locator).unwrap_or_else(|| {
+                    panic!("{language} fixture has no node with locator {locator:?}")
+                })
+            });
             let finding = findings
                 .iter()
-                .find(|finding| finding.kind == kind && location_path(finding) == Some(path))
+                .find(|finding| {
+                    if finding.kind != expected.kind {
+                        return false;
+                    }
+                    if let Some(path) = expected.path {
+                        return location_path(finding) == Some(path);
+                    }
+                    subject_id.as_deref() == Some(finding.subject_id.as_str())
+                        && location_path(finding).is_none()
+                })
                 .unwrap_or_else(|| {
-                    panic!("{language} fixture did not produce {kind:?} at {path}: {findings:?}")
+                    panic!(
+                        "{language} fixture did not produce {:?} for path={:?}, locator={:?}: {findings:?}",
+                        expected.kind, expected.path, expected.locator
+                    )
                 });
-            let expected_confidence = if kind == FindingKind::UnusedFile {
+            let expected_confidence = if expected.kind == FindingKind::UnusedFile {
                 depgraph_core::Confidence::Confirmed
             } else {
-                // Worker metadata marks exports/types as public surfaces; the
-                // analyzer reports them for review but correctly keeps them
-                // indeterminate until that public API decision is made.
+                // Rust/Web worker metadata and Go's exported-identifier rule
+                // mark exports/types as public surfaces; the analyzer reports
+                // them for review but keeps them indeterminate until that API
+                // decision is made.
                 depgraph_core::Confidence::Indeterminate
             };
             assert_eq!(finding.confidence, expected_confidence);
+            if matches!(
+                expected.kind,
+                FindingKind::UnusedExport | FindingKind::UnusedType
+            ) {
+                assert!(
+                    finding
+                        .blockers
+                        .iter()
+                        .any(|blocker| blocker.kind == BlockerKind::PublicSurface),
+                    "{language} fixture public subject lacks a public-surface blocker: {finding:?}"
+                );
+            }
         }
 
         assert_eq!(
             findings.len(),
-            3,
-            "fixture should contain only the three intended findings: {findings:?}"
+            expected_count,
+            "unexpected findings for {language} fixture: {findings:?}"
         );
     }
     Ok(())
