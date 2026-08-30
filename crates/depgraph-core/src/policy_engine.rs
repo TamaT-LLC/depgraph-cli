@@ -16,7 +16,7 @@ use crate::{
         PolicySelector, PolicySelectorCardinality, PolicySelectorField, PolicySelectorKind,
         PolicySuppression, PolicyViolation, PublicApiChange, PublicApiChangeKind,
     },
-    query::{CycleLevel, cycles},
+    query::CycleLevel,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -385,7 +385,6 @@ fn evaluate_policy_with_work(
                 )?
             }
             PolicyRuleKind::Cycle => evaluate_cycles_bounded(
-                snapshot,
                 rule,
                 &admitted,
                 &source_ids,
@@ -1551,9 +1550,236 @@ fn evaluate_direct_bounded(
     Ok(violations)
 }
 
+fn cycle_rings_bounded(
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    edges: &[&AdmittedEdge<'_>],
+    level: CycleLevel,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<Vec<String>>> {
+    let mut allowed = BTreeSet::new();
+    for item in edges {
+        for node_id in [item.edge.source.as_str(), item.edge.target.as_str()] {
+            work.step(is_cancelled)?;
+            if nodes
+                .get(node_id)
+                .is_some_and(|node| node.kind == level.node_kind())
+            {
+                charge_ordered_collection_work(allowed.len(), 1, work, is_cancelled)?;
+                allowed.insert(node_id);
+            }
+        }
+    }
+
+    let mut adjacency = BTreeMap::<&str, Vec<&str>>::new();
+    let mut reverse = BTreeMap::<&str, Vec<&str>>::new();
+    for node_id in &allowed {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(adjacency.len(), 1, work, is_cancelled)?;
+        adjacency.insert(*node_id, Vec::new());
+        charge_ordered_collection_work(reverse.len(), 1, work, is_cancelled)?;
+        reverse.insert(*node_id, Vec::new());
+    }
+    for item in edges {
+        work.step(is_cancelled)?;
+        let source = item.edge.source.as_str();
+        let target = item.edge.target.as_str();
+        if allowed.contains(source) && allowed.contains(target) {
+            adjacency
+                .get_mut(source)
+                .context("cycle adjacency lost an allowed source")?
+                .push(target);
+            reverse
+                .get_mut(target)
+                .context("cycle adjacency lost an allowed target")?
+                .push(source);
+        }
+    }
+    for targets in adjacency.values_mut().chain(reverse.values_mut()) {
+        charge_sort_work(targets.len(), work, is_cancelled)?;
+        work.steps(targets.len(), is_cancelled)?;
+        targets.sort_unstable();
+        targets.dedup();
+    }
+
+    // Iterative Kosaraju keeps both SCC passes stack-safe and gives every
+    // visited node/edge an explicit cancellation and work-budget point.
+    let mut visited = BTreeSet::new();
+    let mut finish_order = Vec::with_capacity(allowed.len());
+    for node_id in &allowed {
+        work.step(is_cancelled)?;
+        if visited.contains(node_id) {
+            continue;
+        }
+        charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
+        visited.insert(*node_id);
+        let mut stack = vec![(*node_id, 0_usize)];
+        while let Some((current, next_index)) = stack.last().copied() {
+            work.step(is_cancelled)?;
+            let outgoing = adjacency
+                .get(current)
+                .context("cycle adjacency lost a visited node")?;
+            if next_index < outgoing.len() {
+                stack.last_mut().expect("stack is non-empty").1 += 1;
+                let next = outgoing[next_index];
+                if !visited.contains(next) {
+                    charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
+                    visited.insert(next);
+                    stack.push((next, 0));
+                }
+            } else {
+                stack.pop();
+                finish_order.push(current);
+            }
+        }
+    }
+
+    let mut assigned = BTreeSet::new();
+    let mut components = Vec::new();
+    for node_id in finish_order.iter().rev().copied() {
+        work.step(is_cancelled)?;
+        if assigned.contains(node_id) {
+            continue;
+        }
+        charge_ordered_collection_work(assigned.len(), 1, work, is_cancelled)?;
+        assigned.insert(node_id);
+        let mut stack = vec![node_id];
+        let mut component = Vec::new();
+        while let Some(current) = stack.pop() {
+            work.step(is_cancelled)?;
+            component.push(current);
+            for next in reverse
+                .get(current)
+                .context("reverse cycle adjacency lost a visited node")?
+            {
+                work.step(is_cancelled)?;
+                if !assigned.contains(next) {
+                    charge_ordered_collection_work(assigned.len(), 1, work, is_cancelled)?;
+                    assigned.insert(*next);
+                    stack.push(*next);
+                }
+            }
+        }
+        charge_sort_work(component.len(), work, is_cancelled)?;
+        component.sort_unstable();
+        components.push(component);
+    }
+
+    let mut rings = Vec::new();
+    for component in components {
+        work.step(is_cancelled)?;
+        let self_loop = if component.len() == 1 {
+            let mut found = false;
+            for target in adjacency
+                .get(component[0])
+                .context("cycle component lost its adjacency")?
+            {
+                work.step(is_cancelled)?;
+                if *target == component[0] {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            false
+        };
+        if component.len() < 2 && !self_loop {
+            continue;
+        }
+        let mut component_set = BTreeSet::new();
+        for node_id in &component {
+            work.step(is_cancelled)?;
+            charge_ordered_collection_work(component_set.len(), 1, work, is_cancelled)?;
+            component_set.insert(*node_id);
+        }
+        let ring = if let Some(ring) = representative_cycle_bounded(
+            component[0],
+            &component_set,
+            &adjacency,
+            work,
+            is_cancelled,
+        )? {
+            ring
+        } else {
+            let mut fallback = Vec::with_capacity(component.len().saturating_add(1));
+            for node_id in &component {
+                work.step(is_cancelled)?;
+                fallback.push((*node_id).to_owned());
+            }
+            work.step(is_cancelled)?;
+            fallback.push(component[0].to_owned());
+            fallback
+        };
+        rings.push(ring);
+    }
+    charge_sort_work(rings.len(), work, is_cancelled)?;
+    rings.sort();
+    Ok(rings)
+}
+
+fn representative_cycle_bounded(
+    start: &str,
+    component: &BTreeSet<&str>,
+    adjacency: &BTreeMap<&str, Vec<&str>>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<String>>> {
+    let mut queue = VecDeque::new();
+    let mut predecessor = BTreeMap::<&str, &str>::new();
+    for next in adjacency
+        .get(start)
+        .context("cycle representative start has no adjacency")?
+    {
+        work.step(is_cancelled)?;
+        if !component.contains(next) {
+            continue;
+        }
+        if *next == start {
+            work.steps(2, is_cancelled)?;
+            return Ok(Some(vec![start.to_owned(), start.to_owned()]));
+        }
+        charge_ordered_collection_work(predecessor.len(), 1, work, is_cancelled)?;
+        predecessor.insert(*next, start);
+        queue.push_back(*next);
+    }
+    while let Some(node) = queue.pop_front() {
+        work.step(is_cancelled)?;
+        for next in adjacency
+            .get(node)
+            .context("cycle representative node has no adjacency")?
+        {
+            work.step(is_cancelled)?;
+            if !component.contains(next) {
+                continue;
+            }
+            if *next == start {
+                let mut path = vec![node.to_owned()];
+                let mut current = node;
+                while current != start {
+                    work.step(is_cancelled)?;
+                    current = predecessor
+                        .get(current)
+                        .copied()
+                        .context("cycle representative predecessor is missing")?;
+                    path.push(current.to_owned());
+                }
+                path.reverse();
+                path.push(start.to_owned());
+                return Ok(Some(path));
+            }
+            if !predecessor.contains_key(next) {
+                charge_ordered_collection_work(predecessor.len(), 1, work, is_cancelled)?;
+                predecessor.insert(*next, node);
+                queue.push_back(*next);
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cycles_bounded(
-    snapshot: &GraphSnapshot,
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
     source_ids: &BTreeSet<&str>,
@@ -1588,33 +1814,10 @@ fn evaluate_cycles_bounded(
     let mut output = Vec::new();
     for (profile_id, edges) in by_profile {
         work.step(is_cancelled)?;
-        let snapshot_records = snapshot
-            .nodes
-            .len()
-            .saturating_add(snapshot.sites.len())
-            .saturating_add(snapshot.edges.len())
-            .saturating_add(snapshot.evidence.len())
-            .saturating_add(snapshot.profiles.len())
-            .saturating_add(snapshot.diagnostics.len())
-            .saturating_add(snapshot.file_coverage.len())
-            .saturating_add(snapshot.adapter_logs.len());
-        work.steps(snapshot_records, is_cancelled)?;
-        let mut filtered = snapshot.clone();
-        let mut filtered_edges = Vec::with_capacity(edges.len());
-        for item in &edges {
-            work.step(is_cancelled)?;
-            filtered_edges.push(item.edge.clone());
-        }
-        filtered.edges = filtered_edges;
-        charge_sort_work(
-            filtered.nodes.len().saturating_add(filtered.edges.len()),
-            work,
-            is_cancelled,
-        )?;
-        let detected_cycles = cycles(&filtered, level);
+        let detected_cycles = cycle_rings_bounded(nodes, &edges, level, work, is_cancelled)?;
         for cycle in detected_cycles {
             work.step(is_cancelled)?;
-            let ring = &cycle.node_ids[..cycle.node_ids.len() - 1];
+            let ring = &cycle[..cycle.len() - 1];
             work.steps(ring.len().saturating_mul(3), is_cancelled)?;
             if !ring.iter().any(|node| source_ids.contains(node.as_str()))
                 || !ring.iter().any(|node| target_ids.contains(node.as_str()))
@@ -1674,7 +1877,7 @@ fn evaluate_cycles_bounded(
                 path_edges,
                 format!(
                     "{} cycle contains {} dependency steps",
-                    cycle.level,
+                    level.node_kind(),
                     node_path.len() - 1
                 ),
                 suppressions,
@@ -2805,7 +3008,7 @@ fn evaluate_edge_condition(
     }
 }
 
-const MAX_EDGE_CONDITION_DEPTH: usize = 128;
+const MAX_EDGE_CONDITION_DEPTH: usize = 16;
 
 enum ConditionParseFrame<'a> {
     Visit {
@@ -2828,9 +3031,9 @@ enum ConditionParseFrame<'a> {
 /// policy evaluation also accepts snapshots loaded from older stores and test
 /// fixtures.  Keeping the parser iterative makes a malformed/deep condition
 /// consume the shared policy budget instead of growing the Rust call stack.
-/// The depth ceiling matches serde_json's default recursion protection, so a
-/// manually assembled snapshot cannot create a condition tree whose recursive
-/// Drop would be deeper than a snapshot accepted from JSON.
+/// The depth ceiling matches the validated PolicyCondition output contract,
+/// so a manually assembled snapshot cannot create a deeper recursive tree on
+/// either successful materialization or an error path.
 fn parse_condition_bounded(
     value: &Value,
     edge_id: &str,
@@ -2903,7 +3106,7 @@ fn parse_condition_bounded(
                             work,
                             is_cancelled,
                         )?;
-                        let key = condition_key(object, edge_id)?;
+                        let key = condition_key_bounded(object, edge_id, work, is_cancelled)?;
                         let value = condition_value_bounded(
                             object.get("value").with_context(|| {
                                 format!("edge {edge_id:?} has an invalid policy condition")
@@ -2922,7 +3125,7 @@ fn parse_condition_bounded(
                             work,
                             is_cancelled,
                         )?;
-                        let key = condition_key(object, edge_id)?;
+                        let key = condition_key_bounded(object, edge_id, work, is_cancelled)?;
                         let raw_values = object
                             .get("values")
                             .and_then(Value::as_array)
@@ -2952,7 +3155,7 @@ fn parse_condition_bounded(
                             is_cancelled,
                         )?;
                         values.push(PolicyCondition::Defined {
-                            key: condition_key(object, edge_id)?,
+                            key: condition_key_bounded(object, edge_id, work, is_cancelled)?,
                         });
                     }
                     _ => {
@@ -3032,12 +3235,18 @@ fn require_condition_fields(
     Ok(())
 }
 
-fn condition_key(object: &serde_json::Map<String, Value>, edge_id: &str) -> Result<String> {
-    object
+fn condition_key_bounded(
+    object: &serde_json::Map<String, Value>,
+    edge_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<String> {
+    let key = object
         .get("key")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))
+        .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+    work.steps(key.len().saturating_add(1), is_cancelled)?;
+    Ok(key.to_owned())
 }
 
 fn condition_value_bounded(
@@ -3046,11 +3255,23 @@ fn condition_value_bounded(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Value> {
-    work.step(is_cancelled)?;
+    charge_condition_value_work(value, work, is_cancelled)?;
     if !(value.is_null() || value.is_boolean() || value.is_number() || value.is_string()) {
         bail!("edge {edge_id:?} has an invalid policy condition");
     }
     Ok(value.clone())
+}
+
+fn charge_condition_value_work(
+    value: &Value,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    work.step(is_cancelled)?;
+    if let Some(value) = value.as_str() {
+        work.steps(value.len(), is_cancelled)?;
+    }
+    Ok(())
 }
 
 enum ConditionEvalFrame<'a> {
@@ -3107,8 +3328,18 @@ fn evaluate_condition_bounded_inner(
                     }
                     PolicyCondition::Eq { key, value } => {
                         values.push(
-                            lookup_context_bounded(context, key, work, is_cancelled)?
-                                .map(|actual| condition_values_equal(actual, value)),
+                            if let Some(actual) =
+                                lookup_context_bounded(context, key, work, is_cancelled)?
+                            {
+                                Some(condition_values_equal_bounded(
+                                    actual,
+                                    value,
+                                    work,
+                                    is_cancelled,
+                                )?)
+                            } else {
+                                None
+                            },
                         );
                     }
                     PolicyCondition::In {
@@ -3123,8 +3354,7 @@ fn evaluate_condition_bounded_inner(
                         };
                         let mut matched = false;
                         for value in expected {
-                            work.step(is_cancelled)?;
-                            if condition_values_equal(actual, value) {
+                            if condition_values_equal_bounded(actual, value, work, is_cancelled)? {
                                 matched = true;
                                 break;
                             }
@@ -3211,7 +3441,7 @@ fn lookup_context_bounded<'a>(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<&'a Value>> {
-    work.step(is_cancelled)?;
+    work.steps(key.len().saturating_add(1), is_cancelled)?;
     if let Some(value) = context.get(key) {
         return Ok(Some(value));
     }
@@ -3254,14 +3484,37 @@ fn add_condition_facts_bounded(
                         });
                     }
                     PolicyCondition::Eq { key, value } => {
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
+                        charge_condition_value_work(value, work, is_cancelled)?;
+                        charge_ordered_collection_work(
+                            context.len(),
+                            key.len(),
+                            work,
+                            is_cancelled,
+                        )?;
                         context.entry(key.clone()).or_insert_with(|| value.clone());
                     }
                     PolicyCondition::In { key, values } if values.len() == 1 => {
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
+                        charge_condition_value_work(&values[0], work, is_cancelled)?;
+                        charge_ordered_collection_work(
+                            context.len(),
+                            key.len(),
+                            work,
+                            is_cancelled,
+                        )?;
                         context
                             .entry(key.clone())
                             .or_insert_with(|| values[0].clone());
                     }
                     PolicyCondition::Defined { key } => {
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
+                        charge_ordered_collection_work(
+                            context.len(),
+                            key.len(),
+                            work,
+                            is_cancelled,
+                        )?;
                         context.entry(key.clone()).or_insert(Value::Bool(true));
                     }
                     PolicyCondition::Any { .. }
@@ -3323,6 +3576,8 @@ fn canonical_condition_bounded(
                         frames.push(ConditionCanonicalizeFrame::Visit(condition));
                     }
                     PolicyCondition::Eq { key, value } => {
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
+                        charge_condition_value_work(value, work, is_cancelled)?;
                         values.push(PolicyCondition::Eq {
                             key: key.clone(),
                             value: value.clone(),
@@ -3332,9 +3587,10 @@ fn canonical_condition_bounded(
                         key,
                         values: expected,
                     } => {
-                        let mut expected = expected.clone();
-                        for value in &expected {
-                            work.step(is_cancelled)?;
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
+                        let mut keyed = Vec::with_capacity(expected.len());
+                        for value in expected {
+                            charge_condition_value_work(value, work, is_cancelled)?;
                             if !(value.is_null()
                                 || value.is_boolean()
                                 || value.is_number()
@@ -3342,11 +3598,17 @@ fn canonical_condition_bounded(
                             {
                                 bail!("edge condition value must be a JSON primitive");
                             }
+                            let sort_key = serde_json::to_string(value)?;
+                            work.steps(sort_key.len().saturating_add(1), is_cancelled)?;
+                            keyed.push((sort_key, value.clone()));
                         }
-                        expected.sort_by_cached_key(|value| {
-                            serde_json::to_string(value).expect("JSON values are serializable")
-                        });
-                        expected.dedup();
+                        charge_condition_key_sort_work(&keyed, work, is_cancelled)?;
+                        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+                        keyed.dedup_by(|left, right| left.0 == right.0);
+                        let expected = keyed
+                            .into_iter()
+                            .map(|(_, value)| value)
+                            .collect::<Vec<_>>();
                         if let [value] = expected.as_slice() {
                             values.push(PolicyCondition::Eq {
                                 key: key.clone(),
@@ -3360,6 +3622,7 @@ fn canonical_condition_bounded(
                         }
                     }
                     PolicyCondition::Defined { key } => {
+                        work.steps(key.len().saturating_add(1), is_cancelled)?;
                         values.push(PolicyCondition::Defined { key: key.clone() });
                     }
                 }
@@ -3445,7 +3708,7 @@ fn canonicalize_condition_operator_bounded(
         let key = condition_sort_key_bounded(&condition, work, is_cancelled)?;
         keyed.push((key, condition));
     }
-    charge_condition_sort_work(keyed.len(), work, is_cancelled)?;
+    charge_condition_key_sort_work(&keyed, work, is_cancelled)?;
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
     keyed.dedup_by(|left, right| left.0 == right.0);
     let conditions = keyed
@@ -3480,6 +3743,22 @@ fn charge_condition_sort_work(
     Ok(())
 }
 
+fn charge_condition_key_sort_work<T>(
+    keyed: &[(String, T)],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    charge_condition_sort_work(keyed.len(), work, is_cancelled)?;
+    if keyed.len() <= 1 {
+        return Ok(());
+    }
+    let rounds = usize::BITS as usize - (keyed.len() - 1).leading_zeros() as usize;
+    for (key, _) in keyed {
+        work.steps(key.len().saturating_mul(rounds), is_cancelled)?;
+    }
+    Ok(())
+}
+
 enum ConditionRenderFrame<'a> {
     Visit(&'a PolicyCondition),
     List {
@@ -3487,6 +3766,32 @@ enum ConditionRenderFrame<'a> {
         next: usize,
     },
     Close(&'static str),
+}
+
+fn append_condition_string_bounded(
+    output: &mut String,
+    value: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    work.steps(value.len().saturating_add(1), is_cancelled)?;
+    let encoded = serde_json::to_string(value)?;
+    work.steps(encoded.len().saturating_add(1), is_cancelled)?;
+    output.push_str(&encoded);
+    Ok(())
+}
+
+fn append_condition_value_bounded(
+    output: &mut String,
+    value: &Value,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    charge_condition_value_work(value, work, is_cancelled)?;
+    let encoded = serde_json::to_string(value)?;
+    work.steps(encoded.len().saturating_add(1), is_cancelled)?;
+    output.push_str(&encoded);
+    Ok(())
 }
 
 /// Produce the same JSON ordering key used by `Condition::canonicalized`, but
@@ -3527,27 +3832,26 @@ fn condition_sort_key_bounded(
                     }
                     PolicyCondition::Eq { key, value } => {
                         output.push_str(r#"{"op":"eq","key":"#);
-                        output.push_str(&serde_json::to_string(key)?);
+                        append_condition_string_bounded(&mut output, key, work, is_cancelled)?;
                         output.push_str(r#","value":"#);
-                        output.push_str(&serde_json::to_string(value)?);
+                        append_condition_value_bounded(&mut output, value, work, is_cancelled)?;
                         output.push('}');
                     }
                     PolicyCondition::In { key, values } => {
                         output.push_str(r#"{"op":"in","key":"#);
-                        output.push_str(&serde_json::to_string(key)?);
+                        append_condition_string_bounded(&mut output, key, work, is_cancelled)?;
                         output.push_str(r#","values":["#);
                         for (index, value) in values.iter().enumerate() {
-                            work.step(is_cancelled)?;
                             if index > 0 {
                                 output.push(',');
                             }
-                            output.push_str(&serde_json::to_string(value)?);
+                            append_condition_value_bounded(&mut output, value, work, is_cancelled)?;
                         }
                         output.push_str("]}");
                     }
                     PolicyCondition::Defined { key } => {
                         output.push_str(r#"{"op":"defined","key":"#);
-                        output.push_str(&serde_json::to_string(key)?);
+                        append_condition_string_bounded(&mut output, key, work, is_cancelled)?;
                         output.push('}');
                     }
                 }
@@ -3582,8 +3886,10 @@ fn combined_condition_bounded(
         work.step(is_cancelled)?;
         let condition = canonical_condition_bounded(&edge.condition, work, is_cancelled)?;
         let key = condition_sort_key_bounded(&condition, work, is_cancelled)?;
+        charge_ordered_collection_work(conditions.len(), key.len(), work, is_cancelled)?;
         conditions.insert(key, condition);
     }
+    work.steps(conditions.len(), is_cancelled)?;
     let conditions = conditions.into_values().collect::<Vec<_>>();
     canonical_condition_bounded(&PolicyCondition::All { conditions }, work, is_cancelled)
 }
@@ -3638,6 +3944,17 @@ fn condition_values_equal(left: &Value, right: &Value) -> bool {
         },
         _ => left == right,
     }
+}
+
+fn condition_values_equal_bounded(
+    left: &Value,
+    right: &Value,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    charge_condition_value_work(left, work, is_cancelled)?;
+    charge_condition_value_work(right, work, is_cancelled)?;
+    Ok(condition_values_equal(left, right))
 }
 
 #[allow(dead_code)]
@@ -4328,7 +4645,6 @@ mod tests {
 
         let mut work = PolicyEvaluationWork::new(0);
         let exhausted = evaluate_cycles_bounded(
-            &graph,
             &cycle_rule,
             &admitted,
             &source_ids,
@@ -5356,6 +5672,58 @@ mod tests {
     }
 
     #[test]
+    fn bounded_cycle_detection_is_iterative_and_cancellable() -> Result<()> {
+        const NODE_COUNT: usize = 512;
+        let edges = (0..NODE_COUNT)
+            .map(|index| {
+                edge(
+                    &format!("cycle-edge-{index}"),
+                    &format!("cycle-node-{index}"),
+                    &format!("cycle-node-{}", (index + 1) % NODE_COUNT),
+                    "profile:production",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut graph = snapshot(edges);
+        graph.nodes = (0..NODE_COUNT)
+            .map(|index| {
+                node(
+                    &format!("cycle-node-{index}"),
+                    &format!("src/cycle/{index}.ts"),
+                )
+            })
+            .collect();
+        let cycle_rule = rule(PolicyRuleKind::Cycle);
+        let admitted = admitted_edges_with_options(&graph, &cycle_rule, true, true)?;
+        let admitted = admitted.iter().collect::<Vec<_>>();
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut work = PolicyEvaluationWork::new(128);
+        let exhausted =
+            cycle_rings_bounded(&nodes, &admitted, CycleLevel::File, &mut work, &mut || {
+                false
+            })
+            .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled =
+            cycle_rings_bounded(&nodes, &admitted, CycleLevel::File, &mut work, &mut || {
+                checks += 1;
+                checks > 128
+            })
+            .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 129);
+        Ok(())
+    }
+
+    #[test]
     fn package_layer_boundary_uses_package_instance_edges() -> Result<()> {
         let mut graph = snapshot(vec![edge(
             "package-edge",
@@ -5628,7 +5996,7 @@ mod tests {
             "key": "mode",
             "value": "production"
         });
-        for _ in 0..2_048 {
+        for _ in 0..64 {
             let mut object = serde_json::Map::new();
             object.insert("op".to_owned(), Value::String("not".to_owned()));
             object.insert("condition".to_owned(), deep_condition);
@@ -5638,7 +6006,7 @@ mod tests {
         deep_graph.edges[0].condition = deep_condition;
         let policy = rule(PolicyRuleKind::RuntimeBoundary);
 
-        let mut work = PolicyEvaluationWork::new(64);
+        let mut work = PolicyEvaluationWork::new(16);
         let exhausted = admitted_edges_with_options_bounded(
             &deep_graph,
             &policy,
@@ -5660,12 +6028,12 @@ mod tests {
             &mut work,
             &mut || {
                 checks += 1;
-                checks > 64
+                checks > 16
             },
         )
         .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
-        assert_eq!(checks, 65);
+        assert_eq!(checks, 17);
 
         let mut work = PolicyEvaluationWork::new(usize::MAX);
         let invalid = admitted_edges_with_options_bounded(
@@ -5678,12 +6046,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("invalid policy condition"));
-
-        // The deeply nested Value is intentionally kept alive until the
-        // bounded parser has returned, then leaked for this process-local
-        // regression test so its recursive Drop implementation cannot mask
-        // the evaluator's stack-safe behavior.
-        std::mem::forget(deep_graph);
 
         let many_children = (0..2_048)
             .map(|index| {
@@ -5754,6 +6116,26 @@ mod tests {
             let actual = canonical_condition_bounded(&condition, &mut work, &mut || false)?;
             assert_eq!(actual, expected);
         }
+
+        let wide_in = PolicyCondition::In {
+            key: "mode".to_owned(),
+            values: (0..2_048)
+                .map(|index| json!(format!("mode-{index}")))
+                .collect(),
+        };
+        let mut work = PolicyEvaluationWork::new(128);
+        let exhausted =
+            canonical_condition_bounded(&wide_in, &mut work, &mut || false).unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let large_atom = PolicyCondition::Eq {
+            key: "k".repeat(2_048),
+            value: json!("v".repeat(2_048)),
+        };
+        let mut work = PolicyEvaluationWork::new(128);
+        let exhausted =
+            condition_sort_key_bounded(&large_atom, &mut work, &mut || false).unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
         Ok(())
     }
 }
