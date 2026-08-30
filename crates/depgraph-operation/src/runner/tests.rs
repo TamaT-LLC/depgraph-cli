@@ -5151,7 +5151,7 @@ fn p1a_runner_cancels_unclaimed_legacy_scan_staging_before_expiry_terminalizatio
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        17
+        depgraph_core::release_compatibility_contract().store_schema_version
     );
     assert_eq!(
         connection
