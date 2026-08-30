@@ -13,7 +13,9 @@ use depgraph_protocol::{
     DeltaScope, ValidatedDelta, WORKER_DELTA_CAPABILITY, WorkerDeltaFileChange,
     WorkerDeltaFileChangeKind, WorkerDeltaRequest, WorkerProtocolMode, negotiate_worker_protocol,
 };
-use depgraph_store::{IncrementalReplacementScope, InterruptedAttemptRecovery};
+use depgraph_store::{
+    IncrementalReplacementScope, InterruptedAttemptRecovery, ScanHealthProvenance,
+};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
@@ -34,6 +36,7 @@ use crate::{
     plan_incremental_invalidation, plan_repository_profiles,
     run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
+    health::{HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest},
     worker::{
         AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
         locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
@@ -1040,6 +1043,17 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                     strict,
                                     base_snapshot_id,
                                     source_revision.as_deref(),
+                                )?;
+                                store.bind_scan_health_provenance(
+                                    &scan_id,
+                                    &ScanHealthProvenance {
+                                        policy_config_digest: health_policy_config_digest(
+                                            &config.policy,
+                                        )?,
+                                        analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+                                        finding_contract_version:
+                                            HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
+                                    },
                                 )?;
                                 let result = (|| -> Result<crate::ScanOutcome> {
                                     if cancellation.is_cancelled() {

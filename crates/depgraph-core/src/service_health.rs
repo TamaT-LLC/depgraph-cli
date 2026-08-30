@@ -4,8 +4,7 @@ use std::{
     path::Path,
 };
 
-use depgraph_protocol::stable_id_from_value;
-use depgraph_store::GraphSnapshot;
+use depgraph_store::{GraphSnapshot, ScanRecord};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -330,6 +329,11 @@ impl HealthAuditReadScope {
     pub fn policy_config_digest(&self) -> &str {
         &self.policy_config_digest
     }
+
+    #[must_use]
+    pub const fn comparability(&self) -> &AuditComparability {
+        &self.comparability
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -605,9 +609,7 @@ impl DepgraphService {
         // resulting boundary IDs remain stable even if repository config is
         // edited before a caller consumes the pinned scope.
         let policy = self.read_policy_config(cancellation)?;
-        let policy_config_digest = policy
-            .normalized_identity()
-            .map(|value| stable_id_from_value("policy-config", &value))
+        let policy_config_digest = crate::health::health_policy_config_digest(&policy)
             .map_err(|_| DepgraphServiceError::Internal)?;
         let after_id = after_request.snapshot_id().clone();
         let after = load_pinned_snapshot(after_request, cancellation)?;
@@ -635,6 +637,11 @@ impl DepgraphService {
             cancellation,
         )?;
         if let Some(before) = &before {
+            compare_health_provenance(
+                &before.snapshot.scan,
+                &after.scan,
+                &mut comparability,
+            );
             comparability.profile_matrix_changed = before.snapshot.profile_matrix.schema_version
                 != after.profile_matrix.schema_version
                 || profile_matrix_identities(&before.snapshot, cancellation)?
@@ -814,6 +821,33 @@ impl DepgraphService {
             findings,
         })
     }
+}
+
+fn compare_health_provenance(
+    before: &ScanRecord,
+    after: &ScanRecord,
+    comparability: &mut AuditComparability,
+) {
+    // Provenance is snapshot evidence, not a value that can be reconstructed
+    // from the current repository configuration.  A missing value on either
+    // side therefore fails closed just like a changed value.
+    comparability.policy_changed = !matches!(
+        (
+            before.health_policy_config_digest.as_deref(),
+            after.health_policy_config_digest.as_deref(),
+        ),
+        (Some(before), Some(after)) if before == after
+    );
+    comparability.contract_changed = !matches!(
+        (
+            before.health_analyzer_version.as_deref(),
+            after.health_analyzer_version.as_deref(),
+            before.health_finding_contract_version.as_deref(),
+            after.health_finding_contract_version.as_deref(),
+        ),
+        (Some(before_analyzer), Some(after_analyzer), Some(before_contract), Some(after_contract))
+            if before_analyzer == after_analyzer && before_contract == after_contract
+    );
 }
 
 fn evaluate_audit_boundary_ids(

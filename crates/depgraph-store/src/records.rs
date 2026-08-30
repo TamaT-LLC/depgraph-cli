@@ -19,6 +19,30 @@ pub struct ScanRecord {
     pub parent_snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
+    /// Canonical policy identity used by the health analyzers for this scan.
+    ///
+    /// These fields are bound while a scan is staging.  They deliberately
+    /// remain optional so stores created before schema 18 can be read and
+    /// compared fail-closed rather than pretending to have provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_policy_config_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_analyzer_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_finding_contract_version: Option<String>,
+}
+
+/// Provenance tuple attached immutably to one staging scan.
+///
+/// The store treats these values as opaque, bounded identities.  Production
+/// callers must supply the normalized `policy-config:sha256:<hex>` identity
+/// and the constants exported by `depgraph-core`; keeping validation at the
+/// store boundary prevents malformed rows from becoming trusted evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanHealthProvenance {
+    pub policy_config_digest: String,
+    pub analyzer_version: String,
+    pub finding_contract_version: String,
 }
 
 pub type ScanAttemptRecord = ScanRecord;

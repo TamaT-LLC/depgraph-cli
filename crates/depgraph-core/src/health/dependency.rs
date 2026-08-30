@@ -544,6 +544,9 @@ mod tests {
             error: None,
             parent_snapshot_id: None,
             source_revision: Some("b".repeat(40)),
+            health_policy_config_digest: None,
+            health_analyzer_version: None,
+            health_finding_contract_version: None,
         }
     }
 

@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     BuildGraphDelta, COMPLETED_SNAPSHOT_SEAL_VERSION, CompletedSnapshotRecord, GraphSnapshot,
+    LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION,
     ProfileMatrixRecord, ProfileRecord, ScanRecord, incremental, load_adapter_logs,
     load_diagnostics, load_edges, load_evidence, load_file_coverage, load_nodes, load_profiles,
     load_sites, merge_build_delta, observed_coverage, profile_matrix::refresh_profile_matrix,
@@ -70,9 +71,11 @@ referenced_runtime_sessions(id) AS (
 struct SnapshotSealHasher(Sha256);
 
 impl SnapshotSealHasher {
-    fn new(snapshot_id: &str) -> Self {
+    fn new(snapshot_id: &str, version: i64) -> Self {
         let mut hasher = Self(Sha256::new());
-        hasher.write_bytes(b"depgraph-completed-snapshot-storage-seal-v1");
+        hasher.write_bytes(
+            format!("depgraph-completed-snapshot-storage-seal-v{version}").as_bytes(),
+        );
         hasher.write_bytes(snapshot_id.as_bytes());
         hasher
     }
@@ -134,8 +137,41 @@ impl SnapshotSealHasher {
     }
 }
 
-fn completed_snapshot_storage_seal(connection: &Connection, snapshot_id: &str) -> Result<String> {
-    let mut hasher = SnapshotSealHasher::new(snapshot_id);
+fn completed_snapshot_storage_seal_with_version(
+    connection: &Connection,
+    snapshot_id: &str,
+    version: i64,
+    include_health_provenance: bool,
+) -> Result<String> {
+    let mut hasher = SnapshotSealHasher::new(snapshot_id, version);
+    let scan_suffix = if include_health_provenance {
+        "
+SELECT scan.id, scan.root, scan.status, scan.strict, scan.started_at,
+       scan.completed_at, scan.project_code_executed, scan.protocol_version,
+       scan.error, scan.parent_snapshot_id, scan.source_revision,
+       scan.mutation_count, scan.health_policy_config_digest,
+       scan.health_analyzer_version, scan.health_finding_contract_version
+  FROM scans AS scan
+ WHERE scan.id IN (
+       SELECT snapshot.scan_id
+         FROM completed_snapshots AS snapshot
+         JOIN snapshot_closure AS closure ON closure.id=snapshot.id
+ )
+ ORDER BY scan.id COLLATE BINARY"
+    } else {
+        "
+SELECT scan.id, scan.root, scan.status, scan.strict, scan.started_at,
+       scan.completed_at, scan.project_code_executed, scan.protocol_version,
+       scan.error, scan.parent_snapshot_id, scan.source_revision,
+       scan.mutation_count
+  FROM scans AS scan
+ WHERE scan.id IN (
+       SELECT snapshot.scan_id
+         FROM completed_snapshots AS snapshot
+         JOIN snapshot_closure AS closure ON closure.id=snapshot.id
+ )
+ ORDER BY scan.id COLLATE BINARY"
+    };
     for (domain, suffix) in [
         (
             "completed_snapshots",
@@ -149,21 +185,7 @@ SELECT snapshot.id, snapshot.source_kind, snapshot.source_attempt_id,
   JOIN snapshot_closure AS closure ON closure.id=snapshot.id
  ORDER BY snapshot.id COLLATE BINARY",
         ),
-        (
-            "scans",
-            "
-SELECT scan.id, scan.root, scan.status, scan.strict, scan.started_at,
-       scan.completed_at, scan.project_code_executed, scan.protocol_version,
-       scan.error, scan.parent_snapshot_id, scan.source_revision,
-       scan.mutation_count
-  FROM scans AS scan
- WHERE scan.id IN (
-       SELECT snapshot.scan_id
-         FROM completed_snapshots AS snapshot
-         JOIN snapshot_closure AS closure ON closure.id=snapshot.id
- )
- ORDER BY scan.id COLLATE BINARY",
-        ),
+        ("scans", scan_suffix),
         (
             "profiles",
             "
@@ -410,6 +432,43 @@ SELECT diagnostic.session_id, diagnostic.ordinal, diagnostic.id,
     Ok(hasher.finish())
 }
 
+fn completed_snapshot_storage_seal(connection: &Connection, snapshot_id: &str) -> Result<String> {
+    completed_snapshot_storage_seal_with_version(
+        connection,
+        snapshot_id,
+        COMPLETED_SNAPSHOT_SEAL_VERSION,
+        true,
+    )
+}
+
+pub(crate) fn verify_completed_snapshot_seal_v1(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<()> {
+    let expected = connection
+        .query_row(
+            "SELECT seal_sha256 FROM completed_snapshot_seals
+              WHERE snapshot_id=?1 AND seal_version=?2",
+            params![snapshot_id, LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .with_context(|| format!("completed snapshot {snapshot_id} has no v1 storage seal"))?;
+    let Some(expected) = expected else {
+        bail!("completed snapshot {snapshot_id} has no v1 storage seal");
+    };
+    let observed = completed_snapshot_storage_seal_with_version(
+        connection,
+        snapshot_id,
+        LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION,
+        false,
+    )?;
+    if observed != expected {
+        bail!("completed snapshot {snapshot_id} legacy storage seal mismatch");
+    }
+    Ok(())
+}
+
 fn validate_completed_snapshot_for_seal(connection: &Connection, snapshot_id: &str) -> Result<()> {
     let record = load_completed_snapshot_record(connection, snapshot_id)?
         .with_context(|| format!("completed snapshot {snapshot_id} was not found"))?;
@@ -491,7 +550,11 @@ fn completed_snapshot_seal_table_exists(connection: &Connection) -> Result<bool>
         .is_some())
 }
 
-pub(crate) fn backfill_completed_snapshot_seals(connection: &Connection) -> Result<()> {
+fn backfill_completed_snapshot_seals_with_version(
+    connection: &Connection,
+    version: i64,
+    include_health_provenance: bool,
+) -> Result<()> {
     // A few early development migration fixtures contain only the key column
     // needed by the cache migration under test. They are not readable graph
     // stores, so there is no canonical snapshot payload to validate or seal.
@@ -506,10 +569,38 @@ pub(crate) fn backfill_completed_snapshot_seals(connection: &Connection) -> Resu
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for snapshot_id in snapshot_ids {
-        persist_completed_snapshot_seal(connection, &snapshot_id)
-            .with_context(|| format!("failed to backfill storage seal for {snapshot_id}"))?;
+        validate_completed_snapshot_for_seal(connection, &snapshot_id)
+            .with_context(|| format!("failed to validate snapshot for storage seal {snapshot_id}"))?;
+        let observed = completed_snapshot_storage_seal_with_version(
+            connection,
+            &snapshot_id,
+            version,
+            include_health_provenance,
+        )?;
+        connection.execute(
+            "INSERT INTO completed_snapshot_seals(snapshot_id, seal_version, seal_sha256)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(snapshot_id) DO NOTHING",
+            params![snapshot_id, version, observed],
+        )?;
     }
     Ok(())
+}
+
+pub(crate) fn backfill_completed_snapshot_seals(connection: &Connection) -> Result<()> {
+    backfill_completed_snapshot_seals_with_version(
+        connection,
+        COMPLETED_SNAPSHOT_SEAL_VERSION,
+        true,
+    )
+}
+
+pub(crate) fn backfill_completed_snapshot_seals_v1(connection: &Connection) -> Result<()> {
+    backfill_completed_snapshot_seals_with_version(
+        connection,
+        LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION,
+        false,
+    )
 }
 
 pub(crate) fn load_completed_snapshot_record(
@@ -565,11 +656,23 @@ pub(crate) fn load_base_snapshot_from_connection(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<GraphSnapshot> {
+    let health_columns_available = table_has_column(connection, "scans", "health_policy_config_digest")?;
+    let health_projection = if health_columns_available {
+        "health_policy_config_digest, health_analyzer_version,
+                    health_finding_contract_version"
+    } else {
+        "NULL AS health_policy_config_digest, NULL AS health_analyzer_version,
+                    NULL AS health_finding_contract_version"
+    };
+    let scan_query = format!(
+        "SELECT id, root, status, strict, started_at, completed_at,
+                    project_code_executed, error, parent_snapshot_id, source_revision,
+                    {health_projection}
+               FROM scans WHERE id=?1"
+    );
     let scan = connection
         .query_row(
-            "SELECT id, root, status, strict, started_at, completed_at,
-                    project_code_executed, error, parent_snapshot_id, source_revision
-               FROM scans WHERE id=?1",
+            &scan_query,
             [scan_id],
             |row| {
                 Ok(ScanRecord {
@@ -583,6 +686,9 @@ pub(crate) fn load_base_snapshot_from_connection(
                     error: row.get(7)?,
                     parent_snapshot_id: row.get(8)?,
                     source_revision: row.get(9)?,
+                    health_policy_config_digest: row.get(10)?,
+                    health_analyzer_version: row.get(11)?,
+                    health_finding_contract_version: row.get(12)?,
                 })
             },
         )

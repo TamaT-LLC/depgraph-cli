@@ -61,15 +61,18 @@ pub use runtime::{
 };
 use schema::{table_exists, table_has_column};
 use snapshot::{
-    SnapshotSource, backfill_completed_snapshot_seals, backfill_completed_snapshots,
+    SnapshotSource, backfill_completed_snapshot_seals, backfill_completed_snapshot_seals_v1,
+    backfill_completed_snapshots,
     completed_snapshot_identity, create_completed_snapshot, load_base_snapshot_from_connection,
     load_completed_snapshot_from_connection, load_completed_snapshot_profiles_from_connection,
     load_completed_snapshot_record, persist_completed_snapshot_seal, promote_completed_snapshot,
     promote_completed_snapshot_if_current_parent, verify_completed_snapshot_seal,
+    verify_completed_snapshot_seal_v1,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 17;
-const COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 1;
+pub const STORE_SCHEMA_VERSION: i64 = 18;
+const LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 1;
+const COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 2;
 const MAX_PENDING_CANCELLED_SCAN_OPERATIONS: usize = 64;
 // This namespace is not a real operation ID and is rejected by attach/release APIs.
 const LEGACY_RUNTIME_IMPORT_OWNER_PREFIX: &str =
@@ -1155,6 +1158,72 @@ ORDER BY id COLLATE BINARY
             source_revision,
             Some(identity),
         )
+    }
+
+    /// Bind the health analyzer provenance to a staging scan exactly once.
+    ///
+    /// A repeated bind with the identical tuple is an idempotent success so a
+    /// caller can safely retry after a transient boundary failure.  Any
+    /// different tuple, partial tuple, or non-staging scan is rejected.  The
+    /// values are persisted in the scan row and are included in completed
+    /// snapshot storage seals; they are never inferred from the current
+    /// repository configuration or graph protocol version.
+    pub fn bind_scan_health_provenance(
+        &mut self,
+        scan_id: &str,
+        provenance: &ScanHealthProvenance,
+    ) -> Result<()> {
+        validate_scan_health_provenance(provenance)?;
+        let tx = self.connection.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT status, health_policy_config_digest,
+                        health_analyzer_version, health_finding_contract_version
+                   FROM scans WHERE id=?1",
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .with_context(|| format!("scan {scan_id} was not found"))?;
+        if existing.0 != "staging" {
+            bail!("health provenance can only be bound while scan {scan_id} is staging");
+        }
+        let current = (
+            existing.1.as_deref(),
+            existing.2.as_deref(),
+            existing.3.as_deref(),
+        );
+        let requested = (
+            provenance.policy_config_digest.as_str(),
+            provenance.analyzer_version.as_str(),
+            provenance.finding_contract_version.as_str(),
+        );
+        match current {
+            (None, None, None) => {
+                tx.execute(
+                    "UPDATE scans
+                        SET health_policy_config_digest=?2,
+                            health_analyzer_version=?3,
+                            health_finding_contract_version=?4
+                      WHERE id=?1 AND status='staging'
+                        AND health_policy_config_digest IS NULL
+                        AND health_analyzer_version IS NULL
+                        AND health_finding_contract_version IS NULL",
+                    params![scan_id, requested.0, requested.1, requested.2],
+                )?;
+            }
+            (Some(policy), Some(analyzer), Some(contract)) if (policy, analyzer, contract) == requested => {}
+            _ => bail!("health provenance for scan {scan_id} is already bound to a different tuple"),
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn start_scan_with_revision_and_operation(
@@ -2300,7 +2369,9 @@ ORDER BY id COLLATE BINARY
         self.connection
             .query_row(
                 "SELECT id, root, status, strict, started_at, completed_at,
-                        project_code_executed, error, parent_snapshot_id, source_revision
+                        project_code_executed, error, parent_snapshot_id, source_revision,
+                        health_policy_config_digest, health_analyzer_version,
+                        health_finding_contract_version
                  FROM scans WHERE id = ?1",
                 [scan_id],
                 |row| {
@@ -2315,6 +2386,9 @@ ORDER BY id COLLATE BINARY
                         error: row.get(7)?,
                         parent_snapshot_id: row.get(8)?,
                         source_revision: row.get(9)?,
+                        health_policy_config_digest: row.get(10)?,
+                        health_analyzer_version: row.get(11)?,
+                        health_finding_contract_version: row.get(12)?,
                     })
                 },
             )
@@ -2918,6 +2992,32 @@ fn validate_scan_operation_recovery_binding(
         || binding.root != repository_root
     {
         bail!("scan completion recovery does not match durable operation staging");
+    }
+    Ok(())
+}
+
+fn validate_scan_health_provenance(provenance: &ScanHealthProvenance) -> Result<()> {
+    let policy = provenance.policy_config_digest.as_str();
+    let valid_policy = policy.len() == "policy-config:sha256:".len() + 64
+        && policy.starts_with("policy-config:sha256:")
+        && policy["policy-config:sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !valid_policy {
+        bail!(
+            "health policy config digest must be policy-config:sha256:<64 lowercase hex>"
+        );
+    }
+    for (name, value) in [
+        ("health analyzer version", provenance.analyzer_version.as_str()),
+        (
+            "health finding contract version",
+            provenance.finding_contract_version.as_str(),
+        ),
+    ] {
+        if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            bail!("{name} is empty, oversized, or contains a control character");
+        }
     }
     Ok(())
 }
