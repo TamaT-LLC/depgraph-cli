@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use depgraph_core::service::{
     MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_EVIDENCE_PER_FINDING,
     MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
@@ -6,7 +8,7 @@ use depgraph_core::{
     BlockerKind, Confidence, FindingKind, FindingKindScope, HealthFinding, HealthFindingDetail,
     HotspotFindingScores, HotspotLayerScore, Severity,
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
@@ -198,15 +200,53 @@ pub struct AgentHealthSuppression {
 const MAX_HOTSPOT_BASIS_POINTS: u32 = 10_000;
 
 /// One machine-readable hotspot layer contribution.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHealthHotspotLayerScore {
     raw: u64,
-    #[schemars(range(max = 10000))]
     normalized_basis_points: u32,
-    #[schemars(range(max = 10000))]
     weight_basis_points: u32,
     available: bool,
+}
+
+impl JsonSchema for AgentHealthHotspotLayerScore {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentHealthHotspotLayerScore".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::AgentHealthHotspotLayerScore").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        // JSON Schema can express the unavailable-layer zero invariant exactly.
+        // The derived weighted-total invariant is documented on the enclosing
+        // score object and enforced by its authoritative Serde projection.
+        json_schema!({
+            "description": "One machine-readable hotspot layer contribution.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "raw": {"type": "integer", "format": "uint64", "minimum": 0},
+                "normalized_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000},
+                "weight_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000},
+                "available": {"type": "boolean"}
+            },
+            "required": ["raw", "normalized_basis_points", "weight_basis_points", "available"],
+            "allOf": [{
+                "if": {
+                    "properties": {"available": {"const": false}},
+                    "required": ["available"]
+                },
+                "then": {
+                    "properties": {
+                        "raw": {"const": 0},
+                        "normalized_basis_points": {"const": 0}
+                    }
+                }
+            }]
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -277,7 +317,7 @@ impl AgentHealthHotspotLayerScore {
 }
 
 /// Closed MCP projection of all five hotspot score layers.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHealthHotspotScores {
     fan_in: AgentHealthHotspotLayerScore,
@@ -285,8 +325,39 @@ pub struct AgentHealthHotspotScores {
     reverse_impact: AgentHealthHotspotLayerScore,
     git_churn: AgentHealthHotspotLayerScore,
     runtime: AgentHealthHotspotLayerScore,
-    #[schemars(range(max = 10000))]
     total: u32,
+}
+
+impl JsonSchema for AgentHealthHotspotScores {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentHealthHotspotScores".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::AgentHealthHotspotScores").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "Closed MCP projection of all five hotspot score layers.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "fan_in": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
+                "fan_out": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
+                "reverse_impact": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
+                "git_churn": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
+                "runtime": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
+                "total": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000}
+            },
+            "required": ["fan_in", "fan_out", "reverse_impact", "git_churn", "runtime", "total"],
+            // Draft 2020-12 has no arithmetic keyword for cross-property sums.
+            // Keep the exact rule machine-readable for schema consumers while
+            // AgentHealthHotspotScores' custom deserializer remains authoritative.
+            "x-depgraph-weight-sum-max": 10000,
+            "x-depgraph-derived-total": "sum(floor(normalized_basis_points * weight_basis_points / 10000))"
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -450,7 +521,7 @@ fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
         .min(MAX_HOTSPOT_BASIS_POINTS)
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHealthFinding {
     id: AgentId,
@@ -466,16 +537,86 @@ pub struct AgentHealthFinding {
     reason: AgentPolicyText,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hotspot_scores: Option<AgentHealthHotspotScores>,
-    #[schemars(length(max = 32))]
     blockers: Vec<AgentHealthBlocker>,
-    #[schemars(length(max = 64))]
     evidence: Vec<AgentHealthEvidenceRef>,
-    #[schemars(length(max = 8))]
     remediations: Vec<AgentHealthRemediation>,
-    #[schemars(length(max = 8))]
     suppressions: Vec<AgentHealthSuppression>,
     analyzer_version: AgentLabel,
     fingerprint: AgentId,
+}
+
+impl JsonSchema for AgentHealthFinding {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentHealthFinding".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::AgentHealthFinding").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": generator.subschema_for::<AgentId>(),
+                "kind": generator.subschema_for::<AgentFindingKind>(),
+                "severity": generator.subschema_for::<AgentHealthSeverity>(),
+                "confidence": generator.subschema_for::<AgentHealthConfidence>(),
+                "subject_id": generator.subschema_for::<AgentLabel>(),
+                "subject_kind": generator.subschema_for::<AgentLabel>(),
+                "location": generator.subschema_for::<Option<AgentHealthSourceLocation>>(),
+                "profile_scope": generator.subschema_for::<Option<AgentId>>(),
+                "reason": generator.subschema_for::<AgentPolicyText>(),
+                "hotspot_scores": generator.subschema_for::<Option<AgentHealthHotspotScores>>(),
+                "blockers": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "items": generator.subschema_for::<AgentHealthBlocker>()
+                },
+                "evidence": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": generator.subschema_for::<AgentHealthEvidenceRef>()
+                },
+                "remediations": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": generator.subschema_for::<AgentHealthRemediation>()
+                },
+                "suppressions": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": generator.subschema_for::<AgentHealthSuppression>()
+                },
+                "analyzer_version": generator.subschema_for::<AgentLabel>(),
+                "fingerprint": generator.subschema_for::<AgentId>()
+            },
+            "required": [
+                "id", "kind", "severity", "confidence", "subject_id", "subject_kind",
+                "reason", "blockers", "evidence", "remediations", "suppressions",
+                "analyzer_version", "fingerprint"
+            ],
+            "allOf": [{
+                "if": {
+                    "properties": {"kind": {"const": "hotspot"}},
+                    "required": ["kind"]
+                },
+                "then": {
+                    "required": ["hotspot_scores"],
+                    "properties": {
+                        "confidence": {"enum": ["indeterminate", "probable"]},
+                        "hotspot_scores": generator.subschema_for::<AgentHealthHotspotScores>()
+                    }
+                },
+                "else": {
+                    "properties": {
+                        "hotspot_scores": {"type": "null"}
+                    }
+                }
+            }]
+        })
+    }
 }
 
 impl AgentHealthFinding {

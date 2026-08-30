@@ -155,14 +155,14 @@ pub enum HotspotAnalysisError {
     ResourceExhausted,
 }
 
-#[must_use]
+#[must_use = "hotspot analysis results must be handled"]
 pub fn score_hotspots(
     snapshot: &GraphSnapshot,
     weights: HotspotWeights,
     churn: &BTreeMap<String, u64>,
     runtime: &BTreeMap<String, u64>,
     availability: HotspotLayerAvailability,
-) -> Vec<HealthFinding> {
+) -> Result<Vec<HealthFinding>, HotspotAnalysisError> {
     score_hotspots_cancellable(
         snapshot,
         weights,
@@ -173,7 +173,6 @@ pub fn score_hotspots(
         usize::MAX,
         || false,
     )
-    .expect("unbounded, non-cancellable hotspot analysis cannot fail with valid weights")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,7 +561,8 @@ mod tests {
                 churn: false,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         assert!(findings.iter().all(|finding| {
             finding
                 .blockers
@@ -597,7 +597,8 @@ mod tests {
                 churn: false,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         let ids = tied
             .iter()
             .map(|finding| finding.subject_id.as_str())
@@ -614,7 +615,8 @@ mod tests {
                 churn: true,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         assert_eq!(ranked[0].subject_id, "file:b");
         let scores = ranked[0]
             .hotspot_scores
@@ -705,21 +707,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "valid weights")]
     fn issue_440_non_cancellable_hotspot_analyzer_rejects_invalid_weights() {
         let graph = snapshot(vec![node("file:a")], Vec::new());
-        let _ = score_hotspots(
-            &graph,
-            HotspotWeights {
-                fan_in: 10_001,
-                fan_out: 0,
-                reverse_impact: 0,
-                git_churn: 0,
-                runtime: 0,
-            },
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            HotspotLayerAvailability::default(),
+        assert_eq!(
+            score_hotspots(
+                &graph,
+                HotspotWeights {
+                    fan_in: 10_001,
+                    fan_out: 0,
+                    reverse_impact: 0,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
         );
     }
 

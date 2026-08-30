@@ -87,6 +87,83 @@ fn issue_440_shared_schema_publishes_closed_hotspot_score_shape() {
 }
 
 #[test]
+fn issue_440_schema_enforces_hotspot_semantics_and_layer_zero_invariant() {
+    let schema = schema_value();
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentHealthFinding",
+    });
+    let validator =
+        jsonschema::draft202012::new(&wrapper).expect("hotspot finding schema must compile");
+    let layer = |weight| {
+        json!({
+            "raw": 0,
+            "normalized_basis_points": 0,
+            "weight_basis_points": weight,
+            "available": true
+        })
+    };
+    let valid = json!({
+        "id": "finding:hotspot",
+        "kind": "hotspot",
+        "severity": "info",
+        "confidence": "probable",
+        "subject_id": "file:src/lib.rs",
+        "subject_kind": "file",
+        "reason": "hotspot ranking",
+        "hotspot_scores": {
+            "fan_in": layer(2500),
+            "fan_out": layer(1500),
+            "reverse_impact": layer(2500),
+            "git_churn": layer(2000),
+            "runtime": layer(1500),
+            "total": 0
+        },
+        "blockers": [],
+        "evidence": [],
+        "remediations": [],
+        "suppressions": [],
+        "analyzer_version": "1.0.2",
+        "fingerprint": "sha256:hotspot"
+    });
+    assert!(validator.is_valid(&valid));
+
+    let mut missing_scores = valid.clone();
+    missing_scores
+        .as_object_mut()
+        .expect("finding object")
+        .remove("hotspot_scores");
+    assert!(!validator.is_valid(&missing_scores));
+
+    let mut confirmed = valid.clone();
+    confirmed["confidence"] = json!("confirmed");
+    assert!(!validator.is_valid(&confirmed));
+
+    let mut non_hotspot = valid.clone();
+    non_hotspot["kind"] = json!("unused-file");
+    assert!(!validator.is_valid(&non_hotspot));
+
+    let mut unavailable_nonzero = valid.clone();
+    unavailable_nonzero["hotspot_scores"]["runtime"]["available"] = json!(false);
+    unavailable_nonzero["hotspot_scores"]["runtime"]["raw"] = json!(1);
+    assert!(!validator.is_valid(&unavailable_nonzero));
+
+    let mut unavailable_nonzero_normalized = valid;
+    unavailable_nonzero_normalized["hotspot_scores"]["runtime"]["available"] = json!(false);
+    unavailable_nonzero_normalized["hotspot_scores"]["runtime"]["normalized_basis_points"] =
+        json!(1);
+    assert!(!validator.is_valid(&unavailable_nonzero_normalized));
+
+    let scores = &schema["$defs"]["AgentHealthHotspotScores"];
+    assert_eq!(scores["x-depgraph-weight-sum-max"], 10_000);
+    assert_eq!(
+        scores["x-depgraph-derived-total"],
+        "sum(floor(normalized_basis_points * weight_basis_points / 10000))"
+    );
+}
+
+#[test]
 fn issue_314_shared_schema_publishes_repository_init_outcome_and_success_envelope() {
     let schema = schema_value();
     let definitions = schema["$defs"].as_object().expect("schema definitions");
