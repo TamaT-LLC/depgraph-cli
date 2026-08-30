@@ -181,8 +181,8 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-`main`は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に記載した`0.5.4`契約を実装している。
-正式版は、[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)と公開後証跡が一致するときに限り有効である。
+公開済みの`v0.5.4` artifactは[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に記載した`0.5.4`契約を実装している。
+`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。

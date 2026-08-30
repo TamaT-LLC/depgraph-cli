@@ -62,6 +62,25 @@ A finding is a closed record:
 | `analyzer_version` | independent analyzer field |
 | `fingerprint` | content digest; excluded from its own payload |
 
+#### Current output and legacy wire input
+
+The generated `depgraph-mcp-tools-v1` schema describes current output. A
+current hotspot finding must contain a non-null `hotspot_scores` object, while
+a non-hotspot finding must not contain a score object. The current projection
+(`AgentHealthFinding::try_from_core`) enforces those rules, and current CLI/MCP
+output never emits a missing or null score field.
+
+`AgentHealthFinding` deserialization intentionally has a wider read boundary for
+records produced before Issue #440: a legacy hotspot finding may omit
+`hotspot_scores` (or contain `null`) and remains readable as an input record.
+This is not a valid new output shape and is deliberately broader than the
+generated schema. Consumers validating new output must apply the schema and
+the current projection; `AgentHealthFinding` is the legacy-compatible input
+reader and accepts the wider boundary. Consumers loading legacy wire data must
+tolerate the missing score and must not infer that the hotspot has zero scores.
+The legacy-input exception is covered by the DTO regression test named
+`issue_440_health_finding_new_output_is_closed_but_legacy_wire_scores_are_optional`.
+
 `health_summary` aggregates snapshot-scoped kinds only. Audit and hotspot
 findings are returned only by `health_audit` / `health_hotspots`, already
 detail-expanded.

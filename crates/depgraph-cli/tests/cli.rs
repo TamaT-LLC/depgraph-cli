@@ -6876,3 +6876,13 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
     }
     assert!(hotspot["hotspot_scores"]["total"].is_u64());
 }
+
+#[test]
+fn issue_440_hotspot_invalid_weight_uses_invalid_input_exit_code() {
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args(["hotspots", "--weight-fan-in", "10001"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid service input"));
+}

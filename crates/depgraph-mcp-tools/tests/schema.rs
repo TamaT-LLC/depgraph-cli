@@ -136,6 +136,10 @@ fn issue_440_schema_enforces_hotspot_semantics_and_layer_zero_invariant() {
         .remove("hotspot_scores");
     assert!(!validator.is_valid(&missing_scores));
 
+    let mut null_scores = valid.clone();
+    null_scores["hotspot_scores"] = Value::Null;
+    assert!(!validator.is_valid(&null_scores));
+
     let mut confirmed = valid.clone();
     confirmed["confidence"] = json!("confirmed");
     assert!(!validator.is_valid(&confirmed));
@@ -143,6 +147,10 @@ fn issue_440_schema_enforces_hotspot_semantics_and_layer_zero_invariant() {
     let mut non_hotspot = valid.clone();
     non_hotspot["kind"] = json!("unused-file");
     assert!(!validator.is_valid(&non_hotspot));
+
+    let mut non_hotspot_null = non_hotspot.clone();
+    non_hotspot_null["hotspot_scores"] = Value::Null;
+    assert!(validator.is_valid(&non_hotspot_null));
 
     let mut unavailable_nonzero = valid.clone();
     unavailable_nonzero["hotspot_scores"]["runtime"]["available"] = json!(false);

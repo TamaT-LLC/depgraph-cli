@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_440_health_finding_projects_closed_hotspot_scores() {
+    fn issue_440_health_finding_new_output_is_closed_but_legacy_wire_scores_are_optional() {
         let mut finding = finding_with_suppressions(Vec::new());
         finding.kind = FindingKind::Hotspot;
         finding.hotspot_scores = Some(hotspot_scores());
@@ -1272,6 +1272,13 @@ mod tests {
         assert!(
             serde_json::from_value::<AgentHealthFinding>(legacy_wire).is_ok(),
             "pre-Issue #440 wire findings may omit the additive scores field"
+        );
+
+        let mut legacy_null = encoded.clone();
+        legacy_null["hotspot_scores"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<AgentHealthFinding>(legacy_null).is_ok(),
+            "pre-Issue #440 wire findings may carry a null additive scores field"
         );
 
         let mut invalid = encoded;

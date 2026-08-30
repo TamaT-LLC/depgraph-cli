@@ -78,7 +78,9 @@ Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable
 MCPを含む最初のv0.5 stableは`v0.5.0`である。
 `stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。
 `v0.5.0`はsigned tag、remote `main`、初期`release/0.5`、source tree、exact eight-job Full CI、固定Agent dogfood reportが一致する場合だけ公開した。
-現行mainは、この互換性境界を変えずに4つのAgent hostへproject／user scopeのMCPセットアップを追加した`v0.5.4`である。
+公開済みの`v0.5.4` artifactは、この互換性境界を変えずに4つのAgent hostへ
+project／user scopeのMCPセットアップを追加した。tag後の現行`main`は別の未公開
+開発線であり、このartifactの契約を自動的に更新しない。
 `v0.5.4`はsigned tag、remote `main`、fast-forward済み`release/0.5`、source tree、exact eight-job Full CIが一致する場合だけ許可し、選択したbaselineをruntime evidenceへ記録する。
 compatibility、tag、migration、maintenance contractは[ADR](adr-v0.5-release-contract.md)、[v0.5.0 release contract](../releases/v0.5.0.md)、[v0.5.4 release note](../releases/v0.5.4.md)をcanonicalとする。
 
