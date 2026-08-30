@@ -626,9 +626,12 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 			ID: s.scopedID("module", group.Module.Path, group.ImportPath), Kind: "module",
 			Locator: "go-package:" + group.ImportPath, DisplayName: group.ImportPath,
 			Properties: map[string]any{
-				"language": "go", "module_path": group.Module.Path, "package_name": group.BaseName,
+				"language": "go", "module_path": group.Module.Path, "package_path": group.ImportPath, "package_name": group.BaseName,
 				"relative_dir": relativePath(s.root, dir), "vendor": isVendorDirectory(s.root, dir),
 			},
+		}
+		if group.Module.ManifestPath != "" {
+			packageNode.Properties["manifest_path"] = relativePath(s.root, group.Module.ManifestPath)
 		}
 		if err := addNode(s.nodes, packageNode); err != nil {
 			return nil, err
@@ -661,6 +664,9 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 					"generated": source.Generated, "test": source.IsTest, "build_constraint": source.ConditionText,
 					"content_hash": contentHash(source.Source),
 				},
+			}
+			if group.Module.ManifestPath != "" {
+				fileNode.Properties["manifest_path"] = relativePath(s.root, group.Module.ManifestPath)
 			}
 			if err := addNode(s.nodes, fileNode); err != nil {
 				return nil, err
@@ -751,6 +757,9 @@ func (s *scannerState) addAssemblyBoundaries(
 				"assembly": true, "generated": false, "build_constraint": conditionText,
 				"content_hash": contentHash(sourceBytes),
 			},
+		}
+		if module.ManifestPath != "" {
+			fileNode.Properties["manifest_path"] = relativePath(s.root, module.ManifestPath)
 		}
 		if err := addNode(s.nodes, fileNode); err != nil {
 			return discovered, err

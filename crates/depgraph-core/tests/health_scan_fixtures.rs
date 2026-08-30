@@ -8,8 +8,10 @@ use std::fs;
 
 use anyhow::Result;
 use depgraph_core::health::{FindingKind, analyze_unused};
+use depgraph_protocol::validate_safe_semantic_ndjson;
 use depgraph_store::{GraphSnapshot, Store};
 use serde_json::{Value, json};
+use std::io::Cursor;
 
 const RUST_FIXTURE: &str = include_str!("fixtures/health/issue437-rust.ndjson");
 const GO_FIXTURE: &str = include_str!("fixtures/health/issue437-go.ndjson");
@@ -20,6 +22,12 @@ fn load_protocol_fixture(
     scan_id: &str,
     fixture: &str,
 ) -> Result<GraphSnapshot> {
+    // Keep these compact worker extracts on the same strict path as production
+    // worker output. Store ingestion intentionally accepts already validated
+    // event values, so validating here catches stale IDs, site/edge mismatches,
+    // and coverage ledger drift before the health analyzer sees the snapshot.
+    validate_safe_semantic_ndjson(Cursor::new(fixture.as_bytes()))?;
+
     let root = temporary.path().join(scan_id);
     fs::create_dir_all(&root)?;
     let store_path = temporary.path().join(format!("{scan_id}.sqlite"));
@@ -104,7 +112,7 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
         assert_eq!(
             findings.len(),
             3,
-            "fixture should contain only the three intended findings"
+            "fixture should contain only the three intended findings: {findings:?}"
         );
     }
     Ok(())

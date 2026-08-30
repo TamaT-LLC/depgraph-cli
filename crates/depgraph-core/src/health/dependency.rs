@@ -90,7 +90,14 @@ pub fn analyze_dependencies_cancellable(
         budget.step(&mut is_cancelled)?;
         manifests_by_path.insert(manifest.path.as_str(), manifest);
     }
-    let usage_targets = package_usage_targets(snapshot, &nodes, &mut budget, &mut is_cancelled)?;
+    let manifest_scopes = manifest_scope_index(snapshot, &nodes, &mut budget, &mut is_cancelled)?;
+    let usage_targets = package_usage_targets(
+        snapshot,
+        &nodes,
+        &manifest_scopes,
+        &mut budget,
+        &mut is_cancelled,
+    )?;
     let mut graph_names_by_manifest = BTreeMap::<String, BTreeSet<String>>::new();
     for site in &snapshot.sites {
         budget.step(&mut is_cancelled)?;
@@ -110,44 +117,59 @@ pub fn analyze_dependencies_cancellable(
             .insert(specifier.to_owned());
         let matching_manifest = manifests_by_path.get(manifest_path.as_str()).copied();
         let drift = matching_manifest.is_none_or(|manifest| manifest.drifted);
+        // A module requirement is only comparable to usage owners inside the
+        // same repository-relative manifest scope. Keep the distinction
+        // between a non-module site (which is intentionally unscoped) and a
+        // module site whose manifest path is malformed: the latter must not
+        // fall back to mixing owners from every manifest.
+        let usage_scope =
+            (site.kind == "module_requirement").then(|| canonical_manifest_scope(&manifest_path));
+        let usage_scope_path = usage_scope.as_ref().and_then(|scope| scope.as_deref());
+        let scope_enforced = usage_scope.is_some();
+        let usage_paths = if site.kind == "module_requirement" {
+            go_requirement_usage_paths(site, &nodes, &mut budget, &mut is_cancelled)?
+        } else {
+            vec![specifier.to_owned()]
+        };
         let mut used_from_production = false;
         let mut used_from_test = false;
-        if let Some(owners) = usage_targets.get(specifier) {
-            for owner in owners {
-                budget.step(&mut is_cancelled)?;
-                if owner.is_test {
-                    used_from_test = true;
-                } else {
-                    used_from_production = true;
-                }
-                if used_from_production && used_from_test {
-                    break;
-                }
+        for usage_path in usage_paths {
+            if let Some(owners) = usage_targets.get(&usage_path) {
+                collect_usage_owners(
+                    owners,
+                    usage_scope_path,
+                    scope_enforced,
+                    &mut used_from_production,
+                    &mut used_from_test,
+                    &mut budget,
+                    &mut is_cancelled,
+                )?;
             }
-        }
-        if site.kind == "module_requirement" && !(used_from_production && used_from_test) {
-            // Go manifests declare a module path while source imports may point
-            // at any package below that module. The helper starts at the
-            // slash-delimited prefix so this remains O(log n + matching
-            // packages), and stops at the first key outside the prefix. The
-            // slash boundary avoids treating a similarly named module (for
-            // example foo/barista) as a use of foo/bar.
-            for (_, owners) in go_module_usage_targets(&usage_targets, specifier) {
-                budget.step(&mut is_cancelled)?;
-                for owner in owners {
+            if site.kind == "module_requirement" && !(used_from_production && used_from_test) {
+                // Go manifests declare a module path while source imports may
+                // point at any package below that module. The helper starts at
+                // the slash-delimited prefix so this remains O(log n +
+                // matching packages), and stops at the first key outside the
+                // prefix. The slash boundary avoids treating a similarly named
+                // module (for example foo/barista) as a use of foo/bar.
+                for (_, owners) in go_module_usage_targets(&usage_targets, &usage_path) {
                     budget.step(&mut is_cancelled)?;
-                    if owner.is_test {
-                        used_from_test = true;
-                    } else {
-                        used_from_production = true;
-                    }
+                    collect_usage_owners(
+                        owners,
+                        usage_scope_path,
+                        scope_enforced,
+                        &mut used_from_production,
+                        &mut used_from_test,
+                        &mut budget,
+                        &mut is_cancelled,
+                    )?;
                     if used_from_production && used_from_test {
                         break;
                     }
                 }
-                if used_from_production && used_from_test {
-                    break;
-                }
+            }
+            if used_from_production && used_from_test {
+                break;
             }
         }
         let production_declared = is_production_declaration(site);
@@ -344,11 +366,150 @@ fn consolidate_findings(
 
 struct UsageOwner {
     is_test: bool,
+    manifest_path: Option<String>,
+}
+
+fn manifest_scope_index<'a>(
+    snapshot: &'a GraphSnapshot,
+    nodes: &BTreeMap<&'a str, &'a NodeRecord>,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<&'a str, Option<String>>, HealthAnalysisError> {
+    let mut parents = BTreeMap::<&'a str, Vec<&'a str>>::new();
+    for edge in &snapshot.edges {
+        budget.step(is_cancelled)?;
+        // Usage edges can originate at a file, package, or semantic symbol.
+        // Worker semantic declarations retain the owning package through a
+        // `declares` chain, so include both structural parent relations when
+        // deriving a repository-relative manifest scope.
+        if !matches!(edge.kind.as_str(), "contains" | "declares")
+            || !nodes.contains_key(edge.source.as_str())
+            || !nodes.contains_key(edge.target.as_str())
+        {
+            continue;
+        }
+        parents
+            .entry(edge.target.as_str())
+            .or_default()
+            .push(edge.source.as_str());
+    }
+
+    let mut scopes = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    struct ManifestScopeFrame<'a> {
+        node_id: &'a str,
+        next_parent: usize,
+        parent_scopes: BTreeSet<String>,
+    }
+
+    // Resolve the containment/declaration forest with an explicit stack. A
+    // hostile graph can contain an arbitrarily deep semantic declaration chain;
+    // recursive DFS would overflow the Rust stack before the health work budget
+    // has a chance to stop it. Each frame keeps the same memoized, cycle-safe
+    // semantics as the former recursive walk while making depth heap-bounded.
+    for &root in nodes.keys() {
+        budget.step(is_cancelled)?;
+        if scopes.contains_key(root) {
+            continue;
+        }
+        let Some(node) = nodes.get(root).copied() else {
+            scopes.insert(root, None);
+            continue;
+        };
+        if let Some(scope) = node
+            .properties
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(canonical_manifest_scope)
+        {
+            scopes.insert(root, Some(scope));
+            continue;
+        }
+        if !visiting.insert(root) {
+            continue;
+        }
+
+        let mut stack = vec![ManifestScopeFrame {
+            node_id: root,
+            next_parent: 0,
+            parent_scopes: BTreeSet::new(),
+        }];
+        while !stack.is_empty() {
+            let frame_index = stack.len() - 1;
+            let next_parent = {
+                let frame = &mut stack[frame_index];
+                match parents.get(frame.node_id) {
+                    Some(parent_ids) if frame.next_parent < parent_ids.len() => {
+                        let parent_id = parent_ids[frame.next_parent];
+                        frame.next_parent += 1;
+                        Some(parent_id)
+                    }
+                    _ => None,
+                }
+            };
+
+            let Some(parent_id) = next_parent else {
+                let frame = stack.pop().expect("non-empty manifest scope stack");
+                visiting.remove(frame.node_id);
+                let scope = (frame.parent_scopes.len() == 1).then(|| {
+                    frame
+                        .parent_scopes
+                        .into_iter()
+                        .next()
+                        .expect("one parent scope")
+                });
+                scopes.insert(frame.node_id, scope.clone());
+                if let Some(scope) = scope
+                    && let Some(parent_frame) = stack.last_mut()
+                {
+                    parent_frame.parent_scopes.insert(scope);
+                }
+                continue;
+            };
+
+            // This is the iterative equivalent of entering a recursive child;
+            // charge it before consulting the memo table so cancellation and
+            // resource exhaustion remain observable at the same boundaries.
+            budget.step(is_cancelled)?;
+            if let Some(cached_scope) = scopes.get(parent_id) {
+                if let Some(scope) = cached_scope.as_ref() {
+                    stack[frame_index].parent_scopes.insert(scope.clone());
+                }
+                continue;
+            }
+            let Some(parent) = nodes.get(parent_id).copied() else {
+                scopes.insert(parent_id, None);
+                continue;
+            };
+            if let Some(scope) = parent
+                .properties
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .and_then(canonical_manifest_scope)
+            {
+                scopes.insert(parent_id, Some(scope.clone()));
+                stack[frame_index].parent_scopes.insert(scope);
+                continue;
+            }
+            if visiting.insert(parent_id) {
+                stack.push(ManifestScopeFrame {
+                    node_id: parent_id,
+                    next_parent: 0,
+                    parent_scopes: BTreeSet::new(),
+                });
+            }
+            // A parent already on the explicit stack is a cycle. As in the
+            // recursive implementation, it contributes no scope and is left
+            // uncached so another path may still provide an unambiguous scope.
+        }
+    }
+    Ok(scopes)
 }
 
 fn package_usage_targets(
     snapshot: &GraphSnapshot,
     nodes: &BTreeMap<&str, &NodeRecord>,
+    manifest_scopes: &BTreeMap<&str, Option<String>>,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BTreeMap<String, Vec<UsageOwner>>, HealthAnalysisError> {
@@ -372,9 +533,83 @@ fn package_usage_targets(
         };
         usage.entry(package).or_default().push(UsageOwner {
             is_test: is_test_node(source, edge),
+            manifest_path: manifest_scopes.get(edge.source.as_str()).cloned().flatten(),
         });
     }
     Ok(usage)
+}
+
+fn collect_usage_owners(
+    owners: &[UsageOwner],
+    manifest_scope: Option<&str>,
+    scope_enforced: bool,
+    used_from_production: &mut bool,
+    used_from_test: &mut bool,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), HealthAnalysisError> {
+    for owner in owners {
+        budget.step(is_cancelled)?;
+        if scope_enforced
+            && (manifest_scope.is_none() || owner.manifest_path.as_deref() != manifest_scope)
+        {
+            continue;
+        }
+        if owner.is_test {
+            *used_from_test = true;
+        } else {
+            *used_from_production = true;
+        }
+        if *used_from_production && *used_from_test {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn go_requirement_usage_paths(
+    site: &SiteRecord,
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>, HealthAnalysisError> {
+    let mut paths = BTreeSet::new();
+    if let Some(specifier) = site.specifier.as_deref() {
+        paths.insert(specifier.to_owned());
+    }
+    for target_id in &site.target_ids {
+        budget.step(is_cancelled)?;
+        let Some(target) = nodes.get(target_id.as_str()).copied() else {
+            continue;
+        };
+        for key in [
+            "package_path",
+            "import_path",
+            "module_path",
+            "requested_module_path",
+            "replace_path",
+        ] {
+            let Some(path) = target
+                .properties
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if is_go_module_path(path) {
+                paths.insert(path.to_owned());
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn is_go_module_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('.')
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains(':')
 }
 
 /// Return only package usage keys below a Go module path.
@@ -405,6 +640,11 @@ fn is_test_node(node: &NodeRecord, edge: &EdgeRecord) -> bool {
         || path.contains(".test.")
         || path.contains(".spec.")
         || edge.environment == "test"
+        || node
+            .properties
+            .get("test")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
         || node
             .properties
             .get("target_kind")
@@ -468,6 +708,21 @@ fn manifest_path_for(node: &NodeRecord, site_kind: &str) -> String {
         "module_requirement" => "go.mod".to_owned(),
         _ => "package.json".to_owned(),
     }
+}
+
+fn canonical_manifest_scope(path: &str) -> Option<String> {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains(':')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -748,6 +1003,28 @@ mod tests {
         }
     }
 
+    fn ecosystem_file_with_manifest(
+        id: &str,
+        path: &str,
+        language: &str,
+        manifest: &str,
+    ) -> NodeRecord {
+        let mut node = ecosystem_file(id, path, language);
+        node.properties["manifest_path"] = json!(manifest);
+        node
+    }
+
+    fn ecosystem_test_file_with_manifest(
+        id: &str,
+        path: &str,
+        language: &str,
+        manifest: &str,
+    ) -> NodeRecord {
+        let mut node = ecosystem_file_with_manifest(id, path, language, manifest);
+        node.properties["test"] = json!(true);
+        node
+    }
+
     fn ecosystem_site(
         id: &str,
         source: &str,
@@ -932,6 +1209,80 @@ mod tests {
     }
 
     #[test]
+    fn issue_437_manifest_scope_index_is_stack_safe_for_deep_graphs() {
+        let depth = 20_000;
+        let mut nodes = Vec::with_capacity(depth);
+        for index in 0..depth {
+            // Reverse the IDs so the first BTreeMap root is the leaf. That
+            // forces one traversal to materialize the complete hostile depth
+            // instead of letting ascending roots populate one cached level at
+            // a time.
+            let id = depth - index - 1;
+            let mut node = file(&format!("file:{id:05}"), &format!("src/{id:05}.rs"));
+            if index == 0 {
+                node.properties["manifest_path"] = json!("Cargo.toml");
+            }
+            nodes.push(node);
+        }
+        nodes.push(ecosystem_package(
+            "pkg:app",
+            "example.com/app",
+            "Cargo.toml",
+            "go",
+        ));
+        nodes.push(NodeRecord {
+            id: "pkg:deep".to_owned(),
+            kind: "module".to_owned(),
+            locator: "go-package:example.net/deep/pkg".to_owned(),
+            display_name: "example.net/deep/pkg".to_owned(),
+            properties: json!({
+                "language": "go",
+                "module_path": "example.net/deep",
+                "package_path": "example.net/deep/pkg",
+                "package_name": "pkg"
+            }),
+        });
+        let mut edges = Vec::with_capacity(depth - 1);
+        for index in 0..(depth - 1) {
+            edges.push(EdgeRecord {
+                id: format!("edge:contains:{index}"),
+                site_id: None,
+                source: format!("file:{:05}", depth - index - 1),
+                target: format!("file:{:05}", depth - index - 2),
+                kind: if index == 0 { "contains" } else { "declares" }.to_owned(),
+                phase: "source".to_owned(),
+                environment: "host".to_owned(),
+                profile_id: "rust:lib".to_owned(),
+                resolution_status: "resolved".to_owned(),
+                precision: "exact".to_owned(),
+                condition: json!({}),
+                generated: false,
+            });
+        }
+        edges.push(usage_edge("file:00000", "pkg:deep"));
+        let mut snapshot = graph(nodes, Vec::new(), edges);
+        snapshot.sites.push(SiteRecord {
+            id: "site:deep-module".to_owned(),
+            source: "pkg:app".to_owned(),
+            kind: "module_requirement".to_owned(),
+            specifier: Some("example.net/deep".to_owned()),
+            profile_id: "rust:lib".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition: json!({}),
+            target_ids: vec!["pkg:deep".to_owned()],
+            reason: None,
+        });
+        let manifests = [ManifestIdentity {
+            path: "Cargo.toml".to_owned(),
+            digest: "sha256:deep-chain".to_owned(),
+            declared: BTreeSet::from(["example.net/deep".to_owned()]),
+            drifted: false,
+        }];
+        assert!(analyze_dependencies(&snapshot, &manifests).is_empty());
+    }
+
+    #[test]
     fn issue_423_duplicate_dependency_sites_merge_into_one_stable_finding() {
         let snapshot = graph(
             vec![
@@ -974,8 +1325,13 @@ mod tests {
                 ecosystem_package("go:unused", "example.com/unused", manifest, "go"),
                 ecosystem_package("go:test-only", "example.com/test-only", manifest, "go"),
                 ecosystem_package("go:mismatch", "example.com/mismatch", manifest, "go"),
-                ecosystem_file("go:test", "app/internal/consumer_test.go", "go"),
-                ecosystem_file("go:main", "app/cmd/main.go", "go"),
+                ecosystem_test_file_with_manifest(
+                    "go:test",
+                    "app/internal/consumer_test.go",
+                    "go",
+                    manifest,
+                ),
+                ecosystem_file_with_manifest("go:main", "app/cmd/main.go", "go", manifest),
             ],
             vec![
                 ecosystem_site(
@@ -1058,22 +1414,36 @@ mod tests {
                     properties: json!({
                         "language": "go",
                         "module_path": "example.net/external",
+                        "package_path": "example.net/external/pkg",
                         "package_name": "pkg",
                         "relative_dir": "pkg"
                     }),
                 },
                 NodeRecord {
-                    id: "go:similar-package".to_owned(),
+                    id: "go:similar-requirement".to_owned(),
                     kind: "external_system".to_owned(),
-                    locator: "gomod:example.net/external/pkg".to_owned(),
-                    display_name: "example.net/external/pkg".to_owned(),
+                    locator: "gomod:example.net/extern".to_owned(),
+                    display_name: "example.net/extern".to_owned(),
                     properties: json!({
                         "ecosystem": "go",
                         "external": true,
-                        "import_path": "example.net/external/pkg"
+                        "module_path": "example.net/extern"
                     }),
                 },
-                ecosystem_file("go:main", "app/main.go", "go"),
+                NodeRecord {
+                    id: "go:externalized-package".to_owned(),
+                    kind: "module".to_owned(),
+                    locator: "go-package:example.net/externalized/pkg".to_owned(),
+                    display_name: "example.net/externalized/pkg".to_owned(),
+                    properties: json!({
+                        "language": "go",
+                        "module_path": "example.net/externalized",
+                        "package_path": "example.net/externalized/pkg",
+                        "package_name": "pkg",
+                        "relative_dir": "pkg"
+                    }),
+                },
+                ecosystem_file_with_manifest("go:main", "app/main.go", "go", manifest),
             ],
             vec![
                 ecosystem_site(
@@ -1091,16 +1461,24 @@ mod tests {
                     "module_requirement",
                     profile_id,
                     "example.net/extern",
-                    "go:similar-package",
+                    "go:similar-requirement",
                     json!({}),
                 ),
             ],
-            vec![ecosystem_usage_edge(
-                "edge:go-module-import",
-                "go:main",
-                "go:external-package",
-                profile_id,
-            )],
+            vec![
+                ecosystem_usage_edge(
+                    "edge:go-module-import",
+                    "go:main",
+                    "go:external-package",
+                    profile_id,
+                ),
+                ecosystem_usage_edge(
+                    "edge:go-similar-import",
+                    "go:main",
+                    "go:externalized-package",
+                    profile_id,
+                ),
+            ],
         );
         let findings = analyze_dependencies(
             &snapshot,
@@ -1121,6 +1499,199 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.kind == FindingKind::UnusedDependency
                 && finding.reason.contains("example.net/extern")
+        }));
+    }
+
+    #[test]
+    fn issue_437_go_requirement_matches_replacement_target_path() {
+        let profile_id = "profile:go-replacement";
+        let manifest = "app/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest, "go"),
+                NodeRecord {
+                    id: "go:replacement-requirement".to_owned(),
+                    kind: "external_system".to_owned(),
+                    locator: "gomod:example.com/original".to_owned(),
+                    display_name: "example.net/replacement".to_owned(),
+                    properties: json!({
+                        "ecosystem": "go",
+                        "external": true,
+                        "module_path": "example.net/replacement",
+                        "requested_module_path": "example.com/original",
+                        "replace_path": "example.net/replacement"
+                    }),
+                },
+                NodeRecord {
+                    id: "go:replacement-package".to_owned(),
+                    kind: "module".to_owned(),
+                    locator: "go-package:example.net/replacement/pkg".to_owned(),
+                    display_name: "example.net/replacement/pkg".to_owned(),
+                    properties: json!({
+                        "language": "go",
+                        "module_path": "example.net/replacement",
+                        "package_path": "example.net/replacement/pkg",
+                        "package_name": "pkg"
+                    }),
+                },
+                ecosystem_file_with_manifest("go:main", "app/main.go", "go", manifest),
+            ],
+            vec![ecosystem_site(
+                "site:go-replacement",
+                "go:app",
+                "module_requirement",
+                profile_id,
+                "example.com/original",
+                "go:replacement-requirement",
+                json!({}),
+            )],
+            vec![ecosystem_usage_edge(
+                "edge:go-replacement-import",
+                "go:main",
+                "go:replacement-package",
+                profile_id,
+            )],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:go-replacement".to_owned(),
+                declared: BTreeSet::from(["example.com/original".to_owned()]),
+                drifted: false,
+            }],
+        );
+        assert!(!findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.com/original")
+        }));
+    }
+
+    #[test]
+    fn issue_437_go_dependency_usage_is_scoped_to_its_manifest() {
+        let profile_id = "profile:go-multi-module";
+        let manifest_a = "app-a/go.mod";
+        let manifest_b = "app-b/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app-a", "example.com/app-a", manifest_a, "go"),
+                ecosystem_package("go:app-b", "example.com/app-b", manifest_b, "go"),
+                NodeRecord {
+                    id: "go:shared-package".to_owned(),
+                    kind: "module".to_owned(),
+                    locator: "go-package:example.net/shared/pkg".to_owned(),
+                    display_name: "example.net/shared/pkg".to_owned(),
+                    properties: json!({
+                        "language": "go",
+                        "module_path": "example.net/shared",
+                        "package_path": "example.net/shared/pkg",
+                        "package_name": "pkg"
+                    }),
+                },
+                ecosystem_file_with_manifest("go:a-main", "app-a/main.go", "go", manifest_a),
+                ecosystem_file_with_manifest("go:b-main", "app-b/main.go", "go", manifest_b),
+            ],
+            vec![
+                ecosystem_site(
+                    "site:go-a-shared",
+                    "go:app-a",
+                    "module_requirement",
+                    profile_id,
+                    "example.net/shared",
+                    "go:shared-package",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-b-shared",
+                    "go:app-b",
+                    "module_requirement",
+                    profile_id,
+                    "example.net/shared",
+                    "go:shared-package",
+                    json!({}),
+                ),
+            ],
+            vec![ecosystem_usage_edge(
+                "edge:go-b-shared-import",
+                "go:b-main",
+                "go:shared-package",
+                profile_id,
+            )],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[
+                ManifestIdentity {
+                    path: manifest_a.to_owned(),
+                    digest: "sha256:go-a".to_owned(),
+                    declared: BTreeSet::from(["example.net/shared".to_owned()]),
+                    drifted: false,
+                },
+                ManifestIdentity {
+                    path: manifest_b.to_owned(),
+                    digest: "sha256:go-b".to_owned(),
+                    declared: BTreeSet::from(["example.net/shared".to_owned()]),
+                    drifted: false,
+                },
+            ],
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.owner_id == "site:go-a-shared")
+        }));
+        assert!(!findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.owner_id == "site:go-b-shared")
+        }));
+    }
+
+    #[test]
+    fn issue_437_invalid_manifest_scope_does_not_mix_go_usage() {
+        let profile_id = "profile:go-invalid-manifest";
+        let manifest = "/checkout/app/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest, "go"),
+                ecosystem_package("go:external", "example.net/external", manifest, "go"),
+                ecosystem_file_with_manifest("go:main", "app/main.go", "go", manifest),
+            ],
+            vec![ecosystem_site(
+                "site:go-external",
+                "go:app",
+                "module_requirement",
+                profile_id,
+                "example.net/external",
+                "go:external",
+                json!({}),
+            )],
+            vec![ecosystem_usage_edge(
+                "edge:go-external-import",
+                "go:main",
+                "go:external",
+                profile_id,
+            )],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:go-invalid-manifest".to_owned(),
+                declared: BTreeSet::from(["example.net/external".to_owned()]),
+                drifted: false,
+            }],
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.net/external")
         }));
     }
 
