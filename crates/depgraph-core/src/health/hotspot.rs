@@ -5,8 +5,8 @@ use serde_json::json;
 
 use super::contract::BASIS_POINTS_MAX;
 use super::{
-    BlockerKind, Confidence, FindingBlocker, FindingIdentity, FindingKind, HealthFinding,
-    Remediation, SourceLocation, finish_finding, rank_normalize_basis_points,
+    BlockerKind, FindingBlocker, FindingIdentity, FindingKind, HealthFinding, Remediation,
+    SourceLocation, finish_finding, rank_normalize_basis_points,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,16 +41,27 @@ impl HotspotWeights {
             git_churn,
             runtime,
         };
-        if [fan_in, fan_out, reverse_impact, git_churn, runtime]
-            .into_iter()
-            .any(|weight| weight > BASIS_POINTS_MAX)
+        weights.validate()?;
+        Ok(weights)
+    }
+
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        if [
+            self.fan_in,
+            self.fan_out,
+            self.reverse_impact,
+            self.git_churn,
+            self.runtime,
+        ]
+        .into_iter()
+        .any(|weight| weight > BASIS_POINTS_MAX)
         {
             return Err("hotspot weight exceeds 10000");
         }
-        if weights.sum() > BASIS_POINTS_MAX {
+        if self.sum() > BASIS_POINTS_MAX {
             return Err("hotspot weights sum exceeds 10000");
         }
-        Ok(weights)
+        Ok(())
     }
 
     #[must_use]
@@ -136,6 +147,8 @@ pub struct HotspotLayerAvailability {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HotspotAnalysisError {
+    #[error("hotspot weights are invalid")]
+    InvalidInput,
     #[error("hotspot analysis was cancelled")]
     Cancelled,
     #[error("hotspot analysis exhausted its bounded work budget")]
@@ -160,7 +173,7 @@ pub fn score_hotspots(
         usize::MAX,
         || false,
     )
-    .expect("unbounded, non-cancellable hotspot analysis cannot fail")
+    .expect("unbounded, non-cancellable hotspot analysis cannot fail with valid weights")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,6 +187,9 @@ pub fn score_hotspots_cancellable(
     maximum_work: usize,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HotspotAnalysisError> {
+    weights
+        .validate()
+        .map_err(|_| HotspotAnalysisError::InvalidInput)?;
     let mut work = HotspotWork::new(maximum_work);
     let mut subjects = Vec::new();
     for node in &snapshot.nodes {
@@ -365,13 +381,6 @@ pub fn score_hotspots_cancellable(
             false,
             false,
         );
-        // `confirmed` has a precise unused-code meaning in the health
-        // contract. Hotspots are rankings, not proof of unusedness, so they
-        // are always capped at `probable`; hard blockers would still degrade
-        // the finding to `indeterminate` through `finish_finding`.
-        if finding.confidence == Confidence::Confirmed {
-            finding.confidence = Confidence::Probable;
-        }
         finding.hotspot_scores = Some(hotspot_scores);
         finding.fingerprint = super::finding_fingerprint(&finding);
         findings.push(finding);
@@ -469,6 +478,8 @@ fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
 mod tests {
     use depgraph_store::{CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ScanRecord};
     use serde_json::json;
+
+    use crate::health::Confidence;
 
     use super::*;
 
@@ -621,6 +632,95 @@ mod tests {
         assert!(HotspotWeights::try_new(4_000, 4_000, 4_000, 0, 0).is_err());
         let maxed = rank_normalize_basis_points(&[0, 10_000]);
         assert_eq!(maxed, vec![0, 10_000]);
+    }
+
+    #[test]
+    fn issue_440_direct_hotspot_weights_are_revalidated() {
+        assert!(
+            (HotspotWeights {
+                fan_in: 10_001,
+                fan_out: 0,
+                reverse_impact: 0,
+                git_churn: 0,
+                runtime: 0,
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (HotspotWeights {
+                fan_in: 4_000,
+                fan_out: 4_000,
+                reverse_impact: 4_000,
+                git_churn: 0,
+                runtime: 0,
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(DEFAULT_HOTSPOT_WEIGHTS.validate().is_ok());
+    }
+
+    #[test]
+    fn issue_440_cancellable_hotspot_analyzer_rejects_invalid_weights() {
+        let graph = snapshot(vec![node("file:a")], Vec::new());
+        assert_eq!(
+            score_hotspots_cancellable(
+                &graph,
+                HotspotWeights {
+                    fan_in: 10_001,
+                    fan_out: 0,
+                    reverse_impact: 0,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+                usize::MAX,
+                usize::MAX,
+                || false,
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
+        );
+        assert_eq!(
+            score_hotspots_cancellable(
+                &graph,
+                HotspotWeights {
+                    fan_in: 4_000,
+                    fan_out: 4_000,
+                    reverse_impact: 4_000,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+                usize::MAX,
+                usize::MAX,
+                || false,
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "valid weights")]
+    fn issue_440_non_cancellable_hotspot_analyzer_rejects_invalid_weights() {
+        let graph = snapshot(vec![node("file:a")], Vec::new());
+        let _ = score_hotspots(
+            &graph,
+            HotspotWeights {
+                fan_in: 10_001,
+                fan_out: 0,
+                reverse_impact: 0,
+                git_churn: 0,
+                runtime: 0,
+            },
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+        );
     }
 
     #[test]

@@ -571,7 +571,16 @@ pub fn finish_finding(
     let profile_scope = identity.profile_scope.clone();
     let subject_id = identity.subject_id.clone();
     let id = finding_id(&identity);
-    let confidence = apply_confidence_guards(has_usage, profiles_complete, &blockers);
+    let confidence = match (
+        kind,
+        apply_confidence_guards(has_usage, profiles_complete, &blockers),
+    ) {
+        // A hotspot is a ranking, not proof of unusedness. Keep the
+        // `confirmed` confidence value reserved for unused-code findings even
+        // when a caller supplies complete profiles and no blockers.
+        (FindingKind::Hotspot, Confidence::Confirmed) => Confidence::Probable,
+        (_, confidence) => confidence,
+    };
     let mut finding = HealthFinding {
         id,
         kind,
@@ -814,6 +823,28 @@ mod tests {
             ),
             Confidence::Confirmed
         );
+    }
+
+    #[test]
+    fn issue_440_finish_finding_caps_hotspot_confidence_at_probable() {
+        let finding = finish_finding(
+            FindingIdentity {
+                kind: FindingKind::Hotspot,
+                subject_id: "file:src/hotspot.rs".to_owned(),
+                profile_scope: None,
+                witness_key: json!({"subject_id": "file:src/hotspot.rs"}),
+            },
+            "file",
+            None,
+            "hotspot ranking",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+        );
+        assert_eq!(finding.confidence, Confidence::Probable);
     }
 
     #[test]
