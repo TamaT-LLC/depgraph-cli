@@ -272,7 +272,11 @@ pub fn analyze_changed_code_with_boundary_ids_cancellable(
         changed.insert(node_id.clone());
     }
     let changed_count = changed.len();
-    let additional_impacted = impacted.difference(&changed).count();
+    let mut additional_impacted = 0_usize;
+    for _ in impacted.difference(&changed) {
+        budget.step(&mut is_cancelled)?;
+        additional_impacted += 1;
+    }
     if changed_count > 0 && additional_impacted >= DEFAULT_WIDE_BLAST_RADIUS_MIN_ADDITIONAL_NODES {
         let impacted_count = impacted.len();
         let impacted = impacted.into_iter().collect::<Vec<_>>();

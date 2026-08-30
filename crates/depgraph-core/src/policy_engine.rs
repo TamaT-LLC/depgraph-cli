@@ -19,7 +19,8 @@ use crate::{
     query::{CycleLevel, cycles},
 };
 
-/// Return the stable policy-violation IDs produced by boundary rules.
+/// Return the stable, unsuppressed policy-violation IDs produced by boundary
+/// rules.
 ///
 /// The audit analyzer deliberately does not infer policy findings from graph
 /// diagnostic text.  Policy rule kinds are configuration data, while the
@@ -46,6 +47,7 @@ pub(crate) fn boundary_violation_ids(
     result
         .violations
         .iter()
+        .filter(|violation| violation.suppression.is_none())
         .filter(|violation| boundary_rule_ids.contains(violation.rule_id.as_str()))
         .map(|violation| violation.id.clone())
         .collect()
@@ -2372,6 +2374,25 @@ mod tests {
                 .id
                 .starts_with("policy-violation:sha256:")
         );
+
+        let mut suppressed_policy = policy;
+        suppressed_policy.suppressions.push(PolicySuppression {
+            id: "reviewed-boundary".to_owned(),
+            rule_id: "fixture-rule".to_owned(),
+            reason: "accepted architecture exception".to_owned(),
+            scope: PolicySuppressionScope {
+                source: Some(PolicySelector {
+                    match_kind: PolicyMatchKind::Exact,
+                    value: "src/ui/a.ts".to_owned(),
+                    cardinality: PolicySelectorCardinality::One,
+                    ..selector("unused")
+                }),
+                ..PolicySuppressionScope::default()
+            },
+        });
+        let suppressed = evaluate_policy("snapshot:fixture", &graph, &suppressed_policy)?;
+        assert_eq!(suppressed.summary.suppressed, 1);
+        assert!(boundary_violation_ids(&suppressed, &suppressed_policy).is_empty());
         Ok(())
     }
 
