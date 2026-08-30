@@ -507,13 +507,13 @@ impl DepgraphService {
         );
         Ok(HealthSummaryResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             collection_digest,
             manifest_digest: collected.manifest_digest,
             counts_by_kind,
             counts_by_confidence,
             coverage: HealthCoverageOverview {
-                completeness: snapshot.coverage.completeness,
+                completeness: snapshot.coverage.completeness.clone(),
                 files_skipped: snapshot.coverage.files_skipped,
                 unresolved: snapshot.coverage.unresolved,
                 candidates: snapshot.coverage.candidates,
@@ -564,7 +564,7 @@ impl DepgraphService {
         );
         Ok(HealthFindingsResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             collection_digest,
             manifest_digest: collected.manifest_digest,
             findings,
@@ -811,7 +811,7 @@ impl DepgraphService {
             .collect::<Vec<_>>();
         Ok(HealthHotspotsResult {
             snapshot_id: snapshot_id.clone(),
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             collection_digest: collection_digest(
                 &CollectionIdentity {
                     snapshot_ids: vec![snapshot_id.as_str().to_owned()],

@@ -985,12 +985,13 @@ pub(crate) fn merge_build_delta(
     _attempt_id: &str,
 ) -> Result<()> {
     for profile in delta.profiles {
+        let mut profile = profile;
         if let Some(existing) = snapshot
             .profiles
             .iter_mut()
             .find(|item| item.id == profile.id)
         {
-            if let Some(build_coverage) = profile.coverage {
+            if let Some(build_coverage) = profile.coverage.take() {
                 let coverage = existing
                     .coverage
                     .get_or_insert_with(CoverageRecord::default);

@@ -525,18 +525,16 @@ pub(crate) fn load_scan_topology(connection: &Connection, scan_id: &str) -> Resu
     Ok(GraphTopology { nodes, edges })
 }
 
-pub(crate) fn topology_from_snapshot(snapshot: GraphSnapshot) -> GraphTopology {
+pub(crate) fn topology_from_snapshot(mut snapshot: GraphSnapshot) -> GraphTopology {
     GraphTopology {
-        nodes: snapshot
-            .nodes
+        nodes: std::mem::take(&mut snapshot.nodes)
             .into_iter()
             .map(|node| GraphTopologyNode {
                 id: node.id,
                 kind: node.kind,
             })
             .collect(),
-        edges: snapshot
-            .edges
+        edges: std::mem::take(&mut snapshot.edges)
             .into_iter()
             .map(|edge| GraphTopologyEdge {
                 source: edge.source,
