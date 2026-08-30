@@ -3195,7 +3195,7 @@ fn committed_runtime_completion_recovers_v15_staging_through_exact_legacy_owner(
     let store = depgraph_core::open_store_read_only(config.store_path()).unwrap();
     assert_eq!(
         store.schema_version().unwrap(),
-        depgraph_store::STORE_SCHEMA_VERSION
+        depgraph_core::release_compatibility_contract().store_schema_version
     );
     assert_eq!(
         store.current_snapshot_id().unwrap().as_deref(),
@@ -5067,7 +5067,7 @@ fn p1a_genuine_v15_v16_scan_completion_intent_adopts_legacy_staging() {
         let store = depgraph_core::open_store_read_only(config.store_path()).unwrap();
         assert_eq!(
             store.schema_version().unwrap(),
-            depgraph_store::STORE_SCHEMA_VERSION
+            depgraph_core::release_compatibility_contract().store_schema_version
         );
         assert_eq!(
             store.current_snapshot_id().unwrap().as_deref(),
