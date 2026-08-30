@@ -54,7 +54,7 @@ A finding is a closed record:
 | `location` | repository-relative path and optional source span |
 | `profile_scope` | present only for explicitly profile-scoped findings |
 | `reason` | human-readable explanation (not an ID input) |
-| `hotspot_scores` | optional structured five-layer score breakdown; present only for `hotspot` |
+| `hotspot_scores` | required non-null structured five-layer score breakdown for current `hotspot` output; absent for current non-hotspot output; legacy hotspot input may omit it or use `null` |
 | `blockers` | why `confirmed` is refused or a comparison degraded |
 | `evidence` | closed references to edges, sites, or evidence rows |
 | `remediations` | next-step hints, never automatic edits |
@@ -311,7 +311,9 @@ Request weights outside `0..=10_000` or whose sum exceeds `10_000` are
 `InvalidInput`. A missing layer contributes `0` and does **not** renormalize
 the remaining weights. Tie-break: score descending, then subject node ID
 ascending. The returned finding order preserves that rank. Each hotspot
-finding carries an optional `hotspot_scores` object with this exact shape:
+finding carries a required, non-null `hotspot_scores` object with this exact
+shape. Only the legacy wire-input boundary described above accepts a missing or
+null score object:
 
 ```json
 {
