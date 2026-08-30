@@ -159,18 +159,14 @@ impl Store {
 pub fn diff_graph_snapshots(
     from_snapshot_id: &str,
     to_snapshot_id: &str,
-    mut from: GraphSnapshot,
-    mut to: GraphSnapshot,
+    from: GraphSnapshot,
+    to: GraphSnapshot,
 ) -> Result<GraphSnapshotDiff> {
     let from_node_evidence = node_source_evidence(&from);
     let to_node_evidence = node_source_evidence(&to);
     let from_source_hashes = source_file_content_hashes(&from);
     let to_source_hashes = source_file_content_hashes(&to);
-    let mut nodes = diff_records(
-        std::mem::take(&mut from.nodes),
-        std::mem::take(&mut to.nodes),
-        |record| record.id.clone(),
-    )?;
+    let mut nodes = diff_records(from.nodes, to.nodes, |record| record.id.clone())?;
     let (renames, rename_candidates) = detect_node_renames(
         &mut nodes,
         &from_node_evidence,
@@ -178,36 +174,18 @@ pub fn diff_graph_snapshots(
         &from_source_hashes,
         &to_source_hashes,
     )?;
-    let sites = diff_records(
-        std::mem::take(&mut from.sites),
-        std::mem::take(&mut to.sites),
-        |record| record.id.clone(),
-    )?;
-    let edges = diff_records(
-        std::mem::take(&mut from.edges),
-        std::mem::take(&mut to.edges),
-        |record| record.id.clone(),
-    )?;
-    let evidence = diff_records(
-        std::mem::take(&mut from.evidence),
-        std::mem::take(&mut to.evidence),
-        evidence_identity,
-    )?;
-    let profiles = diff_records(
-        std::mem::take(&mut from.profiles),
-        std::mem::take(&mut to.profiles),
-        |record| record.id.clone(),
-    )?;
-    let from_coverage = std::mem::take(&mut from.coverage);
-    let to_coverage = std::mem::take(&mut to.coverage);
-    let coverage = if from_coverage == to_coverage {
+    let sites = diff_records(from.sites, to.sites, |record| record.id.clone())?;
+    let edges = diff_records(from.edges, to.edges, |record| record.id.clone())?;
+    let evidence = diff_records(from.evidence, to.evidence, evidence_identity)?;
+    let profiles = diff_records(from.profiles, to.profiles, |record| record.id.clone())?;
+    let coverage = if from.coverage == to.coverage {
         None
     } else {
         Some(ChangedRecord {
             id: "coverage".to_owned(),
-            changed_fields: changed_fields(&from_coverage, &to_coverage)?,
-            before: from_coverage,
-            after: to_coverage,
+            changed_fields: changed_fields(&from.coverage, &to.coverage)?,
+            before: from.coverage,
+            after: to.coverage,
         })
     };
     Ok(GraphSnapshotDiff {

@@ -1311,7 +1311,7 @@ async fn doctor_with_diagnostic_root(
     let latest_attempt = store
         .latest_attempt_id()?
         .map(|scan_id| {
-            let mut snapshot = store.load_snapshot(&scan_id)?;
+            let snapshot = store.load_snapshot(&scan_id)?;
             let compiler_profiles = snapshot
                 .profiles
                 .iter()
@@ -1377,16 +1377,16 @@ async fn doctor_with_diagnostic_root(
                 .collect();
             Ok::<_, anyhow::Error>(ScanHealth {
                 scan_id: scan_id.clone(),
-                status: snapshot.scan.status.clone(),
-                root: snapshot.scan.root.clone(),
+                status: snapshot.scan.status,
+                root: snapshot.scan.root,
                 project_code_executed: snapshot.scan.project_code_executed,
-                coverage: std::mem::take(&mut snapshot.coverage),
-                profiles: std::mem::take(&mut snapshot.profiles),
-                file_coverage: std::mem::take(&mut snapshot.file_coverage),
-                adapter_logs: std::mem::take(&mut snapshot.adapter_logs),
+                coverage: snapshot.coverage,
+                profiles: snapshot.profiles,
+                file_coverage: snapshot.file_coverage,
+                adapter_logs: snapshot.adapter_logs,
                 detected_packages,
-                diagnostics: std::mem::take(&mut snapshot.diagnostics),
-                profile_matrix: std::mem::take(&mut snapshot.profile_matrix),
+                diagnostics: snapshot.diagnostics,
+                profile_matrix: snapshot.profile_matrix,
                 cache_events: store.cache_events_for_scan(&scan_id)?,
                 compiler_precise,
             })

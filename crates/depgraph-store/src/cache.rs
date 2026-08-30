@@ -922,11 +922,8 @@ impl Store {
             .context("validated cache snapshot disappeared while loading its outcome")?;
         let (coverage, diagnostics) =
             if scan_is_semantic_noop_overlay(&self.connection, &snapshot.scan_id)? {
-                let mut graph = self.load_completed_snapshot(&semantic_entry.snapshot_id)?;
-                (
-                    std::mem::take(&mut graph.coverage),
-                    std::mem::take(&mut graph.diagnostics),
-                )
+                let graph = self.load_completed_snapshot(&semantic_entry.snapshot_id)?;
+                (graph.coverage, graph.diagnostics)
             } else {
                 let coverage_json: String = self.connection.query_row(
                     "SELECT json FROM coverage WHERE scan_id=?1",

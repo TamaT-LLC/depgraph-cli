@@ -1541,13 +1541,13 @@ fn ingest_empty_coverage(store: &mut Store, scan_id: &str) -> Result<()> {
 }
 
 fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanOutcome> {
-    let mut snapshot = store.load_snapshot(scan_id)?;
+    let snapshot = store.load_snapshot(scan_id)?;
     Ok(ScanOutcome {
         scan_id: scan_id.to_owned(),
-        status: snapshot.scan.status.clone(),
+        status: snapshot.scan.status,
         exit_code,
-        coverage: std::mem::take(&mut snapshot.coverage),
-        diagnostics: std::mem::take(&mut snapshot.diagnostics),
+        coverage: snapshot.coverage,
+        diagnostics: snapshot.diagnostics,
         cache_events: store.cache_events_for_scan(scan_id)?,
         policy: None,
         performance: None,

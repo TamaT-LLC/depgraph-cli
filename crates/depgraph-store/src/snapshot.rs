@@ -750,8 +750,7 @@ pub(crate) fn load_completed_snapshot_profiles_from_connection(
         }
         let profiles =
             if record.build_attempt_id.is_some() || !record.runtime_session_ids.is_empty() {
-                let mut snapshot = load_completed_snapshot_from_connection(connection, &current)?;
-                std::mem::take(&mut snapshot.profiles)
+                load_completed_snapshot_from_connection(connection, &current)?.profiles
             } else {
                 load_profiles(connection, &record.scan_id)?
             };
@@ -812,14 +811,11 @@ fn load_effective_scan_snapshot(connection: &Connection, scan_id: &str) -> Resul
     Ok(snapshot)
 }
 
-fn apply_semantic_noop_overlay(
-    snapshot: &mut GraphSnapshot,
-    mut overlay: GraphSnapshot,
-) -> Result<()> {
+fn apply_semantic_noop_overlay(snapshot: &mut GraphSnapshot, overlay: GraphSnapshot) -> Result<()> {
     if overlay.nodes.len() != 1 {
         bail!("semantic no-op overlay must persist exactly one node");
     }
-    for node in std::mem::take(&mut overlay.nodes) {
+    for node in overlay.nodes {
         if let Some(existing) = snapshot.nodes.iter_mut().find(|item| item.id == node.id) {
             if existing.kind != node.kind
                 || existing.locator != node.locator
@@ -835,7 +831,7 @@ fn apply_semantic_noop_overlay(
             );
         }
     }
-    for log in std::mem::take(&mut overlay.adapter_logs) {
+    for log in overlay.adapter_logs {
         if let Some(existing) = snapshot
             .adapter_logs
             .iter_mut()
@@ -846,7 +842,7 @@ fn apply_semantic_noop_overlay(
             snapshot.adapter_logs.push(log);
         }
     }
-    snapshot.scan = overlay.scan.clone();
+    snapshot.scan = overlay.scan;
     snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot
         .adapter_logs
