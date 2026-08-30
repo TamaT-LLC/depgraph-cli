@@ -11,10 +11,11 @@ use crate::{
     CancellationToken,
     bounded_query::{QueryFailureClass, read_bounded_repository_file},
     health::{
-        AuditComparability, CollectionIdentity, Confidence, FindingKind, HealthAnalysisError,
-        HealthFinding, HealthFindingDetail, HotspotAnalysisError, HotspotLayerAvailability,
-        HotspotWeights, ManifestIdentity, Severity, analyze_changed_code_cancellable,
-        analyze_dependencies_cancellable, analyze_unused_cancellable, collection_digest,
+        AuditComparability, CollectionIdentity, Confidence, FindingBlocker, FindingKind,
+        HealthAnalysisError, HealthFinding, HealthFindingDetail, HotspotAnalysisError,
+        HotspotLayerAvailability, HotspotWeights, ManifestIdentity, Severity,
+        analyze_changed_code_cancellable, analyze_dependencies_cancellable,
+        analyze_unused_cancellable, collection_digest, finding_fingerprint,
         score_hotspots_cancellable,
     },
     impact::{
@@ -851,19 +852,69 @@ fn manifests_digest(manifests: &[crate::health::ManifestIdentity]) -> Option<Str
     ))
 }
 
-fn bound_findings(findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
+fn bound_findings(mut findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
     if findings.len() > MAX_HEALTH_FINDINGS {
         return Err(DepgraphServiceError::ResourceExhausted);
     }
-    if findings.iter().any(|finding| {
-        finding.blockers.len() > MAX_HEALTH_BLOCKERS_PER_FINDING
-            || finding.evidence.len() > MAX_HEALTH_EVIDENCE_PER_FINDING
+    for finding in &mut findings {
+        if compact_blockers(&mut finding.blockers)? {
+            finding.fingerprint = finding_fingerprint(finding);
+        }
+        if finding.evidence.len() > MAX_HEALTH_EVIDENCE_PER_FINDING
             || finding.remediations.len() > MAX_HEALTH_REMEDIATIONS_PER_FINDING
             || finding.suppressions.len() > MAX_HEALTH_SUPPRESSIONS_PER_FINDING
-    }) {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
     }
     Ok(findings)
+}
+
+fn compact_blockers(blockers: &mut Vec<FindingBlocker>) -> DepgraphServiceResult<bool> {
+    if blockers.len() <= MAX_HEALTH_BLOCKERS_PER_FINDING {
+        return Ok(false);
+    }
+
+    blockers.sort_by(|left, right| {
+        left.kind
+            .as_str()
+            .cmp(right.kind.as_str())
+            .then(left.detail.cmp(&right.detail))
+    });
+    blockers.dedup();
+    if blockers.len() <= MAX_HEALTH_BLOCKERS_PER_FINDING {
+        return Ok(true);
+    }
+
+    let mut by_kind = BTreeMap::<crate::health::BlockerKind, Vec<String>>::new();
+    for blocker in blockers.drain(..) {
+        by_kind
+            .entry(blocker.kind)
+            .or_default()
+            .push(blocker.detail);
+    }
+    if by_kind.len() > MAX_HEALTH_BLOCKERS_PER_FINDING {
+        return Err(DepgraphServiceError::ResourceExhausted);
+    }
+
+    for (kind, details) in by_kind {
+        let detail = if details.len() == 1 {
+            details[0].clone()
+        } else {
+            let digest = hex::encode(Sha256::digest(
+                depgraph_protocol::canonical_json(&serde_json::json!(&details)).as_bytes(),
+            ));
+            format!(
+                "{} blockers of kind {}; representative={}; details_sha256=sha256:{digest}",
+                details.len(),
+                kind.as_str(),
+                details.first().map_or("", String::as_str),
+            )
+        };
+        blockers.push(FindingBlocker { kind, detail });
+    }
+    blockers.sort_by(|left, right| left.kind.as_str().cmp(right.kind.as_str()));
+    Ok(true)
 }
 
 fn load_manifests(
@@ -1305,7 +1356,89 @@ fn collect_runtime_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::DEFAULT_HOTSPOT_WEIGHTS;
+    use crate::health::{BlockerKind, DEFAULT_HOTSPOT_WEIGHTS, FindingIdentity, finish_finding};
+
+    fn finding_with_blockers(blockers: Vec<FindingBlocker>) -> HealthFinding {
+        finish_finding(
+            FindingIdentity {
+                kind: FindingKind::UnusedType,
+                subject_id: "type:large-blocker-set".to_owned(),
+                profile_scope: None,
+                witness_key: serde_json::json!({"path": "src/large.rs"}),
+            },
+            "type",
+            None,
+            "unused type",
+            blockers,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+        )
+    }
+
+    #[test]
+    fn issue_436_health_service_compacts_oversized_blocker_sets_deterministically() {
+        let single = finding_with_blockers(vec![FindingBlocker {
+            kind: BlockerKind::HeuristicPrecision,
+            detail: "edge edge:single is heuristic".to_owned(),
+        }]);
+        assert_eq!(bound_findings(vec![single.clone()]).unwrap(), [single]);
+
+        let duplicate = FindingBlocker {
+            kind: BlockerKind::Unresolved,
+            detail: "site site:duplicate is unresolved".to_owned(),
+        };
+        let deduplicated = bound_findings(vec![finding_with_blockers(vec![
+            duplicate.clone();
+            MAX_HEALTH_BLOCKERS_PER_FINDING
+                + 1
+        ])])
+        .unwrap()
+        .pop()
+        .expect("deduplicated finding");
+        assert_eq!(deduplicated.blockers, [duplicate]);
+        assert_eq!(deduplicated.fingerprint, finding_fingerprint(&deduplicated));
+
+        let details = (0..=MAX_HEALTH_BLOCKERS_PER_FINDING)
+            .map(|index| format!("edge edge:heuristic:{index:02} is heuristic"))
+            .collect::<Vec<_>>();
+        let mut blockers = details
+            .iter()
+            .map(|detail| FindingBlocker {
+                kind: BlockerKind::HeuristicPrecision,
+                detail: detail.clone(),
+            })
+            .collect::<Vec<_>>();
+        blockers.push(FindingBlocker {
+            kind: BlockerKind::PublicSurface,
+            detail: "public API surface".to_owned(),
+        });
+        let mut reversed = blockers.clone();
+        reversed.reverse();
+
+        let first = bound_findings(vec![finding_with_blockers(blockers)])
+            .unwrap()
+            .pop()
+            .expect("compacted finding");
+        let second = bound_findings(vec![finding_with_blockers(reversed)])
+            .unwrap()
+            .pop()
+            .expect("compacted finding");
+        assert_eq!(first.blockers, second.blockers);
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.confidence, Confidence::Indeterminate);
+        assert_eq!(first.blockers.len(), 2);
+        assert_eq!(first.blockers[0].kind, BlockerKind::HeuristicPrecision);
+        assert_eq!(
+            first.blockers[0].detail,
+            "33 blockers of kind heuristic-precision; representative=edge edge:heuristic:00 is heuristic; details_sha256=sha256:13a9adf5625cfa00c3bf1d78b7f04fb2f877f2abbe1778f43e42a757ca072f50"
+        );
+        assert_eq!(first.blockers[1].kind, BlockerKind::PublicSurface);
+        assert_eq!(first.blockers[1].detail, "public API surface");
+        assert_eq!(first.fingerprint, finding_fingerprint(&first));
+    }
 
     #[test]
     fn issue_423_manifest_parsers_cover_declared_sections_only() {
