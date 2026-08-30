@@ -122,18 +122,21 @@ fn analyze_subject(
             usage_profiles.extend(package_profiles.iter().copied());
         }
         // A Go main package is selected by the build as an entry surface even
-        // when no repository edge points at its source file.
-        let go_source_path = node
-            .properties
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| node.locator.strip_prefix("file:"));
+        // when no repository edge points at its source file. Go compiles all
+        // production files in the package together; the entry file is not
+        // required to be named main.go. Test files are deliberately excluded
+        // using the worker-emitted `test` property because they are separate
+        // test variants rather than production entry surfaces.
         let go_package_name = node
             .properties
             .get("package_name")
             .and_then(serde_json::Value::as_str);
         if go_package_name == Some("main")
-            && go_source_path.is_some_and(|path| path == "main.go" || path.ends_with("/main.go"))
+            && node
+                .properties
+                .get("test")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
         {
             usage_profiles.extend(applicable.iter().map(String::as_str));
         }
@@ -234,9 +237,9 @@ fn analyze_subject(
 struct SnapshotIndex<'a> {
     incoming: HashMap<&'a str, Vec<&'a EdgeRecord>>,
     // Go imports are resolved to package/module nodes because a Go package is
-    // compiled as one unit.  Keep the package-level usage profiles alongside
-    // the ordinary incoming-edge index so file findings do not mistake every
-    // file in an imported package for an unused file.
+    // compiled as one unit. Keep production package-level usage profiles
+    // alongside the ordinary incoming-edge index so file findings do not
+    // mistake an imported package's production files for unused files.
     go_file_usage_profiles: HashMap<&'a str, HashSet<&'a str>>,
     sites_by_target: HashMap<&'a str, Vec<&'a SiteRecord>>,
     dynamic_site_ids: HashSet<&'a str>,
@@ -253,6 +256,13 @@ struct SnapshotIndex<'a> {
     all_matrix_profile_ids: Vec<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GoPackageIdentity<'a> {
+    package_path: &'a str,
+    module_path: Option<&'a str>,
+    manifest_path: Option<&'a str>,
+}
+
 impl<'a> SnapshotIndex<'a> {
     fn build(
         snapshot: &'a GraphSnapshot,
@@ -265,7 +275,8 @@ impl<'a> SnapshotIndex<'a> {
             incoming.entry(edge.target.as_str()).or_default().push(edge);
         }
 
-        let mut go_package_path_by_id = HashMap::<&str, &str>::new();
+        let mut go_package_identity_by_id = HashMap::<&str, GoPackageIdentity<'a>>::new();
+        let mut go_package_scopes_by_path = HashMap::<&str, Vec<GoPackageIdentity<'a>>>::new();
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
             if node.kind != "module"
@@ -277,23 +288,26 @@ impl<'a> SnapshotIndex<'a> {
             {
                 continue;
             }
-            if let Some(package_path) = node
-                .properties
-                .get("package_path")
-                .and_then(serde_json::Value::as_str)
-            {
-                go_package_path_by_id.insert(node.id.as_str(), package_path);
+            if let Some(identity) = go_package_identity(node) {
+                go_package_identity_by_id.insert(node.id.as_str(), identity);
+                let scopes = go_package_scopes_by_path
+                    .entry(identity.package_path)
+                    .or_default();
+                if !scopes.contains(&identity) {
+                    scopes.push(identity);
+                }
             }
         }
-        let mut go_package_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
+        let mut go_package_usage_profiles =
+            HashMap::<GoPackageIdentity<'a>, HashSet<&'a str>>::new();
         for edge in &snapshot.edges {
             budget.step(is_cancelled)?;
-            let Some(package_path) = go_package_path_by_id.get(edge.target.as_str()) else {
+            let Some(package_identity) = go_package_identity_by_id.get(edge.target.as_str()) else {
                 continue;
             };
             if is_usage_edge(edge, edge.target.as_str()) && is_definite_usage(edge) {
                 go_package_usage_profiles
-                    .entry(*package_path)
+                    .entry(*package_identity)
                     .or_default()
                     .insert(edge.profile_id.as_str());
             }
@@ -310,6 +324,17 @@ impl<'a> SnapshotIndex<'a> {
             {
                 continue;
             }
+            // `_test.go` files are emitted with test=true by the worker and
+            // belong to a separate test variant. An import of the production
+            // package must not make those files appear used.
+            if node
+                .properties
+                .get("test")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                continue;
+            }
             let Some(package_path) = node
                 .properties
                 .get("package_path")
@@ -317,8 +342,35 @@ impl<'a> SnapshotIndex<'a> {
             else {
                 continue;
             };
-            if let Some(profiles) = go_package_usage_profiles.get(package_path) {
-                go_file_usage_profiles.insert(node.id.as_str(), profiles.clone());
+            let Some(file_identity) = go_package_identity(node) else {
+                continue;
+            };
+            let Some(scopes) = go_package_scopes_by_path.get(package_path) else {
+                continue;
+            };
+            let mut matching_scopes = Vec::new();
+            for scope in scopes {
+                budget.step(is_cancelled)?;
+                if go_package_scope_matches(file_identity, *scope) {
+                    matching_scopes.push(*scope);
+                }
+            }
+            // A legacy/synthetic file node may omit module or manifest
+            // identity. Only use its package-path fallback when the resulting
+            // scope is unambiguous; otherwise fail closed to avoid importing
+            // usage from a sibling module with the same package_path.
+            if matching_scopes.len() != 1 {
+                continue;
+            }
+            let mut profiles = HashSet::new();
+            for scope in matching_scopes {
+                budget.step(is_cancelled)?;
+                if let Some(scope_profiles) = go_package_usage_profiles.get(&scope) {
+                    profiles.extend(scope_profiles.iter().copied());
+                }
+            }
+            if !profiles.is_empty() {
+                go_file_usage_profiles.insert(node.id.as_str(), profiles);
             }
         }
         let mut dynamic_site_ids = HashSet::new();
@@ -415,6 +467,34 @@ impl<'a> SnapshotIndex<'a> {
             all_matrix_profile_ids,
         })
     }
+}
+
+fn go_package_identity<'a>(node: &'a NodeRecord) -> Option<GoPackageIdentity<'a>> {
+    let package_path = node
+        .properties
+        .get("package_path")
+        .and_then(serde_json::Value::as_str)?;
+    let optional_property = |key| {
+        node.properties
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    Some(GoPackageIdentity {
+        package_path,
+        module_path: optional_property("module_path"),
+        manifest_path: optional_property("manifest_path"),
+    })
+}
+
+fn go_package_scope_matches(file: GoPackageIdentity<'_>, package: GoPackageIdentity<'_>) -> bool {
+    file.package_path == package.package_path
+        && file
+            .module_path
+            .is_none_or(|module_path| package.module_path == Some(module_path))
+        && file
+            .manifest_path
+            .is_none_or(|manifest_path| package.manifest_path == Some(manifest_path))
 }
 
 fn is_usage_edge(edge: &EdgeRecord, subject_id: &str) -> bool {
@@ -1017,6 +1097,13 @@ mod tests {
                     json!({"package_path": "example.com/app/pkg"}),
                 ),
                 node(
+                    "go:package-test",
+                    "file",
+                    "go",
+                    "pkg/other_test.go",
+                    json!({"package_path": "example.com/app/pkg", "test": true}),
+                ),
+                node(
                     "go:unused",
                     "file",
                     "go",
@@ -1057,7 +1144,7 @@ mod tests {
                 .filter(|finding| finding.kind == FindingKind::UnusedFile)
                 .map(|finding| finding.subject_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["go:unused"]
+            vec!["go:unused", "go:package-test"]
         );
         for subject in ["go:main", "go:used", "go:other"] {
             assert!(
@@ -1065,6 +1152,153 @@ mod tests {
                 "imported Go package file {subject} must not be reported unused"
             );
         }
+    }
+
+    #[test]
+    fn issue_437_go_main_package_marks_every_production_file_but_not_test_files() {
+        let graph = snapshot(
+            vec![profile("profile:go", "go", true)],
+            vec![
+                node(
+                    "go:entry-helper",
+                    "file",
+                    "go",
+                    "cmd/bootstrap.go",
+                    json!({"package_name": "main", "package_path": "example.com/app/cmd", "test": false}),
+                ),
+                node(
+                    "go:entry-test",
+                    "file",
+                    "go",
+                    "cmd/bootstrap_test.go",
+                    json!({"package_name": "main", "package_path": "example.com/app/cmd", "test": true}),
+                ),
+                node(
+                    "go:ordinary",
+                    "file",
+                    "go",
+                    "pkg/ordinary.go",
+                    json!({"package_name": "pkg", "package_path": "example.com/app/pkg", "test": false}),
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let findings = analyze_unused(&graph);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.subject_id != "go:entry-helper"),
+            "every production file in a Go main package is an entry surface"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.subject_id == "go:entry-test"),
+            "worker-emitted test=true files remain separate from the production entry surface"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.subject_id == "go:ordinary")
+        );
+    }
+
+    #[test]
+    fn issue_437_go_package_usage_keeps_same_package_path_scopes_separate() {
+        let graph = snapshot(
+            vec![profile("profile:go", "go", true)],
+            vec![
+                node(
+                    "go:caller",
+                    "file",
+                    "go",
+                    "caller/main.go",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/caller",
+                        "module_path": "example.com/caller",
+                        "manifest_path": "caller/go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:shared-a",
+                    "module",
+                    "go",
+                    "shared-a",
+                    json!({
+                        "package_path": "example.com/shared",
+                        "module_path": "example.com/first",
+                        "manifest_path": "first/go.mod"
+                    }),
+                ),
+                node(
+                    "go:shared-b",
+                    "module",
+                    "go",
+                    "shared-b",
+                    json!({
+                        "package_path": "example.com/shared",
+                        "module_path": "example.com/second",
+                        "manifest_path": "second/go.mod"
+                    }),
+                ),
+                node(
+                    "go:file-a",
+                    "file",
+                    "go",
+                    "first/shared.go",
+                    json!({
+                        "package_name": "shared",
+                        "package_path": "example.com/shared",
+                        "module_path": "example.com/first",
+                        "manifest_path": "first/go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:file-b",
+                    "file",
+                    "go",
+                    "second/shared.go",
+                    json!({
+                        "package_name": "shared",
+                        "package_path": "example.com/shared",
+                        "module_path": "example.com/second",
+                        "manifest_path": "second/go.mod",
+                        "test": false
+                    }),
+                ),
+            ],
+            vec![edge(
+                "edge:import-first",
+                "go:caller",
+                "go:shared-a",
+                "imports",
+                "profile:go",
+            )],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let findings = analyze_unused(&graph);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.subject_id != "go:file-a"),
+            "the imported module scope marks its own package files used"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.subject_id == "go:file-b"),
+            "a sibling module with the same package_path remains independently analyzable"
+        );
     }
 
     #[test]

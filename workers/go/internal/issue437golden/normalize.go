@@ -8,14 +8,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
 // NormalizeNDJSON parses a safe worker stream and returns a deterministic
 // projection suitable for comparing output captured on different hosts. The
-// projection retains event order and sequence numbers, every node property,
-// site/evidence field, edge (including structural contains/declares edges),
-// file completion, and completion coverage.
+// projection retains every node property, site/evidence field, edge (including
+// structural contains/declares edges), file completion, and completion
+// coverage. Semantic collections are sorted by logical identity so that the
+// projection does not depend on Go map/file-system iteration order. Sequence
+// numbers are reassigned after that canonical ordering.
 func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 	events, err := eventsFromNDJSON(data)
 	if err != nil {
@@ -25,9 +28,16 @@ func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, event := range events {
+	ordered, err := orderEvents(events, maps)
+	if err != nil {
+		return nil, err
+	}
+	for index, event := range ordered {
 		eventName, _ := event["event"].(string)
 		normalizeValue(event, eventName, false, false)
+		// The producer's sequence is a transport ordering detail. It must be
+		// normalized together with the host-independent event ordering.
+		event["seq"] = float64(index + 1)
 		switch eventName {
 		case "node_upsert":
 			node, err := objectField(event, "node")
@@ -88,13 +98,15 @@ func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 			}
 		}
 	}
-	return events, nil
+	return ordered, nil
 }
 
 type eventMaps struct {
-	nodeIDs map[string]string
-	siteIDs map[string]string
-	edgeIDs map[string]string
+	scanID             string
+	declaredProfileIDs map[string]struct{}
+	nodeIDs            map[string]string
+	siteIDs            map[string]string
+	edgeIDs            map[string]string
 }
 
 func eventsFromNDJSON(data []byte) ([]map[string]any, error) {
@@ -119,9 +131,13 @@ func eventsFromNDJSON(data []byte) ([]map[string]any, error) {
 
 func buildEventMaps(events []map[string]any) (eventMaps, error) {
 	maps := eventMaps{
-		nodeIDs: map[string]string{},
-		siteIDs: map[string]string{},
-		edgeIDs: map[string]string{},
+		declaredProfileIDs: map[string]struct{}{},
+		nodeIDs:            map[string]string{},
+		siteIDs:            map[string]string{},
+		edgeIDs:            map[string]string{},
+	}
+	if err := validateStreamReferences(events, &maps); err != nil {
+		return eventMaps{}, err
 	}
 	for _, event := range events {
 		if event["event"] != "node_upsert" {
@@ -214,6 +230,247 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 		maps.edgeIDs[rawID] = normalizedID
 	}
 	return maps, nil
+}
+
+// validateStreamReferences runs before any normalization. Replacing an ID
+// before checking it would let an unknown or cross-profile reference become a
+// plausible placeholder and make a malformed stream compare equal.
+func validateStreamReferences(events []map[string]any, maps *eventMaps) error {
+	for index, event := range events {
+		rawID, ok := event["scan_id"]
+		if !ok {
+			return fmt.Errorf("Go golden event %d is missing scan_id", index)
+		}
+		scanID, ok := rawID.(string)
+		if !ok || scanID == "" {
+			return fmt.Errorf("Go golden event %d has invalid scan_id: %#v", index, rawID)
+		}
+		if maps.scanID == "" {
+			maps.scanID = scanID
+		} else if maps.scanID != scanID {
+			return fmt.Errorf("Go golden stream mixes scan_id %q and %q", maps.scanID, scanID)
+		}
+	}
+	if maps.scanID == "" {
+		return fmt.Errorf("Go golden stream is empty")
+	}
+
+	for index, event := range events {
+		if event["event"] != "profile_declared" {
+			continue
+		}
+		profile, err := objectField(event, "profile")
+		if err != nil {
+			return fmt.Errorf("profile_declared event %d: %w", index, err)
+		}
+		profileID, err := stringField(profile, "id")
+		if err != nil {
+			return fmt.Errorf("profile_declared event %d: %w", index, err)
+		}
+		if profileID == "" {
+			return fmt.Errorf("profile_declared event %d has empty profile.id", index)
+		}
+		if _, duplicate := maps.declaredProfileIDs[profileID]; duplicate {
+			return fmt.Errorf("Go golden stream declares profile %q more than once", profileID)
+		}
+		maps.declaredProfileIDs[profileID] = struct{}{}
+	}
+
+	startedProfileIDs := map[string]struct{}{}
+	startedCount := 0
+	for index, event := range events {
+		if event["event"] == "scan_started" {
+			startedCount++
+			values, ok := event["profile_ids"].([]any)
+			if !ok {
+				return fmt.Errorf("scan_started event %d profile_ids is not an array: %#v", index, event["profile_ids"])
+			}
+			for _, value := range values {
+				profileID, ok := value.(string)
+				if !ok || profileID == "" {
+					return fmt.Errorf("scan_started event %d has invalid profile_ids value: %#v", index, value)
+				}
+				if _, duplicate := startedProfileIDs[profileID]; duplicate {
+					return fmt.Errorf("scan_started event %d repeats profile_id %q", index, profileID)
+				}
+				startedProfileIDs[profileID] = struct{}{}
+			}
+		}
+	}
+	if startedCount > 1 {
+		return fmt.Errorf("Go golden stream has %d scan_started events", startedCount)
+	}
+	if startedCount == 1 {
+		for profileID := range startedProfileIDs {
+			if _, declared := maps.declaredProfileIDs[profileID]; !declared {
+				return fmt.Errorf("scan_started references undeclared profile %q", profileID)
+			}
+		}
+		for profileID := range maps.declaredProfileIDs {
+			if _, started := startedProfileIDs[profileID]; !started {
+				return fmt.Errorf("profile_declared profile %q is absent from scan_started.profile_ids", profileID)
+			}
+		}
+	}
+
+	for index, event := range events {
+		if err := validateReferenceValue(event, maps, fmt.Sprintf("event %d", index)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateReferenceValue(value any, maps *eventMaps, path string) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			fieldPath := path + "." + key
+			switch key {
+			case "scan_id":
+				scanID, ok := child.(string)
+				if !ok || scanID != maps.scanID {
+					return fmt.Errorf("Go golden %s references scan_id %#v, want %q", fieldPath, child, maps.scanID)
+				}
+			case "profile_id":
+				profileID, ok := child.(string)
+				if !ok {
+					return fmt.Errorf("Go golden %s is not a string: %#v", fieldPath, child)
+				}
+				if _, declared := maps.declaredProfileIDs[profileID]; !declared {
+					return fmt.Errorf("Go golden %s references undeclared profile %q", fieldPath, profileID)
+				}
+			case "profile_ids":
+				values, ok := child.([]any)
+				if !ok {
+					return fmt.Errorf("Go golden %s is not an array: %#v", fieldPath, child)
+				}
+				for itemIndex, item := range values {
+					profileID, ok := item.(string)
+					if !ok {
+						return fmt.Errorf("Go golden %s[%d] is not a string: %#v", fieldPath, itemIndex, item)
+					}
+					if _, declared := maps.declaredProfileIDs[profileID]; !declared {
+						return fmt.Errorf("Go golden %s[%d] references undeclared profile %q", fieldPath, itemIndex, profileID)
+					}
+				}
+			default:
+				if err := validateReferenceValue(child, maps, fieldPath); err != nil {
+					return err
+				}
+			}
+		}
+	case []any:
+		for index, child := range typed {
+			if err := validateReferenceValue(child, maps, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func orderEvents(events []map[string]any, maps eventMaps) ([]map[string]any, error) {
+	type sortableEvent struct {
+		event map[string]any
+		key   string
+		index int
+	}
+	items := make([]sortableEvent, 0, len(events))
+	for index, event := range events {
+		key, err := eventOrderingKey(event, maps)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, sortableEvent{event: event, key: key, index: index})
+	}
+	sort.SliceStable(items, func(left, right int) bool {
+		if items[left].key != items[right].key {
+			return items[left].key < items[right].key
+		}
+		return items[left].index < items[right].index
+	})
+	ordered := make([]map[string]any, len(items))
+	for index, item := range items {
+		ordered[index] = item.event
+	}
+	return ordered, nil
+}
+
+func eventOrderingKey(event map[string]any, maps eventMaps) (string, error) {
+	eventName, _ := event["event"].(string)
+	payload, err := cloneObject(event)
+	if err != nil {
+		return "", err
+	}
+	delete(payload, "seq")
+	normalizeValue(payload, eventName, false, false)
+	var logical string
+	switch eventName {
+	case "node_upsert":
+		node, err := objectField(event, "node")
+		if err != nil {
+			return "", err
+		}
+		logical, err = nodeLogicalID(node)
+		if err != nil {
+			return "", err
+		}
+	case "dependency_site":
+		site, err := objectField(event, "site")
+		if err != nil {
+			return "", err
+		}
+		logical, err = canonicalSite(site, maps.nodeIDs)
+		if err != nil {
+			return "", err
+		}
+	case "edge_upsert":
+		edge, err := objectField(event, "edge")
+		if err != nil {
+			return "", err
+		}
+		logical, err = canonicalEdge(edge, maps.nodeIDs, maps.siteIDs)
+		if err != nil {
+			return "", err
+		}
+	case "file_completed":
+		logical, _ = event["path"].(string)
+	}
+	return fmt.Sprintf("%02d\x00%s\x00%s", eventRank(eventName), logical, mustCanonicalJSON(payload)), nil
+}
+
+func eventRank(eventName string) int {
+	switch eventName {
+	case "scan_started":
+		return 0
+	case "profile_declared":
+		return 1
+	case "node_upsert":
+		return 2
+	case "dependency_site":
+		return 3
+	case "edge_upsert":
+		return 4
+	case "diagnostic":
+		return 5
+	case "file_completed":
+		return 6
+	case "profile_completed":
+		return 7
+	case "scan_completed":
+		return 8
+	default:
+		return 9
+	}
+}
+
+func mustCanonicalJSON(value any) string {
+	encoded, err := canonicalJSON(value)
+	if err != nil {
+		return fmt.Sprintf("<invalid:%v>", err)
+	}
+	return encoded
 }
 
 func profileScopedNodeKind(kind string) bool {
