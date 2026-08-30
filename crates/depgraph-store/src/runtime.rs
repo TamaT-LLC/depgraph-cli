@@ -2568,9 +2568,8 @@ mod tests {
         super::super::persist_completed_snapshot_seal(&tx, &semantic_snapshot_id)?;
         tx.commit()?;
 
-        let canonical = store
-            .load_completed_snapshot(&semantic_snapshot_id)?
-            .nodes
+        let mut canonical_snapshot = store.load_completed_snapshot(&semantic_snapshot_id)?;
+        let canonical = std::mem::take(&mut canonical_snapshot.nodes)
             .into_iter()
             .map(|node| super::super::NodeSummaryRecord {
                 id: node.id,

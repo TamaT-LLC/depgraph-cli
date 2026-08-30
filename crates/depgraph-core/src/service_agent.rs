@@ -781,13 +781,13 @@ impl DepgraphService {
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<GraphSitesPageResult> {
         validate_page_limit(self, limit)?;
-        let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
-        let mut items = snapshot
-            .sites
+        let mut snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        let evidence_records = &snapshot.evidence;
+        let mut items = std::mem::take(&mut snapshot.sites)
             .into_iter()
             .filter(|site| node_id.is_none_or(|id| site.source == id))
             .map(|site| {
-                let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id);
+                let mut evidence = site_evidence(evidence_records, "site", &site.id);
                 evidence.sort_by(evidence_order);
                 SiteProjection {
                     id: site.id,
@@ -816,9 +816,9 @@ impl DepgraphService {
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<GraphEdgesPageResult> {
         validate_page_limit(self, limit)?;
-        let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
-        let mut items = snapshot
-            .edges
+        let mut snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        let evidence_records = &snapshot.evidence;
+        let mut items = std::mem::take(&mut snapshot.edges)
             .into_iter()
             .filter(|edge| match direction {
                 EdgeDirection::Incoming => edge.target == node_id,
@@ -826,7 +826,7 @@ impl DepgraphService {
                 EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
             })
             .map(|edge| {
-                let mut evidence = site_evidence(&snapshot.evidence, "edge", &edge.id);
+                let mut evidence = site_evidence(evidence_records, "edge", &edge.id);
                 evidence.sort_by(evidence_order);
                 EdgeProjection {
                     id: edge.id,

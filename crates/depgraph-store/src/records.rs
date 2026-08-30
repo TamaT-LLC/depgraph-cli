@@ -5,6 +5,46 @@ use serde_json::Value;
 
 use crate::ProfileMatrixRecord;
 
+/// Drop a JSON value without recursively descending through nested arrays or
+/// objects.
+///
+/// `serde_json::Value` owns its children directly, so its derived destructor
+/// follows a deeply nested value through the Rust call stack.  Values loaded
+/// from JSON are protected by serde_json's parser recursion limit, but store
+/// records are also assembled by importers, test fixtures, and callers of the
+/// public snapshot API.  Keep the record destructors stack-safe for those
+/// inputs as well.
+pub(crate) fn drop_json_value_iteratively(value: Value) {
+    enum Pending {
+        Value(Value),
+        Array(std::vec::IntoIter<Value>),
+        Object(serde_json::map::IntoIter),
+    }
+
+    let mut pending = vec![Pending::Value(value)];
+    while let Some(item) = pending.pop() {
+        match item {
+            Pending::Value(value) => match value {
+                Value::Array(values) => pending.push(Pending::Array(values.into_iter())),
+                Value::Object(values) => pending.push(Pending::Object(values.into_iter())),
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            },
+            Pending::Array(mut values) => {
+                if let Some(value) = values.next() {
+                    pending.push(Pending::Array(values));
+                    pending.push(Pending::Value(value));
+                }
+            }
+            Pending::Object(mut values) => {
+                if let Some((_key, value)) = values.next() {
+                    pending.push(Pending::Object(values));
+                    pending.push(Pending::Value(value));
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
     pub id: String,
@@ -453,6 +493,46 @@ pub struct GraphSnapshot {
     pub adapter_logs: Vec<AdapterLogRecord>,
     pub coverage: CoverageRecord,
     pub profile_matrix: ProfileMatrixRecord,
+}
+
+impl Drop for GraphSnapshot {
+    fn drop(&mut self) {
+        for mut profile in std::mem::take(&mut self.profiles) {
+            if let Some(toolchain) = profile.toolchain.take() {
+                drop_json_value_iteratively(toolchain);
+            }
+            drop_json_value_iteratively(std::mem::replace(&mut profile.environment, Value::Null));
+            drop_json_value_iteratively(std::mem::replace(&mut profile.properties, Value::Null));
+        }
+        for mut node in std::mem::take(&mut self.nodes) {
+            drop_json_value_iteratively(std::mem::replace(&mut node.properties, Value::Null));
+        }
+        for mut site in std::mem::take(&mut self.sites) {
+            drop_json_value_iteratively(std::mem::replace(&mut site.condition, Value::Null));
+        }
+        for mut edge in std::mem::take(&mut self.edges) {
+            drop_json_value_iteratively(std::mem::replace(&mut edge.condition, Value::Null));
+        }
+        for mut diagnostic in std::mem::take(&mut self.diagnostics) {
+            drop_json_value_iteratively(std::mem::replace(&mut diagnostic.properties, Value::Null));
+        }
+        for mut evidence in std::mem::take(&mut self.evidence) {
+            drop_json_value_iteratively(std::mem::replace(&mut evidence.properties, Value::Null));
+        }
+        let mut profile_matrix = std::mem::take(&mut self.profile_matrix);
+        for mut entry in std::mem::take(&mut profile_matrix.entries) {
+            drop_json_value_iteratively(std::mem::replace(&mut entry.condition_union, Value::Null));
+        }
+        for mut correlation in std::mem::take(&mut profile_matrix.correlations) {
+            drop_json_value_iteratively(std::mem::replace(
+                &mut correlation.condition_union,
+                Value::Null,
+            ));
+            for (_phase, value) in std::mem::take(&mut correlation.conditions_by_phase) {
+                drop_json_value_iteratively(value);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

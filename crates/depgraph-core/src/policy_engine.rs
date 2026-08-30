@@ -78,6 +78,26 @@ fn charge_sort_work(
     work.steps(len.saturating_mul(comparison_rounds), is_cancelled)
 }
 
+fn charge_sort_key_bytes_work<I>(
+    len: usize,
+    key_bytes: I,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()>
+where
+    I: IntoIterator<Item = usize>,
+{
+    charge_sort_work(len, work, is_cancelled)?;
+    if len <= 1 {
+        return Ok(());
+    }
+    let comparison_rounds = usize::BITS as usize - (len - 1).leading_zeros() as usize;
+    for bytes in key_bytes {
+        work.steps(bytes.saturating_mul(comparison_rounds), is_cancelled)?;
+    }
+    Ok(())
+}
+
 fn charge_ordered_collection_work(
     len: usize,
     key_units: usize,
@@ -111,12 +131,13 @@ fn charge_json_value_work(
                 }
             }
             Value::Object(values) => {
-                for value in values.values() {
-                    work.step(is_cancelled)?;
+                for (key, value) in values {
+                    work.steps(key.len().saturating_add(1), is_cancelled)?;
                     pending.push(value);
                 }
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            Value::String(value) => work.steps(value.len(), is_cancelled)?,
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
     Ok(())
@@ -172,7 +193,12 @@ fn new_boundary_violation_ids_bounded(
                 | PolicyRuleKind::ForbiddenDependency
                 | PolicyRuleKind::RuntimeBoundary
         ) {
-            charge_ordered_collection_work(boundary_rule_ids.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                boundary_rule_ids.len(),
+                rule.id.len(),
+                work,
+                is_cancelled,
+            )?;
             boundary_rule_ids.insert(rule.id.as_str());
         }
     }
@@ -188,10 +214,11 @@ fn new_boundary_violation_ids_bounded(
         let key = boundary_violation_comparison_key_bounded(violation, work, is_cancelled)?;
         charge_ordered_collection_work(
             before_by_key.len(),
-            key.dependency_node_path.len().saturating_add(4),
+            boundary_violation_key_bytes(&key),
             work,
             is_cancelled,
         )?;
+        work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
         before_by_key
             .entry(key)
             .or_default()
@@ -208,10 +235,11 @@ fn new_boundary_violation_ids_bounded(
         let key = boundary_violation_comparison_key_bounded(violation, work, is_cancelled)?;
         charge_ordered_collection_work(
             after_by_key.len(),
-            key.dependency_node_path.len().saturating_add(4),
+            boundary_violation_key_bytes(&key),
             work,
             is_cancelled,
         )?;
+        work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
         after_by_key
             .entry(key)
             .or_default()
@@ -220,19 +248,19 @@ fn new_boundary_violation_ids_bounded(
     let mut new_ids = BTreeSet::new();
     for (key, mut ids) in after_by_key {
         work.step(is_cancelled)?;
-        charge_sort_work(ids.len(), work, is_cancelled)?;
+        charge_sort_key_bytes_work(ids.len(), ids.iter().map(String::len), work, is_cancelled)?;
         ids.sort();
         let mut before_id_counts = BTreeMap::<String, usize>::new();
         let mut remaining_before = 0usize;
         charge_ordered_collection_work(
             before_by_key.len(),
-            key.dependency_node_path.len().saturating_add(4),
+            boundary_violation_key_bytes(&key),
             work,
             is_cancelled,
         )?;
         for id in before_by_key.remove(&key).unwrap_or_default() {
             work.step(is_cancelled)?;
-            charge_ordered_collection_work(before_id_counts.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(before_id_counts.len(), id.len(), work, is_cancelled)?;
             let count = before_id_counts.entry(id).or_default();
             *count = count.saturating_add(1);
             remaining_before = remaining_before.saturating_add(1);
@@ -265,7 +293,7 @@ fn new_boundary_violation_ids_bounded(
         let moved_continuing = remaining_before.min(unmatched_after.len());
         for id in unmatched_after.into_iter().skip(moved_continuing) {
             work.step(is_cancelled)?;
-            charge_ordered_collection_work(new_ids.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(new_ids.len(), id.len(), work, is_cancelled)?;
             new_ids.insert(id);
         }
     }
@@ -278,11 +306,24 @@ fn boundary_violation_comparison_key_bounded(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BoundaryViolationComparisonKey> {
     work.step(is_cancelled)?;
-    let mut dependency_node_path = Vec::with_capacity(violation.dependency_path.len());
+    let mut dependency_node_path = Vec::new();
     for step in &violation.dependency_path {
         work.step(is_cancelled)?;
+        work.steps(
+            step.source_id.len().saturating_add(step.target_id.len()),
+            is_cancelled,
+        )?;
         dependency_node_path.push((step.source_id.clone(), step.target_id.clone()));
     }
+    work.steps(
+        violation
+            .rule_id
+            .len()
+            .saturating_add(violation.source.id.len())
+            .saturating_add(violation.target.id.len())
+            .saturating_add(violation.profile_id.as_deref().map_or(0, str::len)),
+        is_cancelled,
+    )?;
     Ok(BoundaryViolationComparisonKey {
         rule_id: violation.rule_id.clone(),
         source_id: violation.source.id.clone(),
@@ -290,6 +331,90 @@ fn boundary_violation_comparison_key_bounded(
         profile_id: violation.profile_id.clone(),
         dependency_node_path,
     })
+}
+
+fn boundary_violation_key_bytes(key: &BoundaryViolationComparisonKey) -> usize {
+    key.rule_id
+        .len()
+        .saturating_add(key.source_id.len())
+        .saturating_add(key.target_id.len())
+        .saturating_add(key.profile_id.as_deref().map_or(0, str::len))
+        .saturating_add(
+            key.dependency_node_path
+                .iter()
+                .map(|(source, target)| source.len().saturating_add(target.len()))
+                .sum::<usize>(),
+        )
+}
+
+fn violation_sort_key_bytes(violation: &PolicyViolation) -> usize {
+    violation
+        .rule_id
+        .len()
+        .saturating_add(violation.source.id.len())
+        .saturating_add(violation.target.id.len())
+        .saturating_add(violation.profile_id.as_deref().map_or(0, str::len))
+        .saturating_add(violation.id.len())
+}
+
+fn charge_violation_stable_id_work(
+    rule_id: &str,
+    source_id: &str,
+    target_id: &str,
+    profile_id: Option<&str>,
+    dependency_path: &[PolicyPathStep],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let path_bytes = dependency_path
+        .iter()
+        .map(|step| {
+            step.source_id
+                .len()
+                .saturating_add(step.edge_id.len())
+                .saturating_add(step.target_id.len())
+        })
+        .sum::<usize>();
+    // The stable-ID input is materialized as JSON and canonicalized before it
+    // is hashed.  Account for object/array framing and field names per path
+    // step in addition to the caller-owned string bytes.
+    work.steps(
+        rule_id
+            .len()
+            .saturating_add(source_id.len())
+            .saturating_add(target_id.len())
+            .saturating_add(profile_id.map_or(0, str::len))
+            .saturating_add(path_bytes)
+            .saturating_add(dependency_path.len().saturating_mul(128))
+            .saturating_add(256),
+        is_cancelled,
+    )
+}
+
+fn charge_public_api_stable_id_work(
+    rule_id: &str,
+    before_id: Option<&str>,
+    after_id: Option<&str>,
+    profile_id: Option<&str>,
+    changed_fields: &[String],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    work.steps(
+        rule_id
+            .len()
+            .saturating_add(before_id.map_or(0, str::len))
+            .saturating_add(after_id.map_or(0, str::len))
+            .saturating_add(profile_id.map_or(0, str::len))
+            .saturating_add(
+                changed_fields
+                    .iter()
+                    .map(|field| field.len().saturating_add(32))
+                    .sum::<usize>(),
+            )
+            .saturating_add(512),
+        is_cancelled,
+    )
 }
 
 /// Evaluate the architecture policy against one validated graph snapshot.
@@ -331,10 +456,16 @@ fn evaluate_policy_with_work(
         is_cancelled,
     )?;
     config.validate()?;
+    // Profile and node properties are copied into condition contexts below.
+    // Validate all caller-owned JSON before that materialization so a deep
+    // manually assembled value cannot recurse through `Value::clone()` even
+    // when the policy has no PublicApiChange rule (the diff path performs the
+    // corresponding `from`-side preflight before cloning).
+    validate_snapshot_values_bounded(snapshot, "snapshot", work, is_cancelled)?;
     let mut nodes = BTreeMap::new();
     for node in &snapshot.nodes {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(nodes.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(nodes.len(), node.id.len(), work, is_cancelled)?;
         nodes.insert(node.id.as_str(), node);
     }
     let mut violations = BTreeMap::new();
@@ -440,12 +571,17 @@ fn evaluate_policy_with_work(
         };
         for violation in evaluated {
             work.step(is_cancelled)?;
-            charge_ordered_collection_work(violations.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                violations.len(),
+                violation.id.len(),
+                work,
+                is_cancelled,
+            )?;
             violations.entry(violation.id.clone()).or_insert(violation);
         }
     }
 
-    let mut ordered = Vec::with_capacity(violations.len());
+    let mut ordered = Vec::new();
     for violation in violations.into_values() {
         work.step(is_cancelled)?;
         work.steps(
@@ -457,11 +593,21 @@ fn evaluate_policy_with_work(
         )?;
         ordered.push(violation);
     }
-    charge_sort_work(ordered.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        ordered.len(),
+        ordered.iter().map(violation_sort_key_bytes),
+        work,
+        is_cancelled,
+    )?;
     work.step(is_cancelled)?;
     let result = PolicyResult::new(snapshot_id, ordered);
     work.step(is_cancelled)?;
-    charge_sort_work(result.violations.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        result.violations.len(),
+        result.violations.iter().map(violation_sort_key_bytes),
+        work,
+        is_cancelled,
+    )?;
     for violation in &result.violations {
         work.step(is_cancelled)?;
         work.steps(
@@ -585,7 +731,7 @@ fn boundary_policy_config_bounded(
                 | PolicyRuleKind::ForbiddenDependency
                 | PolicyRuleKind::RuntimeBoundary
         ) {
-            charge_ordered_collection_work(rule_ids.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(rule_ids.len(), rule.id.len(), work, is_cancelled)?;
             rule_ids.insert(rule.id.as_str());
             rules.push(rule.clone());
         }
@@ -606,6 +752,383 @@ fn boundary_policy_config_bounded(
     Ok(filtered)
 }
 
+// Match serde_json's default recursion guard for general snapshot values.
+// Conditions use the narrower wire-format bound below because their logical
+// operator contract is stricter than arbitrary profile/node metadata.
+const MAX_SNAPSHOT_JSON_DEPTH: usize = 128;
+
+fn validate_snapshot_values_bounded(
+    snapshot: &GraphSnapshot,
+    description: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    for profile in &snapshot.profiles {
+        work.step(is_cancelled)?;
+        if let Some(value) = &profile.toolchain {
+            validate_json_value_bounded(value, description, work, is_cancelled)?;
+        }
+        validate_json_value_bounded(&profile.environment, description, work, is_cancelled)?;
+        validate_json_value_bounded(&profile.properties, description, work, is_cancelled)?;
+    }
+    for node in &snapshot.nodes {
+        work.step(is_cancelled)?;
+        validate_json_value_bounded(&node.properties, description, work, is_cancelled)?;
+    }
+    for site in &snapshot.sites {
+        work.step(is_cancelled)?;
+        validate_json_condition_value_bounded(&site.condition, description, work, is_cancelled)?;
+    }
+    for edge in &snapshot.edges {
+        work.step(is_cancelled)?;
+        validate_json_condition_value_bounded(&edge.condition, description, work, is_cancelled)?;
+    }
+    for evidence in &snapshot.evidence {
+        work.step(is_cancelled)?;
+        validate_json_value_bounded(&evidence.properties, description, work, is_cancelled)?;
+    }
+    for diagnostic in &snapshot.diagnostics {
+        work.step(is_cancelled)?;
+        validate_json_value_bounded(&diagnostic.properties, description, work, is_cancelled)?;
+    }
+    for entry in &snapshot.profile_matrix.entries {
+        work.step(is_cancelled)?;
+        validate_json_value_bounded(&entry.condition_union, description, work, is_cancelled)?;
+    }
+    for correlation in &snapshot.profile_matrix.correlations {
+        work.step(is_cancelled)?;
+        validate_json_value_bounded(
+            &correlation.condition_union,
+            description,
+            work,
+            is_cancelled,
+        )?;
+        for value in correlation.conditions_by_phase.values() {
+            work.step(is_cancelled)?;
+            validate_json_value_bounded(value, description, work, is_cancelled)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_value_bounded(
+    value: &Value,
+    description: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    validate_json_value_bounded_at_depth(
+        value,
+        description,
+        MAX_SNAPSHOT_JSON_DEPTH,
+        work,
+        is_cancelled,
+    )
+}
+
+fn validate_json_condition_value_bounded(
+    value: &Value,
+    description: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    // Each aggregate operator contributes one JSON object and one
+    // `conditions` array before its child. An `in` leaf contributes one
+    // additional `values` array before its primitive value, so a logical
+    // depth-16 condition can reach raw JSON depth 34.
+    validate_json_value_bounded_at_depth(
+        value,
+        description,
+        MAX_EDGE_CONDITION_JSON_DEPTH,
+        work,
+        is_cancelled,
+    )
+}
+
+fn validate_json_value_bounded_at_depth(
+    value: &Value,
+    description: &str,
+    maximum_depth: usize,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut pending = vec![(value, 0_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        work.step(is_cancelled)?;
+        if depth > maximum_depth {
+            bail!("{description} contains JSON nested deeper than {maximum_depth}");
+        }
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    work.step(is_cancelled)?;
+                    pending.push((value, depth.saturating_add(1)));
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    work.steps(key.len().saturating_add(1), is_cancelled)?;
+                    pending.push((value, depth.saturating_add(1)));
+                }
+            }
+            Value::String(value) => work.steps(value.len(), is_cancelled)?,
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn charge_snapshot_text_work(
+    snapshot: &GraphSnapshot,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    fn text(
+        value: &str,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        work.steps(value.len().saturating_add(1), is_cancelled)
+    }
+    fn optional_text(
+        value: Option<&String>,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        if let Some(value) = value {
+            text(value, work, is_cancelled)?;
+        }
+        Ok(())
+    }
+    fn charge_coverage(
+        value: &depgraph_store::CoverageRecord,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        for item in value.completeness.iter().chain(&value.reasons) {
+            text(item, work, is_cancelled)?;
+        }
+        Ok(())
+    }
+
+    text(&snapshot.scan.id, work, is_cancelled)?;
+    text(&snapshot.scan.root, work, is_cancelled)?;
+    text(&snapshot.scan.status, work, is_cancelled)?;
+    text(&snapshot.scan.started_at, work, is_cancelled)?;
+    optional_text(snapshot.scan.completed_at.as_ref(), work, is_cancelled)?;
+    optional_text(snapshot.scan.error.as_ref(), work, is_cancelled)?;
+    optional_text(
+        snapshot.scan.parent_snapshot_id.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    optional_text(snapshot.scan.source_revision.as_ref(), work, is_cancelled)?;
+    optional_text(
+        snapshot.scan.health_policy_config_digest.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    optional_text(
+        snapshot.scan.health_analyzer_version.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    optional_text(
+        snapshot.scan.health_finding_contract_version.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    for profile in &snapshot.profiles {
+        text(&profile.id, work, is_cancelled)?;
+        text(&profile.language, work, is_cancelled)?;
+        optional_text(profile.command.as_ref(), work, is_cancelled)?;
+        optional_text(profile.target.as_ref(), work, is_cancelled)?;
+        optional_text(profile.source_revision.as_ref(), work, is_cancelled)?;
+        for feature in &profile.features {
+            text(feature, work, is_cancelled)?;
+        }
+        if let Some(coverage) = &profile.coverage {
+            charge_coverage(coverage, work, is_cancelled)?;
+        }
+    }
+    for node in &snapshot.nodes {
+        text(&node.id, work, is_cancelled)?;
+        text(&node.kind, work, is_cancelled)?;
+        text(&node.locator, work, is_cancelled)?;
+        text(&node.display_name, work, is_cancelled)?;
+    }
+    for site in &snapshot.sites {
+        text(&site.id, work, is_cancelled)?;
+        text(&site.source, work, is_cancelled)?;
+        text(&site.kind, work, is_cancelled)?;
+        optional_text(site.specifier.as_ref(), work, is_cancelled)?;
+        text(&site.profile_id, work, is_cancelled)?;
+        text(&site.resolution_status, work, is_cancelled)?;
+        text(&site.precision, work, is_cancelled)?;
+        for target in &site.target_ids {
+            text(target, work, is_cancelled)?;
+        }
+        optional_text(site.reason.as_ref(), work, is_cancelled)?;
+    }
+    for edge in &snapshot.edges {
+        text(&edge.id, work, is_cancelled)?;
+        optional_text(edge.site_id.as_ref(), work, is_cancelled)?;
+        text(&edge.source, work, is_cancelled)?;
+        text(&edge.target, work, is_cancelled)?;
+        text(&edge.kind, work, is_cancelled)?;
+        text(&edge.phase, work, is_cancelled)?;
+        text(&edge.environment, work, is_cancelled)?;
+        text(&edge.profile_id, work, is_cancelled)?;
+        text(&edge.resolution_status, work, is_cancelled)?;
+        text(&edge.precision, work, is_cancelled)?;
+    }
+    for evidence in &snapshot.evidence {
+        text(&evidence.owner_type, work, is_cancelled)?;
+        text(&evidence.owner_id, work, is_cancelled)?;
+        text(&evidence.kind, work, is_cancelled)?;
+        text(&evidence.extractor, work, is_cancelled)?;
+        text(&evidence.extractor_version, work, is_cancelled)?;
+        text(&evidence.path, work, is_cancelled)?;
+        optional_text(evidence.detail.as_ref(), work, is_cancelled)?;
+    }
+    for diagnostic in &snapshot.diagnostics {
+        text(&diagnostic.id, work, is_cancelled)?;
+        text(&diagnostic.severity, work, is_cancelled)?;
+        text(&diagnostic.code, work, is_cancelled)?;
+        text(&diagnostic.message, work, is_cancelled)?;
+        optional_text(diagnostic.path.as_ref(), work, is_cancelled)?;
+        optional_text(diagnostic.adapter.as_ref(), work, is_cancelled)?;
+    }
+    for coverage in &snapshot.file_coverage {
+        text(&coverage.adapter, work, is_cancelled)?;
+        text(&coverage.path, work, is_cancelled)?;
+        optional_text(coverage.reason.as_ref(), work, is_cancelled)?;
+    }
+    for log in &snapshot.adapter_logs {
+        text(&log.adapter, work, is_cancelled)?;
+        text(&log.stderr, work, is_cancelled)?;
+    }
+    charge_coverage(&snapshot.coverage, work, is_cancelled)?;
+    text(&snapshot.profile_matrix.schema_version, work, is_cancelled)?;
+    for entry in &snapshot.profile_matrix.entries {
+        text(&entry.id, work, is_cancelled)?;
+        text(&entry.effective_input_id, work, is_cancelled)?;
+        text(&entry.language, work, is_cancelled)?;
+        for value in entry
+            .profile_ids
+            .iter()
+            .chain(&entry.parent_profile_ids)
+            .chain(&entry.phases)
+            .chain(&entry.selection_reasons)
+        {
+            text(value, work, is_cancelled)?;
+        }
+        for (key, coverage) in &entry.phase_coverage {
+            text(key, work, is_cancelled)?;
+            for value in coverage.profile_ids.iter().chain(&coverage.completeness) {
+                text(value, work, is_cancelled)?;
+            }
+        }
+        for conflict in &entry.axis_conflicts {
+            text(&conflict.profile_id, work, is_cancelled)?;
+            text(&conflict.parent_profile_id, work, is_cancelled)?;
+            text(&conflict.diagnostic_id, work, is_cancelled)?;
+            for field in &conflict.fields {
+                text(field, work, is_cancelled)?;
+            }
+        }
+    }
+    for (key, coverage) in &snapshot.profile_matrix.phase_coverage {
+        text(key, work, is_cancelled)?;
+        for value in coverage.profile_ids.iter().chain(&coverage.completeness) {
+            text(value, work, is_cancelled)?;
+        }
+    }
+    for key in snapshot.profile_matrix.difference_counts.keys() {
+        text(key, work, is_cancelled)?;
+    }
+    for correlation in &snapshot.profile_matrix.correlations {
+        text(&correlation.id, work, is_cancelled)?;
+        text(&correlation.effective_profile_id, work, is_cancelled)?;
+        text(&correlation.source, work, is_cancelled)?;
+        text(&correlation.kind, work, is_cancelled)?;
+        text(&correlation.specifier, work, is_cancelled)?;
+        text(&correlation.status, work, is_cancelled)?;
+        optional_text(correlation.diagnostic_id.as_ref(), work, is_cancelled)?;
+        for key in correlation.conditions_by_phase.keys() {
+            text(key, work, is_cancelled)?;
+        }
+        for map in [
+            &correlation.targets_by_phase,
+            &correlation.resolutions_by_phase,
+            &correlation.site_ids_by_phase,
+            &correlation.edge_ids_by_phase,
+        ] {
+            for (key, values) in map {
+                text(key, work, is_cancelled)?;
+                for value in values {
+                    text(value, work, is_cancelled)?;
+                }
+            }
+        }
+        for reason in &correlation.difference_reasons {
+            text(reason, work, is_cancelled)?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_record_count(snapshot: &GraphSnapshot) -> usize {
+    snapshot
+        .profiles
+        .len()
+        .saturating_add(snapshot.nodes.len())
+        .saturating_add(snapshot.sites.len())
+        .saturating_add(snapshot.edges.len())
+        .saturating_add(snapshot.evidence.len())
+        .saturating_add(snapshot.diagnostics.len())
+        .saturating_add(snapshot.profile_matrix.entries.len())
+        .saturating_add(snapshot.profile_matrix.correlations.len())
+}
+
+fn charge_diff_precompute_work(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    charge_snapshot_text_work(from, work, is_cancelled)?;
+    charge_snapshot_text_work(to, work, is_cancelled)?;
+    let records = snapshot_record_count(from)
+        .saturating_add(snapshot_record_count(to))
+        .saturating_add(from.file_coverage.len())
+        .saturating_add(to.file_coverage.len())
+        .saturating_add(from.adapter_logs.len())
+        .saturating_add(to.adapter_logs.len());
+    let rounds = if records == 0 {
+        1
+    } else {
+        usize::BITS as usize - records.leading_zeros() as usize
+    };
+    work.steps(
+        records.saturating_mul(rounds.saturating_add(8)),
+        is_cancelled,
+    )
+}
+
+fn changed_fields_bounded(
+    fields: &[String],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>> {
+    let mut output = Vec::new();
+    for field in fields {
+        work.steps(field.len().saturating_add(1), is_cancelled)?;
+        output.push(field.clone());
+    }
+    Ok(output)
+}
+
 fn evaluate_policy_diff_with_work(
     from_snapshot_id: &str,
     from: &GraphSnapshot,
@@ -616,41 +1139,68 @@ fn evaluate_policy_diff_with_work(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<PolicyResult> {
     config.validate()?;
+    let mut has_public_api_changes = false;
+    for rule in &config.rules {
+        work.step(is_cancelled)?;
+        has_public_api_changes |= rule.kind == PolicyRuleKind::PublicApiChange;
+    }
+    // `evaluate_policy_with_work` can materialize profile/node values while
+    // building its context.  Validate the `from` side before entering that
+    // path so it is also safe when the later diff clone is reached; the `to`
+    // side is preflighted at the start of `evaluate_policy_with_work`.
+    if has_public_api_changes {
+        validate_snapshot_values_bounded(from, "from snapshot", work, is_cancelled)?;
+    }
     let current = evaluate_policy_with_work(to_snapshot_id, to, config, work, is_cancelled)?;
-    if !config
-        .rules
-        .iter()
-        .any(|rule| rule.kind == PolicyRuleKind::PublicApiChange)
-    {
+    if !has_public_api_changes {
         return Ok(current);
     }
+    // `diff_graph_snapshots` consumes both snapshots and therefore requires a
+    // clone.  Reject deep/oversized JSON and charge the clone/diff preflight
+    // before that allocation so malformed snapshots cannot bypass the shared
+    // policy budget through the PublicApiChange-only path.
+    charge_diff_precompute_work(from, to, work, is_cancelled)?;
+    work.step(is_cancelled)?;
     let diff = diff_graph_snapshots(from_snapshot_id, to_snapshot_id, from.clone(), to.clone())?;
-    let rename_pairs: Vec<_> = diff
-        .renames
-        .iter()
-        .map(|rename| (rename.old_id.as_str(), rename.new_id.as_str()))
-        .collect();
-    let mut violations: BTreeMap<_, _> = current
-        .violations
-        .into_iter()
-        .map(|violation| (violation.id.clone(), violation))
-        .collect();
+    work.step(is_cancelled)?;
+    let mut rename_pairs = Vec::new();
+    for rename in &diff.renames {
+        work.step(is_cancelled)?;
+        rename_pairs.push((rename.old_id.as_str(), rename.new_id.as_str()));
+    }
+    let mut violations = BTreeMap::new();
+    for violation in current.violations {
+        work.step(is_cancelled)?;
+        work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(violations.len(), violation.id.len(), work, is_cancelled)?;
+        violations.insert(violation.id.clone(), violation);
+    }
     let mut api_changes = Vec::new();
-    let from_node_evidence = NodeEvidenceIndex::new(from);
-    let to_node_evidence = NodeEvidenceIndex::new(to);
+    let from_node_evidence = NodeEvidenceIndex::new_bounded(from, work, is_cancelled)?;
+    let to_node_evidence = NodeEvidenceIndex::new_bounded(to, work, is_cancelled)?;
 
     for rule in config
         .rules
         .iter()
         .filter(|rule| rule.kind == PolicyRuleKind::PublicApiChange)
     {
-        validate_diff_selector(from, to, &rule.target, &rule.id)?;
-        let suppressions = resolve_diff_suppressions(from, to, &rename_pairs, config, &rule.id)?;
-        let admitted = admitted_edges_with_options(from, rule, false, false)?;
+        validate_diff_selector_bounded(from, to, &rule.target, &rule.id, work, is_cancelled)?;
+        let suppressions = resolve_diff_suppressions_bounded(
+            from,
+            to,
+            &rename_pairs,
+            config,
+            &rule.id,
+            work,
+            is_cancelled,
+        )?;
+        let admitted =
+            admitted_edges_with_options_bounded(from, rule, false, false, work, is_cancelled)?;
         let mut rule_changes = Vec::new();
 
         for node in &diff.nodes.added {
-            if let Some(change) = classify_public_api_change(
+            work.step(is_cancelled)?;
+            if let Some(change) = classify_public_api_change_bounded(
                 rule,
                 PublicApiChangeKind::Added,
                 None,
@@ -660,12 +1210,16 @@ fn evaluate_policy_diff_with_work(
                 to,
                 &from_node_evidence,
                 &to_node_evidence,
+                work,
+                is_cancelled,
             )? {
+                work.step(is_cancelled)?;
                 rule_changes.push((change, None));
             }
         }
         for node in &diff.nodes.removed {
-            if let Some(change) = classify_public_api_change(
+            work.step(is_cancelled)?;
+            if let Some(change) = classify_public_api_change_bounded(
                 rule,
                 PublicApiChangeKind::Removed,
                 Some(node),
@@ -675,61 +1229,81 @@ fn evaluate_policy_diff_with_work(
                 to,
                 &from_node_evidence,
                 &to_node_evidence,
+                work,
+                is_cancelled,
             )? {
+                work.step(is_cancelled)?;
                 rule_changes.push((change, Some(node)));
             }
         }
         for changed in &diff.nodes.changed {
-            if let Some(change) = classify_public_api_change(
+            work.step(is_cancelled)?;
+            if let Some(change) = classify_public_api_change_bounded(
                 rule,
                 PublicApiChangeKind::Changed,
                 Some(&changed.before),
                 Some(&changed.after),
-                changed.changed_fields.clone(),
+                changed_fields_bounded(&changed.changed_fields, work, is_cancelled)?,
                 from,
                 to,
                 &from_node_evidence,
                 &to_node_evidence,
+                work,
+                is_cancelled,
             )? {
+                work.step(is_cancelled)?;
                 rule_changes.push((change, Some(&changed.before)));
             }
         }
         for rename in &diff.renames {
-            if let Some(change) = classify_public_api_change(
+            work.step(is_cancelled)?;
+            if let Some(change) = classify_public_api_change_bounded(
                 rule,
                 PublicApiChangeKind::Changed,
                 Some(&rename.before),
                 Some(&rename.after),
-                rename.changed_fields.clone(),
+                changed_fields_bounded(&rename.changed_fields, work, is_cancelled)?,
                 from,
                 to,
                 &from_node_evidence,
                 &to_node_evidence,
+                work,
+                is_cancelled,
             )? {
+                work.step(is_cancelled)?;
                 rule_changes.push((change, Some(&rename.before)));
             }
         }
 
-        let needs_impact = rule_changes.iter().any(|(change, _)| change.breaking);
+        let mut needs_impact = false;
+        for (change, _) in &rule_changes {
+            work.step(is_cancelled)?;
+            needs_impact |= change.breaking;
+        }
         let sources = needs_impact
             .then(|| {
-                resolve_selector(
+                resolve_selector_bounded(
                     from,
                     &rule.source,
                     &format!("public API rule {:?} source", rule.id),
+                    work,
+                    is_cancelled,
                 )
             })
             .transpose()?
             .unwrap_or_default();
-        let nodes: BTreeMap<_, _> = from
-            .nodes
-            .iter()
-            .map(|node| (node.id.as_str(), node))
-            .collect();
+        let mut nodes = BTreeMap::new();
+        for node in &from.nodes {
+            work.step(is_cancelled)?;
+            work.steps(node.id.len().saturating_add(1), is_cancelled)?;
+            charge_ordered_collection_work(nodes.len(), node.id.len(), work, is_cancelled)?;
+            nodes.insert(node.id.as_str(), node);
+        }
 
         for (change, before) in rule_changes {
+            work.step(is_cancelled)?;
             if let Some(before) = before {
-                for violation in evaluate_public_api_impact(
+                for violation in evaluate_public_api_impact_bounded(
                     rule,
                     &change,
                     before,
@@ -739,23 +1313,93 @@ fn evaluate_policy_diff_with_work(
                     &suppressions,
                     from,
                     to,
+                    work,
+                    is_cancelled,
                 )? {
+                    work.step(is_cancelled)?;
+                    charge_ordered_collection_work(
+                        violations.len(),
+                        violation.id.len(),
+                        work,
+                        is_cancelled,
+                    )?;
                     violations.entry(violation.id.clone()).or_insert(violation);
                 }
             }
+            work.step(is_cancelled)?;
             api_changes.push(change);
         }
     }
 
-    let result = PolicyResult::with_api_changes(
-        to_snapshot_id,
-        api_changes,
-        violations.into_values().collect(),
-    );
+    charge_sort_key_bytes_work(
+        api_changes.len(),
+        api_changes.iter().map(|change| {
+            change
+                .rule_id
+                .len()
+                .saturating_add(change.id.len())
+                .saturating_add(change.changed_fields.iter().map(String::len).sum::<usize>())
+                .saturating_add(change.before.as_ref().map_or(0, |entity| {
+                    entity.id.len().saturating_add(entity.locator.len())
+                }))
+                .saturating_add(change.after.as_ref().map_or(0, |entity| {
+                    entity.id.len().saturating_add(entity.locator.len())
+                }))
+                .saturating_add(change.profile_id.as_deref().map_or(0, str::len))
+        }),
+        work,
+        is_cancelled,
+    )?;
+    work.steps(api_changes.len(), is_cancelled)?;
+    let mut violation_values = Vec::new();
+    for violation in violations.into_values() {
+        work.step(is_cancelled)?;
+        violation_values.push(violation);
+    }
+    charge_sort_key_bytes_work(
+        violation_values.len(),
+        violation_values.iter().map(violation_sort_key_bytes),
+        work,
+        is_cancelled,
+    )?;
+    for violation in &violation_values {
+        work.step(is_cancelled)?;
+        work.steps(
+            violation
+                .dependency_path
+                .len()
+                .saturating_add(violation.evidence.len()),
+            is_cancelled,
+        )?;
+    }
+    let result = PolicyResult::with_api_changes(to_snapshot_id, api_changes, violation_values);
+    work.step(is_cancelled)?;
+    charge_sort_key_bytes_work(
+        result.api_changes.len(),
+        result.api_changes.iter().map(|change| {
+            change
+                .rule_id
+                .len()
+                .saturating_add(change.id.len())
+                .saturating_add(change.before.as_ref().map_or(0, |entity| entity.id.len()))
+                .saturating_add(change.after.as_ref().map_or(0, |entity| entity.id.len()))
+                .saturating_add(change.profile_id.as_deref().map_or(0, str::len))
+        }),
+        work,
+        is_cancelled,
+    )?;
+    charge_sort_key_bytes_work(
+        result.violations.len(),
+        result.violations.iter().map(violation_sort_key_bytes),
+        work,
+        is_cancelled,
+    )?;
     result.validate()?;
+    work.step(is_cancelled)?;
     Ok(result)
 }
 
+#[allow(dead_code)]
 fn validate_diff_selector(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
@@ -783,6 +1427,7 @@ fn validate_diff_selector(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn resolve_diff_suppressions<'a>(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
@@ -834,6 +1479,7 @@ fn resolve_diff_suppressions<'a>(
     Ok(resolved)
 }
 
+#[allow(dead_code)]
 fn resolve_diff_scope_selector(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
@@ -874,7 +1520,905 @@ fn resolve_diff_scope_selector(
     Ok(ids)
 }
 
+fn validate_diff_selector_bounded(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    selector: &PolicySelector,
+    rule_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if selector.cardinality != PolicySelectorCardinality::One {
+        work.step(is_cancelled)?;
+        return Ok(());
+    }
+    let mut before = 0_usize;
+    for node in &from.nodes {
+        work.step(is_cancelled)?;
+        if selector_matches_node_bounded(node, selector, work, is_cancelled)? {
+            before = before.saturating_add(1);
+        }
+    }
+    let mut after = 0_usize;
+    for node in &to.nodes {
+        work.step(is_cancelled)?;
+        if selector_matches_node_bounded(node, selector, work, is_cancelled)? {
+            after = after.saturating_add(1);
+        }
+    }
+    if before > 1 || after > 1 || (before == 0 && after == 0) {
+        bail!(
+            "public API rule {rule_id:?} target selector must resolve to exactly one node in at least one snapshot and at most one per snapshot, but matched {before} before and {after} after"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_diff_suppressions_bounded<'a>(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    rename_pairs: &[(&str, &str)],
+    config: &'a PolicyConfig,
+    rule_id: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<ResolvedSuppression<'a>>> {
+    let mut resolved = Vec::new();
+    for suppression in &config.suppressions {
+        work.step(is_cancelled)?;
+        if suppression.rule_id != rule_id {
+            continue;
+        }
+        work.steps(
+            suppression
+                .id
+                .len()
+                .saturating_add(suppression.rule_id.len())
+                .saturating_add(suppression.reason.len()),
+            is_cancelled,
+        )?;
+        let source_ids = suppression
+            .scope
+            .source
+            .as_ref()
+            .map(|selector| {
+                let description = format!("suppression {:?} source", suppression.id);
+                work.steps(description.len(), is_cancelled)?;
+                resolve_diff_scope_selector_bounded(
+                    from,
+                    to,
+                    rename_pairs,
+                    selector,
+                    &description,
+                    work,
+                    is_cancelled,
+                )
+            })
+            .transpose()?;
+        let target_ids = suppression
+            .scope
+            .target
+            .as_ref()
+            .map(|selector| {
+                let description = format!("suppression {:?} target", suppression.id);
+                work.steps(description.len(), is_cancelled)?;
+                resolve_diff_scope_selector_bounded(
+                    from,
+                    to,
+                    rename_pairs,
+                    selector,
+                    &description,
+                    work,
+                    is_cancelled,
+                )
+            })
+            .transpose()?;
+        work.step(is_cancelled)?;
+        resolved.push(ResolvedSuppression {
+            suppression,
+            source_ids,
+            target_ids,
+        });
+    }
+    charge_sort_key_bytes_work(
+        resolved.len(),
+        resolved.iter().map(|item| item.suppression.id.len()),
+        work,
+        is_cancelled,
+    )?;
+    resolved.sort_by(|left, right| left.suppression.id.cmp(&right.suppression.id));
+    Ok(resolved)
+}
+
+fn resolve_diff_scope_selector_bounded(
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    rename_pairs: &[(&str, &str)],
+    selector: &PolicySelector,
+    description: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeSet<String>> {
+    work.steps(description.len(), is_cancelled)?;
+    let mut before = 0_usize;
+    let mut after = 0_usize;
+    let mut ids = BTreeSet::new();
+    for node in &from.nodes {
+        work.step(is_cancelled)?;
+        if selector_matches_node_bounded(node, selector, work, is_cancelled)? {
+            before = before.saturating_add(1);
+            work.steps(node.id.len().saturating_add(1), is_cancelled)?;
+            charge_ordered_collection_work(ids.len(), node.id.len(), work, is_cancelled)?;
+            ids.insert(node.id.clone());
+        }
+    }
+    for node in &to.nodes {
+        work.step(is_cancelled)?;
+        if selector_matches_node_bounded(node, selector, work, is_cancelled)? {
+            after = after.saturating_add(1);
+            work.steps(node.id.len().saturating_add(1), is_cancelled)?;
+            charge_ordered_collection_work(ids.len(), node.id.len(), work, is_cancelled)?;
+            ids.insert(node.id.clone());
+        }
+    }
+    if selector.cardinality == PolicySelectorCardinality::One
+        && (before > 1 || after > 1 || (before == 0 && after == 0))
+    {
+        bail!(
+            "policy selector {description} must resolve to at most one node per snapshot and at least one across the diff, but matched {before} before and {after} after"
+        );
+    }
+    for (old_id, new_id) in rename_pairs {
+        work.step(is_cancelled)?;
+        if ids.contains(*old_id) || ids.contains(*new_id) {
+            work.steps(old_id.len().saturating_add(new_id.len()), is_cancelled)?;
+            charge_ordered_collection_work(ids.len(), old_id.len(), work, is_cancelled)?;
+            ids.insert((*old_id).to_owned());
+            charge_ordered_collection_work(ids.len(), new_id.len(), work, is_cancelled)?;
+            ids.insert((*new_id).to_owned());
+        }
+    }
+    Ok(ids)
+}
+
+fn charge_policy_condition_work(
+    condition: &PolicyCondition,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut pending = vec![condition];
+    while let Some(condition) = pending.pop() {
+        work.step(is_cancelled)?;
+        match condition {
+            PolicyCondition::All { conditions } | PolicyCondition::Any { conditions } => {
+                work.steps(conditions.len(), is_cancelled)?;
+                pending.extend(conditions.iter());
+            }
+            PolicyCondition::Not { condition } => pending.push(condition),
+            PolicyCondition::Eq { key, value } => {
+                work.steps(key.len().saturating_add(1), is_cancelled)?;
+                charge_json_value_work(value, work, is_cancelled)?;
+            }
+            PolicyCondition::In { key, values } => {
+                work.steps(key.len().saturating_add(1), is_cancelled)?;
+                work.steps(values.len(), is_cancelled)?;
+                for value in values {
+                    charge_json_value_work(value, work, is_cancelled)?;
+                }
+            }
+            PolicyCondition::Defined { key } => {
+                work.steps(key.len().saturating_add(1), is_cancelled)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn policy_entity_bounded(
+    node: &NodeRecord,
+    kind: PolicySelectorKind,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyEntity> {
+    work.steps(
+        node.id
+            .len()
+            .saturating_add(node.locator.len())
+            .saturating_add(1),
+        is_cancelled,
+    )?;
+    Ok(PolicyEntity {
+        id: node.id.clone(),
+        kind,
+        locator: node.locator.clone(),
+    })
+}
+
+fn merge_object_bounded(
+    context: &mut BTreeMap<String, Value>,
+    value: &Value,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            work.steps(key.len().saturating_add(1), is_cancelled)?;
+            charge_json_value_work(value, work, is_cancelled)?;
+            charge_ordered_collection_work(context.len(), key.len(), work, is_cancelled)?;
+            context.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    Ok(())
+}
+
+fn public_api_change_context_bounded(
+    before: Option<&NodeRecord>,
+    after: Option<&NodeRecord>,
+    profile: Option<&ProfileRecord>,
+    kind: PublicApiChangeKind,
+    changed_fields: &[String],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, Value>> {
+    let mut context = BTreeMap::new();
+    if let Some(profile) = profile {
+        merge_object_bounded(&mut context, &profile.environment, work, is_cancelled)?;
+        merge_object_bounded(&mut context, &profile.properties, work, is_cancelled)?;
+        work.steps(profile.language.len().saturating_add(1), is_cancelled)?;
+        context.insert(
+            "language".to_owned(),
+            Value::String(profile.language.clone()),
+        );
+        if let Some(target) = &profile.target {
+            work.steps(target.len().saturating_add(1), is_cancelled)?;
+            context.insert("target".to_owned(), Value::String(target.clone()));
+        }
+        if let Some(command) = &profile.command {
+            work.steps(command.len().saturating_add(1), is_cancelled)?;
+            context.insert("command".to_owned(), Value::String(command.clone()));
+        }
+        let mut features = Vec::new();
+        for feature in &profile.features {
+            work.steps(feature.len().saturating_add(1), is_cancelled)?;
+            features.push(Value::String(feature.clone()));
+        }
+        context.insert("features".to_owned(), Value::Array(features));
+        work.steps(profile.id.len().saturating_add(1), is_cancelled)?;
+        context.insert("profile".to_owned(), Value::String(profile.id.clone()));
+        work.steps(profile.id.len().saturating_add(1), is_cancelled)?;
+        context.insert("profile_id".to_owned(), Value::String(profile.id.clone()));
+    }
+    if let Some(node) = after.or(before) {
+        merge_object_bounded(&mut context, &node.properties, work, is_cancelled)?;
+    }
+    let mut change = serde_json::Map::new();
+    work.steps(1, is_cancelled)?;
+    change.insert(
+        "kind".to_owned(),
+        Value::String(public_api_change_kind_name(kind).to_owned()),
+    );
+    work.steps(1, is_cancelled)?;
+    change.insert(
+        "breaking".to_owned(),
+        Value::Bool(kind != PublicApiChangeKind::Added),
+    );
+    let mut fields = Vec::new();
+    for field in changed_fields {
+        work.steps(field.len().saturating_add(1), is_cancelled)?;
+        fields.push(Value::String(field.clone()));
+    }
+    change.insert("changed_fields".to_owned(), Value::Array(fields));
+    work.steps(1, is_cancelled)?;
+    context.insert("change".to_owned(), Value::Object(change));
+    Ok(context)
+}
+
+fn node_policy_evidence_bounded(
+    index: &NodeEvidenceIndex<'_>,
+    node: &NodeRecord,
+    requirement: &PolicyEvidenceRequirement,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<PolicyEvidenceSpan>> {
+    let records = index
+        .records
+        .get(node.id.as_str())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut spans = Vec::new();
+    for record in records {
+        work.step(is_cancelled)?;
+        if requirement.primary_only && record.ordinal != 0 {
+            continue;
+        }
+        work.steps(
+            record.kind.len().saturating_add(record.path.len()),
+            is_cancelled,
+        )?;
+        let kind: EvidenceKind = serde_json::from_value(Value::String(record.kind.clone()))
+            .with_context(|| {
+                format!(
+                    "node {:?} evidence has unknown kind {:?}",
+                    node.id, record.kind
+                )
+            })?;
+        if !requirement.kinds.contains(&kind) {
+            continue;
+        }
+        spans.push(PolicyEvidenceSpan {
+            kind,
+            path: record.path.clone(),
+            start_line: u32::try_from(record.start_line)?,
+            start_column: u32::try_from(record.start_column)?,
+            end_line: u32::try_from(record.end_line)?,
+            end_column: u32::try_from(record.end_column)?,
+        });
+    }
+    if requirement.kinds.contains(&EvidenceKind::Source)
+        && let Some(path) = string_property(&node.properties, &["source_path", "path"])
+        && let Some(span) = node
+            .properties
+            .get("source_span")
+            .and_then(Value::as_object)
+    {
+        work.steps(path.len().saturating_add(1), is_cancelled)?;
+        let position = |name: &str| {
+            span.get(name)
+                .and_then(Value::as_u64)
+                .with_context(|| format!("node {:?} source_span.{name} is missing", node.id))
+                .and_then(|value| u32::try_from(value).map_err(Into::into))
+        };
+        spans.push(PolicyEvidenceSpan {
+            kind: EvidenceKind::Source,
+            path: path.to_owned(),
+            start_line: position("start_line")?,
+            start_column: position("start_column")?,
+            end_line: position("end_line")?,
+            end_column: position("end_column")?,
+        });
+    }
+    canonicalize_evidence_bounded(&mut spans, work, is_cancelled)?;
+    Ok(spans)
+}
+
+fn append_unique_evidence_bounded(
+    destination: &mut Vec<PolicyEvidenceSpan>,
+    evidence: Vec<PolicyEvidenceSpan>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    for span in evidence {
+        work.step(is_cancelled)?;
+        let mut duplicate = false;
+        for existing in destination.iter() {
+            work.step(is_cancelled)?;
+            work.steps(
+                existing.path.len().saturating_add(span.path.len()),
+                is_cancelled,
+            )?;
+            if existing == &span {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            work.step(is_cancelled)?;
+            destination.push(span);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
+fn classify_public_api_change_bounded(
+    rule: &PolicyRule,
+    kind: PublicApiChangeKind,
+    before: Option<&NodeRecord>,
+    after: Option<&NodeRecord>,
+    mut changed_fields: Vec<String>,
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    from_node_evidence: &NodeEvidenceIndex<'_>,
+    to_node_evidence: &NodeEvidenceIndex<'_>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<PublicApiChange>> {
+    work.step(is_cancelled)?;
+    let before_matches = before
+        .map(|node| selector_matches_node_bounded(node, &rule.target, work, is_cancelled))
+        .transpose()?
+        .unwrap_or(false);
+    let after_matches = after
+        .map(|node| selector_matches_node_bounded(node, &rule.target, work, is_cancelled))
+        .transpose()?
+        .unwrap_or(false);
+    if !before_matches && !after_matches {
+        return Ok(None);
+    }
+    charge_sort_work(changed_fields.len(), work, is_cancelled)?;
+    for field in &changed_fields {
+        work.steps(field.len().saturating_add(1), is_cancelled)?;
+    }
+    changed_fields.sort();
+    changed_fields.dedup();
+    let node = after.or(before).context("public API change has no node")?;
+    let profile_id = if let Some(profile_id) = node_profile_id(node) {
+        work.steps(profile_id.len().saturating_add(1), is_cancelled)?;
+        Some(profile_id.to_owned())
+    } else {
+        None
+    };
+    let profile_matches = match profile_id.as_deref() {
+        Some(profile_id) => {
+            profile_matches_bounded(&rule.profiles, profile_id, work, is_cancelled)?
+        }
+        None => rule.profiles == PolicyProfileFilter::default(),
+    };
+    if !profile_matches {
+        return Ok(None);
+    }
+    let profiles = if after.is_some() {
+        &to.profiles
+    } else {
+        &from.profiles
+    };
+    let profile = if let Some(profile_id) = profile_id.as_deref() {
+        let mut found = None;
+        for candidate in profiles {
+            work.step(is_cancelled)?;
+            if candidate.id == profile_id {
+                found = Some(candidate);
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    let context = public_api_change_context_bounded(
+        before,
+        after,
+        profile,
+        kind,
+        &changed_fields,
+        work,
+        is_cancelled,
+    )?;
+    if evaluate_condition_bounded_inner(&rule.condition, &context, false, work, is_cancelled)?
+        != Some(true)
+    {
+        return Ok(None);
+    }
+
+    let mut evidence = Vec::new();
+    if let Some(after) = after {
+        append_unique_evidence_bounded(
+            &mut evidence,
+            node_policy_evidence_bounded(
+                to_node_evidence,
+                after,
+                &rule.evidence,
+                work,
+                is_cancelled,
+            )?,
+            work,
+            is_cancelled,
+        )?;
+    }
+    if let Some(before) = before {
+        append_unique_evidence_bounded(
+            &mut evidence,
+            node_policy_evidence_bounded(
+                from_node_evidence,
+                before,
+                &rule.evidence,
+                work,
+                is_cancelled,
+            )?,
+            work,
+            is_cancelled,
+        )?;
+    }
+    if evidence.len() < usize::try_from(rule.evidence.minimum_spans)? {
+        return Ok(None);
+    }
+
+    charge_policy_condition_work(&rule.condition, work, is_cancelled)?;
+    work.steps(3, is_cancelled)?;
+    let condition = canonical_condition_bounded(
+        &PolicyCondition::All {
+            conditions: vec![
+                rule.condition.clone(),
+                PolicyCondition::Eq {
+                    key: "change.kind".to_owned(),
+                    value: Value::String(public_api_change_kind_name(kind).to_owned()),
+                },
+                PolicyCondition::Eq {
+                    key: "change.breaking".to_owned(),
+                    value: Value::Bool(kind != PublicApiChangeKind::Added),
+                },
+            ],
+        },
+        work,
+        is_cancelled,
+    )?;
+    let before_entity = before
+        .map(|node| policy_entity_bounded(node, rule.target.kind, work, is_cancelled))
+        .transpose()?;
+    let after_entity = after
+        .map(|node| policy_entity_bounded(node, rule.target.kind, work, is_cancelled))
+        .transpose()?;
+    charge_public_api_stable_id_work(
+        &rule.id,
+        before_entity.as_ref().map(|entity| entity.id.as_str()),
+        after_entity.as_ref().map(|entity| entity.id.as_str()),
+        profile_id.as_deref(),
+        &changed_fields,
+        work,
+        is_cancelled,
+    )?;
+    let id = PublicApiChange::stable_id(
+        &rule.id,
+        kind,
+        before_entity.as_ref().map(|entity| entity.id.as_str()),
+        after_entity.as_ref().map(|entity| entity.id.as_str()),
+        profile_id.as_deref(),
+        &changed_fields,
+    );
+    work.steps(rule.id.len().saturating_add(1), is_cancelled)?;
+    Ok(Some(PublicApiChange {
+        id,
+        rule_id: rule.id.clone(),
+        kind,
+        breaking: kind != PublicApiChangeKind::Added,
+        changed_fields,
+        before: before_entity,
+        after: after_entity,
+        profile_id,
+        condition,
+        evidence,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_public_api_impact_bounded(
+    rule: &PolicyRule,
+    change: &PublicApiChange,
+    before: &NodeRecord,
+    sources: &[&NodeRecord],
+    admitted: &[AdmittedEdge<'_>],
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    suppressions: &[ResolvedSuppression<'_>],
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<PolicyViolation>> {
+    let baseline_profile_id = node_profile_id(before);
+    let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
+    for item in admitted {
+        work.step(is_cancelled)?;
+        if baseline_profile_id.is_some_and(|profile_id| item.edge.profile_id != profile_id) {
+            continue;
+        }
+        charge_ordered_collection_work(
+            by_profile.len(),
+            item.edge.profile_id.len(),
+            work,
+            is_cancelled,
+        )?;
+        by_profile
+            .entry(item.edge.profile_id.as_str())
+            .or_default()
+            .push(item);
+    }
+    let mut output = BTreeMap::new();
+    for (profile_id, edges) in by_profile {
+        work.step(is_cancelled)?;
+        let adjacency = adjacency_bounded(&edges, work, is_cancelled)?;
+        for source in sources {
+            work.step(is_cancelled)?;
+            work.steps(
+                source.id.len().saturating_mul(2).saturating_add(1),
+                is_cancelled,
+            )?;
+            let mut visited = BTreeSet::new();
+            let source_id = source.id.clone();
+            visited.insert(source_id.clone());
+            let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(source_id);
+            while let Some(current) = queue.pop_front() {
+                work.step(is_cancelled)?;
+                if let Some(outgoing) = adjacency.get(current.as_str()) {
+                    for item in outgoing {
+                        work.step(is_cancelled)?;
+                        let target_id = item.edge.target.as_str();
+                        work.steps(target_id.len().saturating_add(1), is_cancelled)?;
+                        charge_ordered_collection_work(
+                            visited.len(),
+                            target_id.len(),
+                            work,
+                            is_cancelled,
+                        )?;
+                        if !visited.contains(target_id) {
+                            // The target is owned by each of the visited,
+                            // predecessor, and queue collections. Charge all
+                            // three copies before allocating any of them.
+                            work.steps(target_id.len().saturating_mul(3), is_cancelled)?;
+                            charge_ordered_collection_work(
+                                predecessor.len(),
+                                target_id.len(),
+                                work,
+                                is_cancelled,
+                            )?;
+                            let target_id = target_id.to_owned();
+                            visited.insert(target_id.clone());
+                            predecessor.insert(target_id.clone(), item);
+                            queue.push_back(target_id);
+                        }
+                    }
+                }
+            }
+            if !visited.contains(&before.id) {
+                continue;
+            }
+            let path_edges =
+                reconstruct_path_bounded(&source.id, &before.id, &predecessor, work, is_cancelled)?;
+            if path_edges.is_empty() {
+                continue;
+            }
+            let violation = make_public_api_violation_bounded(
+                rule,
+                change,
+                source,
+                before,
+                Some(profile_id),
+                path_edges,
+                nodes,
+                suppressions,
+                from,
+                to,
+                work,
+                is_cancelled,
+            )?;
+            work.step(is_cancelled)?;
+            work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
+            charge_ordered_collection_work(output.len(), violation.id.len(), work, is_cancelled)?;
+            output.entry(violation.id.clone()).or_insert(violation);
+        }
+    }
+    for source in sources {
+        work.step(is_cancelled)?;
+        if source.id != before.id {
+            continue;
+        }
+        let violation = make_public_api_violation_bounded(
+            rule,
+            change,
+            source,
+            before,
+            baseline_profile_id,
+            Vec::new(),
+            nodes,
+            suppressions,
+            from,
+            to,
+            work,
+            is_cancelled,
+        )?;
+        work.step(is_cancelled)?;
+        work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(output.len(), violation.id.len(), work, is_cancelled)?;
+        output.entry(violation.id.clone()).or_insert(violation);
+    }
+    let mut values = Vec::new();
+    for violation in output.into_values() {
+        work.step(is_cancelled)?;
+        values.push(violation);
+    }
+    Ok(values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_public_api_violation_bounded(
+    rule: &PolicyRule,
+    change: &PublicApiChange,
+    source: &NodeRecord,
+    target: &NodeRecord,
+    profile_id: Option<&str>,
+    path_edges: Vec<&AdmittedEdge<'_>>,
+    nodes: &BTreeMap<&str, &NodeRecord>,
+    suppressions: &[ResolvedSuppression<'_>],
+    from: &GraphSnapshot,
+    to: &GraphSnapshot,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyViolation> {
+    work.step(is_cancelled)?;
+    work.steps(
+        source
+            .id
+            .len()
+            .saturating_add(target.id.len())
+            .saturating_add(1),
+        is_cancelled,
+    )?;
+    if !nodes.contains_key(source.id.as_str()) || !nodes.contains_key(target.id.as_str()) {
+        bail!("public API impact path references a node missing from the baseline snapshot");
+    }
+    let mut dependency_path = Vec::new();
+    if path_edges.is_empty() {
+        work.steps(
+            source
+                .id
+                .len()
+                .saturating_add(target.id.len())
+                .saturating_add(change.id.len()),
+            is_cancelled,
+        )?;
+        dependency_path.push(PolicyPathStep {
+            source_id: source.id.clone(),
+            edge_id: change.id.clone(),
+            target_id: target.id.clone(),
+        });
+    } else {
+        for item in &path_edges {
+            work.step(is_cancelled)?;
+            work.steps(
+                item.edge
+                    .source
+                    .len()
+                    .saturating_add(item.edge.id.len())
+                    .saturating_add(item.edge.target.len()),
+                is_cancelled,
+            )?;
+            dependency_path.push(path_step_bounded(item.edge, work, is_cancelled)?);
+        }
+    }
+
+    let mut evidence = Vec::new();
+    for span in &change.evidence {
+        work.step(is_cancelled)?;
+        work.steps(span.path.len().saturating_add(1), is_cancelled)?;
+        append_unique_evidence_bounded(&mut evidence, vec![span.clone()], work, is_cancelled)?;
+    }
+    for item in &path_edges {
+        work.step(is_cancelled)?;
+        let mut spans = Vec::new();
+        for span in &item.evidence {
+            work.step(is_cancelled)?;
+            work.steps(span.path.len().saturating_add(1), is_cancelled)?;
+            spans.push(span.clone());
+        }
+        append_unique_evidence_bounded(&mut evidence, spans, work, is_cancelled)?;
+    }
+    canonicalize_evidence_bounded(&mut evidence, work, is_cancelled)?;
+
+    charge_policy_condition_work(&change.condition, work, is_cancelled)?;
+    let mut conditions = vec![change.condition.clone()];
+    if !path_edges.is_empty() {
+        conditions.push(combined_condition_bounded(&path_edges, work, is_cancelled)?);
+    }
+    let condition =
+        canonical_condition_bounded(&PolicyCondition::All { conditions }, work, is_cancelled)?;
+
+    let mut context = combined_context_bounded(&path_edges, work, is_cancelled)?;
+    let profiles = if change.after.is_some() {
+        &to.profiles
+    } else {
+        &from.profiles
+    };
+    let node_profile = if let Some(profile_id) = change.profile_id.as_deref() {
+        let mut found = None;
+        for profile in profiles {
+            work.step(is_cancelled)?;
+            if profile.id == profile_id {
+                found = Some(profile);
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    let after_node = if let Some(after) = change.after.as_ref() {
+        let mut found = None;
+        for node in &to.nodes {
+            work.step(is_cancelled)?;
+            work.steps(after.id.len().saturating_add(node.id.len()), is_cancelled)?;
+            if node.id == after.id {
+                found = Some(node);
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    for (key, value) in public_api_change_context_bounded(
+        Some(target),
+        after_node,
+        node_profile,
+        change.kind,
+        &change.changed_fields,
+        work,
+        is_cancelled,
+    )? {
+        work.step(is_cancelled)?;
+        work.steps(key.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(context.len(), key.len(), work, is_cancelled)?;
+        context.entry(key).or_insert(value);
+    }
+    let suppression = applied_suppression_bounded(
+        suppressions,
+        &rule.id,
+        &source.id,
+        &target.id,
+        profile_id,
+        &context,
+        work,
+        is_cancelled,
+    )?;
+    charge_violation_stable_id_work(
+        &rule.id,
+        &source.id,
+        &target.id,
+        profile_id,
+        &dependency_path,
+        work,
+        is_cancelled,
+    )?;
+    let id = PolicyViolation::stable_id(
+        &rule.id,
+        &source.id,
+        &target.id,
+        profile_id,
+        &dependency_path,
+    );
+    let message_len = "breaking public API "
+        .len()
+        .saturating_add(public_api_change_kind_name(change.kind).len())
+        .saturating_add(" for ".len())
+        .saturating_add(target.id.len())
+        .saturating_add(" impacts ".len())
+        .saturating_add(source.id.len());
+    work.steps(message_len.saturating_add(1), is_cancelled)?;
+    let message = format!(
+        "breaking public API {} for {} impacts {}",
+        public_api_change_kind_name(change.kind),
+        target.id,
+        source.id
+    );
+    let source_entity = policy_entity_bounded(source, rule.source.kind, work, is_cancelled)?;
+    let target_entity = policy_entity_bounded(target, rule.target.kind, work, is_cancelled)?;
+    let change_id = {
+        work.steps(change.id.len().saturating_add(1), is_cancelled)?;
+        Some(change.id.clone())
+    };
+    let owned_profile_id = profile_id.map(|profile_id| {
+        // The bytes were charged above with the stable-ID input.
+        profile_id.to_owned()
+    });
+    work.steps(rule.id.len().saturating_add(1), is_cancelled)?;
+    Ok(PolicyViolation {
+        id,
+        rule_id: rule.id.clone(),
+        severity: rule.severity,
+        message,
+        source: source_entity,
+        target: target_entity,
+        dependency_path,
+        profile_id: owned_profile_id,
+        condition,
+        evidence,
+        change_id,
+        suppression,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn classify_public_api_change(
     rule: &PolicyRule,
     kind: PublicApiChangeKind,
@@ -965,6 +2509,7 @@ fn classify_public_api_change(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn evaluate_public_api_impact(
     rule: &PolicyRule,
     change: &PublicApiChange,
@@ -1042,6 +2587,7 @@ fn evaluate_public_api_impact(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn make_public_api_violation(
     rule: &PolicyRule,
     change: &PublicApiChange,
@@ -1152,6 +2698,7 @@ struct NodeEvidenceIndex<'a> {
 }
 
 impl<'a> NodeEvidenceIndex<'a> {
+    #[allow(dead_code)]
     fn new(snapshot: &'a GraphSnapshot) -> Self {
         let mut evidence_by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
         let mut records: BTreeMap<&str, Vec<&EvidenceRecord>> = BTreeMap::new();
@@ -1213,6 +2760,132 @@ impl<'a> NodeEvidenceIndex<'a> {
         }
         Self { records }
     }
+
+    fn new_bounded(
+        snapshot: &'a GraphSnapshot,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self> {
+        let mut evidence_by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
+        let mut records: BTreeMap<&str, Vec<&EvidenceRecord>> = BTreeMap::new();
+        for evidence in &snapshot.evidence {
+            work.step(is_cancelled)?;
+            work.steps(
+                evidence
+                    .owner_type
+                    .len()
+                    .saturating_add(evidence.owner_id.len())
+                    .saturating_add(evidence.kind.len())
+                    .saturating_add(evidence.path.len()),
+                is_cancelled,
+            )?;
+            charge_ordered_collection_work(
+                evidence_by_owner.len(),
+                evidence
+                    .owner_type
+                    .len()
+                    .saturating_add(evidence.owner_id.len()),
+                work,
+                is_cancelled,
+            )?;
+            evidence_by_owner
+                .entry((evidence.owner_type.as_str(), evidence.owner_id.as_str()))
+                .or_default()
+                .push(evidence);
+            if evidence.owner_type == "node" {
+                charge_ordered_collection_work(
+                    records.len(),
+                    evidence.owner_id.len(),
+                    work,
+                    is_cancelled,
+                )?;
+                records
+                    .entry(evidence.owner_id.as_str())
+                    .or_default()
+                    .push(evidence);
+            }
+        }
+        for edge in snapshot
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "declares" | "contains" | "route_entry"))
+        {
+            work.step(is_cancelled)?;
+            work.steps(
+                edge.id
+                    .len()
+                    .saturating_add(edge.site_id.as_deref().map_or(0, str::len)),
+                is_cancelled,
+            )?;
+            let mut related =
+                if let Some(found) = evidence_by_owner.get(&("edge", edge.id.as_str())) {
+                    work.steps(found.len(), is_cancelled)?;
+                    found.clone()
+                } else {
+                    Vec::new()
+                };
+            if related.is_empty()
+                && let Some(site_id) = edge.site_id.as_deref()
+                && let Some(found) = evidence_by_owner.get(&("site", site_id))
+            {
+                work.steps(found.len(), is_cancelled)?;
+                related = found.clone();
+            }
+            charge_ordered_collection_work(records.len(), edge.target.len(), work, is_cancelled)?;
+            work.steps(related.len(), is_cancelled)?;
+            records
+                .entry(edge.target.as_str())
+                .or_default()
+                .extend(related);
+        }
+        for records in records.values_mut() {
+            charge_sort_key_bytes_work(
+                records.len(),
+                records.iter().map(|record| {
+                    record
+                        .kind
+                        .len()
+                        .saturating_add(record.path.len())
+                        .saturating_add(record.owner_type.len())
+                        .saturating_add(record.owner_id.len())
+                }),
+                work,
+                is_cancelled,
+            )?;
+            for record in records.iter() {
+                work.steps(
+                    record
+                        .kind
+                        .len()
+                        .saturating_add(record.path.len())
+                        .saturating_add(record.owner_type.len())
+                        .saturating_add(record.owner_id.len()),
+                    is_cancelled,
+                )?;
+            }
+            records.sort_by(|left, right| {
+                (
+                    left.ordinal,
+                    &left.kind,
+                    &left.path,
+                    left.start_line,
+                    left.start_column,
+                    &left.owner_type,
+                    &left.owner_id,
+                )
+                    .cmp(&(
+                        right.ordinal,
+                        &right.kind,
+                        &right.path,
+                        right.start_line,
+                        right.start_column,
+                        &right.owner_type,
+                        &right.owner_id,
+                    ))
+            });
+        }
+        Ok(Self { records })
+    }
 }
 
 #[derive(Debug)]
@@ -1229,12 +2902,20 @@ fn resolve_suppressions_bounded<'a>(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<ResolvedSuppression<'a>>> {
-    let mut resolved = Vec::with_capacity(config.suppressions.len());
+    let mut resolved = Vec::new();
     for suppression in &config.suppressions {
         work.step(is_cancelled)?;
         if rule_id.is_some_and(|rule_id| suppression.rule_id != rule_id) {
             continue;
         }
+        work.steps(
+            suppression
+                .id
+                .len()
+                .saturating_add(suppression.rule_id.len())
+                .saturating_add(suppression.reason.len()),
+            is_cancelled,
+        )?;
         let source_ids = suppression
             .scope
             .source
@@ -1272,11 +2953,17 @@ fn resolve_suppressions_bounded<'a>(
             target_ids,
         });
     }
-    charge_sort_work(resolved.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        resolved.len(),
+        resolved.iter().map(|item| item.suppression.id.len()),
+        work,
+        is_cancelled,
+    )?;
     resolved.sort_by(|left, right| left.suppression.id.cmp(&right.suppression.id));
     Ok(resolved)
 }
 
+#[allow(dead_code)]
 fn admitted_edges_with_options<'a>(
     snapshot: &'a GraphSnapshot,
     rule: &PolicyRule,
@@ -1305,14 +2992,19 @@ fn admitted_edges_with_options_bounded<'a>(
     let mut profiles = BTreeMap::new();
     for profile in &snapshot.profiles {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(profiles.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(profiles.len(), profile.id.len(), work, is_cancelled)?;
         profiles.insert(profile.id.as_str(), profile);
     }
     let evidence: BTreeMap<_, Vec<_>> = {
         let mut by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
         for item in &snapshot.evidence {
             work.step(is_cancelled)?;
-            charge_ordered_collection_work(by_owner.len(), 2, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                by_owner.len(),
+                item.owner_type.len().saturating_add(item.owner_id.len()),
+                work,
+                is_cancelled,
+            )?;
             by_owner
                 .entry((item.owner_type.as_str(), item.owner_id.as_str()))
                 .or_default()
@@ -1320,8 +3012,8 @@ fn admitted_edges_with_options_bounded<'a>(
         }
         by_owner
     };
-    let allowed_precisions = serialized_names(&rule.precisions)?;
-    let allowed_statuses = serialized_names(&rule.resolution_statuses)?;
+    let allowed_precisions = serialized_names_bounded(&rule.precisions, work, is_cancelled)?;
+    let allowed_statuses = serialized_names_bounded(&rule.resolution_statuses, work, is_cancelled)?;
     let mut admitted = Vec::new();
 
     for edge in &snapshot.edges {
@@ -1369,7 +3061,19 @@ fn admitted_edges_with_options_bounded<'a>(
             context,
         });
     }
-    charge_sort_work(admitted.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        admitted.len(),
+        admitted.iter().map(|item| {
+            item.edge
+                .profile_id
+                .len()
+                .saturating_add(item.edge.source.len())
+                .saturating_add(item.edge.target.len())
+                .saturating_add(item.edge.id.len())
+        }),
+        work,
+        is_cancelled,
+    )?;
     admitted.sort_by(|left, right| {
         (
             &left.edge.profile_id,
@@ -1403,7 +3107,12 @@ fn evaluate_runtime_boundary(
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in &admitted {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(
+            by_profile.len(),
+            item.edge.profile_id.len(),
+            work,
+            is_cancelled,
+        )?;
         by_profile
             .entry(item.edge.profile_id.as_str())
             .or_default()
@@ -1435,17 +3144,38 @@ fn evaluate_runtime_boundary(
 
         for source in sources {
             work.step(is_cancelled)?;
-            let mut visited = BTreeSet::from([source.id.clone()]);
+            work.steps(
+                source.id.len().saturating_mul(2).saturating_add(1),
+                is_cancelled,
+            )?;
+            let source_id = source.id.clone();
+            let mut visited = BTreeSet::from([source_id.clone()]);
             let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
-            let mut queue = VecDeque::from([source.id.clone()]);
+            let mut queue = VecDeque::from([source_id]);
             while let Some(current) = queue.pop_front() {
                 work.step(is_cancelled)?;
                 for item in adjacency.get(current.as_str()).into_iter().flatten() {
                     work.step(is_cancelled)?;
-                    charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
-                    if visited.insert(item.edge.target.clone()) {
-                        predecessor.insert(item.edge.target.clone(), item);
-                        queue.push_back(item.edge.target.clone());
+                    let target_id = item.edge.target.as_str();
+                    work.steps(target_id.len().saturating_add(1), is_cancelled)?;
+                    charge_ordered_collection_work(
+                        visited.len(),
+                        target_id.len(),
+                        work,
+                        is_cancelled,
+                    )?;
+                    if !visited.contains(target_id) {
+                        work.steps(target_id.len().saturating_mul(3), is_cancelled)?;
+                        charge_ordered_collection_work(
+                            predecessor.len(),
+                            target_id.len(),
+                            work,
+                            is_cancelled,
+                        )?;
+                        let target_id = target_id.to_owned();
+                        visited.insert(target_id.clone());
+                        predecessor.insert(target_id.clone(), item);
+                        queue.push_back(target_id);
                     }
                 }
             }
@@ -1466,10 +3196,10 @@ fn evaluate_runtime_boundary(
                     continue;
                 };
                 path_edges.push(boundary);
-                let mut path = Vec::with_capacity(path_edges.len());
+                let mut path = Vec::new();
                 for item in &path_edges {
                     work.step(is_cancelled)?;
-                    path.push(path_step(item.edge));
+                    path.push(path_step_bounded(item.edge, work, is_cancelled)?);
                 }
                 work.step(is_cancelled)?;
                 let violation = make_violation_bounded(
@@ -1492,12 +3222,18 @@ fn evaluate_runtime_boundary(
                     is_cancelled,
                 )?;
                 work.step(is_cancelled)?;
-                charge_ordered_collection_work(output.len(), 1, work, is_cancelled)?;
+                work.steps(violation.id.len().saturating_add(1), is_cancelled)?;
+                charge_ordered_collection_work(
+                    output.len(),
+                    violation.id.len(),
+                    work,
+                    is_cancelled,
+                )?;
                 output.entry(violation.id.clone()).or_insert(violation);
             }
         }
     }
-    let mut violations = Vec::with_capacity(output.len());
+    let mut violations = Vec::new();
     for violation in output.into_values() {
         work.step(is_cancelled)?;
         violations.push(violation);
@@ -1525,7 +3261,7 @@ fn evaluate_direct_bounded(
             continue;
         }
         work.step(is_cancelled)?;
-        let path = vec![path_step(item.edge)];
+        let path = vec![path_step_bounded(item.edge, work, is_cancelled)?];
         let violation = make_violation_bounded(
             rule,
             nodes,
@@ -1565,7 +3301,7 @@ fn cycle_rings_bounded(
                 .get(node_id)
                 .is_some_and(|node| node.kind == level.node_kind())
             {
-                charge_ordered_collection_work(allowed.len(), 1, work, is_cancelled)?;
+                charge_ordered_collection_work(allowed.len(), node_id.len(), work, is_cancelled)?;
                 allowed.insert(node_id);
             }
         }
@@ -1575,9 +3311,9 @@ fn cycle_rings_bounded(
     let mut reverse = BTreeMap::<&str, Vec<&str>>::new();
     for node_id in &allowed {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(adjacency.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(adjacency.len(), node_id.len(), work, is_cancelled)?;
         adjacency.insert(*node_id, Vec::new());
-        charge_ordered_collection_work(reverse.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(reverse.len(), node_id.len(), work, is_cancelled)?;
         reverse.insert(*node_id, Vec::new());
     }
     for item in edges {
@@ -1596,7 +3332,12 @@ fn cycle_rings_bounded(
         }
     }
     for targets in adjacency.values_mut().chain(reverse.values_mut()) {
-        charge_sort_work(targets.len(), work, is_cancelled)?;
+        charge_sort_key_bytes_work(
+            targets.len(),
+            targets.iter().map(|target| target.len()),
+            work,
+            is_cancelled,
+        )?;
         work.steps(targets.len(), is_cancelled)?;
         targets.sort_unstable();
         targets.dedup();
@@ -1605,13 +3346,13 @@ fn cycle_rings_bounded(
     // Iterative Kosaraju keeps both SCC passes stack-safe and gives every
     // visited node/edge an explicit cancellation and work-budget point.
     let mut visited = BTreeSet::new();
-    let mut finish_order = Vec::with_capacity(allowed.len());
+    let mut finish_order = Vec::new();
     for node_id in &allowed {
         work.step(is_cancelled)?;
         if visited.contains(node_id) {
             continue;
         }
-        charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(visited.len(), node_id.len(), work, is_cancelled)?;
         visited.insert(*node_id);
         let mut stack = vec![(*node_id, 0_usize)];
         while let Some((current, next_index)) = stack.last().copied() {
@@ -1623,7 +3364,7 @@ fn cycle_rings_bounded(
                 stack.last_mut().expect("stack is non-empty").1 += 1;
                 let next = outgoing[next_index];
                 if !visited.contains(next) {
-                    charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
+                    charge_ordered_collection_work(visited.len(), next.len(), work, is_cancelled)?;
                     visited.insert(next);
                     stack.push((next, 0));
                 }
@@ -1641,7 +3382,7 @@ fn cycle_rings_bounded(
         if assigned.contains(node_id) {
             continue;
         }
-        charge_ordered_collection_work(assigned.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(assigned.len(), node_id.len(), work, is_cancelled)?;
         assigned.insert(node_id);
         let mut stack = vec![node_id];
         let mut component = Vec::new();
@@ -1654,13 +3395,18 @@ fn cycle_rings_bounded(
             {
                 work.step(is_cancelled)?;
                 if !assigned.contains(next) {
-                    charge_ordered_collection_work(assigned.len(), 1, work, is_cancelled)?;
+                    charge_ordered_collection_work(assigned.len(), next.len(), work, is_cancelled)?;
                     assigned.insert(*next);
                     stack.push(*next);
                 }
             }
         }
-        charge_sort_work(component.len(), work, is_cancelled)?;
+        charge_sort_key_bytes_work(
+            component.len(),
+            component.iter().map(|node| node.len()),
+            work,
+            is_cancelled,
+        )?;
         component.sort_unstable();
         components.push(component);
     }
@@ -1690,7 +3436,7 @@ fn cycle_rings_bounded(
         let mut component_set = BTreeSet::new();
         for node_id in &component {
             work.step(is_cancelled)?;
-            charge_ordered_collection_work(component_set.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(component_set.len(), node_id.len(), work, is_cancelled)?;
             component_set.insert(*node_id);
         }
         let ring = if let Some(ring) = representative_cycle_bounded(
@@ -1702,18 +3448,27 @@ fn cycle_rings_bounded(
         )? {
             ring
         } else {
-            let mut fallback = Vec::with_capacity(component.len().saturating_add(1));
+            let mut fallback = Vec::new();
             for node_id in &component {
                 work.step(is_cancelled)?;
+                work.steps(node_id.len().saturating_add(1), is_cancelled)?;
                 fallback.push((*node_id).to_owned());
             }
             work.step(is_cancelled)?;
+            work.steps(component[0].len().saturating_add(1), is_cancelled)?;
             fallback.push(component[0].to_owned());
             fallback
         };
         rings.push(ring);
     }
-    charge_sort_work(rings.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        rings.len(),
+        rings
+            .iter()
+            .map(|ring| ring.iter().map(String::len).sum::<usize>()),
+        work,
+        is_cancelled,
+    )?;
     rings.sort();
     Ok(rings)
 }
@@ -1736,10 +3491,13 @@ fn representative_cycle_bounded(
             continue;
         }
         if *next == start {
-            work.steps(2, is_cancelled)?;
+            work.steps(
+                start.len().saturating_mul(2).saturating_add(2),
+                is_cancelled,
+            )?;
             return Ok(Some(vec![start.to_owned(), start.to_owned()]));
         }
-        charge_ordered_collection_work(predecessor.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(predecessor.len(), next.len(), work, is_cancelled)?;
         predecessor.insert(*next, start);
         queue.push_back(*next);
     }
@@ -1754,6 +3512,7 @@ fn representative_cycle_bounded(
                 continue;
             }
             if *next == start {
+                work.steps(node.len().saturating_add(1), is_cancelled)?;
                 let mut path = vec![node.to_owned()];
                 let mut current = node;
                 while current != start {
@@ -1762,14 +3521,16 @@ fn representative_cycle_bounded(
                         .get(current)
                         .copied()
                         .context("cycle representative predecessor is missing")?;
+                    work.steps(current.len().saturating_add(1), is_cancelled)?;
                     path.push(current.to_owned());
                 }
                 path.reverse();
+                work.steps(start.len().saturating_add(1), is_cancelled)?;
                 path.push(start.to_owned());
                 return Ok(Some(path));
             }
             if !predecessor.contains_key(next) {
-                charge_ordered_collection_work(predecessor.len(), 1, work, is_cancelled)?;
+                charge_ordered_collection_work(predecessor.len(), next.len(), work, is_cancelled)?;
                 predecessor.insert(*next, node);
                 queue.push_back(*next);
             }
@@ -1794,7 +3555,7 @@ fn evaluate_cycles_bounded(
     let mut cycle_nodes = BTreeSet::new();
     for node_id in source_ids.iter().chain(target_ids) {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(cycle_nodes.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(cycle_nodes.len(), node_id.len(), work, is_cancelled)?;
         cycle_nodes.insert(*node_id);
     }
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
@@ -1803,7 +3564,12 @@ fn evaluate_cycles_bounded(
         if cycle_nodes.contains(item.edge.source.as_str())
             && cycle_nodes.contains(item.edge.target.as_str())
         {
-            charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                by_profile.len(),
+                item.edge.profile_id.len(),
+                work,
+                is_cancelled,
+            )?;
             by_profile
                 .entry(item.edge.profile_id.as_str())
                 .or_default()
@@ -1818,29 +3584,40 @@ fn evaluate_cycles_bounded(
         for cycle in detected_cycles {
             work.step(is_cancelled)?;
             let ring = &cycle[..cycle.len() - 1];
-            work.steps(ring.len().saturating_mul(3), is_cancelled)?;
-            if !ring.iter().any(|node| source_ids.contains(node.as_str()))
-                || !ring.iter().any(|node| target_ids.contains(node.as_str()))
-            {
+            let mut has_source = false;
+            let mut has_target = false;
+            let mut start = None;
+            for node in ring {
+                work.step(is_cancelled)?;
+                if source_ids.contains(node.as_str()) {
+                    has_source = true;
+                    if start.is_none_or(|current: &String| node < current) {
+                        start = Some(node);
+                    }
+                }
+                has_target |= target_ids.contains(node.as_str());
+            }
+            if !has_source || !has_target {
                 continue;
             }
-            let Some(start) = ring
-                .iter()
-                .filter(|node| source_ids.contains(node.as_str()))
-                .min()
-            else {
-                continue;
-            };
-            let start_index = ring
-                .iter()
-                .position(|node| node == start)
-                .context("cycle start disappeared")?;
-            let mut node_path = Vec::with_capacity(ring.len().saturating_add(1));
+            let start = start.context("cycle start disappeared")?;
+            let mut start_index = None;
+            for (index, node) in ring.iter().enumerate() {
+                work.step(is_cancelled)?;
+                if node == start {
+                    start_index = Some(index);
+                    break;
+                }
+            }
+            let start_index = start_index.context("cycle start disappeared")?;
+            let mut node_path = Vec::new();
             for node in ring[start_index..].iter().chain(&ring[..start_index]) {
                 work.step(is_cancelled)?;
+                work.steps(node.len().saturating_add(1), is_cancelled)?;
                 node_path.push(node.clone());
             }
             work.step(is_cancelled)?;
+            work.steps(start.len().saturating_add(1), is_cancelled)?;
             node_path.push(start.clone());
 
             let mut path = Vec::new();
@@ -1864,7 +3641,7 @@ fn evaluate_cycles_bounded(
                     )
                 })?;
                 work.step(is_cancelled)?;
-                path.push(path_step(item.edge));
+                path.push(path_step_bounded(item.edge, work, is_cancelled)?);
                 path_edges.push(item);
             }
             let violation = make_violation_bounded(
@@ -1906,7 +3683,12 @@ fn evaluate_depth_bounded(
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in admitted {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(
+            by_profile.len(),
+            item.edge.profile_id.len(),
+            work,
+            is_cancelled,
+        )?;
         by_profile
             .entry(item.edge.profile_id.as_str())
             .or_default()
@@ -1919,19 +3701,42 @@ fn evaluate_depth_bounded(
         let adjacency = adjacency_bounded(&edges, work, is_cancelled)?;
         for source in sources {
             work.step(is_cancelled)?;
-            let mut distance = BTreeMap::from([(source.id.clone(), 0_u64)]);
+            work.steps(
+                source.id.len().saturating_mul(2).saturating_add(1),
+                is_cancelled,
+            )?;
+            let source_id = source.id.clone();
+            let mut distance = BTreeMap::from([(source_id.clone(), 0_u64)]);
             let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
-            let mut queue = VecDeque::from([source.id.clone()]);
+            let mut queue = VecDeque::from([source_id]);
             while let Some(current) = queue.pop_front() {
                 work.step(is_cancelled)?;
+                work.steps(current.len().saturating_add(1), is_cancelled)?;
                 let next_distance = distance[&current] + 1;
                 for edge in adjacency.get(current.as_str()).into_iter().flatten() {
                     work.step(is_cancelled)?;
-                    if !distance.contains_key(&edge.edge.target) {
-                        charge_ordered_collection_work(distance.len(), 1, work, is_cancelled)?;
-                        distance.insert(edge.edge.target.clone(), next_distance);
-                        predecessor.insert(edge.edge.target.clone(), edge);
-                        queue.push_back(edge.edge.target.clone());
+                    let target_id = edge.edge.target.as_str();
+                    work.steps(target_id.len().saturating_add(1), is_cancelled)?;
+                    charge_ordered_collection_work(
+                        distance.len(),
+                        target_id.len(),
+                        work,
+                        is_cancelled,
+                    )?;
+                    if !distance.contains_key(target_id) {
+                        // Distance, predecessor, and queue each own a copy of
+                        // the discovered node ID. Charge before cloning.
+                        work.steps(target_id.len().saturating_mul(3), is_cancelled)?;
+                        charge_ordered_collection_work(
+                            predecessor.len(),
+                            target_id.len(),
+                            work,
+                            is_cancelled,
+                        )?;
+                        let target_id = target_id.to_owned();
+                        distance.insert(target_id.clone(), next_distance);
+                        predecessor.insert(target_id.clone(), edge);
+                        queue.push_back(target_id);
                     }
                 }
             }
@@ -1951,10 +3756,10 @@ fn evaluate_depth_bounded(
                     work,
                     is_cancelled,
                 )?;
-                let mut path = Vec::with_capacity(path_edges.len());
+                let mut path = Vec::new();
                 for item in &path_edges {
                     work.step(is_cancelled)?;
-                    path.push(path_step(item.edge));
+                    path.push(path_step_bounded(item.edge, work, is_cancelled)?);
                 }
                 let violation = make_violation_bounded(
                     rule,
@@ -2001,9 +3806,19 @@ fn evaluate_fan_out_bounded(
             if item.edge.source != source.id || !target_ids.contains(item.edge.target.as_str()) {
                 continue;
             }
-            charge_ordered_collection_work(groups.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                groups.len(),
+                item.edge.profile_id.len(),
+                work,
+                is_cancelled,
+            )?;
             let targets = groups.entry(item.edge.profile_id.as_str()).or_default();
-            charge_ordered_collection_work(targets.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                targets.len(),
+                item.edge.target.len(),
+                work,
+                is_cancelled,
+            )?;
             targets
                 .entry(item.edge.target.as_str())
                 .and_modify(|current| {
@@ -2026,7 +3841,7 @@ fn evaluate_fan_out_bounded(
                 &source.id,
                 &witness.edge.target,
                 Some(profile_id),
-                vec![path_step(witness.edge)],
+                vec![path_step_bounded(witness.edge, work, is_cancelled)?],
                 vec![witness],
                 format!("fan-out for {} is {count}, exceeding {max}", source.id),
                 suppressions,
@@ -2061,9 +3876,19 @@ fn evaluate_fan_in_bounded(
             if item.edge.target != target.id || !source_ids.contains(item.edge.source.as_str()) {
                 continue;
             }
-            charge_ordered_collection_work(groups.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                groups.len(),
+                item.edge.profile_id.len(),
+                work,
+                is_cancelled,
+            )?;
             let sources = groups.entry(item.edge.profile_id.as_str()).or_default();
-            charge_ordered_collection_work(sources.len(), 1, work, is_cancelled)?;
+            charge_ordered_collection_work(
+                sources.len(),
+                item.edge.source.len(),
+                work,
+                is_cancelled,
+            )?;
             sources
                 .entry(item.edge.source.as_str())
                 .and_modify(|current| {
@@ -2086,7 +3911,7 @@ fn evaluate_fan_in_bounded(
                 &witness.edge.source,
                 &target.id,
                 Some(profile_id),
-                vec![path_step(witness.edge)],
+                vec![path_step_bounded(witness.edge, work, is_cancelled)?],
                 vec![witness],
                 format!("fan-in for {} is {count}, exceeding {max}", target.id),
                 suppressions,
@@ -2116,6 +3941,7 @@ fn overflow_witness_bounded<'a>(
     bail!("threshold overflow did not have a witness edge")
 }
 
+#[allow(dead_code)]
 fn adjacency<'a>(edges: &[&'a AdmittedEdge<'a>]) -> BTreeMap<&'a str, Vec<&'a AdmittedEdge<'a>>> {
     let mut work = PolicyEvaluationWork::new(usize::MAX);
     adjacency_bounded(edges, &mut work, &mut || false)
@@ -2130,14 +3956,26 @@ fn adjacency_bounded<'a>(
     let mut adjacency: BTreeMap<&str, Vec<_>> = BTreeMap::new();
     for edge in edges {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(adjacency.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(
+            adjacency.len(),
+            edge.edge.source.len(),
+            work,
+            is_cancelled,
+        )?;
         adjacency
             .entry(edge.edge.source.as_str())
             .or_default()
             .push(*edge);
     }
     for outgoing in adjacency.values_mut() {
-        charge_sort_work(outgoing.len(), work, is_cancelled)?;
+        charge_sort_key_bytes_work(
+            outgoing.len(),
+            outgoing
+                .iter()
+                .map(|edge| edge.edge.target.len().saturating_add(edge.edge.id.len())),
+            work,
+            is_cancelled,
+        )?;
         outgoing.sort_by(|left, right| {
             (&left.edge.target, &left.edge.id).cmp(&(&right.edge.target, &right.edge.id))
         });
@@ -2145,6 +3983,7 @@ fn adjacency_bounded<'a>(
     Ok(adjacency)
 }
 
+#[allow(dead_code)]
 fn reconstruct_path<'a>(
     source: &str,
     target: &str,
@@ -2165,6 +4004,7 @@ fn reconstruct_path_bounded<'a>(
     let mut reversed = Vec::new();
     while current != source {
         work.step(is_cancelled)?;
+        work.steps(current.len().saturating_add(1), is_cancelled)?;
         let edge = predecessor
             .get(current)
             .copied()
@@ -2191,11 +4031,13 @@ fn make_violation_bounded(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<PolicyViolation> {
     work.step(is_cancelled)?;
+    work.steps(source_id.len().saturating_add(1), is_cancelled)?;
     let source_node = nodes
         .get(source_id)
         .copied()
         .with_context(|| format!("policy source node {source_id:?} is missing"))?;
     work.step(is_cancelled)?;
+    work.steps(target_id.len().saturating_add(1), is_cancelled)?;
     let target_node = nodes
         .get(target_id)
         .copied()
@@ -2205,6 +4047,7 @@ fn make_violation_bounded(
         work.step(is_cancelled)?;
         for span in &item.evidence {
             work.step(is_cancelled)?;
+            work.steps(span.path.len().saturating_add(1), is_cancelled)?;
             evidence.push(span.clone());
         }
     }
@@ -2221,7 +4064,22 @@ fn make_violation_bounded(
         work,
         is_cancelled,
     )?;
-    work.steps(dependency_path.len().saturating_add(1), is_cancelled)?;
+    work.steps(
+        source_node
+            .locator
+            .len()
+            .saturating_add(target_node.locator.len()),
+        is_cancelled,
+    )?;
+    charge_violation_stable_id_work(
+        &rule.id,
+        source_id,
+        target_id,
+        profile_id,
+        &dependency_path,
+        work,
+        is_cancelled,
+    )?;
     let id =
         PolicyViolation::stable_id(&rule.id, source_id, target_id, profile_id, &dependency_path);
     Ok(PolicyViolation {
@@ -2248,6 +4106,7 @@ fn make_violation_bounded(
     })
 }
 
+#[allow(dead_code)]
 fn applied_suppression(
     suppressions: &[ResolvedSuppression<'_>],
     rule_id: &str,
@@ -2325,7 +4184,14 @@ fn applied_suppression_bounded(
         {
             continue;
         }
-        work.step(is_cancelled)?;
+        work.steps(
+            resolved
+                .suppression
+                .id
+                .len()
+                .saturating_add(resolved.suppression.reason.len()),
+            is_cancelled,
+        )?;
         return Ok(Some(AppliedPolicySuppression {
             id: resolved.suppression.id.clone(),
             reason: resolved.suppression.reason.clone(),
@@ -2334,6 +4200,7 @@ fn applied_suppression_bounded(
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn combined_context(edges: &[&AdmittedEdge<'_>]) -> BTreeMap<String, Value> {
     let mut combined: BTreeMap<String, Option<Value>> = BTreeMap::new();
     for edge in edges {
@@ -2385,6 +4252,7 @@ fn combined_context_bounded(
     Ok(output)
 }
 
+#[allow(dead_code)]
 fn resolve_selector<'a>(
     snapshot: &'a GraphSnapshot,
     selector: &PolicySelector,
@@ -2409,7 +4277,12 @@ fn resolve_selector_bounded<'a>(
             matches.push(node);
         }
     }
-    charge_sort_work(matches.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        matches.len(),
+        matches.iter().map(|node| node.id.len()),
+        work,
+        is_cancelled,
+    )?;
     matches.sort_by(|left, right| left.id.cmp(&right.id));
     if selector.cardinality == PolicySelectorCardinality::One && matches.len() != 1 {
         bail!(
@@ -2428,7 +4301,7 @@ fn borrowed_node_id_set_bounded<'a>(
     let mut ids = BTreeSet::new();
     for node in nodes {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(ids.len(), 1, work, is_cancelled)?;
+        charge_ordered_collection_work(ids.len(), node.id.len(), work, is_cancelled)?;
         ids.insert(node.id.as_str());
     }
     Ok(ids)
@@ -2442,12 +4315,14 @@ fn owned_node_id_set_bounded(
     let mut ids = BTreeSet::new();
     for node in nodes {
         work.step(is_cancelled)?;
-        charge_ordered_collection_work(ids.len(), 1, work, is_cancelled)?;
+        work.steps(node.id.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(ids.len(), node.id.len(), work, is_cancelled)?;
         ids.insert(node.id.clone());
     }
     Ok(ids)
 }
 
+#[allow(dead_code)]
 fn selector_matches_node(node: &NodeRecord, selector: &PolicySelector) -> bool {
     if !node_kind_matches(node, selector.kind) {
         return false;
@@ -2583,6 +4458,7 @@ fn node_profile_id(node: &NodeRecord) -> Option<&str> {
     })
 }
 
+#[allow(dead_code)]
 fn optional_profile_matches(filter: &PolicyProfileFilter, profile_id: Option<&str>) -> bool {
     profile_id.map_or_else(
         || filter == &PolicyProfileFilter::default(),
@@ -2590,6 +4466,7 @@ fn optional_profile_matches(filter: &PolicyProfileFilter, profile_id: Option<&st
     )
 }
 
+#[allow(dead_code)]
 fn policy_entity(node: &NodeRecord, kind: PolicySelectorKind) -> PolicyEntity {
     PolicyEntity {
         id: node.id.clone(),
@@ -2598,6 +4475,7 @@ fn policy_entity(node: &NodeRecord, kind: PolicySelectorKind) -> PolicyEntity {
     }
 }
 
+#[allow(dead_code)]
 fn public_api_change_context(
     before: Option<&NodeRecord>,
     after: Option<&NodeRecord>,
@@ -2653,6 +4531,7 @@ fn string_property<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
         .find_map(|name| value.get(*name).and_then(Value::as_str))
 }
 
+#[allow(dead_code)]
 fn patterns_match(patterns: &[PolicyPattern], value: &str) -> bool {
     patterns
         .iter()
@@ -2679,6 +4558,7 @@ fn patterns_match_bounded(
     Ok(false)
 }
 
+#[allow(dead_code)]
 fn profile_matches(filter: &PolicyProfileFilter, profile_id: &str) -> bool {
     (filter.include.is_empty() || patterns_match(&filter.include, profile_id))
         && !patterns_match(&filter.exclude, profile_id)
@@ -2706,6 +4586,7 @@ fn profile_matches_bounded(
     )?)
 }
 
+#[allow(dead_code)]
 fn pattern_matches(kind: PolicyMatchKind, pattern: &str, value: &str) -> bool {
     match kind {
         PolicyMatchKind::Exact => value == pattern,
@@ -2754,6 +4635,7 @@ fn literal_prefix_matches_bounded(
     Ok(true)
 }
 
+#[allow(dead_code)]
 fn glob_matches(pattern: &str, value: &str) -> bool {
     fn visit(
         pattern: &[char],
@@ -2835,17 +4717,21 @@ fn glob_matches_bounded(
         if pattern_chars[pattern_index] == '*' {
             let double = pattern_chars.get(pattern_index + 1) == Some(&'*');
             let next_pattern = pattern_index + usize::from(double) + 1;
+            work.step(is_cancelled)?;
             pending.push((next_pattern, value_index));
             if double && pattern_chars.get(next_pattern) == Some(&'/') {
+                work.step(is_cancelled)?;
                 pending.push((next_pattern + 1, value_index));
             }
             if value_index < value_chars.len() && (double || value_chars[value_index] != '/') {
+                work.step(is_cancelled)?;
                 pending.push((pattern_index, value_index + 1));
             }
         } else if value_index < value_chars.len()
             && ((pattern_chars[pattern_index] == '?' && value_chars[value_index] != '/')
                 || pattern_chars[pattern_index] == value_chars[value_index])
         {
+            work.step(is_cancelled)?;
             pending.push((pattern_index + 1, value_index + 1));
         }
     }
@@ -2858,15 +4744,107 @@ fn edge_context_bounded(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BTreeMap<String, Value>> {
-    work.steps(8, is_cancelled)?;
-    if let Some(profile) = profile {
-        charge_json_value_work(&profile.environment, work, is_cancelled)?;
-        charge_json_value_work(&profile.properties, work, is_cancelled)?;
-        work.steps(profile.features.len(), is_cancelled)?;
+    fn insert_string(
+        context: &mut BTreeMap<String, Value>,
+        key: &str,
+        value: &str,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        work.steps(
+            key.len().saturating_add(value.len()).saturating_add(1),
+            is_cancelled,
+        )?;
+        charge_ordered_collection_work(context.len(), key.len(), work, is_cancelled)?;
+        context.insert(key.to_owned(), Value::String(value.to_owned()));
+        Ok(())
     }
-    Ok(edge_context(edge, profile))
+    fn insert_bool(
+        context: &mut BTreeMap<String, Value>,
+        key: &str,
+        value: bool,
+        work: &mut PolicyEvaluationWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<()> {
+        work.steps(key.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(context.len(), key.len(), work, is_cancelled)?;
+        context.insert(key.to_owned(), Value::Bool(value));
+        Ok(())
+    }
+
+    let mut context = BTreeMap::new();
+    if let Some(profile) = profile {
+        merge_object_bounded(&mut context, &profile.environment, work, is_cancelled)?;
+        merge_object_bounded(&mut context, &profile.properties, work, is_cancelled)?;
+        insert_string(
+            &mut context,
+            "language",
+            &profile.language,
+            work,
+            is_cancelled,
+        )?;
+        if let Some(target) = &profile.target {
+            insert_string(&mut context, "target", target, work, is_cancelled)?;
+        }
+        if let Some(command) = &profile.command {
+            insert_string(&mut context, "command", command, work, is_cancelled)?;
+        }
+        let mut features = Vec::new();
+        for feature in &profile.features {
+            work.steps(feature.len().saturating_add(1), is_cancelled)?;
+            features.push(Value::String(feature.clone()));
+        }
+        work.steps("features".len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(context.len(), "features".len(), work, is_cancelled)?;
+        context.insert("features".to_owned(), Value::Array(features));
+    }
+    insert_string(
+        &mut context,
+        "profile",
+        &edge.profile_id,
+        work,
+        is_cancelled,
+    )?;
+    insert_string(
+        &mut context,
+        "profile_id",
+        &edge.profile_id,
+        work,
+        is_cancelled,
+    )?;
+    insert_string(&mut context, "phase", &edge.phase, work, is_cancelled)?;
+    insert_string(
+        &mut context,
+        "environment",
+        &edge.environment,
+        work,
+        is_cancelled,
+    )?;
+    insert_string(
+        &mut context,
+        "precision",
+        &edge.precision,
+        work,
+        is_cancelled,
+    )?;
+    insert_string(
+        &mut context,
+        "resolution_status",
+        &edge.resolution_status,
+        work,
+        is_cancelled,
+    )?;
+    insert_bool(
+        &mut context,
+        "generated",
+        edge.generated,
+        work,
+        is_cancelled,
+    )?;
+    Ok(context)
 }
 
+#[allow(dead_code)]
 fn edge_context(edge: &EdgeRecord, profile: Option<&ProfileRecord>) -> BTreeMap<String, Value> {
     let mut context = BTreeMap::new();
     if let Some(profile) = profile {
@@ -2924,6 +4902,7 @@ fn merge_object(context: &mut BTreeMap<String, Value>, value: &Value) {
     }
 }
 
+#[allow(dead_code)]
 fn evaluate_condition(
     condition: &PolicyCondition,
     context: &BTreeMap<String, Value>,
@@ -3009,6 +4988,7 @@ fn evaluate_edge_condition(
 }
 
 const MAX_EDGE_CONDITION_DEPTH: usize = 16;
+const MAX_EDGE_CONDITION_JSON_DEPTH: usize = 2 * MAX_EDGE_CONDITION_DEPTH + 2;
 
 enum ConditionParseFrame<'a> {
     Visit {
@@ -3031,9 +5011,9 @@ enum ConditionParseFrame<'a> {
 /// policy evaluation also accepts snapshots loaded from older stores and test
 /// fixtures.  Keeping the parser iterative makes a malformed/deep condition
 /// consume the shared policy budget instead of growing the Rust call stack.
-/// The depth ceiling matches the validated PolicyCondition output contract,
-/// so a manually assembled snapshot cannot create a deeper recursive tree on
-/// either successful materialization or an error path.
+/// The depth ceiling matches `PolicyCondition::validate_inner`: leaf operators
+/// may occur at depth 16, while an aggregate or `not` operator at that depth
+/// is rejected before its child can deepen the tree.
 fn parse_condition_bounded(
     value: &Value,
     edge_id: &str,
@@ -3047,9 +5027,6 @@ fn parse_condition_bounded(
         match frame {
             ConditionParseFrame::Visit { value, depth } => {
                 work.step(is_cancelled)?;
-                if depth > MAX_EDGE_CONDITION_DEPTH {
-                    bail!("edge {edge_id:?} has an invalid policy condition");
-                }
                 let object = value
                     .as_object()
                     .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
@@ -3057,6 +5034,9 @@ fn parse_condition_bounded(
                     .get("op")
                     .and_then(Value::as_str)
                     .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+                if depth >= MAX_EDGE_CONDITION_DEPTH && matches!(operation, "all" | "any" | "not") {
+                    bail!("edge {edge_id:?} has an invalid policy condition");
+                }
                 match operation {
                     "all" | "any" => {
                         require_condition_fields(
@@ -3072,6 +5052,10 @@ fn parse_condition_bounded(
                             .with_context(|| {
                                 format!("edge {edge_id:?} has an invalid policy condition")
                             })?;
+                        work.steps(children.len(), is_cancelled)?;
+                        if children.len() > 255 {
+                            bail!("edge {edge_id:?} has an invalid policy condition");
+                        }
                         frames.push(ConditionParseFrame::Aggregate {
                             any: operation == "any",
                             children,
@@ -3095,7 +5079,7 @@ fn parse_condition_bounded(
                         frames.push(ConditionParseFrame::Not);
                         frames.push(ConditionParseFrame::Visit {
                             value: child,
-                            depth: depth + 1,
+                            depth: depth.saturating_add(1),
                         });
                     }
                     "eq" => {
@@ -3132,7 +5116,11 @@ fn parse_condition_bounded(
                             .with_context(|| {
                                 format!("edge {edge_id:?} has an invalid policy condition")
                             })?;
-                        let mut condition_values = Vec::with_capacity(raw_values.len());
+                        work.steps(raw_values.len(), is_cancelled)?;
+                        if raw_values.is_empty() || raw_values.len() > 128 {
+                            bail!("edge {edge_id:?} has an invalid policy condition");
+                        }
+                        let mut condition_values = Vec::new();
                         for value in raw_values {
                             condition_values.push(condition_value_bounded(
                                 value,
@@ -3140,6 +5128,14 @@ fn parse_condition_bounded(
                                 work,
                                 is_cancelled,
                             )?);
+                        }
+                        for (index, value) in condition_values.iter().enumerate() {
+                            for previous in &condition_values[..index] {
+                                work.step(is_cancelled)?;
+                                if condition_values_equal(previous, value) {
+                                    bail!("edge {edge_id:?} has an invalid policy condition");
+                                }
+                            }
                         }
                         values.push(PolicyCondition::In {
                             key,
@@ -3189,7 +5185,7 @@ fn parse_condition_bounded(
                     });
                     frames.push(ConditionParseFrame::Visit {
                         value: child,
-                        depth: depth + 1,
+                        depth: depth.saturating_add(1),
                     });
                 } else {
                     values.push(if any {
@@ -3245,6 +5241,14 @@ fn condition_key_bounded(
         .get("key")
         .and_then(Value::as_str)
         .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
+    if key.is_empty()
+        || key.len() > 128
+        || key.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | ':' | '-'))
+        })
+    {
+        bail!("edge {edge_id:?} has an invalid policy condition");
+    }
     work.steps(key.len().saturating_add(1), is_cancelled)?;
     Ok(key.to_owned())
 }
@@ -3257,6 +5261,11 @@ fn condition_value_bounded(
 ) -> Result<Value> {
     charge_condition_value_work(value, work, is_cancelled)?;
     if !(value.is_null() || value.is_boolean() || value.is_number() || value.is_string()) {
+        bail!("edge {edge_id:?} has an invalid policy condition");
+    }
+    if let Value::String(value) = value
+        && (value.is_empty() || value.chars().count() > 1024 || value.chars().any(char::is_control))
+    {
         bail!("edge {edge_id:?} has an invalid policy condition");
     }
     Ok(value.clone())
@@ -3272,6 +5281,30 @@ fn charge_condition_value_work(
         work.steps(value.len(), is_cancelled)?;
     }
     Ok(())
+}
+
+fn condition_value_serialized_work(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(value) => {
+            if *value {
+                4
+            } else {
+                5
+            }
+        }
+        // serde_json numbers are scalar values in the default build. Keep a
+        // conservative fixed charge without serializing/allocating first.
+        Value::Number(_) => 128,
+        // Quotes, backslashes, and escaped UTF-8 code points can expand a
+        // string; this upper bound is intentionally conservative.
+        Value::String(value) => value.len().saturating_mul(6).saturating_add(2),
+        Value::Array(_) | Value::Object(_) => 0,
+    }
+}
+
+fn condition_string_serialized_work(value: &str) -> usize {
+    value.len().saturating_mul(6).saturating_add(2)
 }
 
 enum ConditionEvalFrame<'a> {
@@ -3451,7 +5484,7 @@ fn lookup_context_bounded<'a>(
     };
     let mut value = context.get(first);
     for segment in segments {
-        work.step(is_cancelled)?;
+        work.steps(segment.len().saturating_add(1), is_cancelled)?;
         value = value.and_then(|value| value.get(segment));
     }
     Ok(value)
@@ -3588,7 +5621,7 @@ fn canonical_condition_bounded(
                         values: expected,
                     } => {
                         work.steps(key.len().saturating_add(1), is_cancelled)?;
-                        let mut keyed = Vec::with_capacity(expected.len());
+                        let mut keyed = Vec::new();
                         for value in expected {
                             charge_condition_value_work(value, work, is_cancelled)?;
                             if !(value.is_null()
@@ -3598,6 +5631,7 @@ fn canonical_condition_bounded(
                             {
                                 bail!("edge condition value must be a JSON primitive");
                             }
+                            work.steps(condition_value_serialized_work(value), is_cancelled)?;
                             let sort_key = serde_json::to_string(value)?;
                             work.steps(sort_key.len().saturating_add(1), is_cancelled)?;
                             keyed.push((sort_key, value.clone()));
@@ -3703,7 +5737,7 @@ fn canonicalize_condition_operator_bounded(
         }
     }
 
-    let mut keyed = Vec::with_capacity(flattened.len());
+    let mut keyed = Vec::new();
     for condition in flattened {
         let key = condition_sort_key_bounded(&condition, work, is_cancelled)?;
         keyed.push((key, condition));
@@ -3775,6 +5809,7 @@ fn append_condition_string_bounded(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<()> {
     work.steps(value.len().saturating_add(1), is_cancelled)?;
+    work.steps(condition_string_serialized_work(value), is_cancelled)?;
     let encoded = serde_json::to_string(value)?;
     work.steps(encoded.len().saturating_add(1), is_cancelled)?;
     output.push_str(&encoded);
@@ -3788,6 +5823,7 @@ fn append_condition_value_bounded(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<()> {
     charge_condition_value_work(value, work, is_cancelled)?;
+    work.steps(condition_value_serialized_work(value), is_cancelled)?;
     let encoded = serde_json::to_string(value)?;
     work.steps(encoded.len().saturating_add(1), is_cancelled)?;
     output.push_str(&encoded);
@@ -4002,12 +6038,19 @@ fn select_evidence_bounded(
     } else {
         edge_records
     };
-    let mut records_by_priority = Vec::with_capacity(records.len());
+    let mut records_by_priority = Vec::new();
     for record in records {
         work.step(is_cancelled)?;
         records_by_priority.push(*record);
     }
-    charge_sort_work(records_by_priority.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        records_by_priority.len(),
+        records_by_priority
+            .iter()
+            .map(|record| record.kind.len().saturating_add(record.path.len())),
+        work,
+        is_cancelled,
+    )?;
     records_by_priority.sort_by(|left, right| {
         (
             left.ordinal,
@@ -4030,6 +6073,10 @@ fn select_evidence_bounded(
         if requirement.primary_only && record.ordinal != 0 {
             continue;
         }
+        work.steps(
+            record.kind.len().saturating_add(record.path.len()),
+            is_cancelled,
+        )?;
         let kind: EvidenceKind = serde_json::from_value(Value::String(record.kind.clone()))
             .with_context(|| {
                 format!(
@@ -4053,6 +6100,7 @@ fn select_evidence_bounded(
     Ok(spans)
 }
 
+#[allow(dead_code)]
 fn node_policy_evidence(
     index: &NodeEvidenceIndex<'_>,
     node: &NodeRecord,
@@ -4114,6 +6162,7 @@ fn node_policy_evidence(
     Ok(spans)
 }
 
+#[allow(dead_code)]
 fn append_unique_evidence(
     destination: &mut Vec<PolicyEvidenceSpan>,
     evidence: Vec<PolicyEvidenceSpan>,
@@ -4152,12 +6201,22 @@ fn canonicalize_evidence_bounded(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<()> {
-    charge_sort_work(evidence.len(), work, is_cancelled)?;
+    charge_sort_key_bytes_work(
+        evidence.len(),
+        evidence.iter().map(|span| {
+            span.path
+                .len()
+                .saturating_add(evidence_kind_name(span.kind).len())
+        }),
+        work,
+        is_cancelled,
+    )?;
     work.steps(evidence.len(), is_cancelled)?;
     canonicalize_evidence(evidence);
     Ok(())
 }
 
+#[allow(dead_code)]
 fn combined_condition(edges: &[&AdmittedEdge<'_>]) -> Result<PolicyCondition> {
     let mut conditions: BTreeMap<String, PolicyCondition> = BTreeMap::new();
     for edge in edges {
@@ -4173,19 +6232,27 @@ fn combined_condition(edges: &[&AdmittedEdge<'_>]) -> Result<PolicyCondition> {
     }
 }
 
+#[allow(dead_code)]
 fn canonical_condition(condition: &PolicyCondition) -> Result<PolicyCondition> {
     Ok(serde_json::from_value(serde_json::to_value(
         condition.canonicalized(),
     )?)?)
 }
 
-fn serialized_names<T: Serialize>(values: &[T]) -> Result<BTreeSet<String>> {
+fn serialized_names_bounded<T: Serialize>(
+    values: &[T],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeSet<String>> {
     let mut output = BTreeSet::new();
     for value in values {
+        work.step(is_cancelled)?;
         let serialized = serde_json::to_value(value)?;
         let name = serialized
             .as_str()
             .context("policy enum did not serialize as a string")?;
+        work.steps(name.len().saturating_add(1), is_cancelled)?;
+        charge_ordered_collection_work(output.len(), name.len(), work, is_cancelled)?;
         output.insert(name.to_owned());
     }
     Ok(output)
@@ -4197,6 +6264,21 @@ fn path_step(edge: &EdgeRecord) -> PolicyPathStep {
         edge_id: edge.id.clone(),
         target_id: edge.target.clone(),
     }
+}
+
+fn path_step_bounded(
+    edge: &EdgeRecord,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyPathStep> {
+    work.steps(
+        edge.source
+            .len()
+            .saturating_add(edge.id.len())
+            .saturating_add(edge.target.len()),
+        is_cancelled,
+    )?;
+    Ok(path_step(edge))
 }
 
 fn cycle_level(kind: PolicySelectorKind) -> Option<CycleLevel> {
@@ -5449,6 +7531,153 @@ mod tests {
     }
 
     #[test]
+    fn public_api_diff_preflights_snapshot_clone_and_work() -> Result<()> {
+        let mut public_rule = rule(PolicyRuleKind::PublicApiChange);
+        public_rule.id = "bounded-public-api".to_owned();
+        public_rule.source = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "consumer".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.target = PolicySelector {
+            kind: PolicySelectorKind::Symbol,
+            field: PolicySelectorField::Id,
+            match_kind: PolicyMatchKind::Exact,
+            value: "public-api".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        public_rule.profiles = PolicyProfileFilter::default();
+        public_rule.condition = PolicyCondition::default();
+        let policy = config(public_rule);
+
+        let mut deep_value = json!(null);
+        for _ in 0..20_000 {
+            let mut object = serde_json::Map::new();
+            object.insert("nested".to_owned(), deep_value);
+            deep_value = Value::Object(object);
+        }
+        let mut from = snapshot(Vec::new());
+        from.nodes = vec![NodeRecord {
+            id: "public-api".to_owned(),
+            kind: "symbol".to_owned(),
+            locator: "symbol:public-api".to_owned(),
+            display_name: "public-api".to_owned(),
+            properties: deep_value,
+        }];
+        let mut to = snapshot(Vec::new());
+        to.nodes = vec![semantic_node(
+            "public-api",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v2"}),
+        )];
+        let deep_error = evaluate_policy_diff_cancellable(
+            "before",
+            &from,
+            "after",
+            &to,
+            &policy,
+            usize::MAX,
+            || false,
+        )
+        .unwrap_err();
+        assert!(deep_error.to_string().contains("nested deeper than"));
+
+        let mut large_to = snapshot(Vec::new());
+        large_to.nodes.push(semantic_node(
+            "public-api",
+            "symbol",
+            "src/public.ts",
+            json!({"signature":"v2"}),
+        ));
+        for index in 0..512 {
+            large_to.nodes.push(semantic_node(
+                &format!("unrelated-{index}"),
+                "symbol",
+                &format!("src/unrelated-{index}.ts"),
+                json!({}),
+            ));
+        }
+        let exhausted = evaluate_policy_diff_cancellable(
+            "before",
+            &snapshot(Vec::new()),
+            "after",
+            &large_to,
+            &policy,
+            128,
+            || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let cancelled = evaluate_policy_diff_cancellable(
+            "before",
+            &snapshot(Vec::new()),
+            "after",
+            &large_to,
+            &policy,
+            usize::MAX,
+            || {
+                checks += 1;
+                checks > 24
+            },
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 25);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_preflights_deep_profile_values_before_context_materialization() -> Result<()> {
+        let mut accepted_value = json!(null);
+        for _ in 0..17 {
+            let mut object = serde_json::Map::new();
+            object.insert("nested".to_owned(), accepted_value);
+            accepted_value = Value::Object(object);
+        }
+        let mut accepted_snapshot =
+            snapshot(vec![edge("accepted:a-b", "a", "b", "profile:production")]);
+        accepted_snapshot.profiles[0].environment = accepted_value;
+        assert!(
+            evaluate_policy_cancellable(
+                "accepted",
+                &accepted_snapshot,
+                &config(rule(PolicyRuleKind::LayerBoundary)),
+                usize::MAX,
+                || false,
+            )
+            .is_ok()
+        );
+
+        let mut deep_value = json!(null);
+        for _ in 0..20_000 {
+            let mut object = serde_json::Map::new();
+            object.insert("nested".to_owned(), deep_value);
+            deep_value = Value::Object(object);
+        }
+        let mut snapshot = snapshot(vec![edge("edge:a-b", "a", "b", "profile:production")]);
+        snapshot.profiles[0].environment = deep_value;
+        let error = evaluate_policy_cancellable(
+            "snapshot",
+            &snapshot,
+            &config(rule(PolicyRuleKind::LayerBoundary)),
+            usize::MAX,
+            || false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nested deeper than"));
+        Ok(())
+    }
+
+    #[test]
     fn diff_suppression_follows_confirmed_rename_identity() -> Result<()> {
         let old_api = semantic_node(
             "public-api-v1",
@@ -6066,6 +8295,80 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut boundary_condition = json!({
+            "op": "eq",
+            "key": "mode",
+            "value": "production"
+        });
+        for _ in 0..16 {
+            boundary_condition = json!({"op":"not","condition":boundary_condition});
+        }
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        assert!(
+            parse_condition_bounded(&boundary_condition, "boundary", &mut work, &mut || false,)
+                .is_ok()
+        );
+        boundary_condition = json!({"op":"not","condition":boundary_condition});
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        assert!(
+            parse_condition_bounded(&boundary_condition, "boundary", &mut work, &mut || false,)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid policy condition")
+        );
+
+        let invalid_conditions = [
+            json!({"op":"in","key":"mode","values": []}),
+            json!({"op":"in","key":"mode","values": ["production", "production"]}),
+            json!({"op":"eq","key":"","value": true}),
+            json!({"op":"eq","key":"mode","value":""}),
+        ];
+        for value in invalid_conditions {
+            let mut work = PolicyEvaluationWork::new(usize::MAX);
+            assert!(parse_condition_bounded(&value, "invalid", &mut work, &mut || false,).is_err());
+        }
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let oversized_key = json!({
+            "op":"eq",
+            "key":"k".repeat(129),
+            "value": true
+        });
+        assert!(
+            parse_condition_bounded(&oversized_key, "invalid", &mut work, &mut || false,).is_err()
+        );
+
+        // The logical depth limit is independent from the JSON wire depth:
+        // every aggregate adds both an object and a `conditions` array. A
+        // depth-16 aggregate chain with an `in` leaf is therefore valid and
+        // must survive the snapshot preflight before the parser/evaluator.
+        let mut valid_boundary_condition = json!({
+            "op": "in",
+            "key": "mode",
+            "values": ["production"]
+        });
+        for _ in 0..16 {
+            let mut object = serde_json::Map::new();
+            object.insert("op".to_owned(), Value::String("all".to_owned()));
+            object.insert(
+                "conditions".to_owned(),
+                Value::Array(vec![valid_boundary_condition]),
+            );
+            valid_boundary_condition = Value::Object(object);
+        }
+        let mut valid_graph = snapshot(vec![edge(
+            "valid-boundary-condition",
+            "a",
+            "b",
+            "profile:production",
+        )]);
+        valid_graph.edges[0].condition = valid_boundary_condition;
+        let valid_result = evaluate_policy(
+            "snapshot:valid",
+            &valid_graph,
+            &config(rule(PolicyRuleKind::LayerBoundary)),
+        )?;
+        assert_eq!(valid_result.violations.len(), 1);
         Ok(())
     }
 
