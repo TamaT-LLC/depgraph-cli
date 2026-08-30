@@ -78,6 +78,50 @@ fn charge_sort_work(
     work.steps(len.saturating_mul(comparison_rounds), is_cancelled)
 }
 
+fn charge_ordered_collection_work(
+    len: usize,
+    key_units: usize,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let comparison_rounds = if len == 0 {
+        1
+    } else {
+        usize::BITS as usize - len.leading_zeros() as usize
+    };
+    work.steps(
+        comparison_rounds.saturating_mul(key_units.max(1)),
+        is_cancelled,
+    )
+}
+
+fn charge_json_value_work(
+    value: &Value,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        work.step(is_cancelled)?;
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    work.step(is_cancelled)?;
+                    pending.push(value);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    work.step(is_cancelled)?;
+                    pending.push(value);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BoundaryViolationComparisonKey {
     rule_id: String,
@@ -128,6 +172,7 @@ fn new_boundary_violation_ids_bounded(
                 | PolicyRuleKind::ForbiddenDependency
                 | PolicyRuleKind::RuntimeBoundary
         ) {
+            charge_ordered_collection_work(boundary_rule_ids.len(), 1, work, is_cancelled)?;
             boundary_rule_ids.insert(rule.id.as_str());
         }
     }
@@ -140,12 +185,15 @@ fn new_boundary_violation_ids_bounded(
         {
             continue;
         }
+        let key = boundary_violation_comparison_key_bounded(violation, work, is_cancelled)?;
+        charge_ordered_collection_work(
+            before_by_key.len(),
+            key.dependency_node_path.len().saturating_add(4),
+            work,
+            is_cancelled,
+        )?;
         before_by_key
-            .entry(boundary_violation_comparison_key_bounded(
-                violation,
-                work,
-                is_cancelled,
-            )?)
+            .entry(key)
             .or_default()
             .push(violation.id.clone());
     }
@@ -157,12 +205,15 @@ fn new_boundary_violation_ids_bounded(
         {
             continue;
         }
+        let key = boundary_violation_comparison_key_bounded(violation, work, is_cancelled)?;
+        charge_ordered_collection_work(
+            after_by_key.len(),
+            key.dependency_node_path.len().saturating_add(4),
+            work,
+            is_cancelled,
+        )?;
         after_by_key
-            .entry(boundary_violation_comparison_key_bounded(
-                violation,
-                work,
-                is_cancelled,
-            )?)
+            .entry(key)
             .or_default()
             .push(violation.id.clone());
     }
@@ -173,8 +224,15 @@ fn new_boundary_violation_ids_bounded(
         ids.sort();
         let mut before_id_counts = BTreeMap::<String, usize>::new();
         let mut remaining_before = 0usize;
+        charge_ordered_collection_work(
+            before_by_key.len(),
+            key.dependency_node_path.len().saturating_add(4),
+            work,
+            is_cancelled,
+        )?;
         for id in before_by_key.remove(&key).unwrap_or_default() {
             work.step(is_cancelled)?;
+            charge_ordered_collection_work(before_id_counts.len(), 1, work, is_cancelled)?;
             let count = before_id_counts.entry(id).or_default();
             *count = count.saturating_add(1);
             remaining_before = remaining_before.saturating_add(1);
@@ -207,6 +265,7 @@ fn new_boundary_violation_ids_bounded(
         let moved_continuing = remaining_before.min(unmatched_after.len());
         for id in unmatched_after.into_iter().skip(moved_continuing) {
             work.step(is_cancelled)?;
+            charge_ordered_collection_work(new_ids.len(), 1, work, is_cancelled)?;
             new_ids.insert(id);
         }
     }
@@ -266,12 +325,18 @@ fn evaluate_policy_with_work(
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<PolicyResult> {
+    work.step(is_cancelled)?;
+    work.steps(
+        config.rules.len().saturating_add(config.suppressions.len()),
+        is_cancelled,
+    )?;
     config.validate()?;
-    let nodes: BTreeMap<_, _> = snapshot
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect();
+    let mut nodes = BTreeMap::new();
+    for node in &snapshot.nodes {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(nodes.len(), 1, work, is_cancelled)?;
+        nodes.insert(node.id.as_str(), node);
+    }
     let mut violations = BTreeMap::new();
 
     for rule in &config.rules {
@@ -282,58 +347,43 @@ fn evaluate_policy_with_work(
         if rule.kind == PolicyRuleKind::PublicApiChange {
             continue;
         }
-        let suppressions = if rule.kind == PolicyRuleKind::RuntimeBoundary {
-            resolve_suppressions_bounded(snapshot, config, Some(&rule.id), work, is_cancelled)?
-        } else {
-            resolve_suppressions(snapshot, config, Some(&rule.id))?
-        };
-        let sources = if rule.kind == PolicyRuleKind::RuntimeBoundary {
-            resolve_selector_bounded(
-                snapshot,
-                &rule.source,
-                &format!("rule {:?} source", rule.id),
-                work,
-                is_cancelled,
-            )?
-        } else {
-            resolve_selector(
-                snapshot,
-                &rule.source,
-                &format!("rule {:?} source", rule.id),
-            )?
-        };
-        let targets = if rule.kind == PolicyRuleKind::RuntimeBoundary {
-            resolve_selector_bounded(
-                snapshot,
-                &rule.target,
-                &format!("rule {:?} target", rule.id),
-                work,
-                is_cancelled,
-            )?
-        } else {
-            resolve_selector(
-                snapshot,
-                &rule.target,
-                &format!("rule {:?} target", rule.id),
-            )?
-        };
-        let source_ids: BTreeSet<_> = sources.iter().map(|node| node.id.as_str()).collect();
-        let target_ids: BTreeSet<_> = targets.iter().map(|node| node.id.as_str()).collect();
+        let suppressions =
+            resolve_suppressions_bounded(snapshot, config, Some(&rule.id), work, is_cancelled)?;
+        let sources = resolve_selector_bounded(
+            snapshot,
+            &rule.source,
+            &format!("rule {:?} source", rule.id),
+            work,
+            is_cancelled,
+        )?;
+        let targets = resolve_selector_bounded(
+            snapshot,
+            &rule.target,
+            &format!("rule {:?} target", rule.id),
+            work,
+            is_cancelled,
+        )?;
+        let source_ids = borrowed_node_id_set_bounded(&sources, work, is_cancelled)?;
+        let target_ids = borrowed_node_id_set_bounded(&targets, work, is_cancelled)?;
         let admitted = if rule.kind == PolicyRuleKind::RuntimeBoundary {
             Vec::new()
         } else {
-            admitted_edges(snapshot, rule)?
+            admitted_edges_with_options_bounded(snapshot, rule, true, true, work, is_cancelled)?
         };
 
         let evaluated = match rule.kind {
-            PolicyRuleKind::LayerBoundary | PolicyRuleKind::ForbiddenDependency => evaluate_direct(
-                rule,
-                &admitted,
-                &source_ids,
-                &target_ids,
-                &nodes,
-                &suppressions,
-            )?,
+            PolicyRuleKind::LayerBoundary | PolicyRuleKind::ForbiddenDependency => {
+                evaluate_direct_bounded(
+                    rule,
+                    &admitted,
+                    &source_ids,
+                    &target_ids,
+                    &nodes,
+                    &suppressions,
+                    work,
+                    is_cancelled,
+                )?
+            }
             PolicyRuleKind::Cycle => evaluate_cycles(
                 snapshot,
                 rule,
@@ -377,11 +427,27 @@ fn evaluate_policy_with_work(
             }
         };
         for violation in evaluated {
+            work.step(is_cancelled)?;
+            charge_ordered_collection_work(violations.len(), 1, work, is_cancelled)?;
             violations.entry(violation.id.clone()).or_insert(violation);
         }
     }
 
-    let result = PolicyResult::new(snapshot_id, violations.into_values().collect());
+    let mut ordered = Vec::with_capacity(violations.len());
+    for violation in violations.into_values() {
+        work.step(is_cancelled)?;
+        work.steps(
+            violation
+                .dependency_path
+                .len()
+                .saturating_add(violation.evidence.len()),
+            is_cancelled,
+        )?;
+        ordered.push(violation);
+    }
+    charge_sort_work(ordered.len(), work, is_cancelled)?;
+    let result = PolicyResult::new(snapshot_id, ordered);
+    work.steps(result.violations.len(), is_cancelled)?;
     result.validate()?;
     Ok(result)
 }
@@ -443,10 +509,14 @@ pub(crate) fn evaluate_boundary_violation_ids_cancellable(
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<BTreeSet<String>> {
     let mut work = PolicyEvaluationWork::new(maximum_work);
+    let boundary_config = boundary_policy_config_bounded(config, &mut work, &mut is_cancelled)?;
+    if boundary_config.rules.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let before_result = evaluate_policy_with_work(
         before_snapshot_id,
         before,
-        config,
+        &boundary_config,
         &mut work,
         &mut is_cancelled,
     )?;
@@ -455,17 +525,60 @@ pub(crate) fn evaluate_boundary_violation_ids_cancellable(
         before,
         after_snapshot_id,
         after,
-        config,
+        &boundary_config,
         &mut work,
         &mut is_cancelled,
     )?;
     new_boundary_violation_ids_bounded(
         &before_result,
         &after_result,
-        config,
+        &boundary_config,
         &mut work,
         &mut is_cancelled,
     )
+}
+
+fn boundary_policy_config_bounded(
+    config: &PolicyConfig,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyConfig> {
+    work.step(is_cancelled)?;
+    work.steps(
+        config.rules.len().saturating_add(config.suppressions.len()),
+        is_cancelled,
+    )?;
+    config.validate()?;
+
+    let mut rules = Vec::new();
+    let mut rule_ids = BTreeSet::new();
+    for rule in &config.rules {
+        work.step(is_cancelled)?;
+        if matches!(
+            rule.kind,
+            PolicyRuleKind::LayerBoundary
+                | PolicyRuleKind::ForbiddenDependency
+                | PolicyRuleKind::RuntimeBoundary
+        ) {
+            charge_ordered_collection_work(rule_ids.len(), 1, work, is_cancelled)?;
+            rule_ids.insert(rule.id.as_str());
+            rules.push(rule.clone());
+        }
+    }
+    let mut suppressions = Vec::new();
+    for suppression in &config.suppressions {
+        work.step(is_cancelled)?;
+        if rule_ids.contains(suppression.rule_id.as_str()) {
+            suppressions.push(suppression.clone());
+        }
+    }
+    let filtered = PolicyConfig {
+        schema_version: config.schema_version.clone(),
+        rules,
+        suppressions,
+    };
+    filtered.validate()?;
+    Ok(filtered)
 }
 
 fn evaluate_policy_diff_with_work(
@@ -1084,15 +1197,6 @@ struct ResolvedSuppression<'a> {
     target_ids: Option<BTreeSet<String>>,
 }
 
-fn resolve_suppressions<'a>(
-    snapshot: &GraphSnapshot,
-    config: &'a PolicyConfig,
-    rule_id: Option<&str>,
-) -> Result<Vec<ResolvedSuppression<'a>>> {
-    let mut work = PolicyEvaluationWork::new(usize::MAX);
-    resolve_suppressions_bounded(snapshot, config, rule_id, &mut work, &mut || false)
-}
-
 fn resolve_suppressions_bounded<'a>(
     snapshot: &GraphSnapshot,
     config: &'a PolicyConfig,
@@ -1101,11 +1205,11 @@ fn resolve_suppressions_bounded<'a>(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<ResolvedSuppression<'a>>> {
     let mut resolved = Vec::with_capacity(config.suppressions.len());
-    for suppression in config
-        .suppressions
-        .iter()
-        .filter(|suppression| rule_id.is_none_or(|rule_id| suppression.rule_id == rule_id))
-    {
+    for suppression in &config.suppressions {
+        work.step(is_cancelled)?;
+        if rule_id.is_some_and(|rule_id| suppression.rule_id != rule_id) {
+            continue;
+        }
         let source_ids = suppression
             .scope
             .source
@@ -1118,7 +1222,7 @@ fn resolve_suppressions_bounded<'a>(
                     work,
                     is_cancelled,
                 )
-                .map(|nodes| nodes.into_iter().map(|node| node.id.clone()).collect())
+                .and_then(|nodes| owned_node_id_set_bounded(&nodes, work, is_cancelled))
             })
             .transpose()?;
         let target_ids = suppression
@@ -1133,24 +1237,19 @@ fn resolve_suppressions_bounded<'a>(
                     work,
                     is_cancelled,
                 )
-                .map(|nodes| nodes.into_iter().map(|node| node.id.clone()).collect())
+                .and_then(|nodes| owned_node_id_set_bounded(&nodes, work, is_cancelled))
             })
             .transpose()?;
+        work.step(is_cancelled)?;
         resolved.push(ResolvedSuppression {
             suppression,
             source_ids,
             target_ids,
         });
     }
+    charge_sort_work(resolved.len(), work, is_cancelled)?;
     resolved.sort_by(|left, right| left.suppression.id.cmp(&right.suppression.id));
     Ok(resolved)
-}
-
-fn admitted_edges<'a>(
-    snapshot: &'a GraphSnapshot,
-    rule: &PolicyRule,
-) -> Result<Vec<AdmittedEdge<'a>>> {
-    admitted_edges_with_options(snapshot, rule, true, true)
 }
 
 fn admitted_edges_with_options<'a>(
@@ -1181,12 +1280,14 @@ fn admitted_edges_with_options_bounded<'a>(
     let mut profiles = BTreeMap::new();
     for profile in &snapshot.profiles {
         work.step(is_cancelled)?;
+        charge_ordered_collection_work(profiles.len(), 1, work, is_cancelled)?;
         profiles.insert(profile.id.as_str(), profile);
     }
     let evidence: BTreeMap<_, Vec<_>> = {
         let mut by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
         for item in &snapshot.evidence {
             work.step(is_cancelled)?;
+            charge_ordered_collection_work(by_owner.len(), 2, work, is_cancelled)?;
             by_owner
                 .entry((item.owner_type.as_str(), item.owner_id.as_str()))
                 .or_default()
@@ -1209,7 +1310,12 @@ fn admitted_edges_with_options_bounded<'a>(
 
         let condition: PolicyCondition = serde_json::from_value(edge.condition.clone())
             .with_context(|| format!("edge {:?} has an invalid policy condition", edge.id))?;
-        let mut context = edge_context(edge, profiles.get(edge.profile_id.as_str()).copied());
+        let mut context = edge_context_bounded(
+            edge,
+            profiles.get(edge.profile_id.as_str()).copied(),
+            work,
+            is_cancelled,
+        )?;
         if evaluate_edge_condition(&condition, &context) == Some(false) {
             continue;
         }
@@ -1264,6 +1370,7 @@ fn evaluate_runtime_boundary(
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in &admitted {
         work.step(is_cancelled)?;
+        charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
         by_profile
             .entry(item.edge.profile_id.as_str())
             .or_default()
@@ -1296,6 +1403,7 @@ fn evaluate_runtime_boundary(
                 work.step(is_cancelled)?;
                 for item in adjacency.get(current.as_str()).into_iter().flatten() {
                     work.step(is_cancelled)?;
+                    charge_ordered_collection_work(visited.len(), 1, work, is_cancelled)?;
                     if visited.insert(item.edge.target.clone()) {
                         predecessor.insert(item.edge.target.clone(), item);
                         queue.push_back(item.edge.target.clone());
@@ -1345,6 +1453,7 @@ fn evaluate_runtime_boundary(
                     is_cancelled,
                 )?;
                 work.step(is_cancelled)?;
+                charge_ordered_collection_work(output.len(), 1, work, is_cancelled)?;
                 output.entry(violation.id.clone()).or_insert(violation);
             }
         }
@@ -1357,40 +1466,49 @@ fn evaluate_runtime_boundary(
     Ok(violations)
 }
 
-fn evaluate_direct(
+#[allow(clippy::too_many_arguments)]
+fn evaluate_direct_bounded(
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
     source_ids: &BTreeSet<&str>,
     target_ids: &BTreeSet<&str>,
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
-    admitted
-        .iter()
-        .filter(|item| {
-            source_ids.contains(item.edge.source.as_str())
-                && target_ids.contains(item.edge.target.as_str())
-        })
-        .map(|item| {
-            let path = vec![path_step(item.edge)];
-            make_violation(
-                rule,
-                nodes,
-                &item.edge.source,
-                &item.edge.target,
-                Some(&item.edge.profile_id),
-                path,
-                vec![item],
-                format!(
-                    "{} dependency from {} to {} is forbidden",
-                    rule_kind_name(&rule.kind),
-                    item.edge.source,
-                    item.edge.target
-                ),
-                suppressions,
-            )
-        })
-        .collect()
+    let mut violations = Vec::new();
+    for item in admitted {
+        work.step(is_cancelled)?;
+        if !source_ids.contains(item.edge.source.as_str())
+            || !target_ids.contains(item.edge.target.as_str())
+        {
+            continue;
+        }
+        work.step(is_cancelled)?;
+        let path = vec![path_step(item.edge)];
+        let violation = make_violation_bounded(
+            rule,
+            nodes,
+            &item.edge.source,
+            &item.edge.target,
+            Some(&item.edge.profile_id),
+            path,
+            vec![item],
+            format!(
+                "{} dependency from {} to {} is forbidden",
+                rule_kind_name(&rule.kind),
+                item.edge.source,
+                item.edge.target
+            ),
+            suppressions,
+            work,
+            is_cancelled,
+        )?;
+        work.step(is_cancelled)?;
+        violations.push(violation);
+    }
+    Ok(violations)
 }
 
 fn evaluate_cycles(
@@ -1665,6 +1783,7 @@ fn adjacency_bounded<'a>(
     let mut adjacency: BTreeMap<&str, Vec<_>> = BTreeMap::new();
     for edge in edges {
         work.step(is_cancelled)?;
+        charge_ordered_collection_work(adjacency.len(), 1, work, is_cancelled)?;
         adjacency
             .entry(edge.edge.source.as_str())
             .or_default()
@@ -1926,6 +2045,7 @@ fn combined_context_bounded(
         work.step(is_cancelled)?;
         for (key, value) in &edge.context {
             work.step(is_cancelled)?;
+            charge_json_value_work(value, work, is_cancelled)?;
             combined
                 .entry(key.clone())
                 .and_modify(|current| {
@@ -1970,6 +2090,7 @@ fn resolve_selector_bounded<'a>(
             matches.push(node);
         }
     }
+    charge_sort_work(matches.len(), work, is_cancelled)?;
     matches.sort_by(|left, right| left.id.cmp(&right.id));
     if selector.cardinality == PolicySelectorCardinality::One && matches.len() != 1 {
         bail!(
@@ -1978,6 +2099,34 @@ fn resolve_selector_bounded<'a>(
         );
     }
     Ok(matches)
+}
+
+fn borrowed_node_id_set_bounded<'a>(
+    nodes: &[&'a NodeRecord],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeSet<&'a str>> {
+    let mut ids = BTreeSet::new();
+    for node in nodes {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(ids.len(), 1, work, is_cancelled)?;
+        ids.insert(node.id.as_str());
+    }
+    Ok(ids)
+}
+
+fn owned_node_id_set_bounded(
+    nodes: &[&NodeRecord],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    for node in nodes {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(ids.len(), 1, work, is_cancelled)?;
+        ids.insert(node.id.clone());
+    }
+    Ok(ids)
 }
 
 fn selector_matches_node(node: &NodeRecord, selector: &PolicySelector) -> bool {
@@ -2210,26 +2359,17 @@ fn profile_matches_bounded(
     let included = if filter.include.is_empty() {
         true
     } else {
-        let mut matched = false;
-        for pattern in &filter.include {
-            work.step(is_cancelled)?;
-            if pattern_matches(pattern.match_kind, &pattern.value, profile_id) {
-                matched = true;
-                break;
-            }
-        }
-        matched
+        patterns_match_bounded(&filter.include, profile_id, work, is_cancelled)?
     };
     if !included {
         return Ok(false);
     }
-    for pattern in &filter.exclude {
-        work.step(is_cancelled)?;
-        if pattern_matches(pattern.match_kind, &pattern.value, profile_id) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(!patterns_match_bounded(
+        &filter.exclude,
+        profile_id,
+        work,
+        is_cancelled,
+    )?)
 }
 
 fn pattern_matches(kind: PolicyMatchKind, pattern: &str, value: &str) -> bool {
@@ -2281,6 +2421,21 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         0,
         &mut HashMap::new(),
     )
+}
+
+fn edge_context_bounded(
+    edge: &EdgeRecord,
+    profile: Option<&ProfileRecord>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, Value>> {
+    work.steps(8, is_cancelled)?;
+    if let Some(profile) = profile {
+        charge_json_value_work(&profile.environment, work, is_cancelled)?;
+        charge_json_value_work(&profile.properties, work, is_cancelled)?;
+        work.steps(profile.features.len(), is_cancelled)?;
+    }
+    Ok(edge_context(edge, profile))
 }
 
 fn edge_context(edge: &EdgeRecord, profile: Option<&ProfileRecord>) -> BTreeMap<String, Value> {
@@ -3104,9 +3259,10 @@ mod tests {
         let admitted = admitted_edges_with_options(&graph, &runtime, false, true)?;
         let admitted_refs = admitted.iter().collect::<Vec<_>>();
 
-        // The insertion allowance is intentionally exact: the following
-        // deterministic outgoing-edge sort must consume additional work.
-        let mut work = PolicyEvaluationWork::new(admitted_refs.len());
+        // Each insertion and ordered-map lookup has an exact allowance: the
+        // following deterministic outgoing-edge sort must consume more work.
+        let adjacency_insertion_work = admitted_refs.len().saturating_mul(2);
+        let mut work = PolicyEvaluationWork::new(adjacency_insertion_work);
         let exhausted = adjacency_bounded(&admitted_refs, &mut work, &mut || false).unwrap_err();
         assert!(is_policy_evaluation_resource_exhausted(&exhausted));
 
@@ -3350,6 +3506,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_audit_filters_non_boundary_rules_and_their_suppressions() -> Result<()> {
+        let (graph, mut policy) = runtime_boundary_broad_fixture(1, 1);
+        let mut cycle = rule(PolicyRuleKind::Cycle);
+        cycle.id = "unrelated-cycle".to_owned();
+        policy.suppressions.push(PolicySuppression {
+            id: "unrelated-cycle-suppression".to_owned(),
+            rule_id: cycle.id.clone(),
+            reason: "not part of a health boundary audit".to_owned(),
+            scope: PolicySuppressionScope {
+                source: Some(cycle.source.clone()),
+                ..PolicySuppressionScope::default()
+            },
+        });
+        policy.rules.push(cycle);
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let filtered = boundary_policy_config_bounded(&policy, &mut work, &mut || false)?;
+        assert_eq!(filtered.rules.len(), 1);
+        assert_eq!(filtered.rules[0].kind, PolicyRuleKind::RuntimeBoundary);
+        assert!(filtered.suppressions.is_empty());
+
+        let ids = evaluate_boundary_violation_ids_cancellable(
+            "snapshot:before",
+            &graph,
+            "snapshot:after",
+            &graph,
+            &policy,
+            usize::MAX,
+            || false,
+        )?;
+        assert!(ids.is_empty());
         Ok(())
     }
 
