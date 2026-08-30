@@ -43,26 +43,27 @@ pub(crate) fn new_boundary_violation_ids(
     after: &PolicyResult,
     config: &PolicyConfig,
 ) -> BTreeSet<String> {
-    let before_keys = active_boundary_violations(before, config)
-        .into_iter()
-        .map(boundary_violation_comparison_key)
-        .collect::<BTreeSet<_>>();
-    let mut after_by_key = BTreeMap::<BoundaryViolationComparisonKey, String>::new();
-    for violation in active_boundary_violations(after, config) {
-        let key = boundary_violation_comparison_key(violation);
-        after_by_key
-            .entry(key)
-            .and_modify(|id| {
-                if violation.id < *id {
-                    *id = violation.id.clone();
-                }
-            })
-            .or_insert_with(|| violation.id.clone());
+    let mut before_counts = BTreeMap::<BoundaryViolationComparisonKey, usize>::new();
+    for violation in active_boundary_violations(before, config) {
+        let count = before_counts
+            .entry(boundary_violation_comparison_key(violation))
+            .or_default();
+        *count = count.saturating_add(1);
     }
-    after_by_key
-        .into_iter()
-        .filter_map(|(key, id)| (!before_keys.contains(&key)).then_some(id))
-        .collect()
+    let mut after_by_key = BTreeMap::<BoundaryViolationComparisonKey, Vec<String>>::new();
+    for violation in active_boundary_violations(after, config) {
+        after_by_key
+            .entry(boundary_violation_comparison_key(violation))
+            .or_default()
+            .push(violation.id.clone());
+    }
+    let mut new_ids = BTreeSet::new();
+    for (key, mut ids) in after_by_key {
+        ids.sort();
+        let continuing = before_counts.get(&key).copied().unwrap_or(0).min(ids.len());
+        new_ids.extend(ids.into_iter().skip(continuing));
+    }
+    new_ids
 }
 
 fn active_boundary_violations<'a>(
@@ -2436,6 +2437,19 @@ mod tests {
         )?;
         assert_ne!(result.violations[0].id, moved_edge.violations[0].id);
         assert!(new_boundary_violation_ids(&result, &moved_edge, &policy).is_empty());
+
+        let added_parallel_edge = evaluate_policy(
+            "snapshot:parallel-edge",
+            &snapshot(vec![
+                edge("e2", "a", "b", "profile:production"),
+                edge("e3", "a", "b", "profile:production"),
+            ]),
+            &policy,
+        )?;
+        assert_eq!(
+            new_boundary_violation_ids(&result, &added_parallel_edge, &policy).len(),
+            1
+        );
 
         let new_target = evaluate_policy(
             "snapshot:new-target",

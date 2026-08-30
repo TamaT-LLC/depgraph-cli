@@ -250,7 +250,9 @@ and evidence positions because a dependency-site line move can change those
 authenticated `PolicyViolation.id` inputs without introducing a new boundary
 violation. A finding that is genuinely new still exposes the after-side
 `PolicyViolation.id` as its subject, preserving the evaluator identity without
-reclassifying a continuing semantic path.
+reclassifying a continuing semantic path. Correspondence preserves
+multiplicity, so adding another violation on the same node path still yields
+one new finding.
 
 Canonical identities:
 
