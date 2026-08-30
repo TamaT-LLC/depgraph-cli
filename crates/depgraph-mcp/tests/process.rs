@@ -7273,7 +7273,11 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
         .to_owned();
     let mut tampered = cursor.chars().collect::<Vec<_>>();
     if let Some(ch) = tampered.last_mut() {
-        *ch = if *ch == 'A' { 'B' } else { 'A' };
+        // Cursor signatures are hexadecimal and decoding is case-insensitive.
+        // Switching `a` to `A` therefore occasionally preserved the exact
+        // signature and made this negative test flaky. Change the nibble's
+        // value instead of only its case.
+        *ch = if *ch == '0' { '1' } else { '0' };
     }
     let tampered = tampered.into_iter().collect::<String>();
     let tamper = interactive_tool_call(&mut mcp, 9, "health_hotspots_list", {
