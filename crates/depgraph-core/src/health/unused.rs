@@ -127,18 +127,13 @@ fn analyze_subject(
         // already evaluated each file's build condition for each real Go
         // profile, so an inactive file cannot make this entry treatment hide
         // an UnusedFile finding.
-        let go_package_name = node
-            .properties
-            .get("package_name")
-            .and_then(serde_json::Value::as_str);
         let is_go_test = node
             .properties
             .get("test")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
         if !is_go_test
-            && (go_package_name == Some("main")
-                || index.go_main_file_ids.contains(node.id.as_str()))
+            && index.go_main_file_ids.contains(node.id.as_str())
             && let Some(active_profiles) = index.go_file_active_profiles.get(node.id.as_str())
         {
             usage_profiles.extend(active_profiles.iter().copied());
@@ -276,7 +271,7 @@ struct SnapshotIndex<'a> {
     all_matrix_profile_ids: Vec<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct GoPackageIdentity<'a> {
     package_path: &'a str,
     module_path: Option<&'a str>,
@@ -344,7 +339,7 @@ impl<'a> SnapshotIndex<'a> {
         }
 
         let mut go_package_identity_by_id = HashMap::<&str, GoPackageIdentity<'a>>::new();
-        let mut go_package_scopes_by_path = HashMap::<&str, Vec<GoPackageIdentity<'a>>>::new();
+        let mut go_package_scopes_by_path = HashMap::<&str, BTreeSet<GoPackageIdentity<'a>>>::new();
         let mut go_main_package_scopes = HashSet::<GoPackageIdentity<'a>>::new();
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
@@ -359,12 +354,10 @@ impl<'a> SnapshotIndex<'a> {
             }
             if let Some(identity) = go_package_identity(node) {
                 go_package_identity_by_id.insert(node.id.as_str(), identity);
-                let scopes = go_package_scopes_by_path
+                go_package_scopes_by_path
                     .entry(identity.package_path)
-                    .or_default();
-                if !scopes.contains(&identity) {
-                    scopes.push(identity);
-                }
+                    .or_default()
+                    .insert(identity);
                 if node
                     .properties
                     .get("package_name")
@@ -397,21 +390,21 @@ impl<'a> SnapshotIndex<'a> {
                         .or_default()
                         .insert(edge.profile_id.as_str());
                 }
-            } else if is_definite_usage(edge) {
-                match condition {
-                    GoConditionState::True => {
+            } else {
+                match (is_definite_usage(edge), condition) {
+                    (true, GoConditionState::True) => {
                         go_package_usage_profiles
                             .entry(*package_identity)
                             .or_default()
                             .insert(edge.profile_id.as_str());
                     }
-                    GoConditionState::Unknown => {
+                    (false, GoConditionState::True) | (_, GoConditionState::Unknown) => {
                         go_package_uncertain_profiles
                             .entry(*package_identity)
                             .or_default()
                             .insert(edge.profile_id.as_str());
                     }
-                    GoConditionState::False => {}
+                    (_, GoConditionState::False) => {}
                 }
             }
         }
@@ -540,97 +533,82 @@ impl<'a> SnapshotIndex<'a> {
             let Some(file_identity) = go_package_identity(node) else {
                 continue;
             };
+            let active_profiles = go_file_active_profiles.get(node.id.as_str());
+            let unknown_profiles = go_file_unknown_profiles.get(node.id.as_str());
+            let mut file_profiles = BTreeSet::new();
+            if let Some(profiles) = active_profiles {
+                for profile_id in profiles {
+                    budget.step(is_cancelled)?;
+                    file_profiles.insert(*profile_id);
+                }
+            }
+            if let Some(profiles) = unknown_profiles {
+                for profile_id in profiles {
+                    budget.step(is_cancelled)?;
+                    file_profiles.insert(*profile_id);
+                }
+            }
             let Some(scopes) = go_package_scopes_by_path.get(package_path) else {
+                for profile_id in file_profiles {
+                    budget.step(is_cancelled)?;
+                    go_file_blockers.entry(node.id.as_str()).or_default().push(
+                        go_unresolved_package_scope_blocker(package_path, profile_id),
+                    );
+                }
                 continue;
             };
-            let matching_scopes: Vec<_> = scopes
-                .iter()
-                .copied()
-                .filter(|scope| go_package_scope_matches(file_identity, *scope))
-                .collect();
-            let active_profiles = go_file_active_profiles
-                .get(node.id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let unknown_profiles = go_file_unknown_profiles
-                .get(node.id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let file_profiles: HashSet<_> = active_profiles
-                .iter()
-                .chain(&unknown_profiles)
-                .copied()
-                .collect();
+            let mut matching_scopes = Vec::new();
+            for scope in scopes {
+                budget.step(is_cancelled)?;
+                if go_package_scope_matches(file_identity, *scope) {
+                    matching_scopes.push(*scope);
+                }
+            }
             if matching_scopes.len() != 1 {
                 // A file that cannot be assigned to exactly one package scope
-                // must not inherit a sibling module's usage.
-                if matching_scopes.len() > 1 {
-                    let mut relevant_profiles = BTreeSet::new();
+                // must not inherit a sibling module's usage. Preserve the
+                // uncertainty for both zero and multiple matching scopes: a
+                // stale file identity can otherwise turn package usage into a
+                // Confirmed unused-file result.
+                for profile_id in file_profiles {
+                    budget.step(is_cancelled)?;
+                    go_file_blockers.entry(node.id.as_str()).or_default().push(
+                        go_unresolved_package_scope_blocker(package_path, profile_id),
+                    );
+                    let mut has_candidate = false;
                     for scope in scopes {
-                        relevant_profiles.extend(
-                            go_package_usage_profiles
-                                .get(scope)
-                                .into_iter()
-                                .flatten()
-                                .copied(),
-                        );
-                        relevant_profiles.extend(
-                            go_package_uncertain_profiles
-                                .get(scope)
-                                .into_iter()
-                                .flatten()
-                                .copied(),
-                        );
-                        relevant_profiles.extend(
-                            go_package_candidate_profiles
-                                .get(scope)
-                                .into_iter()
-                                .flatten()
-                                .copied(),
-                        );
-                    }
-                    for profile_id in relevant_profiles {
                         budget.step(is_cancelled)?;
-                        if !file_profiles.contains(profile_id) {
-                            continue;
+                        if go_package_candidate_profiles
+                            .get(scope)
+                            .is_some_and(|profiles| profiles.contains(profile_id))
+                        {
+                            has_candidate = true;
+                            break;
                         }
+                    }
+                    if has_candidate {
                         go_file_blockers
                             .entry(node.id.as_str())
                             .or_default()
-                            .push(go_ambiguous_package_scope_blocker(package_path, profile_id));
-                        if scopes.iter().any(|scope| {
-                            go_package_candidate_profiles
-                                .get(scope)
-                                .is_some_and(|profiles| profiles.contains(profile_id))
-                        }) {
-                            go_file_blockers
-                                .entry(node.id.as_str())
-                                .or_default()
-                                .push(go_candidate_package_blocker(package_path, profile_id));
-                        }
+                            .push(go_candidate_package_blocker(package_path, profile_id));
                     }
                 }
                 continue;
             }
             let scope = matching_scopes[0];
-            if node
-                .properties
-                .get("package_name")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .is_none()
-                && go_main_package_scopes.contains(&scope)
-            {
+            if go_main_package_scopes.contains(&scope) {
                 go_main_file_ids.insert(node.id.as_str());
             }
             let package_profiles = go_package_usage_profiles.get(&scope);
-            for profile_id in &active_profiles {
-                budget.step(is_cancelled)?;
-                if package_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
-                    go_file_usage_profiles
-                        .entry(node.id.as_str())
-                        .or_default()
-                        .insert(*profile_id);
+            if let Some(active_profiles) = active_profiles {
+                for profile_id in active_profiles {
+                    budget.step(is_cancelled)?;
+                    if package_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
+                        go_file_usage_profiles
+                            .entry(node.id.as_str())
+                            .or_default()
+                            .insert(*profile_id);
+                    }
                 }
             }
             let uncertain_profiles = go_package_uncertain_profiles.get(&scope);
@@ -638,10 +616,9 @@ impl<'a> SnapshotIndex<'a> {
             for profile_id in file_profiles {
                 budget.step(is_cancelled)?;
                 if uncertain_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
-                    go_file_blockers
-                        .entry(node.id.as_str())
-                        .or_default()
-                        .push(go_incomplete_package_blocker(package_path, profile_id));
+                    go_file_blockers.entry(node.id.as_str()).or_default().push(
+                        go_incomplete_package_usage_blocker(package_path, profile_id),
+                    );
                 }
                 if candidate_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
                     go_file_blockers
@@ -861,10 +838,10 @@ fn go_file_condition_state(
 }
 
 fn combine_go_condition_states(states: Vec<GoConditionState>) -> GoConditionState {
-    if states.contains(&GoConditionState::Unknown) {
-        GoConditionState::Unknown
-    } else if states.contains(&GoConditionState::True) {
+    if states.contains(&GoConditionState::True) {
         GoConditionState::True
+    } else if states.contains(&GoConditionState::Unknown) {
+        GoConditionState::Unknown
     } else {
         GoConditionState::False
     }
@@ -909,10 +886,10 @@ fn evaluate_go_condition(
                     GoConditionState::True => {}
                 }
             }
-            if saw_unknown {
-                Ok(GoConditionState::Unknown)
-            } else if saw_false {
+            if saw_false {
                 Ok(GoConditionState::False)
+            } else if saw_unknown {
+                Ok(GoConditionState::Unknown)
             } else {
                 Ok(GoConditionState::True)
             }
@@ -927,10 +904,10 @@ fn evaluate_go_condition(
                     GoConditionState::False => {}
                 }
             }
-            if saw_unknown {
-                Ok(GoConditionState::Unknown)
-            } else if saw_true {
+            if saw_true {
                 Ok(GoConditionState::True)
+            } else if saw_unknown {
+                Ok(GoConditionState::Unknown)
             } else {
                 Ok(GoConditionState::False)
             }
@@ -1063,11 +1040,11 @@ fn go_inactive_condition_blocker(node: &NodeRecord) -> FindingBlocker {
     }
 }
 
-fn go_incomplete_package_blocker(package_path: &str, profile_id: &str) -> FindingBlocker {
+fn go_incomplete_package_usage_blocker(package_path: &str, profile_id: &str) -> FindingBlocker {
     FindingBlocker {
         kind: BlockerKind::IncompleteCoverage,
         detail: format!(
-            "Go package usage condition for {package_path} is unsupported or ambiguous in profile {profile_id}"
+            "Go package usage for {package_path} is unresolved, imprecise, or conditionally ambiguous in profile {profile_id}"
         ),
     }
 }
@@ -1081,10 +1058,12 @@ fn go_candidate_package_blocker(package_path: &str, profile_id: &str) -> Finding
     }
 }
 
-fn go_ambiguous_package_scope_blocker(package_path: &str, profile_id: &str) -> FindingBlocker {
+fn go_unresolved_package_scope_blocker(package_path: &str, profile_id: &str) -> FindingBlocker {
     FindingBlocker {
         kind: BlockerKind::IncompleteCoverage,
-        detail: format!("Go package scope for {package_path} is ambiguous in profile {profile_id}"),
+        detail: format!(
+            "Go package scope for {package_path} is missing or ambiguous in profile {profile_id}"
+        ),
     }
 }
 
@@ -1731,6 +1710,13 @@ mod tests {
                     json!({"package_path": "example.com/app/pkg"}),
                 ),
                 node(
+                    "go:main-package",
+                    "module",
+                    "go",
+                    "cmd",
+                    json!({"package_name": "main", "package_path": "example.com/app/cmd"}),
+                ),
+                node(
                     "go:unused-package",
                     "module",
                     "go",
@@ -1798,6 +1784,30 @@ mod tests {
                     json!({"package_name": "main", "package_path": "example.com/app/cmd", "test": true}),
                 ),
                 node(
+                    "go:stale-main",
+                    "file",
+                    "go",
+                    "stale/main.go",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/app/cmd",
+                        "module_path": "example.com/stale",
+                        "manifest_path": "stale/go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:orphan-assembly",
+                    "file",
+                    "go",
+                    "orphan/entry.s",
+                    json!({
+                        "assembly": true,
+                        "package_path": "example.com/app/orphan",
+                        "manifest_path": "go.mod"
+                    }),
+                ),
+                node(
                     "go:ordinary",
                     "file",
                     "go",
@@ -1841,6 +1851,17 @@ mod tests {
                 .iter()
                 .any(|finding| finding.subject_id == "go:ordinary")
         );
+        for subject_id in ["go:stale-main", "go:orphan-assembly"] {
+            let finding = findings
+                .iter()
+                .find(|finding| finding.subject_id == subject_id)
+                .expect("unverified Go package scope remains visible");
+            assert_eq!(finding.confidence, Confidence::Indeterminate);
+            assert!(finding.blockers.iter().any(|blocker| {
+                blocker.kind == BlockerKind::IncompleteCoverage
+                    && blocker.detail.contains("missing or ambiguous")
+            }));
+        }
     }
 
     #[test]
@@ -2045,6 +2066,57 @@ mod tests {
     }
 
     #[test]
+    fn issue_437_go_condition_decisive_branch_overrides_unknown() {
+        let mut go_profile = profile("profile:go", "go", true);
+        go_profile.environment = json!({"GOOS": "linux", "GOARCH": "amd64"});
+        let unknown = Condition::Defined {
+            key: "go.build_tag:custom".to_owned(),
+        };
+        let false_and_unknown = Condition::All {
+            conditions: vec![
+                Condition::Defined {
+                    key: "go.build_tag:windows".to_owned(),
+                },
+                unknown.clone(),
+            ],
+        };
+        let true_or_unknown = Condition::Any {
+            conditions: vec![
+                Condition::Defined {
+                    key: "go.build_tag:linux".to_owned(),
+                },
+                unknown,
+            ],
+        };
+        let mut budget = HealthAnalysisBudget::new(64);
+        let mut is_cancelled = || false;
+        assert_eq!(
+            evaluate_go_condition(
+                &false_and_unknown,
+                &go_profile,
+                0,
+                &mut budget,
+                &mut is_cancelled,
+            ),
+            Ok(GoConditionState::False)
+        );
+        assert_eq!(
+            evaluate_go_condition(
+                &true_or_unknown,
+                &go_profile,
+                0,
+                &mut budget,
+                &mut is_cancelled,
+            ),
+            Ok(GoConditionState::True)
+        );
+        assert_eq!(
+            combine_go_condition_states(vec![GoConditionState::Unknown, GoConditionState::True,]),
+            GoConditionState::True
+        );
+    }
+
+    #[test]
     fn issue_437_go_candidate_package_import_blocks_every_target_file() {
         let profile_id = "profile:go-candidate";
         let graph = snapshot(
@@ -2101,6 +2173,19 @@ mod tests {
                         "test": false
                     }),
                 ),
+                node(
+                    "go:stale-file",
+                    "file",
+                    "go",
+                    "stale/pkg.go",
+                    json!({
+                        "package_name": "pkg",
+                        "package_path": "example.com/app/pkg",
+                        "module_path": "example.com/stale",
+                        "manifest_path": "stale/go.mod",
+                        "test": false
+                    }),
+                ),
             ],
             vec![{
                 let mut candidate = edge(
@@ -2118,7 +2203,7 @@ mod tests {
             ProfileMatrixRecord::default(),
         );
         let findings = analyze_unused(&graph);
-        for subject_id in ["go:file-a", "go:file-b"] {
+        for subject_id in ["go:file-a", "go:file-b", "go:stale-file"] {
             let finding = findings
                 .iter()
                 .find(|finding| finding.subject_id == subject_id)
@@ -2127,7 +2212,82 @@ mod tests {
             assert!(finding.blockers.iter().any(|blocker| {
                 blocker.kind == BlockerKind::Candidate && blocker.detail.contains("is a candidate")
             }));
+            if subject_id == "go:stale-file" {
+                assert!(finding.blockers.iter().any(|blocker| {
+                    blocker.kind == BlockerKind::IncompleteCoverage
+                        && blocker.detail.contains("missing or ambiguous")
+                }));
+            }
         }
+    }
+
+    #[test]
+    fn issue_437_go_imprecise_package_import_blocks_target_files() {
+        let profile_id = "profile:go-imprecise";
+        let mut import = edge(
+            "edge:imprecise-package",
+            "go:caller",
+            "go:package",
+            "imports",
+            profile_id,
+        );
+        import.precision = "overapprox".to_owned();
+        let graph = snapshot(
+            vec![profile(profile_id, "go", true)],
+            vec![
+                node(
+                    "go:caller",
+                    "file",
+                    "go",
+                    "cmd/main.go",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/app/cmd",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:package",
+                    "module",
+                    "go",
+                    "pkg",
+                    json!({
+                        "package_name": "pkg",
+                        "package_path": "example.com/app/pkg",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod"
+                    }),
+                ),
+                node(
+                    "go:file",
+                    "file",
+                    "go",
+                    "pkg/lib.go",
+                    json!({
+                        "package_name": "pkg",
+                        "package_path": "example.com/app/pkg",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod",
+                        "test": false
+                    }),
+                ),
+            ],
+            vec![import],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:file")
+            .expect("imprecisely imported package file remains visible");
+        assert_eq!(finding.confidence, Confidence::Indeterminate);
+        assert!(finding.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::IncompleteCoverage
+                && blocker.detail.contains("unresolved, imprecise")
+        }));
     }
 
     #[test]
