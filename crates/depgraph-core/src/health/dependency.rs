@@ -125,7 +125,8 @@ pub fn analyze_dependencies_cancellable(
         let usage_scope =
             (site.kind == "module_requirement").then(|| canonical_manifest_scope(&manifest_path));
         let usage_scope_path = usage_scope.as_ref().and_then(|scope| scope.as_deref());
-        let scope_enforced = usage_scope.is_some();
+        let scope_enforced = site.kind == "module_requirement";
+        let mut scope_uncertain = scope_enforced && usage_scope_path.is_none();
         let usage_paths = if site.kind == "module_requirement" {
             go_requirement_usage_paths(site, &nodes, &mut budget, &mut is_cancelled)?
         } else {
@@ -139,6 +140,7 @@ pub fn analyze_dependencies_cancellable(
                     owners,
                     usage_scope_path,
                     scope_enforced,
+                    &mut scope_uncertain,
                     &mut used_from_production,
                     &mut used_from_test,
                     &mut budget,
@@ -158,6 +160,7 @@ pub fn analyze_dependencies_cancellable(
                         owners,
                         usage_scope_path,
                         scope_enforced,
+                        &mut scope_uncertain,
                         &mut used_from_production,
                         &mut used_from_test,
                         &mut budget,
@@ -192,6 +195,7 @@ pub fn analyze_dependencies_cancellable(
                     drift,
                     "declared dependency has no graph usage edges",
                     profile_coverage,
+                    scope_uncertain,
                 ),
             )?;
         } else if production_declared && used_from_test && !used_from_production {
@@ -208,6 +212,7 @@ pub fn analyze_dependencies_cancellable(
                     drift,
                     "production dependency is only referenced from test code",
                     profile_coverage,
+                    scope_uncertain,
                 ),
             )?;
         }
@@ -227,6 +232,7 @@ pub fn analyze_dependencies_cancellable(
                     true,
                     "graph dependency site is absent from the request-fixed manifest",
                     profile_coverage,
+                    scope_uncertain,
                 ),
             )?;
         }
@@ -367,7 +373,7 @@ fn consolidate_findings(
 #[derive(Clone)]
 struct UsageOwner {
     is_test: bool,
-    manifest_path: Option<String>,
+    manifest_scope: ManifestScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,15 +381,6 @@ enum ManifestScope {
     Unknown,
     Unambiguous(String),
     Ambiguous,
-}
-
-impl ManifestScope {
-    fn unambiguous_path(&self) -> Option<&str> {
-        match self {
-            Self::Unambiguous(path) => Some(path),
-            Self::Unknown | Self::Ambiguous => None,
-        }
-    }
 }
 
 fn manifest_scope_index<'a>(
@@ -490,7 +487,7 @@ fn manifest_scope_index<'a>(
                             parent_frame.parent_scopes.insert(scope);
                         }
                         ManifestScope::Ambiguous => parent_frame.ambiguous = true,
-                        ManifestScope::Unknown => {}
+                        ManifestScope::Unknown => parent_frame.ambiguous = true,
                     }
                 }
                 continue;
@@ -505,13 +502,15 @@ fn manifest_scope_index<'a>(
                     ManifestScope::Unambiguous(scope) => {
                         stack[frame_index].parent_scopes.insert(scope.clone());
                     }
-                    ManifestScope::Ambiguous => stack[frame_index].ambiguous = true,
-                    ManifestScope::Unknown => {}
+                    ManifestScope::Ambiguous | ManifestScope::Unknown => {
+                        stack[frame_index].ambiguous = true;
+                    }
                 }
                 continue;
             }
             let Some(parent) = nodes.get(parent_id).copied() else {
                 scopes.insert(parent_id, ManifestScope::Unknown);
+                stack[frame_index].ambiguous = true;
                 continue;
             };
             if let Some(scope) = parent
@@ -574,10 +573,10 @@ fn package_usage_targets(
         };
         let owner = UsageOwner {
             is_test: is_test_node(source, edge),
-            manifest_path: manifest_scopes
+            manifest_scope: manifest_scopes
                 .get(edge.source.as_str())
-                .and_then(ManifestScope::unambiguous_path)
-                .map(str::to_owned),
+                .cloned()
+                .unwrap_or(ManifestScope::Unknown),
         };
         // A local Go replacement can resolve an import of the requested module
         // to a package whose declared module path is different. Retain the
@@ -603,10 +602,12 @@ fn package_usage_targets(
     Ok(usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_usage_owners(
     owners: &[UsageOwner],
     manifest_scope: Option<&str>,
     scope_enforced: bool,
+    scope_uncertain: &mut bool,
     used_from_production: &mut bool,
     used_from_test: &mut bool,
     budget: &mut HealthAnalysisBudget,
@@ -614,10 +615,19 @@ fn collect_usage_owners(
 ) -> Result<(), HealthAnalysisError> {
     for owner in owners {
         budget.step(is_cancelled)?;
-        if scope_enforced
-            && (manifest_scope.is_none() || owner.manifest_path.as_deref() != manifest_scope)
-        {
-            continue;
+        if scope_enforced {
+            match (manifest_scope, &owner.manifest_scope) {
+                (Some(expected), ManifestScope::Unambiguous(actual)) if actual == expected => {}
+                (Some(_), ManifestScope::Unambiguous(_)) => continue,
+                (Some(_), ManifestScope::Ambiguous | ManifestScope::Unknown) => {
+                    *scope_uncertain = true;
+                    continue;
+                }
+                (None, _) => {
+                    *scope_uncertain = true;
+                    continue;
+                }
+            }
         }
         if owner.is_test {
             *used_from_test = true;
@@ -796,6 +806,7 @@ fn dependency_finding(
     drift: bool,
     reason: &str,
     profile_coverage: DependencyProfileCoverage,
+    scope_uncertain: bool,
 ) -> HealthFinding {
     let mut blockers = Vec::new();
     if drift {
@@ -814,6 +825,14 @@ fn dependency_finding(
         blockers.push(FindingBlocker {
             kind: BlockerKind::Unresolved,
             detail: format!("site {} is unresolved", site.id),
+        });
+    }
+    if scope_uncertain {
+        blockers.push(FindingBlocker {
+            kind: BlockerKind::IncompleteCoverage,
+            detail: format!(
+                "manifest scope for dependency usage in {manifest_path} is missing or ambiguous"
+            ),
         });
     }
     if !profile_coverage.analyzed {
@@ -1446,12 +1465,96 @@ mod tests {
                 drifted: false,
             }],
         );
-        assert!(findings.iter().any(|finding| {
-            finding.kind == FindingKind::UnusedDependency
-                && finding
-                    .evidence
-                    .iter()
-                    .any(|evidence| evidence.owner_id == "site:dependency")
+        let finding = findings
+            .iter()
+            .find(|finding| {
+                finding.kind == FindingKind::UnusedDependency
+                    && finding
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.owner_id == "site:dependency")
+            })
+            .expect("ambiguous owner remains visible");
+        assert_eq!(finding.confidence, crate::health::Confidence::Indeterminate);
+        assert!(finding.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::IncompleteCoverage
+                && blocker.detail.contains("missing or ambiguous")
+        }));
+    }
+
+    #[test]
+    fn issue_437_unknown_parent_scope_does_not_hide_usage() {
+        let profile_id = "profile:go-scope";
+        let manifest = "app/go.mod";
+        let dependency = NodeRecord {
+            id: "go:unknown-parent-dependency".to_owned(),
+            kind: "module".to_owned(),
+            locator: "go-package:example.net/unknown-parent/pkg".to_owned(),
+            display_name: "example.net/unknown-parent/pkg".to_owned(),
+            properties: json!({
+                "language": "go",
+                "module_path": "example.net/unknown-parent",
+                "package_path": "example.net/unknown-parent/pkg",
+                "package_name": "pkg"
+            }),
+        };
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:unknown-parent-app", "example.com/app", manifest, "go"),
+                dependency,
+                ecosystem_file("scope:owner", "shared/owner.go", "go"),
+                ecosystem_file_with_manifest("scope:known", "shared/known.go", "go", manifest),
+                ecosystem_file("scope:unknown", "shared/unknown.go", "go"),
+            ],
+            vec![ecosystem_site(
+                "site:unknown-parent-dependency",
+                "go:unknown-parent-app",
+                "module_requirement",
+                profile_id,
+                "example.net/unknown-parent",
+                "go:unknown-parent-dependency",
+                json!({}),
+            )],
+            vec![
+                structural_edge("edge:known-owner", "scope:known", "scope:owner", "contains"),
+                structural_edge(
+                    "edge:unknown-owner",
+                    "scope:unknown",
+                    "scope:owner",
+                    "contains",
+                ),
+                ecosystem_usage_edge(
+                    "edge:unknown-parent-use",
+                    "scope:owner",
+                    "go:unknown-parent-dependency",
+                    profile_id,
+                ),
+            ],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:unknown-parent".to_owned(),
+                declared: BTreeSet::from(["example.net/unknown-parent".to_owned()]),
+                drifted: false,
+            }],
+        );
+        let finding = findings
+            .iter()
+            .find(|finding| {
+                finding.kind == FindingKind::UnusedDependency
+                    && finding
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.owner_id == "site:unknown-parent-dependency")
+            })
+            .expect("unknown parent owner remains visible");
+        assert_eq!(finding.confidence, crate::health::Confidence::Indeterminate);
+        assert!(finding.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::IncompleteCoverage
+                && blocker.detail.contains("missing or ambiguous")
         }));
     }
 
@@ -2023,9 +2126,17 @@ mod tests {
                 drifted: false,
             }],
         );
-        assert!(findings.iter().any(|finding| {
-            finding.kind == FindingKind::UnusedDependency
-                && finding.reason.contains("example.net/external")
+        let finding = findings
+            .iter()
+            .find(|finding| {
+                finding.kind == FindingKind::UnusedDependency
+                    && finding.reason.contains("example.net/external")
+            })
+            .expect("invalid manifest scope remains visible");
+        assert_eq!(finding.confidence, crate::health::Confidence::Indeterminate);
+        assert!(finding.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::IncompleteCoverage
+                && blocker.detail.contains("missing or ambiguous")
         }));
     }
 
