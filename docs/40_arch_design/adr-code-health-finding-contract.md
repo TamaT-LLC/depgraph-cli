@@ -244,6 +244,14 @@ blocker from graph diagnostics. The public graph-only analyzer compatibility
 wrapper therefore always passes an empty boundary-ID set unless the service
 audit path explicitly supplies evaluator output.
 
+Before/after correspondence uses the policy rule ID, source/target IDs,
+profile, and ordered dependency node path. It deliberately excludes edge IDs
+and evidence positions because a dependency-site line move can change those
+authenticated `PolicyViolation.id` inputs without introducing a new boundary
+violation. A finding that is genuinely new still exposes the after-side
+`PolicyViolation.id` as its subject, preserving the evaluator identity without
+reclassifying a continuing semantic path.
+
 Canonical identities:
 
 - cycle: node-ID rotation starting at the lexicographically smallest ID

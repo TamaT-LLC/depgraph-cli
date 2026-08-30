@@ -19,18 +19,56 @@ use crate::{
     query::{CycleLevel, cycles},
 };
 
-/// Return the stable, unsuppressed policy-violation IDs produced by boundary
-/// rules.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BoundaryViolationComparisonKey {
+    rule_id: String,
+    source_id: String,
+    target_id: String,
+    profile_id: Option<String>,
+    dependency_node_path: Vec<(String, String)>,
+}
+
+/// Return the current evaluator IDs for boundary violations whose semantic
+/// path was absent from the before result.
 ///
-/// The audit analyzer deliberately does not infer policy findings from graph
-/// diagnostic text.  Policy rule kinds are configuration data, while the
-/// violation ID is the evaluator's canonical identity for a violation; keep
-/// both pieces at this boundary so audit findings follow policy semantics.
+/// `PolicyViolation.id` deliberately authenticates exact edge IDs. Worker
+/// edge IDs can change when a dependency site moves without changing the
+/// policy-relevant node path, so using the raw ID as the comparison key would
+/// report a continuing violation as new. The emitted value remains the
+/// evaluator's stable current ID; only before/after correspondence ignores
+/// edge identity and evidence position.
 #[must_use]
-pub(crate) fn boundary_violation_ids(
-    result: &PolicyResult,
+pub(crate) fn new_boundary_violation_ids(
+    before: &PolicyResult,
+    after: &PolicyResult,
     config: &PolicyConfig,
 ) -> BTreeSet<String> {
+    let before_keys = active_boundary_violations(before, config)
+        .into_iter()
+        .map(boundary_violation_comparison_key)
+        .collect::<BTreeSet<_>>();
+    let mut after_by_key = BTreeMap::<BoundaryViolationComparisonKey, String>::new();
+    for violation in active_boundary_violations(after, config) {
+        let key = boundary_violation_comparison_key(violation);
+        after_by_key
+            .entry(key)
+            .and_modify(|id| {
+                if violation.id < *id {
+                    *id = violation.id.clone();
+                }
+            })
+            .or_insert_with(|| violation.id.clone());
+    }
+    after_by_key
+        .into_iter()
+        .filter_map(|(key, id)| (!before_keys.contains(&key)).then_some(id))
+        .collect()
+}
+
+fn active_boundary_violations<'a>(
+    result: &'a PolicyResult,
+    config: &PolicyConfig,
+) -> Vec<&'a PolicyViolation> {
     let boundary_rule_ids = config
         .rules
         .iter()
@@ -49,8 +87,23 @@ pub(crate) fn boundary_violation_ids(
         .iter()
         .filter(|violation| violation.suppression.is_none())
         .filter(|violation| boundary_rule_ids.contains(violation.rule_id.as_str()))
-        .map(|violation| violation.id.clone())
         .collect()
+}
+
+fn boundary_violation_comparison_key(
+    violation: &PolicyViolation,
+) -> BoundaryViolationComparisonKey {
+    BoundaryViolationComparisonKey {
+        rule_id: violation.rule_id.clone(),
+        source_id: violation.source.id.clone(),
+        target_id: violation.target.id.clone(),
+        profile_id: violation.profile_id.clone(),
+        dependency_node_path: violation
+            .dependency_path
+            .iter()
+            .map(|step| (step.source_id.clone(), step.target_id.clone()))
+            .collect(),
+    }
 }
 
 /// Evaluate the architecture policy against one validated graph snapshot.
@@ -2366,13 +2419,32 @@ mod tests {
         let result = evaluate_policy("snapshot:fixture", &graph, &policy)?;
         assert_eq!(result.violations.len(), 1);
 
-        let ids = boundary_violation_ids(&result, &policy);
+        let empty = PolicyResult::new("snapshot:empty", Vec::new());
+        let ids = new_boundary_violation_ids(&empty, &result, &policy);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&result.violations[0].id));
         assert!(
             result.violations[0]
                 .id
                 .starts_with("policy-violation:sha256:")
+        );
+
+        let moved_edge = evaluate_policy(
+            "snapshot:moved-edge",
+            &snapshot(vec![edge("e2", "a", "b", "profile:production")]),
+            &policy,
+        )?;
+        assert_ne!(result.violations[0].id, moved_edge.violations[0].id);
+        assert!(new_boundary_violation_ids(&result, &moved_edge, &policy).is_empty());
+
+        let new_target = evaluate_policy(
+            "snapshot:new-target",
+            &snapshot(vec![edge("e3", "a", "c", "profile:production")]),
+            &policy,
+        )?;
+        assert_eq!(
+            new_boundary_violation_ids(&result, &new_target, &policy),
+            BTreeSet::from([new_target.violations[0].id.clone()])
         );
 
         let mut suppressed_policy = policy;
@@ -2392,7 +2464,7 @@ mod tests {
         });
         let suppressed = evaluate_policy("snapshot:fixture", &graph, &suppressed_policy)?;
         assert_eq!(suppressed.summary.suppressed, 1);
-        assert!(boundary_violation_ids(&suppressed, &suppressed_policy).is_empty());
+        assert!(new_boundary_violation_ids(&empty, &suppressed, &suppressed_policy).is_empty());
         Ok(())
     }
 

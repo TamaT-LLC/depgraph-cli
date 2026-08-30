@@ -40,7 +40,7 @@ use crate::{
 
 use crate::{
     policy::PolicyConfig,
-    policy_engine::{boundary_violation_ids, evaluate_policy, evaluate_policy_diff},
+    policy_engine::{evaluate_policy, evaluate_policy_diff, new_boundary_violation_ids},
 };
 
 const MAX_GIT_REF_BYTES: usize = 256;
@@ -858,9 +858,11 @@ fn evaluate_audit_boundary_ids(
         policy,
     )
     .map_err(|_| DepgraphServiceError::PolicyInput)?;
-    let before_ids = boundary_violation_ids(&before_result, policy);
-    let after_ids = boundary_violation_ids(&after_result, policy);
-    Ok(after_ids.difference(&before_ids).cloned().collect())
+    Ok(new_boundary_violation_ids(
+        &before_result,
+        &after_result,
+        policy,
+    ))
 }
 
 struct SnapshotScopedCollection {
