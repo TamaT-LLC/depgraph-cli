@@ -28,15 +28,19 @@ struct BoundaryViolationComparisonKey {
     dependency_node_path: Vec<(String, String)>,
 }
 
-/// Return the current evaluator IDs for boundary violations whose semantic
-/// path was absent from the before result.
+/// Return current evaluator IDs representing boundary-violation occurrences
+/// whose semantic-path multiplicity increased from the before result.
 ///
 /// `PolicyViolation.id` deliberately authenticates exact edge IDs. Worker
 /// edge IDs can change when a dependency site moves without changing the
 /// policy-relevant node path, so using the raw ID as the comparison key would
-/// report a continuing violation as new. The emitted value remains the
-/// evaluator's stable current ID; only before/after correspondence ignores
-/// edge identity and evidence position.
+/// report a continuing violation as new. The emitted value remains a stable
+/// current evaluator ID; only before/after correspondence ignores edge
+/// identity and evidence position. If all raw IDs in one semantic group move
+/// while a parallel occurrence is also added, the policy results contain no
+/// provenance that can identify the physical added site. In that case the
+/// lexicographically selected surplus ID is a deterministic after-side
+/// representative, not a claim of source-occurrence correspondence.
 #[must_use]
 pub(crate) fn new_boundary_violation_ids(
     before: &PolicyResult,
@@ -86,7 +90,10 @@ pub(crate) fn new_boundary_violation_ids(
 
         // Any remaining before occurrence changed only its position-derived
         // edge identity. Pair those semantically before classifying surplus
-        // after occurrences as genuinely new.
+        // after IDs as deterministic representatives of the increased
+        // multiplicity. PolicyResult intentionally carries no line-movement
+        // provenance, so selecting a physical added site here would be a
+        // guess when every parallel occurrence changed its raw ID.
         let moved_continuing = remaining_before.min(unmatched_after.len());
         new_ids.extend(unmatched_after.into_iter().skip(moved_continuing));
     }
@@ -2484,6 +2491,15 @@ mod tests {
             new_boundary_violation_ids(&moved_edge, &added_parallel_edge, &policy),
             BTreeSet::from([added_edge_id])
         );
+
+        let all_after_ids = added_parallel_edge
+            .violations
+            .iter()
+            .map(|violation| violation.id.clone())
+            .collect::<BTreeSet<_>>();
+        let moved_and_added = new_boundary_violation_ids(&result, &added_parallel_edge, &policy);
+        assert_eq!(moved_and_added.len(), 1);
+        assert!(moved_and_added.is_subset(&all_after_ids));
 
         let new_target = evaluate_policy(
             "snapshot:new-target",

@@ -215,7 +215,7 @@ pub fn analyze_changed_code_with_boundary_ids_cancellable(
                     FindingKind::NewBoundaryViolation,
                     identity.clone(),
                     vec![identity.clone()],
-                    "boundary violation is present after the change and absent before",
+                    "boundary-violation semantic-path multiplicity increased; subject is a deterministic after-side policy-violation representative",
                     &shared_blockers,
                     new_checks_indeterminate,
                 ),

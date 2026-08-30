@@ -248,11 +248,19 @@ Before/after correspondence uses the policy rule ID, source/target IDs,
 profile, and ordered dependency node path. It deliberately excludes edge IDs
 and evidence positions because a dependency-site line move can change those
 authenticated `PolicyViolation.id` inputs without introducing a new boundary
-violation. A finding that is genuinely new still exposes the after-side
-`PolicyViolation.id` as its subject, preserving the evaluator identity without
-reclassifying a continuing semantic path. Correspondence preserves
-multiplicity, so adding another violation on the same node path still yields
-one new finding.
+violation. Correspondence first preserves exact before/after
+`PolicyViolation.id` matches, then pairs remaining occurrences by the semantic
+key above. Multiplicity is preserved, so adding another violation on the same
+node path still yields one new finding whose subject is an after-side
+`PolicyViolation.id`.
+
+When all raw IDs in a semantic group change at the same time as a parallel
+occurrence is added, neither `PolicyResult` contains movement provenance that
+can distinguish the physical moved and added sites. The finding therefore
+uses a deterministic surplus after-side ID as the evaluator representative of
+the increased multiplicity; it does not claim that representative is the
+source-level added occurrence. Consumers must use the semantic key and count
+increase for newness, rather than infer line-level causality from that ID.
 
 Canonical identities:
 
