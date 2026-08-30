@@ -2116,12 +2116,11 @@ fn applied_suppression_bounded(
         } else if scope.profiles != PolicyProfileFilter::default() {
             continue;
         }
-        if let Some(condition) = &scope.condition {
-            if evaluate_condition_bounded_inner(condition, context, false, work, is_cancelled)?
+        if let Some(condition) = &scope.condition
+            && evaluate_condition_bounded_inner(condition, context, false, work, is_cancelled)?
                 != Some(true)
-            {
-                continue;
-            }
+        {
+            continue;
         }
         work.step(is_cancelled)?;
         return Ok(Some(AppliedPolicySuppression {
@@ -2521,10 +2520,35 @@ fn pattern_matches_bounded(
 ) -> Result<bool> {
     work.step(is_cancelled)?;
     match kind {
-        PolicyMatchKind::Exact => Ok(value == pattern),
-        PolicyMatchKind::Prefix => Ok(value.starts_with(pattern)),
+        PolicyMatchKind::Exact => {
+            if value.len() != pattern.len() {
+                return Ok(false);
+            }
+            literal_prefix_matches_bounded(pattern, value, work, is_cancelled)
+        }
+        PolicyMatchKind::Prefix => {
+            if value.len() < pattern.len() {
+                return Ok(false);
+            }
+            literal_prefix_matches_bounded(pattern, value, work, is_cancelled)
+        }
         PolicyMatchKind::Glob => glob_matches_bounded(pattern, value, work, is_cancelled),
     }
+}
+
+fn literal_prefix_matches_bounded(
+    pattern: &str,
+    value: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    for (expected, actual) in pattern.bytes().zip(value.bytes()) {
+        work.step(is_cancelled)?;
+        if expected != actual {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
@@ -3132,17 +3156,17 @@ fn evaluate_condition_bounded_inner(
                     values.push(if any {
                         if saw_true {
                             Some(true)
-                        } else if !saw_unknown && !saw_false {
-                            Some(false)
-                        } else {
+                        } else if saw_unknown {
                             None
+                        } else {
+                            Some(false)
                         }
                     } else if saw_false {
                         Some(false)
-                    } else if !saw_unknown && !saw_true {
-                        Some(true)
-                    } else {
+                    } else if saw_unknown {
                         None
+                    } else {
+                        Some(true)
                     });
                 }
             }
@@ -5501,6 +5525,75 @@ mod tests {
         .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
         assert_eq!(checks, 33);
+
+        let huge_literal = "segment/".repeat(2_048);
+        for match_kind in [PolicyMatchKind::Exact, PolicyMatchKind::Prefix] {
+            let mut work = PolicyEvaluationWork::new(32);
+            let exhausted = pattern_matches_bounded(
+                match_kind,
+                &huge_literal,
+                &huge_literal,
+                &mut work,
+                &mut || false,
+            )
+            .unwrap_err();
+            assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_condition_evaluation_preserves_all_and_any_truth_tables() -> Result<()> {
+        let context = BTreeMap::from([
+            ("first".to_owned(), json!(true)),
+            ("second".to_owned(), json!(false)),
+        ]);
+        let truth = PolicyCondition::Eq {
+            key: "first".to_owned(),
+            value: json!(true),
+        };
+        let falsehood = PolicyCondition::Eq {
+            key: "second".to_owned(),
+            value: json!(true),
+        };
+        for (condition, expected) in [
+            (
+                PolicyCondition::All {
+                    conditions: vec![truth.clone(), truth.clone()],
+                },
+                Some(true),
+            ),
+            (
+                PolicyCondition::Any {
+                    conditions: vec![falsehood.clone(), falsehood.clone()],
+                },
+                Some(false),
+            ),
+            (
+                PolicyCondition::All {
+                    conditions: vec![truth.clone(), falsehood.clone()],
+                },
+                Some(false),
+            ),
+            (
+                PolicyCondition::Any {
+                    conditions: vec![truth.clone(), falsehood.clone()],
+                },
+                Some(true),
+            ),
+        ] {
+            let mut work = PolicyEvaluationWork::new(1_000);
+            assert_eq!(
+                evaluate_condition_bounded_inner(
+                    &condition,
+                    &context,
+                    false,
+                    &mut work,
+                    &mut || false,
+                )?,
+                expected
+            );
+        }
         Ok(())
     }
 
