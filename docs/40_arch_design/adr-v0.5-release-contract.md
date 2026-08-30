@@ -14,7 +14,7 @@ The latest published GitHub Release is `v0.4.0-rc.6`. No `v0.4.0` stable GitHub 
 `main`. Publishing current `main` as `v0.4.0` would therefore misidentify both
 the source and the compatibility boundary.
 
-Current `main` writes Store schema `17`, while the published rc.6 package
+Current `main` writes Store schema `18`, while the published rc.6 package
 writes schema `13`. MCP also introduces a separate operation journal at schema
 `5` and two public Agent contracts. Those surfaces need one minor-release
 identity and an explicit upgrade source before another release candidate can
@@ -35,7 +35,7 @@ The v0.5 compatibility tuple is:
 | --- | --- |
 | Product and adapters | `0.5.0` |
 | Worker protocol / graph schema | `1.0` |
-| SQLite Store | schema `17` |
+| SQLite Store | schema `18` |
 | Durable operation journal | schema `5` |
 | MCP tool DTO | `depgraph-mcp-tools-v1` |
 | Operation DTO | `depgraph-operation-v1` |
@@ -44,6 +44,10 @@ The v0.5 compatibility tuple is:
 | Packaged MCP smoke | `mcp-package-smoke-v3` |
 | Release gate | `stable-release-gate-v2` |
 | Packaged smoke | `stable-v0.5.0-packaged-smoke-v1` |
+
+The original v0.5.0 release contract used Store schema 17. That value remains
+historical evidence for the v0.5.0/v0.5.3 line; the current v0.5.4 contract is
+schema 18 as documented above.
 
 The existing `v0.4.0-rc.N` tags, GitHub Releases, reserved `v0.4.0` baseline
 commit, baseline tree/digest, and `refs/heads/release/0.4` are immutable
@@ -149,13 +153,17 @@ name so several repositories can coexist in one user configuration.
 
 The lifecycle remains read-only and ownership-checked. Host configuration
 updates are serialized per file, and repository state remains until the final
-owned binding for the current version and target is removed. This patch does
-not change the worker protocol, Store schema, operation journal schema, MCP
-DTOs, release artifact formats, or existing CLI defaults.
+owned binding for the current version and target is removed. This patch keeps
+the worker protocol, operation journal schema, MCP DTOs, release artifact
+formats, and existing CLI defaults, while advancing the Store to schema 18 for
+health provenance and provenance-aware snapshot seals.
 
 The signed `v0.5.4` tag, remote `main`, and `release/0.5` remain bound to one
 reviewed Full-CI-green commit. The published `v0.5.3` tag, source, Release,
-assets, and post-publish evidence remain immutable history.
+assets, and post-publish evidence remain immutable history. The v0.5.4 Store
+contract is schema 18: schema-17 stores migrate transactionally, completed
+snapshot seals are rebuilt as provenance-aware v2, and an older binary must not
+open the migrated Store.
 
 ## Consequences
 
@@ -163,6 +171,7 @@ assets, and post-publish evidence remain immutable history.
   exist on GitHub.
 - v0.5 RCs validate real packages while stable publication remains fail-closed
   unless the exact main/maintenance/tag/Full-CI identity is present.
-- Store and operation-journal compatibility are separate and explicit.
+- Store schema 18 and operation-journal compatibility are separate and explicit;
+  schema 17 remains only the historical v0.5.3 contract.
 - Fixture, version, tag, manifest, and documentation drift fail tests before
   publication.

@@ -54,7 +54,7 @@ updated: 2026-08-26
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.5.4` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |
+| SQLite store / scan cache / impact query cache | `18` / `2` / `1` |
 | Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
@@ -75,7 +75,7 @@ Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph sche
 Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable-release-gate-v1`を確定したが、stable GitHub Releaseは公開されなかった。公開済みの最終候補は`v0.4.0-rc.6`であり、[v0.4.0 document](../releases/v0.4.0.md)はimmutable baselineの履歴記録であって現行support claimではない。
 
 MCPを含む最初のv0.5 stableは`v0.5.0`である。
-`stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。
+`stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `18`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。schema `17`はv0.5.3の歴史的契約として保持し、v0.5.4は旧binaryによるmigration後Storeのopenを拒否する。
 `v0.5.0`はsigned tag、remote `main`、初期`release/0.5`、source tree、exact eight-job Full CI、固定Agent dogfood reportが一致する場合だけ公開した。
 現行mainは、この互換性境界を変えずに4つのAgent hostへproject／user scopeのMCPセットアップを追加した`v0.5.4`である。
 `v0.5.4`はsigned tag、remote `main`、fast-forward済み`release/0.5`、source tree、exact eight-job Full CIが一致する場合だけ許可し、選択したbaselineをruntime evidenceへ記録する。
