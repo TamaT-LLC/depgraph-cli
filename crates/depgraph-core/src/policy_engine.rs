@@ -384,7 +384,7 @@ fn evaluate_policy_with_work(
                     is_cancelled,
                 )?
             }
-            PolicyRuleKind::Cycle => evaluate_cycles(
+            PolicyRuleKind::Cycle => evaluate_cycles_bounded(
                 snapshot,
                 rule,
                 &admitted,
@@ -392,25 +392,38 @@ fn evaluate_policy_with_work(
                 &target_ids,
                 &nodes,
                 &suppressions,
+                work,
+                is_cancelled,
             )?,
-            PolicyRuleKind::DependencyDepth => {
-                evaluate_depth(rule, &admitted, &sources, &targets, &nodes, &suppressions)?
-            }
-            PolicyRuleKind::FanIn => evaluate_fan_in(
+            PolicyRuleKind::DependencyDepth => evaluate_depth_bounded(
+                rule,
+                &admitted,
+                &sources,
+                &targets,
+                &nodes,
+                &suppressions,
+                work,
+                is_cancelled,
+            )?,
+            PolicyRuleKind::FanIn => evaluate_fan_in_bounded(
                 rule,
                 &admitted,
                 &source_ids,
                 &targets,
                 &nodes,
                 &suppressions,
+                work,
+                is_cancelled,
             )?,
-            PolicyRuleKind::FanOut => evaluate_fan_out(
+            PolicyRuleKind::FanOut => evaluate_fan_out_bounded(
                 rule,
                 &admitted,
                 &sources,
                 &target_ids,
                 &nodes,
                 &suppressions,
+                work,
+                is_cancelled,
             )?,
             PolicyRuleKind::RuntimeBoundary => evaluate_runtime_boundary(
                 rule,
@@ -446,9 +459,22 @@ fn evaluate_policy_with_work(
         ordered.push(violation);
     }
     charge_sort_work(ordered.len(), work, is_cancelled)?;
+    work.step(is_cancelled)?;
     let result = PolicyResult::new(snapshot_id, ordered);
-    work.steps(result.violations.len(), is_cancelled)?;
+    work.step(is_cancelled)?;
+    charge_sort_work(result.violations.len(), work, is_cancelled)?;
+    for violation in &result.violations {
+        work.step(is_cancelled)?;
+        work.steps(
+            violation
+                .dependency_path
+                .len()
+                .saturating_add(violation.evidence.len()),
+            is_cancelled,
+        )?;
+    }
     result.validate()?;
+    work.step(is_cancelled)?;
     Ok(result)
 }
 
@@ -1511,7 +1537,8 @@ fn evaluate_direct_bounded(
     Ok(violations)
 }
 
-fn evaluate_cycles(
+#[allow(clippy::too_many_arguments)]
+fn evaluate_cycles_bounded(
     snapshot: &GraphSnapshot,
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
@@ -1519,15 +1546,24 @@ fn evaluate_cycles(
     target_ids: &BTreeSet<&str>,
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
     let level = cycle_level(rule.source.kind)
         .with_context(|| format!("cycle rule {:?} uses an unsupported selector kind", rule.id))?;
-    let cycle_nodes: BTreeSet<_> = source_ids.union(target_ids).copied().collect();
+    let mut cycle_nodes = BTreeSet::new();
+    for node_id in source_ids.iter().chain(target_ids) {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(cycle_nodes.len(), 1, work, is_cancelled)?;
+        cycle_nodes.insert(*node_id);
+    }
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in admitted {
+        work.step(is_cancelled)?;
         if cycle_nodes.contains(item.edge.source.as_str())
             && cycle_nodes.contains(item.edge.target.as_str())
         {
+            charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
             by_profile
                 .entry(item.edge.profile_id.as_str())
                 .or_default()
@@ -1537,10 +1573,35 @@ fn evaluate_cycles(
 
     let mut output = Vec::new();
     for (profile_id, edges) in by_profile {
+        work.step(is_cancelled)?;
+        let snapshot_records = snapshot
+            .nodes
+            .len()
+            .saturating_add(snapshot.sites.len())
+            .saturating_add(snapshot.edges.len())
+            .saturating_add(snapshot.evidence.len())
+            .saturating_add(snapshot.profiles.len())
+            .saturating_add(snapshot.diagnostics.len())
+            .saturating_add(snapshot.file_coverage.len())
+            .saturating_add(snapshot.adapter_logs.len());
+        work.steps(snapshot_records, is_cancelled)?;
         let mut filtered = snapshot.clone();
-        filtered.edges = edges.iter().map(|item| item.edge.clone()).collect();
-        for cycle in cycles(&filtered, level) {
+        let mut filtered_edges = Vec::with_capacity(edges.len());
+        for item in &edges {
+            work.step(is_cancelled)?;
+            filtered_edges.push(item.edge.clone());
+        }
+        filtered.edges = filtered_edges;
+        charge_sort_work(
+            filtered.nodes.len().saturating_add(filtered.edges.len()),
+            work,
+            is_cancelled,
+        )?;
+        let detected_cycles = cycles(&filtered, level);
+        for cycle in detected_cycles {
+            work.step(is_cancelled)?;
             let ring = &cycle.node_ids[..cycle.node_ids.len() - 1];
+            work.steps(ring.len().saturating_mul(3), is_cancelled)?;
             if !ring.iter().any(|node| source_ids.contains(node.as_str()))
                 || !ring.iter().any(|node| target_ids.contains(node.as_str()))
             {
@@ -1557,27 +1618,39 @@ fn evaluate_cycles(
                 .iter()
                 .position(|node| node == start)
                 .context("cycle start disappeared")?;
-            let mut node_path = ring[start_index..].to_vec();
-            node_path.extend_from_slice(&ring[..start_index]);
+            let mut node_path = Vec::with_capacity(ring.len().saturating_add(1));
+            for node in ring[start_index..].iter().chain(&ring[..start_index]) {
+                work.step(is_cancelled)?;
+                node_path.push(node.clone());
+            }
+            work.step(is_cancelled)?;
             node_path.push(start.clone());
 
             let mut path = Vec::new();
             let mut path_edges = Vec::new();
             for pair in node_path.windows(2) {
-                let item = edges
-                    .iter()
-                    .filter(|item| item.edge.source == pair[0] && item.edge.target == pair[1])
-                    .min_by(|left, right| left.edge.id.cmp(&right.edge.id))
-                    .with_context(|| {
-                        format!(
-                            "cycle query returned a step without an admitted edge: {} -> {}",
-                            pair[0], pair[1]
-                        )
-                    })?;
+                work.step(is_cancelled)?;
+                let mut selected: Option<&AdmittedEdge<'_>> = None;
+                for item in &edges {
+                    work.step(is_cancelled)?;
+                    if item.edge.source == pair[0]
+                        && item.edge.target == pair[1]
+                        && selected.is_none_or(|current| item.edge.id < current.edge.id)
+                    {
+                        selected = Some(item);
+                    }
+                }
+                let item = selected.with_context(|| {
+                    format!(
+                        "cycle query returned a step without an admitted edge: {} -> {}",
+                        pair[0], pair[1]
+                    )
+                })?;
+                work.step(is_cancelled)?;
                 path.push(path_step(item.edge));
-                path_edges.push(*item);
+                path_edges.push(item);
             }
-            output.push(make_violation(
+            let violation = make_violation_bounded(
                 rule,
                 nodes,
                 start,
@@ -1591,23 +1664,32 @@ fn evaluate_cycles(
                     node_path.len() - 1
                 ),
                 suppressions,
-            )?);
+                work,
+                is_cancelled,
+            )?;
+            work.step(is_cancelled)?;
+            output.push(violation);
         }
     }
     Ok(output)
 }
 
-fn evaluate_depth(
+#[allow(clippy::too_many_arguments)]
+fn evaluate_depth_bounded(
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
     sources: &[&NodeRecord],
     targets: &[&NodeRecord],
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
     let max = rule.threshold.context("depth rule threshold")?.max;
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in admitted {
+        work.step(is_cancelled)?;
+        charge_ordered_collection_work(by_profile.len(), 1, work, is_cancelled)?;
         by_profile
             .entry(item.edge.profile_id.as_str())
             .or_default()
@@ -1616,15 +1698,20 @@ fn evaluate_depth(
     let mut output = Vec::new();
 
     for (profile_id, edges) in by_profile {
-        let adjacency = adjacency(&edges);
+        work.step(is_cancelled)?;
+        let adjacency = adjacency_bounded(&edges, work, is_cancelled)?;
         for source in sources {
+            work.step(is_cancelled)?;
             let mut distance = BTreeMap::from([(source.id.clone(), 0_u64)]);
             let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
             let mut queue = VecDeque::from([source.id.clone()]);
             while let Some(current) = queue.pop_front() {
+                work.step(is_cancelled)?;
                 let next_distance = distance[&current] + 1;
                 for edge in adjacency.get(current.as_str()).into_iter().flatten() {
+                    work.step(is_cancelled)?;
                     if !distance.contains_key(&edge.edge.target) {
+                        charge_ordered_collection_work(distance.len(), 1, work, is_cancelled)?;
                         distance.insert(edge.edge.target.clone(), next_distance);
                         predecessor.insert(edge.edge.target.clone(), edge);
                         queue.push_back(edge.edge.target.clone());
@@ -1633,15 +1720,26 @@ fn evaluate_depth(
             }
 
             for target in targets {
+                work.step(is_cancelled)?;
                 let Some(&actual) = distance.get(&target.id) else {
                     continue;
                 };
                 if actual <= max {
                     continue;
                 }
-                let path_edges = reconstruct_path(&source.id, &target.id, &predecessor)?;
-                let path = path_edges.iter().map(|item| path_step(item.edge)).collect();
-                output.push(make_violation(
+                let path_edges = reconstruct_path_bounded(
+                    &source.id,
+                    &target.id,
+                    &predecessor,
+                    work,
+                    is_cancelled,
+                )?;
+                let mut path = Vec::with_capacity(path_edges.len());
+                for item in &path_edges {
+                    work.step(is_cancelled)?;
+                    path.push(path_step(item.edge));
+                }
+                let violation = make_violation_bounded(
                     rule,
                     nodes,
                     &source.id,
@@ -1654,31 +1752,42 @@ fn evaluate_depth(
                         source.id, target.id
                     ),
                     suppressions,
-                )?);
+                    work,
+                    is_cancelled,
+                )?;
+                work.step(is_cancelled)?;
+                output.push(violation);
             }
         }
     }
     Ok(output)
 }
 
-fn evaluate_fan_out(
+#[allow(clippy::too_many_arguments)]
+fn evaluate_fan_out_bounded(
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
     sources: &[&NodeRecord],
     target_ids: &BTreeSet<&str>,
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
     let max = rule.threshold.context("fan-out rule threshold")?.max;
     let mut output = Vec::new();
     for source in sources {
+        work.step(is_cancelled)?;
         let mut groups: BTreeMap<&str, BTreeMap<&str, &AdmittedEdge<'_>>> = BTreeMap::new();
-        for item in admitted.iter().filter(|item| {
-            item.edge.source == source.id && target_ids.contains(item.edge.target.as_str())
-        }) {
-            groups
-                .entry(item.edge.profile_id.as_str())
-                .or_default()
+        for item in admitted {
+            work.step(is_cancelled)?;
+            if item.edge.source != source.id || !target_ids.contains(item.edge.target.as_str()) {
+                continue;
+            }
+            charge_ordered_collection_work(groups.len(), 1, work, is_cancelled)?;
+            let targets = groups.entry(item.edge.profile_id.as_str()).or_default();
+            charge_ordered_collection_work(targets.len(), 1, work, is_cancelled)?;
+            targets
                 .entry(item.edge.target.as_str())
                 .and_modify(|current| {
                     if item.edge.id < current.edge.id {
@@ -1688,12 +1797,13 @@ fn evaluate_fan_out(
                 .or_insert(item);
         }
         for (profile_id, targets) in groups {
+            work.step(is_cancelled)?;
             let count = u64::try_from(targets.len())?;
             if count <= max {
                 continue;
             }
-            let witness = overflow_witness(&targets, max)?;
-            output.push(make_violation(
+            let witness = overflow_witness_bounded(&targets, max, work, is_cancelled)?;
+            let violation = make_violation_bounded(
                 rule,
                 nodes,
                 &source.id,
@@ -1703,30 +1813,41 @@ fn evaluate_fan_out(
                 vec![witness],
                 format!("fan-out for {} is {count}, exceeding {max}", source.id),
                 suppressions,
-            )?);
+                work,
+                is_cancelled,
+            )?;
+            work.step(is_cancelled)?;
+            output.push(violation);
         }
     }
     Ok(output)
 }
 
-fn evaluate_fan_in(
+#[allow(clippy::too_many_arguments)]
+fn evaluate_fan_in_bounded(
     rule: &PolicyRule,
     admitted: &[AdmittedEdge<'_>],
     source_ids: &BTreeSet<&str>,
     targets: &[&NodeRecord],
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
     let max = rule.threshold.context("fan-in rule threshold")?.max;
     let mut output = Vec::new();
     for target in targets {
+        work.step(is_cancelled)?;
         let mut groups: BTreeMap<&str, BTreeMap<&str, &AdmittedEdge<'_>>> = BTreeMap::new();
-        for item in admitted.iter().filter(|item| {
-            item.edge.target == target.id && source_ids.contains(item.edge.source.as_str())
-        }) {
-            groups
-                .entry(item.edge.profile_id.as_str())
-                .or_default()
+        for item in admitted {
+            work.step(is_cancelled)?;
+            if item.edge.target != target.id || !source_ids.contains(item.edge.source.as_str()) {
+                continue;
+            }
+            charge_ordered_collection_work(groups.len(), 1, work, is_cancelled)?;
+            let sources = groups.entry(item.edge.profile_id.as_str()).or_default();
+            charge_ordered_collection_work(sources.len(), 1, work, is_cancelled)?;
+            sources
                 .entry(item.edge.source.as_str())
                 .and_modify(|current| {
                     if item.edge.id < current.edge.id {
@@ -1736,12 +1857,13 @@ fn evaluate_fan_in(
                 .or_insert(item);
         }
         for (profile_id, sources) in groups {
+            work.step(is_cancelled)?;
             let count = u64::try_from(sources.len())?;
             if count <= max {
                 continue;
             }
-            let witness = overflow_witness(&sources, max)?;
-            output.push(make_violation(
+            let witness = overflow_witness_bounded(&sources, max, work, is_cancelled)?;
+            let violation = make_violation_bounded(
                 rule,
                 nodes,
                 &witness.edge.source,
@@ -1751,22 +1873,30 @@ fn evaluate_fan_in(
                 vec![witness],
                 format!("fan-in for {} is {count}, exceeding {max}", target.id),
                 suppressions,
-            )?);
+                work,
+                is_cancelled,
+            )?;
+            work.step(is_cancelled)?;
+            output.push(violation);
         }
     }
     Ok(output)
 }
 
-fn overflow_witness<'a>(
+fn overflow_witness_bounded<'a>(
     entries: &'a BTreeMap<&str, &'a AdmittedEdge<'a>>,
     max: u64,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<&'a AdmittedEdge<'a>> {
     let index = usize::try_from(max)?;
-    entries
-        .values()
-        .nth(index)
-        .copied()
-        .context("threshold overflow did not have a witness edge")
+    for (current, entry) in entries.values().enumerate() {
+        work.step(is_cancelled)?;
+        if current == index {
+            return Ok(*entry);
+        }
+    }
+    bail!("threshold overflow did not have a witness edge")
 }
 
 fn adjacency<'a>(edges: &[&'a AdmittedEdge<'a>]) -> BTreeMap<&'a str, Vec<&'a AdmittedEdge<'a>>> {
@@ -1827,34 +1957,6 @@ fn reconstruct_path_bounded<'a>(
     }
     reversed.reverse();
     Ok(reversed)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_violation(
-    rule: &PolicyRule,
-    nodes: &BTreeMap<&str, &NodeRecord>,
-    source_id: &str,
-    target_id: &str,
-    profile_id: Option<&str>,
-    dependency_path: Vec<PolicyPathStep>,
-    path_edges: Vec<&AdmittedEdge<'_>>,
-    message: String,
-    suppressions: &[ResolvedSuppression<'_>],
-) -> Result<PolicyViolation> {
-    let mut work = PolicyEvaluationWork::new(usize::MAX);
-    make_violation_bounded(
-        rule,
-        nodes,
-        source_id,
-        target_id,
-        profile_id,
-        dependency_path,
-        path_edges,
-        message,
-        suppressions,
-        &mut work,
-        &mut || false,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3310,6 +3412,101 @@ mod tests {
 
         let mut work = PolicyEvaluationWork::new(usize::MAX);
         let cancelled = adjacency_bounded(&admitted_refs, &mut work, &mut || true).unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        Ok(())
+    }
+
+    #[test]
+    fn non_runtime_policy_evaluators_honor_work_budget_and_cancellation() -> Result<()> {
+        let graph = snapshot(vec![
+            edge("e1", "a", "b", "profile:production"),
+            edge("e2", "b", "a", "profile:production"),
+        ]);
+        let cycle_rule = rule(PolicyRuleKind::Cycle);
+        let admitted = admitted_edges_with_options(&graph, &cycle_rule, true, true)?;
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        let sources = vec![&graph.nodes[0]];
+        let targets = vec![&graph.nodes[1]];
+        let source_ids = BTreeSet::from(["a"]);
+        let target_ids = BTreeSet::from(["b"]);
+
+        let mut work = PolicyEvaluationWork::new(0);
+        let exhausted = evaluate_cycles_bounded(
+            &graph,
+            &cycle_rule,
+            &admitted,
+            &source_ids,
+            &target_ids,
+            &nodes,
+            &[],
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut threshold_rule = rule(PolicyRuleKind::DependencyDepth);
+        threshold_rule.threshold = Some(PolicyThreshold { max: 0 });
+        let mut work = PolicyEvaluationWork::new(0);
+        let exhausted = evaluate_depth_bounded(
+            &threshold_rule,
+            &admitted,
+            &sources,
+            &targets,
+            &nodes,
+            &[],
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        threshold_rule.kind = PolicyRuleKind::FanOut;
+        let mut work = PolicyEvaluationWork::new(0);
+        let exhausted = evaluate_fan_out_bounded(
+            &threshold_rule,
+            &admitted,
+            &sources,
+            &target_ids,
+            &nodes,
+            &[],
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        threshold_rule.kind = PolicyRuleKind::FanIn;
+        let mut work = PolicyEvaluationWork::new(0);
+        let exhausted = evaluate_fan_in_bounded(
+            &threshold_rule,
+            &admitted,
+            &source_ids,
+            &targets,
+            &nodes,
+            &[],
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled = evaluate_fan_in_bounded(
+            &threshold_rule,
+            &admitted,
+            &source_ids,
+            &targets,
+            &nodes,
+            &[],
+            &mut work,
+            &mut || true,
+        )
+        .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
         Ok(())
     }
