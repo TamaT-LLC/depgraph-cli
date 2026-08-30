@@ -2021,7 +2021,7 @@ mod tests {
         let compatible = release_compatibility_contract();
         verify_release_compatibility(&compatible).unwrap();
         assert_eq!(compatible.worker_protocol_version, "1.0");
-        assert_eq!(compatible.store_schema_version, 17);
+        assert_eq!(compatible.store_schema_version, STORE_SCHEMA_VERSION);
         assert_eq!(compatible.operation_journal_schema_version, 5);
         assert_eq!(
             compatible.mcp_tool_contract_version,

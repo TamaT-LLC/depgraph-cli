@@ -23,7 +23,9 @@ use crate::{
     },
     cancellation::CancellationToken,
     config::Config,
-    health::{HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest},
+    health::{
+        HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest,
+    },
     policy::PolicyResult,
     policy_engine::evaluate_policy,
     profile_selection::{

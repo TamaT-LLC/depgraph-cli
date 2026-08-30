@@ -10,7 +10,7 @@ use depgraph_core::service::{
 use depgraph_core::{
     CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind, HotspotWeights,
 };
-use depgraph_store::Store;
+use depgraph_store::{ScanHealthProvenance, Store};
 use serde_json::json;
 
 fn service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
@@ -29,7 +29,21 @@ fn seed_health_snapshot(
     revision: &str,
     add_changed_usage: bool,
 ) -> Result<String> {
+    seed_health_snapshot_with_provenance(store, root, scan_id, revision, add_changed_usage, None)
+}
+
+fn seed_health_snapshot_with_provenance(
+    store: &mut Store,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+    add_changed_usage: bool,
+    provenance: Option<&ScanHealthProvenance>,
+) -> Result<String> {
     store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
+    if let Some(provenance) = provenance {
+        store.bind_scan_health_provenance(scan_id, provenance)?;
+    }
     let coverage = json!({
         "profiles": 1,
         "files_discovered": 0,
@@ -357,6 +371,8 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
         &cancellation,
     )?;
     assert_eq!(scope.after().id().as_str(), after_id);
+    assert!(scope.comparability().policy_changed);
+    assert!(scope.comparability().contract_changed);
     let (before, _) = scope.comparable_pair().expect("base snapshot pair");
     assert_eq!(before.id().as_str(), base_id);
     let first = service.health_audit(&scope, &cancellation)?;
@@ -553,6 +569,204 @@ evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
         .expect("evaluated boundary violation becomes an audit finding");
     assert_eq!(boundary.subject_id, expected_policy_id);
     assert_eq!(boundary.subject_id, policy_pair.result.violations[0].id);
+    Ok(())
+}
+
+#[test]
+fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let current_policy = depgraph_core::health::health_policy_config_digest(
+        &depgraph_core::PolicyConfig::default(),
+    )?;
+    let previous_policy = format!("policy-config:sha256:{}", "b".repeat(64));
+    let contract = "depgraph-health-finding-v1".to_owned();
+
+    let mut store = Store::open(&store_path)?;
+    let base_provenance = ScanHealthProvenance {
+        policy_config_digest: previous_policy.clone(),
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-base",
+        &base_revision,
+        false,
+        Some(&base_provenance),
+    )?;
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after policy\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "policy provenance after"]);
+    let first_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let first_after_provenance = ScanHealthProvenance {
+        policy_config_digest: current_policy.clone(),
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-after-policy",
+        &first_head,
+        true,
+        Some(&first_after_provenance),
+    )?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let first_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(first_scope.comparability().policy_changed);
+    assert!(!first_scope.comparability().contract_changed);
+
+    // The snapshots below agree with each other, but the live policy remains
+    // the default digest while both persisted rows carry `previous_policy`.
+    // This must still be incomparable because the evaluator is using the
+    // current policy, not the historical snapshot policy.
+    fs::write(
+        root.join("src/used.rs"),
+        "pub fn used() { println!(\"live policy drift\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "live policy drift"]);
+    let second_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let second_provenance = ScanHealthProvenance {
+        policy_config_digest: previous_policy,
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract,
+    };
+    let mut store = Store::open(&store_path)?;
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-after-live-drift",
+        &second_head,
+        true,
+        Some(&second_provenance),
+    )?;
+    drop(store);
+
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let second_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(second_scope.comparability().policy_changed);
+    assert!(!second_scope.comparability().contract_changed);
+    Ok(())
+}
+
+#[test]
+fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let policy = depgraph_core::health::health_policy_config_digest(
+        &depgraph_core::PolicyConfig::default(),
+    )?;
+    let contract = "depgraph-health-finding-v1".to_owned();
+    let mut store = Store::open(&store_path)?;
+    let base_provenance = ScanHealthProvenance {
+        policy_config_digest: policy.clone(),
+        analyzer_version: "1.0.0".to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-base",
+        &base_revision,
+        false,
+        Some(&base_provenance),
+    )?;
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after contract\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "contract provenance after"]);
+    let head = run_git(&root, &["rev-parse", "HEAD"]);
+    let after_provenance = ScanHealthProvenance {
+        policy_config_digest: policy.clone(),
+        analyzer_version: "1.0.1".to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-after",
+        &head,
+        true,
+        Some(&after_provenance),
+    )?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(!scope.comparability().policy_changed);
+    assert!(scope.comparability().contract_changed);
+
+    // The snapshots can agree on the old analyzer version while the running
+    // binary has moved forward.  The pair is then incomparable even though
+    // the two persisted analyzer values are equal.
+    fs::write(
+        root.join("src/used.rs"),
+        "pub fn used() { println!(\"live analyzer drift\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "live analyzer drift"]);
+    let second_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let second_provenance = ScanHealthProvenance {
+        policy_config_digest: policy,
+        analyzer_version: "1.0.0".to_owned(),
+        finding_contract_version: contract,
+    };
+    let mut store = Store::open(&store_path)?;
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-after-live-drift",
+        &second_head,
+        true,
+        Some(&second_provenance),
+    )?;
+    drop(store);
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let second_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(!second_scope.comparability().policy_changed);
+    assert!(second_scope.comparability().contract_changed);
     Ok(())
 }
 

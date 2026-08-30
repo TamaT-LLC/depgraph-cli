@@ -22,11 +22,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     BuildGraphDelta, COMPLETED_SNAPSHOT_SEAL_VERSION, CompletedSnapshotRecord, GraphSnapshot,
-    LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION,
-    ProfileMatrixRecord, ProfileRecord, ScanRecord, incremental, load_adapter_logs,
-    load_diagnostics, load_edges, load_evidence, load_file_coverage, load_nodes, load_profiles,
-    load_sites, merge_build_delta, observed_coverage, profile_matrix::refresh_profile_matrix,
-    runtime, table_has_column,
+    LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION, ProfileMatrixRecord, ProfileRecord, ScanRecord,
+    incremental, load_adapter_logs, load_diagnostics, load_edges, load_evidence,
+    load_file_coverage, load_nodes, load_profiles, load_sites, merge_build_delta,
+    observed_coverage, profile_matrix::refresh_profile_matrix, runtime, table_has_column,
 };
 
 #[derive(Clone, Copy)]
@@ -73,9 +72,8 @@ struct SnapshotSealHasher(Sha256);
 impl SnapshotSealHasher {
     fn new(snapshot_id: &str, version: i64) -> Self {
         let mut hasher = Self(Sha256::new());
-        hasher.write_bytes(
-            format!("depgraph-completed-snapshot-storage-seal-v{version}").as_bytes(),
-        );
+        hasher
+            .write_bytes(format!("depgraph-completed-snapshot-storage-seal-v{version}").as_bytes());
         hasher.write_bytes(snapshot_id.as_bytes());
         hasher
     }
@@ -570,7 +568,7 @@ fn backfill_completed_snapshot_seals_with_version(
     };
     for snapshot_id in snapshot_ids {
         validate_completed_snapshot_for_seal(connection, &snapshot_id)
-            .with_context(|| format!("failed to validate snapshot for storage seal {snapshot_id}"))?;
+            .with_context(|| format!("failed to backfill storage seal for {snapshot_id}"))?;
         let observed = completed_snapshot_storage_seal_with_version(
             connection,
             &snapshot_id,
@@ -596,6 +594,24 @@ pub(crate) fn backfill_completed_snapshot_seals(connection: &Connection) -> Resu
 }
 
 pub(crate) fn backfill_completed_snapshot_seals_v1(connection: &Connection) -> Result<()> {
+    let existing_version = connection
+        .query_row(
+            "SELECT MIN(seal_version) FROM completed_snapshot_seals",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    if existing_version == Some(COMPLETED_SNAPSHOT_SEAL_VERSION) {
+        // A test or an interrupted upgrade can reopen a database whose rows
+        // already use the v2 seal while its user_version still advertises an
+        // older schema.  Do not attempt to insert v1 rows into the v2 CHECK
+        // constraint; the v18 step will authenticate them in place.
+        return Ok(());
+    }
+    if existing_version.is_some_and(|version| version != LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION) {
+        bail!("completed snapshot seals contain an unsupported version");
+    }
     backfill_completed_snapshot_seals_with_version(
         connection,
         LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION,
@@ -656,7 +672,8 @@ pub(crate) fn load_base_snapshot_from_connection(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<GraphSnapshot> {
-    let health_columns_available = table_has_column(connection, "scans", "health_policy_config_digest")?;
+    let health_columns_available =
+        table_has_column(connection, "scans", "health_policy_config_digest")?;
     let health_projection = if health_columns_available {
         "health_policy_config_digest, health_analyzer_version,
                     health_finding_contract_version"
@@ -671,27 +688,23 @@ pub(crate) fn load_base_snapshot_from_connection(
                FROM scans WHERE id=?1"
     );
     let scan = connection
-        .query_row(
-            &scan_query,
-            [scan_id],
-            |row| {
-                Ok(ScanRecord {
-                    id: row.get(0)?,
-                    root: row.get(1)?,
-                    status: row.get(2)?,
-                    strict: row.get(3)?,
-                    started_at: row.get(4)?,
-                    completed_at: row.get(5)?,
-                    project_code_executed: row.get(6)?,
-                    error: row.get(7)?,
-                    parent_snapshot_id: row.get(8)?,
-                    source_revision: row.get(9)?,
-                    health_policy_config_digest: row.get(10)?,
-                    health_analyzer_version: row.get(11)?,
-                    health_finding_contract_version: row.get(12)?,
-                })
-            },
-        )
+        .query_row(&scan_query, [scan_id], |row| {
+            Ok(ScanRecord {
+                id: row.get(0)?,
+                root: row.get(1)?,
+                status: row.get(2)?,
+                strict: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                project_code_executed: row.get(6)?,
+                error: row.get(7)?,
+                parent_snapshot_id: row.get(8)?,
+                source_revision: row.get(9)?,
+                health_policy_config_digest: row.get(10)?,
+                health_analyzer_version: row.get(11)?,
+                health_finding_contract_version: row.get(12)?,
+            })
+        })
         .optional()?
         .with_context(|| format!("scan {scan_id} was not found"))?;
     let profiles = load_profiles(connection, scan_id)?;

@@ -12,8 +12,9 @@ use crate::{
     bounded_query::{QueryFailureClass, read_bounded_repository_file},
     health::{
         AuditAnalysisOptions, AuditComparability, CollectionIdentity, Confidence, FindingKind,
-        HealthAnalysisError, HealthFinding, HealthFindingDetail, HotspotAnalysisError,
-        HotspotLayerAvailability, HotspotWeights, ManifestIdentity, Severity,
+        HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, HealthAnalysisError,
+        HealthFinding, HealthFindingDetail, HotspotAnalysisError, HotspotLayerAvailability,
+        HotspotWeights, ManifestIdentity, Severity,
         analyze_changed_code_with_boundary_ids_cancellable, analyze_dependencies_cancellable,
         analyze_unused_cancellable, collection_digest, contract::collection_digest_with_policy,
         score_hotspots_cancellable,
@@ -640,6 +641,9 @@ impl DepgraphService {
             compare_health_provenance(
                 &before.snapshot.scan,
                 &after.scan,
+                &policy_config_digest,
+                HEALTH_ANALYZER_VERSION,
+                HEALTH_FINDING_CONTRACT_VERSION,
                 &mut comparability,
             );
             comparability.profile_matrix_changed = before.snapshot.profile_matrix.schema_version
@@ -826,6 +830,9 @@ impl DepgraphService {
 fn compare_health_provenance(
     before: &ScanRecord,
     after: &ScanRecord,
+    current_policy_config_digest: &str,
+    current_analyzer_version: &str,
+    current_finding_contract_version: &str,
     comparability: &mut AuditComparability,
 ) {
     // Provenance is snapshot evidence, not a value that can be reconstructed
@@ -836,7 +843,8 @@ fn compare_health_provenance(
             before.health_policy_config_digest.as_deref(),
             after.health_policy_config_digest.as_deref(),
         ),
-        (Some(before), Some(after)) if before == after
+        (Some(before), Some(after))
+            if before == after && before == current_policy_config_digest
     );
     comparability.contract_changed = !matches!(
         (
@@ -846,7 +854,10 @@ fn compare_health_provenance(
             after.health_finding_contract_version.as_deref(),
         ),
         (Some(before_analyzer), Some(after_analyzer), Some(before_contract), Some(after_contract))
-            if before_analyzer == after_analyzer && before_contract == after_contract
+            if before_analyzer == after_analyzer
+                && before_contract == after_contract
+                && before_analyzer == current_analyzer_version
+                && before_contract == current_finding_contract_version
     );
 }
 

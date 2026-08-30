@@ -477,6 +477,11 @@ mod tests {
                 runtime: false,
             },
         );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
+        );
         assert!(findings.iter().all(|finding| {
             finding
                 .blockers

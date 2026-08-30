@@ -32,11 +32,13 @@ use crate::incremental::profile_records_profile_plan_id;
 use crate::{
     CancellationToken, Config, DaemonConfig, INCREMENTAL_PLAN_SCHEMA_VERSION,
     IncrementalChangeKind, IncrementalFileChange, IncrementalInvalidationMode,
-    IncrementalInvalidationPlan, IncrementalInvalidationReason, ScanCacheMode, open_store,
-    plan_incremental_invalidation, plan_repository_profiles,
+    IncrementalInvalidationPlan, IncrementalInvalidationReason, ScanCacheMode,
+    health::{
+        HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest,
+    },
+    open_store, plan_incremental_invalidation, plan_repository_profiles,
     run_scan_with_cache_mode_and_cancellation,
     scan::{cancel_scan, complete_scan, git_source_revision},
-    health::{HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest},
     worker::{
         AdapterKind, WorkerFailureKind, execute_worker_delta_with_cancellation, is_security_error,
         locate_worker, probe_worker_version_with_cancellation, worker_capabilities,
@@ -1051,8 +1053,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                             &config.policy,
                                         )?,
                                         analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
-                                        finding_contract_version:
-                                            HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
+                                        finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION
+                                            .to_owned(),
                                     },
                                 )?;
                                 let result = (|| -> Result<crate::ScanOutcome> {

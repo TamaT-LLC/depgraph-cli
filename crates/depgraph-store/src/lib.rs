@@ -62,10 +62,10 @@ pub use runtime::{
 use schema::{table_exists, table_has_column};
 use snapshot::{
     SnapshotSource, backfill_completed_snapshot_seals, backfill_completed_snapshot_seals_v1,
-    backfill_completed_snapshots,
-    completed_snapshot_identity, create_completed_snapshot, load_base_snapshot_from_connection,
-    load_completed_snapshot_from_connection, load_completed_snapshot_profiles_from_connection,
-    load_completed_snapshot_record, persist_completed_snapshot_seal, promote_completed_snapshot,
+    backfill_completed_snapshots, completed_snapshot_identity, create_completed_snapshot,
+    load_base_snapshot_from_connection, load_completed_snapshot_from_connection,
+    load_completed_snapshot_profiles_from_connection, load_completed_snapshot_record,
+    persist_completed_snapshot_seal, promote_completed_snapshot,
     promote_completed_snapshot_if_current_parent, verify_completed_snapshot_seal,
     verify_completed_snapshot_seal_v1,
 };
@@ -1219,8 +1219,11 @@ ORDER BY id COLLATE BINARY
                     params![scan_id, requested.0, requested.1, requested.2],
                 )?;
             }
-            (Some(policy), Some(analyzer), Some(contract)) if (policy, analyzer, contract) == requested => {}
-            _ => bail!("health provenance for scan {scan_id} is already bound to a different tuple"),
+            (Some(policy), Some(analyzer), Some(contract))
+                if (policy, analyzer, contract) == requested => {}
+            _ => {
+                bail!("health provenance for scan {scan_id} is already bound to a different tuple")
+            }
         }
         tx.commit()?;
         Ok(())
@@ -3004,12 +3007,13 @@ fn validate_scan_health_provenance(provenance: &ScanHealthProvenance) -> Result<
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
     if !valid_policy {
-        bail!(
-            "health policy config digest must be policy-config:sha256:<64 lowercase hex>"
-        );
+        bail!("health policy config digest must be policy-config:sha256:<64 lowercase hex>");
     }
     for (name, value) in [
-        ("health analyzer version", provenance.analyzer_version.as_str()),
+        (
+            "health analyzer version",
+            provenance.analyzer_version.as_str(),
+        ),
         (
             "health finding contract version",
             provenance.finding_contract_version.as_str(),
@@ -3536,6 +3540,128 @@ mod tests {
         let error = Store::open_read_only(&path).err().expect("missing store");
         assert!(error.to_string().contains("read-only"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn health_provenance_binding_is_immutable_complete_and_staging_only() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let policy = format!("policy-config:sha256:{}", "a".repeat(64));
+        let provenance = ScanHealthProvenance {
+            policy_config_digest: policy.clone(),
+            analyzer_version: "1.0.1".to_owned(),
+            finding_contract_version: "depgraph-health-finding-v1".to_owned(),
+        };
+        store.start_scan("provenance-bind", Path::new("/fixture"), false)?;
+        store.bind_scan_health_provenance("provenance-bind", &provenance)?;
+        // Retrying the same bind is intentionally idempotent.
+        store.bind_scan_health_provenance("provenance-bind", &provenance)?;
+        let record = store.scan("provenance-bind")?.context("bound scan")?;
+        assert_eq!(
+            record.health_policy_config_digest.as_deref(),
+            Some(policy.as_str())
+        );
+        assert_eq!(record.health_analyzer_version.as_deref(), Some("1.0.1"));
+        assert_eq!(
+            record.health_finding_contract_version.as_deref(),
+            Some("depgraph-health-finding-v1")
+        );
+
+        let different = ScanHealthProvenance {
+            policy_config_digest: format!("policy-config:sha256:{}", "b".repeat(64)),
+            ..provenance.clone()
+        };
+        let error = store
+            .bind_scan_health_provenance("provenance-bind", &different)
+            .expect_err("a staging scan cannot be rebound to a different tuple");
+        assert!(error.to_string().contains("different tuple"));
+
+        store.start_scan("provenance-terminal", Path::new("/fixture"), false)?;
+        store.finish_scan("provenance-terminal", "failed", Some("fixture"), false)?;
+        let error = store
+            .bind_scan_health_provenance("provenance-terminal", &provenance)
+            .expect_err("terminal scans cannot receive provenance");
+        assert!(error.to_string().contains("only be bound while scan"));
+
+        store.start_scan("provenance-partial", Path::new("/fixture"), false)?;
+        store.connection.execute(
+            "UPDATE scans SET health_policy_config_digest=?2 WHERE id=?1",
+            params!["provenance-partial", provenance.policy_config_digest],
+        )?;
+        let error = store
+            .bind_scan_health_provenance("provenance-partial", &provenance)
+            .expect_err("partial tuples must fail closed");
+        assert!(error.to_string().contains("partial") || error.to_string().contains("different"));
+        Ok(())
+    }
+
+    #[test]
+    fn health_provenance_is_authenticated_by_completed_snapshot_seal() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let scan_id = stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("fixture-revision"),
+        )?;
+        let provenance = ScanHealthProvenance {
+            policy_config_digest: format!("policy-config:sha256:{}", "c".repeat(64)),
+            analyzer_version: "1.0.1".to_owned(),
+            finding_contract_version: "depgraph-health-finding-v1".to_owned(),
+        };
+        store.bind_scan_health_provenance(&scan_id, &provenance)?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+        let snapshot_id = store.current_snapshot_id()?.context("snapshot")?;
+        store
+            .completed_snapshot_details(&snapshot_id)
+            .expect("v2 seal accepts the bound provenance");
+
+        store.connection.execute(
+            "UPDATE scans
+                SET health_policy_config_digest=?2,
+                    health_analyzer_version=?3,
+                    health_finding_contract_version=?4
+              WHERE id=?1",
+            params![
+                scan_id,
+                format!("policy-config:sha256:{}", "d".repeat(64)),
+                "1.0.1",
+                "depgraph-health-finding-v1"
+            ],
+        )?;
+        let error = store
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("provenance tampering must invalidate the storage seal");
+        assert!(error.to_string().contains("storage seal mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_store_migrates_from_zero_to_schema18_with_v2_seals() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("fresh-v18.db");
+        let store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, 18);
+        for column in [
+            "health_policy_config_digest",
+            "health_analyzer_version",
+            "health_finding_contract_version",
+        ] {
+            assert!(table_has_column(&store.connection, "scans", column)?);
+        }
+        let seal_versions = store.connection.query_row(
+            "SELECT GROUP_CONCAT(DISTINCT seal_version)\
+                   FROM completed_snapshot_seals",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        assert_eq!(seal_versions, None);
+        let seal_schema: String = store.connection.query_row(
+            "SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='completed_snapshot_seals'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(seal_schema.contains("seal_version = 2"));
+        Ok(())
     }
 
     fn operation_scan_attempt_id(operation_id: &str, nonce: char) -> String {
@@ -5303,6 +5429,108 @@ mod tests {
     }
 
     #[test]
+    fn v17_legacy_snapshot_migrates_after_v1_seal_verification_and_reseals_v2() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("v17-legacy.db");
+        let snapshot_id = downgrade_completed_store_to_v17(&path)?;
+
+        // Migration-compatible read handles may inspect the old graph before
+        // the writer opens and upgrades it; their projection must not assume
+        // the v18 provenance columns already exist.
+        let legacy = Store::open_read_only_for_migration(&path)?;
+        let legacy_snapshot = legacy.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            (
+                legacy_snapshot.scan.health_policy_config_digest,
+                legacy_snapshot.scan.health_analyzer_version,
+                legacy_snapshot.scan.health_finding_contract_version,
+            ),
+            (None, None, None)
+        );
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.schema_version()?, STORE_SCHEMA_VERSION);
+        let scan_id = store
+            .completed_snapshot(&snapshot_id)?
+            .context("legacy completed snapshot")?
+            .scan_id;
+        let scan = store.scan(&scan_id)?.context("legacy scan")?;
+        assert_eq!(
+            (
+                scan.health_policy_config_digest,
+                scan.health_analyzer_version,
+                scan.health_finding_contract_version,
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT seal_version FROM completed_snapshot_seals WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            COMPLETED_SNAPSHOT_SEAL_VERSION
+        );
+        store
+            .completed_snapshot_details(&snapshot_id)
+            .expect("migrated v2 seal validates");
+        Ok(())
+    }
+
+    #[test]
+    fn v17_legacy_seal_tampering_is_rejected_without_migration() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("v17-legacy-tampered.db");
+        downgrade_completed_store_to_v17(&path)?;
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "UPDATE scans SET root='/tampered' WHERE id='scan-golden'",
+            [],
+        )?;
+        drop(connection);
+
+        let error = Store::open(&path)
+            .err()
+            .context("tampered v1 seal must fail before v18 migration")?;
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("legacy storage seal mismatch"),
+            "{error_chain}"
+        );
+        let connection = Connection::open(&path)?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            17
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v17_incomplete_legacy_seals_are_rejected_without_migration() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("v17-legacy-incomplete.db");
+        downgrade_completed_store_to_v17(&path)?;
+        let connection = Connection::open(&path)?;
+        connection.execute("DELETE FROM completed_snapshot_seals", [])?;
+        drop(connection);
+
+        let error = Store::open(&path)
+            .err()
+            .context("incomplete v1 seals must fail closed")?;
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("seals are incomplete"),
+            "{error_chain}"
+        );
+        let connection = Connection::open(&path)?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            17
+        );
+        Ok(())
+    }
+
+    #[test]
     fn v15_foreign_key_violation_rolls_back_the_entire_v16_migration() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("v15-foreign-key-violation.db");
@@ -6349,6 +6577,35 @@ mod tests {
             store.ingest_event(&event)?;
         }
         Ok(scan_id)
+    }
+
+    fn downgrade_completed_store_to_v17(path: &Path) -> Result<String> {
+        let snapshot_id = {
+            let mut store = Store::open(path)?;
+            ingest_protocol_fixture(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            )?;
+            store.current_snapshot_id()?.context("legacy snapshot")?
+        };
+        let connection = Connection::open(path)?;
+        connection.execute_batch(
+            "DROP TABLE completed_snapshot_seals;
+             ALTER TABLE scans DROP COLUMN health_policy_config_digest;
+             ALTER TABLE scans DROP COLUMN health_analyzer_version;
+             ALTER TABLE scans DROP COLUMN health_finding_contract_version;
+             CREATE TABLE completed_snapshot_seals (
+                 snapshot_id TEXT PRIMARY KEY
+                     REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                 seal_version INTEGER NOT NULL CHECK (seal_version = 1),
+                 seal_sha256 TEXT NOT NULL
+                     CHECK (length(seal_sha256) = 64
+                         AND seal_sha256 NOT GLOB '*[^0-9a-f]*')
+             );
+             PRAGMA user_version=17;",
+        )?;
+        backfill_completed_snapshot_seals_v1(&connection)?;
+        Ok(snapshot_id)
     }
 
     fn build_attempt_audit(run_id: &str) -> Value {

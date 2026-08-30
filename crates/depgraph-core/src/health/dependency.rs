@@ -666,6 +666,11 @@ mod tests {
         assert!(
             findings
                 .iter()
+                .all(|finding| finding.suppressions.is_empty())
+        );
+        assert!(
+            findings
+                .iter()
                 .any(|finding| finding.kind == FindingKind::UnusedDependency
                     && finding.reason.contains("unused-crate"))
         );

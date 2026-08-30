@@ -65,7 +65,8 @@ That binary opened the official rc.1 schema-11 fixture and transactionally
 migrated it to schema 13 without changing the completed snapshot identity.
 
 The v0.5 package and unit gates verify fixture checksum, transactional
-migration to schema 17, the exact immutable snapshot ID, node/site/edge/
+migration to schema 18 (including legacy v1 seal verification and v2
+provenance-aware resealing), the exact immutable snapshot ID, node/site/edge/
 evidence counts, integrity, and post-migration snapshot naming. The rc.1
 schema-11 and v0.2 schema-5 fixtures remain independent historical migration
 tests.
@@ -73,8 +74,8 @@ tests.
 Before migration, operators stop all writers and copy the database together
 with any WAL/SHM files. Tests retain the pre-upgrade database bytes and prove
 the rollback copy is unchanged. An rc.6 or other older binary must not be used
-to open the schema-17 database. Rollback means stopping v0.5, preserving the
-schema-17 database for diagnosis, restoring the complete byte-for-byte
+to open the schema-18 database. Rollback means stopping v0.5, preserving the
+schema-18 database for diagnosis, restoring the complete byte-for-byte
 pre-upgrade backup set, and only then starting the old binary.
 
 ## Candidate, baseline, and maintenance policy

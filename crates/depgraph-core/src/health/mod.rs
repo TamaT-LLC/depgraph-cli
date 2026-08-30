@@ -35,9 +35,7 @@ pub use unused::{analyze_unused, analyze_unused_cancellable};
 /// the repository configuration again later.  The policy implementation owns
 /// normalization of set-like rules, suppressions, selectors, and conditions;
 /// this helper only applies the stable namespace used by the store contract.
-pub fn health_policy_config_digest(
-    policy: &crate::policy::PolicyConfig,
-) -> anyhow::Result<String> {
+pub fn health_policy_config_digest(policy: &crate::policy::PolicyConfig) -> anyhow::Result<String> {
     let identity = policy.normalized_identity()?;
     Ok(depgraph_protocol::stable_id_from_value(
         "policy-config",

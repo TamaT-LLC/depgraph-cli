@@ -466,6 +466,8 @@ pub(crate) struct BuildGraphDelta {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphSnapshot {
+    /// Scan metadata, including optional schema-18 health provenance used to
+    /// compare audit snapshots fail-closed.
     pub scan: ScanRecord,
     pub profiles: Vec<ProfileRecord>,
     pub nodes: Vec<NodeRecord>,

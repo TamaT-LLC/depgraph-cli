@@ -768,6 +768,11 @@ mod tests {
             ProfileMatrixRecord::default(),
         );
         let findings = analyze_unused(&rust);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
+        );
         let kinds = findings
             .iter()
             .map(|finding| finding.kind)

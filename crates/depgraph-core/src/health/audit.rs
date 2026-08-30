@@ -77,12 +77,12 @@ impl AuditComparability {
         push(
             self.policy_changed,
             BlockerKind::IncomparablePolicy,
-            "policy digest differs between the audit inputs",
+            "policy digest differs between the audit inputs or the pinned live policy",
         );
         push(
             self.contract_changed,
             BlockerKind::IncomparableContract,
-            "analyzer or finding contract versions differ",
+            "analyzer or finding contract versions differ from each other or the running contract",
         );
         blockers
     }
@@ -707,6 +707,11 @@ mod tests {
                 missing_base: true,
                 ..AuditComparability::default()
             },
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
         );
         let degraded = findings
             .iter()
