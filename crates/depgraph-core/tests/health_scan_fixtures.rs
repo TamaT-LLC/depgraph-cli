@@ -5,6 +5,7 @@
 //! this test does not invent source-path or visibility fields that the worker
 //! does not emit.
 
+use std::collections::BTreeSet;
 use std::fs;
 
 use anyhow::Result;
@@ -112,12 +113,12 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
         (
             "go",
             GO_FIXTURE,
-            6,
+            3,
             [
                 ExpectedFinding {
                     kind: FindingKind::UnusedFile,
                     path: None,
-                    locator: Some("file:pkg/unused.go"),
+                    locator: Some("file:pkg/unused/unused.go"),
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedExport,
@@ -158,6 +159,44 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
     for (language, fixture, expected_count, expected_findings) in cases {
         let snapshot = load_protocol_fixture(&temporary, &format!("issue437-{language}"), fixture)?;
         let findings = analyze_unused(&snapshot);
+
+        let expected_keys = expected_findings
+            .iter()
+            .map(|expected| {
+                let subject = expected
+                    .locator
+                    .map(|locator| {
+                        format!(
+                            "subject:{}",
+                            fixture_node_id(fixture, locator).unwrap_or_else(|| {
+                                panic!("{language} fixture has no node with locator {locator:?}")
+                            })
+                        )
+                    })
+                    .or_else(|| expected.path.map(|path| format!("path:{path}")))
+                    .expect("expected finding must identify a subject");
+                (expected.kind, subject)
+            })
+            .collect::<BTreeSet<_>>();
+        let actual_keys = findings
+            .iter()
+            .map(|finding| {
+                let subject = location_path(finding).map_or_else(
+                    || format!("subject:{}", finding.subject_id),
+                    |path| format!("path:{path}"),
+                );
+                (finding.kind, subject)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            findings.len(),
+            actual_keys.len(),
+            "duplicate findings for {language}: {findings:?}"
+        );
+        assert_eq!(
+            actual_keys, expected_keys,
+            "unexpected findings for {language}: {findings:?}"
+        );
 
         for expected in expected_findings {
             let subject_id = expected.locator.map(|locator| {
@@ -210,7 +249,7 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
         assert_eq!(
             findings.len(),
             expected_count,
-            "unexpected findings for {language} fixture: {findings:?}"
+            "finding count drift for {language}: {findings:?}"
         );
     }
     Ok(())

@@ -101,6 +101,16 @@ func TestRunIssue437HealthFixtureEmitsRealSemanticGraph(t *testing.T) {
 	if exitCode := run([]string{"--root", root, "--scan-id", "issue437-health-e2e"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("run() exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(sourcePath), "..", "..", "..", ".."))
+	fixturePath := filepath.Join(repoRoot, "crates", "depgraph-core", "tests", "fixtures", "health", "issue437-go.ndjson")
+	fixtureBytes, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read Go health fixture %s: %v", fixturePath, err)
+	}
+	// This assertion exercises the real command envelope path. The worker
+	// package test covers Scan/Emit directly; this one ensures run() forwards
+	// the complete golden graph and completion ledger unchanged.
+	issue437AssertRunGolden(t, stdout.Bytes(), fixtureBytes)
 
 	wantResolvers := map[string]string{
 		"example.com/issue437/cmd.main":         "main",

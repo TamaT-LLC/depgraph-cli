@@ -108,6 +108,36 @@ fn analyze_subject(
         budget.step(is_cancelled)?;
         usage_profiles.insert(edge.profile_id.as_str());
     }
+    if kind == FindingKind::UnusedFile
+        && node
+            .properties
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            == Some("go")
+    {
+        // The Go worker's import edge targets the package/module node, not an
+        // arbitrary source file.  An exact package import therefore accounts
+        // for every source file in that package for the matching profile.
+        if let Some(package_profiles) = index.go_file_usage_profiles.get(node.id.as_str()) {
+            usage_profiles.extend(package_profiles.iter().copied());
+        }
+        // A Go main package is selected by the build as an entry surface even
+        // when no repository edge points at its source file.
+        let go_source_path = node
+            .properties
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| node.locator.strip_prefix("file:"));
+        let go_package_name = node
+            .properties
+            .get("package_name")
+            .and_then(serde_json::Value::as_str);
+        if go_package_name == Some("main")
+            && go_source_path.is_some_and(|path| path == "main.go" || path.ends_with("/main.go"))
+        {
+            usage_profiles.extend(applicable.iter().map(String::as_str));
+        }
+    }
     let mut unused_across_profiles = true;
     for profile in &applicable {
         budget.step(is_cancelled)?;
@@ -203,6 +233,11 @@ fn analyze_subject(
 
 struct SnapshotIndex<'a> {
     incoming: HashMap<&'a str, Vec<&'a EdgeRecord>>,
+    // Go imports are resolved to package/module nodes because a Go package is
+    // compiled as one unit.  Keep the package-level usage profiles alongside
+    // the ordinary incoming-edge index so file findings do not mistake every
+    // file in an imported package for an unused file.
+    go_file_usage_profiles: HashMap<&'a str, HashSet<&'a str>>,
     sites_by_target: HashMap<&'a str, Vec<&'a SiteRecord>>,
     dynamic_site_ids: HashSet<&'a str>,
     targetless_candidate: bool,
@@ -228,6 +263,63 @@ impl<'a> SnapshotIndex<'a> {
         for edge in &snapshot.edges {
             budget.step(is_cancelled)?;
             incoming.entry(edge.target.as_str()).or_default().push(edge);
+        }
+
+        let mut go_package_path_by_id = HashMap::<&str, &str>::new();
+        for node in &snapshot.nodes {
+            budget.step(is_cancelled)?;
+            if node.kind != "module"
+                || node
+                    .properties
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("go")
+            {
+                continue;
+            }
+            if let Some(package_path) = node
+                .properties
+                .get("package_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                go_package_path_by_id.insert(node.id.as_str(), package_path);
+            }
+        }
+        let mut go_package_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
+        for edge in &snapshot.edges {
+            budget.step(is_cancelled)?;
+            let Some(package_path) = go_package_path_by_id.get(edge.target.as_str()) else {
+                continue;
+            };
+            if is_usage_edge(edge, edge.target.as_str()) && is_definite_usage(edge) {
+                go_package_usage_profiles
+                    .entry(*package_path)
+                    .or_default()
+                    .insert(edge.profile_id.as_str());
+            }
+        }
+        let mut go_file_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
+        for node in &snapshot.nodes {
+            budget.step(is_cancelled)?;
+            if node.kind != "file"
+                || node
+                    .properties
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("go")
+            {
+                continue;
+            }
+            let Some(package_path) = node
+                .properties
+                .get("package_path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if let Some(profiles) = go_package_usage_profiles.get(package_path) {
+                go_file_usage_profiles.insert(node.id.as_str(), profiles.clone());
+            }
         }
         let mut dynamic_site_ids = HashSet::new();
         for evidence in &snapshot.evidence {
@@ -307,6 +399,7 @@ impl<'a> SnapshotIndex<'a> {
         }
         Ok(Self {
             incoming,
+            go_file_usage_profiles,
             sites_by_target,
             dynamic_site_ids,
             targetless_candidate,
@@ -893,6 +986,83 @@ mod tests {
                     .blockers
                     .iter()
                     .all(|blocker| { blocker.kind != BlockerKind::ProfileNotAnalyzed })
+            );
+        }
+    }
+
+    #[test]
+    fn issue_437_go_package_usage_marks_all_source_files_in_imported_package() {
+        let graph = snapshot(
+            vec![profile("profile:go", "go", true)],
+            vec![
+                node(
+                    "go:main",
+                    "file",
+                    "go",
+                    "cmd/main.go",
+                    json!({"package_name": "main", "package_path": "example.com/app/cmd"}),
+                ),
+                node(
+                    "go:used",
+                    "file",
+                    "go",
+                    "pkg/used.go",
+                    json!({"package_path": "example.com/app/pkg"}),
+                ),
+                node(
+                    "go:other",
+                    "file",
+                    "go",
+                    "pkg/other.go",
+                    json!({"package_path": "example.com/app/pkg"}),
+                ),
+                node(
+                    "go:unused",
+                    "file",
+                    "go",
+                    "unused/unused.go",
+                    json!({"package_path": "example.com/app/unused"}),
+                ),
+                node(
+                    "go:pkg",
+                    "module",
+                    "go",
+                    "pkg",
+                    json!({"package_path": "example.com/app/pkg"}),
+                ),
+                node(
+                    "go:unused-package",
+                    "module",
+                    "go",
+                    "unused",
+                    json!({"package_path": "example.com/app/unused"}),
+                ),
+            ],
+            vec![edge(
+                "edge:import",
+                "go:main",
+                "go:pkg",
+                "imports",
+                "profile:go",
+            )],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let findings = analyze_unused(&graph);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.kind == FindingKind::UnusedFile)
+                .map(|finding| finding.subject_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["go:unused"]
+        );
+        for subject in ["go:main", "go:used", "go:other"] {
+            assert!(
+                findings.iter().all(|finding| finding.subject_id != subject),
+                "imported Go package file {subject} must not be reported unused"
             );
         }
     }

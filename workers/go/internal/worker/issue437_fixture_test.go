@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/TamaT-LLC/depgraph-cli/workers/go/internal/issue437golden"
 )
 
 var issue437HealthSemanticResolvers = map[string]string{
@@ -55,9 +57,12 @@ func TestIssue437HealthFixtureMatchesEmittedGoSemanticNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Go health fixture %s: %v", fixturePath, err)
 	}
-	// Profile/toolchain IDs and environment fields are deliberately excluded
-	// from this comparison. Semantic identities, node properties, and relation
-	// endpoints are the stable producer/consumer contract.
+	// Compare the complete protocol stream. Profile/toolchain/host axes are
+	// normalized by issue437AssertFullGolden; node properties, file identities,
+	// site evidence, and every structural/semantic edge remain part of the
+	// comparison.
+	issue437AssertFullGolden(t, emitted.Bytes(), fixtureBytes)
+
 	fixture := issue437SemanticNodesFromNDJSON(t, fixtureBytes)
 	producedRelations := issue437SemanticRelationsFromNDJSON(t, emitted.Bytes())
 	fixtureRelations := issue437SemanticRelationsFromNDJSON(t, fixtureBytes)
@@ -76,13 +81,12 @@ func TestIssue437HealthFixtureMatchesEmittedGoSemanticNodes(t *testing.T) {
 		if !ok {
 			t.Fatalf("worker did not emit %s node %q", kind, resolver)
 		}
-		fixtureNode, ok := fixture[resolver]
-		if !ok {
+		if _, ok := fixture[resolver]; !ok {
 			t.Fatalf("fixture did not contain %s node %q", kind, resolver)
 		}
-		if !reflect.DeepEqual(producerNode, fixtureNode) {
-			t.Fatalf("fixture node %q differs from emitted worker node:\nproducer: %+v\nfixture:  %+v", resolver, producerNode, fixtureNode)
-		}
+		// Full golden comparison above covers the node ID after profile-axis
+		// normalization and all stable node fields. Keep this resolver-level
+		// lookup as a focused diagnostic for missing semantic identities.
 		if producerNode.Kind != kind {
 			t.Fatalf("worker node %q kind = %q, want %q", resolver, producerNode.Kind, kind)
 		}
@@ -101,6 +105,30 @@ func TestIssue437HealthFixtureMatchesEmittedGoSemanticNodes(t *testing.T) {
 				t.Fatalf("worker node %q emitted non-worker fixture property %q: %+v", resolver, property, producerNode.Properties)
 			}
 		}
+	}
+}
+
+// issue437AssertFullGolden compares the complete Go worker stream, including
+// file nodes, structural contains/declares edges, semantic sites/edges, file
+// completion records, and the profile/scan completion envelopes. The worker's
+// profile ID is intentionally host-scoped: it includes GOOS, GOARCH, cgo,
+// tags, call-graph mode, and dependency state. IDs derived from that profile
+// are normalized to their stable logical identity; workspace IDs and every
+// stable field that gives those identities meaning remain exact.
+func issue437AssertFullGolden(t *testing.T, produced, fixture []byte) {
+	t.Helper()
+	want, err := issue437golden.NormalizeNDJSON(fixture)
+	if err != nil {
+		t.Fatalf("normalize Go fixture golden: %v", err)
+	}
+	got, err := issue437golden.NormalizeNDJSON(produced)
+	if err != nil {
+		t.Fatalf("normalize emitted Go stream: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		wantJSON, _ := json.MarshalIndent(want, "", "  ")
+		t.Fatalf("complete Go worker golden stream differs:\nproducer:\n%s\nfixture:\n%s", gotJSON, wantJSON)
 	}
 }
 
