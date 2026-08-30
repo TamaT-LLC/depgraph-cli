@@ -1175,65 +1175,7 @@ ORDER BY id COLLATE BINARY
     ) -> Result<()> {
         validate_scan_health_provenance(provenance)?;
         let tx = self.connection.transaction()?;
-        let existing = tx
-            .query_row(
-                "SELECT status, health_policy_config_digest,
-                        health_analyzer_version, health_finding_contract_version
-                   FROM scans WHERE id=?1",
-                [scan_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .with_context(|| format!("scan {scan_id} was not found"))?;
-        if existing.0 != "staging" {
-            bail!("health provenance can only be bound while scan {scan_id} is staging");
-        }
-        let current = (
-            existing.1.as_deref(),
-            existing.2.as_deref(),
-            existing.3.as_deref(),
-        );
-        let requested = (
-            provenance.policy_config_digest.as_str(),
-            provenance.analyzer_version.as_str(),
-            provenance.finding_contract_version.as_str(),
-        );
-        match current {
-            (None, None, None) => {
-                let changed = tx.execute(
-                    "UPDATE scans
-                        SET health_policy_config_digest=?2,
-                            health_analyzer_version=?3,
-                            health_finding_contract_version=?4
-                      WHERE id=?1 AND status='staging'
-                        AND health_policy_config_digest IS NULL
-                        AND health_analyzer_version IS NULL
-                        AND health_finding_contract_version IS NULL",
-                    params![scan_id, requested.0, requested.1, requested.2],
-                )?;
-                if changed != 1 {
-                    // Another writer may have bound the tuple after the
-                    // snapshot query above. Do not report success when the
-                    // compare-and-set affected no row: immutable binding is
-                    // part of the provenance contract.
-                    bail!(
-                        "health provenance for scan {scan_id} was concurrently bound to a different tuple"
-                    );
-                }
-            }
-            (Some(policy), Some(analyzer), Some(contract))
-                if (policy, analyzer, contract) == requested => {}
-            _ => {
-                bail!("health provenance for scan {scan_id} is already bound to a different tuple")
-            }
-        }
+        bind_scan_health_provenance_in_transaction(&tx, scan_id, provenance)?;
         tx.commit()?;
         Ok(())
     }
@@ -3004,6 +2946,73 @@ fn validate_scan_operation_recovery_binding(
         || binding.root != repository_root
     {
         bail!("scan completion recovery does not match durable operation staging");
+    }
+    Ok(())
+}
+
+pub(crate) fn bind_scan_health_provenance_in_transaction(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    provenance: &ScanHealthProvenance,
+) -> Result<()> {
+    let existing = tx
+        .query_row(
+            "SELECT status, health_policy_config_digest,
+                    health_analyzer_version, health_finding_contract_version
+               FROM scans WHERE id=?1",
+            [scan_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .with_context(|| format!("scan {scan_id} was not found"))?;
+    if existing.0 != "staging" {
+        bail!("health provenance can only be bound while scan {scan_id} is staging");
+    }
+    let current = (
+        existing.1.as_deref(),
+        existing.2.as_deref(),
+        existing.3.as_deref(),
+    );
+    let requested = (
+        provenance.policy_config_digest.as_str(),
+        provenance.analyzer_version.as_str(),
+        provenance.finding_contract_version.as_str(),
+    );
+    match current {
+        (None, None, None) => {
+            let changed = tx.execute(
+                "UPDATE scans
+                    SET health_policy_config_digest=?2,
+                        health_analyzer_version=?3,
+                        health_finding_contract_version=?4
+                  WHERE id=?1 AND status='staging'
+                    AND health_policy_config_digest IS NULL
+                    AND health_analyzer_version IS NULL
+                    AND health_finding_contract_version IS NULL",
+                params![scan_id, requested.0, requested.1, requested.2],
+            )?;
+            if changed != 1 {
+                // Another writer may have bound the tuple after the
+                // snapshot query above. Do not report success when the
+                // compare-and-set affected no row: immutable binding is
+                // part of the provenance contract.
+                bail!(
+                    "health provenance for scan {scan_id} was concurrently bound to a different tuple"
+                );
+            }
+        }
+        (Some(policy), Some(analyzer), Some(contract))
+            if (policy, analyzer, contract) == requested => {}
+        _ => {
+            bail!("health provenance for scan {scan_id} is already bound to a different tuple")
+        }
     }
     Ok(())
 }

@@ -892,6 +892,14 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                 force_full_scan = true;
                             } else {
                                 let source_revision = git_source_revision(&root);
+                                let health_provenance = ScanHealthProvenance {
+                                    policy_config_digest: health_policy_config_digest(
+                                        &config.policy,
+                                    )?,
+                                    analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+                                    finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION
+                                        .to_owned(),
+                                };
                                 let store_commit_started = Instant::now();
                                 match store.commit_semantic_noop_delta(
                                     &scan_id,
@@ -899,6 +907,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                     strict,
                                     base_snapshot_id,
                                     source_revision.as_deref(),
+                                    &health_provenance,
                                     &delta,
                                     &stderr,
                                     stderr_truncated,
@@ -2596,14 +2605,29 @@ mod tests {
             serde_json::json!(format!("sha256:{}", "1".repeat(64)))
         );
         let scan_id = outcome.scan_id.context("incremental scan ID")?;
+        let scan = store.scan(&scan_id)?.context("incremental scan")?;
         assert_eq!(
-            store
-                .scan(&scan_id)?
-                .context("incremental scan")?
-                .parent_snapshot_id
-                .as_deref(),
+            scan.parent_snapshot_id.as_deref(),
             Some(base_snapshot_id.as_str())
         );
+        let expected_provenance = ScanHealthProvenance {
+            policy_config_digest: health_policy_config_digest(&Config::default().policy)?,
+            analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+            finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
+        };
+        assert_eq!(
+            scan.health_policy_config_digest.as_deref(),
+            Some(expected_provenance.policy_config_digest.as_str())
+        );
+        assert_eq!(
+            scan.health_analyzer_version.as_deref(),
+            Some(expected_provenance.analyzer_version.as_str())
+        );
+        assert_eq!(
+            scan.health_finding_contract_version.as_deref(),
+            Some(expected_provenance.finding_contract_version.as_str())
+        );
+        assert!(store.verify_snapshot_integrity(&current)?.valid);
         Ok(())
     }
 
