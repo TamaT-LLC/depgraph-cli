@@ -38,7 +38,7 @@ fn load_protocol_fixture(
     let snapshot_id = store
         .current_snapshot_id()?
         .expect("protocol fixture should promote a completed snapshot");
-    Ok(store.load_completed_snapshot(&snapshot_id)?)
+    store.load_completed_snapshot(&snapshot_id)
 }
 
 fn location_path(finding: &depgraph_core::HealthFinding) -> Option<&str> {
