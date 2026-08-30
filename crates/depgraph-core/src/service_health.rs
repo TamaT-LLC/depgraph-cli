@@ -1411,7 +1411,7 @@ fn collect_runtime_observations(
 #[cfg(test)]
 mod tests {
     use depgraph_protocol::{EvidenceKind, Precision, ResolutionStatus};
-    use depgraph_store::{CoverageRecord, ProfileMatrixRecord};
+    use depgraph_store::{CoverageRecord, ProfileMatrixRecord, ScanRecord};
 
     use super::*;
     use crate::health::DEFAULT_HOTSPOT_WEIGHTS;
@@ -1467,9 +1467,6 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: None,
-                health_policy_config_digest: None,
-                health_analyzer_version: None,
-                health_finding_contract_version: None,
             },
             profiles: Vec::new(),
             nodes: Vec::new(),
