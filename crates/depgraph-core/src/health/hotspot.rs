@@ -5,8 +5,8 @@ use serde_json::json;
 
 use super::contract::BASIS_POINTS_MAX;
 use super::{
-    BlockerKind, FindingBlocker, FindingIdentity, FindingKind, HealthFinding, Remediation,
-    SourceLocation, finish_finding, rank_normalize_basis_points,
+    BlockerKind, Confidence, FindingBlocker, FindingIdentity, FindingKind, HealthFinding,
+    Remediation, SourceLocation, finish_finding, rank_normalize_basis_points,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +92,41 @@ pub struct HotspotLayerScores {
     pub runtime: u32,
     pub total: u32,
 }
+
+/// The machine-readable contribution of one hotspot score layer.
+///
+/// `raw` is the source metric before rank normalization. Both basis-point
+/// fields are bounded to `0..=10_000`; `weight_basis_points` is the configured
+/// request weight and is deliberately retained when `available` is false so
+/// consumers can explain why the layer contributed zero without renormalizing
+/// the remaining layers.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotspotLayerScore {
+    pub raw: u64,
+    pub normalized_basis_points: u32,
+    pub weight_basis_points: u32,
+    pub available: bool,
+}
+
+/// Structured explainability data attached to a hotspot `HealthFinding`.
+///
+/// The field names are part of `depgraph-health-finding-v1`. Keep the existing
+/// [`HotspotLayerScores`] aggregate type for callers that use the historical
+/// normalized-only API; this type is the additive finding contract.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotspotFindingScores {
+    pub fan_in: HotspotLayerScore,
+    pub fan_out: HotspotLayerScore,
+    pub reverse_impact: HotspotLayerScore,
+    pub git_churn: HotspotLayerScore,
+    pub runtime: HotspotLayerScore,
+    pub total: u32,
+}
+
+/// Backwards-compatible short name for structured hotspot score data.
+pub type HotspotScores = HotspotFindingScores;
 
 #[derive(Clone, Debug, Default)]
 pub struct HotspotLayerAvailability {
@@ -260,43 +295,86 @@ pub fn score_hotspots_cancellable(
             end_line: None,
             end_column: None,
         });
-        findings.push(finish_finding(
-                FindingIdentity {
-                    kind: FindingKind::Hotspot,
-                    subject_id: node.id.clone(),
-                    profile_scope: None,
-                    witness_key: json!({
-                        "subject_id": node.id,
-                        "weights": weights.as_map()
-                    }),
-                },
-                node.kind.clone(),
-                location,
-                format!(
-                    "hotspot score {}; normalized-bp fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}; raw fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}",
-                    scores.total,
-                    scores.fan_in,
-                    scores.fan_out,
-                    scores.reverse_impact,
-                    scores.git_churn,
-                    scores.runtime,
-                    raw[0],
-                    raw[1],
-                    raw[2],
-                    raw[3],
-                    raw[4],
-                ),
-                blockers,
-                Vec::new(),
-                vec![Remediation {
-                    kind: "use-health-hotspots".to_owned(),
-                    detail: "inspect layer evidence before treating rank as a deletion signal"
-                        .to_owned(),
-                }],
-                Vec::new(),
-                false,
-                availability.churn && availability.runtime,
-            ));
+        let hotspot_scores = HotspotFindingScores {
+            fan_in: HotspotLayerScore {
+                raw: raw[0],
+                normalized_basis_points: scores.fan_in,
+                weight_basis_points: weights.fan_in,
+                available: true,
+            },
+            fan_out: HotspotLayerScore {
+                raw: raw[1],
+                normalized_basis_points: scores.fan_out,
+                weight_basis_points: weights.fan_out,
+                available: true,
+            },
+            reverse_impact: HotspotLayerScore {
+                raw: raw[2],
+                normalized_basis_points: scores.reverse_impact,
+                weight_basis_points: weights.reverse_impact,
+                available: true,
+            },
+            git_churn: HotspotLayerScore {
+                raw: raw[3],
+                normalized_basis_points: scores.git_churn,
+                weight_basis_points: weights.git_churn,
+                available: availability.churn,
+            },
+            runtime: HotspotLayerScore {
+                raw: raw[4],
+                normalized_basis_points: scores.runtime,
+                weight_basis_points: weights.runtime,
+                available: availability.runtime,
+            },
+            total: scores.total,
+        };
+        let mut finding = finish_finding(
+            FindingIdentity {
+                kind: FindingKind::Hotspot,
+                subject_id: node.id.clone(),
+                profile_scope: None,
+                witness_key: json!({
+                    "subject_id": node.id,
+                    "weights": weights.as_map()
+                }),
+            },
+            node.kind.clone(),
+            location,
+            format!(
+                "hotspot score {}; normalized-bp fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}; raw fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}",
+                scores.total,
+                scores.fan_in,
+                scores.fan_out,
+                scores.reverse_impact,
+                scores.git_churn,
+                scores.runtime,
+                raw[0],
+                raw[1],
+                raw[2],
+                raw[3],
+                raw[4],
+            ),
+            blockers,
+            Vec::new(),
+            vec![Remediation {
+                kind: "use-health-hotspots".to_owned(),
+                detail: "inspect layer evidence before treating rank as a deletion signal"
+                    .to_owned(),
+            }],
+            Vec::new(),
+            false,
+            false,
+        );
+        // `confirmed` has a precise unused-code meaning in the health
+        // contract. Hotspots are rankings, not proof of unusedness, so they
+        // are always capped at `probable`; hard blockers would still degrade
+        // the finding to `indeterminate` through `finish_finding`.
+        if finding.confidence == Confidence::Confirmed {
+            finding.confidence = Confidence::Probable;
+        }
+        finding.hotspot_scores = Some(hotspot_scores);
+        finding.fingerprint = super::finding_fingerprint(&finding);
+        findings.push(finding);
     }
     Ok(findings)
 }
@@ -482,8 +560,18 @@ mod tests {
         }));
         let first = findings.first().expect("ranked hotspot");
         assert_eq!(first.subject_id, "file:c");
-        assert!(first.reason.contains("raw fan-in=2"));
-        assert!(first.reason.contains("reverse-impact=3"));
+        let scores = first
+            .hotspot_scores
+            .as_ref()
+            .expect("structured hotspot scores");
+        assert_eq!(scores.fan_in.raw, 2);
+        assert_eq!(scores.reverse_impact.raw, 3);
+        assert_eq!(
+            scores.fan_in.weight_basis_points,
+            DEFAULT_HOTSPOT_WEIGHTS.fan_in
+        );
+        assert_eq!(scores.total, 5_000);
+        assert_eq!(first.confidence, Confidence::Probable);
     }
 
     #[test]
@@ -517,11 +605,14 @@ mod tests {
             },
         );
         assert_eq!(ranked[0].subject_id, "file:b");
-        assert!(
-            ranked[0]
-                .reason
-                .contains("raw fan-in=0 fan-out=0 reverse-impact=0 git-churn=3")
-        );
+        let scores = ranked[0]
+            .hotspot_scores
+            .as_ref()
+            .expect("structured hotspot scores");
+        assert_eq!(scores.git_churn.raw, 3);
+        assert_eq!(scores.git_churn.normalized_basis_points, 10_000);
+        assert!(scores.git_churn.available);
+        assert!(!scores.runtime.available);
     }
 
     #[test]

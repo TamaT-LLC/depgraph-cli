@@ -4,8 +4,10 @@ use depgraph_protocol::{canonical_json, stable_id_from_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::hotspot::HotspotFindingScores;
+
 pub const HEALTH_FINDING_CONTRACT_VERSION: &str = "depgraph-health-finding-v1";
-pub const HEALTH_ANALYZER_VERSION: &str = "1.0.1";
+pub const HEALTH_ANALYZER_VERSION: &str = "1.0.2";
 pub const BASIS_POINTS_MAX: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -309,6 +311,12 @@ pub struct HealthFinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_scope: Option<String>,
     pub reason: String,
+    /// Structured explainability data for hotspot findings.
+    ///
+    /// This is intentionally optional so non-hotspot findings retain the
+    /// compact contract while hotspot consumers can avoid parsing `reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot_scores: Option<HotspotFindingScores>,
     pub blockers: Vec<FindingBlocker>,
     pub evidence: Vec<FindingEvidenceRef>,
     pub remediations: Vec<Remediation>,
@@ -574,6 +582,7 @@ pub fn finish_finding(
         location,
         profile_scope,
         reason: reason.into(),
+        hotspot_scores: None,
         blockers,
         evidence,
         remediations,
@@ -586,7 +595,7 @@ pub fn finish_finding(
 }
 
 fn fingerprint_payload(finding: &HealthFinding) -> Value {
-    json!({
+    let mut payload = json!({
         "analyzer_version": finding.analyzer_version,
         "blockers": finding.blockers,
         "confidence": finding.confidence,
@@ -596,13 +605,17 @@ fn fingerprint_payload(finding: &HealthFinding) -> Value {
         "kind": finding.kind,
         "location": finding.location,
         "profile_scope": finding.profile_scope,
-        "reason": finding.reason,
         "remediations": finding.remediations,
         "severity": finding.severity,
         "subject_id": finding.subject_id,
         "subject_kind": finding.subject_kind,
         "suppressions": finding.suppressions,
-    })
+    });
+    if let Some(scores) = &finding.hotspot_scores {
+        payload["hotspot_scores"] = serde_json::to_value(scores)
+            .expect("hotspot score contract is always JSON serializable");
+    }
+    payload
 }
 
 fn hex_digest(bytes: &str) -> String {
@@ -649,17 +662,43 @@ mod tests {
     }
 
     #[test]
-    fn issue_423_finding_id_is_deterministic_and_ignores_analyzer_version_and_reason() {
+    fn issue_423_finding_id_is_deterministic_and_fingerprint_ignores_reason() {
         let first = finding_id(&sample_identity());
         let mut restated = sample_identity();
         restated.witness_key = json!({"path": "src/unused.rs"});
         assert_eq!(first, finding_id(&restated));
         assert!(first.starts_with("finding:sha256:"));
 
-        let left = sample_finding("unused because no incoming imports", "1.0.0");
-        let right = sample_finding("wording changed after analyzer 1.1.0", "1.1.0");
+        let left = sample_finding(
+            "unused because no incoming imports",
+            HEALTH_ANALYZER_VERSION,
+        );
+        let right = sample_finding(
+            "wording changed after analyzer update",
+            HEALTH_ANALYZER_VERSION,
+        );
         assert_eq!(left.id, right.id);
-        assert_ne!(left.fingerprint, right.fingerprint);
+        assert_eq!(left.fingerprint, right.fingerprint);
+
+        let changed_analyzer = sample_finding("wording changed after analyzer update", "1.0.1");
+        assert_ne!(left.fingerprint, changed_analyzer.fingerprint);
+    }
+
+    #[test]
+    fn issue_440_path_dependent_finding_ids_change_on_witness_or_subject_rename() {
+        let old = FindingIdentity {
+            kind: FindingKind::UnusedFile,
+            subject_id: "file:src/old.rs".to_owned(),
+            profile_scope: None,
+            witness_key: json!({"path": "src/old.rs"}),
+        };
+        let mut witness_renamed = old.clone();
+        witness_renamed.witness_key = json!({"path": "src/new.rs"});
+        assert_ne!(finding_id(&old), finding_id(&witness_renamed));
+
+        let mut subject_renamed = old;
+        subject_renamed.subject_id = "file:src/new.rs".to_owned();
+        assert_ne!(finding_id(&witness_renamed), finding_id(&subject_renamed));
     }
 
     #[test]
@@ -670,7 +709,57 @@ mod tests {
         assert!(!object.contains_key("fingerprint"));
         assert!(!object.contains_key("collection_digest"));
         assert!(!object.contains_key("transition"));
+        assert!(!object.contains_key("reason"));
         assert_eq!(finding.fingerprint, finding_fingerprint(&finding));
+    }
+
+    #[test]
+    fn issue_440_structured_hotspot_scores_are_included_in_fingerprint() {
+        let mut finding = sample_finding("hotspot wording", HEALTH_ANALYZER_VERSION);
+        finding.hotspot_scores = Some(crate::health::HotspotFindingScores {
+            fan_in: crate::health::HotspotLayerScore {
+                raw: 1,
+                normalized_basis_points: 2_000,
+                weight_basis_points: 2_500,
+                available: true,
+            },
+            fan_out: crate::health::HotspotLayerScore {
+                raw: 2,
+                normalized_basis_points: 3_000,
+                weight_basis_points: 1_500,
+                available: true,
+            },
+            reverse_impact: crate::health::HotspotLayerScore {
+                raw: 3,
+                normalized_basis_points: 4_000,
+                weight_basis_points: 2_500,
+                available: true,
+            },
+            git_churn: crate::health::HotspotLayerScore {
+                raw: 0,
+                normalized_basis_points: 0,
+                weight_basis_points: 2_000,
+                available: false,
+            },
+            runtime: crate::health::HotspotLayerScore {
+                raw: 0,
+                normalized_basis_points: 0,
+                weight_basis_points: 1_500,
+                available: false,
+            },
+            total: 3_000,
+        });
+        finding.fingerprint = finding_fingerprint(&finding);
+        let original = finding.fingerprint.clone();
+        finding.reason = "another rendering of the same score".to_owned();
+        assert_eq!(finding_fingerprint(&finding), original);
+        finding
+            .hotspot_scores
+            .as_mut()
+            .expect("scores")
+            .fan_in
+            .normalized_basis_points = 2_001;
+        assert_ne!(finding_fingerprint(&finding), original);
     }
 
     #[test]

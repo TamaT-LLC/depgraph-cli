@@ -4,6 +4,7 @@
 - Date: 2026-08-26
 - Decision ID: `PROJ-ARC-001-ADR-009`
 - Issue: `PROJ-ARC-004` / #423
+- Amendment: #440
 - Contract: `depgraph-health-finding-v1`
 
 ## Context
@@ -53,6 +54,7 @@ A finding is a closed record:
 | `location` | repository-relative path and optional source span |
 | `profile_scope` | present only for explicitly profile-scoped findings |
 | `reason` | human-readable explanation (not an ID input) |
+| `hotspot_scores` | optional structured five-layer score breakdown; present only for `hotspot` |
 | `blockers` | why `confirmed` is refused or a comparison degraded |
 | `evidence` | closed references to edges, sites, or evidence rows |
 | `remediations` | next-step hints, never automatic edits |
@@ -88,7 +90,8 @@ Inputs, in this order, are hashed as canonical JSON:
 
 Excluded: analyzer version, severity, confidence, reason text, evidence count,
 blockers, remediations, fingerprint, collection digest, and baseline
-transition.
+transition. A file-oriented witness may include a repository-relative path;
+that is intentional identity input for the current contract.
 
 Compatible analyzer improvements keep the kind name and therefore the ID.
 Incompatible kind semantics rename the kind (`unused-export-v2`). During
@@ -98,8 +101,22 @@ automatic rewrite and no coexistence window that maps old IDs to new IDs.
 ### Fingerprint
 
 Fingerprint is `sha256:<hex>` of the finding's canonical JSON after removing
-`fingerprint`, `collection_digest`, and any baseline transition field. Those
-derived fields never enter the hashed payload.
+`fingerprint`, `collection_digest`, any baseline transition field, and the
+human-readable `reason`. Those derived or presentation-only fields never enter
+the hashed payload. `hotspot_scores`, when present, remains in the payload so
+an actual metric or configured weight change is observable as a fingerprint
+change.
+
+### Fingerprint migration impact
+
+Issue #440 changes the fingerprint payload without changing the v1 finding ID
+contract. Existing baselines therefore classify a reason-only or formatter
+change as `changed`/pass when the structured finding data is unchanged. A
+changed hotspot layer score, availability bit, or weight remains a meaningful
+fingerprint change. The analyzer version is bumped to `1.0.2`; operators that
+want a clean baseline may regenerate fingerprints, while retaining old records
+is safe because matching continues by stable ID and no automatic rewrite is
+performed.
 
 ### Collection digest
 
@@ -151,6 +168,11 @@ Judgement uses the union of every applicable profile in the snapshot.
 A finding stays at `probable` when usage is absent and every hard blocker is
 absent, but completeness is only `syntax-complete`. Any hard blocker forces
 `indeterminate`.
+
+Hotspot findings are rankings rather than proof of unusedness. They are capped
+at `probable` even when all five score layers are available; a hard blocker can
+still degrade one to `indeterminate`. This keeps `confirmed` reserved for its
+unused-code meaning across every finding kind.
 
 Hard blockers: `public-surface`, `entry-point`, `dynamic-loading`,
 `candidate`, `unresolved`, `heuristic-precision`, `overapprox-precision`,
@@ -263,8 +285,53 @@ Default weights, each `0..=10_000` and summing to `10_000`:
 Request weights outside `0..=10_000` or whose sum exceeds `10_000` are
 `InvalidInput`. A missing layer contributes `0` and does **not** renormalize
 the remaining weights. Tie-break: score descending, then subject node ID
-ascending. The returned finding order preserves that rank, and each finding
-states both raw layer values and normalized basis-point values.
+ascending. The returned finding order preserves that rank. Each hotspot
+finding carries an optional `hotspot_scores` object with this exact shape:
+
+```json
+{
+  "fan_in": {
+    "raw": 0,
+    "normalized_basis_points": 0,
+    "weight_basis_points": 2500,
+    "available": true
+  },
+  "fan_out": {
+    "raw": 0,
+    "normalized_basis_points": 0,
+    "weight_basis_points": 1500,
+    "available": true
+  },
+  "reverse_impact": {
+    "raw": 0,
+    "normalized_basis_points": 0,
+    "weight_basis_points": 2500,
+    "available": true
+  },
+  "git_churn": {
+    "raw": 0,
+    "normalized_basis_points": 0,
+    "weight_basis_points": 2000,
+    "available": false
+  },
+  "runtime": {
+    "raw": 0,
+    "normalized_basis_points": 0,
+    "weight_basis_points": 1500,
+    "available": false
+  },
+  "total": 0
+}
+```
+
+`raw` is the source integer metric, normalized values and weights are
+`0..=10_000` basis points, and `total` is the weighted total in the same
+range, calculated as `sum(floor(normalized_basis_points * weight_basis_points / 10_000))`.
+An unavailable layer must expose `available: false` and zero raw and normalized
+values; its configured weight remains visible and is not shifted to another
+layer. `reason` remains a human-readable rendering only. The existing
+normalized-only `HotspotLayerScores` Rust type remains available for source
+compatibility; the finding/Agent contract uses the additive breakdown above.
 
 Default churn window: at most `512` commits from a request-start OID, commit
 OID order, optional canonical repository-relative path filter. Git output and
@@ -301,6 +368,18 @@ CI, MCP READ tools, and packaging of those tools.
 Excluded: source mutation, treating incomplete evidence as `confirmed`,
 clone/duplication/complexity/feature-flag detectors, relaxing safe-scan or
 read-only MCP defaults, and a CLI-independent MCP analyzer.
+
+### Path-dependent IDs and rename migration
+
+Current file-oriented witnesses include the canonical repository-relative path
+(`{path, subject_id}`), so a move or rename creates a resolved old finding and
+a new finding rather than silently carrying the old baseline entry forward.
+Rename-following ID migration is intentionally deferred: an exact mapping
+would require immutable before/after content and ownership evidence across
+all profile kinds, while guessing would hide real regressions. Consumers must
+therefore treat a path rename as an explicit baseline migration (resolve the
+old ID and review the new ID); no alias or automatic rewrite is part of
+`depgraph-health-finding-v1`.
 
 ## Options considered
 

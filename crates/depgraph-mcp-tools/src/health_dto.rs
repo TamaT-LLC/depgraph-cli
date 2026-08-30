@@ -4,7 +4,7 @@ use depgraph_core::service::{
 };
 use depgraph_core::{
     BlockerKind, Confidence, FindingKind, FindingKindScope, HealthFinding, HealthFindingDetail,
-    Severity,
+    HotspotFindingScores, HotspotLayerScore, Severity,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -195,6 +195,261 @@ pub struct AgentHealthSuppression {
     ticket: Option<AgentLabel>,
 }
 
+const MAX_HOTSPOT_BASIS_POINTS: u32 = 10_000;
+
+/// One machine-readable hotspot layer contribution.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthHotspotLayerScore {
+    raw: u64,
+    #[schemars(range(max = 10000))]
+    normalized_basis_points: u32,
+    #[schemars(range(max = 10000))]
+    weight_basis_points: u32,
+    available: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentHealthHotspotLayerScoreWire {
+    raw: u64,
+    normalized_basis_points: u32,
+    weight_basis_points: u32,
+    available: bool,
+}
+
+impl<'de> Deserialize<'de> for AgentHealthHotspotLayerScore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentHealthHotspotLayerScoreWire::deserialize(deserializer)?;
+        if wire.normalized_basis_points > MAX_HOTSPOT_BASIS_POINTS
+            || wire.weight_basis_points > MAX_HOTSPOT_BASIS_POINTS
+            || (!wire.available && (wire.raw != 0 || wire.normalized_basis_points != 0))
+        {
+            return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
+        }
+        Ok(Self {
+            raw: wire.raw,
+            normalized_basis_points: wire.normalized_basis_points,
+            weight_basis_points: wire.weight_basis_points,
+            available: wire.available,
+        })
+    }
+}
+
+impl AgentHealthHotspotLayerScore {
+    fn try_from_core(source: &HotspotLayerScore) -> Result<Self, ContractBuildError> {
+        if source.normalized_basis_points > MAX_HOTSPOT_BASIS_POINTS
+            || source.weight_basis_points > MAX_HOTSPOT_BASIS_POINTS
+            || (!source.available && (source.raw != 0 || source.normalized_basis_points != 0))
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            raw: source.raw,
+            normalized_basis_points: source.normalized_basis_points,
+            weight_basis_points: source.weight_basis_points,
+            available: source.available,
+        })
+    }
+
+    #[must_use]
+    pub const fn raw(&self) -> u64 {
+        self.raw
+    }
+
+    #[must_use]
+    pub const fn normalized_basis_points(&self) -> u32 {
+        self.normalized_basis_points
+    }
+
+    #[must_use]
+    pub const fn weight_basis_points(&self) -> u32 {
+        self.weight_basis_points
+    }
+
+    #[must_use]
+    pub const fn available(&self) -> bool {
+        self.available
+    }
+}
+
+/// Closed MCP projection of all five hotspot score layers.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthHotspotScores {
+    fan_in: AgentHealthHotspotLayerScore,
+    fan_out: AgentHealthHotspotLayerScore,
+    reverse_impact: AgentHealthHotspotLayerScore,
+    git_churn: AgentHealthHotspotLayerScore,
+    runtime: AgentHealthHotspotLayerScore,
+    #[schemars(range(max = 10000))]
+    total: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentHealthHotspotScoresWire {
+    fan_in: AgentHealthHotspotLayerScore,
+    fan_out: AgentHealthHotspotLayerScore,
+    reverse_impact: AgentHealthHotspotLayerScore,
+    git_churn: AgentHealthHotspotLayerScore,
+    runtime: AgentHealthHotspotLayerScore,
+    total: u32,
+}
+
+impl<'de> Deserialize<'de> for AgentHealthHotspotScores {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentHealthHotspotScoresWire::deserialize(deserializer)?;
+        if wire.total > MAX_HOTSPOT_BASIS_POINTS
+            || weight_sum(&wire) > MAX_HOTSPOT_BASIS_POINTS
+            || wire.total
+                != weighted_total([
+                    (
+                        wire.fan_in.normalized_basis_points(),
+                        wire.fan_in.weight_basis_points(),
+                    ),
+                    (
+                        wire.fan_out.normalized_basis_points(),
+                        wire.fan_out.weight_basis_points(),
+                    ),
+                    (
+                        wire.reverse_impact.normalized_basis_points(),
+                        wire.reverse_impact.weight_basis_points(),
+                    ),
+                    (
+                        wire.git_churn.normalized_basis_points(),
+                        wire.git_churn.weight_basis_points(),
+                    ),
+                    (
+                        wire.runtime.normalized_basis_points(),
+                        wire.runtime.weight_basis_points(),
+                    ),
+                ])
+        {
+            return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
+        }
+        Ok(Self {
+            fan_in: wire.fan_in,
+            fan_out: wire.fan_out,
+            reverse_impact: wire.reverse_impact,
+            git_churn: wire.git_churn,
+            runtime: wire.runtime,
+            total: wire.total,
+        })
+    }
+}
+
+impl AgentHealthHotspotScores {
+    pub fn try_from_core(source: &HotspotFindingScores) -> Result<Self, ContractBuildError> {
+        if source.total > MAX_HOTSPOT_BASIS_POINTS
+            || source
+                .fan_in
+                .weight_basis_points
+                .saturating_add(source.fan_out.weight_basis_points)
+                .saturating_add(source.reverse_impact.weight_basis_points)
+                .saturating_add(source.git_churn.weight_basis_points)
+                .saturating_add(source.runtime.weight_basis_points)
+                > MAX_HOTSPOT_BASIS_POINTS
+            || source.total != core_weighted_total(source)
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            fan_in: AgentHealthHotspotLayerScore::try_from_core(&source.fan_in)?,
+            fan_out: AgentHealthHotspotLayerScore::try_from_core(&source.fan_out)?,
+            reverse_impact: AgentHealthHotspotLayerScore::try_from_core(&source.reverse_impact)?,
+            git_churn: AgentHealthHotspotLayerScore::try_from_core(&source.git_churn)?,
+            runtime: AgentHealthHotspotLayerScore::try_from_core(&source.runtime)?,
+            total: source.total,
+        })
+    }
+
+    #[must_use]
+    pub const fn fan_in(&self) -> &AgentHealthHotspotLayerScore {
+        &self.fan_in
+    }
+
+    #[must_use]
+    pub const fn fan_out(&self) -> &AgentHealthHotspotLayerScore {
+        &self.fan_out
+    }
+
+    #[must_use]
+    pub const fn reverse_impact(&self) -> &AgentHealthHotspotLayerScore {
+        &self.reverse_impact
+    }
+
+    #[must_use]
+    pub const fn git_churn(&self) -> &AgentHealthHotspotLayerScore {
+        &self.git_churn
+    }
+
+    #[must_use]
+    pub const fn runtime(&self) -> &AgentHealthHotspotLayerScore {
+        &self.runtime
+    }
+
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.total
+    }
+}
+
+fn weight_sum(scores: &AgentHealthHotspotScoresWire) -> u32 {
+    scores
+        .fan_in
+        .weight_basis_points()
+        .saturating_add(scores.fan_out.weight_basis_points())
+        .saturating_add(scores.reverse_impact.weight_basis_points())
+        .saturating_add(scores.git_churn.weight_basis_points())
+        .saturating_add(scores.runtime.weight_basis_points())
+}
+
+fn core_weighted_total(scores: &HotspotFindingScores) -> u32 {
+    weighted_total([
+        (
+            scores.fan_in.normalized_basis_points,
+            scores.fan_in.weight_basis_points,
+        ),
+        (
+            scores.fan_out.normalized_basis_points,
+            scores.fan_out.weight_basis_points,
+        ),
+        (
+            scores.reverse_impact.normalized_basis_points,
+            scores.reverse_impact.weight_basis_points,
+        ),
+        (
+            scores.git_churn.normalized_basis_points,
+            scores.git_churn.weight_basis_points,
+        ),
+        (
+            scores.runtime.normalized_basis_points,
+            scores.runtime.weight_basis_points,
+        ),
+    ])
+}
+
+/// Keep the DTO's derived total identical to the core's integer arithmetic.
+fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
+    layers
+        .into_iter()
+        .map(|(normalized, weight)| {
+            u32::try_from(
+                u64::from(normalized) * u64::from(weight) / u64::from(MAX_HOTSPOT_BASIS_POINTS),
+            )
+            .unwrap_or(MAX_HOTSPOT_BASIS_POINTS)
+        })
+        .fold(0, u32::saturating_add)
+        .min(MAX_HOTSPOT_BASIS_POINTS)
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHealthFinding {
@@ -209,6 +464,8 @@ pub struct AgentHealthFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_scope: Option<AgentId>,
     reason: AgentPolicyText,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hotspot_scores: Option<AgentHealthHotspotScores>,
     #[schemars(length(max = 32))]
     blockers: Vec<AgentHealthBlocker>,
     #[schemars(length(max = 64))]
@@ -244,16 +501,28 @@ impl AgentHealthFinding {
                 })
             })
             .transpose()?;
+        let kind = AgentFindingKind::from_core(source.kind);
+        let confidence = AgentHealthConfidence::from_core(source.confidence);
+        let hotspot_scores = source
+            .hotspot_scores
+            .as_ref()
+            .map(AgentHealthHotspotScores::try_from_core)
+            .transpose()?;
+        validate_hotspot_finding(kind, confidence, hotspot_scores.as_ref())?;
+        if kind == AgentFindingKind::Hotspot && hotspot_scores.is_none() {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
         Ok(Self {
             id: parse_id(&source.id)?,
-            kind: AgentFindingKind::from_core(source.kind),
+            kind,
             severity: AgentHealthSeverity::from_core(source.severity),
-            confidence: AgentHealthConfidence::from_core(source.confidence),
+            confidence,
             subject_id: parse_label(&source.subject_id)?,
             subject_kind: parse_label(&source.subject_kind)?,
             location,
             profile_scope: source.profile_scope.as_deref().map(parse_id).transpose()?,
             reason: parse_text(&source.reason)?,
+            hotspot_scores,
             blockers: source
                 .blockers
                 .iter()
@@ -322,6 +591,11 @@ struct AgentHealthFindingWire {
     #[serde(default)]
     profile_scope: Option<AgentId>,
     reason: AgentPolicyText,
+    // Records emitted before Issue #440 did not carry structured scores. Keep
+    // wire deserialization backward-compatible; new output projection uses
+    // `AgentHealthFinding::try_from_core`, which requires scores for hotspots.
+    #[serde(default)]
+    hotspot_scores: Option<AgentHealthHotspotScores>,
     blockers: Vec<AgentHealthBlocker>,
     evidence: Vec<AgentHealthEvidenceRef>,
     remediations: Vec<AgentHealthRemediation>,
@@ -343,6 +617,8 @@ impl<'de> Deserialize<'de> for AgentHealthFinding {
         {
             return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
         }
+        validate_hotspot_finding(wire.kind, wire.confidence, wire.hotspot_scores.as_ref())
+            .map_err(D::Error::custom)?;
         Ok(Self {
             id: wire.id,
             kind: wire.kind,
@@ -353,6 +629,7 @@ impl<'de> Deserialize<'de> for AgentHealthFinding {
             location: wire.location,
             profile_scope: wire.profile_scope,
             reason: wire.reason,
+            hotspot_scores: wire.hotspot_scores,
             blockers: wire.blockers,
             evidence: wire.evidence,
             remediations: wire.remediations,
@@ -686,9 +963,25 @@ fn parse_text(value: &str) -> Result<AgentPolicyText, ContractBuildError> {
     AgentPolicyText::parse(value).map_err(|_| ContractBuildError::AgentDtoValue)
 }
 
+fn validate_hotspot_finding(
+    kind: AgentFindingKind,
+    confidence: AgentHealthConfidence,
+    hotspot_scores: Option<&AgentHealthHotspotScores>,
+) -> Result<(), ContractBuildError> {
+    if kind != AgentFindingKind::Hotspot && hotspot_scores.is_some() {
+        return Err(ContractBuildError::AgentDtoValue);
+    }
+    if kind == AgentFindingKind::Hotspot && confidence == AgentHealthConfidence::Confirmed {
+        return Err(ContractBuildError::AgentDtoValue);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use depgraph_core::{FindingSuppression, SourceLocation};
+    use depgraph_core::{
+        FindingSuppression, HotspotFindingScores, HotspotLayerScore, SourceLocation,
+    };
     use serde_json::json;
 
     use super::*;
@@ -704,12 +997,49 @@ mod tests {
             location: None,
             profile_scope: None,
             reason: "No reachable usage was observed.".to_owned(),
+            hotspot_scores: None,
             blockers: Vec::new(),
             evidence: Vec::new(),
             remediations: Vec::new(),
             suppressions,
             analyzer_version: "1.0.0".to_owned(),
             fingerprint: "sha256:sample".to_owned(),
+        }
+    }
+
+    fn hotspot_scores() -> HotspotFindingScores {
+        HotspotFindingScores {
+            fan_in: HotspotLayerScore {
+                raw: 2,
+                normalized_basis_points: 10_000,
+                weight_basis_points: 2_500,
+                available: true,
+            },
+            fan_out: HotspotLayerScore {
+                raw: 1,
+                normalized_basis_points: 5_000,
+                weight_basis_points: 1_500,
+                available: true,
+            },
+            reverse_impact: HotspotLayerScore {
+                raw: 3,
+                normalized_basis_points: 10_000,
+                weight_basis_points: 2_500,
+                available: true,
+            },
+            git_churn: HotspotLayerScore {
+                raw: 0,
+                normalized_basis_points: 0,
+                weight_basis_points: 2_000,
+                available: false,
+            },
+            runtime: HotspotLayerScore {
+                raw: 0,
+                normalized_basis_points: 0,
+                weight_basis_points: 1_500,
+                available: false,
+            },
+            total: 5_750,
         }
     }
 
@@ -760,6 +1090,99 @@ mod tests {
         });
         assert_eq!(
             AgentHealthFinding::try_from_core(&finding),
+            Err(ContractBuildError::AgentDtoValue)
+        );
+    }
+
+    #[test]
+    fn issue_440_health_finding_projects_closed_hotspot_scores() {
+        let mut finding = finding_with_suppressions(Vec::new());
+        finding.kind = FindingKind::Hotspot;
+        finding.hotspot_scores = Some(hotspot_scores());
+        let agent = AgentHealthFinding::try_from_core(&finding).expect("valid hotspot finding");
+        let encoded = serde_json::to_value(&agent).expect("serialize hotspot finding");
+        assert_eq!(
+            encoded["hotspot_scores"]["fan_in"],
+            json!({
+                "raw": 2,
+                "normalized_basis_points": 10_000,
+                "weight_basis_points": 2_500,
+                "available": true
+            })
+        );
+        assert_eq!(encoded["hotspot_scores"]["total"], 5_750);
+        assert_eq!(encoded["hotspot_scores"]["git_churn"]["available"], false);
+
+        let round_trip: AgentHealthFinding =
+            serde_json::from_value(encoded.clone()).expect("deserialize hotspot finding");
+        assert_eq!(round_trip.id().as_str(), "finding:sample");
+        assert!(
+            serde_json::to_value(round_trip)
+                .expect("re-serialize hotspot finding")
+                .get("hotspot_scores")
+                .is_some()
+        );
+
+        let mut legacy_wire = encoded.clone();
+        legacy_wire
+            .as_object_mut()
+            .expect("finding object")
+            .remove("hotspot_scores");
+        assert!(
+            serde_json::from_value::<AgentHealthFinding>(legacy_wire).is_ok(),
+            "pre-Issue #440 wire findings may omit the additive scores field"
+        );
+
+        let mut invalid = encoded;
+        invalid["hotspot_scores"]["runtime"]["raw"] = json!(1);
+        assert!(serde_json::from_value::<AgentHealthFinding>(invalid).is_err());
+
+        let mut invalid = serde_json::to_value(&agent).expect("serialize hotspot finding");
+        invalid["hotspot_scores"]["fan_in"]["weight_basis_points"] = json!(10_000);
+        assert!(serde_json::from_value::<AgentHealthFinding>(invalid).is_err());
+
+        let mut invalid = serde_json::to_value(&agent).expect("serialize hotspot finding");
+        invalid["hotspot_scores"]["fan_in"]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<AgentHealthFinding>(invalid).is_err());
+
+        let mut invalid = serde_json::to_value(&agent).expect("serialize hotspot finding");
+        invalid["hotspot_scores"]["total"] = json!(5_751);
+        assert!(serde_json::from_value::<AgentHealthFinding>(invalid).is_err());
+
+        let mut invalid = serde_json::to_value(&agent).expect("serialize hotspot finding");
+        invalid["kind"] = json!("unused-file");
+        assert!(serde_json::from_value::<AgentHealthFinding>(invalid).is_err());
+
+        let mut invalid = finding_with_suppressions(Vec::new());
+        invalid.hotspot_scores = Some(hotspot_scores());
+        assert_eq!(
+            AgentHealthFinding::try_from_core(&invalid),
+            Err(ContractBuildError::AgentDtoValue)
+        );
+
+        let mut invalid = finding_with_suppressions(Vec::new());
+        invalid.kind = FindingKind::Hotspot;
+        assert_eq!(
+            AgentHealthFinding::try_from_core(&invalid),
+            Err(ContractBuildError::AgentDtoValue)
+        );
+
+        let mut invalid = finding_with_suppressions(Vec::new());
+        invalid.kind = FindingKind::Hotspot;
+        invalid.confidence = Confidence::Confirmed;
+        invalid.hotspot_scores = Some(hotspot_scores());
+        assert_eq!(
+            AgentHealthFinding::try_from_core(&invalid),
+            Err(ContractBuildError::AgentDtoValue)
+        );
+
+        let mut invalid = finding_with_suppressions(Vec::new());
+        invalid.kind = FindingKind::Hotspot;
+        let mut scores = hotspot_scores();
+        scores.total = 5_751;
+        invalid.hotspot_scores = Some(scores);
+        assert_eq!(
+            AgentHealthFinding::try_from_core(&invalid),
             Err(ContractBuildError::AgentDtoValue)
         );
     }

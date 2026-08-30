@@ -7246,6 +7246,31 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
         cli_hotspots["data"]["collection_digest"]
     );
 
+    let cli_hotspot = &cli_hotspots["data"]["findings"][0];
+    let mcp_hotspot = &hotspots["structuredContent"]["result"]["findings"]["items"][0];
+    for layer in [
+        "fan_in",
+        "fan_out",
+        "reverse_impact",
+        "git_churn",
+        "runtime",
+    ] {
+        assert!(mcp_hotspot["hotspot_scores"][layer].is_object(), "{layer}");
+        assert_eq!(
+            mcp_hotspot["hotspot_scores"][layer], cli_hotspot["hotspot_scores"][layer],
+            "MCP/CLI hotspot layer parity for {layer}"
+        );
+        assert!(mcp_hotspot["hotspot_scores"][layer]["raw"].is_u64());
+        assert!(mcp_hotspot["hotspot_scores"][layer]["normalized_basis_points"].is_u64());
+        assert!(mcp_hotspot["hotspot_scores"][layer]["weight_basis_points"].is_u64());
+        assert!(mcp_hotspot["hotspot_scores"][layer]["available"].is_boolean());
+    }
+    assert_eq!(
+        mcp_hotspot["hotspot_scores"]["total"],
+        cli_hotspot["hotspot_scores"]["total"]
+    );
+    assert_eq!(mcp_hotspot["confidence"], "probable");
+
     let hotspot_id = hotspots["structuredContent"]["result"]["findings"]["items"][0]["id"]
         .as_str()
         .unwrap()

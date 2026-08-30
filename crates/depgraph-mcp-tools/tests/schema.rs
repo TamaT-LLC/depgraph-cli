@@ -36,6 +36,57 @@ fn issue_305_shared_schema_publishes_new_closed_response_definitions() {
 }
 
 #[test]
+fn issue_440_shared_schema_publishes_closed_hotspot_score_shape() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    let layer = &definitions["AgentHealthHotspotLayerScore"];
+    assert_eq!(layer["additionalProperties"], false);
+    assert_eq!(
+        layer["required"],
+        json!([
+            "raw",
+            "normalized_basis_points",
+            "weight_basis_points",
+            "available"
+        ])
+    );
+    assert_eq!(
+        layer["properties"]["normalized_basis_points"]["maximum"],
+        10_000
+    );
+    assert_eq!(
+        layer["properties"]["weight_basis_points"]["maximum"],
+        10_000
+    );
+
+    let scores = &definitions["AgentHealthHotspotScores"];
+    assert_eq!(scores["additionalProperties"], false);
+    assert_eq!(
+        scores["required"],
+        json!([
+            "fan_in",
+            "fan_out",
+            "reverse_impact",
+            "git_churn",
+            "runtime",
+            "total"
+        ])
+    );
+    assert_eq!(scores["properties"]["total"]["maximum"], 10_000);
+    assert_eq!(
+        definitions["AgentHealthFinding"]["properties"]["hotspot_scores"]["anyOf"][0]["$ref"],
+        "#/$defs/AgentHealthHotspotScores"
+    );
+    assert!(
+        !definitions["AgentHealthFinding"]["required"]
+            .as_array()
+            .expect("finding required fields")
+            .iter()
+            .any(|field| field == "hotspot_scores")
+    );
+}
+
+#[test]
 fn issue_314_shared_schema_publishes_repository_init_outcome_and_success_envelope() {
     let schema = schema_value();
     let definitions = schema["$defs"].as_object().expect("schema definitions");
@@ -746,7 +797,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 179, "review newly added object schemas explicitly");
+    assert_eq!(objects, 181, "review newly added object schemas explicitly");
 }
 
 #[test]

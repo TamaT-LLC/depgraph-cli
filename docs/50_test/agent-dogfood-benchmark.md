@@ -246,15 +246,22 @@ Read blockers before treating a finding as safe to delete. The engine, not
 the Agent, owns confidence:
 
 - `confirmed`: unused across every applicable analyzed profile, those profiles
-  are `semantic-complete`, and no hard blocker remains.
+  are `semantic-complete`, and no hard blocker remains. This value is never
+  used for hotspot rankings.
 - `probable`: no observed usage and no hard blocker, but applicable profiles
-  are only `syntax-complete`.
+  are only `syntax-complete`; hotspot rankings are capped here even when all
+  score layers are available.
 - `indeterminate`: a hard blocker prevents confirmation.
 
 Hard blockers are the 21 kinds other than the two score-layer blockers
-`churn-unavailable` and `runtime-not-observed`. Score-layer blockers degrade
-that scoring layer to zero and do not, by themselves, forbid `confirmed`.
-Agents must report the tool's confidence without promotion.
+`churn-unavailable` and `runtime-not-observed`. For unused findings, score-layer
+blockers degrade that scoring layer to zero and do not, by themselves, forbid
+`confirmed`; hotspot findings are rankings and are never `confirmed`.
+Agents must report the tool's confidence without promotion. For hotspot
+results, read the typed `hotspot_scores` object (`fan_in`, `fan_out`,
+`reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing the
+human-readable reason string; each layer includes `raw`,
+`normalized_basis_points`, `weight_basis_points`, and `available`.
 
 Primary definitions:
 

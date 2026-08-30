@@ -407,8 +407,20 @@ fn issue_423_health_hotspots_degrade_missing_layers_deterministically() -> Resul
         .collect::<Vec<_>>();
     assert_eq!(ids, repeated_ids);
     assert_eq!(first.findings()[0].subject_id, "file:src/used.rs");
-    assert!(first.findings()[0].reason.contains("reverse-impact=10000"));
-    assert!(first.findings()[0].reason.contains("git-churn=1 runtime=0"));
+    let scores = first.findings()[0]
+        .hotspot_scores
+        .as_ref()
+        .expect("hotspot findings expose structured scores");
+    assert_eq!(scores.reverse_impact.normalized_basis_points, 10_000);
+    assert_eq!(scores.git_churn.raw, 1);
+    assert!(scores.git_churn.available);
+    assert_eq!(scores.runtime.raw, 0);
+    assert!(!scores.runtime.available);
+    assert_eq!(
+        scores.runtime.weight_basis_points,
+        DEFAULT_HOTSPOT_WEIGHTS.runtime
+    );
+    assert_eq!(first.findings()[0].confidence, Confidence::Probable);
     assert!(first.findings().iter().all(|finding| {
         finding
             .blockers

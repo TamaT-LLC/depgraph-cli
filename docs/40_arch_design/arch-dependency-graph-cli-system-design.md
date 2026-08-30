@@ -30,6 +30,7 @@ updated: 2026-08-26
 > 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
 > 2026-08-26: Issue #423として説明可能なコードヘルス解析を共有serviceと`depgraph-health-finding-v1`へ実装し、CLI `health` / `cleanup` / `audit` / `hotspots` と MCP 5 toolを同じ契約で公開した。
+> 2026-08-30: Issue #440としてhotspot findingへ5層（fan-in、fan-out、reverse-impact、Git churn、runtime）のraw／正規化basis point／weight／availabilityとtotalを`hotspot_scores`として構造化して公開した。hotspotのconfidenceは`probable`上限とし、reasonはhuman表示専用でfingerprintから除外する。ファイル系findingのpath依存IDとrename追従をdeferredとする移行影響をADRへ固定した。
 > 2026-08-26: `v0.5.4`でCodex、Claude Code、Cursor、Grokのproject／user scope MCPセットアップを追加した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.3`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
@@ -2013,6 +2014,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-08-30: Issue #440として`hotspot_scores`の5層構造化（raw／正規化basis point／weight／availability／total）、MCP closed DTO/schema/catalog、CLI/MCP parity E2Eを追加した。hotspotはランキングであり`confirmed`に昇格せず`probable`上限、reasonはfingerprint payloadから除外、path依存finding IDとrename追従deferredの移行影響をADRへ記録した。
 - 2026-08-26: Issue #423として`depgraph-health-finding-v1`の共有read-only service、unused / dependency / audit / hotspot analyzer、CLI `health` / `cleanup` / `audit` / `hotspots`、MCP 5 tool、baseline遷移gate、CLI/MCP parityを実装した。`health` summaryはsnapshot-scoped kindだけを集計し、audit / hotspotは含めない。`confirmed`は適用対象profile全部がsemantic-completeでhard blockerが無い場合に限る。
 - 2026-08-07: Issue #304としてbounded query/runtime validationの共有read-only service、CLI migration、`graph_query` / `runtime_trace_validate` MCP handlerを実装した。query/traceはinlineまたはconfined repository-relative fileのexactly oneとし、absolute/traversal/symlink/nonregular/oversizeを拒否する。queryのparse/credential/type/output pre-admissionとtrace shape/credential validationをstore前に完了し、query plan cap超過はexecution前の`QUERY_REJECTED`とする。両操作はpinned completed snapshotだけを読み、store/snapshot/source treeを不変に保つ。MCPはclosed query/runtime DTO、canonical byte/item pagination、snapshot/input-bound cursor、Read runtime controlを使い、CLI/MCP parity、non-echo security、catalog/schema/contract goldenで固定した。
 - 2026-08-02: PRとmain pushのCIをRust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmark、Linux / macOS integration、Windows smokeは手動dispatchだけで実行する構成へ変更した。`v*` tagのRelease workflowはquality、hostile E2E、benchmark、全5 targetのarchive / compiler pack、aggregate verificationを実行し、全gate成功後だけ公開する。

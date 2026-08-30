@@ -80,10 +80,10 @@ depgraph export --format mermaid > graph.mmd
 | グラフ出力 | `export` | JSON、DOT、Mermaid、GraphML |
 | 未使用のfile / export / type / dependency | `health`、`health list`、`cleanup` | snapshot-scoped finding、confidence、blocker。summaryはaudit / hotspotを含まない |
 | 変更差分のリスク | `audit --changed <GIT_REF>` | `merge-base(GIT_REF, HEAD)..HEAD` の新規cycle、境界違反、公開API変更、blast radius。`changed_oid`は監査対象HEADを示す。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
-| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位 |
+| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、availability、totalを構造化して出力し、confidenceは`probable`上限 |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
 
-`health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` は使用がなくhard blockerも無いが、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。sourceは自動変更しない。
+`health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` は使用がなくhard blockerも無いが、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。hotspotは未使用の証明ではないため常に`probable`以下であり、`hotspot_scores`の`available`で層の充足を確認する。sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
 `id:`、`path:`、`package:`、`route:`、`symbol:`、`type:`を受け付ける。
