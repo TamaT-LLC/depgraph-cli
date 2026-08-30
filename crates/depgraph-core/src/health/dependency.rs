@@ -364,6 +364,7 @@ fn consolidate_findings(
     Ok(consolidated)
 }
 
+#[derive(Clone)]
 struct UsageOwner {
     is_test: bool,
     manifest_path: Option<String>,
@@ -548,6 +549,11 @@ fn package_usage_targets(
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BTreeMap<String, Vec<UsageOwner>>, HealthAnalysisError> {
+    let mut sites = BTreeMap::new();
+    for site in &snapshot.sites {
+        budget.step(is_cancelled)?;
+        sites.insert(site.id.as_str(), site);
+    }
     let mut usage = BTreeMap::<String, Vec<UsageOwner>>::new();
     for edge in &snapshot.edges {
         budget.step(is_cancelled)?;
@@ -566,13 +572,33 @@ fn package_usage_targets(
         let Some(package) = package_name(target) else {
             continue;
         };
-        usage.entry(package).or_default().push(UsageOwner {
+        let owner = UsageOwner {
             is_test: is_test_node(source, edge),
             manifest_path: manifest_scopes
                 .get(edge.source.as_str())
                 .and_then(ManifestScope::unambiguous_path)
                 .map(str::to_owned),
-        });
+        };
+        // A local Go replacement can resolve an import of the requested module
+        // to a package whose declared module path is different. Retain the
+        // import site's specifier as a usage key so the requirement is credited
+        // only when the source actually imports its requested path; a direct
+        // import of the replacement module must not hide an unused requirement.
+        if is_go_node(target)
+            && matches!(edge.kind.as_str(), "imports" | "side_effect_imports")
+            && let Some(site_id) = edge.site_id.as_deref()
+            && let Some(site) = sites.get(site_id)
+            && matches!(site.kind.as_str(), "import" | "side_effect_import")
+            && let Some(specifier) = site.specifier.as_deref()
+            && is_go_module_path(specifier)
+            && specifier != package.as_str()
+        {
+            usage
+                .entry(specifier.to_owned())
+                .or_default()
+                .push(owner.clone());
+        }
+        usage.entry(package).or_default().push(owner);
     }
     Ok(usage)
 }
@@ -620,23 +646,18 @@ fn go_requirement_usage_paths(
         let Some(target) = nodes.get(target_id.as_str()).copied() else {
             continue;
         };
-        for key in [
-            "package_path",
-            "import_path",
-            "module_path",
-            "requested_module_path",
-            "replace_path",
-        ] {
-            let Some(path) = target
-                .properties
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            if is_go_module_path(path) {
-                paths.insert(path.to_owned());
-            }
+        // The requested path identifies the requirement declared by go.mod;
+        // resolved module/package/replace paths describe the replacement and
+        // must not make that requirement look used by themselves.
+        let Some(path) = target
+            .properties
+            .get("requested_module_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if is_go_module_path(path) {
+            paths.insert(path.to_owned());
         }
     }
     Ok(paths.into_iter().collect())
@@ -648,6 +669,18 @@ fn is_go_module_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !path.contains('\\')
         && !path.contains(':')
+}
+
+fn is_go_node(node: &NodeRecord) -> bool {
+    node.properties
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        == Some("go")
+        || node
+            .properties
+            .get("ecosystem")
+            .and_then(serde_json::Value::as_str)
+            == Some("go")
 }
 
 /// Return only package usage keys below a Go module path.
@@ -697,17 +730,7 @@ fn is_production_declaration(site: &SiteRecord) -> bool {
 }
 
 fn package_name(node: &NodeRecord) -> Option<String> {
-    let is_go = node
-        .properties
-        .get("language")
-        .and_then(serde_json::Value::as_str)
-        == Some("go")
-        || node
-            .properties
-            .get("ecosystem")
-            .and_then(serde_json::Value::as_str)
-            == Some("go");
-    if is_go {
+    if is_go_node(node) {
         // Go package declarations use a short package_name (for example
         // "http"), while go.mod requirements and import usage are keyed by
         // canonical module/import paths. Prefer those canonical identities so
@@ -1118,6 +1141,18 @@ mod tests {
             condition: json!({}),
             generated: false,
         }
+    }
+
+    fn ecosystem_usage_edge_with_site(
+        id: &str,
+        site_id: &str,
+        source: &str,
+        target: &str,
+        profile_id: &str,
+    ) -> EdgeRecord {
+        let mut edge = ecosystem_usage_edge(id, source, target, profile_id);
+        edge.site_id = Some(site_id.to_owned());
+        edge
     }
 
     fn ecosystem_graph(
@@ -1712,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_437_go_requirement_matches_replacement_target_path() {
+    fn issue_437_go_requirement_does_not_match_direct_replacement_target_import() {
         let profile_id = "profile:go-replacement";
         let manifest = "app/go.mod";
         let snapshot = ecosystem_graph(
@@ -1746,17 +1781,29 @@ mod tests {
                 },
                 ecosystem_file_with_manifest("go:main", "app/main.go", "go", manifest),
             ],
-            vec![ecosystem_site(
-                "site:go-replacement",
-                "go:app",
-                "module_requirement",
-                profile_id,
-                "example.com/original",
-                "go:replacement-requirement",
-                json!({}),
-            )],
-            vec![ecosystem_usage_edge(
+            vec![
+                ecosystem_site(
+                    "site:go-replacement",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.com/original",
+                    "go:replacement-requirement",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-replacement-import",
+                    "go:main",
+                    "import",
+                    profile_id,
+                    "example.net/replacement/pkg",
+                    "go:replacement-package",
+                    json!({}),
+                ),
+            ],
+            vec![ecosystem_usage_edge_with_site(
                 "edge:go-replacement-import",
+                "site:go-replacement-import",
                 "go:main",
                 "go:replacement-package",
                 profile_id,
@@ -1767,6 +1814,84 @@ mod tests {
             &[ManifestIdentity {
                 path: manifest.to_owned(),
                 digest: "sha256:go-replacement".to_owned(),
+                declared: BTreeSet::from(["example.com/original".to_owned()]),
+                drifted: false,
+            }],
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.com/original")
+        }));
+    }
+
+    #[test]
+    fn issue_437_go_requirement_matches_requested_import_through_replacement() {
+        let profile_id = "profile:go-replacement-requested";
+        let manifest = "app/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest, "go"),
+                NodeRecord {
+                    id: "go:replacement-requirement".to_owned(),
+                    kind: "external_system".to_owned(),
+                    locator: "gomod:example.com/original".to_owned(),
+                    display_name: "example.net/replacement".to_owned(),
+                    properties: json!({
+                        "ecosystem": "go",
+                        "external": true,
+                        "module_path": "example.net/replacement",
+                        "requested_module_path": "example.com/original",
+                        "replace_path": "example.net/replacement"
+                    }),
+                },
+                NodeRecord {
+                    id: "go:replacement-package".to_owned(),
+                    kind: "module".to_owned(),
+                    locator: "go-package:example.net/replacement/pkg".to_owned(),
+                    display_name: "example.net/replacement/pkg".to_owned(),
+                    properties: json!({
+                        "language": "go",
+                        "module_path": "example.net/replacement",
+                        "package_path": "example.net/replacement/pkg",
+                        "package_name": "pkg"
+                    }),
+                },
+                ecosystem_file_with_manifest("go:main", "app/main.go", "go", manifest),
+            ],
+            vec![
+                ecosystem_site(
+                    "site:go-replacement",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.com/original",
+                    "go:replacement-requirement",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-replacement-import",
+                    "go:main",
+                    "import",
+                    profile_id,
+                    "example.com/original/pkg",
+                    "go:replacement-package",
+                    json!({}),
+                ),
+            ],
+            vec![ecosystem_usage_edge_with_site(
+                "edge:go-replacement-import",
+                "site:go-replacement-import",
+                "go:main",
+                "go:replacement-package",
+                profile_id,
+            )],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:go-replacement-requested".to_owned(),
                 declared: BTreeSet::from(["example.com/original".to_owned()]),
                 drifted: false,
             }],
