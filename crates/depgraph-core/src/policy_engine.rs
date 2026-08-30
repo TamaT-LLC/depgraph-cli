@@ -43,12 +43,12 @@ pub(crate) fn new_boundary_violation_ids(
     after: &PolicyResult,
     config: &PolicyConfig,
 ) -> BTreeSet<String> {
-    let mut before_counts = BTreeMap::<BoundaryViolationComparisonKey, usize>::new();
+    let mut before_by_key = BTreeMap::<BoundaryViolationComparisonKey, Vec<String>>::new();
     for violation in active_boundary_violations(before, config) {
-        let count = before_counts
+        before_by_key
             .entry(boundary_violation_comparison_key(violation))
-            .or_default();
-        *count = count.saturating_add(1);
+            .or_default()
+            .push(violation.id.clone());
     }
     let mut after_by_key = BTreeMap::<BoundaryViolationComparisonKey, Vec<String>>::new();
     for violation in active_boundary_violations(after, config) {
@@ -60,8 +60,35 @@ pub(crate) fn new_boundary_violation_ids(
     let mut new_ids = BTreeSet::new();
     for (key, mut ids) in after_by_key {
         ids.sort();
-        let continuing = before_counts.get(&key).copied().unwrap_or(0).min(ids.len());
-        new_ids.extend(ids.into_iter().skip(continuing));
+        let mut before_id_counts = BTreeMap::<String, usize>::new();
+        for id in before_by_key.remove(&key).unwrap_or_default() {
+            let count = before_id_counts.entry(id).or_default();
+            *count = count.saturating_add(1);
+        }
+
+        // Preserve exact evaluator identities first. This keeps a continuing
+        // parallel edge paired with itself, so the ID emitted for an added
+        // occurrence is the added edge's ID rather than an arbitrary sibling.
+        let mut remaining_before = before_id_counts.values().copied().sum::<usize>();
+        let mut unmatched_after = Vec::new();
+        for id in ids {
+            let Some(count) = before_id_counts.get_mut(&id) else {
+                unmatched_after.push(id);
+                continue;
+            };
+            if *count == 0 {
+                unmatched_after.push(id);
+                continue;
+            }
+            *count -= 1;
+            remaining_before = remaining_before.saturating_sub(1);
+        }
+
+        // Any remaining before occurrence changed only its position-derived
+        // edge identity. Pair those semantically before classifying surplus
+        // after occurrences as genuinely new.
+        let moved_continuing = remaining_before.min(unmatched_after.len());
+        new_ids.extend(unmatched_after.into_iter().skip(moved_continuing));
     }
     new_ids
 }
@@ -2446,9 +2473,16 @@ mod tests {
             ]),
             &policy,
         )?;
+        let added_edge_id = added_parallel_edge
+            .violations
+            .iter()
+            .find(|violation| violation.dependency_path[0].edge_id == "e3")
+            .expect("parallel edge e3 violation")
+            .id
+            .clone();
         assert_eq!(
-            new_boundary_violation_ids(&result, &added_parallel_edge, &policy).len(),
-            1
+            new_boundary_violation_ids(&moved_edge, &added_parallel_edge, &policy),
+            BTreeSet::from([added_edge_id])
         );
 
         let new_target = evaluate_policy(
