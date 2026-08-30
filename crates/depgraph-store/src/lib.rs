@@ -1207,7 +1207,7 @@ ORDER BY id COLLATE BINARY
         );
         match current {
             (None, None, None) => {
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE scans
                         SET health_policy_config_digest=?2,
                             health_analyzer_version=?3,
@@ -1218,6 +1218,15 @@ ORDER BY id COLLATE BINARY
                         AND health_finding_contract_version IS NULL",
                     params![scan_id, requested.0, requested.1, requested.2],
                 )?;
+                if changed != 1 {
+                    // Another writer may have bound the tuple after the
+                    // snapshot query above. Do not report success when the
+                    // compare-and-set affected no row: immutable binding is
+                    // part of the provenance contract.
+                    bail!(
+                        "health provenance for scan {scan_id} was concurrently bound to a different tuple"
+                    );
+                }
             }
             (Some(policy), Some(analyzer), Some(contract))
                 if (policy, analyzer, contract) == requested => {}

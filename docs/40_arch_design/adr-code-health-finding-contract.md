@@ -210,13 +210,6 @@ protocol values are never substituted for missing snapshot provenance. The
 snapshot graph content ID remains independent of these policy/health contract
 values.
 
-The store still records optional `source_revision` on scans and completed
-snapshots. That field is the Git HEAD OID (`git rev-parse --verify HEAD`) when
-Git is available. Audit treats `source_revision` as the commit OID when
-present, looks up a base snapshot by that field plus optional `--base-snapshot`,
-and live-checks worktree dirtiness at request start. Missing `source_revision`
-is `missing-base-snapshot` (or prevents OID binding for `--changed`).
-
 Rejected: stuffing a worktree hash into `source_revision` (the field is an
 OID today); bumping the store schema only to store a dirty bit that can be
 observed live.
