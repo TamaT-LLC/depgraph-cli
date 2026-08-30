@@ -369,12 +369,28 @@ struct UsageOwner {
     manifest_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManifestScope {
+    Unknown,
+    Unambiguous(String),
+    Ambiguous,
+}
+
+impl ManifestScope {
+    fn unambiguous_path(&self) -> Option<&str> {
+        match self {
+            Self::Unambiguous(path) => Some(path),
+            Self::Unknown | Self::Ambiguous => None,
+        }
+    }
+}
+
 fn manifest_scope_index<'a>(
     snapshot: &'a GraphSnapshot,
     nodes: &BTreeMap<&'a str, &'a NodeRecord>,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<BTreeMap<&'a str, Option<String>>, HealthAnalysisError> {
+) -> Result<BTreeMap<&'a str, ManifestScope>, HealthAnalysisError> {
     let mut parents = BTreeMap::<&'a str, Vec<&'a str>>::new();
     for edge in &snapshot.edges {
         budget.step(is_cancelled)?;
@@ -400,6 +416,7 @@ fn manifest_scope_index<'a>(
         node_id: &'a str,
         next_parent: usize,
         parent_scopes: BTreeSet<String>,
+        ambiguous: bool,
     }
 
     // Resolve the containment/declaration forest with an explicit stack. A
@@ -413,7 +430,7 @@ fn manifest_scope_index<'a>(
             continue;
         }
         let Some(node) = nodes.get(root).copied() else {
-            scopes.insert(root, None);
+            scopes.insert(root, ManifestScope::Unknown);
             continue;
         };
         if let Some(scope) = node
@@ -422,7 +439,7 @@ fn manifest_scope_index<'a>(
             .and_then(serde_json::Value::as_str)
             .and_then(canonical_manifest_scope)
         {
-            scopes.insert(root, Some(scope));
+            scopes.insert(root, ManifestScope::Unambiguous(scope));
             continue;
         }
         if !visiting.insert(root) {
@@ -433,6 +450,7 @@ fn manifest_scope_index<'a>(
             node_id: root,
             next_parent: 0,
             parent_scopes: BTreeSet::new(),
+            ambiguous: false,
         }];
         while !stack.is_empty() {
             let frame_index = stack.len() - 1;
@@ -451,18 +469,28 @@ fn manifest_scope_index<'a>(
             let Some(parent_id) = next_parent else {
                 let frame = stack.pop().expect("non-empty manifest scope stack");
                 visiting.remove(frame.node_id);
-                let scope = (frame.parent_scopes.len() == 1).then(|| {
-                    frame
-                        .parent_scopes
-                        .into_iter()
-                        .next()
-                        .expect("one parent scope")
-                });
+                let scope = if frame.ambiguous || frame.parent_scopes.len() > 1 {
+                    ManifestScope::Ambiguous
+                } else if frame.parent_scopes.len() == 1 {
+                    ManifestScope::Unambiguous(
+                        frame
+                            .parent_scopes
+                            .into_iter()
+                            .next()
+                            .expect("one parent scope"),
+                    )
+                } else {
+                    ManifestScope::Unknown
+                };
                 scopes.insert(frame.node_id, scope.clone());
-                if let Some(scope) = scope
-                    && let Some(parent_frame) = stack.last_mut()
-                {
-                    parent_frame.parent_scopes.insert(scope);
+                if let Some(parent_frame) = stack.last_mut() {
+                    match scope {
+                        ManifestScope::Unambiguous(scope) => {
+                            parent_frame.parent_scopes.insert(scope);
+                        }
+                        ManifestScope::Ambiguous => parent_frame.ambiguous = true,
+                        ManifestScope::Unknown => {}
+                    }
                 }
                 continue;
             };
@@ -472,13 +500,17 @@ fn manifest_scope_index<'a>(
             // resource exhaustion remain observable at the same boundaries.
             budget.step(is_cancelled)?;
             if let Some(cached_scope) = scopes.get(parent_id) {
-                if let Some(scope) = cached_scope.as_ref() {
-                    stack[frame_index].parent_scopes.insert(scope.clone());
+                match cached_scope {
+                    ManifestScope::Unambiguous(scope) => {
+                        stack[frame_index].parent_scopes.insert(scope.clone());
+                    }
+                    ManifestScope::Ambiguous => stack[frame_index].ambiguous = true,
+                    ManifestScope::Unknown => {}
                 }
                 continue;
             }
             let Some(parent) = nodes.get(parent_id).copied() else {
-                scopes.insert(parent_id, None);
+                scopes.insert(parent_id, ManifestScope::Unknown);
                 continue;
             };
             if let Some(scope) = parent
@@ -487,7 +519,7 @@ fn manifest_scope_index<'a>(
                 .and_then(serde_json::Value::as_str)
                 .and_then(canonical_manifest_scope)
             {
-                scopes.insert(parent_id, Some(scope.clone()));
+                scopes.insert(parent_id, ManifestScope::Unambiguous(scope.clone()));
                 stack[frame_index].parent_scopes.insert(scope);
                 continue;
             }
@@ -496,11 +528,14 @@ fn manifest_scope_index<'a>(
                     node_id: parent_id,
                     next_parent: 0,
                     parent_scopes: BTreeSet::new(),
+                    ambiguous: false,
                 });
+            } else {
+                // Structural cycles make ownership indeterminate. Propagate
+                // that state through every dependent frame so another parent
+                // cannot accidentally make the result look unambiguous.
+                stack[frame_index].ambiguous = true;
             }
-            // A parent already on the explicit stack is a cycle. As in the
-            // recursive implementation, it contributes no scope and is left
-            // uncached so another path may still provide an unambiguous scope.
         }
     }
     Ok(scopes)
@@ -509,7 +544,7 @@ fn manifest_scope_index<'a>(
 fn package_usage_targets(
     snapshot: &GraphSnapshot,
     nodes: &BTreeMap<&str, &NodeRecord>,
-    manifest_scopes: &BTreeMap<&str, Option<String>>,
+    manifest_scopes: &BTreeMap<&str, ManifestScope>,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<BTreeMap<String, Vec<UsageOwner>>, HealthAnalysisError> {
@@ -533,7 +568,10 @@ fn package_usage_targets(
         };
         usage.entry(package).or_default().push(UsageOwner {
             is_test: is_test_node(source, edge),
-            manifest_path: manifest_scopes.get(edge.source.as_str()).cloned().flatten(),
+            manifest_path: manifest_scopes
+                .get(edge.source.as_str())
+                .and_then(ManifestScope::unambiguous_path)
+                .map(str::to_owned),
         });
     }
     Ok(usage)
@@ -926,6 +964,23 @@ mod tests {
         }
     }
 
+    fn structural_edge(id: &str, source: &str, target: &str, kind: &str) -> EdgeRecord {
+        EdgeRecord {
+            id: id.to_owned(),
+            site_id: None,
+            source: source.to_owned(),
+            target: target.to_owned(),
+            kind: kind.to_owned(),
+            phase: "source".to_owned(),
+            environment: "host".to_owned(),
+            profile_id: "profile:go-scope".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition: json!({}),
+            generated: false,
+        }
+    }
+
     fn graph(
         nodes: Vec<NodeRecord>,
         sites: Vec<SiteRecord>,
@@ -1280,6 +1335,160 @@ mod tests {
             drifted: false,
         }];
         assert!(analyze_dependencies(&snapshot, &manifests).is_empty());
+    }
+
+    #[test]
+    fn issue_437_ambiguous_parent_scope_propagates_fail_closed() {
+        let profile_id = "profile:go-scope";
+        let manifest_a = "a/go.mod";
+        let manifest_b = "b/go.mod";
+        let mut manifest_a_owner = ecosystem_file("scope:manifest-a", "a/manifest-owner.go", "go");
+        manifest_a_owner.properties["manifest_path"] = json!(manifest_a);
+        let mut manifest_b_owner = ecosystem_file("scope:manifest-b", "b/manifest-owner.go", "go");
+        manifest_b_owner.properties["manifest_path"] = json!(manifest_b);
+        let dependency = NodeRecord {
+            id: "go:dependency".to_owned(),
+            kind: "module".to_owned(),
+            locator: "go-package:example.net/dependency/pkg".to_owned(),
+            display_name: "example.net/dependency/pkg".to_owned(),
+            properties: json!({
+                "language": "go",
+                "module_path": "example.net/dependency",
+                "package_path": "example.net/dependency/pkg",
+                "package_name": "pkg"
+            }),
+        };
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest_a, "go"),
+                dependency,
+                ecosystem_file("scope:a", "shared/a.go", "go"),
+                ecosystem_file("scope:b", "shared/b.go", "go"),
+                ecosystem_file("scope:c", "shared/c.go", "go"),
+                manifest_a_owner,
+                manifest_b_owner,
+            ],
+            vec![ecosystem_site(
+                "site:dependency",
+                "go:app",
+                "module_requirement",
+                profile_id,
+                "example.net/dependency",
+                "go:dependency",
+                json!({}),
+            )],
+            vec![
+                structural_edge("edge:b-a", "scope:b", "scope:a", "contains"),
+                structural_edge("edge:c-a", "scope:c", "scope:a", "contains"),
+                structural_edge(
+                    "edge:manifest-a-b",
+                    "scope:manifest-a",
+                    "scope:b",
+                    "contains",
+                ),
+                structural_edge(
+                    "edge:manifest-b-b",
+                    "scope:manifest-b",
+                    "scope:b",
+                    "contains",
+                ),
+                structural_edge(
+                    "edge:manifest-a-c",
+                    "scope:manifest-a",
+                    "scope:c",
+                    "contains",
+                ),
+                ecosystem_usage_edge("edge:ambiguous-use", "scope:a", "go:dependency", profile_id),
+            ],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest_a.to_owned(),
+                digest: "sha256:scope-a".to_owned(),
+                declared: BTreeSet::from(["example.net/dependency".to_owned()]),
+                drifted: false,
+            }],
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.owner_id == "site:dependency")
+        }));
+    }
+
+    #[test]
+    fn issue_437_structural_cycle_scope_propagates_fail_closed() {
+        let profile_id = "profile:go-scope";
+        let manifest = "a/go.mod";
+        let mut manifest_owner = ecosystem_file("cycle:manifest", "a/manifest-owner.go", "go");
+        manifest_owner.properties["manifest_path"] = json!(manifest);
+        let dependency = NodeRecord {
+            id: "go:cycle-dependency".to_owned(),
+            kind: "module".to_owned(),
+            locator: "go-package:example.net/cycle/pkg".to_owned(),
+            display_name: "example.net/cycle/pkg".to_owned(),
+            properties: json!({
+                "language": "go",
+                "module_path": "example.net/cycle",
+                "package_path": "example.net/cycle/pkg",
+                "package_name": "pkg"
+            }),
+        };
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:cycle-app", "example.com/app", manifest, "go"),
+                dependency,
+                ecosystem_file("cycle:a", "shared/a.go", "go"),
+                ecosystem_file("cycle:b", "shared/b.go", "go"),
+                manifest_owner,
+            ],
+            vec![ecosystem_site(
+                "site:cycle-dependency",
+                "go:cycle-app",
+                "module_requirement",
+                profile_id,
+                "example.net/cycle",
+                "go:cycle-dependency",
+                json!({}),
+            )],
+            vec![
+                structural_edge("edge:cycle-a-b", "cycle:a", "cycle:b", "declares"),
+                structural_edge("edge:cycle-b-a", "cycle:b", "cycle:a", "declares"),
+                structural_edge(
+                    "edge:manifest-cycle-b",
+                    "cycle:manifest",
+                    "cycle:b",
+                    "contains",
+                ),
+                ecosystem_usage_edge(
+                    "edge:cycle-use",
+                    "cycle:a",
+                    "go:cycle-dependency",
+                    profile_id,
+                ),
+            ],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:cycle-scope".to_owned(),
+                declared: BTreeSet::from(["example.net/cycle".to_owned()]),
+                drifted: false,
+            }],
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.owner_id == "site:cycle-dependency")
+        }));
     }
 
     #[test]
