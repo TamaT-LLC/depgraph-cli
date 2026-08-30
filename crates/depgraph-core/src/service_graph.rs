@@ -540,7 +540,7 @@ impl DepgraphService {
         }
         Ok(ImpactServiceResult {
             snapshot_id,
-            scan_id: snapshot.scan.id.clone(),
+            scan_id: snapshot.scan.id,
             impact: result,
         })
     }
@@ -559,7 +559,7 @@ impl DepgraphService {
         }
         Ok(CyclesResult {
             snapshot_id,
-            scan_id: snapshot.scan.id.clone(),
+            scan_id: snapshot.scan.id,
             cycles,
         })
     }
@@ -578,7 +578,7 @@ impl DepgraphService {
         }
         Ok(UnresolvedServiceResult {
             snapshot_id,
-            scan_id: snapshot.scan.id.clone(),
+            scan_id: snapshot.scan.id,
             items,
         })
     }

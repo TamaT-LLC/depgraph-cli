@@ -925,8 +925,7 @@ ORDER BY id COLLATE BINARY
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         names.sort();
-        let mut loaded = self.load_completed_snapshot(snapshot_id)?;
-        let mut coverage = std::mem::take(&mut loaded.coverage);
+        let mut coverage = self.load_completed_snapshot(snapshot_id)?.coverage;
         coverage.completeness.sort();
         coverage.completeness.dedup();
         coverage.reasons.sort();
@@ -2480,8 +2479,7 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn mark_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
-        let mut loaded = self.load_snapshot(scan_id)?;
-        let mut coverage = std::mem::take(&mut loaded.coverage);
+        let mut coverage = self.load_snapshot(scan_id)?.coverage;
         coverage.completeness.clear();
         coverage.reasons.push(reason.to_owned());
         coverage.reasons.sort();
@@ -4248,12 +4246,13 @@ mod tests {
             include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
         )?;
         let snapshot_id = store.current_snapshot_id()?.context("current snapshot")?;
-        let mut snapshot = store.load_completed_snapshot(&snapshot_id)?;
+        let snapshot = store.load_completed_snapshot(&snapshot_id)?;
         let topology = store.load_completed_topology(&snapshot_id)?;
 
         assert_eq!(
             topology.nodes,
-            std::mem::take(&mut snapshot.nodes)
+            snapshot
+                .nodes
                 .into_iter()
                 .map(|node| GraphTopologyNode {
                     id: node.id,
@@ -4263,7 +4262,8 @@ mod tests {
         );
         assert_eq!(
             topology.edges,
-            std::mem::take(&mut snapshot.edges)
+            snapshot
+                .edges
                 .into_iter()
                 .map(|edge| GraphTopologyEdge {
                     source: edge.source,
@@ -5459,9 +5459,9 @@ mod tests {
         let legacy_snapshot = legacy.load_completed_snapshot(&snapshot_id)?;
         assert_eq!(
             (
-                legacy_snapshot.scan.health_policy_config_digest.clone(),
-                legacy_snapshot.scan.health_analyzer_version.clone(),
-                legacy_snapshot.scan.health_finding_contract_version.clone(),
+                legacy_snapshot.scan.health_policy_config_digest,
+                legacy_snapshot.scan.health_analyzer_version,
+                legacy_snapshot.scan.health_finding_contract_version,
             ),
             (None, None, None)
         );

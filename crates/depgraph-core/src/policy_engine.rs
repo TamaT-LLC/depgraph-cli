@@ -27,6 +27,10 @@ pub(crate) struct PolicyEvaluationWorkExhausted;
 #[error("policy evaluation was cancelled")]
 pub(crate) struct PolicyEvaluationCancelled;
 
+#[derive(Debug, thiserror::Error)]
+#[error("combined policy condition exceeds the maximum logical nesting depth")]
+struct CombinedPolicyConditionDepthExceeded;
+
 pub(crate) fn is_policy_evaluation_resource_exhausted(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<PolicyEvaluationWorkExhausted>()
@@ -5927,7 +5931,42 @@ fn combined_condition_bounded(
     }
     work.steps(conditions.len(), is_cancelled)?;
     let conditions = conditions.into_values().collect::<Vec<_>>();
-    canonical_condition_bounded(&PolicyCondition::All { conditions }, work, is_cancelled)
+    let condition =
+        canonical_condition_bounded(&PolicyCondition::All { conditions }, work, is_cancelled)?;
+    validate_combined_condition_depth_bounded(&condition, work, is_cancelled)?;
+    Ok(condition)
+}
+
+fn validate_combined_condition_depth_bounded(
+    condition: &PolicyCondition,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let mut pending = vec![(condition, 0_usize)];
+    while let Some((condition, depth)) = pending.pop() {
+        work.step(is_cancelled)?;
+        match condition {
+            PolicyCondition::All { conditions } | PolicyCondition::Any { conditions } => {
+                if depth >= MAX_EDGE_CONDITION_DEPTH {
+                    return Err(CombinedPolicyConditionDepthExceeded.into());
+                }
+                work.steps(conditions.len(), is_cancelled)?;
+                for child in conditions.iter().rev() {
+                    pending.push((child, depth.saturating_add(1)));
+                }
+            }
+            PolicyCondition::Not { condition } => {
+                if depth >= MAX_EDGE_CONDITION_DEPTH {
+                    return Err(CombinedPolicyConditionDepthExceeded.into());
+                }
+                pending.push((condition, depth.saturating_add(1)));
+            }
+            PolicyCondition::Eq { .. }
+            | PolicyCondition::In { .. }
+            | PolicyCondition::Defined { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -7591,6 +7630,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(deep_error.to_string().contains("nested deeper than"));
+        // This intentionally leaks the manually assembled 20,000-level value:
+        // serde_json::Value's public destructor is recursive, and this test is
+        // specifically exercising the evaluator's preflight before it can be
+        // dropped. Production snapshots are parser-bounded before ownership
+        // reaches this path.
+        std::mem::forget(from);
 
         let mut large_to = snapshot(Vec::new());
         large_to.nodes.push(semantic_node(
@@ -7677,6 +7722,148 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("nested deeper than"));
+        // See the matching PublicApiChange preflight test above. Do not let
+        // the fixture's recursive Value destructor turn a successful
+        // evaluator rejection into a test-process stack overflow.
+        std::mem::forget(snapshot);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_condition_depth_boundary_is_explicit_and_bounded() -> Result<()> {
+        fn nested_condition(depth: usize, suffix: &str) -> PolicyCondition {
+            let mut condition = PolicyCondition::Eq {
+                key: format!("leaf-{suffix}"),
+                value: json!("value"),
+            };
+            for index in (0..depth).rev() {
+                condition = if index % 2 == 0 {
+                    PolicyCondition::Not {
+                        condition: Box::new(condition),
+                    }
+                } else {
+                    PolicyCondition::All {
+                        conditions: vec![
+                            condition,
+                            PolicyCondition::Eq {
+                                key: format!("extra-{suffix}-{index}"),
+                                value: json!(index),
+                            },
+                        ],
+                    }
+                };
+            }
+            condition
+        }
+
+        let edge_a = edge("depth-a", "a", "b", "profile:production");
+        let edge_b = edge("depth-b", "b", "c", "profile:production");
+        let depth16 = [
+            AdmittedEdge {
+                edge: &edge_a,
+                condition: nested_condition(16, "a"),
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+            AdmittedEdge {
+                edge: &edge_b,
+                condition: nested_condition(16, "b"),
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+        ];
+        let depth16_refs = depth16.iter().collect::<Vec<_>>();
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let error =
+            combined_condition_bounded(&depth16_refs, &mut work, &mut || false).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CombinedPolicyConditionDepthExceeded>()
+                .is_some(),
+            "depth overflow must fail at combined-condition validation"
+        );
+
+        let depth15 = [
+            AdmittedEdge {
+                edge: &edge_a,
+                condition: nested_condition(15, "a"),
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+            AdmittedEdge {
+                edge: &edge_b,
+                condition: nested_condition(15, "b"),
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+        ];
+        let depth15_refs = depth15.iter().collect::<Vec<_>>();
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        assert!(
+            combined_condition_bounded(&depth15_refs, &mut work, &mut || false).is_ok(),
+            "depth-15 edge conditions remain representable after path composition"
+        );
+
+        let flat = [
+            AdmittedEdge {
+                edge: &edge_a,
+                condition: PolicyCondition::Eq {
+                    key: "flat-a".to_owned(),
+                    value: json!(true),
+                },
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+            AdmittedEdge {
+                edge: &edge_b,
+                condition: PolicyCondition::Eq {
+                    key: "flat-b".to_owned(),
+                    value: json!(false),
+                },
+                evidence: Vec::new(),
+                context: BTreeMap::new(),
+            },
+        ];
+        let flat_refs = flat.iter().collect::<Vec<_>>();
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        assert!(combined_condition_bounded(&flat_refs, &mut work, &mut || false).is_ok());
+
+        let exact_path = |value: &str| PolicySelector {
+            match_kind: PolicyMatchKind::Exact,
+            value: value.to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            ..selector("unused")
+        };
+        let mut depth16_edge_a = edge("actual-depth-a", "a", "b", "profile:production");
+        depth16_edge_a.condition = serde_json::to_value(nested_condition(16, "actual-a"))?;
+        let mut depth16_edge_b = edge("actual-depth-b", "b", "c", "profile:production");
+        depth16_edge_b.condition = serde_json::to_value(nested_condition(16, "actual-b"))?;
+        let depth16_graph = snapshot(vec![depth16_edge_a, depth16_edge_b]);
+        let mut depth_rule = rule(PolicyRuleKind::DependencyDepth);
+        depth_rule.source = exact_path("src/ui/a.ts");
+        depth_rule.target = exact_path("src/data/c.ts");
+        depth_rule.threshold = Some(PolicyThreshold { max: 1 });
+        let error =
+            evaluate_policy("snapshot:depth16", &depth16_graph, &config(depth_rule)).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<CombinedPolicyConditionDepthExceeded>()
+                .is_some(),
+            "actual policy evaluation must reject the composed depth overflow"
+        );
+
+        let mut depth15_edge_a = edge("actual-depth-a", "a", "b", "profile:production");
+        depth15_edge_a.condition = serde_json::to_value(nested_condition(15, "actual-a"))?;
+        let mut depth15_edge_b = edge("actual-depth-b", "b", "c", "profile:production");
+        depth15_edge_b.condition = serde_json::to_value(nested_condition(15, "actual-b"))?;
+        let depth15_graph = snapshot(vec![depth15_edge_a, depth15_edge_b]);
+        let mut depth_rule = rule(PolicyRuleKind::DependencyDepth);
+        depth_rule.source = exact_path("src/ui/a.ts");
+        depth_rule.target = exact_path("src/data/c.ts");
+        depth_rule.threshold = Some(PolicyThreshold { max: 1 });
+        let result = evaluate_policy("snapshot:depth15", &depth15_graph, &config(depth_rule))?;
+        assert_eq!(result.violations.len(), 1);
+        result.validate()?;
         Ok(())
     }
 
