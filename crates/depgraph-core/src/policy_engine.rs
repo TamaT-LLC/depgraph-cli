@@ -19,6 +19,46 @@ use crate::{
     query::{CycleLevel, cycles},
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("policy evaluation exhausted its bounded work budget")]
+pub(crate) struct PolicyEvaluationWorkExhausted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("policy evaluation was cancelled")]
+pub(crate) struct PolicyEvaluationCancelled;
+
+pub(crate) fn is_policy_evaluation_resource_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PolicyEvaluationWorkExhausted>()
+        .is_some()
+}
+
+pub(crate) fn is_policy_evaluation_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PolicyEvaluationCancelled>().is_some()
+}
+
+struct PolicyEvaluationWork {
+    used: usize,
+    maximum: usize,
+}
+
+impl PolicyEvaluationWork {
+    const fn new(maximum: usize) -> Self {
+        Self { used: 0, maximum }
+    }
+
+    fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+        if is_cancelled() {
+            return Err(PolicyEvaluationCancelled.into());
+        }
+        if self.used >= self.maximum {
+            return Err(PolicyEvaluationWorkExhausted.into());
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BoundaryViolationComparisonKey {
     rule_id: String,
@@ -151,6 +191,29 @@ pub fn evaluate_policy(
     snapshot: &GraphSnapshot,
     config: &PolicyConfig,
 ) -> Result<PolicyResult> {
+    evaluate_policy_cancellable(snapshot_id, snapshot, config, usize::MAX, || false)
+}
+
+/// Evaluate a policy while bounding the potentially quadratic RuntimeBoundary
+/// selector traversal and observing cooperative cancellation.
+pub(crate) fn evaluate_policy_cancellable(
+    snapshot_id: impl Into<String>,
+    snapshot: &GraphSnapshot,
+    config: &PolicyConfig,
+    maximum_work: usize,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<PolicyResult> {
+    let mut work = PolicyEvaluationWork::new(maximum_work);
+    evaluate_policy_with_work(snapshot_id, snapshot, config, &mut work, &mut is_cancelled)
+}
+
+fn evaluate_policy_with_work(
+    snapshot_id: impl Into<String>,
+    snapshot: &GraphSnapshot,
+    config: &PolicyConfig,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyResult> {
     config.validate()?;
     let nodes: BTreeMap<_, _> = snapshot
         .nodes
@@ -160,6 +223,7 @@ pub fn evaluate_policy(
     let mut violations = BTreeMap::new();
 
     for rule in &config.rules {
+        work.step(is_cancelled)?;
         // These rule kinds use specialized evaluation contexts outside this static
         // architecture pass. Their dedicated evaluators compose with this pass, so
         // do not let them discard otherwise valid static architecture violations.
@@ -167,16 +231,36 @@ pub fn evaluate_policy(
             continue;
         }
         let suppressions = resolve_suppressions(snapshot, config, Some(&rule.id))?;
-        let sources = resolve_selector(
-            snapshot,
-            &rule.source,
-            &format!("rule {:?} source", rule.id),
-        )?;
-        let targets = resolve_selector(
-            snapshot,
-            &rule.target,
-            &format!("rule {:?} target", rule.id),
-        )?;
+        let sources = if rule.kind == PolicyRuleKind::RuntimeBoundary {
+            resolve_selector_bounded(
+                snapshot,
+                &rule.source,
+                &format!("rule {:?} source", rule.id),
+                work,
+                is_cancelled,
+            )?
+        } else {
+            resolve_selector(
+                snapshot,
+                &rule.source,
+                &format!("rule {:?} source", rule.id),
+            )?
+        };
+        let targets = if rule.kind == PolicyRuleKind::RuntimeBoundary {
+            resolve_selector_bounded(
+                snapshot,
+                &rule.target,
+                &format!("rule {:?} target", rule.id),
+                work,
+                is_cancelled,
+            )?
+        } else {
+            resolve_selector(
+                snapshot,
+                &rule.target,
+                &format!("rule {:?} target", rule.id),
+            )?
+        };
         let source_ids: BTreeSet<_> = sources.iter().map(|node| node.id.as_str()).collect();
         let target_ids: BTreeSet<_> = targets.iter().map(|node| node.id.as_str()).collect();
         let admitted = if rule.kind == PolicyRuleKind::RuntimeBoundary {
@@ -229,6 +313,8 @@ pub fn evaluate_policy(
                 &target_ids,
                 &nodes,
                 &suppressions,
+                work,
+                is_cancelled,
             )?,
             PolicyRuleKind::PublicApiChange => {
                 unreachable!("public API rules are handled by the snapshot-diff evaluator")
@@ -253,8 +339,88 @@ pub fn evaluate_policy_diff(
     to: &GraphSnapshot,
     config: &PolicyConfig,
 ) -> Result<PolicyResult> {
+    evaluate_policy_diff_cancellable(
+        from_snapshot_id,
+        from,
+        to_snapshot_id,
+        to,
+        config,
+        usize::MAX,
+        || false,
+    )
+}
+
+/// Evaluate a snapshot diff with the same bounded RuntimeBoundary evaluator
+/// used by the graph service.
+pub(crate) fn evaluate_policy_diff_cancellable(
+    from_snapshot_id: &str,
+    from: &GraphSnapshot,
+    to_snapshot_id: &str,
+    to: &GraphSnapshot,
+    config: &PolicyConfig,
+    maximum_work: usize,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<PolicyResult> {
+    let mut work = PolicyEvaluationWork::new(maximum_work);
+    evaluate_policy_diff_with_work(
+        from_snapshot_id,
+        from,
+        to_snapshot_id,
+        to,
+        config,
+        &mut work,
+        &mut is_cancelled,
+    )
+}
+
+/// Evaluate both sides of a health-audit policy comparison under one shared
+/// work budget.  RuntimeBoundary evaluation is performed twice (once for each
+/// pinned snapshot), so giving each side an independent ceiling would double
+/// the service's intended bound.
+pub(crate) fn evaluate_boundary_violation_ids_cancellable(
+    before_snapshot_id: &str,
+    before: &GraphSnapshot,
+    after_snapshot_id: &str,
+    after: &GraphSnapshot,
+    config: &PolicyConfig,
+    maximum_work: usize,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<BTreeSet<String>> {
+    let mut work = PolicyEvaluationWork::new(maximum_work);
+    let before_result = evaluate_policy_with_work(
+        before_snapshot_id,
+        before,
+        config,
+        &mut work,
+        &mut is_cancelled,
+    )?;
+    let after_result = evaluate_policy_diff_with_work(
+        before_snapshot_id,
+        before,
+        after_snapshot_id,
+        after,
+        config,
+        &mut work,
+        &mut is_cancelled,
+    )?;
+    Ok(new_boundary_violation_ids(
+        &before_result,
+        &after_result,
+        config,
+    ))
+}
+
+fn evaluate_policy_diff_with_work(
+    from_snapshot_id: &str,
+    from: &GraphSnapshot,
+    to_snapshot_id: &str,
+    to: &GraphSnapshot,
+    config: &PolicyConfig,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<PolicyResult> {
     config.validate()?;
-    let current = evaluate_policy(to_snapshot_id, to, config)?;
+    let current = evaluate_policy_with_work(to_snapshot_id, to, config, work, is_cancelled)?;
     if !config
         .rules
         .iter()
@@ -920,6 +1086,25 @@ fn admitted_edges_with_options<'a>(
     apply_rule_condition: bool,
     require_evidence: bool,
 ) -> Result<Vec<AdmittedEdge<'a>>> {
+    let mut work = PolicyEvaluationWork::new(usize::MAX);
+    admitted_edges_with_options_bounded(
+        snapshot,
+        rule,
+        apply_rule_condition,
+        require_evidence,
+        &mut work,
+        &mut || false,
+    )
+}
+
+fn admitted_edges_with_options_bounded<'a>(
+    snapshot: &'a GraphSnapshot,
+    rule: &PolicyRule,
+    apply_rule_condition: bool,
+    require_evidence: bool,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<AdmittedEdge<'a>>> {
     let profiles: BTreeMap<_, _> = snapshot
         .profiles
         .iter()
@@ -928,6 +1113,7 @@ fn admitted_edges_with_options<'a>(
     let evidence: BTreeMap<_, Vec<_>> = {
         let mut by_owner: BTreeMap<(&str, &str), Vec<&EvidenceRecord>> = BTreeMap::new();
         for item in &snapshot.evidence {
+            work.step(is_cancelled)?;
             by_owner
                 .entry((item.owner_type.as_str(), item.owner_id.as_str()))
                 .or_default()
@@ -940,6 +1126,7 @@ fn admitted_edges_with_options<'a>(
     let mut admitted = Vec::new();
 
     for edge in &snapshot.edges {
+        work.step(is_cancelled)?;
         if !profile_matches(&rule.profiles, &edge.profile_id)
             || !allowed_precisions.contains(edge.precision.as_str())
             || !allowed_statuses.contains(edge.resolution_status.as_str())
@@ -962,6 +1149,7 @@ fn admitted_edges_with_options<'a>(
         if require_evidence && spans.len() < usize::try_from(rule.evidence.minimum_spans)? {
             continue;
         }
+        work.step(is_cancelled)?;
         admitted.push(AdmittedEdge {
             edge,
             condition: canonical_condition(&condition)?,
@@ -986,6 +1174,7 @@ fn admitted_edges_with_options<'a>(
     Ok(admitted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_runtime_boundary(
     rule: &PolicyRule,
     snapshot: &GraphSnapshot,
@@ -993,10 +1182,14 @@ fn evaluate_runtime_boundary(
     target_ids: &BTreeSet<&str>,
     nodes: &BTreeMap<&str, &NodeRecord>,
     suppressions: &[ResolvedSuppression<'_>],
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<PolicyViolation>> {
-    let admitted = admitted_edges_with_options(snapshot, rule, false, true)?;
+    let admitted =
+        admitted_edges_with_options_bounded(snapshot, rule, false, true, work, is_cancelled)?;
     let mut by_profile: BTreeMap<&str, Vec<&AdmittedEdge<'_>>> = BTreeMap::new();
     for item in &admitted {
+        work.step(is_cancelled)?;
         by_profile
             .entry(item.edge.profile_id.as_str())
             .or_default()
@@ -1005,25 +1198,30 @@ fn evaluate_runtime_boundary(
 
     let mut output = BTreeMap::new();
     for (profile_id, edges) in by_profile {
+        work.step(is_cancelled)?;
         let adjacency = adjacency(&edges);
-        let boundaries: Vec<_> = edges
-            .iter()
-            .copied()
-            .filter(|item| {
-                matches!(
-                    item.edge.kind.as_str(),
-                    "client_boundary" | "server_boundary"
-                ) && target_ids.contains(item.edge.target.as_str())
-                    && evaluate_condition(&rule.condition, &item.context) == Some(true)
-            })
-            .collect();
+        let mut boundaries = Vec::new();
+        for item in &edges {
+            work.step(is_cancelled)?;
+            if matches!(
+                item.edge.kind.as_str(),
+                "client_boundary" | "server_boundary"
+            ) && target_ids.contains(item.edge.target.as_str())
+                && evaluate_condition(&rule.condition, &item.context) == Some(true)
+            {
+                boundaries.push(*item);
+            }
+        }
 
         for source in sources {
+            work.step(is_cancelled)?;
             let mut visited = BTreeSet::from([source.id.clone()]);
             let mut predecessor: HashMap<String, &AdmittedEdge<'_>> = HashMap::new();
             let mut queue = VecDeque::from([source.id.clone()]);
             while let Some(current) = queue.pop_front() {
+                work.step(is_cancelled)?;
                 for item in adjacency.get(current.as_str()).into_iter().flatten() {
+                    work.step(is_cancelled)?;
                     if visited.insert(item.edge.target.clone()) {
                         predecessor.insert(item.edge.target.clone(), item);
                         queue.push_back(item.edge.target.clone());
@@ -1032,15 +1230,27 @@ fn evaluate_runtime_boundary(
             }
 
             for boundary in &boundaries {
+                work.step(is_cancelled)?;
                 let mut path_edges = if source.id == boundary.edge.source {
                     Vec::new()
                 } else if visited.contains(&boundary.edge.source) {
-                    reconstruct_path(&source.id, &boundary.edge.source, &predecessor)?
+                    reconstruct_path_bounded(
+                        &source.id,
+                        &boundary.edge.source,
+                        &predecessor,
+                        work,
+                        is_cancelled,
+                    )?
                 } else {
                     continue;
                 };
                 path_edges.push(boundary);
-                let path = path_edges.iter().map(|item| path_step(item.edge)).collect();
+                let mut path = Vec::with_capacity(path_edges.len());
+                for item in &path_edges {
+                    work.step(is_cancelled)?;
+                    path.push(path_step(item.edge));
+                }
+                work.step(is_cancelled)?;
                 let violation = make_violation(
                     rule,
                     nodes,
@@ -1380,9 +1590,21 @@ fn reconstruct_path<'a>(
     target: &str,
     predecessor: &HashMap<String, &'a AdmittedEdge<'a>>,
 ) -> Result<Vec<&'a AdmittedEdge<'a>>> {
+    let mut work = PolicyEvaluationWork::new(usize::MAX);
+    reconstruct_path_bounded(source, target, predecessor, &mut work, &mut || false)
+}
+
+fn reconstruct_path_bounded<'a>(
+    source: &str,
+    target: &str,
+    predecessor: &HashMap<String, &'a AdmittedEdge<'a>>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<&'a AdmittedEdge<'a>>> {
     let mut current = target;
     let mut reversed = Vec::new();
     while current != source {
+        work.step(is_cancelled)?;
         let edge = predecessor
             .get(current)
             .copied()
@@ -1516,11 +1738,25 @@ fn resolve_selector<'a>(
     selector: &PolicySelector,
     description: &str,
 ) -> Result<Vec<&'a NodeRecord>> {
-    let mut matches: Vec<_> = snapshot
-        .nodes
-        .iter()
-        .filter(|node| selector_matches_node(node, selector))
-        .collect();
+    let mut work = PolicyEvaluationWork::new(usize::MAX);
+    resolve_selector_bounded(snapshot, selector, description, &mut work, &mut || false)
+}
+
+fn resolve_selector_bounded<'a>(
+    snapshot: &'a GraphSnapshot,
+    selector: &PolicySelector,
+    description: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<&'a NodeRecord>> {
+    let mut matches = Vec::new();
+    for node in &snapshot.nodes {
+        work.step(is_cancelled)?;
+        if selector_matches_node(node, selector) {
+            work.step(is_cancelled)?;
+            matches.push(node);
+        }
+    }
     matches.sort_by(|left, right| left.id.cmp(&right.id));
     if selector.cardinality == PolicySelectorCardinality::One && matches.len() != 1 {
         bail!(
@@ -2392,6 +2628,157 @@ mod tests {
             rules: vec![rule],
             suppressions: Vec::new(),
         }
+    }
+
+    fn runtime_boundary_broad_fixture(
+        source_count: usize,
+        chain_length: usize,
+    ) -> (GraphSnapshot, PolicyConfig) {
+        assert!(source_count > 0);
+        assert!(chain_length > 0);
+
+        let mut nodes = Vec::with_capacity(source_count + chain_length + 1);
+        for index in 0..source_count {
+            let id = format!("source-{index:04}");
+            nodes.push(semantic_node(
+                &id,
+                "component",
+                &format!("src/{id}.tsx"),
+                json!({}),
+            ));
+        }
+        for index in 0..chain_length {
+            let id = format!("chain-{index:04}");
+            nodes.push(semantic_node(
+                &id,
+                "component",
+                &format!("src/{id}.tsx"),
+                json!({}),
+            ));
+        }
+        nodes.push(semantic_node(
+            "boundary",
+            "component",
+            "src/boundary.tsx",
+            json!({}),
+        ));
+
+        let mut edges = Vec::with_capacity(source_count + chain_length);
+        for index in 0..source_count {
+            let source = format!("source-{index:04}");
+            edges.push(edge(
+                &format!("{source}-imports-chain"),
+                &source,
+                "chain-0000",
+                "profile:production",
+            ));
+        }
+        for index in 0..chain_length.saturating_sub(1) {
+            let source = format!("chain-{index:04}");
+            let target = format!("chain-{:04}", index + 1);
+            edges.push(edge(
+                &format!("{source}-imports-next"),
+                &source,
+                &target,
+                "profile:production",
+            ));
+        }
+        let mut boundary_edge = edge(
+            "chain-crosses-boundary",
+            &format!("chain-{:04}", chain_length - 1),
+            "boundary",
+            "profile:production",
+        );
+        boundary_edge.kind = "client_boundary".to_owned();
+        edges.push(boundary_edge);
+
+        let mut graph = snapshot(edges);
+        graph.nodes = nodes;
+
+        let mut runtime = rule(PolicyRuleKind::RuntimeBoundary);
+        runtime.id = "bounded-runtime-boundary".to_owned();
+        runtime.source = PolicySelector {
+            kind: PolicySelectorKind::Component,
+            field: PolicySelectorField::Locator,
+            match_kind: PolicyMatchKind::Prefix,
+            value: "component:source-".to_owned(),
+            cardinality: PolicySelectorCardinality::Many,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        runtime.target = PolicySelector {
+            kind: PolicySelectorKind::Component,
+            field: PolicySelectorField::Locator,
+            match_kind: PolicyMatchKind::Exact,
+            value: "component:boundary".to_owned(),
+            cardinality: PolicySelectorCardinality::One,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        (graph, config(runtime))
+    }
+
+    #[test]
+    fn runtime_boundary_broad_selector_honors_work_budget_and_cancellation() -> Result<()> {
+        let (graph, policy) = runtime_boundary_broad_fixture(64, 128);
+
+        let exhausted =
+            evaluate_policy_cancellable("snapshot:bounded-runtime", &graph, &policy, 2_000, || {
+                false
+            })
+            .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let cancelled = evaluate_policy_cancellable(
+            "snapshot:bounded-runtime",
+            &graph,
+            &policy,
+            usize::MAX,
+            || {
+                checks += 1;
+                checks > 2_000
+            },
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 2_001);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_boundary_audit_shares_one_work_budget_across_snapshots() -> Result<()> {
+        let (before, policy) = runtime_boundary_broad_fixture(8, 16);
+        let mut one_snapshot_work: usize = 0;
+        let one_snapshot =
+            evaluate_policy_cancellable("snapshot:before", &before, &policy, usize::MAX, || {
+                one_snapshot_work += 1;
+                false
+            })?;
+        assert!(!one_snapshot.violations.is_empty());
+        assert!(one_snapshot_work > 1);
+
+        let single_snapshot_budget = one_snapshot_work.saturating_add(1);
+        let after = before.clone();
+        evaluate_policy_cancellable(
+            "snapshot:before",
+            &before,
+            &policy,
+            single_snapshot_budget,
+            || false,
+        )?;
+        let exhausted = evaluate_boundary_violation_ids_cancellable(
+            "snapshot:before",
+            &before,
+            "snapshot:after",
+            &after,
+            &policy,
+            single_snapshot_budget,
+            || false,
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+        Ok(())
     }
 
     #[test]

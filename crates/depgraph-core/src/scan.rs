@@ -27,12 +27,13 @@ use crate::{
         HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest,
     },
     policy::PolicyResult,
-    policy_engine::evaluate_policy,
+    policy_engine::{evaluate_policy_cancellable, is_policy_evaluation_cancelled},
     profile_selection::{
         DefaultProfileSelectionPlan, ProfileSelectionMode, validate_profile_selection_plan,
     },
     profile_selection_preview::plan_repository_profiles,
     profile_selection_rank::profile_selection_doctor_status,
+    service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
         execute_worker_with_cancellation, is_security_error, locate_worker,
@@ -1152,8 +1153,17 @@ fn complete_scan_with_mode(
     } else {
         let snapshot = store.load_snapshot(scan_id)?;
         let snapshot_id = store.prospective_scan_snapshot_id(scan_id)?;
-        match evaluate_policy(snapshot_id, &snapshot, &config.policy) {
+        match evaluate_policy_cancellable(
+            snapshot_id,
+            &snapshot,
+            &config.policy,
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            || cancellation.is_cancelled(),
+        ) {
             Ok(result) => Some(result),
+            Err(error) if is_policy_evaluation_cancelled(&error) || cancellation.is_cancelled() => {
+                return cancel_scan(store, scan_id);
+            }
             Err(error) => {
                 let message = format!("architecture policy evaluation failed: {error:#}");
                 add_core_diagnostic(

@@ -40,7 +40,10 @@ use crate::{
 
 use crate::{
     policy::PolicyConfig,
-    policy_engine::{evaluate_policy, evaluate_policy_diff, new_boundary_violation_ids},
+    policy_engine::{
+        evaluate_boundary_violation_ids_cancellable, is_policy_evaluation_cancelled,
+        is_policy_evaluation_resource_exhausted,
+    },
 };
 
 const MAX_GIT_REF_BYTES: usize = 256;
@@ -867,6 +870,22 @@ fn evaluate_audit_boundary_ids(
     after: &PinnedHealthSnapshot,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<BTreeSet<String>> {
+    evaluate_audit_boundary_ids_with_limit(
+        policy,
+        before,
+        after,
+        cancellation,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+    )
+}
+
+fn evaluate_audit_boundary_ids_with_limit(
+    policy: &PolicyConfig,
+    before: Option<&PinnedHealthSnapshot>,
+    after: &PinnedHealthSnapshot,
+    cancellation: &CancellationToken,
+    maximum_work: usize,
+) -> DepgraphServiceResult<BTreeSet<String>> {
     let has_boundary_rule = policy.rules.iter().any(|rule| {
         matches!(
             rule.kind,
@@ -890,24 +909,24 @@ fn evaluate_audit_boundary_ids(
         policy.rules.len().saturating_add(1),
         cancellation,
     )?;
-    let before_result = evaluate_policy(before.id().as_str(), before.snapshot(), policy)
-        .map_err(|_| DepgraphServiceError::PolicyInput)?;
-    if cancellation.is_cancelled() {
-        return Err(DepgraphServiceError::Cancelled);
-    }
-    let after_result = evaluate_policy_diff(
+    evaluate_boundary_violation_ids_cancellable(
         before.id().as_str(),
         before.snapshot(),
         after.id().as_str(),
         after.snapshot(),
         policy,
+        maximum_work,
+        || cancellation.is_cancelled(),
     )
-    .map_err(|_| DepgraphServiceError::PolicyInput)?;
-    Ok(new_boundary_violation_ids(
-        &before_result,
-        &after_result,
-        policy,
-    ))
+    .map_err(|source| {
+        if is_policy_evaluation_resource_exhausted(&source) {
+            DepgraphServiceError::ResourceExhausted
+        } else if is_policy_evaluation_cancelled(&source) || cancellation.is_cancelled() {
+            DepgraphServiceError::Cancelled
+        } else {
+            DepgraphServiceError::PolicyInput
+        }
+    })
 }
 
 struct SnapshotScopedCollection {
@@ -1436,8 +1455,114 @@ fn collect_runtime_observations(
 
 #[cfg(test)]
 mod tests {
+    use depgraph_protocol::{EvidenceKind, Precision, ResolutionStatus};
+    use depgraph_store::{CoverageRecord, ProfileMatrixRecord};
+
     use super::*;
     use crate::health::DEFAULT_HOTSPOT_WEIGHTS;
+    use crate::policy::{
+        POLICY_SCHEMA_VERSION, PolicyCondition, PolicyEvidenceRequirement, PolicyMatchKind,
+        PolicyProfileFilter, PolicyRule, PolicyRuleKind, PolicySelector, PolicySelectorCardinality,
+        PolicySelectorField, PolicySelectorKind, PolicySelectorScope,
+    };
+
+    fn bounded_runtime_policy() -> PolicyConfig {
+        let selector = |value: &str, cardinality| PolicySelector {
+            kind: PolicySelectorKind::Component,
+            field: PolicySelectorField::Locator,
+            match_kind: PolicyMatchKind::Prefix,
+            value: value.to_owned(),
+            cardinality,
+            exclude: Vec::new(),
+            scope: PolicySelectorScope::default(),
+        };
+        PolicyConfig {
+            schema_version: POLICY_SCHEMA_VERSION.to_owned(),
+            rules: vec![PolicyRule {
+                id: "health-runtime-boundary".to_owned(),
+                kind: PolicyRuleKind::RuntimeBoundary,
+                severity: crate::policy::PolicySeverity::Error,
+                source: selector("component:source-", PolicySelectorCardinality::Many),
+                target: selector("component:boundary", PolicySelectorCardinality::One),
+                profiles: PolicyProfileFilter::default(),
+                condition: PolicyCondition::default(),
+                precisions: vec![Precision::Exact],
+                resolution_statuses: vec![ResolutionStatus::Resolved],
+                evidence: PolicyEvidenceRequirement {
+                    kinds: vec![EvidenceKind::Source],
+                    minimum_spans: 1,
+                    primary_only: true,
+                },
+                threshold: None,
+            }],
+            suppressions: Vec::new(),
+        }
+    }
+
+    fn empty_snapshot() -> GraphSnapshot {
+        GraphSnapshot {
+            scan: ScanRecord {
+                id: "scan:health-limit-test".to_owned(),
+                root: "/health-limit-test".to_owned(),
+                status: "completed".to_owned(),
+                strict: false,
+                started_at: String::new(),
+                completed_at: None,
+                project_code_executed: false,
+                error: None,
+                parent_snapshot_id: None,
+                source_revision: None,
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
+            },
+            profiles: Vec::new(),
+            nodes: Vec::new(),
+            sites: Vec::new(),
+            edges: Vec::new(),
+            evidence: Vec::new(),
+            diagnostics: Vec::new(),
+            file_coverage: Vec::new(),
+            adapter_logs: Vec::new(),
+            coverage: CoverageRecord::default(),
+            profile_matrix: ProfileMatrixRecord::default(),
+        }
+    }
+
+    fn pinned_snapshot(digest: char) -> PinnedHealthSnapshot {
+        let stable_id = format!("snapshot:sha256:{}", digest.to_string().repeat(64));
+        PinnedHealthSnapshot {
+            id: ResolvedSnapshotId::from_completed(stable_id).expect("stable test snapshot ID"),
+            snapshot: empty_snapshot(),
+        }
+    }
+
+    #[test]
+    fn issue_439_health_boundary_maps_policy_budget_and_cancellation() {
+        let policy = bounded_runtime_policy();
+        let before = pinned_snapshot('a');
+        let after = pinned_snapshot('b');
+        let live = CancellationToken::new();
+        let exhausted =
+            evaluate_audit_boundary_ids_with_limit(&policy, Some(&before), &after, &live, 0);
+        assert!(matches!(
+            exhausted,
+            Err(DepgraphServiceError::ResourceExhausted)
+        ));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            evaluate_audit_boundary_ids_with_limit(
+                &policy,
+                Some(&before),
+                &after,
+                &cancelled,
+                usize::MAX,
+            ),
+            Err(DepgraphServiceError::Cancelled)
+        ));
+    }
 
     #[test]
     fn issue_423_manifest_parsers_cover_declared_sections_only() {
