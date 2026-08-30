@@ -419,6 +419,28 @@ fn is_production_declaration(site: &SiteRecord) -> bool {
 }
 
 fn package_name(node: &NodeRecord) -> Option<String> {
+    let is_go = node
+        .properties
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        == Some("go")
+        || node
+            .properties
+            .get("ecosystem")
+            .and_then(serde_json::Value::as_str)
+            == Some("go");
+    if is_go {
+        // Go package declarations use a short package_name (for example
+        // "http"), while go.mod requirements and import usage are keyed by
+        // canonical module/import paths. Prefer those canonical identities so
+        // importing a package below a required module cannot be reported as an
+        // unused dependency.
+        for key in ["import_path", "package_path", "module_path"] {
+            if let Some(value) = node.properties.get(key).and_then(serde_json::Value::as_str) {
+                return Some(value.to_owned());
+            }
+        }
+    }
     for key in [
         "name",
         "package",
@@ -1030,13 +1052,14 @@ mod tests {
                 ecosystem_package("go:app", "example.com/app", manifest, "go"),
                 NodeRecord {
                     id: "go:external-package".to_owned(),
-                    kind: "external_system".to_owned(),
-                    locator: "gomod:example.net/external/pkg".to_owned(),
+                    kind: "module".to_owned(),
+                    locator: "go-package:example.net/external/pkg".to_owned(),
                     display_name: "example.net/external/pkg".to_owned(),
                     properties: json!({
-                        "ecosystem": "go",
-                        "external": true,
-                        "import_path": "example.net/external/pkg"
+                        "language": "go",
+                        "module_path": "example.net/external",
+                        "package_name": "pkg",
+                        "relative_dir": "pkg"
                     }),
                 },
                 NodeRecord {
