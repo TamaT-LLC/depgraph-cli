@@ -3,12 +3,13 @@ use std::{fs, path::Path, process::Command};
 use anyhow::Result;
 use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest,
-    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest,
-    SnapshotLocator,
+    DepgraphServiceLimits, HealthAuditRequest, HealthAuditResult, HealthFindingGetRequest,
+    HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS,
+    PolicyEvaluateRequest, SnapshotLocator,
 };
 use depgraph_core::{
-    CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind, HotspotWeights,
+    BlockerKind, CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind,
+    HotspotWeights,
 };
 use depgraph_store::{ScanHealthProvenance, Store};
 use serde_json::json;
@@ -208,6 +209,45 @@ fn init_git(root: &Path) -> String {
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-m", "seed"]);
     run_git(root, &["rev-parse", "HEAD"])
+}
+
+fn write_boundary_policy(root: &Path) -> Result<()> {
+    fs::write(
+        root.join(".depgraph.toml"),
+        r#"schema_version = 1
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "audit-boundary"
+kind = "forbidden_dependency"
+severity = "error"
+source = { kind = "file", field = "id", match = "exact", value = "file:src/used.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+target = { kind = "file", field = "id", match = "exact", value = "file:src/unused.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+profiles = { include = [{ match = "exact", value = "fixture:rust" }], exclude = [] }
+condition = { op = "all", conditions = [] }
+precisions = ["exact"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
+"#,
+    )?;
+    Ok(())
+}
+
+fn assert_audit_degraded_with_blocker(result: &HealthAuditResult, blocker: BlockerKind) {
+    let finding = result
+        .findings()
+        .iter()
+        .find(|finding| finding.kind == FindingKind::NewBoundaryViolation)
+        .expect("boundary policy finding reaches the audit result");
+    assert_eq!(finding.confidence, Confidence::Indeterminate);
+    assert!(
+        finding
+            .blockers
+            .iter()
+            .any(|finding_blocker| finding_blocker.kind == blocker),
+        "expected {blocker:?} blocker in {finding:?}"
+    );
 }
 
 #[test]
@@ -569,6 +609,19 @@ evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
         .expect("evaluated boundary violation becomes an audit finding");
     assert_eq!(boundary.subject_id, expected_policy_id);
     assert_eq!(boundary.subject_id, policy_pair.result.violations[0].id);
+    assert_eq!(boundary.confidence, Confidence::Indeterminate);
+    assert!(
+        boundary
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == BlockerKind::IncomparablePolicy)
+    );
+    assert!(
+        boundary
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == BlockerKind::IncomparableContract)
+    );
     Ok(())
 }
 
@@ -577,10 +630,11 @@ fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("repo");
     fs::create_dir_all(root.join("src"))?;
+    write_boundary_policy(&root)?;
     let base_revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let current_policy = depgraph_core::health::health_policy_config_digest(
-        &depgraph_core::PolicyConfig::default(),
+        &depgraph_core::Config::load(&root)?.policy,
     )?;
     let previous_policy = format!("policy-config:sha256:{}", "b".repeat(64));
     let contract = "depgraph-health-finding-v1".to_owned();
@@ -633,11 +687,14 @@ fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts
     )?;
     assert!(first_scope.comparability().policy_changed);
     assert!(!first_scope.comparability().contract_changed);
+    let first_result = service.health_audit(&first_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&first_result, BlockerKind::IncomparablePolicy);
 
     // The snapshots below agree with each other, but the live policy remains
-    // the default digest while both persisted rows carry `previous_policy`.
-    // This must still be incomparable because the evaluator is using the
-    // current policy, not the historical snapshot policy.
+    // the current configured policy while both persisted rows carry
+    // `previous_policy`. This must still be incomparable because the
+    // evaluator is using the current policy, not the historical snapshot
+    // policy.
     fs::write(
         root.join("src/used.rs"),
         "pub fn used() { println!(\"live policy drift\"); }\n",
@@ -670,6 +727,8 @@ fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts
     )?;
     assert!(second_scope.comparability().policy_changed);
     assert!(!second_scope.comparability().contract_changed);
+    let second_result = service.health_audit(&second_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&second_result, BlockerKind::IncomparablePolicy);
     Ok(())
 }
 
@@ -678,10 +737,11 @@ fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Resul
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("repo");
     fs::create_dir_all(root.join("src"))?;
+    write_boundary_policy(&root)?;
     let base_revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let policy = depgraph_core::health::health_policy_config_digest(
-        &depgraph_core::PolicyConfig::default(),
+        &depgraph_core::Config::load(&root)?.policy,
     )?;
     let contract = "depgraph-health-finding-v1".to_owned();
     let mut store = Store::open(&store_path)?;
@@ -732,6 +792,8 @@ fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Resul
     )?;
     assert!(!scope.comparability().policy_changed);
     assert!(scope.comparability().contract_changed);
+    let result = service.health_audit(&scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&result, BlockerKind::IncomparableContract);
 
     // The snapshots can agree on the old analyzer version while the running
     // binary has moved forward.  The pair is then incomparable even though
@@ -767,6 +829,8 @@ fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Resul
     )?;
     assert!(!second_scope.comparability().policy_changed);
     assert!(second_scope.comparability().contract_changed);
+    let second_result = service.health_audit(&second_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&second_result, BlockerKind::IncomparableContract);
     Ok(())
 }
 
