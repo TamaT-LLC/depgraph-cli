@@ -2805,11 +2805,17 @@ fn evaluate_edge_condition(
     }
 }
 
+const MAX_EDGE_CONDITION_DEPTH: usize = 128;
+
 enum ConditionParseFrame<'a> {
-    Visit(&'a Value),
+    Visit {
+        value: &'a Value,
+        depth: usize,
+    },
     Aggregate {
         any: bool,
         children: &'a [Value],
+        depth: usize,
         next: usize,
         awaiting_child: bool,
         values: Vec<PolicyCondition>,
@@ -2822,19 +2828,25 @@ enum ConditionParseFrame<'a> {
 /// policy evaluation also accepts snapshots loaded from older stores and test
 /// fixtures.  Keeping the parser iterative makes a malformed/deep condition
 /// consume the shared policy budget instead of growing the Rust call stack.
+/// The depth ceiling matches serde_json's default recursion protection, so a
+/// manually assembled snapshot cannot create a condition tree whose recursive
+/// Drop would be deeper than a snapshot accepted from JSON.
 fn parse_condition_bounded(
     value: &Value,
     edge_id: &str,
     work: &mut PolicyEvaluationWork,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<PolicyCondition> {
-    let mut frames = vec![ConditionParseFrame::Visit(value)];
+    let mut frames = vec![ConditionParseFrame::Visit { value, depth: 0 }];
     let mut values = Vec::new();
 
     while let Some(frame) = frames.pop() {
         match frame {
-            ConditionParseFrame::Visit(value) => {
+            ConditionParseFrame::Visit { value, depth } => {
                 work.step(is_cancelled)?;
+                if depth > MAX_EDGE_CONDITION_DEPTH {
+                    bail!("edge {edge_id:?} has an invalid policy condition");
+                }
                 let object = value
                     .as_object()
                     .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
@@ -2860,6 +2872,7 @@ fn parse_condition_bounded(
                         frames.push(ConditionParseFrame::Aggregate {
                             any: operation == "any",
                             children,
+                            depth,
                             next: 0,
                             awaiting_child: false,
                             values: Vec::new(),
@@ -2877,7 +2890,10 @@ fn parse_condition_bounded(
                             format!("edge {edge_id:?} has an invalid policy condition")
                         })?;
                         frames.push(ConditionParseFrame::Not);
-                        frames.push(ConditionParseFrame::Visit(child));
+                        frames.push(ConditionParseFrame::Visit {
+                            value: child,
+                            depth: depth + 1,
+                        });
                     }
                     "eq" => {
                         require_condition_fields(
@@ -2947,6 +2963,7 @@ fn parse_condition_bounded(
             ConditionParseFrame::Aggregate {
                 any,
                 children,
+                depth,
                 mut next,
                 awaiting_child,
                 values: mut conditions,
@@ -2962,11 +2979,15 @@ fn parse_condition_bounded(
                     frames.push(ConditionParseFrame::Aggregate {
                         any,
                         children,
+                        depth,
                         next,
                         awaiting_child: true,
                         values: conditions,
                     });
-                    frames.push(ConditionParseFrame::Visit(child));
+                    frames.push(ConditionParseFrame::Visit {
+                        value: child,
+                        depth: depth + 1,
+                    });
                 } else {
                     values.push(if any {
                         PolicyCondition::Any { conditions }
@@ -5645,6 +5666,18 @@ mod tests {
         .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
         assert_eq!(checks, 65);
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let invalid = admitted_edges_with_options_bounded(
+            &deep_graph,
+            &policy,
+            false,
+            true,
+            &mut work,
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("invalid policy condition"));
 
         // The deeply nested Value is intentionally kept alive until the
         // bounded parser has returned, then leaked for this process-local
