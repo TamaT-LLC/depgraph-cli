@@ -6,8 +6,12 @@ package issue437golden
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"path"
 	"sort"
 	"strings"
 )
@@ -48,8 +52,11 @@ func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 			if err != nil {
 				return nil, err
 			}
-			node["id"], err = mappedID(maps.nodeIDs, rawID, "node")
+			node["id"], err = mappedOrNormalizedID(maps.nodeIDs, maps.normalizedNodeIDs, rawID, "node")
 			if err != nil {
+				return nil, err
+			}
+			if err := normalizeSemanticNodeIdentity(node, maps.nodeIDs, maps.normalizedNodeIDs); err != nil {
 				return nil, err
 			}
 		case "dependency_site":
@@ -111,10 +118,65 @@ func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 	return ordered, nil
 }
 
+func normalizeSemanticNodeIdentity(node map[string]any, nodeIDs map[string]string, normalizedNodeIDs map[string]struct{}) error {
+	kind, err := stringField(node, "kind")
+	if err != nil {
+		return err
+	}
+	if kind != "symbol" && kind != "type" {
+		return nil
+	}
+	properties, err := objectField(node, "properties")
+	if err != nil {
+		return err
+	}
+	identity, err := objectField(properties, "canonical_identity")
+	if err != nil {
+		return err
+	}
+	if kind == "symbol" {
+		identityKind, err := nonEmptyString(identity, "identity_kind")
+		if err != nil {
+			return err
+		}
+		if identityKind != "named" {
+			rawID, err := stringField(node, "id")
+			if err != nil {
+				return err
+			}
+			mapped, err := mappedOrNormalizedID(nodeIDs, normalizedNodeIDs, rawID, "semantic node")
+			if err != nil {
+				return err
+			}
+			// Go's local/anonymous producer locator embeds the profile-scoped
+			// enclosing node ID. Replace that transport spelling with the
+			// normalized node ID so the complete golden payload is host-stable.
+			node["locator"] = "go-symbol:" + mapped
+		}
+	}
+	for _, field := range []string{"enclosing_symbol", "generated_from"} {
+		value, exists := identity[field]
+		if !exists {
+			continue
+		}
+		rawID, ok := value.(string)
+		if !ok || rawID == "" {
+			return fmt.Errorf("Go golden semantic identity %s is not a non-empty node ID: %#v", field, value)
+		}
+		mapped, err := mappedOrNormalizedID(nodeIDs, normalizedNodeIDs, rawID, "semantic identity "+field)
+		if err != nil {
+			return err
+		}
+		identity[field] = mapped
+	}
+	return nil
+}
+
 type eventMaps struct {
 	scanID             string
 	declaredProfileIDs map[string]struct{}
 	nodeIDs            map[string]string
+	normalizedNodeIDs  map[string]struct{}
 	siteIDs            map[string]string
 	edgeIDs            map[string]string
 	diagnosticIDs      map[string]string
@@ -144,6 +206,7 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 	maps := eventMaps{
 		declaredProfileIDs: map[string]struct{}{},
 		nodeIDs:            map[string]string{},
+		normalizedNodeIDs:  map[string]struct{}{},
 		siteIDs:            map[string]string{},
 		edgeIDs:            map[string]string{},
 		diagnosticIDs:      map[string]string{},
@@ -151,6 +214,7 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 	if err := validateStreamReferences(events, &maps); err != nil {
 		return eventMaps{}, err
 	}
+	nodesByID := map[string]map[string]any{}
 	for _, event := range events {
 		if event["event"] != "node_upsert" {
 			continue
@@ -163,29 +227,45 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 		if err != nil {
 			return eventMaps{}, err
 		}
+		if previous, duplicate := nodesByID[rawID]; duplicate {
+			previousJSON, _ := canonicalJSON(previous)
+			currentJSON, _ := canonicalJSON(node)
+			if previousJSON != currentJSON {
+				return eventMaps{}, fmt.Errorf("Go golden node ID %q is upserted with conflicting payloads", rawID)
+			}
+			continue
+		}
+		nodesByID[rawID] = node
+	}
+
+	logicalNodeIDs, err := resolveNodeLogicalIDs(nodesByID)
+	if err != nil {
+		return eventMaps{}, err
+	}
+	rawNodeIDs := make([]string, 0, len(nodesByID))
+	for rawID := range nodesByID {
+		rawNodeIDs = append(rawNodeIDs, rawID)
+	}
+	sort.Strings(rawNodeIDs)
+	normalizedToRaw := map[string]string{}
+	for _, rawID := range rawNodeIDs {
+		// The workspace identity is not profile-scoped, so retaining its raw
+		// ID makes a real workspace identity drift fail the comparison.
+		node := nodesByID[rawID]
 		kind, err := stringField(node, "kind")
 		if err != nil {
 			return eventMaps{}, err
 		}
-		logicalID, err := nodeLogicalID(node)
-		if err != nil {
-			return eventMaps{}, err
-		}
-		// The workspace identity is not profile-scoped, so retaining its raw
-		// ID makes a real workspace identity drift fail the comparison.
 		normalizedID := rawID
 		if profileScopedNodeKind(kind) {
-			normalizedID = "profile-node:" + logicalID
+			normalizedID = "profile-node:" + logicalNodeIDs[rawID]
 		}
-		if previous, duplicate := maps.nodeIDs[rawID]; duplicate && previous != normalizedID {
-			return eventMaps{}, fmt.Errorf("Go golden node ID %q maps to both %q and %q", rawID, previous, normalizedID)
+		if existingRaw, duplicate := normalizedToRaw[normalizedID]; duplicate && existingRaw != rawID {
+			return eventMaps{}, fmt.Errorf("Go golden logical node %q has multiple IDs %q and %q", normalizedID, existingRaw, rawID)
 		}
-		for existingRaw, existingNormalized := range maps.nodeIDs {
-			if existingRaw != rawID && existingNormalized == normalizedID {
-				return eventMaps{}, fmt.Errorf("Go golden logical node %q has multiple IDs %q and %q", normalizedID, existingRaw, rawID)
-			}
-		}
+		normalizedToRaw[normalizedID] = rawID
 		maps.nodeIDs[rawID] = normalizedID
+		maps.normalizedNodeIDs[normalizedID] = struct{}{}
 	}
 	for _, event := range events {
 		if event["event"] != "dependency_site" {
@@ -454,8 +534,19 @@ func eventOrderingKey(event map[string]any, maps eventMaps) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		logical, err = nodeLogicalID(node)
+		rawID, err := stringField(node, "id")
 		if err != nil {
+			return "", err
+		}
+		logical, err = mappedOrNormalizedID(maps.nodeIDs, maps.normalizedNodeIDs, rawID, "node")
+		if err != nil {
+			return "", err
+		}
+		payloadNode, err := objectField(payload, "node")
+		if err != nil {
+			return "", err
+		}
+		if err := normalizeSemanticNodeIdentity(payloadNode, maps.nodeIDs, maps.normalizedNodeIDs); err != nil {
 			return "", err
 		}
 	case "dependency_site":
@@ -538,31 +629,417 @@ func profileScopedNodeKind(kind string) bool {
 	}
 }
 
-func nodeLogicalID(node map[string]any) (string, error) {
+// resolveNodeLogicalIDs performs an explicit dependency walk instead of
+// recursively following enclosing_symbol/generated_from. Semantic scans can
+// contain arbitrarily deeply nested locals; keeping the walk on the heap makes
+// normalization stack-safe while still rejecting cycles and missing origins.
+func resolveNodeLogicalIDs(nodesByID map[string]map[string]any) (map[string]string, error) {
+	logicalNodeIDs := map[string]string{}
+	states := map[string]uint8{}
+	rawIDs := make([]string, 0, len(nodesByID))
+	for rawID := range nodesByID {
+		rawIDs = append(rawIDs, rawID)
+	}
+	sort.Strings(rawIDs)
+
+	type frame struct {
+		rawID string
+		deps  []string
+		next  int
+	}
+	for _, rootID := range rawIDs {
+		if states[rootID] == 2 {
+			continue
+		}
+		stack := []frame{{rawID: rootID}}
+		for len(stack) > 0 {
+			current := &stack[len(stack)-1]
+			state := states[current.rawID]
+			if state == 0 {
+				if _, ok := nodesByID[current.rawID]; !ok {
+					return nil, fmt.Errorf("Go golden semantic node identity references unknown node %q", current.rawID)
+				}
+				states[current.rawID] = 1
+				deps, err := semanticNodeOriginIDs(nodesByID[current.rawID])
+				if err != nil {
+					return nil, err
+				}
+				current.deps = deps
+			}
+			if current.next < len(current.deps) {
+				dependency := current.deps[current.next]
+				current.next++
+				switch states[dependency] {
+				case 0:
+					stack = append(stack, frame{rawID: dependency})
+				case 1:
+					return nil, fmt.Errorf("Go golden semantic node identity contains a cycle at %q", dependency)
+				case 2:
+					// The dependency was already resolved in this walk.
+				}
+				continue
+			}
+
+			logicalID, err := nodeLogicalIDResolved(nodesByID[current.rawID], nodesByID, logicalNodeIDs)
+			if err != nil {
+				return nil, err
+			}
+			logicalNodeIDs[current.rawID] = logicalID
+			states[current.rawID] = 2
+			stack = stack[:len(stack)-1]
+		}
+	}
+	return logicalNodeIDs, nil
+}
+
+func nodeLogicalIDResolved(node map[string]any, nodesByID map[string]map[string]any, memo map[string]string) (string, error) {
 	kind, err := stringField(node, "kind")
 	if err != nil {
 		return "", err
 	}
-	if kind == "symbol" || kind == "type" {
-		properties, err := objectField(node, "properties")
+	switch kind {
+	case "symbol", "type":
+		return semanticNodeLogicalID(node, nodesByID, memo)
+	case "external_system":
+		return externalNodeLogicalID(node)
+	default:
+		locator, locatorErr := stringField(node, "locator")
+		if locatorErr != nil {
+			return "", locatorErr
+		}
+		return kind + ":" + locator, nil
+	}
+}
+
+func semanticNodeOriginIDs(node map[string]any) ([]string, error) {
+	kind, err := stringField(node, "kind")
+	if err != nil {
+		return nil, err
+	}
+	if kind != "symbol" && kind != "type" {
+		return nil, nil
+	}
+	properties, err := objectField(node, "properties")
+	if err != nil {
+		return nil, err
+	}
+	identity, err := objectField(properties, "canonical_identity")
+	if err != nil {
+		return nil, fmt.Errorf("Go golden %s node has no canonical_identity object: %w", kind, err)
+	}
+	if _, err := nonEmptyString(identity, "language"); err != nil {
+		return nil, err
+	}
+	if _, err := nonEmptyString(identity, "package_locator"); err != nil {
+		return nil, err
+	}
+	if kind == "type" {
+		if err := requireMatchingSemanticKind(properties, identity, "type_kind"); err != nil {
+			return nil, err
+		}
+		if _, err := nonEmptyString(identity, "resolver_identity"); err != nil {
+			return nil, fmt.Errorf("Go golden type identity: %w", err)
+		}
+		return nil, nil
+	}
+	if err := requireMatchingSemanticKind(properties, identity, "symbol_kind"); err != nil {
+		return nil, err
+	}
+	identityKind, err := requiredIdentityKind(identity)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateReservedSymbolIdentityKind(identity["symbol_kind"].(string), identityKind); err != nil {
+		return nil, err
+	}
+	switch identityKind {
+	case "named":
+		if _, err := nonEmptyString(identity, "resolver_identity"); err != nil {
+			return nil, fmt.Errorf("Go golden named symbol identity: %w", err)
+		}
+		return nil, nil
+	case "local":
+		field, rawOrigin, err := semanticIdentityOrigin(identityKind, identity, "enclosing_symbol")
+		if err != nil {
+			return nil, err
+		}
+		if field == "" {
+			return nil, fmt.Errorf("Go golden %s symbol identity has no origin field", identityKind)
+		}
+		return []string{rawOrigin}, nil
+	case "anonymous":
+		field, rawOrigin, err := semanticIdentityOrigin(identityKind, identity, "")
+		if err != nil {
+			return nil, err
+		}
+		if field == "" {
+			return nil, fmt.Errorf("Go golden %s symbol identity has no origin field", identityKind)
+		}
+		return []string{rawOrigin}, nil
+	case "generated":
+		field, rawOrigin, err := semanticIdentityOrigin(identityKind, identity, "generated_from")
+		if err != nil {
+			return nil, err
+		}
+		if field == "" {
+			return nil, fmt.Errorf("Go golden %s symbol identity has no origin field", identityKind)
+		}
+		return []string{rawOrigin}, nil
+	default:
+		return nil, fmt.Errorf("Go golden symbol has unsupported canonical_identity.identity_kind %q", identityKind)
+	}
+}
+
+func semanticNodeLogicalID(node map[string]any, nodesByID map[string]map[string]any, memo map[string]string) (string, error) {
+	kind, err := stringField(node, "kind")
+	if err != nil {
+		return "", err
+	}
+	properties, err := objectField(node, "properties")
+	if err != nil {
+		return "", err
+	}
+	identity, err := objectField(properties, "canonical_identity")
+	if err != nil {
+		return "", fmt.Errorf("Go golden %s node has no canonical_identity object: %w", kind, err)
+	}
+	if _, err := nonEmptyString(identity, "language"); err != nil {
+		return "", err
+	}
+	if _, err := nonEmptyString(identity, "package_locator"); err != nil {
+		return "", err
+	}
+	if kind == "symbol" {
+		if err := requireMatchingSemanticKind(properties, identity, "symbol_kind"); err != nil {
+			return "", err
+		}
+		identityKind, err := requiredIdentityKind(identity)
 		if err != nil {
 			return "", err
 		}
-		identity, err := objectField(properties, "canonical_identity")
-		if err != nil {
+		if err := validateReservedSymbolIdentityKind(identity["symbol_kind"].(string), identityKind); err != nil {
 			return "", err
 		}
-		resolver, err := stringField(identity, "resolver_identity")
-		if err != nil {
-			return "", err
+		switch identityKind {
+		case "named":
+			resolver, resolverErr := nonEmptyString(identity, "resolver_identity")
+			if resolverErr != nil {
+				return "", fmt.Errorf("Go golden named symbol identity: %w", resolverErr)
+			}
+			return "symbol:" + resolver, nil
+		case "local":
+			return anchoredSemanticNodeLogicalID("local", identity, "enclosing_symbol", nodesByID, memo)
+		case "anonymous":
+			return anchoredSemanticNodeLogicalID("anonymous", identity, "", nodesByID, memo)
+		case "generated":
+			return anchoredSemanticNodeLogicalID("generated", identity, "generated_from", nodesByID, memo)
+		default:
+			return "", fmt.Errorf("Go golden symbol has unsupported canonical_identity.identity_kind %q", identityKind)
 		}
-		return kind + ":" + resolver, nil
+	}
+	if err := requireMatchingSemanticKind(properties, identity, "type_kind"); err != nil {
+		return "", err
+	}
+	resolver, err := nonEmptyString(identity, "resolver_identity")
+	if err != nil {
+		return "", fmt.Errorf("Go golden type identity: %w", err)
+	}
+	return "type:" + resolver, nil
+}
+
+func anchoredSemanticNodeLogicalID(identityKind string, identity map[string]any, requiredOrigin string, nodesByID map[string]map[string]any, memo map[string]string) (string, error) {
+	present, rawOrigin, err := semanticIdentityOrigin(identityKind, identity, requiredOrigin)
+	if err != nil {
+		return "", err
+	}
+	origin, err := logicalNodeReference(rawOrigin, nodesByID, memo)
+	if err != nil {
+		return "", fmt.Errorf("Go golden %s symbol identity origin: %w", identityKind, err)
+	}
+	canonical, err := cloneObject(identity)
+	if err != nil {
+		return "", err
+	}
+	canonical[present] = origin
+	encoded, err := canonicalJSON(canonical)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(encoded))
+	return "symbol:" + identityKind + ":sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func semanticIdentityOrigin(identityKind string, identity map[string]any, requiredOrigin string) (string, string, error) {
+	originFields := []string{"enclosing_symbol", "generated_from"}
+	present := ""
+	for _, field := range originFields {
+		if _, exists := identity[field]; !exists {
+			continue
+		}
+		if present != "" {
+			return "", "", fmt.Errorf("Go golden %s symbol identity has ambiguous origin fields", identityKind)
+		}
+		present = field
+	}
+	if requiredOrigin != "" && present != requiredOrigin {
+		return "", "", fmt.Errorf("Go golden %s symbol identity requires %s origin", identityKind, requiredOrigin)
+	}
+	if present == "" {
+		return "", "", fmt.Errorf("Go golden %s symbol identity has no origin field", identityKind)
+	}
+	if _, hasResolver := identity["resolver_identity"]; hasResolver {
+		return "", "", fmt.Errorf("Go golden %s symbol identity must not contain resolver_identity", identityKind)
+	}
+	if err := validateRelativePath(identity); err != nil {
+		return "", "", err
+	}
+	if err := validateIdentitySpan(identity); err != nil {
+		return "", "", err
+	}
+	rawOrigin, err := nonEmptyString(identity, present)
+	if err != nil {
+		return "", "", fmt.Errorf("Go golden %s symbol identity: %w", identityKind, err)
+	}
+	return present, rawOrigin, nil
+}
+
+func logicalNodeReference(rawID string, nodesByID map[string]map[string]any, memo map[string]string) (string, error) {
+	logicalID, ok := memo[rawID]
+	if !ok {
+		return "", fmt.Errorf("Go golden semantic node identity references unresolved node %q", rawID)
+	}
+	node, ok := nodesByID[rawID]
+	if !ok {
+		return "", fmt.Errorf("Go golden semantic node identity references unknown node %q", rawID)
+	}
+	kind, err := stringField(node, "kind")
+	if err != nil {
+		return "", err
+	}
+	if profileScopedNodeKind(kind) {
+		return "profile-node:" + logicalID, nil
+	}
+	// Workspace identities intentionally remain exact rather than being
+	// normalized from an untrusted profile-scoped reference.
+	return rawID, nil
+}
+
+func externalNodeLogicalID(node map[string]any) (string, error) {
+	properties, err := objectField(node, "properties")
+	if err != nil {
+		return "", err
+	}
+	if rawResolver, exists := properties["resolver_identity"]; exists {
+		resolver, ok := rawResolver.(string)
+		if !ok || resolver == "" {
+			return "", fmt.Errorf("Go golden external node resolver_identity is not a non-empty string: %#v", rawResolver)
+		}
+		targetKind, err := nonEmptyString(properties, "target_kind")
+		if err != nil {
+			return "", fmt.Errorf("Go golden external node with resolver_identity: %w", err)
+		}
+		return "external:" + targetKind + ":" + resolver, nil
 	}
 	locator, err := stringField(node, "locator")
 	if err != nil {
 		return "", err
 	}
-	return kind + ":" + locator, nil
+	return "external_system:" + locator, nil
+}
+
+func requiredIdentityKind(identity map[string]any) (string, error) {
+	identityKind, err := nonEmptyString(identity, "identity_kind")
+	if err != nil {
+		return "", fmt.Errorf("Go golden symbol identity: %w", err)
+	}
+	return identityKind, nil
+}
+
+func requireMatchingSemanticKind(properties, identity map[string]any, field string) error {
+	topLevel, err := nonEmptyString(properties, field)
+	if err != nil {
+		return fmt.Errorf("Go golden semantic node: %w", err)
+	}
+	canonical, err := nonEmptyString(identity, field)
+	if err != nil {
+		return fmt.Errorf("Go golden semantic identity: %w", err)
+	}
+	if topLevel != canonical {
+		return fmt.Errorf("Go golden semantic node %s disagrees with canonical identity", field)
+	}
+	return nil
+}
+
+func validateReservedSymbolIdentityKind(symbolKind, identityKind string) error {
+	expected := ""
+	switch {
+	case strings.HasPrefix(symbolKind, "local_") || symbolKind == "parameter":
+		expected = "local"
+	case strings.HasPrefix(symbolKind, "anonymous_") || symbolKind == "closure" || symbolKind == "lambda":
+		expected = "anonymous"
+	case strings.HasPrefix(symbolKind, "generated_"):
+		expected = "generated"
+	}
+	if expected != "" && identityKind != expected {
+		return fmt.Errorf("Go golden symbol_kind %q requires canonical identity_kind %q, got %q", symbolKind, expected, identityKind)
+	}
+	return nil
+}
+
+func nonEmptyString(object map[string]any, key string) (string, error) {
+	value, ok := object[key]
+	if !ok {
+		return "", fmt.Errorf("Go golden object is missing %s", key)
+	}
+	text, ok := value.(string)
+	if !ok || text == "" {
+		return "", fmt.Errorf("Go golden object %s is not a non-empty string: %#v", key, value)
+	}
+	return text, nil
+}
+
+func validateRelativePath(identity map[string]any) error {
+	relativePath, err := nonEmptyString(identity, "relative_path")
+	if err != nil {
+		return fmt.Errorf("Go golden anchored symbol identity: %w", err)
+	}
+	if strings.Contains(relativePath, "\\") || path.IsAbs(relativePath) {
+		return fmt.Errorf("Go golden anchored symbol identity has non-portable relative_path %q", relativePath)
+	}
+	clean := path.Clean(relativePath)
+	if clean != relativePath {
+		return fmt.Errorf("Go golden anchored symbol identity has non-canonical relative_path %q", relativePath)
+	}
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") ||
+		(len(relativePath) >= 2 && relativePath[1] == ':') {
+		return fmt.Errorf("Go golden anchored symbol identity escapes the workspace with relative_path %q", relativePath)
+	}
+	return nil
+}
+
+func validateIdentitySpan(identity map[string]any) error {
+	span, err := objectField(identity, "span")
+	if err != nil {
+		return fmt.Errorf("Go golden anchored symbol identity: %w", err)
+	}
+	values := map[string]float64{}
+	const maxUint32 = float64(1<<32 - 1)
+	for _, field := range []string{"start_line", "start_column", "end_line", "end_column"} {
+		value, ok := span[field]
+		if !ok {
+			return fmt.Errorf("Go golden anchored symbol identity span is missing %s", field)
+		}
+		number, ok := value.(float64)
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 1 || number > maxUint32 || math.Trunc(number) != number {
+			return fmt.Errorf("Go golden anchored symbol identity span %s is not a positive integer: %#v", field, value)
+		}
+		values[field] = number
+	}
+	if values["end_line"] < values["start_line"] ||
+		(values["end_line"] == values["start_line"] && values["end_column"] < values["start_column"]) {
+		return fmt.Errorf("Go golden anchored symbol identity span ends before it starts: %#v", span)
+	}
+	return nil
 }
 
 func canonicalSite(site map[string]any, nodeIDs map[string]string) (string, error) {
@@ -807,6 +1284,16 @@ func normalizeStringSlice(object map[string]any, key string, ids map[string]stri
 func mappedID(ids map[string]string, rawID, role string) (string, error) {
 	if mapped, ok := ids[rawID]; ok {
 		return mapped, nil
+	}
+	return "", fmt.Errorf("Go golden %s references unknown ID %q", role, rawID)
+}
+
+func mappedOrNormalizedID(ids map[string]string, normalizedIDs map[string]struct{}, rawID, role string) (string, error) {
+	if mapped, ok := ids[rawID]; ok {
+		return mapped, nil
+	}
+	if _, alreadyNormalized := normalizedIDs[rawID]; alreadyNormalized {
+		return rawID, nil
 	}
 	return "", fmt.Errorf("Go golden %s references unknown ID %q", role, rawID)
 }

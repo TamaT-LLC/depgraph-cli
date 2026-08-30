@@ -108,6 +108,77 @@ func TestIssue437HealthFixtureMatchesEmittedGoSemanticNodes(t *testing.T) {
 	}
 }
 
+func TestIssue437SemanticProjectionAcceptsAnchoredAndExternalNodes(t *testing.T) {
+	result, err := Scan(filepath.Join("testdata", "semantic"))
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	var emitted bytes.Buffer
+	if err := Emit(&emitted, "issue437-semantic-e2e", result); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+
+	semanticNodes := issue437SemanticNodesFromNDJSON(t, emitted.Bytes())
+	if len(semanticNodes) == 0 {
+		t.Fatal("semantic projection returned no symbol/type nodes")
+	}
+	sawAnchored := false
+	sawExternalResolver := false
+	normalized, err := issue437golden.NormalizeNDJSON(emitted.Bytes())
+	if err != nil {
+		t.Fatalf("normalize semantic worker stream: %v", err)
+	}
+	for _, event := range normalized {
+		if event["event"] != "node_upsert" {
+			continue
+		}
+		node, ok := event["node"].(map[string]any)
+		if !ok {
+			t.Fatalf("node_upsert payload is not an object: %#v", event["node"])
+		}
+		kind, _ := node["kind"].(string)
+		properties, _ := node["properties"].(map[string]any)
+		if kind == "external_system" {
+			if resolver, ok := properties["resolver_identity"].(string); ok && resolver != "" {
+				sawExternalResolver = true
+				id, _ := node["id"].(string)
+				if id != "profile-node:external:symbol:"+resolver && id != "profile-node:external:type:"+resolver && id != "profile-node:external:generic_instance:"+resolver {
+					t.Fatalf("external resolver %q was not normalized by logical identity: %q", resolver, id)
+				}
+			}
+		}
+		if kind != "symbol" {
+			continue
+		}
+		identity, ok := properties["canonical_identity"].(map[string]any)
+		if !ok {
+			continue
+		}
+		identityKind, _ := identity["identity_kind"].(string)
+		if identityKind == "named" {
+			continue
+		}
+		sawAnchored = true
+		for _, field := range []string{"enclosing_symbol", "generated_from"} {
+			if origin, ok := identity[field].(string); ok {
+				if !strings.HasPrefix(origin, "profile-node:") {
+					t.Fatalf("normalized %s origin retained a raw node ID: %q", field, origin)
+				}
+			}
+		}
+		locator, _ := node["locator"].(string)
+		if strings.Contains(locator, "go-symbol:symbol:sha256:") {
+			t.Fatalf("normalized anchored locator retained raw profile node ID: %q", locator)
+		}
+	}
+	if !sawAnchored {
+		t.Fatal("semantic fixture emitted no local/anonymous symbols")
+	}
+	if !sawExternalResolver {
+		t.Fatal("semantic fixture emitted no external resolver node")
+	}
+}
+
 // issue437AssertFullGolden compares the complete Go worker stream, including
 // file nodes, structural contains/declares edges, semantic sites/edges, file
 // completion records, and the profile/scan completion envelopes. The worker's
@@ -135,7 +206,8 @@ func issue437AssertFullGolden(t *testing.T, produced, fixture []byte) {
 func issue437SemanticNodesFromNDJSON(t *testing.T, data []byte) map[string]Node {
 	t.Helper()
 	nodes := map[string]Node{}
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	normalized := issue437NormalizedNDJSON(t, data)
+	scanner := bufio.NewScanner(bytes.NewReader(normalized))
 	for scanner.Scan() {
 		var event struct {
 			Event string `json:"event"`
@@ -151,14 +223,17 @@ func issue437SemanticNodesFromNDJSON(t *testing.T, data []byte) map[string]Node 
 		if !ok {
 			t.Fatalf("semantic node %s has no canonical identity: %+v", event.Node.ID, event.Node)
 		}
-		resolver, ok := identity["resolver_identity"].(string)
-		if !ok || resolver == "" {
-			t.Fatalf("semantic node %s has no resolver identity: %+v", event.Node.ID, identity)
+		key, ok := identity["resolver_identity"].(string)
+		if !ok || key == "" {
+			// Local and anonymous symbols deliberately have no resolver identity.
+			// NormalizeNDJSON has already replaced their anchored raw node IDs with
+			// a canonical, host-independent node ID.
+			key = event.Node.ID
 		}
-		if previous, duplicate := nodes[resolver]; duplicate && !reflect.DeepEqual(previous, *event.Node) {
-			t.Fatalf("resolver %q maps to multiple semantic nodes: %+v and %+v", resolver, previous, *event.Node)
+		if previous, duplicate := nodes[key]; duplicate && !reflect.DeepEqual(previous, *event.Node) {
+			t.Fatalf("semantic identity %q maps to multiple nodes: %+v and %+v", key, previous, *event.Node)
 		}
-		nodes[resolver] = *event.Node
+		nodes[key] = *event.Node
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatalf("scan worker events: %v", err)
@@ -176,7 +251,8 @@ func issue437SemanticRelationsFromNDJSON(t *testing.T, data []byte) issue437Rela
 	nodes := map[string]Node{}
 	sites := map[string]Site{}
 	var edges []Edge
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	normalized := issue437NormalizedNDJSON(t, data)
+	scanner := bufio.NewScanner(bytes.NewReader(normalized))
 	for scanner.Scan() {
 		var event struct {
 			Event string `json:"event"`
@@ -241,5 +317,21 @@ func issue437NodeLabel(t *testing.T, nodes map[string]Node, id string) string {
 			return node.Kind + ":" + resolver
 		}
 	}
-	return node.Kind + ":" + node.Locator
+	return node.Kind + ":" + node.ID
+}
+
+func issue437NormalizedNDJSON(t *testing.T, data []byte) []byte {
+	t.Helper()
+	events, err := issue437golden.NormalizeNDJSON(data)
+	if err != nil {
+		t.Fatalf("normalize worker stream for semantic projection: %v", err)
+	}
+	var normalized bytes.Buffer
+	encoder := json.NewEncoder(&normalized)
+	for _, event := range events {
+		if err := encoder.Encode(event); err != nil {
+			t.Fatalf("encode normalized worker event: %v", err)
+		}
+	}
+	return normalized.Bytes()
 }

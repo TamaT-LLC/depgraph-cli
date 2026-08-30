@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -150,6 +151,186 @@ func TestNormalizeNDJSONRejectsUnknownAndMismatchedProfileReferences(t *testing.
 	}
 }
 
+func TestNormalizeNDJSONCanonicalizesAnchoredSemanticNodesAndExternalIdentities(t *testing.T) {
+	darwin, err := NormalizeNDJSON(testGoldenStreamWithAnchoredSemanticNodes("darwin", false))
+	if err != nil {
+		t.Fatalf("normalize Darwin anchored stream: %v", err)
+	}
+	linux, err := NormalizeNDJSON(testGoldenStreamWithAnchoredSemanticNodes("linux", true))
+	if err != nil {
+		t.Fatalf("normalize Linux anchored stream: %v", err)
+	}
+	if !reflect.DeepEqual(darwin, linux) {
+		darwinJSON, _ := json.MarshalIndent(darwin, "", "  ")
+		linuxJSON, _ := json.MarshalIndent(linux, "", "  ")
+		t.Fatalf("host anchored streams differ after logical normalization:\nDarwin:\n%s\nLinux:\n%s", darwinJSON, linuxJSON)
+	}
+	for _, event := range darwin {
+		if event["event"] != "node_upsert" {
+			continue
+		}
+		node := event["node"].(map[string]any)
+		if node["kind"] != "symbol" {
+			continue
+		}
+		identity := node["properties"].(map[string]any)["canonical_identity"]
+		identityObject, ok := identity.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, field := range []string{"enclosing_symbol", "generated_from"} {
+			if origin, ok := identityObject[field].(string); ok && strings.Contains(origin, "symbol:darwin") {
+				t.Fatalf("normalized anchored identity retained raw host node ID %q", origin)
+			}
+		}
+	}
+}
+
+func TestNormalizeNDJSONRejectsInvalidAnchoredSemanticIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "missing origin",
+			mutate: func(identity map[string]any) {
+				delete(identity, "enclosing_symbol")
+			},
+		},
+		{
+			name: "ambiguous origin",
+			mutate: func(identity map[string]any) {
+				identity["generated_from"] = identity["enclosing_symbol"]
+			},
+		},
+		{
+			name: "reserved identity kind mismatch",
+			mutate: func(identity map[string]any) {
+				identity["identity_kind"] = "anonymous"
+				delete(identity, "enclosing_symbol")
+				identity["generated_from"] = "module:darwin"
+			},
+		},
+		{
+			name: "noncanonical path",
+			mutate: func(identity map[string]any) {
+				identity["relative_path"] = "./nested.go"
+			},
+		},
+		{
+			name: "drive path",
+			mutate: func(identity map[string]any) {
+				identity["relative_path"] = "C:/nested.go"
+			},
+		},
+		{
+			name: "dot path",
+			mutate: func(identity map[string]any) {
+				identity["relative_path"] = "."
+			},
+		},
+		{
+			name: "parent path",
+			mutate: func(identity map[string]any) {
+				identity["relative_path"] = "../nested.go"
+			},
+		},
+		{
+			name: "backslash path",
+			mutate: func(identity map[string]any) {
+				identity["relative_path"] = "nested\\go"
+			},
+		},
+		{
+			name: "backwards span",
+			mutate: func(identity map[string]any) {
+				identity["span"].(map[string]any)["end_column"] = float64(1)
+			},
+		},
+		{
+			name: "span overflow",
+			mutate: func(identity map[string]any) {
+				identity["span"].(map[string]any)["start_line"] = float64(1 << 32)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			events := decodeGoldenStream(t, testGoldenStreamWithAnchoredSemanticNodes("darwin", false))
+			for _, event := range events {
+				if event["event"] != "node_upsert" {
+					continue
+				}
+				node := event["node"].(map[string]any)
+				if node["id"] != "symbol:local-darwin" {
+					continue
+				}
+				identity := node["properties"].(map[string]any)["canonical_identity"].(map[string]any)
+				test.mutate(identity)
+				if _, err := NormalizeNDJSON(encodeGoldenEvents(t, events)); err == nil {
+					t.Fatalf("NormalizeNDJSON accepted malformed anchored identity")
+				}
+				return
+			}
+			t.Fatal("anchored semantic test stream has no local symbol")
+		})
+	}
+}
+
+func TestNormalizeNDJSONRejectsAnchoredSemanticIdentityCycle(t *testing.T) {
+	events := decodeGoldenStream(t, testGoldenStreamWithAnchoredSemanticNodes("darwin", false))
+	var local, nested map[string]any
+	for _, event := range events {
+		if event["event"] != "node_upsert" {
+			continue
+		}
+		node := event["node"].(map[string]any)
+		switch node["id"] {
+		case "symbol:local-darwin":
+			local = node
+		case "symbol:anonymous-darwin":
+			nested = node
+		}
+	}
+	if local == nil || nested == nil {
+		t.Fatal("anchored semantic test stream is missing cycle nodes")
+	}
+	localIdentity := local["properties"].(map[string]any)["canonical_identity"].(map[string]any)
+	nestedIdentity := nested["properties"].(map[string]any)["canonical_identity"].(map[string]any)
+	localIdentity["enclosing_symbol"] = nested["id"]
+	nestedIdentity["enclosing_symbol"] = local["id"]
+	if _, err := NormalizeNDJSON(encodeGoldenEvents(t, events)); err == nil {
+		t.Fatal("NormalizeNDJSON accepted a cycle in anchored semantic identities")
+	}
+}
+
+func TestNormalizeNDJSONRejectsExternalResolverWithoutTargetKind(t *testing.T) {
+	events := decodeGoldenStream(t, testGoldenStreamWithAnchoredSemanticNodes("darwin", false))
+	for _, event := range events {
+		if event["event"] != "node_upsert" {
+			continue
+		}
+		node := event["node"].(map[string]any)
+		if node["kind"] != "external_system" {
+			continue
+		}
+		properties := node["properties"].(map[string]any)
+		delete(properties, "target_kind")
+		if _, err := NormalizeNDJSON(encodeGoldenEvents(t, events)); err == nil {
+			t.Fatal("NormalizeNDJSON accepted external resolver identity without target_kind")
+		}
+		return
+	}
+	t.Fatal("anchored semantic test stream has no external resolver node")
+}
+
+func TestNormalizeNDJSONResolvesDeepAnchoredSemanticChainWithoutStackOverflow(t *testing.T) {
+	const depth = 20000
+	if _, err := NormalizeNDJSON(testDeepAnchoredSemanticStream(depth)); err != nil {
+		t.Fatalf("normalize deep anchored stream: %v", err)
+	}
+}
+
 func testGoldenStream(host string, reverseSemanticEvents bool) []byte {
 	profileID := "profile:" + host
 	scanID := "scan:" + host
@@ -204,6 +385,135 @@ func testGoldenStream(host string, reverseSemanticEvents bool) []byte {
 		// graph collections in the opposite order and assigned different seqs.
 		events[2], events[3] = events[3], events[2]
 		events[4], events[5] = events[5], events[4]
+	}
+	return encodeGoldenEventsWithoutTesting(events)
+}
+
+func testGoldenStreamWithAnchoredSemanticNodes(host string, reverseNodes bool) []byte {
+	events, err := eventsFromNDJSON(testGoldenStream(host, false))
+	if err != nil {
+		panic(fmt.Sprintf("decode anchored semantic test stream: %v", err))
+	}
+	scanID := "scan:" + host
+	base := func(seq float64, node map[string]any) map[string]any {
+		return map[string]any{
+			"adapter": "go", "adapter_version": "0.5.4", "event": "node_upsert",
+			"protocol_version": "1.0", "scan_id": scanID, "seq": seq,
+			"node": node,
+		}
+	}
+	namedID := "symbol:" + host
+	moduleID := "module:" + host
+	localID := "symbol:local-" + host
+	anonymousID := "symbol:anonymous-" + host
+	initializerID := "symbol:initializer-" + host
+	semanticIdentity := func(kind, symbolKind string, fields map[string]any) map[string]any {
+		identity := map[string]any{
+			"identity_kind": identityKindForAnchoredTest(kind), "language": "go",
+			"package_locator": "go:example.com/p@workspace#example.com/p",
+			"symbol_kind":     symbolKind,
+		}
+		for key, value := range fields {
+			identity[key] = value
+		}
+		return identity
+	}
+	local := map[string]any{
+		"id": localID, "kind": "symbol", "locator": "go-symbol:" + localID, "display_name": "local",
+		"properties": map[string]any{
+			"canonical_identity": semanticIdentity("local", "local_variable", map[string]any{
+				"enclosing_symbol": namedID, "relative_path": "nested.go",
+				"span": map[string]any{"start_line": float64(10), "start_column": float64(2), "end_line": float64(10), "end_column": float64(7)},
+			}),
+			"language": "go", "package_locator": "go:example.com/p@workspace#example.com/p", "symbol_kind": "local_variable",
+		},
+	}
+	anonymous := map[string]any{
+		"id": anonymousID, "kind": "symbol", "locator": "go-symbol:" + anonymousID, "display_name": "closure",
+		"properties": map[string]any{
+			"canonical_identity": semanticIdentity("anonymous", "closure", map[string]any{
+				"enclosing_symbol": localID, "relative_path": "nested.go",
+				"span": map[string]any{"start_line": float64(11), "start_column": float64(3), "end_line": float64(11), "end_column": float64(12)},
+			}),
+			"language": "go", "package_locator": "go:example.com/p@workspace#example.com/p", "symbol_kind": "closure",
+		},
+	}
+	initializer := map[string]any{
+		"id": initializerID, "kind": "symbol", "locator": "go-symbol:" + initializerID, "display_name": "package initialization",
+		"properties": map[string]any{
+			"canonical_identity": semanticIdentity("anonymous", "package_initializer", map[string]any{
+				"generated_from": moduleID, "relative_path": "nested.go",
+				"span": map[string]any{"start_line": float64(1), "start_column": float64(1), "end_line": float64(1), "end_column": float64(1)},
+			}),
+			"language": "go", "package_locator": "go:example.com/p@workspace#example.com/p", "symbol_kind": "package_initializer",
+		},
+	}
+	module := map[string]any{
+		"id": moduleID, "kind": "module", "locator": "go-package:example.com/p", "display_name": "example.com/p",
+		"properties": map[string]any{"language": "go", "package_path": "example.com/p"},
+	}
+	external := map[string]any{
+		"id": "external:" + host, "kind": "external_system", "locator": "go-symbol:fmt.Sprintf", "display_name": "Sprintf",
+		"properties": map[string]any{"external": true, "language": "go", "resolver_identity": "fmt.Sprintf", "target_kind": "symbol", "symbol_kind": "function"},
+	}
+	nodes := []map[string]any{module, local, anonymous, initializer, external}
+	if reverseNodes {
+		for left, right := 0, len(nodes)-1; left < right; left, right = left+1, right-1 {
+			nodes[left], nodes[right] = nodes[right], nodes[left]
+		}
+	}
+	for index, node := range nodes {
+		events = append(events, base(float64(200+index), node))
+	}
+	for _, event := range events {
+		if event["event"] != "dependency_site" {
+			continue
+		}
+		site := event["site"].(map[string]any)
+		if reverseNodes {
+			site["target_ids"] = []any{anonymousID, "symbol:" + host, localID, "external:" + host}
+		} else {
+			site["target_ids"] = []any{"external:" + host, localID, "symbol:" + host, anonymousID}
+		}
+		break
+	}
+	return encodeGoldenEventsWithoutTesting(events)
+}
+
+func identityKindForAnchoredTest(kind string) string {
+	if kind == "local" {
+		return "local"
+	}
+	return "anonymous"
+}
+
+func testDeepAnchoredSemanticStream(depth int) []byte {
+	const host = "deep"
+	events, err := eventsFromNDJSON(testGoldenStream(host, false))
+	if err != nil {
+		panic(fmt.Sprintf("decode deep semantic test stream: %v", err))
+	}
+	namedID := "symbol:" + host
+	previousID := namedID
+	for index := 0; index < depth; index++ {
+		rawID := fmt.Sprintf("symbol:%s-%d", host, index)
+		node := map[string]any{
+			"id": rawID, "kind": "symbol", "locator": "go-symbol:" + rawID, "display_name": "local",
+			"properties": map[string]any{
+				"canonical_identity": map[string]any{
+					"enclosing_symbol": previousID, "identity_kind": "local", "language": "go",
+					"package_locator": "go:example.com/p@workspace#example.com/p", "relative_path": "deep.go",
+					"span":        map[string]any{"start_line": float64(index + 1), "start_column": float64(1), "end_line": float64(index + 1), "end_column": float64(5)},
+					"symbol_kind": "local_variable",
+				},
+				"language": "go", "package_locator": "go:example.com/p@workspace#example.com/p", "symbol_kind": "local_variable",
+			},
+		}
+		events = append(events, map[string]any{
+			"adapter": "go", "adapter_version": "0.5.4", "event": "node_upsert", "protocol_version": "1.0",
+			"scan_id": "scan:" + host, "seq": float64(300 + index), "node": node,
+		})
+		previousID = rawID
 	}
 	return encodeGoldenEventsWithoutTesting(events)
 }
