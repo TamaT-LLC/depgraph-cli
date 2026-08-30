@@ -7,8 +7,9 @@ pub mod surface;
 pub mod unused;
 
 pub use audit::{
-    AuditComparability, HealthAuditInputIdentity, analyze_changed_code,
-    analyze_changed_code_cancellable, canonical_cycle_rotation,
+    AuditAnalysisOptions, AuditComparability, DEFAULT_WIDE_BLAST_RADIUS_MIN_ADDITIONAL_NODES,
+    HealthAuditInputIdentity, analyze_changed_code, analyze_changed_code_cancellable,
+    analyze_changed_code_with_boundary_ids_cancellable, canonical_cycle_rotation,
 };
 pub use budget::HealthAnalysisError;
 pub use contract::{

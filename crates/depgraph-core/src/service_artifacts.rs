@@ -912,7 +912,7 @@ impl DepgraphService {
             .ok_or(DepgraphServiceError::NotFound)
     }
 
-    fn read_policy_config(
+    pub(crate) fn read_policy_config(
         &self,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<crate::policy::PolicyConfig> {
@@ -1292,7 +1292,7 @@ impl From<CoverageRecord> for SnapshotDiffCoverage {
     }
 }
 
-fn preflight_graph_work(
+pub(crate) fn preflight_graph_work(
     from: &GraphSnapshot,
     to: &GraphSnapshot,
     factor: usize,

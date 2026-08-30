@@ -109,6 +109,7 @@ derived fields never enter the hashed payload.
 - sorted finding IDs
 - input identity: snapshot ID (audit uses the before/after pair), optional
   manifest digest, changed OID, churn window, and hotspot weights
+- audit's pinned policy configuration digest
 
 ### Baseline transitions
 
@@ -227,8 +228,21 @@ Default mismatch policy is degrade, not reject:
 - missing before snapshot → blast radius remains evaluable; cycle / boundary /
   API new checks return `indeterminate` placeholders with
   `missing-base-snapshot`
-- incomparable profile matrix, completeness retreat, policy digest change, or
-  contract mismatch → the affected new-check degrades
+- incomparable profile matrix, completeness retreat, or contract mismatch →
+  the affected new-check degrades
+
+Policy configuration is read once when the audit scope opens. If a comparable
+before snapshot exists, the policy evaluator runs against the pinned before /
+after pair at that point; the resulting boundary violation IDs are retained in
+the scope and never recomputed while the scope is consumed. A boundary audit
+finding therefore uses the evaluator's stable `PolicyViolation.id`, not a
+diagnostic code or message substring. Audits do not claim historical policy
+comparability: policy provenance and policy-change comparison remain outside
+this contract and are reserved for #439. When no boundary policy rule is
+configured, the boundary ID set is empty; audit does not infer a boundary or
+blocker from graph diagnostics. The public graph-only analyzer compatibility
+wrapper therefore always passes an empty boundary-ID set unless the service
+audit path explicitly supplies evaluator output.
 
 Canonical identities:
 
@@ -237,8 +251,10 @@ Canonical identities:
 - public API: existing `public_api_change` plus snapshot symbol/signature
   diff restricted to classified public surface
 - blast radius: reverse `impact()` over the changed set; a
-  `wide-blast-radius` finding is emitted only when reverse traversal reaches
-  at least one node beyond the changed subjects themselves
+  `wide-blast-radius` finding is emitted only when the set difference between
+  impacted nodes and changed subjects contains at least two nodes. This fixed
+  v1 threshold is not request-configurable; a future contract revision may
+  introduce an explicitly versioned override.
 
 ### Hotspot score
 

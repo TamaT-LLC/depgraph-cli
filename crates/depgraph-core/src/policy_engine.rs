@@ -19,6 +19,38 @@ use crate::{
     query::{CycleLevel, cycles},
 };
 
+/// Return the stable policy-violation IDs produced by boundary rules.
+///
+/// The audit analyzer deliberately does not infer policy findings from graph
+/// diagnostic text.  Policy rule kinds are configuration data, while the
+/// violation ID is the evaluator's canonical identity for a violation; keep
+/// both pieces at this boundary so audit findings follow policy semantics.
+#[must_use]
+pub(crate) fn boundary_violation_ids(
+    result: &PolicyResult,
+    config: &PolicyConfig,
+) -> BTreeSet<String> {
+    let boundary_rule_ids = config
+        .rules
+        .iter()
+        .filter(|rule| {
+            matches!(
+                rule.kind,
+                PolicyRuleKind::LayerBoundary
+                    | PolicyRuleKind::ForbiddenDependency
+                    | PolicyRuleKind::RuntimeBoundary
+            )
+        })
+        .map(|rule| rule.id.as_str())
+        .collect::<BTreeSet<_>>();
+    result
+        .violations
+        .iter()
+        .filter(|violation| boundary_rule_ids.contains(violation.rule_id.as_str()))
+        .map(|violation| violation.id.clone())
+        .collect()
+}
+
 /// Evaluate the architecture policy against one validated graph snapshot.
 ///
 /// Selector cardinality is resolved before any rule is evaluated. Every rule then
@@ -2322,6 +2354,24 @@ mod tests {
         assert_eq!(result.violations.len(), 1);
         assert_eq!(result.violations[0].rule_id, "fixture-rule");
         assert_eq!(result.exit_code, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_violation_ids_are_taken_from_policy_evaluator_results() -> Result<()> {
+        let graph = snapshot(vec![edge("e1", "a", "b", "profile:production")]);
+        let policy = config(rule(PolicyRuleKind::ForbiddenDependency));
+        let result = evaluate_policy("snapshot:fixture", &graph, &policy)?;
+        assert_eq!(result.violations.len(), 1);
+
+        let ids = boundary_violation_ids(&result, &policy);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&result.violations[0].id));
+        assert!(
+            result.violations[0]
+                .id
+                .starts_with("policy-violation:sha256:")
+        );
         Ok(())
     }
 

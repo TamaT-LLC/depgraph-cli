@@ -7024,7 +7024,13 @@ fn real_eof_exits_successfully_before_five_second_deadline() {
     assert!(output.stderr.is_empty());
 }
 
-fn seed_issue_423_health_store(path: &Path, root: &Path, scan_id: &str, revision: &str) {
+fn seed_issue_423_health_store(
+    path: &Path,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+    add_blast_edge: bool,
+) {
     let mut store = Store::open(path).unwrap();
     store
         .start_scan_with_revision(scan_id, root, false, Some(revision))
@@ -7106,11 +7112,30 @@ fn seed_issue_423_health_store(path: &Path, root: &Path, scan_id: &str, revision
         "generated": false
     });
     store.ingest_event(&edge).unwrap();
-    let mut profile_completed = common("profile_completed", 7);
+    let mut next_seq = 7_u64;
+    if add_blast_edge {
+        let mut changed_edge = common("edge_upsert", next_seq);
+        changed_edge["edge"] = json!({
+            "id": "edge:used-unused",
+            "source": "file:src/used.rs",
+            "target": "file:src/unused.rs",
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&changed_edge).unwrap();
+        next_seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", next_seq);
     profile_completed["profile_id"] = json!("fixture:rust");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 8);
+    let mut completed = common("scan_completed", next_seq + 1);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store.finish_scan(scan_id, "completed", None, true).unwrap();
@@ -7151,7 +7176,7 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
     run(&["add", "."]);
     run(&["commit", "-m", "seed"]);
     let revision = run(&["rev-parse", "HEAD"]);
-    seed_issue_423_health_store(&store_path, &root, "health-scan", &revision);
+    seed_issue_423_health_store(&store_path, &root, "health-scan", &revision, false);
     let store_before = store_invariant(&store_path);
     let source_before = source_tree_digest(&root);
 
@@ -7316,4 +7341,139 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
     mcp.finish();
     assert_eq!(store_invariant(&store_path), store_before);
     assert_eq!(source_tree_digest(&root), source_before);
+}
+
+#[test]
+fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "health")
+            .env("GIT_AUTHOR_EMAIL", "health@example.test")
+            .env("GIT_COMMITTER_NAME", "health")
+            .env("GIT_COMMITTER_EMAIL", "health@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "health"]);
+    run(&["config", "user.email", "health@example.test"]);
+    fs::write(root.join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
+    fs::write(root.join("src/used.rs"), "pub fn used() {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "mod used;\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "base"]);
+    let base_revision = run(&["rev-parse", "HEAD"]);
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after\"); }\n",
+    )
+    .unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "snapshot after base"]);
+    let after_revision = run(&["rev-parse", "HEAD"]);
+    seed_issue_423_health_store(
+        &store_path,
+        &root,
+        "health-after-missing-base",
+        &after_revision,
+        true,
+    );
+
+    fs::write(root.join("notes.txt"), "later change\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "change after snapshot"]);
+
+    let cli_binary = AssertCommand::cargo_bin("depgraph").unwrap();
+    let cli_output = Command::new(cli_binary.get_program())
+        .args(cli_binary.get_args())
+        .current_dir(&root)
+        .arg("--store")
+        .arg(&store_path)
+        .args(["audit", "--changed", &base_revision, "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        cli_output.status.success(),
+        "CLI stderr: {}",
+        String::from_utf8_lossy(&cli_output.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository",
+        "snapshot": "current",
+        "changed": base_revision,
+        "limit": 100
+    });
+    let first = interactive_tool_call(&mut mcp, 2, "health_audit_get", common.clone());
+    let second = interactive_tool_call(&mut mcp, 3, "health_audit_get", common);
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(second["isError"], false, "{second}");
+    assert_eq!(
+        first["structuredContent"]["result"]["collection_digest"],
+        second["structuredContent"]["result"]["collection_digest"]
+    );
+    assert_eq!(
+        first["structuredContent"]["result"]["collection_digest"],
+        cli["data"]["collection_digest"]
+    );
+    assert_eq!(
+        first["structuredContent"]["result"]["findings"]["items"],
+        cli["data"]["findings"]
+    );
+    assert!(first["structuredContent"]["result"]["before_snapshot_id"].is_null());
+    let findings = first["structuredContent"]["result"]["findings"]["items"]
+        .as_array()
+        .unwrap();
+    let degraded = findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding["kind"].as_str(),
+                Some("new-cycle") | Some("new-boundary-violation") | Some("public-api-change")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(degraded.len(), 3);
+    for finding in degraded {
+        assert_eq!(finding["confidence"], "indeterminate");
+        assert!(
+            finding["subject_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("degraded:")
+        );
+        assert!(
+            finding["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| { blocker["kind"] == "missing-base-snapshot" })
+        );
+    }
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["kind"] == "wide-blast-radius")
+    );
+    mcp.finish();
 }

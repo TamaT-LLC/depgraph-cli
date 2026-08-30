@@ -4,7 +4,8 @@ use anyhow::Result;
 use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
     DepgraphServiceLimits, HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest,
-    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS, SnapshotLocator,
+    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest,
+    SnapshotLocator,
 };
 use depgraph_core::{
     CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind, HotspotWeights,
@@ -133,7 +134,18 @@ fn seed_health_snapshot(
             "resolution_status": "resolved",
             "precision": "exact",
             "condition": {"op": "all", "conditions": []},
-            "generated": false
+            "generated": false,
+            "evidence": [{
+                "kind": "source",
+                "extractor": "health-fixture",
+                "extractor_version": "1.0",
+                "path": "src/used.rs",
+                "start_line": 1,
+                "start_column": 1,
+                "end_line": 1,
+                "end_column": 2,
+                "properties": {}
+            }]
         });
         store.ingest_event(&changed_edge)?;
         next_seq += 1;
@@ -366,6 +378,181 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     let second = service.health_audit(&scope, &cancellation)?;
     assert_eq!(first.collection_digest(), second.collection_digest());
     assert_eq!(first.findings(), second.findings());
+    Ok(())
+}
+
+#[test]
+fn issue_438_health_audit_missing_base_keeps_placeholders_blast_and_digest_stable() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+
+    // Keep only a snapshot after the merge base. Its graph has two reverse
+    // dependents so the missing-base path can still prove blast-radius work.
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "snapshot after base"]);
+    let after_revision = run_git(&root, &["rev-parse", "HEAD"]);
+    let mut store = Store::open(&store_path)?;
+    let after_id = seed_health_snapshot(
+        &mut store,
+        &root,
+        "health-after-missing-base",
+        &after_revision,
+        true,
+    )?;
+    drop(store);
+
+    // The merge base remains the original commit, for which no snapshot was
+    // stored. The unrelated change keeps the after snapshot stale while the
+    // changed set still contains the changed subject above.
+    fs::write(root.join("notes.txt"), "later change\n")?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "change after snapshot"]);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    assert_eq!(after.snapshot_id().as_str(), after_id);
+    let scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(scope.before().is_none());
+    assert!(
+        scope
+            .policy_config_digest()
+            .starts_with("policy-config:sha256:")
+    );
+
+    let first = service.health_audit(&scope, &cancellation)?;
+    let second = service.health_audit(&scope, &cancellation)?;
+    assert_eq!(first.before_snapshot_id(), None);
+    assert_eq!(first.collection_digest(), second.collection_digest());
+    assert_eq!(first.findings(), second.findings());
+    let degraded = first
+        .findings()
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.kind,
+                FindingKind::NewCycle
+                    | FindingKind::NewBoundaryViolation
+                    | FindingKind::PublicApiChange
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(degraded.len(), 3);
+    assert!(degraded.iter().all(|finding| {
+        finding.confidence == Confidence::Indeterminate
+            && finding.subject_id == format!("degraded:{}", finding.kind.as_str())
+            && finding
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == depgraph_core::BlockerKind::MissingBaseSnapshot)
+    }));
+    assert!(
+        first
+            .findings()
+            .iter()
+            .any(|finding| finding.kind == FindingKind::WideBlastRadius)
+    );
+    Ok(())
+}
+
+#[test]
+fn issue_438_health_audit_uses_evaluated_policy_violation_identity() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let mut store = Store::open(&store_path)?;
+    let base_id = seed_health_snapshot(
+        &mut store,
+        &root,
+        "health-policy-base",
+        &base_revision,
+        false,
+    )?;
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "introduce boundary edge"]);
+    let after_revision = run_git(&root, &["rev-parse", "HEAD"]);
+    let after_id = seed_health_snapshot(
+        &mut store,
+        &root,
+        "health-policy-after",
+        &after_revision,
+        true,
+    )?;
+    drop(store);
+
+    fs::write(
+        root.join(".depgraph.toml"),
+        r#"schema_version = 1
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "audit-boundary"
+kind = "forbidden_dependency"
+severity = "error"
+source = { kind = "file", field = "id", match = "exact", value = "file:src/used.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+target = { kind = "file", field = "id", match = "exact", value = "file:src/unused.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+profiles = { include = [{ match = "exact", value = "fixture:rust" }], exclude = [] }
+condition = { op = "all", conditions = [] }
+precisions = ["exact"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
+"#,
+    )?;
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let policy_pair = service.policy_evaluate(
+        &PolicyEvaluateRequest::new(
+            SnapshotLocator::parse(&base_id)?,
+            SnapshotLocator::parse(&after_id)?,
+        ),
+        &cancellation,
+    )?;
+    let expected_policy_id = policy_pair
+        .result
+        .violations
+        .first()
+        .map(|violation| violation.id.clone())
+        .expect("after snapshot has a policy violation");
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert_eq!(
+        scope.policy_config_digest(),
+        policy_pair.result.policy_config_digest
+    );
+    let result = service.health_audit(&scope, &cancellation)?;
+    let boundary = result
+        .findings()
+        .iter()
+        .find(|finding| finding.kind == FindingKind::NewBoundaryViolation)
+        .expect("evaluated boundary violation becomes an audit finding");
+    assert_eq!(boundary.subject_id, expected_policy_id);
+    assert_eq!(boundary.subject_id, policy_pair.result.violations[0].id);
     Ok(())
 }
 

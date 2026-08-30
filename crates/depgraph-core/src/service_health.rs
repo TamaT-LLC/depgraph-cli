@@ -4,6 +4,7 @@ use std::{
     path::Path,
 };
 
+use depgraph_protocol::stable_id_from_value;
 use depgraph_store::GraphSnapshot;
 use sha2::{Digest as _, Sha256};
 
@@ -11,10 +12,11 @@ use crate::{
     CancellationToken,
     bounded_query::{QueryFailureClass, read_bounded_repository_file},
     health::{
-        AuditComparability, CollectionIdentity, Confidence, FindingKind, HealthAnalysisError,
-        HealthFinding, HealthFindingDetail, HotspotAnalysisError, HotspotLayerAvailability,
-        HotspotWeights, ManifestIdentity, Severity, analyze_changed_code_cancellable,
-        analyze_dependencies_cancellable, analyze_unused_cancellable, collection_digest,
+        AuditAnalysisOptions, AuditComparability, CollectionIdentity, Confidence, FindingKind,
+        HealthAnalysisError, HealthFinding, HealthFindingDetail, HotspotAnalysisError,
+        HotspotLayerAvailability, HotspotWeights, ManifestIdentity, Severity,
+        analyze_changed_code_with_boundary_ids_cancellable, analyze_dependencies_cancellable,
+        analyze_unused_cancellable, collection_digest, contract::collection_digest_with_policy,
         score_hotspots_cancellable,
     },
     impact::{
@@ -25,6 +27,7 @@ use crate::{
         DepgraphService, DepgraphServiceError, DepgraphServiceResult, RepositoryRelativePath,
         ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
     },
+    service_artifacts::preflight_graph_work,
     service_graph::load_pinned_snapshot,
     service_limits::{
         MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_HEALTH_BLOCKERS_PER_FINDING,
@@ -33,6 +36,11 @@ use crate::{
         MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
         MAX_HEALTH_TOTAL_MANIFEST_BYTES,
     },
+};
+
+use crate::{
+    policy::PolicyConfig,
+    policy_engine::{boundary_violation_ids, evaluate_policy, evaluate_policy_diff},
 };
 
 const MAX_GIT_REF_BYTES: usize = 256;
@@ -293,6 +301,8 @@ pub struct HealthAuditReadScope {
     changed_set: GitChangedSet,
     changed_set_digest: String,
     comparability: AuditComparability,
+    boundary_violation_ids: BTreeSet<String>,
+    policy_config_digest: String,
 }
 
 impl HealthAuditReadScope {
@@ -314,6 +324,11 @@ impl HealthAuditReadScope {
     #[must_use]
     pub fn changed_oid(&self) -> &str {
         &self.changed_set.head
+    }
+
+    #[must_use]
+    pub fn policy_config_digest(&self) -> &str {
+        &self.policy_config_digest
     }
 }
 
@@ -586,6 +601,14 @@ impl DepgraphService {
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
+        // Read and evaluate policy once while opening the scope.  The
+        // resulting boundary IDs remain stable even if repository config is
+        // edited before a caller consumes the pinned scope.
+        let policy = self.read_policy_config(cancellation)?;
+        let policy_config_digest = policy
+            .normalized_identity()
+            .map(|value| stable_id_from_value("policy-config", &value))
+            .map_err(|_| DepgraphServiceError::Internal)?;
         let after_id = after_request.snapshot_id().clone();
         let after = load_pinned_snapshot(after_request, cancellation)?;
         let changed_set = read_git_changed_set_cancellable(
@@ -623,6 +646,15 @@ impl DepgraphService {
         } else {
             comparability.missing_base = true;
         }
+        let boundary_violation_ids = evaluate_audit_boundary_ids(
+            &policy,
+            before.as_ref(),
+            &PinnedHealthSnapshot {
+                id: after_id.clone(),
+                snapshot: after.clone(),
+            },
+            cancellation,
+        )?;
         Ok(HealthAuditReadScope {
             after: PinnedHealthSnapshot {
                 id: after_id,
@@ -632,6 +664,8 @@ impl DepgraphService {
             changed_set,
             changed_set_digest,
             comparability,
+            boundary_violation_ids,
+            policy_config_digest,
         })
     }
 
@@ -672,13 +706,16 @@ impl DepgraphService {
         }
         let changed_nodes = changed_nodes.into_iter().collect::<Vec<_>>();
         let findings = bound_findings(
-            analyze_changed_code_cancellable(
+            analyze_changed_code_with_boundary_ids_cancellable(
                 scope.after.snapshot(),
                 scope.before.as_ref().map(PinnedHealthSnapshot::snapshot),
                 &changed_nodes,
                 &scope.comparability,
-                MAX_HEALTH_FINDINGS,
-                MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+                AuditAnalysisOptions {
+                    boundary_violation_ids: &scope.boundary_violation_ids,
+                    maximum_findings: MAX_HEALTH_FINDINGS,
+                    maximum_work: MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+                },
                 || cancellation.is_cancelled(),
             )
             .map_err(map_health_analysis_error)?,
@@ -699,7 +736,7 @@ impl DepgraphService {
             after_snapshot_id: scope.after.id.clone(),
             before_snapshot_id: scope.before.as_ref().map(|before| before.id.clone()),
             changed_oid: scope.changed_set.head.clone(),
-            collection_digest: collection_digest(
+            collection_digest: collection_digest_with_policy(
                 &CollectionIdentity {
                     snapshot_ids,
                     manifest_digest: None,
@@ -711,6 +748,7 @@ impl DepgraphService {
                     hotspot_weights: None,
                 },
                 &ids,
+                &scope.policy_config_digest,
             ),
             findings,
         })
@@ -776,6 +814,53 @@ impl DepgraphService {
             findings,
         })
     }
+}
+
+fn evaluate_audit_boundary_ids(
+    policy: &PolicyConfig,
+    before: Option<&PinnedHealthSnapshot>,
+    after: &PinnedHealthSnapshot,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<BTreeSet<String>> {
+    let has_boundary_rule = policy.rules.iter().any(|rule| {
+        matches!(
+            rule.kind,
+            crate::policy::PolicyRuleKind::LayerBoundary
+                | crate::policy::PolicyRuleKind::ForbiddenDependency
+                | crate::policy::PolicyRuleKind::RuntimeBoundary
+        )
+    });
+    if !has_boundary_rule {
+        return Ok(BTreeSet::new());
+    }
+    let Some(before) = before else {
+        return Ok(BTreeSet::new());
+    };
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    preflight_graph_work(
+        before.snapshot(),
+        after.snapshot(),
+        policy.rules.len().saturating_add(1),
+        cancellation,
+    )?;
+    let before_result = evaluate_policy(before.id().as_str(), before.snapshot(), policy)
+        .map_err(|_| DepgraphServiceError::PolicyInput)?;
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    let after_result = evaluate_policy_diff(
+        before.id().as_str(),
+        before.snapshot(),
+        after.id().as_str(),
+        after.snapshot(),
+        policy,
+    )
+    .map_err(|_| DepgraphServiceError::PolicyInput)?;
+    let before_ids = boundary_violation_ids(&before_result, policy);
+    let after_ids = boundary_violation_ids(&after_result, policy);
+    Ok(after_ids.difference(&before_ids).cloned().collect())
 }
 
 struct SnapshotScopedCollection {
