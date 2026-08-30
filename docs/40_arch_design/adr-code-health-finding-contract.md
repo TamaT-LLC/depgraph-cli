@@ -123,19 +123,25 @@ Fingerprint is `sha256:<hex>` of the finding's canonical JSON after removing
 `fingerprint`, `collection_digest`, any baseline transition field, and the
 human-readable `reason`. Those derived or presentation-only fields never enter
 the hashed payload. `hotspot_scores`, when present, remains in the payload so
-an actual metric or configured weight change is observable as a fingerprint
-change.
+an actual metric or layer-availability change is observable as a fingerprint
+change. Configured hotspot weights are also part of the finding witness used to
+derive the stable finding ID. Changing weights therefore intentionally creates
+a new finding ID (and the new finding's fingerprint changes as well), so a
+finding from one weight configuration cannot be silently matched to a finding
+from another configuration.
 
 ### Fingerprint migration impact
 
 Issue #440 changes the fingerprint payload without changing the v1 finding ID
-contract. Existing baselines therefore classify a reason-only or formatter
+algorithm. Existing baselines therefore classify a reason-only or formatter
 change as `changed`/pass when the structured finding data is unchanged. A
-changed hotspot layer score, availability bit, or weight remains a meaningful
-fingerprint change. The analyzer version is bumped to `1.0.2`; operators that
-want a clean baseline may regenerate fingerprints, while retaining old records
-is safe because matching continues by stable ID and no automatic rewrite is
-performed.
+changed hotspot layer score or availability bit with the same weights remains a
+meaningful fingerprint change. Changing hotspot weights changes the finding ID
+and collection digest as well as the fingerprint; this is intentional
+fail-closed provenance, rather than an in-place baseline change. The analyzer
+version is bumped to `1.0.2`; operators that want a clean baseline may
+regenerate fingerprints, while retaining old records is safe because matching
+continues by stable ID and no automatic rewrite is performed.
 
 ### Collection digest
 

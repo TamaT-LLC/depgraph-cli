@@ -732,9 +732,10 @@ struct AgentHealthFindingWire {
     #[serde(default)]
     profile_scope: Option<AgentId>,
     reason: AgentPolicyText,
-    // Records emitted before Issue #440 did not carry structured scores. Keep
-    // wire deserialization backward-compatible; new output projection uses
-    // `AgentHealthFinding::try_from_core`, which requires scores for hotspots.
+    // Records emitted before Issue #440 did not carry structured scores (and
+    // could still report `confirmed`). Keep that legacy shape readable on the
+    // wire; new output projection uses `AgentHealthFinding::try_from_core`,
+    // which requires scores for hotspots and never emits `confirmed`.
     #[serde(default)]
     hotspot_scores: Option<AgentHealthHotspotScores>,
     blockers: Vec<AgentHealthBlocker>,
@@ -1112,7 +1113,13 @@ fn validate_hotspot_finding(
     if kind != AgentFindingKind::Hotspot && hotspot_scores.is_some() {
         return Err(ContractBuildError::AgentDtoValue);
     }
-    if kind == AgentFindingKind::Hotspot && confidence == AgentHealthConfidence::Confirmed {
+    // `confirmed` was emitted by the pre-Issue #440 hotspot wire format, which
+    // had no structured score object. Keep that legacy input readable, but do
+    // not accept the combination on a current structured hotspot record.
+    if kind == AgentFindingKind::Hotspot
+        && confidence == AgentHealthConfidence::Confirmed
+        && hotspot_scores.is_some()
+    {
         return Err(ContractBuildError::AgentDtoValue);
     }
     Ok(())
@@ -1279,6 +1286,33 @@ mod tests {
         assert!(
             serde_json::from_value::<AgentHealthFinding>(legacy_null).is_ok(),
             "pre-Issue #440 wire findings may carry a null additive scores field"
+        );
+
+        let mut legacy_confirmed = encoded.clone();
+        legacy_confirmed["confidence"] = json!("confirmed");
+        legacy_confirmed
+            .as_object_mut()
+            .expect("finding object")
+            .remove("hotspot_scores");
+        assert!(
+            serde_json::from_value::<AgentHealthFinding>(legacy_confirmed).is_ok(),
+            "legacy hotspot wire findings may retain their pre-Issue #440 confirmed confidence"
+        );
+
+        let mut legacy_confirmed_null = encoded.clone();
+        legacy_confirmed_null["confidence"] = json!("confirmed");
+        legacy_confirmed_null["hotspot_scores"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<AgentHealthFinding>(legacy_confirmed_null).is_ok(),
+            "legacy hotspot wire findings may retain confirmed confidence with null scores"
+        );
+
+        let mut current_confirmed =
+            serde_json::to_value(&agent).expect("serialize hotspot finding");
+        current_confirmed["confidence"] = json!("confirmed");
+        assert!(
+            serde_json::from_value::<AgentHealthFinding>(current_confirmed).is_err(),
+            "current structured hotspot wire findings must not claim confirmed confidence"
         );
 
         let mut invalid = encoded;

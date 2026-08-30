@@ -664,6 +664,40 @@ mod tests {
     }
 
     #[test]
+    fn issue_440_hotspot_weight_changes_create_new_finding_identity() {
+        let graph = snapshot(vec![node("file:a"), node("file:b")], Vec::new());
+        let default_findings = score_hotspots(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+        )
+        .expect("valid default hotspot weights");
+        let changed_weights = HotspotWeights::try_new(3_000, 1_000, 2_500, 2_000, 1_500)
+            .expect("valid changed hotspot weights");
+        let changed_findings = score_hotspots(
+            &graph,
+            changed_weights,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+        )
+        .expect("valid changed hotspot weights");
+
+        let default_finding = default_findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:a")
+            .expect("default finding");
+        let changed_finding = changed_findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:a")
+            .expect("changed finding");
+        assert_ne!(default_finding.id, changed_finding.id);
+        assert_ne!(default_finding.fingerprint, changed_finding.fingerprint);
+    }
+
+    #[test]
     fn issue_440_cancellable_hotspot_analyzer_rejects_invalid_weights() {
         let graph = snapshot(vec![node("file:a")], Vec::new());
         assert_eq!(
