@@ -96,6 +96,16 @@ func NormalizeNDJSON(data []byte) ([]map[string]any, error) {
 					return nil, err
 				}
 			}
+		case "diagnostic":
+			diagnostic, err := objectField(event, "diagnostic")
+			if err != nil {
+				return nil, err
+			}
+			normalized, err := normalizeDiagnostic(diagnostic, maps, true)
+			if err != nil {
+				return nil, err
+			}
+			event["diagnostic"] = normalized
 		}
 	}
 	return ordered, nil
@@ -107,6 +117,7 @@ type eventMaps struct {
 	nodeIDs            map[string]string
 	siteIDs            map[string]string
 	edgeIDs            map[string]string
+	diagnosticIDs      map[string]string
 }
 
 func eventsFromNDJSON(data []byte) ([]map[string]any, error) {
@@ -135,6 +146,7 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 		nodeIDs:            map[string]string{},
 		siteIDs:            map[string]string{},
 		edgeIDs:            map[string]string{},
+		diagnosticIDs:      map[string]string{},
 	}
 	if err := validateStreamReferences(events, &maps); err != nil {
 		return eventMaps{}, err
@@ -228,6 +240,36 @@ func buildEventMaps(events []map[string]any) (eventMaps, error) {
 			}
 		}
 		maps.edgeIDs[rawID] = normalizedID
+	}
+	for _, event := range events {
+		if event["event"] != "diagnostic" {
+			continue
+		}
+		diagnostic, err := objectField(event, "diagnostic")
+		if err != nil {
+			return eventMaps{}, err
+		}
+		rawID, err := stringField(diagnostic, "id")
+		if err != nil {
+			return eventMaps{}, err
+		}
+		if rawID == "" {
+			return eventMaps{}, fmt.Errorf("Go golden diagnostic has empty id")
+		}
+		canonical, err := canonicalDiagnostic(diagnostic, maps)
+		if err != nil {
+			return eventMaps{}, err
+		}
+		normalizedID := "diagnostic:" + canonical
+		if previous, duplicate := maps.diagnosticIDs[rawID]; duplicate && previous != normalizedID {
+			return eventMaps{}, fmt.Errorf("Go golden diagnostic ID %q maps to both %q and %q", rawID, previous, normalizedID)
+		}
+		for existingRaw, existingNormalized := range maps.diagnosticIDs {
+			if existingRaw != rawID && existingNormalized == normalizedID {
+				return eventMaps{}, fmt.Errorf("Go golden logical diagnostic %q has multiple IDs %q and %q", normalizedID, existingRaw, rawID)
+			}
+		}
+		maps.diagnosticIDs[rawID] = normalizedID
 	}
 	return maps, nil
 }
@@ -434,6 +476,20 @@ func eventOrderingKey(event map[string]any, maps eventMaps) (string, error) {
 		if err != nil {
 			return "", err
 		}
+	case "diagnostic":
+		diagnostic, err := objectField(event, "diagnostic")
+		if err != nil {
+			return "", err
+		}
+		logical, err = canonicalDiagnostic(diagnostic, maps)
+		if err != nil {
+			return "", err
+		}
+		normalized, err := normalizeDiagnostic(diagnostic, maps, true)
+		if err != nil {
+			return "", err
+		}
+		payload["diagnostic"] = normalized
 	case "file_completed":
 		logical, _ = event["path"].(string)
 	}
@@ -548,6 +604,125 @@ func canonicalEdge(edge map[string]any, nodeIDs, siteIDs map[string]string) (str
 	return canonicalJSON(copy)
 }
 
+func canonicalDiagnostic(diagnostic map[string]any, maps eventMaps) (string, error) {
+	normalized, err := normalizeDiagnostic(diagnostic, maps, false)
+	if err != nil {
+		return "", err
+	}
+	return canonicalJSON(normalized)
+}
+
+func normalizeDiagnostic(diagnostic map[string]any, maps eventMaps, includeID bool) (map[string]any, error) {
+	copy, err := cloneObject(diagnostic)
+	if err != nil {
+		return nil, err
+	}
+	normalizeValue(copy, "diagnostic", false, false)
+	if includeID {
+		rawID, err := stringField(copy, "id")
+		if err != nil {
+			return nil, err
+		}
+		mapped, err := mappedID(maps.diagnosticIDs, rawID, "diagnostic")
+		if err != nil {
+			return nil, err
+		}
+		copy["id"] = mapped
+	} else {
+		delete(copy, "id")
+	}
+	if err := normalizeDiagnosticReferences(copy, maps, "diagnostic"); err != nil {
+		return nil, err
+	}
+	return copy, nil
+}
+
+// normalizeDiagnosticReferences only rewrites fields whose protocol meaning
+// is a graph reference. Arbitrary diagnostic properties remain visible. An
+// unknown value in one of these reference fields is rejected rather than
+// replaced with a plausible placeholder.
+func normalizeDiagnosticReferences(value any, maps eventMaps, path string) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			fieldPath := path + "." + key
+			switch key {
+			case "site_id":
+				mapped, err := mappedDiagnosticReference(child, maps.siteIDs, fieldPath)
+				if err != nil {
+					return err
+				}
+				typed[key] = mapped
+			case "node_id", "source_id", "target_id":
+				mapped, err := mappedDiagnosticReference(child, maps.nodeIDs, fieldPath)
+				if err != nil {
+					return err
+				}
+				typed[key] = mapped
+			case "edge_id":
+				mapped, err := mappedDiagnosticReference(child, maps.edgeIDs, fieldPath)
+				if err != nil {
+					return err
+				}
+				typed[key] = mapped
+			case "site_ids":
+				if err := normalizeStringSliceAtPath(typed, key, maps.siteIDs, fieldPath); err != nil {
+					return err
+				}
+			case "node_ids", "source_ids", "target_ids":
+				if err := normalizeStringSliceAtPath(typed, key, maps.nodeIDs, fieldPath); err != nil {
+					return err
+				}
+			case "edge_ids":
+				if err := normalizeStringSliceAtPath(typed, key, maps.edgeIDs, fieldPath); err != nil {
+					return err
+				}
+			default:
+				if err := normalizeDiagnosticReferences(child, maps, fieldPath); err != nil {
+					return err
+				}
+			}
+		}
+	case []any:
+		for index, child := range typed {
+			if err := normalizeDiagnosticReferences(child, maps, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func mappedDiagnosticReference(value any, ids map[string]string, path string) (string, error) {
+	rawID, ok := value.(string)
+	if !ok || rawID == "" {
+		return "", fmt.Errorf("Go golden diagnostic reference %s is not a non-empty string: %#v", path, value)
+	}
+	return mappedID(ids, rawID, "diagnostic reference "+path)
+}
+
+func normalizeStringSliceAtPath(object map[string]any, key string, ids map[string]string, path string) error {
+	values, ok := object[key].([]any)
+	if !ok {
+		return fmt.Errorf("Go golden diagnostic field %q is not an array: %#v", path, object[key])
+	}
+	for index, value := range values {
+		rawID, ok := value.(string)
+		if !ok || rawID == "" {
+			return fmt.Errorf("Go golden diagnostic field %q[%d] contains invalid ID: %#v", path, index, value)
+		}
+		mapped, err := mappedID(ids, rawID, "diagnostic reference "+path)
+		if err != nil {
+			return err
+		}
+		values[index] = mapped
+	}
+	sort.Slice(values, func(left, right int) bool {
+		return values[left].(string) < values[right].(string)
+	})
+	return nil
+}
+
 func normalizeValue(value any, eventName string, inProfile, inEnvironment bool) any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -623,6 +798,9 @@ func normalizeStringSlice(object map[string]any, key string, ids map[string]stri
 		}
 		values[index] = mapped
 	}
+	sort.Slice(values, func(left, right int) bool {
+		return values[left].(string) < values[right].(string)
+	})
 	return nil
 }
 

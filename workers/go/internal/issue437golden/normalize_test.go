@@ -29,6 +29,86 @@ func TestNormalizeNDJSONCanonicalizesHostEventOrderAndSequence(t *testing.T) {
 	}
 }
 
+func TestNormalizeNDJSONSortsTargetIDsAfterLogicalSubstitution(t *testing.T) {
+	darwin, err := NormalizeNDJSON(testGoldenStreamWithTwoTargets("darwin", false))
+	if err != nil {
+		t.Fatalf("normalize Darwin stream: %v", err)
+	}
+	linux, err := NormalizeNDJSON(testGoldenStreamWithTwoTargets("linux", true))
+	if err != nil {
+		t.Fatalf("normalize Linux stream: %v", err)
+	}
+	if !reflect.DeepEqual(darwin, linux) {
+		darwinJSON, _ := json.MarshalIndent(darwin, "", "  ")
+		linuxJSON, _ := json.MarshalIndent(linux, "", "  ")
+		t.Fatalf("host streams differ after logical target ordering:\nDarwin:\n%s\nLinux:\n%s", darwinJSON, linuxJSON)
+	}
+
+	for _, event := range darwin {
+		if event["event"] != "dependency_site" {
+			continue
+		}
+		site, ok := event["site"].(map[string]any)
+		if !ok {
+			t.Fatalf("dependency site is not an object: %#v", event["site"])
+		}
+		got, ok := site["target_ids"].([]any)
+		if !ok {
+			t.Fatalf("dependency site target_ids is not an array: %#v", site["target_ids"])
+		}
+		want := []any{
+			"profile-node:symbol:example.com/p.Entry",
+			"profile-node:symbol:example.com/p.Other",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("normalized target_ids = %#v, want %#v", got, want)
+		}
+		return
+	}
+	t.Fatal("normalized stream has no dependency_site event")
+}
+
+func TestNormalizeNDJSONCanonicalizesCallgraphAndSSADiagnostics(t *testing.T) {
+	darwin, err := NormalizeNDJSON(testGoldenStreamWithDiagnostics("darwin", false))
+	if err != nil {
+		t.Fatalf("normalize Darwin stream: %v", err)
+	}
+	linux, err := NormalizeNDJSON(testGoldenStreamWithDiagnostics("linux", true))
+	if err != nil {
+		t.Fatalf("normalize Linux stream: %v", err)
+	}
+	if !reflect.DeepEqual(darwin, linux) {
+		darwinJSON, _ := json.MarshalIndent(darwin, "", "  ")
+		linuxJSON, _ := json.MarshalIndent(linux, "", "  ")
+		t.Fatalf("host streams differ after diagnostic normalization:\nDarwin:\n%s\nLinux:\n%s", darwinJSON, linuxJSON)
+	}
+}
+
+func TestNormalizeNDJSONRejectsUnknownDiagnosticReferences(t *testing.T) {
+	events := decodeGoldenStream(t, testGoldenStreamWithDiagnostics("darwin", false))
+	for _, event := range events {
+		if event["event"] != "diagnostic" {
+			continue
+		}
+		diagnostic, ok := event["diagnostic"].(map[string]any)
+		if !ok {
+			t.Fatalf("diagnostic is not an object: %#v", event["diagnostic"])
+		}
+		properties, ok := diagnostic["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("diagnostic properties are not an object: %#v", diagnostic["properties"])
+		}
+		if diagnostic["code"] == "go_callgraph_limit" {
+			properties["site_id"] = "site:unknown"
+			if _, err := NormalizeNDJSON(encodeGoldenEvents(t, events)); err == nil {
+				t.Fatal("NormalizeNDJSON accepted an unknown diagnostic site reference")
+			}
+			return
+		}
+	}
+	t.Fatal("diagnostic test stream has no callgraph diagnostic")
+}
+
 func TestNormalizeNDJSONRejectsUnknownAndMismatchedProfileReferences(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -124,6 +204,84 @@ func testGoldenStream(host string, reverseSemanticEvents bool) []byte {
 		// graph collections in the opposite order and assigned different seqs.
 		events[2], events[3] = events[3], events[2]
 		events[4], events[5] = events[5], events[4]
+	}
+	return encodeGoldenEventsWithoutTesting(events)
+}
+
+func testGoldenStreamWithTwoTargets(host string, reverseSemanticEvents bool) []byte {
+	events, err := eventsFromNDJSON(testGoldenStream(host, reverseSemanticEvents))
+	if err != nil {
+		panic(fmt.Sprintf("decode two-target test stream: %v", err))
+	}
+	secondID := "symbol:zzzz-" + host
+	if host == "darwin" {
+		// The raw producer order is intentionally reversed between hosts. The
+		// logical resolver identity must be sorted after ID substitution.
+		secondID = "symbol:aardvark-" + host
+	}
+	events = append(events, map[string]any{
+		"adapter": "go", "adapter_version": "0.5.4", "event": "node_upsert",
+		"protocol_version": "1.0", "scan_id": "scan:" + host, "seq": float64(110),
+		"node": map[string]any{
+			"id": secondID, "kind": "symbol", "locator": "go-symbol:example.com/p.Other",
+			"display_name": "Other", "properties": map[string]any{
+				"canonical_identity": map[string]any{
+					"identity_kind": "named", "language": "go",
+					"package_locator":   "go:example.com/p@workspace#example.com/p",
+					"resolver_identity": "example.com/p.Other", "symbol_kind": "function",
+				},
+				"language": "go", "package_locator": "go:example.com/p@workspace#example.com/p",
+				"symbol_kind": "function",
+			},
+		},
+	})
+	for _, event := range events {
+		if event["event"] != "dependency_site" {
+			continue
+		}
+		site := event["site"].(map[string]any)
+		if host == "darwin" {
+			site["target_ids"] = []any{secondID, "symbol:" + host}
+		} else {
+			site["target_ids"] = []any{"symbol:" + host, secondID}
+		}
+		break
+	}
+	return encodeGoldenEventsWithoutTesting(events)
+}
+
+func testGoldenStreamWithDiagnostics(host string, reverseSemanticEvents bool) []byte {
+	events, err := eventsFromNDJSON(testGoldenStream(host, reverseSemanticEvents))
+	if err != nil {
+		panic(fmt.Sprintf("decode diagnostic test stream: %v", err))
+	}
+	profileID := "profile:" + host
+	scanID := "scan:" + host
+	siteID := "site:" + host
+	fileID := "file:" + host
+	base := func(seq float64, id, code, message string, properties map[string]any) map[string]any {
+		return map[string]any{
+			"adapter": "go", "adapter_version": "0.5.4", "event": "diagnostic",
+			"protocol_version": "1.0", "scan_id": scanID, "seq": seq,
+			"diagnostic": map[string]any{
+				"id": id, "code": code, "severity": "warning", "message": message,
+				"profile_id": profileID, "path": "file.go", "start_line": float64(1),
+				"start_column": float64(1), "end_line": float64(1), "end_column": float64(5),
+				"evidence": []any{}, "properties": properties, "recoverable": true,
+			},
+		}
+	}
+	callgraph := base(111, "diagnostic:callgraph:"+host, "go_callgraph_limit", "call graph boundary", map[string]any{
+		"boundary": "native", "reason": "outside_ssa", "site_id": siteID,
+		"context": map[string]any{"node_id": fileID},
+	})
+	ssa := base(112, "diagnostic:ssa:"+host, "go_ssa_partial_program", "incomplete SSA", map[string]any{
+		"algorithm": "cha", "reason": "incomplete_program", "fallback_reason": "incomplete_program_fallback",
+	})
+	if reverseSemanticEvents {
+		events = append(events, ssa, callgraph)
+	} else {
+		events = append(events, callgraph, ssa)
 	}
 	return encodeGoldenEventsWithoutTesting(events)
 }

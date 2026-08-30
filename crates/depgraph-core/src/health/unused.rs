@@ -131,7 +131,7 @@ fn analyze_subject(
             .properties
             .get("package_name")
             .and_then(serde_json::Value::as_str);
-        if go_package_name == Some("main")
+        if (go_package_name == Some("main") || index.go_main_file_ids.contains(node.id.as_str()))
             && node
                 .properties
                 .get("test")
@@ -241,6 +241,10 @@ struct SnapshotIndex<'a> {
     // alongside the ordinary incoming-edge index so file findings do not
     // mistake an imported package's production files for unused files.
     go_file_usage_profiles: HashMap<&'a str, HashSet<&'a str>>,
+    // Assembly and other production file nodes can carry the package scope
+    // without a package_name property. Keep the exact main-package file set
+    // so those files receive the same entry treatment as parsed Go files.
+    go_main_file_ids: HashSet<&'a str>,
     sites_by_target: HashMap<&'a str, Vec<&'a SiteRecord>>,
     dynamic_site_ids: HashSet<&'a str>,
     targetless_candidate: bool,
@@ -277,6 +281,7 @@ impl<'a> SnapshotIndex<'a> {
 
         let mut go_package_identity_by_id = HashMap::<&str, GoPackageIdentity<'a>>::new();
         let mut go_package_scopes_by_path = HashMap::<&str, Vec<GoPackageIdentity<'a>>>::new();
+        let mut go_main_package_scopes = HashSet::<GoPackageIdentity<'a>>::new();
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
             if node.kind != "module"
@@ -296,6 +301,14 @@ impl<'a> SnapshotIndex<'a> {
                 if !scopes.contains(&identity) {
                     scopes.push(identity);
                 }
+                if node
+                    .properties
+                    .get("package_name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("main")
+                {
+                    go_main_package_scopes.insert(identity);
+                }
             }
         }
         let mut go_package_usage_profiles =
@@ -313,6 +326,7 @@ impl<'a> SnapshotIndex<'a> {
             }
         }
         let mut go_file_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
+        let mut go_main_file_ids = HashSet::<&str>::new();
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
             if node.kind != "file"
@@ -361,6 +375,23 @@ impl<'a> SnapshotIndex<'a> {
             // usage from a sibling module with the same package_path.
             if matching_scopes.len() != 1 {
                 continue;
+            }
+            let package_name = node
+                .properties
+                .get("package_name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty());
+            if package_name.is_none()
+                && node
+                    .properties
+                    .get("test")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                && matching_scopes
+                    .iter()
+                    .any(|scope| go_main_package_scopes.contains(scope))
+            {
+                go_main_file_ids.insert(node.id.as_str());
             }
             let mut profiles = HashSet::new();
             for scope in matching_scopes {
@@ -452,6 +483,7 @@ impl<'a> SnapshotIndex<'a> {
         Ok(Self {
             incoming,
             go_file_usage_profiles,
+            go_main_file_ids,
             sites_by_target,
             dynamic_site_ids,
             targetless_candidate,
@@ -1167,6 +1199,17 @@ mod tests {
                     json!({"package_name": "main", "package_path": "example.com/app/cmd", "test": false}),
                 ),
                 node(
+                    "go:entry-assembly",
+                    "file",
+                    "go",
+                    "cmd/entry.s",
+                    json!({
+                        "assembly": true,
+                        "package_path": "example.com/app/cmd",
+                        "manifest_path": "cmd/go.mod"
+                    }),
+                ),
+                node(
                     "go:entry-test",
                     "file",
                     "go",
@@ -1179,6 +1222,18 @@ mod tests {
                     "go",
                     "pkg/ordinary.go",
                     json!({"package_name": "pkg", "package_path": "example.com/app/pkg", "test": false}),
+                ),
+                node(
+                    "go:entry-package",
+                    "module",
+                    "go",
+                    "cmd",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/app/cmd",
+                        "module_path": "example.com/app",
+                        "manifest_path": "cmd/go.mod"
+                    }),
                 ),
             ],
             Vec::new(),
