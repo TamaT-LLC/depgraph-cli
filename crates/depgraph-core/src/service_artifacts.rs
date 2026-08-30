@@ -19,7 +19,11 @@ use crate::{
         PolicyResultSummary, PolicySelectorKind, PolicySeverity, PublicApiChangeKind,
         policy_annotations,
     },
-    policy_engine::evaluate_policy_diff,
+    policy_engine::{
+        evaluate_policy_diff_cancellable, is_policy_evaluation_cancelled,
+        is_policy_evaluation_resource_exhausted,
+    },
+    service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
 };
 
 use crate::service::{
@@ -661,8 +665,16 @@ impl DepgraphService {
         let rule_factor = policy.rules.len().saturating_add(1);
         preflight_graph_work(&from, &to, rule_factor, cancellation)?;
         check_cancelled(cancellation)?;
-        let evaluated = evaluate_policy_diff(&from_id, &from, &to_id, &to, &policy)
-            .map_err(|source| cancelled_or_policy(source, cancellation))?;
+        let evaluated = evaluate_policy_diff_cancellable(
+            &from_id,
+            &from,
+            &to_id,
+            &to,
+            &policy,
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|source| cancelled_or_policy(source, cancellation))?;
         check_cancelled(cancellation)?;
         if evaluated
             .api_changes
@@ -1823,10 +1835,16 @@ fn cancelled_or_store(
 }
 
 fn cancelled_or_policy(
-    _source: anyhow::Error,
+    source: anyhow::Error,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceError {
-    cancelled_or(DepgraphServiceError::PolicyInput, cancellation)
+    if is_policy_evaluation_resource_exhausted(&source) {
+        cancelled_or(DepgraphServiceError::ResourceExhausted, cancellation)
+    } else if is_policy_evaluation_cancelled(&source) {
+        cancelled_or(DepgraphServiceError::Cancelled, cancellation)
+    } else {
+        cancelled_or(DepgraphServiceError::PolicyInput, cancellation)
+    }
 }
 
 #[allow(dead_code)]
