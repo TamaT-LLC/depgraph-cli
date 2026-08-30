@@ -282,7 +282,11 @@ fn evaluate_policy_with_work(
         if rule.kind == PolicyRuleKind::PublicApiChange {
             continue;
         }
-        let suppressions = resolve_suppressions(snapshot, config, Some(&rule.id))?;
+        let suppressions = if rule.kind == PolicyRuleKind::RuntimeBoundary {
+            resolve_suppressions_bounded(snapshot, config, Some(&rule.id), work, is_cancelled)?
+        } else {
+            resolve_suppressions(snapshot, config, Some(&rule.id))?
+        };
         let sources = if rule.kind == PolicyRuleKind::RuntimeBoundary {
             resolve_selector_bounded(
                 snapshot,
@@ -1085,6 +1089,17 @@ fn resolve_suppressions<'a>(
     config: &'a PolicyConfig,
     rule_id: Option<&str>,
 ) -> Result<Vec<ResolvedSuppression<'a>>> {
+    let mut work = PolicyEvaluationWork::new(usize::MAX);
+    resolve_suppressions_bounded(snapshot, config, rule_id, &mut work, &mut || false)
+}
+
+fn resolve_suppressions_bounded<'a>(
+    snapshot: &GraphSnapshot,
+    config: &'a PolicyConfig,
+    rule_id: Option<&str>,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<ResolvedSuppression<'a>>> {
     let mut resolved = Vec::with_capacity(config.suppressions.len());
     for suppression in config
         .suppressions
@@ -1096,10 +1111,12 @@ fn resolve_suppressions<'a>(
             .source
             .as_ref()
             .map(|selector| {
-                resolve_selector(
+                resolve_selector_bounded(
                     snapshot,
                     selector,
                     &format!("suppression {:?} source", suppression.id),
+                    work,
+                    is_cancelled,
                 )
                 .map(|nodes| nodes.into_iter().map(|node| node.id.clone()).collect())
             })
@@ -1109,10 +1126,12 @@ fn resolve_suppressions<'a>(
             .target
             .as_ref()
             .map(|selector| {
-                resolve_selector(
+                resolve_selector_bounded(
                     snapshot,
                     selector,
                     &format!("suppression {:?} target", suppression.id),
+                    work,
+                    is_cancelled,
                 )
                 .map(|nodes| nodes.into_iter().map(|node| node.id.clone()).collect())
             })
@@ -1946,7 +1965,7 @@ fn resolve_selector_bounded<'a>(
     let mut matches = Vec::new();
     for node in &snapshot.nodes {
         work.step(is_cancelled)?;
-        if selector_matches_node(node, selector) {
+        if selector_matches_node_bounded(node, selector, work, is_cancelled)? {
             work.step(is_cancelled)?;
             matches.push(node);
         }
@@ -1983,6 +2002,49 @@ fn selector_matches_node(node: &NodeRecord, selector: &PolicySelector) -> bool {
             selector_field(node, exclude.field)
                 .is_some_and(|value| pattern_matches(exclude.match_kind, &exclude.value, value))
         })
+}
+
+fn selector_matches_node_bounded(
+    node: &NodeRecord,
+    selector: &PolicySelector,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    if !node_kind_matches(node, selector.kind) {
+        return Ok(false);
+    }
+    if !selector.scope.paths.is_empty() {
+        let Some(value) = node_path(node) else {
+            return Ok(false);
+        };
+        if !patterns_match_bounded(&selector.scope.paths, value, work, is_cancelled)? {
+            return Ok(false);
+        }
+    }
+    if !selector.scope.packages.is_empty() {
+        let Some(value) = node_package(node) else {
+            return Ok(false);
+        };
+        if !patterns_match_bounded(&selector.scope.packages, value, work, is_cancelled)? {
+            return Ok(false);
+        }
+    }
+    let Some(value) = selector_field(node, selector.field) else {
+        return Ok(false);
+    };
+    work.step(is_cancelled)?;
+    if !pattern_matches(selector.match_kind, &selector.value, value) {
+        return Ok(false);
+    }
+    for exclude in &selector.exclude {
+        work.step(is_cancelled)?;
+        if selector_field(node, exclude.field)
+            .is_some_and(|value| pattern_matches(exclude.match_kind, &exclude.value, value))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn node_kind_matches(node: &NodeRecord, kind: PolicySelectorKind) -> bool {
@@ -2117,6 +2179,21 @@ fn patterns_match(patterns: &[PolicyPattern], value: &str) -> bool {
     patterns
         .iter()
         .any(|pattern| pattern_matches(pattern.match_kind, &pattern.value, value))
+}
+
+fn patterns_match_bounded(
+    patterns: &[PolicyPattern],
+    value: &str,
+    work: &mut PolicyEvaluationWork,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    for pattern in patterns {
+        work.step(is_cancelled)?;
+        if pattern_matches(pattern.match_kind, &pattern.value, value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn profile_matches(filter: &PolicyProfileFilter, profile_id: &str) -> bool {
@@ -3078,6 +3155,103 @@ mod tests {
         let mut work = PolicyEvaluationWork::new(usize::MAX);
         let cancelled = adjacency_bounded(&admitted_refs, &mut work, &mut || true).unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_boundary_suppression_selector_honors_work_budget_and_cancellation() -> Result<()> {
+        let (graph, mut policy) = runtime_boundary_broad_fixture(64, 128);
+        policy.suppressions.push(PolicySuppression {
+            id: "bounded-suppression".to_owned(),
+            rule_id: "bounded-runtime-boundary".to_owned(),
+            reason: "fixture suppression".to_owned(),
+            scope: PolicySuppressionScope {
+                source: Some(policy.rules[0].source.clone()),
+                ..PolicySuppressionScope::default()
+            },
+        });
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(1);
+        let exhausted = resolve_suppressions_bounded(
+            &graph,
+            &policy,
+            Some("bounded-runtime-boundary"),
+            &mut work,
+            &mut || {
+                checks += 1;
+                false
+            },
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+        assert_eq!(checks, 2);
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled = resolve_suppressions_bounded(
+            &graph,
+            &policy,
+            Some("bounded-runtime-boundary"),
+            &mut work,
+            &mut || {
+                checks += 1;
+                checks > 1
+            },
+        )
+        .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_selector_charges_scope_and_exclusion_patterns() -> Result<()> {
+        let (graph, policy) = runtime_boundary_broad_fixture(1, 1);
+        let mut node = graph.nodes[0].clone();
+        node.properties = json!({"path": "src/source-0000.tsx"});
+
+        let mut scoped_selector = policy.rules[0].source.clone();
+        scoped_selector.scope.paths = vec![
+            PolicyPattern {
+                match_kind: PolicyMatchKind::Exact,
+                value: "src/does-not-exist.tsx".to_owned(),
+            },
+            PolicyPattern {
+                match_kind: PolicyMatchKind::Exact,
+                value: "src/also-does-not-exist.tsx".to_owned(),
+            },
+        ];
+        let mut work = PolicyEvaluationWork::new(1);
+        let exhausted =
+            selector_matches_node_bounded(&node, &scoped_selector, &mut work, &mut || false)
+                .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut excluded_selector = policy.rules[0].source.clone();
+        excluded_selector.exclude = (0..3)
+            .map(|index| PolicySelectorPattern {
+                field: PolicySelectorField::Locator,
+                match_kind: PolicyMatchKind::Exact,
+                value: format!("component:does-not-exist-{index}"),
+            })
+            .collect();
+        let mut work = PolicyEvaluationWork::new(2);
+        let exhausted =
+            selector_matches_node_bounded(&node, &excluded_selector, &mut work, &mut || false)
+                .unwrap_err();
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
+
+        let mut checks = 0;
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let cancelled =
+            selector_matches_node_bounded(&node, &excluded_selector, &mut work, &mut || {
+                checks += 1;
+                checks > 2
+            })
+            .unwrap_err();
+        assert!(is_policy_evaluation_cancelled(&cancelled));
+        assert_eq!(checks, 3);
         Ok(())
     }
 
