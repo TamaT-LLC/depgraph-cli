@@ -125,6 +125,31 @@ pub fn analyze_dependencies_cancellable(
                 }
             }
         }
+        if site.kind == "module_requirement" && !(used_from_production && used_from_test) {
+            // Go manifests declare a module path while source imports may point
+            // at any package below that module. The helper starts at the
+            // slash-delimited prefix so this remains O(log n + matching
+            // packages), and stops at the first key outside the prefix. The
+            // slash boundary avoids treating a similarly named module (for
+            // example foo/barista) as a use of foo/bar.
+            for (_, owners) in go_module_usage_targets(&usage_targets, specifier) {
+                budget.step(&mut is_cancelled)?;
+                for owner in owners {
+                    budget.step(&mut is_cancelled)?;
+                    if owner.is_test {
+                        used_from_test = true;
+                    } else {
+                        used_from_production = true;
+                    }
+                    if used_from_production && used_from_test {
+                        break;
+                    }
+                }
+                if used_from_production && used_from_test {
+                    break;
+                }
+            }
+        }
         let production_declared = is_production_declaration(site);
         let profile_coverage = dependency_profile_coverage(
             profiles.get(site.profile_id.as_str()).copied(),
@@ -352,6 +377,21 @@ fn package_usage_targets(
     Ok(usage)
 }
 
+/// Return only package usage keys below a Go module path.
+///
+/// `BTreeMap::range` seeks to the first slash-delimited prefix in O(log n);
+/// `take_while` then visits only matching subpackages, preserving the
+/// analyzer's bounded work accounting.
+fn go_module_usage_targets<'a>(
+    usage_targets: &'a BTreeMap<String, Vec<UsageOwner>>,
+    module_path: &str,
+) -> impl Iterator<Item = (&'a String, &'a Vec<UsageOwner>)> {
+    let prefix = format!("{module_path}/");
+    usage_targets
+        .range(prefix.clone()..)
+        .take_while(move |(used_package, _)| used_package.starts_with(&prefix))
+}
+
 fn is_test_node(node: &NodeRecord, edge: &EdgeRecord) -> bool {
     let path = node
         .properties
@@ -379,7 +419,13 @@ fn is_production_declaration(site: &SiteRecord) -> bool {
 }
 
 fn package_name(node: &NodeRecord) -> Option<String> {
-    for key in ["name", "package", "package_name", "module_path"] {
+    for key in [
+        "name",
+        "package",
+        "package_name",
+        "module_path",
+        "import_path",
+    ] {
         if let Some(value) = node.properties.get(key).and_then(|value| value.as_str()) {
             return Some(value.to_owned());
         }
@@ -637,6 +683,110 @@ mod tests {
         }
     }
 
+    fn ecosystem_profile(id: &str, language: &str) -> ProfileRecord {
+        ProfileRecord {
+            id: id.to_owned(),
+            language: language.to_owned(),
+            toolchain: None,
+            command: None,
+            target: None,
+            features: Vec::new(),
+            environment: json!({}),
+            source_revision: None,
+            properties: json!({}),
+            coverage: Some(CoverageRecord {
+                completeness: vec!["semantic-complete".to_owned()],
+                ..CoverageRecord::default()
+            }),
+        }
+    }
+
+    fn ecosystem_package(id: &str, name: &str, manifest: &str, language: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: "package_instance".to_owned(),
+            locator: format!("package://{name}"),
+            display_name: name.to_owned(),
+            properties: json!({
+                "name": name,
+                "manifest_path": manifest,
+                "language": language,
+                "module_path": name
+            }),
+        }
+    }
+
+    fn ecosystem_file(id: &str, path: &str, language: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: "file".to_owned(),
+            locator: format!("file://{path}"),
+            display_name: path.to_owned(),
+            properties: json!({"path": path, "language": language}),
+        }
+    }
+
+    fn ecosystem_site(
+        id: &str,
+        source: &str,
+        kind: &str,
+        profile_id: &str,
+        specifier: &str,
+        target: &str,
+        condition: serde_json::Value,
+    ) -> SiteRecord {
+        SiteRecord {
+            id: id.to_owned(),
+            source: source.to_owned(),
+            kind: kind.to_owned(),
+            specifier: Some(specifier.to_owned()),
+            profile_id: profile_id.to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition,
+            target_ids: vec![target.to_owned()],
+            reason: None,
+        }
+    }
+
+    fn ecosystem_usage_edge(id: &str, source: &str, target: &str, profile_id: &str) -> EdgeRecord {
+        EdgeRecord {
+            id: id.to_owned(),
+            site_id: None,
+            source: source.to_owned(),
+            target: target.to_owned(),
+            kind: "imports".to_owned(),
+            phase: "source".to_owned(),
+            environment: "host".to_owned(),
+            profile_id: profile_id.to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition: json!({}),
+            generated: false,
+        }
+    }
+
+    fn ecosystem_graph(
+        profile: ProfileRecord,
+        nodes: Vec<NodeRecord>,
+        sites: Vec<SiteRecord>,
+        edges: Vec<EdgeRecord>,
+    ) -> GraphSnapshot {
+        GraphSnapshot {
+            scan: empty_scan(),
+            profiles: vec![profile],
+            nodes,
+            sites,
+            edges,
+            evidence: Vec::new(),
+            diagnostics: Vec::new(),
+            file_coverage: Vec::new(),
+            adapter_logs: Vec::new(),
+            coverage: CoverageRecord::default(),
+            profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
+        }
+    }
+
     #[test]
     fn issue_423_detects_unused_test_only_and_manifest_mismatch() {
         let snapshot = graph(
@@ -789,5 +939,243 @@ mod tests {
         assert_eq!(unused[0].evidence.len(), 2);
         assert_eq!(unused[0].evidence[0].owner_id, "site:left-a");
         assert_eq!(unused[0].evidence[1].owner_id, "site:left-b");
+    }
+
+    #[test]
+    fn issue_437_go_dependency_findings_cover_unused_test_only_and_manifest_mismatch() {
+        let profile_id = "profile:go-health";
+        let manifest = "app/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest, "go"),
+                ecosystem_package("go:unused", "example.com/unused", manifest, "go"),
+                ecosystem_package("go:test-only", "example.com/test-only", manifest, "go"),
+                ecosystem_package("go:mismatch", "example.com/mismatch", manifest, "go"),
+                ecosystem_file("go:test", "app/internal/consumer_test.go", "go"),
+                ecosystem_file("go:main", "app/cmd/main.go", "go"),
+            ],
+            vec![
+                ecosystem_site(
+                    "site:go-unused",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.com/unused",
+                    "go:unused",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-test-only",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.com/test-only",
+                    "go:test-only",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-mismatch",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.com/mismatch",
+                    "go:mismatch",
+                    json!({}),
+                ),
+            ],
+            vec![
+                ecosystem_usage_edge("edge:go-test-only", "go:test", "go:test-only", profile_id),
+                ecosystem_usage_edge("edge:go-mismatch", "go:main", "go:mismatch", profile_id),
+            ],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:go-health".to_owned(),
+                declared: BTreeSet::from([
+                    "example.com/unused".to_owned(),
+                    "example.com/test-only".to_owned(),
+                ]),
+                drifted: false,
+            }],
+        );
+
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.com/unused")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::TestOnlyDependency
+                && finding.reason.contains("example.com/test-only")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::ManifestMismatch
+                && finding.reason.contains("example.com/mismatch")
+        }));
+        assert!(!findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.com/mismatch")
+        }));
+    }
+
+    #[test]
+    fn issue_437_go_module_dependency_matches_an_imported_subpackage() {
+        let profile_id = "profile:go-module-prefix";
+        let manifest = "app/go.mod";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "go"),
+            vec![
+                ecosystem_package("go:app", "example.com/app", manifest, "go"),
+                NodeRecord {
+                    id: "go:external-package".to_owned(),
+                    kind: "external_system".to_owned(),
+                    locator: "gomod:example.net/external/pkg".to_owned(),
+                    display_name: "example.net/external/pkg".to_owned(),
+                    properties: json!({
+                        "ecosystem": "go",
+                        "external": true,
+                        "import_path": "example.net/external/pkg"
+                    }),
+                },
+                NodeRecord {
+                    id: "go:similar-package".to_owned(),
+                    kind: "external_system".to_owned(),
+                    locator: "gomod:example.net/external/pkg".to_owned(),
+                    display_name: "example.net/external/pkg".to_owned(),
+                    properties: json!({
+                        "ecosystem": "go",
+                        "external": true,
+                        "import_path": "example.net/external/pkg"
+                    }),
+                },
+                ecosystem_file("go:main", "app/main.go", "go"),
+            ],
+            vec![
+                ecosystem_site(
+                    "site:go-module",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.net/external",
+                    "go:external-package",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:go-similar-prefix",
+                    "go:app",
+                    "module_requirement",
+                    profile_id,
+                    "example.net/extern",
+                    "go:similar-package",
+                    json!({}),
+                ),
+            ],
+            vec![ecosystem_usage_edge(
+                "edge:go-module-import",
+                "go:main",
+                "go:external-package",
+                profile_id,
+            )],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:go-module-prefix".to_owned(),
+                declared: BTreeSet::from([
+                    "example.net/external".to_owned(),
+                    "example.net/extern".to_owned(),
+                ]),
+                drifted: false,
+            }],
+        );
+        assert!(!findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.net/external")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency
+                && finding.reason.contains("example.net/extern")
+        }));
+    }
+
+    #[test]
+    fn issue_437_web_dependency_findings_cover_unused_test_only_and_manifest_mismatch() {
+        let profile_id = "profile:web-health";
+        let manifest = "apps/web/package.json";
+        let snapshot = ecosystem_graph(
+            ecosystem_profile(profile_id, "web"),
+            vec![
+                ecosystem_package("web:app", "@fixture/web", manifest, "web"),
+                ecosystem_package("web:unused", "unused-web", manifest, "web"),
+                ecosystem_package("web:test-only", "test-only-web", manifest, "web"),
+                ecosystem_package("web:mismatch", "mismatch-web", manifest, "web"),
+                ecosystem_file("web:test", "apps/web/src/consumer.test.ts", "typescript"),
+                ecosystem_file("web:main", "apps/web/src/main.ts", "typescript"),
+            ],
+            vec![
+                ecosystem_site(
+                    "site:web-unused",
+                    "web:app",
+                    "package_dependency",
+                    profile_id,
+                    "unused-web",
+                    "web:unused",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:web-test-only",
+                    "web:app",
+                    "package_dependency",
+                    profile_id,
+                    "test-only-web",
+                    "web:test-only",
+                    json!({}),
+                ),
+                ecosystem_site(
+                    "site:web-mismatch",
+                    "web:app",
+                    "package_dependency",
+                    profile_id,
+                    "mismatch-web",
+                    "web:mismatch",
+                    json!({}),
+                ),
+            ],
+            vec![
+                ecosystem_usage_edge(
+                    "edge:web-test-only",
+                    "web:test",
+                    "web:test-only",
+                    profile_id,
+                ),
+                ecosystem_usage_edge("edge:web-mismatch", "web:main", "web:mismatch", profile_id),
+            ],
+        );
+        let findings = analyze_dependencies(
+            &snapshot,
+            &[ManifestIdentity {
+                path: manifest.to_owned(),
+                digest: "sha256:web-health".to_owned(),
+                declared: BTreeSet::from(["unused-web".to_owned(), "test-only-web".to_owned()]),
+                drifted: false,
+            }],
+        );
+
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency && finding.reason.contains("unused-web")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::TestOnlyDependency
+                && finding.reason.contains("test-only-web")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.kind == FindingKind::ManifestMismatch && finding.reason.contains("mismatch-web")
+        }));
+        assert!(!findings.iter().any(|finding| {
+            finding.kind == FindingKind::UnusedDependency && finding.reason.contains("mismatch-web")
+        }));
     }
 }

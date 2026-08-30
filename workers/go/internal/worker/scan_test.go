@@ -67,6 +67,23 @@ func TestScanWorkspaceFixture(t *testing.T) {
 		if !strings.Contains(node.ID, ":sha256:") {
 			t.Fatalf("node ID does not use canonical sha256 format: %s", node.ID)
 		}
+		if node.Kind == "package_instance" {
+			modulePath, ok := node.Properties["module_path"].(string)
+			if !ok {
+				t.Fatalf("package %q has no string module_path", node.ID)
+			}
+			wantManifest, ok := map[string]string{
+				"example.com/app":      "app/go.mod",
+				"example.com/shared":   "shared/go.mod",
+				"example.com/replaced": "replaced/go.mod",
+			}[modulePath]
+			if !ok {
+				t.Fatalf("unexpected package module_path %q", modulePath)
+			}
+			if got, _ := node.Properties["manifest_path"].(string); got != wantManifest {
+				t.Fatalf("package %q manifest_path = %q, want %q", modulePath, got, wantManifest)
+			}
+		}
 		if node.Kind == "file" && strings.HasSuffix(node.Locator, "app/lib/generated.go") {
 			generatedFound, _ = node.Properties["generated"].(bool)
 		}

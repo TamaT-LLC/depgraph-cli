@@ -485,6 +485,9 @@ func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]N
 				"go_version": module.GoVersion, "toolchain": module.Toolchain, "workspace_member": workspaceMember,
 			},
 		}
+		if module.ManifestPath != "" {
+			node.Properties["manifest_path"] = relativePath(s.root, module.ManifestPath)
+		}
 		if err := addNode(s.nodes, node); err != nil {
 			return nil, err
 		}
