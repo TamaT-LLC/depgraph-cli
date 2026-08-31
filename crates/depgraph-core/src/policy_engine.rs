@@ -5039,7 +5039,7 @@ fn parse_condition_bounded(
                     .and_then(Value::as_str)
                     .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
                 if depth >= MAX_EDGE_CONDITION_DEPTH && matches!(operation, "all" | "any" | "not") {
-                    bail!("edge {edge_id:?} has an invalid policy condition");
+                    return Err(PolicyEvaluationWorkExhausted.into());
                 }
                 match operation {
                     "all" | "any" => {
@@ -5058,7 +5058,7 @@ fn parse_condition_bounded(
                             })?;
                         work.steps(children.len(), is_cancelled)?;
                         if children.len() > 255 {
-                            bail!("edge {edge_id:?} has an invalid policy condition");
+                            return Err(PolicyEvaluationWorkExhausted.into());
                         }
                         frames.push(ConditionParseFrame::Aggregate {
                             any: operation == "any",
@@ -5121,8 +5121,8 @@ fn parse_condition_bounded(
                                 format!("edge {edge_id:?} has an invalid policy condition")
                             })?;
                         work.steps(raw_values.len(), is_cancelled)?;
-                        if raw_values.is_empty() || raw_values.len() > 128 {
-                            bail!("edge {edge_id:?} has an invalid policy condition");
+                        if raw_values.len() > 128 {
+                            return Err(PolicyEvaluationWorkExhausted.into());
                         }
                         let mut condition_values = Vec::new();
                         for value in raw_values {
@@ -5132,14 +5132,6 @@ fn parse_condition_bounded(
                                 work,
                                 is_cancelled,
                             )?);
-                        }
-                        for (index, value) in condition_values.iter().enumerate() {
-                            for previous in &condition_values[..index] {
-                                work.step(is_cancelled)?;
-                                if condition_values_equal(previous, value) {
-                                    bail!("edge {edge_id:?} has an invalid policy condition");
-                                }
-                            }
                         }
                         values.push(PolicyCondition::In {
                             key,
@@ -5245,13 +5237,11 @@ fn condition_key_bounded(
         .get("key")
         .and_then(Value::as_str)
         .with_context(|| format!("edge {edge_id:?} has an invalid policy condition"))?;
-    if key.is_empty()
-        || key.len() > 128
-        || key.chars().any(|character| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | ':' | '-'))
-        })
-    {
+    if key.is_empty() {
         bail!("edge {edge_id:?} has an invalid policy condition");
+    }
+    if key.len() > 128 {
+        return Err(PolicyEvaluationWorkExhausted.into());
     }
     work.steps(key.len().saturating_add(1), is_cancelled)?;
     Ok(key.to_owned())
@@ -5268,9 +5258,9 @@ fn condition_value_bounded(
         bail!("edge {edge_id:?} has an invalid policy condition");
     }
     if let Value::String(value) = value
-        && (value.is_empty() || value.chars().count() > 1024 || value.chars().any(char::is_control))
+        && value.chars().count() > 1024
     {
-        bail!("edge {edge_id:?} has an invalid policy condition");
+        return Err(PolicyEvaluationWorkExhausted.into());
     }
     Ok(value.clone())
 }
@@ -8452,7 +8442,7 @@ mod tests {
         assert_eq!(checks, 17);
 
         let mut work = PolicyEvaluationWork::new(usize::MAX);
-        let invalid = admitted_edges_with_options_bounded(
+        let exhausted = admitted_edges_with_options_bounded(
             &deep_graph,
             &policy,
             false,
@@ -8461,7 +8451,7 @@ mod tests {
             &mut || false,
         )
         .unwrap_err();
-        assert!(invalid.to_string().contains("invalid policy condition"));
+        assert!(is_policy_evaluation_resource_exhausted(&exhausted));
 
         let many_children = (0..2_048)
             .map(|index| {
@@ -8501,32 +8491,125 @@ mod tests {
         );
         boundary_condition = json!({"op":"not","condition":boundary_condition});
         let mut work = PolicyEvaluationWork::new(usize::MAX);
-        assert!(
-            parse_condition_bounded(&boundary_condition, "boundary", &mut work, &mut || false,)
+        assert!(is_policy_evaluation_resource_exhausted(
+            &parse_condition_bounded(&boundary_condition, "boundary", &mut work, &mut || false,)
                 .unwrap_err()
-                .to_string()
-                .contains("invalid policy condition")
-        );
+        ));
 
-        let invalid_conditions = [
+        let protocol_compatible_conditions = [
             json!({"op":"in","key":"mode","values": []}),
             json!({"op":"in","key":"mode","values": ["production", "production"]}),
-            json!({"op":"eq","key":"","value": true}),
             json!({"op":"eq","key":"mode","value":""}),
+            json!({"op":"eq","key":"feature flag/β","value":"\u{0000}"}),
         ];
-        for value in invalid_conditions {
+        for value in protocol_compatible_conditions {
             let mut work = PolicyEvaluationWork::new(usize::MAX);
-            assert!(parse_condition_bounded(&value, "invalid", &mut work, &mut || false,).is_err());
+            assert!(
+                parse_condition_bounded(&value, "protocol-v1", &mut work, &mut || false,).is_ok()
+            );
         }
+
+        let mut protocol_graph = snapshot(vec![edge(
+            "empty-in-condition",
+            "a",
+            "b",
+            "profile:production",
+        )]);
+        protocol_graph.edges[0].condition = json!({"op":"in","key":"mode","values": []});
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        assert!(
+            admitted_edges_with_options_bounded(
+                &protocol_graph,
+                &policy,
+                false,
+                false,
+                &mut work,
+                &mut || false,
+            )?
+            .is_empty()
+        );
+
+        let protocol_condition = json!({
+            "op":"any",
+            "conditions":[
+                {"op":"in","key":"missing/value","values": []},
+                {"op":"eq","key":"feature flag/β","value":"\u{0000}"},
+                {"op":"eq","key":"blank/value","value":""}
+            ]
+        });
+        let mut protocol_violation_graph = snapshot(vec![edge(
+            "protocol-condition-violation",
+            "a",
+            "b",
+            "profile:production",
+        )]);
+        protocol_violation_graph.profiles[0].environment = json!({
+            "mode":"production",
+            "feature flag/β":"\u{0000}",
+            "blank/value":""
+        });
+        protocol_violation_graph.edges[0].condition = protocol_condition;
+        let protocol_violation = evaluate_policy(
+            "snapshot:protocol-condition",
+            &protocol_violation_graph,
+            &config(rule(PolicyRuleKind::LayerBoundary)),
+        )?;
+        assert_eq!(protocol_violation.violations.len(), 1);
+        let projected_condition =
+            serde_json::to_value(&protocol_violation.violations[0].condition)?;
+        let projected_condition = projected_condition.to_string();
+        assert!(projected_condition.contains("feature flag/β"));
+        assert!(projected_condition.contains("blank/value"));
+        assert!(projected_condition.contains("\"values\":[]"));
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let empty_key = json!({"op":"eq","key":"","value": true});
+        assert!(parse_condition_bounded(&empty_key, "invalid", &mut work, &mut || false,).is_err());
+
         let mut work = PolicyEvaluationWork::new(usize::MAX);
         let oversized_key = json!({
             "op":"eq",
             "key":"k".repeat(129),
             "value": true
         });
-        assert!(
-            parse_condition_bounded(&oversized_key, "invalid", &mut work, &mut || false,).is_err()
-        );
+        assert!(is_policy_evaluation_resource_exhausted(
+            &parse_condition_bounded(&oversized_key, "resource-exhausted", &mut work, &mut || {
+                false
+            },)
+            .unwrap_err()
+        ));
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let oversized_values = json!({
+            "op":"in",
+            "key":"mode",
+            "values": vec![Value::Null; 129]
+        });
+        assert!(is_policy_evaluation_resource_exhausted(
+            &parse_condition_bounded(
+                &oversized_values,
+                "resource-exhausted",
+                &mut work,
+                &mut || false,
+            )
+            .unwrap_err()
+        ));
+
+        let mut work = PolicyEvaluationWork::new(usize::MAX);
+        let oversized_value = json!({
+            "op":"eq",
+            "key":"mode",
+            "value":"v".repeat(1_025)
+        });
+        assert!(is_policy_evaluation_resource_exhausted(
+            &parse_condition_bounded(
+                &oversized_value,
+                "resource-exhausted",
+                &mut work,
+                &mut || false,
+            )
+            .unwrap_err()
+        ));
 
         // The logical depth limit is independent from the JSON wire depth:
         // every aggregate adds both an object and a `conditions` array. A
