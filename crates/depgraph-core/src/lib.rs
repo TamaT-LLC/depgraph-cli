@@ -304,9 +304,10 @@ pub use health::{
     BaselineFindingRecord, BaselineTransition, BlockerKind, CollectionIdentity, Confidence,
     DEFAULT_HOTSPOT_WEIGHTS, FindingBlocker, FindingEvidenceRef, FindingIdentity, FindingKind,
     FindingKindScope, FindingSuppression, HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION,
-    HealthFinding, HealthFindingDetail, HealthGateConfig, HealthGateDecision, HotspotWeights,
-    Remediation, Severity, SourceLocation, classify_baseline_transition, collection_digest,
-    evaluate_health_gate, finding_fingerprint, finding_id,
+    HealthFinding, HealthFindingDetail, HealthGateConfig, HealthGateDecision, HotspotFindingScores,
+    HotspotLayerScore, HotspotLayerScores, HotspotScores, HotspotWeights, Remediation, Severity,
+    SourceLocation, classify_baseline_transition, collection_digest, evaluate_health_gate,
+    finding_fingerprint, finding_id,
 };
 pub use http_operation_correlation::{
     HTTP_OPERATION_CORRELATION_VERSION, HttpOperationCorrelationOutcome,
