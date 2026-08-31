@@ -30,7 +30,7 @@ updated: 2026-08-26
 > 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
 > 2026-08-26: 公開済み`v0.5.4` tag後のIssue #423として、説明可能なコードヘルス解析を共有serviceと`depgraph-health-finding-v1`へ実装し、CLI `health` / `cleanup` / `audit` / `hotspots` と MCP 5 toolを同じ未公開開発契約で追加した。
-> 2026-08-30: tag後`main`のIssue #440としてhotspot findingへ5層（fan-in、fan-out、reverse-impact、Git churn、runtime）のraw／正規化basis point／weight／availabilityとtotalを`hotspot_scores`として構造化した。hotspotのconfidenceは`probable`上限とし、reasonはhuman表示専用でfingerprintから除外する。ファイル系findingのpath依存IDとrename追従をdeferredとする移行影響をADRへ固定した。
+> 2026-08-30: tag後`main`のIssue #440としてhotspot findingへ5層（fan-in、fan-out、reverse-impact、Git churn、runtime）のraw／正規化basis point／weight／available／totalを`hotspot_scores`として構造化した。hotspotのconfidenceは`probable`上限とし、reasonはhuman表示専用でfingerprintから除外する。ファイル系findingのpath依存IDとrename追従をdeferredとする移行影響をADRへ固定した。
 > 2026-08-26: `v0.5.4`でCodex、Claude Code、Cursor、Grokのproject／user scope MCPセットアップを追加した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.3`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
@@ -76,7 +76,7 @@ Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph sche
 Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable-release-gate-v1`を確定したが、stable GitHub Releaseは公開されなかった。公開済みの最終候補は`v0.4.0-rc.6`であり、[v0.4.0 document](../releases/v0.4.0.md)はimmutable baselineの履歴記録であって現行support claimではない。
 
 MCPを含む最初のv0.5 stableは`v0.5.0`である。
-公開済み`v0.5.0`〜`v0.5.4`の`stable-release-gate-v2`は、公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。tag後の現行`main`は同じfixtureをschema `18`までmigrationし、schema 17から18への段階でlegacy seal v1を検証してhealth provenanceを結合したseal v2へ再構築する。schema `17`は公開済み`v0.5.4`までのstable契約であり、schema 18へmigrationしたStoreを旧binaryで開くことはできない。
+公開済み`v0.5.0`〜`v0.5.4`の`stable-release-gate-v2`は、公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。tag後の現行`main`は同じfixtureをschema `18`までmigrationし、schema 17から18への段階でlegacy seal v1を検証してhealth provenanceを結合したseal v2へ再構築する。schema `17`は公開済み`v0.5.4`までのstable契約であり、schema 18へmigrationしたStoreを公開済みの旧binaryで開くことはできない。
 `v0.5.0`はsigned tag、remote `main`、初期`release/0.5`、source tree、exact eight-job Full CI、固定Agent dogfood reportが一致する場合だけ公開した。
 公開済みの`v0.5.4` artifactは、この互換性境界を変えずに4つのAgent hostへ
 project／user scopeのMCPセットアップを追加した。tag後の現行`main`は別の未公開
@@ -2016,7 +2016,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
-- 2026-08-30: Issue #440として`hotspot_scores`の5層構造化（raw／正規化basis point／weight／availability／total）、MCP closed DTO/schema/catalog、CLI/MCP parity E2Eを追加した。hotspotはランキングであり`confirmed`に昇格せず`probable`上限、reasonはfingerprint payloadから除外、path依存finding IDとrename追従deferredの移行影響をADRへ記録した。
+- 2026-08-30: Issue #440として`hotspot_scores`の5層構造化（raw／正規化basis point／weight／available／total）、MCP closed DTO/schema/catalog、CLI/MCP parity E2Eを追加した。hotspotはランキングであり`confirmed`に昇格せず`probable`上限、reasonはfingerprint payloadから除外、path依存finding IDとrename追従deferredの移行影響をADRへ記録した。
 - 2026-08-26: Issue #423として`depgraph-health-finding-v1`の共有read-only service、unused / dependency / audit / hotspot analyzer、CLI `health` / `cleanup` / `audit` / `hotspots`、MCP 5 tool、baseline遷移gate、CLI/MCP parityを実装した。`health` summaryはsnapshot-scoped kindだけを集計し、audit / hotspotは含めない。`confirmed`は適用対象profile全部がsemantic-completeでhard blockerが無い場合に限る。
 - 2026-08-07: Issue #304としてbounded query/runtime validationの共有read-only service、CLI migration、`graph_query` / `runtime_trace_validate` MCP handlerを実装した。query/traceはinlineまたはconfined repository-relative fileのexactly oneとし、absolute/traversal/symlink/nonregular/oversizeを拒否する。queryのparse/credential/type/output pre-admissionとtrace shape/credential validationをstore前に完了し、query plan cap超過はexecution前の`QUERY_REJECTED`とする。両操作はpinned completed snapshotだけを読み、store/snapshot/source treeを不変に保つ。MCPはclosed query/runtime DTO、canonical byte/item pagination、snapshot/input-bound cursor、Read runtime controlを使い、CLI/MCP parity、non-echo security、catalog/schema/contract goldenで固定した。
 - 2026-08-02: PRとmain pushのCIをRust / Go / Webの品質検査とcompiler-precise hostile E2Eに限定し、benchmark、Linux / macOS integration、Windows smokeは手動dispatchだけで実行する構成へ変更した。`v*` tagのRelease workflowはquality、hostile E2E、benchmark、全5 targetのarchive / compiler pack、aggregate verificationを実行し、全gate成功後だけ公開する。

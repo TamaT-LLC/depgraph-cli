@@ -80,7 +80,7 @@ depgraph export --format mermaid > graph.mmd
 | グラフ出力 | `export` | JSON、DOT、Mermaid、GraphML |
 | 未使用のfile / export / type / dependency | `health`、`health list`、`cleanup` | snapshot-scoped finding、confidence、blocker。summaryはaudit / hotspotを含まない |
 | 変更差分のリスク | `audit --changed <GIT_REF>` | `merge-base(GIT_REF, HEAD)..HEAD` の新規cycle、境界違反、公開API変更、blast radius。`changed_oid`は監査対象HEADを示す。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
-| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、availability、totalを構造化して出力し、confidenceは`probable`上限 |
+| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、available、totalを構造化して出力し、confidenceは`probable`上限 |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
 
 `health` の **confidence** は次の意味である。`confirmed` は適用対象の解析済みprofileすべてで未使用かつそれらがsemantic-completeでhard blockerが無い。`probable` は使用がなくhard blockerも無いが、適用対象profileがsyntax-completeまでの状態である。`indeterminate` はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。hotspotは未使用の証明ではないため常に`probable`以下であり、`hotspot_scores`の`available`で層の充足を確認する。findingの`suppressions`はv1ではwire互換性のため保持するoutput-only/deferred fieldであり、CLI・MCP・policyからの入力経路はなく、組み込みanalyzerは常に空配列を返す。監査のbefore/afterはschema 18に保存したpolicy digest・analyzer version・finding contract versionを比較し、欠落や差異をfail-closedで`incomparable-policy` / `incomparable-contract`へ劣化させる。sourceは自動変更しない。
@@ -188,7 +188,7 @@ MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
 v0.5のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`5`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v1`を使用する。
 公開済み`v0.5.4` artifactのStore schemaは`17`である。
-tag後の現行`main`はStore schema `18`を使用し、schema 18へ移行したStoreを`v0.5.4` binaryで開くことはできない。
+tag後の現行`main`はStore schema `18`を使用し、schema 18へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
 
 `v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。

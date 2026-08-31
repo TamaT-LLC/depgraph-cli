@@ -25,7 +25,7 @@ pub use dependency::{ManifestIdentity, analyze_dependencies, analyze_dependencie
 pub use hotspot::{
     DEFAULT_HOTSPOT_WEIGHTS, HotspotAnalysisError, HotspotFindingScores, HotspotLayer,
     HotspotLayerAvailability, HotspotLayerScore, HotspotLayerScores, HotspotScores, HotspotWeights,
-    score_hotspots, score_hotspots_cancellable,
+    hotspot_weighted_total, score_hotspots, score_hotspots_cancellable,
 };
 pub use surface::{SurfaceClassification, SurfaceRole, classify_surface};
 pub use unused::{analyze_unused, analyze_unused_cancellable};

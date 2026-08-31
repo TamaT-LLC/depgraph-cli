@@ -661,20 +661,14 @@ impl DepgraphService {
         } else {
             comparability.missing_base = true;
         }
-        let boundary_violation_ids = evaluate_audit_boundary_ids(
-            &policy,
-            before.as_ref(),
-            &PinnedHealthSnapshot {
-                id: after_id.clone(),
-                snapshot: after.clone(),
-            },
-            cancellation,
-        )?;
+        let after = PinnedHealthSnapshot {
+            id: after_id,
+            snapshot: after,
+        };
+        let boundary_violation_ids =
+            evaluate_audit_boundary_ids(&policy, before.as_ref(), &after, cancellation)?;
         Ok(HealthAuditReadScope {
-            after: PinnedHealthSnapshot {
-                id: after_id,
-                snapshot: after,
-            },
+            after,
             before,
             changed_set,
             changed_set_digest,

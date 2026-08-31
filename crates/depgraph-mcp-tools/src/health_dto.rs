@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use depgraph_core::health::{BASIS_POINTS_MAX, hotspot_weighted_total};
 use depgraph_core::service::{
     MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_EVIDENCE_PER_FINDING,
     MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
@@ -197,8 +198,6 @@ pub struct AgentHealthSuppression {
     ticket: Option<AgentLabel>,
 }
 
-const MAX_HOTSPOT_BASIS_POINTS: u32 = 10_000;
-
 /// One machine-readable hotspot layer contribution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -228,8 +227,8 @@ impl JsonSchema for AgentHealthHotspotLayerScore {
             "additionalProperties": false,
             "properties": {
                 "raw": {"type": "integer", "format": "uint64", "minimum": 0},
-                "normalized_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000},
-                "weight_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000},
+                "normalized_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": BASIS_POINTS_MAX},
+                "weight_basis_points": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": BASIS_POINTS_MAX},
                 "available": {"type": "boolean"}
             },
             "required": ["raw", "normalized_basis_points", "weight_basis_points", "available"],
@@ -264,8 +263,8 @@ impl<'de> Deserialize<'de> for AgentHealthHotspotLayerScore {
         D: Deserializer<'de>,
     {
         let wire = AgentHealthHotspotLayerScoreWire::deserialize(deserializer)?;
-        if wire.normalized_basis_points > MAX_HOTSPOT_BASIS_POINTS
-            || wire.weight_basis_points > MAX_HOTSPOT_BASIS_POINTS
+        if wire.normalized_basis_points > BASIS_POINTS_MAX
+            || wire.weight_basis_points > BASIS_POINTS_MAX
             || (!wire.available && (wire.raw != 0 || wire.normalized_basis_points != 0))
         {
             return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
@@ -281,8 +280,8 @@ impl<'de> Deserialize<'de> for AgentHealthHotspotLayerScore {
 
 impl AgentHealthHotspotLayerScore {
     fn try_from_core(source: &HotspotLayerScore) -> Result<Self, ContractBuildError> {
-        if source.normalized_basis_points > MAX_HOTSPOT_BASIS_POINTS
-            || source.weight_basis_points > MAX_HOTSPOT_BASIS_POINTS
+        if source.normalized_basis_points > BASIS_POINTS_MAX
+            || source.weight_basis_points > BASIS_POINTS_MAX
             || (!source.available && (source.raw != 0 || source.normalized_basis_points != 0))
         {
             return Err(ContractBuildError::AgentDtoValue);
@@ -348,13 +347,13 @@ impl JsonSchema for AgentHealthHotspotScores {
                 "reverse_impact": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
                 "git_churn": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
                 "runtime": generator.subschema_for::<AgentHealthHotspotLayerScore>(),
-                "total": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10000}
+                "total": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": BASIS_POINTS_MAX}
             },
             "required": ["fan_in", "fan_out", "reverse_impact", "git_churn", "runtime", "total"],
             // Draft 2020-12 has no arithmetic keyword for cross-property sums.
             // Keep the exact rule machine-readable for schema consumers while
             // AgentHealthHotspotScores' custom deserializer remains authoritative.
-            "x-depgraph-weight-sum-max": 10000,
+            "x-depgraph-weight-sum-max": BASIS_POINTS_MAX,
             "x-depgraph-derived-total": "sum(floor(normalized_basis_points * weight_basis_points / 10000))"
         })
     }
@@ -377,10 +376,10 @@ impl<'de> Deserialize<'de> for AgentHealthHotspotScores {
         D: Deserializer<'de>,
     {
         let wire = AgentHealthHotspotScoresWire::deserialize(deserializer)?;
-        if wire.total > MAX_HOTSPOT_BASIS_POINTS
-            || weight_sum(&wire) > MAX_HOTSPOT_BASIS_POINTS
+        if wire.total > BASIS_POINTS_MAX
+            || weight_sum(&wire) > BASIS_POINTS_MAX
             || wire.total
-                != weighted_total([
+                != hotspot_weighted_total([
                     (
                         wire.fan_in.normalized_basis_points(),
                         wire.fan_in.weight_basis_points(),
@@ -418,7 +417,7 @@ impl<'de> Deserialize<'de> for AgentHealthHotspotScores {
 
 impl AgentHealthHotspotScores {
     pub fn try_from_core(source: &HotspotFindingScores) -> Result<Self, ContractBuildError> {
-        if source.total > MAX_HOTSPOT_BASIS_POINTS
+        if source.total > BASIS_POINTS_MAX
             || source
                 .fan_in
                 .weight_basis_points
@@ -426,7 +425,7 @@ impl AgentHealthHotspotScores {
                 .saturating_add(source.reverse_impact.weight_basis_points)
                 .saturating_add(source.git_churn.weight_basis_points)
                 .saturating_add(source.runtime.weight_basis_points)
-                > MAX_HOTSPOT_BASIS_POINTS
+                > BASIS_POINTS_MAX
             || source.total != core_weighted_total(source)
         {
             return Err(ContractBuildError::AgentDtoValue);
@@ -483,7 +482,7 @@ fn weight_sum(scores: &AgentHealthHotspotScoresWire) -> u32 {
 }
 
 fn core_weighted_total(scores: &HotspotFindingScores) -> u32 {
-    weighted_total([
+    hotspot_weighted_total([
         (
             scores.fan_in.normalized_basis_points,
             scores.fan_in.weight_basis_points,
@@ -505,20 +504,6 @@ fn core_weighted_total(scores: &HotspotFindingScores) -> u32 {
             scores.runtime.weight_basis_points,
         ),
     ])
-}
-
-/// Keep the DTO's derived total identical to the core's integer arithmetic.
-fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
-    layers
-        .into_iter()
-        .map(|(normalized, weight)| {
-            u32::try_from(
-                u64::from(normalized) * u64::from(weight) / u64::from(MAX_HOTSPOT_BASIS_POINTS),
-            )
-            .unwrap_or(MAX_HOTSPOT_BASIS_POINTS)
-        })
-        .fold(0, u32::saturating_add)
-        .min(MAX_HOTSPOT_BASIS_POINTS)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

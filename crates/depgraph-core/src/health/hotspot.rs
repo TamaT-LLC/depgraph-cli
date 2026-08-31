@@ -259,7 +259,7 @@ pub fn score_hotspots_cancellable(
                 reverse_impact: reverse_n[index],
                 git_churn: churn_n[index],
                 runtime: runtime_n[index],
-                total: weighted_total([
+                total: hotspot_weighted_total([
                     (fan_in_n[index], weights.fan_in),
                     (fan_out_n[index], weights.fan_out),
                     (reverse_n[index], weights.reverse_impact),
@@ -462,7 +462,12 @@ impl HotspotWork {
     }
 }
 
-fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
+/// Compute the canonical weighted hotspot total using integer basis points.
+///
+/// Agent projections use this helper as well so validation cannot drift from
+/// the analyzer's rounding and saturation rules.
+#[must_use]
+pub fn hotspot_weighted_total(layers: [(u32, u32); 5]) -> u32 {
     layers
         .into_iter()
         .map(|(normalized, weight)| {

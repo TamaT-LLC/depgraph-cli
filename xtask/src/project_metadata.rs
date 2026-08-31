@@ -859,7 +859,7 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
         MCP_OPERATION_CONTRACT_VERSION,
     );
     let current_store_contract = format!(
-        "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを`v0.5.4` binaryで開くことはできない。",
+        "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
         depgraph_store::STORE_SCHEMA_VERSION,
     );
     for required in [
@@ -1116,7 +1116,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     )?;
     verify_public_community_surface(root)?;
     let english_current_store_contract = format!(
-        "Current post-tag\n`main` uses Store schema `{}`; a Store migrated to schema {} cannot be opened\nby a `v0.5.4` binary.",
+        "Current post-tag\n`main` uses Store schema `{}`; a Store migrated to schema {} cannot be opened\nby the published `v0.5.4` binary.",
         depgraph_store::STORE_SCHEMA_VERSION,
         depgraph_store::STORE_SCHEMA_VERSION,
     );
@@ -1493,13 +1493,14 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "No `v0.4.0` stable GitHub Release was published",
         "| Product and adapters | `0.5.0` |",
         "| Worker protocol / graph schema | `1.0` |",
-        "| SQLite Store | schema `18` |",
+        "| SQLite Store | schema `17` |",
         "| Durable operation journal | schema `5` |",
         "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
         "| Operation DTO | `depgraph-operation-v1` |",
         "| Agent host configuration | `depgraph-agent-host-config-v1` |",
         "| Agent onboarding release evidence | `release-post-publish-evidence-v1` |",
-        "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
+        "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
+        "Post-tag `main` uses Store schema 18 and packaged MCP smoke v3.",
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         V0_4_RC6_TAG_COMMIT,
         V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
@@ -1792,6 +1793,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "計51点",
         "checkout内のproduct binaryや未公開package artifact",
         "non-empty matrix値をすべて含む",
+        "公開済み`v0.5.4`のMCP sidecarは`mcp-package-smoke-v2`",
         "`mcp-package-smoke-v3`",
         "`depgraph-agent-host-config-v1`",
         "`maintenance-ref-pinned`",

@@ -89,7 +89,7 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | How can I export the graph? | `export` | JSON, DOT, Mermaid, or GraphML |
 | Which files, exports, types, or dependencies look unused? | `health`, `health list`, `cleanup` | Snapshot-scoped findings with confidence and blockers. Summary excludes audit and hotspot results |
 | What risk did a Git change introduce? | `audit --changed <GIT_REF>` | New cycles, boundary violations, public API changes, and blast radius in `merge-base(GIT_REF, HEAD)..HEAD`; `changed_oid` identifies the audited HEAD. Without a base snapshot, the three comparison checks are indeterminate while blast radius remains evaluable |
-| Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, availability, and total fields; confidence is capped at `probable` |
+| Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, available, and total fields; confidence is capped at `probable` |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
 **Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no observed usage and no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Hotspots are rankings rather than proof of unusedness and are capped at `probable`; read their typed `hotspot_scores` layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. Audit before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. Source is never changed automatically.
@@ -215,7 +215,7 @@ The worker protocol remains at `1.0` for v0.5, with operation journal schema
 `5`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`.
 The published `v0.5.4` artifact uses Store schema `17`. Current post-tag
 `main` uses Store schema `18`; a Store migrated to schema 18 cannot be opened
-by a `v0.5.4` binary.
+by the published `v0.5.4` binary.
 
 `v0.4.0` is a historical reserved baseline; no `v0.4.0` stable GitHub Release
 was published. Its contract remains in the historical

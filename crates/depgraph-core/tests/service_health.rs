@@ -653,25 +653,7 @@ fn issue_438_health_audit_uses_evaluated_policy_violation_identity() -> Result<(
     )?;
     drop(store);
 
-    fs::write(
-        root.join(".depgraph.toml"),
-        r#"schema_version = 1
-[policy]
-schema_version = "1.0"
-
-[[policy.rules]]
-id = "audit-boundary"
-kind = "forbidden_dependency"
-severity = "error"
-source = { kind = "file", field = "id", match = "exact", value = "file:src/used.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
-target = { kind = "file", field = "id", match = "exact", value = "file:src/unused.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
-profiles = { include = [{ match = "exact", value = "fixture:rust" }], exclude = [] }
-condition = { op = "all", conditions = [] }
-precisions = ["exact"]
-resolution_statuses = ["resolved"]
-evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
-"#,
-    )?;
+    write_boundary_policy(&root)?;
 
     let service = service(&root, &store_path)?;
     let cancellation = CancellationToken::new();
@@ -735,7 +717,7 @@ fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts
         &depgraph_core::Config::load(&root)?.policy,
     )?;
     let previous_policy = format!("policy-config:sha256:{}", "b".repeat(64));
-    let contract = "depgraph-health-finding-v1".to_owned();
+    let contract = depgraph_core::HEALTH_FINDING_CONTRACT_VERSION.to_owned();
 
     let mut store = Store::open(&store_path)?;
     let base_provenance = ScanHealthProvenance {
@@ -844,7 +826,7 @@ fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Resul
     let policy = depgraph_core::health::health_policy_config_digest(
         &depgraph_core::Config::load(&root)?.policy,
     )?;
-    let contract = "depgraph-health-finding-v1".to_owned();
+    let contract = depgraph_core::HEALTH_FINDING_CONTRACT_VERSION.to_owned();
     let mut store = Store::open(&store_path)?;
     let base_provenance = ScanHealthProvenance {
         policy_config_digest: policy.clone(),
