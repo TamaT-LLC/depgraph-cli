@@ -186,7 +186,9 @@ target/debug/depgraph --version
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
-v0.5のワーカープロトコルは`1.0`、ストアスキーマは`18`、操作ジャーナルスキーマは`5`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v1`を使用する。
+v0.5のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`5`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v1`を使用する。
+公開済み`v0.5.4` artifactのStore schemaは`17`である。
+tag後の現行`main`はStore schema `18`を使用し、schema 18へ移行したStoreを`v0.5.4` binaryで開くことはできない。
 
 `v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。

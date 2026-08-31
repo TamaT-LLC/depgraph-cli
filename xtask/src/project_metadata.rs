@@ -852,12 +852,15 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
     );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
-        "v0.5のワーカープロトコルは`{}`、ストアスキーマは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
+        "v0.5のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
         depgraph_protocol::PROTOCOL_VERSION,
-        depgraph_store::STORE_SCHEMA_VERSION,
         depgraph_operation::JOURNAL_SCHEMA_VERSION,
         MCP_TOOL_CONTRACT_VERSION,
         MCP_OPERATION_CONTRACT_VERSION,
+    );
+    let current_store_contract = format!(
+        "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを`v0.5.4` binaryで開くことはできない。",
+        depgraph_store::STORE_SCHEMA_VERSION,
     );
     for required in [
         "日本語 | [English](README.en.md)",
@@ -868,6 +871,8 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
         "`npm i -g @tamat-llc/depgraph`",
         "すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。",
         compatibility.as_str(),
+        "公開済み`v0.5.4` artifactのStore schemaは`17`である。",
+        current_store_contract.as_str(),
         "`v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。",
         "[`v0.4.0`の契約](docs/releases/v0.4.0.md)",
         "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
@@ -1110,6 +1115,11 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         &root.join("docs/40_arch_design/adr-code-health-finding-contract.md"),
     )?;
     verify_public_community_surface(root)?;
+    let english_current_store_contract = format!(
+        "Current post-tag\n`main` uses Store schema `{}`; a Store migrated to schema {} cannot be opened\nby a `v0.5.4` binary.",
+        depgraph_store::STORE_SCHEMA_VERSION,
+        depgraph_store::STORE_SCHEMA_VERSION,
+    );
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -1128,7 +1138,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
         "no `v0.4.0` stable GitHub",
-        "Store\nschema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
+        "The published `v0.5.4` artifact uses Store schema `17`.",
+        english_current_store_contract.as_str(),
     ] {
         if !english_readme.contains(required) {
             bail!("English README release metadata is missing {required:?}");
@@ -1586,7 +1597,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "npm Trusted Publishing",
         "release-post-publish-evidence-v0.5.4.json",
         "stable-v0.5.0-packaged-smoke-v1",
-        "mcp-package-smoke-v3",
+        "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
+        "`mcp-package-smoke-v3`を使う",
         "Node.js 24",
         "musl",
     ] {

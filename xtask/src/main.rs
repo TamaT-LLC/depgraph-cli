@@ -4431,8 +4431,15 @@ mod tests {
             super::read_lf_normalized_text(&workspace_root().join("README.en.md"))?;
         super::project_metadata::verify_japanese_readme_contract(&readme, &english_readme)?;
 
-        let store_schema = format!("ストアスキーマは`{}`", depgraph_store::STORE_SCHEMA_VERSION);
-        let drifted_schema = readme.replacen(&store_schema, "ストアスキーマは`999`", 1);
+        let store_schema = format!(
+            "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを`v0.5.4` binaryで開くことはできない。",
+            depgraph_store::STORE_SCHEMA_VERSION
+        );
+        let drifted_schema = readme.replacen(
+            &store_schema,
+            "tag後の現行`main`はStore schema `999`を使用し、schema 999へ移行したStoreを`v0.5.4` binaryで開くことはできない。",
+            1,
+        );
         assert_ne!(drifted_schema, readme);
         assert!(
             super::project_metadata::verify_japanese_readme_contract(
