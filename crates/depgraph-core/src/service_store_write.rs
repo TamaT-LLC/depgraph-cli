@@ -938,14 +938,24 @@ impl DepgraphService {
         operation_id: &str,
     ) -> DepgraphServiceResult<()> {
         self.require_store_write()?;
-        let _writer = acquire_store_writer_lock(self.config().store_path())
+        let writer = acquire_store_writer_lock(self.config().store_path())
             .map_err(|_| DepgraphServiceError::StoreWriterConflict)?;
         let mut store = Store::open(self.config().store_path())
             .map_err(|source| DepgraphServiceError::MutatingStoreUnavailable { source })?;
-        store
+        let result = store
             .finalize_cancelled_scan_for_operation(operation_id)
             .map(drop)
-            .map_err(DepgraphServiceError::store_operation)
+            .map_err(DepgraphServiceError::store_operation);
+        drop(store);
+        // Release the sidecar lock explicitly after closing the SQLite store so
+        // the next cleanup page can reacquire it without a host-dependent
+        // close-on-drop race. Preserve the store operation error if both fail.
+        let unlock_result = writer
+            .unlock()
+            .map_err(|source| DepgraphServiceError::store_operation(source.into()));
+        result?;
+        unlock_result?;
+        Ok(())
     }
 
     /// Load fixed-size cancellation proofs that need their terminal journal
