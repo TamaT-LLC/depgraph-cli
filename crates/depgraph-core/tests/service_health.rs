@@ -4,8 +4,8 @@ use anyhow::Result;
 use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
     DepgraphServiceLimits, HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest,
-    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest,
-    SnapshotLocator,
+    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_BLOCKERS_PER_FINDING,
+    MAX_HEALTH_FINDINGS, PolicyEvaluateRequest, SnapshotLocator,
 };
 use depgraph_core::{
     CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind, HotspotWeights,
@@ -28,6 +28,7 @@ fn seed_health_snapshot(
     scan_id: &str,
     revision: &str,
     add_changed_usage: bool,
+    heuristic_unused_edges: usize,
 ) -> Result<String> {
     store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
     let coverage = json!({
@@ -121,6 +122,24 @@ fn seed_health_snapshot(
     });
     store.ingest_event(&edge)?;
     let mut next_seq = 7;
+    for index in 0..heuristic_unused_edges {
+        let mut heuristic = common("edge_upsert", next_seq);
+        heuristic["edge"] = json!({
+            "id": format!("edge:heuristic-unused:{index:02}"),
+            "source": "file:src/lib.rs",
+            "target": "file:src/unused.rs",
+            "kind": "references",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "heuristic",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&heuristic)?;
+        next_seq += 1;
+    }
     if add_changed_usage {
         let mut changed_edge = common("edge_upsert", next_seq);
         changed_edge["edge"] = json!({
@@ -204,7 +223,7 @@ fn issue_423_health_service_pins_snapshot_and_rejects_invalid_requests() -> Resu
     let revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    let snapshot_id = seed_health_snapshot(&mut store, &root, "health-scan", &revision, false)?;
+    let snapshot_id = seed_health_snapshot(&mut store, &root, "health-scan", &revision, false, 0)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -298,6 +317,72 @@ fn issue_423_health_service_pins_snapshot_and_rejects_invalid_requests() -> Resu
     Ok(())
 }
 
+#[test]
+fn issue_436_health_endpoints_compact_oversized_blocker_sets() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let mut store = Store::open(&store_path)?;
+    let snapshot_id = seed_health_snapshot(
+        &mut store,
+        &root,
+        "health-many-blockers",
+        &revision,
+        false,
+        MAX_HEALTH_BLOCKERS_PER_FINDING + 1,
+    )?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut request =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let summary = service.health_summary(
+        &mut request,
+        &HealthSummaryRequest::try_new(None)?,
+        &cancellation,
+    )?;
+    let findings_request =
+        HealthFindingsRequest::try_new(Vec::new(), Vec::new(), Vec::new(), MAX_HEALTH_FINDINGS)?;
+    let findings = service.health_findings(&mut request, &findings_request, &cancellation)?;
+    assert_eq!(summary.snapshot_id().as_str(), snapshot_id);
+    assert_eq!(summary.collection_digest(), findings.collection_digest());
+
+    let unused = findings
+        .findings()
+        .iter()
+        .find(|finding| finding.subject_id == "file:src/unused.rs")
+        .expect("heuristic references do not prove usage");
+    assert_eq!(unused.confidence, Confidence::Indeterminate);
+    assert_eq!(unused.blockers.len(), 1);
+    assert_eq!(
+        unused.blockers[0].kind,
+        depgraph_core::BlockerKind::HeuristicPrecision
+    );
+    assert!(
+        unused.blockers[0]
+            .detail
+            .starts_with("33 blockers of kind heuristic-precision;")
+    );
+    assert_eq!(
+        unused.fingerprint,
+        depgraph_core::finding_fingerprint(unused)
+    );
+
+    let detail = service.health_finding_get(
+        &mut request,
+        &HealthFindingGetRequest::try_new(unused.id.clone())?,
+        &cancellation,
+    )?;
+    assert_eq!(&detail.finding, unused);
+    let repeated = service.health_findings(&mut request, &findings_request, &cancellation)?;
+    assert_eq!(repeated.collection_digest(), findings.collection_digest());
+    assert_eq!(repeated.findings(), findings.findings());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn issue_423_unreadable_manifest_degrades_health_instead_of_failing() -> Result<()> {
@@ -312,7 +397,7 @@ fn issue_423_unreadable_manifest_degrades_health_instead_of_failing() -> Result<
     symlink(&outside_manifest, root.join("Cargo.toml"))?;
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    seed_health_snapshot(&mut store, &root, "health-symlink", &revision, false)?;
+    seed_health_snapshot(&mut store, &root, "health-symlink", &revision, false, 0)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -336,7 +421,7 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     let base_revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    let base_id = seed_health_snapshot(&mut store, &root, "health-base", &base_revision, false)?;
+    let base_id = seed_health_snapshot(&mut store, &root, "health-base", &base_revision, false, 0)?;
     fs::write(
         root.join("src/unused.rs"),
         "pub fn unused() { println!(\"changed\"); }\n",
@@ -344,7 +429,8 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "change unused"]);
     let head_revision = run_git(&root, &["rev-parse", "HEAD"]);
-    let after_id = seed_health_snapshot(&mut store, &root, "health-after", &head_revision, true)?;
+    let after_id =
+        seed_health_snapshot(&mut store, &root, "health-after", &head_revision, true, 0)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
@@ -405,6 +491,7 @@ fn issue_438_health_audit_missing_base_keeps_placeholders_blast_and_digest_stabl
         "health-after-missing-base",
         &after_revision,
         true,
+        0,
     )?;
     drop(store);
 
@@ -481,6 +568,7 @@ fn issue_438_health_audit_uses_evaluated_policy_violation_identity() -> Result<(
         "health-policy-base",
         &base_revision,
         false,
+        0,
     )?;
 
     fs::write(
@@ -496,6 +584,7 @@ fn issue_438_health_audit_uses_evaluated_policy_violation_identity() -> Result<(
         "health-policy-after",
         &after_revision,
         true,
+        0,
     )?;
     drop(store);
 
@@ -564,7 +653,7 @@ fn issue_423_health_hotspots_degrade_missing_layers_deterministically() -> Resul
     let revision = init_git(&root);
     let store_path = temporary.path().join("graph.sqlite");
     let mut store = Store::open(&store_path)?;
-    seed_health_snapshot(&mut store, &root, "health-hotspots", &revision, false)?;
+    seed_health_snapshot(&mut store, &root, "health-hotspots", &revision, false, 0)?;
     drop(store);
 
     let service = service(&root, &store_path)?;
