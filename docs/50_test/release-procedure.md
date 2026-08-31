@@ -178,7 +178,7 @@ user scopeの両方で設定する。各entryのstatus、共有stateの保持、
 state削除までをclean home上で5 targetすべて検証する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
-Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 17へのtransactional migration、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-17 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
+Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 18へのtransactional migration（legacy v1 sealの検証とprovenance-aware v2 sealの再構築を含む）、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-18 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
 
 ## 公開後の再取得検証
 

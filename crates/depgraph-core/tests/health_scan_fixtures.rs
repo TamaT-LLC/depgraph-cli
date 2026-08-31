@@ -4,6 +4,9 @@
 //! file, semantic-site, semantic-edge, diagnostic, and coverage records, so
 //! this test does not invent source-path or visibility fields that the worker
 //! does not emit.
+//! Web file nodes additionally pin the production ownership and source-hash
+//! property shape so a hand-authored fixture cannot silently drift from the
+//! worker's final protocol stream.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -84,8 +87,74 @@ fn fixture_node_id(fixture: &str, locator: &str) -> Option<String> {
     })
 }
 
+fn assert_web_file_node_shape(fixture: &str) -> Result<()> {
+    let expected_keys = [
+        "analysis_hash",
+        "content_hash",
+        "extension",
+        "generated",
+        "language",
+        "package_id",
+        "package_locator",
+        "path",
+        "profile_id",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let mut file_count = 0;
+
+    for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+        let event: Value = serde_json::from_str(line)?;
+        let Some(node) = event.get("node") else {
+            continue;
+        };
+        if node.get("kind").and_then(Value::as_str) != Some("file")
+            || node
+                .get("properties")
+                .and_then(|properties| properties.get("language"))
+                .and_then(Value::as_str)
+                != Some("typescript")
+        {
+            continue;
+        }
+
+        let properties = node
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("Web file node must have object properties");
+        let actual_keys = properties.keys().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(actual_keys, expected_keys, "Web file node property drift");
+        assert_eq!(
+            properties.get("package_locator").and_then(Value::as_str),
+            Some("npm:issue437@workspace#.")
+        );
+        assert!(
+            properties
+                .get("package_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.starts_with("package:sha256:")),
+            "Web file node must retain its package owner"
+        );
+        for field in ["content_hash", "analysis_hash"] {
+            assert!(
+                properties
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.starts_with("sha256:")),
+                "Web file node must retain its {field}"
+            );
+        }
+        file_count += 1;
+    }
+
+    assert_eq!(file_count, 4, "Web fixture file-node count drift");
+    Ok(())
+}
+
 #[test]
 fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web() -> Result<()> {
+    assert_web_file_node_shape(WEB_FIXTURE)?;
     let temporary = tempfile::tempdir()?;
     let cases = [
         (

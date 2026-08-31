@@ -3,14 +3,15 @@ use std::{fs, path::Path, process::Command};
 use anyhow::Result;
 use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest,
-    HealthHotspotsRequest, HealthSummaryRequest, MAX_HEALTH_BLOCKERS_PER_FINDING,
-    MAX_HEALTH_FINDINGS, PolicyEvaluateRequest, SnapshotLocator,
+    DepgraphServiceLimits, HealthAuditRequest, HealthAuditResult, HealthFindingGetRequest,
+    HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest,
+    MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest, SnapshotLocator,
 };
 use depgraph_core::{
-    CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind, HotspotWeights,
+    BlockerKind, CancellationToken, Confidence, DEFAULT_HOTSPOT_WEIGHTS, FindingKind,
+    HotspotWeights,
 };
-use depgraph_store::Store;
+use depgraph_store::{ScanHealthProvenance, Store};
 use serde_json::json;
 
 fn service(root: &Path, store_path: &Path) -> Result<DepgraphService> {
@@ -30,7 +31,30 @@ fn seed_health_snapshot(
     add_changed_usage: bool,
     heuristic_unused_edges: usize,
 ) -> Result<String> {
+    seed_health_snapshot_with_provenance(
+        store,
+        root,
+        scan_id,
+        revision,
+        add_changed_usage,
+        heuristic_unused_edges,
+        None,
+    )
+}
+
+fn seed_health_snapshot_with_provenance(
+    store: &mut Store,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+    add_changed_usage: bool,
+    heuristic_unused_edges: usize,
+    provenance: Option<&ScanHealthProvenance>,
+) -> Result<String> {
     store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
+    if let Some(provenance) = provenance {
+        store.bind_scan_health_provenance(scan_id, provenance)?;
+    }
     let coverage = json!({
         "profiles": 1,
         "files_discovered": 0,
@@ -213,6 +237,45 @@ fn init_git(root: &Path) -> String {
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-m", "seed"]);
     run_git(root, &["rev-parse", "HEAD"])
+}
+
+fn write_boundary_policy(root: &Path) -> Result<()> {
+    fs::write(
+        root.join(".depgraph.toml"),
+        r#"schema_version = 1
+[policy]
+schema_version = "1.0"
+
+[[policy.rules]]
+id = "audit-boundary"
+kind = "forbidden_dependency"
+severity = "error"
+source = { kind = "file", field = "id", match = "exact", value = "file:src/used.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+target = { kind = "file", field = "id", match = "exact", value = "file:src/unused.rs", cardinality = "one", exclude = [], scope = { paths = [], packages = [] } }
+profiles = { include = [{ match = "exact", value = "fixture:rust" }], exclude = [] }
+condition = { op = "all", conditions = [] }
+precisions = ["exact"]
+resolution_statuses = ["resolved"]
+evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
+"#,
+    )?;
+    Ok(())
+}
+
+fn assert_audit_degraded_with_blocker(result: &HealthAuditResult, blocker: BlockerKind) {
+    let finding = result
+        .findings()
+        .iter()
+        .find(|finding| finding.kind == FindingKind::NewBoundaryViolation)
+        .expect("boundary policy finding reaches the audit result");
+    assert_eq!(finding.confidence, Confidence::Indeterminate);
+    assert!(
+        finding
+            .blockers
+            .iter()
+            .any(|finding_blocker| finding_blocker.kind == blocker),
+        "expected {blocker:?} blocker in {finding:?}"
+    );
 }
 
 #[test]
@@ -443,6 +506,8 @@ fn issue_423_health_audit_pins_a_snapshot_pair_and_binds_identity() -> Result<()
         &cancellation,
     )?;
     assert_eq!(scope.after().id().as_str(), after_id);
+    assert!(scope.comparability().policy_changed);
+    assert!(scope.comparability().contract_changed);
     let (before, _) = scope.comparable_pair().expect("base snapshot pair");
     assert_eq!(before.id().as_str(), base_id);
     let first = service.health_audit(&scope, &cancellation)?;
@@ -642,6 +707,234 @@ evidence = { kinds = ["source"], minimum_spans = 1, primary_only = true }
         .expect("evaluated boundary violation becomes an audit finding");
     assert_eq!(boundary.subject_id, expected_policy_id);
     assert_eq!(boundary.subject_id, policy_pair.result.violations[0].id);
+    assert_eq!(boundary.confidence, Confidence::Indeterminate);
+    assert!(
+        boundary
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == BlockerKind::IncomparablePolicy)
+    );
+    assert!(
+        boundary
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == BlockerKind::IncomparableContract)
+    );
+    Ok(())
+}
+
+#[test]
+fn issue_439_health_audit_fails_closed_when_policy_differs_or_live_policy_drifts() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    write_boundary_policy(&root)?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let current_policy = depgraph_core::health::health_policy_config_digest(
+        &depgraph_core::Config::load(&root)?.policy,
+    )?;
+    let previous_policy = format!("policy-config:sha256:{}", "b".repeat(64));
+    let contract = "depgraph-health-finding-v1".to_owned();
+
+    let mut store = Store::open(&store_path)?;
+    let base_provenance = ScanHealthProvenance {
+        policy_config_digest: previous_policy.clone(),
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-base",
+        &base_revision,
+        false,
+        0,
+        Some(&base_provenance),
+    )?;
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after policy\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "policy provenance after"]);
+    let first_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let first_after_provenance = ScanHealthProvenance {
+        policy_config_digest: current_policy.clone(),
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-after-policy",
+        &first_head,
+        true,
+        0,
+        Some(&first_after_provenance),
+    )?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let first_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(first_scope.comparability().policy_changed);
+    assert!(!first_scope.comparability().contract_changed);
+    let first_result = service.health_audit(&first_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&first_result, BlockerKind::IncomparablePolicy);
+
+    // The snapshots below agree with each other, but the live policy remains
+    // the current configured policy while both persisted rows carry
+    // `previous_policy`. This must still be incomparable because the
+    // evaluator is using the current policy, not the historical snapshot
+    // policy.
+    fs::write(
+        root.join("src/used.rs"),
+        "pub fn used() { println!(\"live policy drift\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "live policy drift"]);
+    let second_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let second_provenance = ScanHealthProvenance {
+        policy_config_digest: previous_policy,
+        analyzer_version: depgraph_core::HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: contract,
+    };
+    let mut store = Store::open(&store_path)?;
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-provenance-after-live-drift",
+        &second_head,
+        true,
+        0,
+        Some(&second_provenance),
+    )?;
+    drop(store);
+
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let second_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(second_scope.comparability().policy_changed);
+    assert!(!second_scope.comparability().contract_changed);
+    let second_result = service.health_audit(&second_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&second_result, BlockerKind::IncomparablePolicy);
+    Ok(())
+}
+
+#[test]
+fn issue_439_health_audit_fails_closed_when_analyzer_contract_changes() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    write_boundary_policy(&root)?;
+    let base_revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let policy = depgraph_core::health::health_policy_config_digest(
+        &depgraph_core::Config::load(&root)?.policy,
+    )?;
+    let contract = "depgraph-health-finding-v1".to_owned();
+    let mut store = Store::open(&store_path)?;
+    let base_provenance = ScanHealthProvenance {
+        policy_config_digest: policy.clone(),
+        analyzer_version: "1.0.0".to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-base",
+        &base_revision,
+        false,
+        0,
+        Some(&base_provenance),
+    )?;
+
+    fs::write(
+        root.join("src/unused.rs"),
+        "pub fn unused() { println!(\"after contract\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "contract provenance after"]);
+    let head = run_git(&root, &["rev-parse", "HEAD"]);
+    let after_provenance = ScanHealthProvenance {
+        policy_config_digest: policy.clone(),
+        analyzer_version: "1.0.1".to_owned(),
+        finding_contract_version: contract.clone(),
+    };
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-after",
+        &head,
+        true,
+        0,
+        Some(&after_provenance),
+    )?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(!scope.comparability().policy_changed);
+    assert!(scope.comparability().contract_changed);
+    let result = service.health_audit(&scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&result, BlockerKind::IncomparableContract);
+
+    // The snapshots can agree on the old analyzer version while the running
+    // binary has moved forward.  The pair is then incomparable even though
+    // the two persisted analyzer values are equal.
+    fs::write(
+        root.join("src/used.rs"),
+        "pub fn used() { println!(\"live analyzer drift\"); }\n",
+    )?;
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "live analyzer drift"]);
+    let second_head = run_git(&root, &["rev-parse", "HEAD"]);
+    let second_provenance = ScanHealthProvenance {
+        policy_config_digest: policy,
+        analyzer_version: "1.0.0".to_owned(),
+        finding_contract_version: contract,
+    };
+    let mut store = Store::open(&store_path)?;
+    seed_health_snapshot_with_provenance(
+        &mut store,
+        &root,
+        "health-contract-after-live-drift",
+        &second_head,
+        true,
+        0,
+        Some(&second_provenance),
+    )?;
+    drop(store);
+    let mut after =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let second_scope = service.start_health_audit_scope(
+        &mut after,
+        &HealthAuditRequest::try_new(&base_revision, None)?,
+        &cancellation,
+    )?;
+    assert!(!second_scope.comparability().policy_changed);
+    assert!(second_scope.comparability().contract_changed);
+    let second_result = service.health_audit(&second_scope, &cancellation)?;
+    assert_audit_degraded_with_blocker(&second_result, BlockerKind::IncomparableContract);
     Ok(())
 }
 

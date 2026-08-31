@@ -1410,6 +1410,9 @@ mod tests {
             error: None,
             parent_snapshot_id: None,
             source_revision: Some("a".repeat(40)),
+            health_policy_config_digest: None,
+            health_analyzer_version: None,
+            health_finding_contract_version: None,
         }
     }
 
@@ -1530,6 +1533,11 @@ mod tests {
             ProfileMatrixRecord::default(),
         );
         let findings = analyze_unused(&rust);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
+        );
         let kinds = findings
             .iter()
             .map(|finding| finding.kind)

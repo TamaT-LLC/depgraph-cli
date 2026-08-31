@@ -5607,7 +5607,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            depgraph_store::STORE_SCHEMA_VERSION
         );
     }
 

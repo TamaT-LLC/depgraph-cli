@@ -29,8 +29,8 @@ updated: 2026-08-26
 > `v0.5.1`のsourceを履歴として固定し、現行stable tag、remote `main`、`release/0.5`のexact-source条件を維持する。
 > 2026-08-25: `v0.5.3`でWindowsの公開後onboarding canaryがZIPをPowerShellで展開するよう修正した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.2`のsourceと公開assetを履歴として固定する。
-> 2026-08-26: Issue #423として説明可能なコードヘルス解析を共有serviceと`depgraph-health-finding-v1`へ実装し、CLI `health` / `cleanup` / `audit` / `hotspots` と MCP 5 toolを同じ契約で公開した。
-> 2026-08-30: Issue #440としてhotspot findingへ5層（fan-in、fan-out、reverse-impact、Git churn、runtime）のraw／正規化basis point／weight／availabilityとtotalを`hotspot_scores`として構造化して公開した。hotspotのconfidenceは`probable`上限とし、reasonはhuman表示専用でfingerprintから除外する。ファイル系findingのpath依存IDとrename追従をdeferredとする移行影響をADRへ固定した。
+> 2026-08-26: 公開済み`v0.5.4` tag後のIssue #423として、説明可能なコードヘルス解析を共有serviceと`depgraph-health-finding-v1`へ実装し、CLI `health` / `cleanup` / `audit` / `hotspots` と MCP 5 toolを同じ未公開開発契約で追加した。
+> 2026-08-30: tag後`main`のIssue #440としてhotspot findingへ5層（fan-in、fan-out、reverse-impact、Git churn、runtime）のraw／正規化basis point／weight／availabilityとtotalを`hotspot_scores`として構造化した。hotspotのconfidenceは`probable`上限とし、reasonはhuman表示専用でfingerprintから除外する。ファイル系findingのpath依存IDとrename追従をdeferredとする移行影響をADRへ固定した。
 > 2026-08-26: `v0.5.4`でCodex、Claude Code、Cursor、Grokのproject／user scope MCPセットアップを追加した。
 > 製品の互換性境界と配布artifact形式は変更せず、`v0.5.3`のsourceと公開assetを履歴として固定する。
 > 2026-08-07: Issue #304として、bounded queryとruntime trace validationを共有read-only serviceへ移した。
@@ -55,7 +55,7 @@ updated: 2026-08-26
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.5.4` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |
+| SQLite store / scan cache / impact query cache | `18` / `2` / `1` |
 | Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
@@ -76,7 +76,7 @@ Milestone 4のrelease candidateは`v0.4.0-rc.1`とする。protocol / graph sche
 Milestone 4では`v0.4.0` stableを計画し、そのreserved baselineと`stable-release-gate-v1`を確定したが、stable GitHub Releaseは公開されなかった。公開済みの最終候補は`v0.4.0-rc.6`であり、[v0.4.0 document](../releases/v0.4.0.md)はimmutable baselineの履歴記録であって現行support claimではない。
 
 MCPを含む最初のv0.5 stableは`v0.5.0`である。
-`stable-release-gate-v2`は公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをv0.5 packageでschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。
+公開済み`v0.5.0`〜`v0.5.4`の`stable-release-gate-v2`は、公式`v0.4.0-rc.6` packageでschema `13`へ移行したchecksum-pinned Store fixtureをschema `17`へtransactional migrationし、completed graphのintegrity、node / site / edge / evidence、immutable ID、snapshot nameの書込み、rollback backup byte不変を検証する。tag後の現行`main`は同じfixtureをschema `18`までmigrationし、schema 17から18への段階でlegacy seal v1を検証してhealth provenanceを結合したseal v2へ再構築する。schema `17`は公開済み`v0.5.4`までのstable契約であり、schema 18へmigrationしたStoreを旧binaryで開くことはできない。
 `v0.5.0`はsigned tag、remote `main`、初期`release/0.5`、source tree、exact eight-job Full CI、固定Agent dogfood reportが一致する場合だけ公開した。
 公開済みの`v0.5.4` artifactは、この互換性境界を変えずに4つのAgent hostへ
 project／user scopeのMCPセットアップを追加した。tag後の現行`main`は別の未公開

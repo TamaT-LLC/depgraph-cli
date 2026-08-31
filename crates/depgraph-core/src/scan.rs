@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use depgraph_store::{
     CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord,
-    ScanOperationStagingIdentity, Store, ValidatedScan, ValidatedScanCacheHit,
+    ScanHealthProvenance, ScanOperationStagingIdentity, Store, ValidatedScan,
+    ValidatedScanCacheHit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,6 +23,9 @@ use crate::{
     },
     cancellation::CancellationToken,
     config::Config,
+    health::{
+        HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION, health_policy_config_digest,
+    },
     policy::PolicyResult,
     policy_engine::{evaluate_policy_cancellable, is_policy_evaluation_cancelled},
     profile_selection::{
@@ -417,6 +421,15 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     } else {
         store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
     }
+    store.bind_scan_health_provenance(
+        &scan_id,
+        &ScanHealthProvenance {
+            policy_config_digest: health_policy_config_digest(&config.policy)
+                .context("failed to normalize health policy identity")?,
+            analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+            finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
+        },
+    )?;
     let profile_status = profile_selection_doctor_status(&profile_plan, strict)?;
     if !profile_status.default_profile_matrix_complete {
         add_core_diagnostic(

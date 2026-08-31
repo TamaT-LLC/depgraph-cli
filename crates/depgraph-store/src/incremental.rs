@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    AdapterLogRecord, Store, completed_snapshot_identity, ensure_scan_staging,
-    ingest_event_in_transaction, insert_node, load_completed_snapshot_record,
-    promote_completed_snapshot, required_str, upsert_edge_row, upsert_site_row,
+    AdapterLogRecord, ScanHealthProvenance, Store, bind_scan_health_provenance_in_transaction,
+    completed_snapshot_identity, ensure_scan_staging, ingest_event_in_transaction, insert_node,
+    load_completed_snapshot_record, promote_completed_snapshot, required_str, upsert_edge_row,
+    upsert_site_row, validate_scan_health_provenance,
 };
 
 const MAX_SCOPE_VALUES: usize = 100_000;
@@ -119,6 +120,8 @@ impl Store {
 
     /// Atomically persists and promotes a proven content-fingerprint-only
     /// mutation without cloning or digesting the repository-complete graph.
+    /// The supplied health provenance is bound in the same transaction as the
+    /// staging scan and its completed snapshot seal.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_semantic_noop_delta(
         &mut self,
@@ -127,10 +130,12 @@ impl Store {
         strict: bool,
         base_snapshot_id: &str,
         source_revision: Option<&str>,
+        provenance: &ScanHealthProvenance,
         delta: &ValidatedDelta,
         stderr: &str,
         stderr_truncated: bool,
     ) -> Result<String> {
+        validate_scan_health_provenance(provenance)?;
         if source_revision.is_some_and(|revision| revision.trim().is_empty()) {
             bail!("source revision must not be empty");
         }
@@ -190,6 +195,7 @@ impl Store {
                 source_revision,
             ],
         )?;
+        bind_scan_health_provenance_in_transaction(&tx, scan_id, provenance)?;
         insert_node(&tx, scan_id, &serde_json::to_value(next)?)?;
         tx.execute(
             "INSERT INTO adapter_logs(scan_id, adapter, stderr, truncated)
@@ -2224,6 +2230,14 @@ mod tests {
             .unwrap()
     }
 
+    fn health_provenance() -> ScanHealthProvenance {
+        ScanHealthProvenance {
+            policy_config_digest: format!("policy-config:sha256:{}", "0".repeat(64)),
+            analyzer_version: "health-analyzer-v1".to_owned(),
+            finding_contract_version: "health-finding-v1".to_owned(),
+        }
+    }
+
     fn completed_semantic_noop_fixture(
         label: &str,
     ) -> (Store, String, String, String, StableGraphIds) {
@@ -2242,6 +2256,7 @@ mod tests {
             &ids.source,
             &format!("sha256:{}", "2".repeat(64)),
         );
+        let provenance = health_provenance();
         let snapshot_id = store
             .commit_semantic_noop_delta(
                 &overlay_scan_id,
@@ -2249,6 +2264,7 @@ mod tests {
                 false,
                 &base_id,
                 Some("revision-overlay"),
+                &provenance,
                 &delta,
                 "",
                 false,
@@ -2498,6 +2514,7 @@ mod tests {
         let (events, ids) = stable_graph_events("semantic-noop-base");
         let base_id = complete(&mut store, "semantic-noop-base", &events);
         let base_snapshot = store.load_completed_snapshot(&base_id).unwrap();
+        let provenance = health_provenance();
         let projection = store
             .semantic_noop_delta_base(&base_id, "src/index.ts")
             .unwrap()
@@ -2517,11 +2534,25 @@ mod tests {
                 false,
                 &base_id,
                 Some("revision-2"),
+                &provenance,
                 &delta,
                 "semantic no-op",
                 false,
             )
             .unwrap();
+        let first_scan = store.scan("semantic-noop-1").unwrap().unwrap();
+        assert_eq!(
+            first_scan.health_policy_config_digest.as_deref(),
+            Some(provenance.policy_config_digest.as_str())
+        );
+        assert_eq!(
+            first_scan.health_analyzer_version.as_deref(),
+            Some(provenance.analyzer_version.as_str())
+        );
+        assert_eq!(
+            first_scan.health_finding_contract_version.as_deref(),
+            Some(provenance.finding_contract_version.as_str())
+        );
 
         let sparse_counts: (i64, i64, i64, i64) = store
             .connection
@@ -2574,6 +2605,7 @@ mod tests {
                 false,
                 &first_id,
                 Some("revision-3"),
+                &provenance,
                 &next_delta,
                 "",
                 false,
