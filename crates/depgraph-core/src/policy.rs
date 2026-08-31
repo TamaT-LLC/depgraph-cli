@@ -556,7 +556,11 @@ impl PolicyCondition {
     }
 
     fn validate(&self) -> Result<()> {
-        self.validate_inner(0)
+        self.validate_inner(0, false)
+    }
+
+    fn validate_protocol_projection(&self) -> Result<()> {
+        self.validate_inner(0, true)
     }
 
     fn constant_truth(&self) -> Option<bool> {
@@ -588,7 +592,7 @@ impl PolicyCondition {
         }
     }
 
-    fn validate_inner(&self, depth: u32) -> Result<()> {
+    fn validate_inner(&self, depth: u32, protocol_projection: bool) -> Result<()> {
         match self {
             Self::All { conditions } | Self::Any { conditions } => {
                 if depth >= 16 {
@@ -598,33 +602,54 @@ impl PolicyCondition {
                     bail!("condition operators must not contain more than 255 children");
                 }
                 for condition in conditions {
-                    condition.validate_inner(depth + 1)?;
+                    condition.validate_inner(depth + 1, protocol_projection)?;
                 }
             }
             Self::Not { condition } => {
                 if depth >= 16 {
                     bail!("condition operator nesting depth must not exceed 16");
                 }
-                condition.validate_inner(depth + 1)?;
+                condition.validate_inner(depth + 1, protocol_projection)?;
             }
             Self::Eq { key, value } => {
-                validate_condition_key(key)?;
-                validate_condition_value(value)?;
+                if protocol_projection {
+                    validate_protocol_condition_key(key)?;
+                    validate_protocol_condition_value(value)?;
+                } else {
+                    validate_condition_key(key)?;
+                    validate_condition_value(value)?;
+                }
             }
             Self::In { key, values } => {
-                validate_condition_key(key)?;
-                if values.is_empty() {
+                if protocol_projection {
+                    validate_protocol_condition_key(key)?;
+                } else {
+                    validate_condition_key(key)?;
+                }
+                if !protocol_projection && values.is_empty() {
                     bail!("in condition values must not be empty");
                 }
                 if values.len() > 128 {
                     bail!("in condition values must not contain more than 128 entries");
                 }
                 for value in values {
-                    validate_condition_value(value)?;
+                    if protocol_projection {
+                        validate_protocol_condition_value(value)?;
+                    } else {
+                        validate_condition_value(value)?;
+                    }
                 }
-                validate_unique_condition_values(values)?;
+                if !protocol_projection {
+                    validate_unique_condition_values(values)?;
+                }
             }
-            Self::Defined { key } => validate_condition_key(key)?,
+            Self::Defined { key } => {
+                if protocol_projection {
+                    validate_protocol_condition_key(key)?;
+                } else {
+                    validate_condition_key(key)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1034,7 +1059,7 @@ impl PolicyViolation {
         if let Some(profile_id) = &self.profile_id {
             validate_bounded_text("policy violation profile ID", profile_id, 1024)?;
         }
-        self.condition.validate()?;
+        self.condition.validate_protocol_projection()?;
         if self.evidence.is_empty() {
             bail!("policy violation evidence must not be empty");
         }
@@ -1473,6 +1498,31 @@ fn validate_condition_value(value: &Value) -> Result<()> {
     }
     if let Value::String(value) = value {
         validate_bounded_text("condition string value", value, 1024)?;
+    }
+    Ok(())
+}
+
+fn validate_protocol_condition_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("protocol condition key must not be empty");
+    }
+    if key.len() > 128 {
+        bail!("protocol condition key must not exceed 128 UTF-8 bytes");
+    }
+    Ok(())
+}
+
+fn validate_protocol_condition_value(value: &Value) -> Result<()> {
+    if !matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    ) {
+        bail!("protocol condition values must be JSON primitives");
+    }
+    if let Value::String(value) = value
+        && value.chars().count() > 1024
+    {
+        bail!("protocol condition string values must not exceed 1024 characters");
     }
     Ok(())
 }
