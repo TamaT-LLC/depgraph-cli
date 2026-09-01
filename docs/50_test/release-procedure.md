@@ -179,7 +179,7 @@ user scopeの両方で設定する。各entryのstatus、共有stateの保持、
 state削除までをclean home上で5 targetすべて検証する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
-公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureをschema 17へtransactional migrationする履歴を固定する。
+公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksumを入力に、schema 17へtransactional migrationする履歴を固定する。
 tag後の現行`main`／評価用RCのgateは同じfixtureをschema 18まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
 どちらもcompleted graph identityとrollback copyのbyte不変を検証する。
 実運用ではwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。

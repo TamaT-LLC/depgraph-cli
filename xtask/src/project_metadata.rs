@@ -1140,6 +1140,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "no `v0.4.0` stable GitHub",
         "The published `v0.5.4` artifact uses Store schema `17`.",
         english_current_store_contract.as_str(),
+        "Store\nschema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
     ] {
         if !english_readme.contains(required) {
             bail!("English README release metadata is missing {required:?}");

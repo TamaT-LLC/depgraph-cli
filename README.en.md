@@ -211,8 +211,10 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 
 Every v0.5 archive includes the native MCP server, durable
 operation runner, and versioned Agent tool/operation schema.
-The worker protocol remains at `1.0` for v0.5, with operation journal schema
-`5`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`.
+The worker protocol remains at `1.0` for v0.5. The current development
+compatibility tuple is Store
+schema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
+`depgraph-operation-v1`.
 The published `v0.5.4` artifact uses Store schema `17`. Current post-tag
 `main` uses Store schema `18`; a Store migrated to schema 18 cannot be opened
 by the published `v0.5.4` binary.

@@ -161,10 +161,11 @@ the worker protocol, Store schema 17, operation journal schema, MCP DTOs,
 release artifact formats, and existing CLI defaults unchanged.
 
 The signed `v0.5.4` tag, its source, the release/0.5 baseline, assets, and
-post-publish evidence remain immutable history. The v0.5.4 Store contract is
-schema 17. Post-tag `main` advances the Store to schema 18 for health
-provenance and provenance-aware snapshot seals; that development contract is
-not part of the v0.5.4 artifact.
+post-publish evidence remain immutable history. At publication time, the signed
+tag, remote `main`, and `release/0.5` must identify one reviewed Full-CI-green
+commit. The v0.5.4 Store contract is schema 17. Post-tag `main` advances the
+Store to schema 18 for health provenance and provenance-aware snapshot seals;
+that development contract is not part of the v0.5.4 artifact.
 
 ## Consequences
 
