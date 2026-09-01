@@ -1845,6 +1845,9 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: Some("abc123".to_owned()),
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
             },
             profiles: vec![ProfileRecord {
                 id: "profile:web".to_owned(),

@@ -4816,7 +4816,10 @@ fn issue_313_v2_runtime_replay_migrates_only_after_complete_prevalidation() {
         sqlite_user_version(journal_path.as_path()),
         JOURNAL_SCHEMA_VERSION
     );
-    assert_eq!(sqlite_user_version(&store_path), 17);
+    assert_eq!(
+        sqlite_user_version(&store_path),
+        depgraph_store::STORE_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -4894,7 +4897,10 @@ fn issue_313_valid_new_runtime_submit_migrates_genuine_v3_after_absence_lookup()
     );
     submit.finish();
     assert_eq!(sqlite_user_version(&journal_path), JOURNAL_SCHEMA_VERSION);
-    assert_eq!(sqlite_user_version(&store_path), 17);
+    assert_eq!(
+        sqlite_user_version(&store_path),
+        depgraph_store::STORE_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -5007,7 +5013,10 @@ fn issue_313_runtime_import_is_prevalidated_idempotent_durable_and_closed() {
         "params":{"name":"runtime_trace_import_submit","arguments":arguments}
     }));
     let task_id = accepted["result"]["taskId"].as_str().unwrap().to_owned();
-    assert_eq!(sqlite_user_version(&store_path), 17);
+    assert_eq!(
+        sqlite_user_version(&store_path),
+        depgraph_store::STORE_SCHEMA_VERSION
+    );
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let terminal = loop {

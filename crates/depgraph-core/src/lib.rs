@@ -1960,11 +1960,11 @@ mod tests {
 
     use super::{
         AdapterKind, DoctorWorkerLocation, FRAMEWORK_BUILD_CONVERTER_ARTIFACT,
-        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, default_doctor_diagnostic_root,
-        doctor_toolchain_remediation, evaluated_worker_health, framework_build_capability_contract,
-        parse_release_manifest, parse_worker_handshake, preflight_doctor_workers,
-        release_compatibility_contract, suppressed_worker_health, verify_release_compatibility,
-        worker,
+        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, STORE_SCHEMA_VERSION,
+        default_doctor_diagnostic_root, doctor_toolchain_remediation, evaluated_worker_health,
+        framework_build_capability_contract, parse_release_manifest, parse_worker_handshake,
+        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
+        verify_release_compatibility, worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -2021,7 +2021,7 @@ mod tests {
         let compatible = release_compatibility_contract();
         verify_release_compatibility(&compatible).unwrap();
         assert_eq!(compatible.worker_protocol_version, "1.0");
-        assert_eq!(compatible.store_schema_version, 17);
+        assert_eq!(compatible.store_schema_version, STORE_SCHEMA_VERSION);
         assert_eq!(compatible.operation_journal_schema_version, 5);
         assert_eq!(
             compatible.mcp_tool_contract_version,

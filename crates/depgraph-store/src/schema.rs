@@ -1,7 +1,7 @@
 //! Schema migrations and schema/row validation for the SQLite store.
 //!
 //! `Store::migrate` owns every `PRAGMA user_version` transition (v1 through
-//! v17) and the DDL statements each step applies. The free functions
+//! v18) and the DDL statements each step applies. The free functions
 //! alongside it authenticate a pre-migration store's shape and validate that
 //! a migrated schema -- and, where a migration also captures existing rows,
 //! those rows -- exactly match the expected shape. Extracted from `lib.rs`
@@ -16,7 +16,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::{
     LEGACY_RUNTIME_IMPORT_OWNER_PREFIX, LEGACY_SCAN_OPERATION_CANDIDATE_PREFIX,
     LegacyRuntimeImportCandidate, LegacyScanOperationCandidate, STORE_CACHE_SIZE_KIB,
-    STORE_PAGE_SIZE_BYTES, STORE_SCHEMA_VERSION, Store, backfill_completed_snapshot_seals,
+    STORE_PAGE_SIZE_BYTES, STORE_SCHEMA_VERSION, ScanHealthProvenance, Store,
+    backfill_completed_snapshot_seals, backfill_completed_snapshot_seals_v1,
     backfill_completed_snapshots, legacy_runtime_import_owner_id,
     legacy_scan_operation_candidate_id, load_scan_operation_recovery_binding_from,
     validate_internal_scan_operation_binding, validate_legacy_scan_operation_candidate,
@@ -769,7 +770,7 @@ impl Store {
                             AND seal_sha256 NOT GLOB '*[^0-9a-f]*')
                  );",
             )?;
-            backfill_completed_snapshot_seals(&tx)?;
+            backfill_completed_snapshot_seals_v1(&tx)?;
             tx.execute_batch("PRAGMA user_version = 15;")?;
             tx.commit()?;
         }
@@ -833,10 +834,138 @@ impl Store {
             validate_store_foreign_keys(&tx, 17)?;
             tx.execute_batch("PRAGMA user_version = 17;")?;
             tx.commit()?;
-            return Ok(());
+        }
+        if current < 18 {
+            let tx = self.connection.transaction()?;
+            // Validate the pre-v18 seal before changing the rows it covers.
+            // The v18 seal is rebuilt below after provenance columns become
+            // part of the authenticated scan projection.
+            let seals_table_exists = table_exists(&tx, "completed_snapshot_seals")?;
+            let completed_snapshots_available =
+                table_has_column(&tx, "completed_snapshots", "created_at")?;
+            let snapshot_count = if current >= 15 && completed_snapshots_available {
+                tx.query_row("SELECT COUNT(*) FROM completed_snapshots", [], |row| {
+                    row.get::<_, u64>(0)
+                })?
+            } else {
+                0
+            };
+            let seal_count = if current >= 15 && seals_table_exists {
+                tx.query_row("SELECT COUNT(*) FROM completed_snapshot_seals", [], |row| {
+                    row.get::<_, u64>(0)
+                })?
+            } else {
+                0
+            };
+            if current >= 15 && completed_snapshots_available && snapshot_count != seal_count {
+                bail!(
+                    "schema {current} completed snapshot seals are incomplete: \
+                     {seal_count} seals for {snapshot_count} snapshots"
+                );
+            }
+            if current >= 15
+                && completed_snapshots_available
+                && snapshot_count > 0
+                && !seals_table_exists
+            {
+                bail!("schema {current} completed snapshot seal table is missing");
+            }
+            let existing_seal_version = if seals_table_exists {
+                tx.query_row(
+                    "SELECT MIN(seal_version) FROM completed_snapshot_seals",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+            } else {
+                None
+            };
+            if existing_seal_version.is_some_and(|version| version != 1 && version != 2) {
+                bail!("completed snapshot seals contain an unsupported version");
+            }
+            let existing_seals = if existing_seal_version.is_some() && completed_snapshots_available
+            {
+                let mut statement = tx.prepare(
+                    "SELECT snapshot_id FROM completed_snapshot_seals
+                       ORDER BY snapshot_id COLLATE BINARY",
+                )?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            if existing_seal_version == Some(1) {
+                for snapshot_id in &existing_seals {
+                    crate::verify_completed_snapshot_seal_v1(&tx, snapshot_id).with_context(
+                        || format!("failed to validate pre-v18 storage seal for {snapshot_id}"),
+                    )?;
+                }
+            }
+            if !table_has_column(&tx, "scans", "health_policy_config_digest")? {
+                tx.execute_batch(
+                    "ALTER TABLE scans ADD COLUMN health_policy_config_digest TEXT;
+                     ALTER TABLE scans ADD COLUMN health_analyzer_version TEXT;
+                     ALTER TABLE scans ADD COLUMN health_finding_contract_version TEXT;",
+                )?;
+            }
+            // The authenticated projection and algorithm changed.  Retain
+            // the immutable snapshot rows, rebuild the seal table with the
+            // v2 CHECK constraint, and recompute every seal in this
+            // transaction.
+            if existing_seal_version == Some(2) {
+                for snapshot_id in &existing_seals {
+                    crate::verify_completed_snapshot_seal(&tx, snapshot_id).with_context(|| {
+                        format!("failed to validate v2 storage seal for {snapshot_id}")
+                    })?;
+                }
+            }
+            if seals_table_exists {
+                tx.execute_batch(
+                    "CREATE TABLE completed_snapshot_seals_v18 (
+                        snapshot_id TEXT PRIMARY KEY
+                            REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                        seal_version INTEGER NOT NULL CHECK (seal_version = 2),
+                        seal_sha256 TEXT NOT NULL
+                            CHECK (length(seal_sha256) = 64
+                                AND seal_sha256 NOT GLOB '*[^0-9a-f]*')
+                     );",
+                )?;
+                if existing_seal_version == Some(2) {
+                    tx.execute(
+                        "INSERT INTO completed_snapshot_seals_v18(
+                             snapshot_id, seal_version, seal_sha256
+                         )
+                         SELECT snapshot_id, seal_version, seal_sha256
+                           FROM completed_snapshot_seals",
+                        [],
+                    )?;
+                }
+                tx.execute_batch(
+                    "DROP TABLE completed_snapshot_seals;
+                     ALTER TABLE completed_snapshot_seals_v18
+                         RENAME TO completed_snapshot_seals;",
+                )?;
+                backfill_completed_snapshot_seals(&tx)?;
+            } else if table_has_column(&tx, "completed_snapshots", "created_at")? {
+                tx.execute_batch(
+                    "CREATE TABLE completed_snapshot_seals (
+                        snapshot_id TEXT PRIMARY KEY
+                            REFERENCES completed_snapshots(id) ON DELETE CASCADE,
+                        seal_version INTEGER NOT NULL CHECK (seal_version = 2),
+                        seal_sha256 TEXT NOT NULL
+                            CHECK (length(seal_sha256) = 64
+                                AND seal_sha256 NOT GLOB '*[^0-9a-f]*')
+                     );",
+                )?;
+                backfill_completed_snapshot_seals(&tx)?;
+            }
+            validate_health_provenance_schema_and_rows(&tx)?;
+            tx.execute_batch("PRAGMA user_version = 18;")?;
+            tx.commit()?;
         }
         validate_runtime_import_operation_ownership_schema_and_rows(&self.connection)?;
         validate_scan_operation_staging_schema_and_rows(&self.connection)?;
+        validate_health_provenance_schema_and_rows(&self.connection)?;
         validate_store_foreign_keys(&self.connection, STORE_SCHEMA_VERSION)?;
         Ok(())
     }
@@ -1293,6 +1422,55 @@ pub(crate) fn validate_scan_operation_staging_schema_and_rows(
                     bail!("completed scan operation staging is not durably sealed");
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_health_provenance_schema_and_rows(connection: &Connection) -> Result<()> {
+    if !table_exists(connection, "scans")? {
+        return Ok(());
+    }
+    for column in [
+        "health_policy_config_digest",
+        "health_analyzer_version",
+        "health_finding_contract_version",
+    ] {
+        if !table_has_column(connection, "scans", column)? {
+            bail!("store schema 18 is missing scans.{column}");
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, health_policy_config_digest, health_analyzer_version,
+                health_finding_contract_version
+           FROM scans
+          ORDER BY id COLLATE BINARY",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (scan_id, policy, analyzer, contract) = row?;
+        match (policy, analyzer, contract) {
+            (None, None, None) => {}
+            (
+                Some(policy_config_digest),
+                Some(analyzer_version),
+                Some(finding_contract_version),
+            ) => {
+                crate::validate_scan_health_provenance(&ScanHealthProvenance {
+                    policy_config_digest,
+                    analyzer_version,
+                    finding_contract_version,
+                })
+                .with_context(|| format!("scan {scan_id} has invalid health provenance"))?;
+            }
+            _ => bail!("scan {scan_id} has a partial health provenance tuple"),
         }
     }
     Ok(())

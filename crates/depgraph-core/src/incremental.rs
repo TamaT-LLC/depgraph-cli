@@ -900,6 +900,9 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: None,
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
             },
             profiles: vec![
                 profile("rust:a", "rust", "cargo:a@1#a"),

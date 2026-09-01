@@ -286,11 +286,28 @@ pub struct Remediation {
     pub detail: String,
 }
 
+/// A suppression attached to a health finding.
+///
+/// This remains part of the finding wire contract for compatibility, but v1
+/// deliberately does not expose a CLI, MCP, or policy input route for health
+/// finding suppressions.  Built-in analyzers consequently return an empty
+/// list; input and application semantics are deferred to a versioned future
+/// contract.  The existing baseline `resolved` transition is independent of
+/// this field.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindingSuppression {
+    /// Stable identifier of the suppression record.
+    ///
+    /// In finding-contract v1 this is an output-only, deferred field.  The
+    /// CLI, MCP, and policy inputs do not provide a route for creating health
+    /// finding suppressions yet; built-in health analyzers therefore emit an
+    /// empty list.  The field remains on the wire so a future version can add
+    /// a versioned input contract without breaking stored findings or clients.
     pub id: String,
+    /// Finding ID to which the deferred suppression would apply.
     pub finding_id: String,
+    /// Optional human tracking ticket retained for the future input contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
 }
@@ -312,6 +329,8 @@ pub struct HealthFinding {
     pub blockers: Vec<FindingBlocker>,
     pub evidence: Vec<FindingEvidenceRef>,
     pub remediations: Vec<Remediation>,
+    /// Output-only/deferred in finding-contract v1; built-in analyzers emit
+    /// an empty list while the field remains wire-compatible.
     pub suppressions: Vec<FindingSuppression>,
     pub analyzer_version: String,
     pub fingerprint: String,
@@ -732,6 +751,33 @@ mod tests {
         let first = collection_digest_with_policy(&identity, &findings, "policy:a");
         let second = collection_digest_with_policy(&identity, &findings, "policy:b");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn issue_439_builtin_finding_suppressions_are_output_only_and_empty() {
+        let finding = finish_finding(
+            sample_identity(),
+            "file",
+            None,
+            "unused",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+        );
+        assert!(finding.suppressions.is_empty());
+
+        // A non-empty value is still accepted for wire-compatibility and
+        // round-trips through the closed DTO; this test only fixes the
+        // built-in analyzer default above, not the public representation.
+        let suppression = FindingSuppression {
+            id: "suppression:deferred".to_owned(),
+            finding_id: finding.id,
+            ticket: None,
+        };
+        assert_eq!(suppression.ticket, None);
     }
 
     #[test]

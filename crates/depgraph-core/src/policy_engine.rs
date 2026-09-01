@@ -927,6 +927,21 @@ fn charge_snapshot_text_work(
         is_cancelled,
     )?;
     optional_text(snapshot.scan.source_revision.as_ref(), work, is_cancelled)?;
+    optional_text(
+        snapshot.scan.health_policy_config_digest.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    optional_text(
+        snapshot.scan.health_analyzer_version.as_ref(),
+        work,
+        is_cancelled,
+    )?;
+    optional_text(
+        snapshot.scan.health_finding_contract_version.as_ref(),
+        work,
+        is_cancelled,
+    )?;
     for profile in &snapshot.profiles {
         text(&profile.id, work, is_cancelled)?;
         text(&profile.language, work, is_cancelled)?;
@@ -6440,6 +6455,9 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: None,
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
             },
             profiles: vec![
                 ProfileRecord {

@@ -33,6 +33,8 @@ pub(crate) fn load_scan_attempt_summary(
         .query_row(
             "SELECT id, root, status, strict, started_at, completed_at,
                     project_code_executed, error, parent_snapshot_id, source_revision
+                    , health_policy_config_digest, health_analyzer_version,
+                    health_finding_contract_version
                FROM scans WHERE id=?1",
             [scan_id],
             |row| {
@@ -47,6 +49,9 @@ pub(crate) fn load_scan_attempt_summary(
                     error: row.get(7)?,
                     parent_snapshot_id: row.get(8)?,
                     source_revision: row.get(9)?,
+                    health_policy_config_digest: row.get(10)?,
+                    health_analyzer_version: row.get(11)?,
+                    health_finding_contract_version: row.get(12)?,
                 })
             },
         )

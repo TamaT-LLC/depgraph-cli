@@ -92,7 +92,7 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
-**Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no observed usage and no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Source is never changed automatically.
+**Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no observed usage and no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Source is never changed automatically. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. Audit before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`.
 
 A **selector** identifies a graph node on the CLI. The accepted prefixes are
 `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:`. If more than one
@@ -211,7 +211,7 @@ The MVP implements the architecture described in [the system design](docs/40_arc
 Every v0.5 archive includes the native MCP server, durable
 operation runner, and versioned Agent tool/operation schema.
 The worker protocol remains at `1.0` for v0.5, with Store
-schema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
+schema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
 `depgraph-operation-v1`.
 
 `v0.4.0` is a historical reserved baseline; no `v0.4.0` stable GitHub Release

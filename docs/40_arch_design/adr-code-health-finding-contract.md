@@ -174,10 +174,16 @@ Rejected alternatives for promotion:
 
 ### Suppression
 
-A suppression is an explicit baseline or policy record keyed by stable finding
-ID (optionally plus a human ticket). It never deletes source. It is recorded
-on the finding and does not rewrite the ID. Suppressions do not convert
-`indeterminate` into `confirmed`.
+`suppressions` remains a field in the finding domain value, DTOs, and wire
+schema for forward and backward compatibility. In contract v1 it is
+output-only and deferred: the CLI, MCP, and policy configuration do not expose
+an input route for creating a health-finding suppression, and every built-in
+health analyzer returns `[]`. A future input route must be introduced by an
+explicitly versioned contract; clients must not infer one from this field.
+
+The existing baseline `resolved: true` transition is the only v1
+suppression-like behavior. It never deletes source, rewrites a finding ID, or
+converts `indeterminate` into `confirmed`.
 
 ### Snapshot provenance
 
@@ -185,11 +191,24 @@ The current store already records optional `source_revision` on scans and
 completed snapshots. That field is the Git HEAD OID (`git rev-parse --verify
 HEAD`) when Git is available.
 
-This ADR keeps store schema `17`. It does not add a worktree digest column.
-Audit treats `source_revision` as the commit OID when present, looks up a
-base snapshot by that field plus optional `--base-snapshot`, and live-checks
-worktree dirtiness at request start. Missing `source_revision` is
-`missing-base-snapshot` (or prevents OID binding for `--changed`).
+Store schema `18` persists three optional health provenance values on each
+scan: the normalized policy configuration digest, the health analyzer version,
+and the finding contract version. A scan binds this tuple exactly once while
+staging; completed snapshots authenticate it in the v2 storage seal. Existing
+schema-17 scans migrate with a `None` tuple, after their legacy v1 seal is
+verified and safely rebuilt as a v2 seal. Derived build/runtime snapshots
+inherit their scan's tuple, while an incremental scan binds a new tuple.
+
+Audit compares the persisted before/after tuples with the policy digest and
+analyzer/contract versions pinned by the current audit scope. A missing or
+different policy digest, including a mismatch with the currently evaluated
+policy, sets `incomparable-policy`; a missing or different analyzer or finding
+contract version, including a mismatch with the running health constants, sets
+`incomparable-contract`. These blockers degrade new comparison findings to
+`indeterminate` while blast-radius analysis continues. Current policy or graph
+protocol values are never substituted for missing snapshot provenance. The
+snapshot graph content ID remains independent of these policy/health contract
+values.
 
 Rejected: stuffing a worktree hash into `source_revision` (the field is an
 OID today); bumping the store schema only to store a dirty bit that can be
@@ -228,21 +247,21 @@ Default mismatch policy is degrade, not reject:
 - missing before snapshot → blast radius remains evaluable; cycle / boundary /
   API new checks return `indeterminate` placeholders with
   `missing-base-snapshot`
-- incomparable profile matrix, completeness retreat, or contract mismatch →
-  the affected new-check degrades
+- incomparable profile matrix, completeness retreat, policy provenance, or
+  health contract provenance → the affected new-check degrades
 
 Policy configuration is read once when the audit scope opens. If a comparable
 before snapshot exists, the policy evaluator runs against the pinned before /
 after pair at that point; the resulting boundary violation IDs are retained in
 the scope and never recomputed while the scope is consumed. A boundary audit
 finding therefore uses the evaluator's stable `PolicyViolation.id`, not a
-diagnostic code or message substring. Audits do not claim historical policy
-comparability: policy provenance and policy-change comparison remain outside
-this contract and are reserved for #439. When no boundary policy rule is
-configured, the boundary ID set is empty; audit does not infer a boundary or
-blocker from graph diagnostics. The public graph-only analyzer compatibility
-wrapper therefore always passes an empty boundary-ID set unless the service
-audit path explicitly supplies evaluator output.
+diagnostic code or message substring. Historical policy comparability is
+determined separately from that live evaluation using the persisted schema-18
+policy digest described above. When no boundary policy rule is configured,
+the boundary ID set is empty; audit does not infer a boundary or blocker from
+graph diagnostics. The public graph-only analyzer compatibility wrapper
+therefore always passes an empty boundary-ID set unless the service audit path
+explicitly supplies evaluator output.
 
 Before/after correspondence uses the policy rule ID, source/target IDs,
 profile, and ordered dependency node path. It deliberately excludes edge IDs
@@ -357,11 +376,14 @@ Rejected. Confidence or severity upgrades would hide regressions.
 Rejected. The product needs graph-specific blockers, snapshot pinning, and
 byte-deterministic digests.
 
-### Bump store schema to store worktree digests
+### Persist health provenance in the store
 
-Rejected for v1. `source_revision` already holds the HEAD OID. Dirty
-worktrees are observable live. A schema 18 bump remains available if a later
-issue needs an attested worktree digest inside the snapshot identity.
+Accepted for #439. A schema-18 migration adds optional scan-level policy,
+analyzer, and finding-contract provenance columns. The values are bound once
+while a scan is staging and are included in a v2 completed-snapshot storage
+seal; old scans migrate with missing provenance and therefore compare
+fail-closed. They remain outside the graph content ID so a policy or health
+contract change does not create a different graph snapshot.
 
 ## Consequences
 

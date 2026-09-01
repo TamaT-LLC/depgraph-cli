@@ -77,12 +77,12 @@ impl AuditComparability {
         push(
             self.policy_changed,
             BlockerKind::IncomparablePolicy,
-            "policy digest differs between the audit inputs",
+            "policy digest differs between the audit inputs or the pinned live policy",
         );
         push(
             self.contract_changed,
             BlockerKind::IncomparableContract,
-            "analyzer or finding contract versions differ",
+            "analyzer or finding contract versions differ from each other or the running contract",
         );
         blockers
     }
@@ -579,6 +579,9 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: Some("a".repeat(40)),
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
             },
             profiles: Vec::new(),
             nodes: Vec::new(),
@@ -704,6 +707,11 @@ mod tests {
                 missing_base: true,
                 ..AuditComparability::default()
             },
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
         );
         let degraded = findings
             .iter()

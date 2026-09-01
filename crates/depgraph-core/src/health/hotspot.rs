@@ -435,6 +435,9 @@ mod tests {
                 error: None,
                 parent_snapshot_id: None,
                 source_revision: Some("c".repeat(40)),
+                health_policy_config_digest: None,
+                health_analyzer_version: None,
+                health_finding_contract_version: None,
             },
             profiles: Vec::new(),
             nodes,
@@ -473,6 +476,11 @@ mod tests {
                 churn: false,
                 runtime: false,
             },
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.suppressions.is_empty())
         );
         assert!(findings.iter().all(|finding| {
             finding

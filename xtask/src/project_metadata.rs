@@ -1128,7 +1128,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
         "no `v0.4.0` stable GitHub",
-        "Store\nschema `17`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
+        "Store\nschema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
     ] {
         if !english_readme.contains(required) {
             bail!("English README release metadata is missing {required:?}");
@@ -1145,7 +1145,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     for required in [
         "updated: 2026-08-26",
         "| Product / Rust / Go / Web adapter | `0.5.4` |",
-        "| SQLite store / scan cache / impact query cache | `17` / `2` / `1` |",
+        "| SQLite store / scan cache / impact query cache | `18` / `2` / `1` |",
         "| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "stable GitHub Releaseは公開されなかった",
@@ -1482,7 +1482,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "No `v0.4.0` stable GitHub Release was published",
         "| Product and adapters | `0.5.0` |",
         "| Worker protocol / graph schema | `1.0` |",
-        "| SQLite Store | schema `17` |",
+        "| SQLite Store | schema `18` |",
         "| Durable operation journal | schema `5` |",
         "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
         "| Operation DTO | `depgraph-operation-v1` |",
