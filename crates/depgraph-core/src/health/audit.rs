@@ -15,6 +15,17 @@ use super::{
 };
 use super::{HealthAnalysisError, budget::HealthAnalysisBudget};
 
+/// Minimum number of impacted nodes outside the changed subjects that makes a
+/// reverse-impact result a wide-blast finding in the v1 audit contract.
+pub const DEFAULT_WIDE_BLAST_RADIUS_MIN_ADDITIONAL_NODES: usize = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub struct AuditAnalysisOptions<'a> {
+    pub boundary_violation_ids: &'a BTreeSet<String>,
+    pub maximum_findings: usize,
+    pub maximum_work: usize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AuditComparability {
     pub missing_base: bool,
@@ -141,20 +152,50 @@ pub fn analyze_changed_code_cancellable(
     comparability: &AuditComparability,
     maximum_findings: usize,
     maximum_work: usize,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
+    let boundary_violation_ids = BTreeSet::new();
+    analyze_changed_code_with_boundary_ids_cancellable(
+        after,
+        before,
+        changed_node_ids,
+        comparability,
+        AuditAnalysisOptions {
+            boundary_violation_ids: &boundary_violation_ids,
+            maximum_findings,
+            maximum_work,
+        },
+        is_cancelled,
+    )
+}
+
+/// Analyze changed code with the policy evaluator's pinned boundary IDs.
+///
+/// Callers that have no policy evaluation (including the compatibility
+/// wrapper above) pass an empty set.  In particular, graph diagnostics are not
+/// interpreted here: policy violation IDs are the sole boundary identity.
+pub fn analyze_changed_code_with_boundary_ids_cancellable(
+    after: &GraphSnapshot,
+    before: Option<&GraphSnapshot>,
+    changed_node_ids: &[String],
+    comparability: &AuditComparability,
+    options: AuditAnalysisOptions<'_>,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
-    let mut budget = HealthAnalysisBudget::new(maximum_work);
+    let mut budget = HealthAnalysisBudget::new(options.maximum_work);
     let shared_blockers = comparability.blockers();
     let new_checks_indeterminate = comparability.new_checks_are_indeterminate();
     let mut findings = Vec::new();
     if let Some(before) = before {
-        let before_cycles = cycle_identities(before, maximum_work, &mut budget, &mut is_cancelled)?;
-        let after_cycles = cycle_identities(after, maximum_work, &mut budget, &mut is_cancelled)?;
+        let before_cycles =
+            cycle_identities(before, options.maximum_work, &mut budget, &mut is_cancelled)?;
+        let after_cycles =
+            cycle_identities(after, options.maximum_work, &mut budget, &mut is_cancelled)?;
         for rotation in after_cycles.difference(&before_cycles) {
             budget.step(&mut is_cancelled)?;
             push_finding(
                 &mut findings,
-                maximum_findings,
+                options.maximum_findings,
                 audit_finding(
                     FindingKind::NewCycle,
                     rotation.join("->"),
@@ -165,18 +206,16 @@ pub fn analyze_changed_code_cancellable(
                 ),
             )?;
         }
-        let before_boundaries = boundary_identities(before, &mut budget, &mut is_cancelled)?;
-        let after_boundaries = boundary_identities(after, &mut budget, &mut is_cancelled)?;
-        for identity in after_boundaries.difference(&before_boundaries) {
+        for identity in options.boundary_violation_ids {
             budget.step(&mut is_cancelled)?;
             push_finding(
                 &mut findings,
-                maximum_findings,
+                options.maximum_findings,
                 audit_finding(
                     FindingKind::NewBoundaryViolation,
                     identity.clone(),
                     vec![identity.clone()],
-                    "boundary violation is present after the change and absent before",
+                    "boundary-violation semantic-path multiplicity increased; subject is a deterministic after-side policy-violation representative",
                     &shared_blockers,
                     new_checks_indeterminate,
                 ),
@@ -186,7 +225,7 @@ pub fn analyze_changed_code_cancellable(
             budget.step(&mut is_cancelled)?;
             push_finding(
                 &mut findings,
-                maximum_findings,
+                options.maximum_findings,
                 audit_finding(
                     FindingKind::PublicApiChange,
                     change.0.clone(),
@@ -206,7 +245,7 @@ pub fn analyze_changed_code_cancellable(
             budget.step(&mut is_cancelled)?;
             push_finding(
                 &mut findings,
-                maximum_findings,
+                options.maximum_findings,
                 audit_finding(
                     kind,
                     format!("degraded:{}", kind.as_str()),
@@ -230,10 +269,15 @@ pub fn analyze_changed_code_cancellable(
     let mut changed = BTreeSet::new();
     for node_id in changed_node_ids {
         budget.step(&mut is_cancelled)?;
-        changed.insert(node_id);
+        changed.insert(node_id.clone());
     }
     let changed_count = changed.len();
-    if changed_count > 0 && impacted.len() > changed_count {
+    let mut additional_impacted = 0_usize;
+    for _ in impacted.difference(&changed) {
+        budget.step(&mut is_cancelled)?;
+        additional_impacted += 1;
+    }
+    if changed_count > 0 && additional_impacted >= DEFAULT_WIDE_BLAST_RADIUS_MIN_ADDITIONAL_NODES {
         let impacted_count = impacted.len();
         let impacted = impacted.into_iter().collect::<Vec<_>>();
         let subject = changed_node_ids
@@ -256,7 +300,7 @@ pub fn analyze_changed_code_cancellable(
             .collect::<Vec<_>>();
         push_finding(
             &mut findings,
-            maximum_findings,
+            options.maximum_findings,
             audit_finding(
                 FindingKind::WideBlastRadius,
                 subject,
@@ -358,21 +402,6 @@ fn canonical_cycle_rotation_bounded(
         }
     }
     Ok(best)
-}
-
-fn boundary_identities(
-    snapshot: &GraphSnapshot,
-    budget: &mut HealthAnalysisBudget,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<BTreeSet<String>, HealthAnalysisError> {
-    let mut identities = BTreeSet::new();
-    for diagnostic in &snapshot.diagnostics {
-        budget.step(is_cancelled)?;
-        if diagnostic.code.contains("boundary") || diagnostic.code.contains("policy") {
-            identities.insert(diagnostic.id.clone());
-        }
-    }
-    Ok(identities)
 }
 
 fn public_api_changes(
@@ -529,10 +558,13 @@ fn audit_finding(
 
 #[cfg(test)]
 mod tests {
-    use depgraph_store::{CoverageRecord, EdgeRecord, NodeRecord, ProfileMatrixRecord, ScanRecord};
+    use depgraph_store::{
+        CoverageRecord, DiagnosticRecord, EdgeRecord, NodeRecord, ProfileMatrixRecord, ScanRecord,
+    };
     use serde_json::json;
 
     use super::*;
+    use crate::health::Confidence;
 
     fn empty_snapshot() -> GraphSnapshot {
         GraphSnapshot {
@@ -619,15 +651,159 @@ mod tests {
     }
 
     #[test]
+    fn issue_438_missing_base_keeps_degraded_placeholders_and_blast_analysis() {
+        let mut after = empty_snapshot();
+        after.nodes = vec![
+            NodeRecord {
+                id: "file:changed".to_owned(),
+                kind: "file".to_owned(),
+                locator: "repo://src/changed.rs".to_owned(),
+                display_name: "changed.rs".to_owned(),
+                properties: json!({"path": "src/changed.rs", "language": "rust"}),
+            },
+            NodeRecord {
+                id: "file:caller-a".to_owned(),
+                kind: "file".to_owned(),
+                locator: "repo://src/caller-a.rs".to_owned(),
+                display_name: "caller-a.rs".to_owned(),
+                properties: json!({"path": "src/caller-a.rs", "language": "rust"}),
+            },
+            NodeRecord {
+                id: "file:caller-b".to_owned(),
+                kind: "file".to_owned(),
+                locator: "repo://src/caller-b.rs".to_owned(),
+                display_name: "caller-b.rs".to_owned(),
+                properties: json!({"path": "src/caller-b.rs", "language": "rust"}),
+            },
+        ];
+        for (edge_id, caller) in [
+            ("edge:caller-a-changed", "file:caller-a"),
+            ("edge:caller-b-changed", "file:caller-b"),
+        ] {
+            after.edges.push(EdgeRecord {
+                id: edge_id.to_owned(),
+                site_id: None,
+                source: caller.to_owned(),
+                target: "file:changed".to_owned(),
+                kind: "imports".to_owned(),
+                phase: "semantic".to_owned(),
+                environment: "host".to_owned(),
+                profile_id: "rust:lib".to_owned(),
+                resolution_status: "resolved".to_owned(),
+                precision: "exact".to_owned(),
+                condition: json!({}),
+                generated: false,
+            });
+        }
+        let changed = vec!["file:changed".to_owned()];
+        let findings = analyze_changed_code(
+            &after,
+            None,
+            &changed,
+            &AuditComparability {
+                missing_base: true,
+                ..AuditComparability::default()
+            },
+        );
+        let degraded = findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.kind,
+                    FindingKind::NewCycle
+                        | FindingKind::NewBoundaryViolation
+                        | FindingKind::PublicApiChange
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(degraded.len(), 3);
+        assert!(degraded.iter().all(|finding| {
+            finding.confidence == Confidence::Indeterminate
+                && finding.subject_id == format!("degraded:{}", finding.kind.as_str())
+                && finding
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == BlockerKind::MissingBaseSnapshot)
+        }));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::WideBlastRadius)
+        );
+    }
+
+    #[test]
+    fn issue_438_boundary_identity_uses_policy_ids_not_diagnostic_text() {
+        let mut before = empty_snapshot();
+        before.diagnostics.push(DiagnosticRecord {
+            ordinal: 1,
+            id: "diagnostic:boundary-text".to_owned(),
+            severity: "error".to_owned(),
+            code: "architecture-boundary".to_owned(),
+            message: "boundary text is not a policy result".to_owned(),
+            path: None,
+            adapter: None,
+            start_line: None,
+            start_column: None,
+            end_line: None,
+            end_column: None,
+            properties: json!({}),
+        });
+        let mut after = before.clone();
+        after.diagnostics[0].id = "diagnostic:boundary-text-after".to_owned();
+        let changed = vec!["file:changed".to_owned()];
+        let without_policy = analyze_changed_code(
+            &after,
+            Some(&before),
+            &changed,
+            &AuditComparability::default(),
+        );
+        assert!(
+            !without_policy
+                .iter()
+                .any(|finding| finding.kind == FindingKind::NewBoundaryViolation)
+        );
+
+        let policy_id = "policy-violation:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let policy_ids = BTreeSet::from([policy_id.to_owned()]);
+        let with_policy = analyze_changed_code_with_boundary_ids_cancellable(
+            &after,
+            Some(&before),
+            &changed,
+            &AuditComparability::default(),
+            AuditAnalysisOptions {
+                boundary_violation_ids: &policy_ids,
+                maximum_findings: usize::MAX,
+                maximum_work: usize::MAX,
+            },
+            || false,
+        )
+        .expect("unbounded analysis succeeds");
+        let boundary = with_policy
+            .iter()
+            .find(|finding| finding.kind == FindingKind::NewBoundaryViolation)
+            .expect("pinned policy violation becomes an audit finding");
+        assert_eq!(boundary.subject_id, policy_id);
+        assert!(boundary.id.starts_with("finding:sha256:"));
+    }
+
+    #[test]
     fn issue_423_deleted_subject_uses_before_snapshot_for_blast_radius() {
         let mut before = empty_snapshot();
         before.nodes = vec![
             NodeRecord {
-                id: "file:caller".to_owned(),
+                id: "file:caller-a".to_owned(),
                 kind: "file".to_owned(),
-                locator: "repo://src/caller.rs".to_owned(),
-                display_name: "caller.rs".to_owned(),
-                properties: json!({"path": "src/caller.rs", "language": "rust"}),
+                locator: "repo://src/caller-a.rs".to_owned(),
+                display_name: "caller-a.rs".to_owned(),
+                properties: json!({"path": "src/caller-a.rs", "language": "rust"}),
+            },
+            NodeRecord {
+                id: "file:caller-b".to_owned(),
+                kind: "file".to_owned(),
+                locator: "repo://src/caller-b.rs".to_owned(),
+                display_name: "caller-b.rs".to_owned(),
+                properties: json!({"path": "src/caller-b.rs", "language": "rust"}),
             },
             NodeRecord {
                 id: "file:deleted".to_owned(),
@@ -637,20 +813,25 @@ mod tests {
                 properties: json!({"path": "src/deleted.rs", "language": "rust"}),
             },
         ];
-        before.edges.push(EdgeRecord {
-            id: "edge:caller-deleted".to_owned(),
-            site_id: None,
-            source: "file:caller".to_owned(),
-            target: "file:deleted".to_owned(),
-            kind: "imports".to_owned(),
-            phase: "semantic".to_owned(),
-            environment: "host".to_owned(),
-            profile_id: "rust:lib".to_owned(),
-            resolution_status: "resolved".to_owned(),
-            precision: "exact".to_owned(),
-            condition: json!({}),
-            generated: false,
-        });
+        for (edge_id, caller) in [
+            ("edge:caller-a-deleted", "file:caller-a"),
+            ("edge:caller-b-deleted", "file:caller-b"),
+        ] {
+            before.edges.push(EdgeRecord {
+                id: edge_id.to_owned(),
+                site_id: None,
+                source: caller.to_owned(),
+                target: "file:deleted".to_owned(),
+                kind: "imports".to_owned(),
+                phase: "semantic".to_owned(),
+                environment: "host".to_owned(),
+                profile_id: "rust:lib".to_owned(),
+                resolution_status: "resolved".to_owned(),
+                precision: "exact".to_owned(),
+                condition: json!({}),
+                generated: false,
+            });
+        }
         let after = empty_snapshot();
         let findings = analyze_changed_code(
             &after,
@@ -662,7 +843,7 @@ mod tests {
             .iter()
             .find(|finding| finding.kind == FindingKind::WideBlastRadius)
             .expect("blast radius from deleted subject");
-        assert!(blast.reason.contains("2 nodes from 1 changed nodes"));
+        assert!(blast.reason.contains("3 nodes from 1 changed nodes"));
 
         let first = analyze_changed_code(
             &after,

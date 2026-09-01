@@ -6370,7 +6370,13 @@ fn mcp_setup_rejects_a_non_repository_before_network_or_state_changes() {
     assert!(!default_store.exists());
 }
 
-fn seed_issue_423_health_store(store_path: &Path, root: &Path, scan_id: &str, revision: &str) {
+fn seed_issue_423_health_store(
+    store_path: &Path,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+    add_blast_edge: bool,
+) {
     let mut store = depgraph_store::Store::open(store_path).unwrap();
     store
         .start_scan_with_revision(scan_id, root, false, Some(revision))
@@ -6447,11 +6453,30 @@ fn seed_issue_423_health_store(store_path: &Path, root: &Path, scan_id: &str, re
         "generated": false
     });
     store.ingest_event(&edge).unwrap();
-    let mut profile_completed = common("profile_completed", 7);
+    let mut next_seq = 7_u64;
+    if add_blast_edge {
+        let mut changed_edge = common("edge_upsert", next_seq);
+        changed_edge["edge"] = json!({
+            "id": "edge:used-unused",
+            "source": "file:src/used.rs",
+            "target": "file:src/unused.rs",
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&changed_edge).unwrap();
+        next_seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", next_seq);
     profile_completed["profile_id"] = json!("fixture:rust");
     profile_completed["coverage"] = coverage.clone();
     store.ingest_event(&profile_completed).unwrap();
-    let mut completed = common("scan_completed", 8);
+    let mut completed = common("scan_completed", next_seq + 1);
     completed["coverage"] = coverage;
     store.ingest_event(&completed).unwrap();
     store.finish_scan(scan_id, "completed", None, true).unwrap();
@@ -6479,7 +6504,7 @@ fn issue_423_health_repo() -> (
     run_git(root.path(), &["add", "."]);
     run_git(root.path(), &["commit", "-m", "seed"]);
     let revision = run_git(root.path(), &["rev-parse", "HEAD"]);
-    seed_issue_423_health_store(&store_path, root.path(), "health-scan", &revision);
+    seed_issue_423_health_store(&store_path, root.path(), "health-scan", &revision, false);
     (root, cache, store_path, revision)
 }
 
@@ -6858,5 +6883,104 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
             .as_str()
             .unwrap()
             .starts_with("collection:sha256:")
+    );
+}
+
+#[test]
+fn issue_438_health_audit_cli_missing_base_keeps_placeholders_blast_and_digest_stable() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    run_git(root.path(), &["init"]);
+    run_git(root.path(), &["config", "user.name", "health"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "health@example.test"],
+    );
+    fs::write(root.path().join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
+    fs::write(root.path().join("src/used.rs"), "pub fn used() {}\n").unwrap();
+    fs::write(root.path().join("src/lib.rs"), "mod used;\n").unwrap();
+    run_git(root.path(), &["add", "."]);
+    run_git(root.path(), &["commit", "-m", "base"]);
+    let base_revision = run_git(root.path(), &["rev-parse", "HEAD"]);
+
+    fs::write(
+        root.path().join("src/unused.rs"),
+        "pub fn unused() { println!(\"after\"); }\n",
+    )
+    .unwrap();
+    run_git(root.path(), &["add", "."]);
+    run_git(root.path(), &["commit", "-m", "snapshot after base"]);
+    let after_revision = run_git(root.path(), &["rev-parse", "HEAD"]);
+    seed_issue_423_health_store(
+        &store_path,
+        root.path(),
+        "health-after-missing-base",
+        &after_revision,
+        true,
+    );
+
+    fs::write(root.path().join("notes.txt"), "later change\n").unwrap();
+    run_git(root.path(), &["add", "."]);
+    run_git(root.path(), &["commit", "-m", "change after snapshot"]);
+
+    let audit = || {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "audit",
+                "--changed",
+                &base_revision,
+                "--all",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let first = audit();
+    let second = audit();
+    assert!(first["data"]["before_snapshot_id"].is_null());
+    assert_eq!(
+        first["data"]["collection_digest"],
+        second["data"]["collection_digest"]
+    );
+    assert_eq!(first["data"]["findings"], second["data"]["findings"]);
+    let findings = first["data"]["findings"].as_array().unwrap();
+    let degraded = findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding["kind"].as_str(),
+                Some("new-cycle") | Some("new-boundary-violation") | Some("public-api-change")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(degraded.len(), 3);
+    for finding in degraded {
+        assert_eq!(finding["confidence"], "indeterminate");
+        assert!(
+            finding["subject_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("degraded:")
+        );
+        assert!(
+            finding["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| { blocker["kind"] == "missing-base-snapshot" })
+        );
+    }
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["kind"] == "wide-blast-radius")
     );
 }

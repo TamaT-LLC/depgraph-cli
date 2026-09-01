@@ -442,6 +442,30 @@ pub fn collection_digest(identity: &CollectionIdentity, finding_ids: &[String]) 
     )
 }
 
+/// Compute an audit collection digest while binding the scope's pinned
+/// policy configuration.  The regular collection identity remains unchanged
+/// for health and hotspot callers; audit scopes use this extension so two
+/// policies cannot accidentally share an input digest.
+pub(crate) fn collection_digest_with_policy(
+    identity: &CollectionIdentity,
+    finding_ids: &[String],
+    policy_config_digest: &str,
+) -> String {
+    let mut ids = finding_ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    let payload = json!({
+        "contract": HEALTH_FINDING_CONTRACT_VERSION,
+        "finding_ids": ids,
+        "input": identity,
+        "policy_config_digest": policy_config_digest,
+    });
+    format!(
+        "collection:sha256:{}",
+        hex_digest(&canonical_json(&payload))
+    )
+}
+
 #[must_use]
 pub fn actionable_rank(severity: Severity, confidence: Confidence) -> u16 {
     u16::from(severity.rank()) * 8 + u16::from(confidence.rank())
@@ -690,6 +714,24 @@ mod tests {
             collection_digest(&identity, &["finding:1".to_owned(), "finding:2".to_owned()]);
         assert_eq!(first, second);
         assert!(first.starts_with("collection:sha256:"));
+    }
+
+    #[test]
+    fn issue_438_audit_collection_digest_binds_pinned_policy() {
+        let identity = CollectionIdentity {
+            snapshot_ids: vec!["snapshot:a".to_owned()],
+            manifest_digest: None,
+            changed_oid: Some("oid:a".to_owned()),
+            changed_set_digest: Some("changed:a".to_owned()),
+            churn_start_oid: None,
+            churn_commit_limit: None,
+            churn_path_filter: Vec::new(),
+            hotspot_weights: None,
+        };
+        let findings = ["finding:a".to_owned()];
+        let first = collection_digest_with_policy(&identity, &findings, "policy:a");
+        let second = collection_digest_with_policy(&identity, &findings, "policy:b");
+        assert_ne!(first, second);
     }
 
     #[test]

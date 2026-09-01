@@ -109,6 +109,7 @@ derived fields never enter the hashed payload.
 - sorted finding IDs
 - input identity: snapshot ID (audit uses the before/after pair), optional
   manifest digest, changed OID, churn window, and hotspot weights
+- audit's pinned policy configuration digest
 
 ### Baseline transitions
 
@@ -227,8 +228,39 @@ Default mismatch policy is degrade, not reject:
 - missing before snapshot → blast radius remains evaluable; cycle / boundary /
   API new checks return `indeterminate` placeholders with
   `missing-base-snapshot`
-- incomparable profile matrix, completeness retreat, policy digest change, or
-  contract mismatch → the affected new-check degrades
+- incomparable profile matrix, completeness retreat, or contract mismatch →
+  the affected new-check degrades
+
+Policy configuration is read once when the audit scope opens. If a comparable
+before snapshot exists, the policy evaluator runs against the pinned before /
+after pair at that point; the resulting boundary violation IDs are retained in
+the scope and never recomputed while the scope is consumed. A boundary audit
+finding therefore uses the evaluator's stable `PolicyViolation.id`, not a
+diagnostic code or message substring. Audits do not claim historical policy
+comparability: policy provenance and policy-change comparison remain outside
+this contract and are reserved for #439. When no boundary policy rule is
+configured, the boundary ID set is empty; audit does not infer a boundary or
+blocker from graph diagnostics. The public graph-only analyzer compatibility
+wrapper therefore always passes an empty boundary-ID set unless the service
+audit path explicitly supplies evaluator output.
+
+Before/after correspondence uses the policy rule ID, source/target IDs,
+profile, and ordered dependency node path. It deliberately excludes edge IDs
+and evidence positions because a dependency-site line move can change those
+authenticated `PolicyViolation.id` inputs without introducing a new boundary
+violation. Correspondence first preserves exact before/after
+`PolicyViolation.id` matches, then pairs remaining occurrences by the semantic
+key above. Multiplicity is preserved, so adding another violation on the same
+node path still yields one new finding whose subject is an after-side
+`PolicyViolation.id`.
+
+When all raw IDs in a semantic group change at the same time as a parallel
+occurrence is added, neither `PolicyResult` contains movement provenance that
+can distinguish the physical moved and added sites. The finding therefore
+uses a deterministic surplus after-side ID as the evaluator representative of
+the increased multiplicity; it does not claim that representative is the
+source-level added occurrence. Consumers must use the semantic key and count
+increase for newness, rather than infer line-level causality from that ID.
 
 Canonical identities:
 
@@ -237,8 +269,10 @@ Canonical identities:
 - public API: existing `public_api_change` plus snapshot symbol/signature
   diff restricted to classified public surface
 - blast radius: reverse `impact()` over the changed set; a
-  `wide-blast-radius` finding is emitted only when reverse traversal reaches
-  at least one node beyond the changed subjects themselves
+  `wide-blast-radius` finding is emitted only when the set difference between
+  impacted nodes and changed subjects contains at least two nodes. This fixed
+  v1 threshold is not request-configurable; a future contract revision may
+  introduce an explicitly versioned override.
 
 ### Hotspot score
 
