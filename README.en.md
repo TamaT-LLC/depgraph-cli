@@ -89,10 +89,10 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | How can I export the graph? | `export` | JSON, DOT, Mermaid, or GraphML |
 | Which files, exports, types, or dependencies look unused? | `health`, `health list`, `cleanup` | Snapshot-scoped findings with confidence and blockers. Summary excludes audit and hotspot results |
 | What risk did a Git change introduce? | `audit --changed <GIT_REF>` | New cycles, boundary violations, public API changes, and blast radius in `merge-base(GIT_REF, HEAD)..HEAD`; `changed_oid` identifies the audited HEAD. Without a base snapshot, the three comparison checks are indeterminate while blast radius remains evaluable |
-| Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation |
+| Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, available, and total fields; confidence is capped at `probable` |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
-**Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no observed usage and no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Source is never changed automatically. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. Audit before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`.
+**Confidence** on `health` findings means: `confirmed` is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains; `probable` has no observed usage and no hard blocker but applicable profiles are only syntax-complete; `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Hotspots are rankings rather than proof of unusedness and are capped at `probable`; read their typed `hotspot_scores` layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. Audit before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. Source is never changed automatically.
 
 A **selector** identifies a graph node on the CLI. The accepted prefixes are
 `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:`. If more than one
@@ -201,18 +201,23 @@ tests together. Development workflow and command details are in
 
 ## Releases and compatibility
 
-`main` implements the `0.5.4` contract documented in the
-[`v0.5.4` release notes](docs/releases/v0.5.4.md). A stable release is valid
-only when the
+The published `v0.5.4` artifact implements the contract documented in the
+[`v0.5.4` release notes](docs/releases/v0.5.4.md). `main` may contain
+post-tag development changes that are not part of that published artifact. A
+stable release is valid only when the
 [`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)
 and its post-publish evidence exist and agree.
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
 Every v0.5 archive includes the native MCP server, durable
 operation runner, and versioned Agent tool/operation schema.
-The worker protocol remains at `1.0` for v0.5, with Store
+The worker protocol remains at `1.0` for v0.5. The current development
+compatibility tuple is Store
 schema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and
 `depgraph-operation-v1`.
+The published `v0.5.4` artifact uses Store schema `17`. Current post-tag
+`main` uses Store schema `18`; a Store migrated to schema 18 cannot be opened
+by the published `v0.5.4` binary.
 
 `v0.4.0` is a historical reserved baseline; no `v0.4.0` stable GitHub Release
 was published. Its contract remains in the historical

@@ -617,7 +617,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_hotspots_list",
-        "Rank graph hotspots with integer basis-point scores. Missing Git churn or runtime observation contributes 0 without renormalizing weights.",
+        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights.",
         [
             "snapshot",
             "churn_commit_limit",

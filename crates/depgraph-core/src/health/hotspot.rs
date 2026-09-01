@@ -41,16 +41,27 @@ impl HotspotWeights {
             git_churn,
             runtime,
         };
-        if [fan_in, fan_out, reverse_impact, git_churn, runtime]
-            .into_iter()
-            .any(|weight| weight > BASIS_POINTS_MAX)
+        weights.validate()?;
+        Ok(weights)
+    }
+
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        if [
+            self.fan_in,
+            self.fan_out,
+            self.reverse_impact,
+            self.git_churn,
+            self.runtime,
+        ]
+        .into_iter()
+        .any(|weight| weight > BASIS_POINTS_MAX)
         {
             return Err("hotspot weight exceeds 10000");
         }
-        if weights.sum() > BASIS_POINTS_MAX {
+        if self.sum() > BASIS_POINTS_MAX {
             return Err("hotspot weights sum exceeds 10000");
         }
-        Ok(weights)
+        Ok(())
     }
 
     #[must_use]
@@ -93,6 +104,41 @@ pub struct HotspotLayerScores {
     pub total: u32,
 }
 
+/// The machine-readable contribution of one hotspot score layer.
+///
+/// `raw` is the source metric before rank normalization. Both basis-point
+/// fields are bounded to `0..=10_000`; `weight_basis_points` is the configured
+/// request weight and is deliberately retained when `available` is false so
+/// consumers can explain why the layer contributed zero without renormalizing
+/// the remaining layers.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotspotLayerScore {
+    pub raw: u64,
+    pub normalized_basis_points: u32,
+    pub weight_basis_points: u32,
+    pub available: bool,
+}
+
+/// Structured explainability data attached to a hotspot `HealthFinding`.
+///
+/// The field names are part of `depgraph-health-finding-v1`. Keep the existing
+/// [`HotspotLayerScores`] aggregate type for callers that use the historical
+/// normalized-only API; this type is the additive finding contract.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotspotFindingScores {
+    pub fan_in: HotspotLayerScore,
+    pub fan_out: HotspotLayerScore,
+    pub reverse_impact: HotspotLayerScore,
+    pub git_churn: HotspotLayerScore,
+    pub runtime: HotspotLayerScore,
+    pub total: u32,
+}
+
+/// Backwards-compatible short name for structured hotspot score data.
+pub type HotspotScores = HotspotFindingScores;
+
 #[derive(Clone, Debug, Default)]
 pub struct HotspotLayerAvailability {
     pub churn: bool,
@@ -101,20 +147,22 @@ pub struct HotspotLayerAvailability {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HotspotAnalysisError {
+    #[error("hotspot weights are invalid")]
+    InvalidInput,
     #[error("hotspot analysis was cancelled")]
     Cancelled,
     #[error("hotspot analysis exhausted its bounded work budget")]
     ResourceExhausted,
 }
 
-#[must_use]
+#[must_use = "hotspot analysis results must be handled"]
 pub fn score_hotspots(
     snapshot: &GraphSnapshot,
     weights: HotspotWeights,
     churn: &BTreeMap<String, u64>,
     runtime: &BTreeMap<String, u64>,
     availability: HotspotLayerAvailability,
-) -> Vec<HealthFinding> {
+) -> Result<Vec<HealthFinding>, HotspotAnalysisError> {
     score_hotspots_cancellable(
         snapshot,
         weights,
@@ -125,7 +173,6 @@ pub fn score_hotspots(
         usize::MAX,
         || false,
     )
-    .expect("unbounded, non-cancellable hotspot analysis cannot fail")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -139,6 +186,9 @@ pub fn score_hotspots_cancellable(
     maximum_work: usize,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HotspotAnalysisError> {
+    weights
+        .validate()
+        .map_err(|_| HotspotAnalysisError::InvalidInput)?;
     let mut work = HotspotWork::new(maximum_work);
     let mut subjects = Vec::new();
     for node in &snapshot.nodes {
@@ -209,7 +259,7 @@ pub fn score_hotspots_cancellable(
                 reverse_impact: reverse_n[index],
                 git_churn: churn_n[index],
                 runtime: runtime_n[index],
-                total: weighted_total([
+                total: hotspot_weighted_total([
                     (fan_in_n[index], weights.fan_in),
                     (fan_out_n[index], weights.fan_out),
                     (reverse_n[index], weights.reverse_impact),
@@ -260,43 +310,79 @@ pub fn score_hotspots_cancellable(
             end_line: None,
             end_column: None,
         });
-        findings.push(finish_finding(
-                FindingIdentity {
-                    kind: FindingKind::Hotspot,
-                    subject_id: node.id.clone(),
-                    profile_scope: None,
-                    witness_key: json!({
-                        "subject_id": node.id,
-                        "weights": weights.as_map()
-                    }),
-                },
-                node.kind.clone(),
-                location,
-                format!(
-                    "hotspot score {}; normalized-bp fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}; raw fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}",
-                    scores.total,
-                    scores.fan_in,
-                    scores.fan_out,
-                    scores.reverse_impact,
-                    scores.git_churn,
-                    scores.runtime,
-                    raw[0],
-                    raw[1],
-                    raw[2],
-                    raw[3],
-                    raw[4],
-                ),
-                blockers,
-                Vec::new(),
-                vec![Remediation {
-                    kind: "use-health-hotspots".to_owned(),
-                    detail: "inspect layer evidence before treating rank as a deletion signal"
-                        .to_owned(),
-                }],
-                Vec::new(),
-                false,
-                availability.churn && availability.runtime,
-            ));
+        let hotspot_scores = HotspotFindingScores {
+            fan_in: HotspotLayerScore {
+                raw: raw[0],
+                normalized_basis_points: scores.fan_in,
+                weight_basis_points: weights.fan_in,
+                available: true,
+            },
+            fan_out: HotspotLayerScore {
+                raw: raw[1],
+                normalized_basis_points: scores.fan_out,
+                weight_basis_points: weights.fan_out,
+                available: true,
+            },
+            reverse_impact: HotspotLayerScore {
+                raw: raw[2],
+                normalized_basis_points: scores.reverse_impact,
+                weight_basis_points: weights.reverse_impact,
+                available: true,
+            },
+            git_churn: HotspotLayerScore {
+                raw: raw[3],
+                normalized_basis_points: scores.git_churn,
+                weight_basis_points: weights.git_churn,
+                available: availability.churn,
+            },
+            runtime: HotspotLayerScore {
+                raw: raw[4],
+                normalized_basis_points: scores.runtime,
+                weight_basis_points: weights.runtime,
+                available: availability.runtime,
+            },
+            total: scores.total,
+        };
+        let mut finding = finish_finding(
+            FindingIdentity {
+                kind: FindingKind::Hotspot,
+                subject_id: node.id.clone(),
+                profile_scope: None,
+                witness_key: json!({
+                    "subject_id": node.id,
+                    "weights": weights.as_map()
+                }),
+            },
+            node.kind.clone(),
+            location,
+            format!(
+                "hotspot score {}; normalized-bp fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}; raw fan-in={} fan-out={} reverse-impact={} git-churn={} runtime={}",
+                scores.total,
+                scores.fan_in,
+                scores.fan_out,
+                scores.reverse_impact,
+                scores.git_churn,
+                scores.runtime,
+                raw[0],
+                raw[1],
+                raw[2],
+                raw[3],
+                raw[4],
+            ),
+            blockers,
+            Vec::new(),
+            vec![Remediation {
+                kind: "use-health-hotspots".to_owned(),
+                detail: "inspect layer evidence before treating rank as a deletion signal"
+                    .to_owned(),
+            }],
+            Vec::new(),
+            false,
+            false,
+        );
+        finding.hotspot_scores = Some(hotspot_scores);
+        finding.fingerprint = super::finding_fingerprint(&finding);
+        findings.push(finding);
     }
     Ok(findings)
 }
@@ -376,7 +462,12 @@ impl HotspotWork {
     }
 }
 
-fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
+/// Compute the canonical weighted hotspot total using integer basis points.
+///
+/// Agent projections use this helper as well so validation cannot drift from
+/// the analyzer's rounding and saturation rules.
+#[must_use]
+pub fn hotspot_weighted_total(layers: [(u32, u32); 5]) -> u32 {
     layers
         .into_iter()
         .map(|(normalized, weight)| {
@@ -391,6 +482,8 @@ fn weighted_total(layers: [(u32, u32); 5]) -> u32 {
 mod tests {
     use depgraph_store::{CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ScanRecord};
     use serde_json::json;
+
+    use crate::health::Confidence;
 
     use super::*;
 
@@ -476,7 +569,8 @@ mod tests {
                 churn: false,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         assert!(
             findings
                 .iter()
@@ -490,8 +584,18 @@ mod tests {
         }));
         let first = findings.first().expect("ranked hotspot");
         assert_eq!(first.subject_id, "file:c");
-        assert!(first.reason.contains("raw fan-in=2"));
-        assert!(first.reason.contains("reverse-impact=3"));
+        let scores = first
+            .hotspot_scores
+            .as_ref()
+            .expect("structured hotspot scores");
+        assert_eq!(scores.fan_in.raw, 2);
+        assert_eq!(scores.reverse_impact.raw, 3);
+        assert_eq!(
+            scores.fan_in.weight_basis_points,
+            DEFAULT_HOTSPOT_WEIGHTS.fan_in
+        );
+        assert_eq!(scores.total, 5_000);
+        assert_eq!(first.confidence, Confidence::Probable);
     }
 
     #[test]
@@ -506,7 +610,8 @@ mod tests {
                 churn: false,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         let ids = tied
             .iter()
             .map(|finding| finding.subject_id.as_str())
@@ -523,13 +628,17 @@ mod tests {
                 churn: true,
                 runtime: false,
             },
-        );
+        )
+        .expect("valid hotspot weights");
         assert_eq!(ranked[0].subject_id, "file:b");
-        assert!(
-            ranked[0]
-                .reason
-                .contains("raw fan-in=0 fan-out=0 reverse-impact=0 git-churn=3")
-        );
+        let scores = ranked[0]
+            .hotspot_scores
+            .as_ref()
+            .expect("structured hotspot scores");
+        assert_eq!(scores.git_churn.raw, 3);
+        assert_eq!(scores.git_churn.normalized_basis_points, 10_000);
+        assert!(scores.git_churn.available);
+        assert!(!scores.runtime.available);
     }
 
     #[test]
@@ -538,6 +647,131 @@ mod tests {
         assert!(HotspotWeights::try_new(4_000, 4_000, 4_000, 0, 0).is_err());
         let maxed = rank_normalize_basis_points(&[0, 10_000]);
         assert_eq!(maxed, vec![0, 10_000]);
+    }
+
+    #[test]
+    fn issue_440_direct_hotspot_weights_are_revalidated() {
+        assert!(
+            (HotspotWeights {
+                fan_in: 10_001,
+                fan_out: 0,
+                reverse_impact: 0,
+                git_churn: 0,
+                runtime: 0,
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (HotspotWeights {
+                fan_in: 4_000,
+                fan_out: 4_000,
+                reverse_impact: 4_000,
+                git_churn: 0,
+                runtime: 0,
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(DEFAULT_HOTSPOT_WEIGHTS.validate().is_ok());
+    }
+
+    #[test]
+    fn issue_440_hotspot_weight_changes_create_new_finding_identity() {
+        let graph = snapshot(vec![node("file:a"), node("file:b")], Vec::new());
+        let default_findings = score_hotspots(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+        )
+        .expect("valid default hotspot weights");
+        let changed_weights = HotspotWeights::try_new(3_000, 1_000, 2_500, 2_000, 1_500)
+            .expect("valid changed hotspot weights");
+        let changed_findings = score_hotspots(
+            &graph,
+            changed_weights,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+        )
+        .expect("valid changed hotspot weights");
+
+        let default_finding = default_findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:a")
+            .expect("default finding");
+        let changed_finding = changed_findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:a")
+            .expect("changed finding");
+        assert_ne!(default_finding.id, changed_finding.id);
+        assert_ne!(default_finding.fingerprint, changed_finding.fingerprint);
+    }
+
+    #[test]
+    fn issue_440_cancellable_hotspot_analyzer_rejects_invalid_weights() {
+        let graph = snapshot(vec![node("file:a")], Vec::new());
+        assert_eq!(
+            score_hotspots_cancellable(
+                &graph,
+                HotspotWeights {
+                    fan_in: 10_001,
+                    fan_out: 0,
+                    reverse_impact: 0,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+                usize::MAX,
+                usize::MAX,
+                || false,
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
+        );
+        assert_eq!(
+            score_hotspots_cancellable(
+                &graph,
+                HotspotWeights {
+                    fan_in: 4_000,
+                    fan_out: 4_000,
+                    reverse_impact: 4_000,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+                usize::MAX,
+                usize::MAX,
+                || false,
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn issue_440_non_cancellable_hotspot_analyzer_rejects_invalid_weights() {
+        let graph = snapshot(vec![node("file:a")], Vec::new());
+        assert_eq!(
+            score_hotspots(
+                &graph,
+                HotspotWeights {
+                    fan_in: 10_001,
+                    fan_out: 0,
+                    reverse_impact: 0,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+            ),
+            Err(HotspotAnalysisError::InvalidInput)
+        );
     }
 
     #[test]

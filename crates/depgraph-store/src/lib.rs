@@ -5549,6 +5549,84 @@ mod tests {
     }
 
     #[test]
+    fn v17_store_missing_scans_table_is_rejected_without_migration() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("v17-missing-scans.db");
+        drop(Store::open(&path)?);
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE scans;
+             PRAGMA user_version=17;",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+
+        let error = Store::open(&path)
+            .err()
+            .context("missing scans table must reject v18 migration")?;
+        assert!(
+            format!("{error:#}").contains("store schema 17 is missing scans table"),
+            "unexpected migration error: {error:#}"
+        );
+        assert_eq!(store_semantic_snapshot(&path)?, before);
+        assert_eq!(
+            Connection::open(&path)?
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            17
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v17_foreign_key_violation_rolls_back_the_entire_v18_migration() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("v17-foreign-key-violation.db");
+        downgrade_completed_store_to_v17(&path)?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO snapshot_names(name, snapshot_id, named_at)
+             VALUES ('orphan', 'snapshot:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                     '2026-08-31T00:00:00.000Z');",
+        )?;
+        drop(connection);
+        let before = store_semantic_snapshot(&path)?;
+
+        let error = Store::open(&path)
+            .err()
+            .context("v17 foreign key violation must reject migration")?;
+        assert!(
+            format!("{error:#}").contains("migration left 1 foreign key violations"),
+            "unexpected migration error: {error:#}"
+        );
+        assert_eq!(store_semantic_snapshot(&path)?, before);
+
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            17
+        );
+        assert!(!schema::table_has_column(
+            &connection,
+            "scans",
+            "health_policy_config_digest"
+        )?);
+        assert_eq!(
+            connection.query_row(
+                "SELECT DISTINCT seal_version FROM completed_snapshot_seals",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn v15_foreign_key_violation_rolls_back_the_entire_v16_migration() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("v15-foreign-key-violation.db");

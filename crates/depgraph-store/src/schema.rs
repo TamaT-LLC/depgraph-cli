@@ -901,6 +901,9 @@ impl Store {
                     )?;
                 }
             }
+            if !table_exists(&tx, "scans")? {
+                bail!("store schema {current} is missing scans table");
+            }
             if !table_has_column(&tx, "scans", "health_policy_config_digest")? {
                 tx.execute_batch(
                     "ALTER TABLE scans ADD COLUMN health_policy_config_digest TEXT;
@@ -960,6 +963,7 @@ impl Store {
                 backfill_completed_snapshot_seals(&tx)?;
             }
             validate_health_provenance_schema_and_rows(&tx)?;
+            validate_store_foreign_keys(&tx, 18)?;
             tx.execute_batch("PRAGMA user_version = 18;")?;
             tx.commit()?;
         }

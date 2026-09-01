@@ -389,7 +389,8 @@ impl HealthHotspotsRequest {
         churn_path_filter: Vec<String>,
         weights: HotspotWeights,
     ) -> DepgraphServiceResult<Self> {
-        if !(1..=MAX_HEALTH_CHURN_COMMITS).contains(&churn_commit_limit)
+        if weights.validate().is_err()
+            || !(1..=MAX_HEALTH_CHURN_COMMITS).contains(&churn_commit_limit)
             || churn_path_filter.len() > MAX_HEALTH_FILTER_ITEMS
         {
             return Err(DepgraphServiceError::InvalidInput);
@@ -660,20 +661,14 @@ impl DepgraphService {
         } else {
             comparability.missing_base = true;
         }
-        let boundary_violation_ids = evaluate_audit_boundary_ids(
-            &policy,
-            before.as_ref(),
-            &PinnedHealthSnapshot {
-                id: after_id.clone(),
-                snapshot: after.clone(),
-            },
-            cancellation,
-        )?;
+        let after = PinnedHealthSnapshot {
+            id: after_id,
+            snapshot: after,
+        };
+        let boundary_violation_ids =
+            evaluate_audit_boundary_ids(&policy, before.as_ref(), &after, cancellation)?;
         Ok(HealthAuditReadScope {
-            after: PinnedHealthSnapshot {
-                id: after_id,
-                snapshot: after,
-            },
+            after,
             before,
             changed_set,
             changed_set_digest,
@@ -774,6 +769,10 @@ impl DepgraphService {
         request: &HealthHotspotsRequest,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<HealthHotspotsResult> {
+        request
+            .weights
+            .validate()
+            .map_err(|_| DepgraphServiceError::InvalidInput)?;
         let snapshot_id = snapshot_request.snapshot_id().clone();
         let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
         let (churn, churn_oid, churn_ok) = collect_churn(
@@ -798,6 +797,7 @@ impl DepgraphService {
             || cancellation.is_cancelled(),
         )
         .map_err(|error| match error {
+            HotspotAnalysisError::InvalidInput => DepgraphServiceError::InvalidInput,
             HotspotAnalysisError::Cancelled => DepgraphServiceError::Cancelled,
             HotspotAnalysisError::ResourceExhausted => DepgraphServiceError::ResourceExhausted,
         })?;
@@ -1774,6 +1774,38 @@ libc = "1"
         )
         .expect("valid hotspot request");
         assert_eq!(request.churn_path_filter(), ["src/lib.rs"]);
+    }
+
+    #[test]
+    fn issue_440_hotspot_request_rejects_invalid_weights() {
+        assert!(
+            HealthHotspotsRequest::try_new(
+                8,
+                Vec::new(),
+                HotspotWeights {
+                    fan_in: 10_001,
+                    fan_out: 0,
+                    reverse_impact: 0,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            HealthHotspotsRequest::try_new(
+                8,
+                Vec::new(),
+                HotspotWeights {
+                    fan_in: 4_000,
+                    fan_out: 4_000,
+                    reverse_impact: 4_000,
+                    git_churn: 0,
+                    runtime: 0,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

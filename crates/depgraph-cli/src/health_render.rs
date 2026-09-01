@@ -52,7 +52,9 @@ pub const HOTSPOTS_LONG_HELP: &str = "\
 Rank graph hotspots using integer basis-point scores (0..=10000).
 
 Layers: fan-in, fan-out, reverse impact, Git churn, runtime observation.
-A missing layer contributes 0 and does not renormalize weights.";
+A missing layer contributes 0, is marked unavailable in the structured
+hotspot_scores output, and does not renormalize weights. Hotspot confidence
+is capped at probable; inspect hotspot_scores rather than parsing reason.";
 
 #[derive(Serialize)]
 pub struct CliHealthSummaryView<'a> {

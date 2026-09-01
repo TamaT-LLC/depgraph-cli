@@ -403,6 +403,12 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         None => Uuid::new_v4().to_string(),
     };
     let source_revision = git_source_revision(&root);
+    let health_provenance = ScanHealthProvenance {
+        policy_config_digest: health_policy_config_digest(&config.policy)
+            .context("failed to normalize health policy identity")?,
+        analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+        finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
+    };
     if let Some(identity) = promotion.operation_identity {
         store.start_scan_for_operation(
             &scan_id,
@@ -421,15 +427,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     } else {
         store.start_scan_with_revision(&scan_id, &root, strict, source_revision.as_deref())?;
     }
-    store.bind_scan_health_provenance(
-        &scan_id,
-        &ScanHealthProvenance {
-            policy_config_digest: health_policy_config_digest(&config.policy)
-                .context("failed to normalize health policy identity")?,
-            analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
-            finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION.to_owned(),
-        },
-    )?;
+    store.bind_scan_health_provenance(&scan_id, &health_provenance)?;
     let profile_status = profile_selection_doctor_status(&profile_plan, strict)?;
     if !profile_status.default_profile_matrix_complete {
         add_core_diagnostic(
@@ -2016,6 +2014,25 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.status, "completed");
         assert_eq!(outcome.coverage.dependency_sites, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_identity_does_not_create_a_scan_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        let mut config = Config::default();
+        config.policy.schema_version = "invalid".to_owned();
+
+        let error = run_scan(&mut store, root.path().to_path_buf(), &config, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to normalize health policy identity"),
+            "unexpected scan error: {error:#}"
+        );
+        assert!(store.resolve_scan_id(None, true).is_err());
         Ok(())
     }
 

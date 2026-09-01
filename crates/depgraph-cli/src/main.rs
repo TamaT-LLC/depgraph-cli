@@ -2178,7 +2178,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 weight_git_churn,
                 weight_runtime,
             )
-            .map_err(|error| anyhow::anyhow!(error))?;
+            .map_err(|_| DepgraphServiceError::InvalidInput)?;
             let (service, mut snapshot) =
                 graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
             let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?;

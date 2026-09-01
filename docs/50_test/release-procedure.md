@@ -157,7 +157,8 @@ Releaseはquality、benchmark、hostile E2E、通常archive、compiler pack、ag
 Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-target` checkは、
 欠損、改変、version drift、target間schema driftを拒否する。
 
-各native jobのMCP sidecarは`mcp-package-smoke-v3`である。従来のprotocol/catalog、
+公開済み`v0.5.4`のMCP sidecarは`mcp-package-smoke-v2`である。
+tag後の現行`main`／評価用RCの各native jobは`mcp-package-smoke-v3`を使う。従来のprotocol/catalog、
 durable recovery、stdio purityに加え、`depgraph-agent-host-config-v1`からCodex、
 Claude Desktop、VS Codeのread-only設定をclean temporary homeで生成する。公開前smokeは
 closed synthetic `release-post-publish-evidence-v1`と別計算したtrusted digestを用い、
@@ -178,7 +179,12 @@ user scopeの両方で設定する。各entryのstatus、共有stateの保持、
 state削除までをclean home上で5 targetすべて検証する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
-Store upgradeでは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksum、schema 18へのtransactional migration（legacy v1 sealの検証とprovenance-aware v2 sealの再構築を含む）、completed graph identity、rollback copyのbyte不変をrelease gateが検証する。実運用でもwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。旧binaryでschema-18 databaseを開くdowngrade-in-placeは禁止し、rollback時はmigrated databaseを退避してbackup一式をrestoreしてから旧binaryを起動する。
+公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksumを入力に、schema 17へtransactional migrationする履歴を固定する。
+tag後の現行`main`／評価用RCのgateは同じfixtureをschema 18まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
+どちらもcompleted graph identityとrollback copyのbyte不変を検証する。
+実運用ではwriterを停止し、databaseとWAL/SHMを一組でbackupしてchecksumを記録する。
+schema 18へ移行したdatabaseを公開済み`v0.5.4` artifactまたはそれ以前のbinaryで開くdowngrade-in-placeは禁止する。
+rollback時はmigrated databaseを退避し、backup一式をrestoreしてから旧binaryを起動する。
 
 ## 公開後の再取得検証
 

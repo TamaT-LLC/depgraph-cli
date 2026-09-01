@@ -50,7 +50,8 @@ pub use dto::{
 pub use health_dto::{
     AgentFindingKind, AgentFindingKindScope, AgentHealthAudit, AgentHealthBlocker,
     AgentHealthBlockerKind, AgentHealthConfidence, AgentHealthCoverage, AgentHealthEvidenceRef,
-    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
+    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage,
+    AgentHealthHotspotLayerScore, AgentHealthHotspotScores, AgentHealthHotspots,
     AgentHealthNamedCount, AgentHealthRemediation, AgentHealthSeverity, AgentHealthSourceLocation,
     AgentHealthSummary, AgentHealthSuppression,
 };

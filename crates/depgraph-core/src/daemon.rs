@@ -1048,6 +1048,15 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                 );
                             } else {
                                 let source_revision = git_source_revision(&root);
+                                let health_provenance = ScanHealthProvenance {
+                                    policy_config_digest: health_policy_config_digest(
+                                        &config.policy,
+                                    )
+                                    .context("failed to normalize health policy identity")?,
+                                    analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
+                                    finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION
+                                        .to_owned(),
+                                };
                                 store.start_incremental_scan_with_revision(
                                     &scan_id,
                                     &root,
@@ -1055,17 +1064,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                     base_snapshot_id,
                                     source_revision.as_deref(),
                                 )?;
-                                store.bind_scan_health_provenance(
-                                    &scan_id,
-                                    &ScanHealthProvenance {
-                                        policy_config_digest: health_policy_config_digest(
-                                            &config.policy,
-                                        )?,
-                                        analyzer_version: HEALTH_ANALYZER_VERSION.to_owned(),
-                                        finding_contract_version: HEALTH_FINDING_CONTRACT_VERSION
-                                            .to_owned(),
-                                    },
-                                )?;
+                                store.bind_scan_health_provenance(&scan_id, &health_provenance)?;
                                 let result = (|| -> Result<crate::ScanOutcome> {
                                     if cancellation.is_cancelled() {
                                         return cancel_scan(&mut store, &scan_id);
@@ -2628,6 +2627,42 @@ mod tests {
             Some(expected_provenance.finding_contract_version.as_str())
         );
         assert!(store.verify_snapshot_integrity(&current)?.valid);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_identity_does_not_leave_an_incremental_scan_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        seed_incremental_store(root.path(), &store_path)?;
+        let worker = Arc::new(SuccessfulIncrementalWorker::default());
+        let mut config = Config::default();
+        config.policy.schema_version = "invalid".to_owned();
+        let runner =
+            RepositoryScanRunner::new(root.path().to_path_buf(), store_path.clone(), config, false)
+                .with_incremental_worker(worker);
+
+        let error = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "invalid-policy-delta".to_owned(),
+                    changes: vec![
+                        IncrementalFileChange::modified("src/index.ts"),
+                        IncrementalFileChange::modified("src/lib.ts"),
+                    ],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to normalize health policy identity"),
+            "unexpected incremental error: {error:#}"
+        );
+        let store = open_store(&store_path)?;
+        assert_eq!(store.resolve_scan_id(None, true)?, "incremental-base");
         Ok(())
     }
 
