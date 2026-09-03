@@ -4,7 +4,7 @@
 - Date: 2026-08-26
 - Decision ID: `PROJ-ARC-001-ADR-009`
 - Issue: `PROJ-ARC-004` / #423
-- Amendment: #440
+- Amendments: #440; non-unused confidence guard (2026-09-03)
 - Contract: `depgraph-health-finding-v1`
 
 ## Context
@@ -138,8 +138,9 @@ change as `changed`/pass when the structured finding data is unchanged. A
 changed hotspot layer score or availability bit with the same weights remains a
 meaningful fingerprint change. Changing hotspot weights changes the finding ID
 and collection digest as well as the fingerprint; this is intentional
-fail-closed provenance, rather than an in-place baseline change. The analyzer
-version is bumped to `1.0.2`; operators that want a clean baseline may
+fail-closed provenance, rather than an in-place baseline change. Issue #440
+bumped the analyzer version to `1.0.2`. The subsequent non-unused confidence
+guard fix bumps it again to `1.0.3`; operators that want a clean baseline may
 regenerate fingerprints, while retaining old records is safe because matching
 continues by stable ID and no automatic rewrite is performed.
 

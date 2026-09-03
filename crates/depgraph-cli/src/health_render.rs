@@ -14,10 +14,11 @@ pub const HEALTH_LONG_HELP: &str = "\
 Explainable code-health findings for one pinned snapshot.
 
 Confidence:
-  confirmed      unused across every applicable analyzed profile, all of those
-                 profiles are semantic-complete, and no hard blocker remains
-  probable       unused so far with no hard blocker, but applicable profiles
-                 are syntax-complete rather than semantic-complete
+  confirmed      reserved for unused-file, unused-export, unused-type, and
+                 unused-dependency; unused across every applicable analyzed
+                 profile, all semantic-complete, with no hard blocker
+  probable       unused so far with no hard blocker but only syntax-complete,
+                 or a non-unused finding capped below confirmed
   indeterminate  a blocker prevents confirmed unused (public surface, entry
                  point, dynamic loading, candidate, unresolved, generated
                  artifact, profile-not-analyzed, manifest-drift, or similar)
@@ -46,7 +47,8 @@ Audit changed code against a before/after snapshot pair.
 Both refs are resolved at request start; changed_oid identifies that HEAD.
 Without a comparable base snapshot, blast radius remains evaluable while
 new-cycle / new-boundary / public-api checks return indeterminate placeholders
-with blocker missing-base-snapshot.";
+with blocker missing-base-snapshot. Comparable audit findings are capped at
+probable confidence.";
 
 pub const HOTSPOTS_LONG_HELP: &str = "\
 Rank graph hotspots using integer basis-point scores (0..=10000).
@@ -131,7 +133,7 @@ pub fn print_health_summary_human(summary: &depgraph_core::service::HealthSummar
         println!("confidence {confidence}: {count}");
     }
     println!(
-        "summary excludes audit and hotspot findings; confirmed requires semantic-complete profiles and no hard blockers"
+        "summary excludes audit and hotspot findings; confirmed is reserved for semantic-complete unused-file, unused-export, unused-type, and unused-dependency findings without hard blockers"
     );
 }
 

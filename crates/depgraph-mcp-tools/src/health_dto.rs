@@ -718,9 +718,9 @@ struct AgentHealthFindingWire {
     profile_scope: Option<AgentId>,
     reason: AgentPolicyText,
     // Records emitted before Issue #440 did not carry structured scores (and
-    // could still report `confirmed`). Keep that legacy shape readable on the
-    // wire; new output projection uses `AgentHealthFinding::try_from_core`,
-    // which requires scores for hotspots and never emits `confirmed`.
+    // could still report `confirmed` for a hotspot). Keep that legacy shape
+    // readable on the wire; new output projection requires scores for hotspots
+    // and caps their confidence at `probable`.
     #[serde(default)]
     hotspot_scores: Option<AgentHealthHotspotScores>,
     blockers: Vec<AgentHealthBlocker>,
