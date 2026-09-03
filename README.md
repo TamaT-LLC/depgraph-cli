@@ -91,7 +91,9 @@ unused findingの`probable`は使用とhard blockerがないものの、適用�
 `indeterminate`はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。
 hotspotの層の充足は`hotspot_scores.available`で確認する。
 findingの`suppressions`はv1ではwire互換性のため保持するoutput-only/deferred fieldであり、CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返す。
-監査のbefore/afterはschema 18に保存したpolicy digest、analyzer version、finding contract versionを比較し、欠落や差異をfail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
+tag後の現行`main`／評価用RCの監査では、before/afterがschema 18に保存したpolicy digest、analyzer version、finding contract versionを比較する。
+provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
+公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
 sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
