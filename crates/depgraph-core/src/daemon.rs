@@ -1368,7 +1368,7 @@ fn daemon_outcome_from_scan(
 pub struct DaemonHandle {
     stop_sender: Option<oneshot::Sender<()>>,
     status: watch::Receiver<DaemonStatus>,
-    task: Option<JoinHandle<Result<DaemonStatus>>>,
+    task: Option<JoinHandle<DaemonStatus>>,
 }
 
 impl DaemonHandle {
@@ -1385,7 +1385,7 @@ impl DaemonHandle {
             let _ = sender.send(());
         }
         let task = self.task.take().context("daemon task is unavailable")?;
-        task.await.context("daemon task failed")?
+        task.await.context("daemon task failed")
     }
 }
 
@@ -1516,13 +1516,16 @@ impl DaemonLocks {
         // A caller may restart the daemon as soon as stop() completes. Release
         // both exclusions before publishing that completion because relying on
         // close-on-drop can leave a transient self-conflict on some hosts.
-        self.lifecycle
+        let lifecycle = self
+            .lifecycle
             .unlock()
-            .context("failed to release the daemon lifecycle lock")?;
-        self.writer
+            .context("failed to release the daemon lifecycle lock");
+        let writer = self
+            .writer
             .unlock()
-            .context("failed to release the daemon store-writer lock")?;
-        Ok(())
+            .context("failed to release the daemon store-writer lock");
+        lifecycle?;
+        writer
     }
 }
 
@@ -1613,7 +1616,7 @@ async fn run_daemon_loop(
     status_sender: watch::Sender<DaemonStatus>,
     mut stop_receiver: oneshot::Receiver<()>,
     locks: Option<DaemonLocks>,
-) -> Result<DaemonStatus> {
+) -> DaemonStatus {
     let mut coalescer = EventCoalescer::default();
     let mut deadline = None::<Instant>;
     let mut active = None::<ActiveAttempt>;
@@ -1773,15 +1776,19 @@ async fn run_daemon_loop(
         }
     }
 
-    if let Some(locks) = locks.as_ref() {
-        locks.unlock()?;
+    if let Some(locks) = locks {
+        // Explicit unlock is the fast path, while synchronous close remains
+        // the fail-safe for an OS unlock error. Both finish before Stopped is
+        // published so persistent lifecycle cleanup cannot be skipped.
+        let _ = locks.unlock();
+        drop(locks);
     }
     status.phase = DaemonPhase::Stopped;
     status.stopped_at = Some(timestamp());
     status.active_attempt_id = None;
     status.pending_change_count = 0;
     publish_status(&status_sender, &status);
-    Ok(status)
+    status
 }
 
 fn spawn_attempt(
