@@ -1368,7 +1368,7 @@ fn daemon_outcome_from_scan(
 pub struct DaemonHandle {
     stop_sender: Option<oneshot::Sender<()>>,
     status: watch::Receiver<DaemonStatus>,
-    task: Option<JoinHandle<DaemonStatus>>,
+    task: Option<JoinHandle<Result<DaemonStatus>>>,
 }
 
 impl DaemonHandle {
@@ -1385,7 +1385,7 @@ impl DaemonHandle {
             let _ = sender.send(());
         }
         let task = self.task.take().context("daemon task is unavailable")?;
-        task.await.context("daemon task failed")
+        task.await.context("daemon task failed")?
     }
 }
 
@@ -1507,8 +1507,23 @@ pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
 }
 
 struct DaemonLocks {
-    _writer: std::fs::File,
-    _lifecycle: std::fs::File,
+    writer: std::fs::File,
+    lifecycle: std::fs::File,
+}
+
+impl DaemonLocks {
+    fn unlock(&self) -> Result<()> {
+        // A caller may restart the daemon as soon as stop() completes. Release
+        // both exclusions before publishing that completion because relying on
+        // close-on-drop can leave a transient self-conflict on some hosts.
+        self.lifecycle
+            .unlock()
+            .context("failed to release the daemon lifecycle lock")?;
+        self.writer
+            .unlock()
+            .context("failed to release the daemon store-writer lock")?;
+        Ok(())
+    }
 }
 
 fn acquire_daemon_locks(store_path: &Path) -> Result<DaemonLocks> {
@@ -1519,10 +1534,7 @@ fn acquire_daemon_locks(store_path: &Path) -> Result<DaemonLocks> {
         "daemon lifecycle",
         "a daemon is already running",
     )?;
-    Ok(DaemonLocks {
-        _writer: writer,
-        _lifecycle: lifecycle,
-    })
+    Ok(DaemonLocks { writer, lifecycle })
 }
 
 fn acquire_store_sidecar_lock(
@@ -1600,8 +1612,8 @@ async fn run_daemon_loop(
     mut status: DaemonStatus,
     status_sender: watch::Sender<DaemonStatus>,
     mut stop_receiver: oneshot::Receiver<()>,
-    _locks: Option<DaemonLocks>,
-) -> DaemonStatus {
+    locks: Option<DaemonLocks>,
+) -> Result<DaemonStatus> {
     let mut coalescer = EventCoalescer::default();
     let mut deadline = None::<Instant>;
     let mut active = None::<ActiveAttempt>;
@@ -1761,12 +1773,15 @@ async fn run_daemon_loop(
         }
     }
 
+    if let Some(locks) = locks.as_ref() {
+        locks.unlock()?;
+    }
     status.phase = DaemonPhase::Stopped;
     status.stopped_at = Some(timestamp());
     status.active_attempt_id = None;
     status.pending_change_count = 0;
     publish_status(&status_sender, &status);
-    status
+    Ok(status)
 }
 
 fn spawn_attempt(
@@ -3064,6 +3079,22 @@ mod tests {
             runner,
         )?;
         assert_eq!(restarted.stop().await?.phase, DaemonPhase::Stopped);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_locks_can_be_reacquired_before_unlocked_handles_drop() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let first = acquire_daemon_locks(&store_path)?;
+
+        first.unlock()?;
+        let second = acquire_daemon_locks(&store_path)?;
+        second.unlock()?;
+
+        // Keep both open handles alive until after reacquisition so this test
+        // cannot pass merely because close-on-drop released either lock.
+        drop((first, second));
         Ok(())
     }
 }
