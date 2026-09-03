@@ -8,6 +8,30 @@ use depgraph_core::service::{
 use predicates::prelude::*;
 use serde_json::json;
 
+#[cfg(unix)]
+#[test]
+fn version_survives_a_windows_sized_process_stack() {
+    let binary = Command::cargo_bin("depgraph").unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -s 1024; exec \"$1\" --version")
+        .arg("depgraph-stack-probe")
+        .arg(binary.get_program())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("depgraph {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 fn run_git(root: &std::path::Path, arguments: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
