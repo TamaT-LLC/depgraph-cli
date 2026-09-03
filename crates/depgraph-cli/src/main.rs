@@ -42,6 +42,10 @@ mod health_render;
 mod mcp_setup;
 mod snapshot_diff;
 
+// Clap builds the complete command graph before handling `--version` or `--help`.
+// Keep that work off Windows' 1 MiB process-main stack, with Unix-sized headroom.
+const CLI_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
 use snapshot_diff::render_service_human_diff;
@@ -821,8 +825,26 @@ struct SnapshotCreatedOutput<'a> {
     snapshot: &'a CompletedSnapshotView,
 }
 
+fn main() -> ExitCode {
+    let cli_thread = match std::thread::Builder::new()
+        .name("depgraph-cli-main".to_owned())
+        .stack_size(CLI_MAIN_STACK_BYTES)
+        .spawn(cli_main)
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            eprintln!("error: failed to start the depgraph CLI thread: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match cli_thread.join() {
+        Ok(exit_code) => exit_code,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn cli_main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
