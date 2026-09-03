@@ -14,7 +14,7 @@ fn version_survives_a_windows_sized_process_stack() {
     let binary = Command::cargo_bin("depgraph").unwrap();
     let output = std::process::Command::new("sh")
         .arg("-c")
-        .arg("ulimit -s 1024; exec \"$1\" --version")
+        .arg("ulimit -s 1024 || exit 1; exec \"$1\" --version")
         .arg("depgraph-stack-probe")
         .arg(binary.get_program())
         .output()
