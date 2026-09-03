@@ -460,6 +460,16 @@ fn evaluate_policy_with_work(
         is_cancelled,
     )?;
     config.validate()?;
+    // An empty, validated policy cannot inspect or expose any snapshot data.
+    // Keep the cancellation check and policy validation above, but do not walk
+    // every snapshot JSON value merely to produce the empty result. This is
+    // important for large packaged build snapshots, where the evaluator's
+    // preprocessing budget is reserved for an actually applicable policy.
+    if config.rules.is_empty() {
+        let result = PolicyResult::new(snapshot_id, Vec::new());
+        result.validate()?;
+        return Ok(result);
+    }
     // Profile and node properties are copied into condition contexts below.
     // Validate all caller-owned JSON before that materialization so a deep
     // manually assembled value cannot recurse through `Value::clone()` even
@@ -7670,6 +7680,42 @@ mod tests {
         .unwrap_err();
         assert!(is_policy_evaluation_cancelled(&cancelled));
         assert_eq!(checks, 25);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_policy_skips_snapshot_preprocessing_work() -> Result<()> {
+        let mut graph = snapshot(Vec::new());
+        graph.nodes = (0..128)
+            .map(|index| node(&format!("node-{index}"), &format!("src/node-{index}.ts")))
+            .collect();
+        let policy = PolicyConfig::default();
+
+        // The first snapshot record would exhaust this budget in the old path.
+        // An empty policy is a valid no-op, so the evaluator must not charge
+        // snapshot-property preprocessing work for the graph it is paired with.
+        let result =
+            evaluate_policy_cancellable("snapshot:empty-policy", &graph, &policy, 1, || false)?;
+        assert_eq!(result.snapshot_id, "snapshot:empty-policy");
+        assert!(result.api_changes.is_empty());
+        assert!(result.violations.is_empty());
+        assert_eq!(result.exit_code, 0);
+
+        // The packaged release gate evaluates a snapshot pair, so cover that
+        // entry point as well without requiring the full Next.js fixture.
+        let result = evaluate_policy_diff_cancellable(
+            "snapshot:before",
+            &graph,
+            "snapshot:after",
+            &graph,
+            &policy,
+            1,
+            || false,
+        )?;
+        assert_eq!(result.snapshot_id, "snapshot:after");
+        assert!(result.api_changes.is_empty());
+        assert!(result.violations.is_empty());
+        assert_eq!(result.exit_code, 0);
         Ok(())
     }
 

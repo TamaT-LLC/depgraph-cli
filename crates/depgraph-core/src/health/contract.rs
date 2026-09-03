@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::hotspot::HotspotFindingScores;
 
 pub const HEALTH_FINDING_CONTRACT_VERSION: &str = "depgraph-health-finding-v1";
-pub const HEALTH_ANALYZER_VERSION: &str = "1.0.2";
+pub const HEALTH_ANALYZER_VERSION: &str = "1.0.3";
 pub const BASIS_POINTS_MAX: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -54,6 +54,19 @@ impl FindingKind {
                 | Self::UnusedDependency
                 | Self::TestOnlyDependency
                 | Self::ManifestMismatch
+        )
+    }
+
+    /// Whether this finding kind represents an unused-code conclusion.
+    ///
+    /// `confirmed` is reserved for unused-code findings. Other kinds may
+    /// still be actionable, but their evidence does not establish that a
+    /// subject is unused and must therefore remain at `probable` or below.
+    #[must_use]
+    const fn is_unused_code(self) -> bool {
+        matches!(
+            self,
+            Self::UnusedFile | Self::UnusedExport | Self::UnusedType | Self::UnusedDependency
         )
     }
 
@@ -614,15 +627,14 @@ pub fn finish_finding(
     let profile_scope = identity.profile_scope.clone();
     let subject_id = identity.subject_id.clone();
     let id = finding_id(&identity);
-    let confidence = match (
-        kind,
-        apply_confidence_guards(has_usage, profiles_complete, &blockers),
-    ) {
-        // A hotspot is a ranking, not proof of unusedness. Keep the
-        // `confirmed` confidence value reserved for unused-code findings even
+    let confidence = apply_confidence_guards(has_usage, profiles_complete, &blockers);
+    let confidence = if kind.is_unused_code() {
+        confidence
+    } else {
+        // Audit, non-unused dependency, and hotspot findings are not proof of
+        // unusedness. Keep `confirmed` reserved for unused-code findings even
         // when a caller supplies complete profiles and no blockers.
-        (FindingKind::Hotspot, Confidence::Confirmed) => Confidence::Probable,
-        (_, confidence) => confidence,
+        confidence.min(Confidence::Probable)
     };
     let mut finding = HealthFinding {
         id,
@@ -933,6 +945,64 @@ mod tests {
             true,
         );
         assert_eq!(finding.confidence, Confidence::Probable);
+    }
+
+    #[test]
+    fn issue_446_finish_finding_caps_non_unused_confidence_and_preserves_unused_confirmation() {
+        for kind in [
+            FindingKind::TestOnlyDependency,
+            FindingKind::ManifestMismatch,
+            FindingKind::NewCycle,
+            FindingKind::NewBoundaryViolation,
+            FindingKind::PublicApiChange,
+            FindingKind::WideBlastRadius,
+            FindingKind::Hotspot,
+        ] {
+            let finding = finish_finding(
+                FindingIdentity {
+                    kind,
+                    subject_id: format!("{}:subject", kind.as_str()),
+                    profile_scope: None,
+                    witness_key: json!({"subject": kind.as_str()}),
+                },
+                kind.as_str(),
+                None,
+                "finding",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+            );
+            assert_eq!(finding.confidence, Confidence::Probable, "{kind:?}");
+        }
+
+        for kind in [
+            FindingKind::UnusedFile,
+            FindingKind::UnusedExport,
+            FindingKind::UnusedType,
+            FindingKind::UnusedDependency,
+        ] {
+            let finding = finish_finding(
+                FindingIdentity {
+                    kind,
+                    subject_id: format!("{}:subject", kind.as_str()),
+                    profile_scope: None,
+                    witness_key: json!({"subject": kind.as_str()}),
+                },
+                kind.as_str(),
+                None,
+                "unused",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+            );
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{kind:?}");
+        }
     }
 
     #[test]

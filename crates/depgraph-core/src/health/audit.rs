@@ -796,6 +796,26 @@ mod tests {
     }
 
     #[test]
+    fn issue_446_audit_findings_never_promote_to_confirmed() {
+        for kind in [
+            FindingKind::NewCycle,
+            FindingKind::NewBoundaryViolation,
+            FindingKind::PublicApiChange,
+            FindingKind::WideBlastRadius,
+        ] {
+            let finding = audit_finding(
+                kind,
+                format!("subject:{}", kind.as_str()),
+                vec![kind.as_str().to_owned()],
+                "clean comparable audit finding",
+                &[],
+                false,
+            );
+            assert_eq!(finding.confidence, Confidence::Probable, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn issue_423_deleted_subject_uses_before_snapshot_for_blast_radius() {
         let mut before = empty_snapshot();
         before.nodes = vec![

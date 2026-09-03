@@ -574,7 +574,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_summary_get",
-        "Summarize snapshot-scoped code-health findings. Confidence is confirmed, probable, or indeterminate. Summary excludes audit and hotspot findings. confirmed requires every applicable profile to be semantic-complete and to lack public-surface, entry-point, dynamic-loading, candidate, unresolved, coverage, profile-not-analyzed, and manifest-drift blockers.",
+        "Summarize snapshot-scoped code-health findings. Confidence is confirmed, probable, or indeterminate. Summary excludes audit and hotspot findings. confirmed is reserved for unused-file, unused-export, unused-type, and unused-dependency when every applicable profile is semantic-complete and no hard blocker remains; test-only-dependency and manifest-mismatch are capped at probable.",
         ["snapshot", "kinds"],
         [CliAction::HealthSummary],
         READ,
@@ -583,7 +583,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_findings_list",
-        "List snapshot-scoped unused-file, unused-export, unused-type, unused-dependency, test-only-dependency, and manifest-mismatch findings. Read blockers before treating a finding as confirmed unused.",
+        "List snapshot-scoped unused-file, unused-export, unused-type, unused-dependency, test-only-dependency, and manifest-mismatch findings. confirmed is reserved for the four unused kinds; test-only-dependency and manifest-mismatch are capped at probable. Read blockers before treating a finding as unused.",
         [
             "snapshot",
             "kinds",
@@ -608,7 +608,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_audit_get",
-        "Audit merge-base(changed, HEAD)..HEAD against a snapshot pair. The changed input is the comparison base and changed_oid identifies request-start HEAD. Without a comparable base snapshot, blast radius remains evaluable while new-cycle, new-boundary, and public-api checks return indeterminate placeholders.",
+        "Audit merge-base(changed, HEAD)..HEAD against a snapshot pair. The changed input is the comparison base and changed_oid identifies request-start HEAD. Comparable audit findings are capped at probable. Without a comparable base snapshot, blast radius remains evaluable while new-cycle, new-boundary, and public-api checks return indeterminate placeholders.",
         ["snapshot", "changed", "base_snapshot", "cursor", "limit"],
         [CliAction::Audit],
         READ,

@@ -245,12 +245,12 @@ accepted as the same host. `verify` requires every sample identity and
 Read blockers before treating a finding as safe to delete. The engine, not
 the Agent, owns confidence:
 
-- `confirmed`: unused across every applicable analyzed profile, those profiles
-  are `semantic-complete`, and no hard blocker remains. This value is never
-  used for hotspot rankings.
-- `probable`: no observed usage and no hard blocker, but applicable profiles
-  are only `syntax-complete`; hotspot rankings are capped here even when all
-  score layers are available.
+- `confirmed`: reserved for `unused-file`, `unused-export`, `unused-type`, and
+  `unused-dependency`. The subject is unused across every applicable analyzed
+  profile, those profiles are `semantic-complete`, and no hard blocker remains.
+- `probable`: an unused finding has no observed usage or hard blocker, but its
+  applicable profiles are only `syntax-complete`. `test-only-dependency`,
+  `manifest-mismatch`, audit, and hotspot findings are capped here.
 - `indeterminate`: a hard blocker prevents confirmation.
 
 Hard blockers are the 21 kinds other than the two score-layer blockers
