@@ -6,7 +6,7 @@ use std::{
 
 use depgraph_core::{
     CancellationToken, CompilerPackRequirement, DepgraphCapability, DepgraphService,
-    DepgraphServiceConfig, DepgraphServiceError, GraphQueryFilter, ScanCacheMode,
+    DepgraphServiceConfig, DepgraphServiceError, GraphQueryFilter, ScanCacheMode, StoreLockGuard,
     service::{
         DeferredExportFileCompletion, DeferredExportFileRecovery, DeferredRuntimeImportCompletion,
         DeferredRuntimeImportRecovery, DeferredRuntimeImportServiceOutcome, DeferredScanCompletion,
@@ -190,7 +190,7 @@ impl DeferredOperationCompletion {
         }
     }
 
-    fn cancel(self) -> Result<Option<std::fs::File>, RunnerError> {
+    fn cancel(self) -> Result<Option<StoreLockGuard>, RunnerError> {
         match self {
             Self::Scan(completion) => completion
                 .cancel_with_writer_guard()
@@ -424,7 +424,7 @@ pub trait OperationDispatcher {
     fn cleanup_abandoned(
         &mut self,
         _work: &RunnerWork,
-    ) -> Result<Option<std::fs::File>, RunnerError> {
+    ) -> Result<Option<StoreLockGuard>, RunnerError> {
         Ok(None)
     }
 
@@ -646,7 +646,7 @@ impl<D: OperationDispatcher> OperationRunner<D> {
     fn terminalize_after_cleanup<T>(
         &mut self,
         work: &RunnerWork,
-        cleanup_guard: Option<std::fs::File>,
+        cleanup_guard: Option<StoreLockGuard>,
         terminalize: impl FnOnce() -> Result<T, RunnerError>,
     ) -> Result<T, RunnerError> {
         let cleanup_guard = match cleanup_guard {
@@ -1124,7 +1124,7 @@ impl<D: OperationDispatcher> OperationRunner<D> {
 
 fn discard_pending_completion(
     outcome: DispatchOutcome,
-) -> Result<Option<std::fs::File>, RunnerError> {
+) -> Result<Option<StoreLockGuard>, RunnerError> {
     match outcome {
         DispatchOutcome::CompletionPending { completion, .. }
         | DispatchOutcome::CancellationCleanupPending { completion }
@@ -2545,7 +2545,7 @@ impl OperationDispatcher for ScanOperationDispatcher {
     fn cleanup_abandoned(
         &mut self,
         work: &RunnerWork,
-    ) -> Result<Option<std::fs::File>, RunnerError> {
+    ) -> Result<Option<StoreLockGuard>, RunnerError> {
         if work.kind() == OperationKind::ScanSubmit {
             return DepgraphService::new(self.config.clone())
                 .cancel_deferred_scan_for_operation(work.operation_id().as_str())

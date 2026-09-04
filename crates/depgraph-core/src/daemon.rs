@@ -1496,8 +1496,8 @@ fn start_daemon_with_runner_and_lock(
 
 /// Acquires the per-store writer lock shared by daemon and foreground scans.
 ///
-/// The returned file must remain alive for the full duration of the writer.
-pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
+/// The returned guard must remain alive for the full duration of the writer.
+pub fn acquire_store_writer_lock(store_path: &Path) -> Result<StoreLockGuard> {
     acquire_store_sidecar_lock(
         store_path,
         ".writer-lock",
@@ -1506,9 +1506,41 @@ pub fn acquire_store_writer_lock(store_path: &Path) -> Result<std::fs::File> {
     )
 }
 
+/// Exclusive advisory lock on a store sidecar file.
+///
+/// The lock is released synchronously when the guard is dropped or when
+/// [`StoreLockGuard::unlock`] is called, whichever happens first.
+#[derive(Debug)]
+pub struct StoreLockGuard {
+    file: std::fs::File,
+}
+
+impl StoreLockGuard {
+    /// Release the lock now, before the guard is dropped.
+    ///
+    /// Callers that must observe a release failure use this instead of
+    /// relying on drop; unlocking an already-unlocked file is harmless.
+    pub fn unlock(&self) -> std::io::Result<()> {
+        self.file.unlock()
+    }
+}
+
+impl Drop for StoreLockGuard {
+    fn drop(&mut self) {
+        // Closing the descriptor only releases an advisory lock once every
+        // reference to the open file description is gone. A child process
+        // spawned concurrently by any thread briefly inherits a duplicate of
+        // this descriptor, so close-on-drop can leave the lock held until that
+        // child finishes exec, and an immediate reacquire in this process then
+        // fails with a spurious conflict. An explicit unlock releases the lock
+        // regardless of how many references still exist.
+        let _ = self.file.unlock();
+    }
+}
+
 struct DaemonLocks {
-    writer: std::fs::File,
-    lifecycle: std::fs::File,
+    writer: StoreLockGuard,
+    lifecycle: StoreLockGuard,
 }
 
 impl DaemonLocks {
@@ -1545,7 +1577,7 @@ fn acquire_store_sidecar_lock(
     suffix: &str,
     description: &str,
     contention: &str,
-) -> Result<std::fs::File> {
+) -> Result<StoreLockGuard> {
     let lock_path = with_path_suffix(store_path, suffix);
     let parent = lock_path
         .parent()
@@ -1573,7 +1605,7 @@ fn acquire_store_sidecar_lock(
         .with_context(|| format!("failed to open {description} lock {}", lock_path.display()))?;
     file.try_lock()
         .with_context(|| format!("{contention} for store {}", store_path.display()))?;
-    Ok(file)
+    Ok(StoreLockGuard { file })
 }
 
 fn absolute_normalized_path(path: PathBuf) -> Result<PathBuf> {
@@ -3102,6 +3134,52 @@ mod tests {
         // Keep both open handles alive until after reacquisition so this test
         // cannot pass merely because close-on-drop released either lock.
         drop((first, second));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_lock_guard_drop_releases_lock_while_child_processes_are_spawned() -> Result<()> {
+        // Enough drop/reacquire rounds that a close-on-drop release would
+        // collide with a concurrently inherited descriptor with near certainty.
+        const REACQUISITION_ROUNDS: usize = 2_000;
+
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawner = {
+            let stop = Arc::clone(&stop);
+            let spawned = Arc::clone(&spawned);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if std::process::Command::new("true").status().is_ok() {
+                        spawned.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        let reacquisitions = (|| -> Result<()> {
+            for _ in 0..REACQUISITION_ROUNDS {
+                let held = acquire_store_writer_lock(&store_path)?;
+                // Drop without calling unlock(): the guard alone must release
+                // the lock even while a child holds a duplicated descriptor.
+                drop(held);
+                let reacquired = acquire_store_writer_lock(&store_path)
+                    .context("reacquisition immediately after drop failed")?;
+                drop(reacquired);
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().expect("child spawner thread panicked");
+
+        reacquisitions?;
+        assert!(
+            spawned.load(Ordering::Relaxed) > 0,
+            "no child process was spawned, so the test exercised nothing"
+        );
         Ok(())
     }
 }
