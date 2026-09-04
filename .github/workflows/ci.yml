@@ -757,6 +757,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
+      - name: Report runner disk before the smoke build
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
@@ -768,6 +777,15 @@ jobs:
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build
+      - name: Report runner disk after the smoke build
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Release metadata and LF-normalized project licenses
         run: cargo test -p xtask --locked repository_release_metadata_is_synchronized
       - name: TypeScript compiler failure lifecycle
@@ -777,12 +795,20 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
-      - name: Reclaim smoke build artifacts before the isolated package gate
-        run: cargo clean
       - name: Packaged cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: x86_64-pc-windows-msvc
         run: cargo xtask package
+      - name: Report runner disk after the package gate
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Web TypeChecker import, type-use, and exact-call graph smoke
         shell: pwsh
         run: |
