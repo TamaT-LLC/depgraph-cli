@@ -27,7 +27,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep separate from compiler-precise-hostile (different cargo profile / env).
-          key: rust
+          # rust-cache's key does not account for profile settings in the workspace
+          # Cargo.toml (e.g. [profile.dev.package."*"]), only Cargo.lock and env/rustc
+          # inputs. If that profile config changes, an unhashed key restores the old,
+          # differently-optimized artifacts, cargo rebuilds all of them anyway, and
+          # since the key still counts as a full match the rebuilt artifacts are never
+          # saved back - every run after that pays the same full rebuild. Hashing
+          # Cargo.toml here forces a new cache entry whenever the profile changes.
+          key: rust-${{ hashFiles('Cargo.toml') }}
       - name: Install the compiler-precise Linux namespace boundary
         run: |
           sudo apt-get update
@@ -118,7 +125,8 @@ jobs:
         if: steps.decide.outputs.run == 'true'
         with:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
-          key: compiler-precise-hostile
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: compiler-precise-hostile-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.decide.outputs.run == 'true'
         with:
@@ -262,7 +270,8 @@ jobs:
           # both legs build with CARGO_INCREMENTAL=0 and debug symbols off.
           # rust-cache also hashes RUSTFLAGS and every CARGO_* env into its key,
           # so those bounds can never be served from another job's cache.
-          key: integration-${{ matrix.target }}
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
           # The gates below run for 30+ minutes; keep the dependency artifacts
           # when a gate fails so the rerun does not start from a cold cache.
           cache-on-failure: true

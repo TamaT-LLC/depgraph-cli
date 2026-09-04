@@ -439,7 +439,9 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     let [cache_step] = cache_steps.as_slice() else {
         return Ok(false);
     };
-    if !cache_step.contains("\n          key: integration-${{ matrix.target }}\n") {
+    if !cache_step.contains(
+        "\n          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+    ) {
         return Ok(false);
     }
     let disk_reports = [
@@ -2613,7 +2615,8 @@ mod tests {
     #[test]
     fn integration_resource_policy_rejects_cache_and_disk_report_drift() {
         let ci = checked_in_ci_workflow();
-        let cache_key = "          key: integration-${{ matrix.target }}\n";
+        let cache_key =
+            "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
         assert_eq!(ci.matches(cache_key).count(), 1);
         for drift in [
             ci.replacen(cache_key, "          key: rust\n", 1),

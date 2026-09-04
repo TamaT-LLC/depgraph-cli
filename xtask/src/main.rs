@@ -5434,7 +5434,7 @@ mod tests {
                 1,
             ),
             ci.replacen(
-                "          key: integration-${{ matrix.target }}\n",
+                "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
                 "          key: rust\n",
                 1,
             ),
