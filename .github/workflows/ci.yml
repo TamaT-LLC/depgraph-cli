@@ -738,6 +738,14 @@ jobs:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
+    env:
+      # This job builds debug then release on one runner without reclaiming
+      # target/ in between (no `cargo clean`). Keep the intermediate state
+      # bounded (no incremental artifacts, no debug symbols): the Windows
+      # target was observed at 12.6 GB with debuginfo included.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src

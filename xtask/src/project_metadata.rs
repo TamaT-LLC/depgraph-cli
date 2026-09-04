@@ -270,9 +270,11 @@ pub(crate) fn verify_workflow_policy_text(
                     .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
                     .count()
                     != 1
-                || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 2
-                || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 2
-                || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 2
+                // compiler-precise-hostile, integration, and windows-smoke each
+                // pin their own copy of the intermediate-state bound.
+                || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 3
+                || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 3
+                || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 3
                 || !integration_job_pins_resource_policy(workflow)?
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
