@@ -180,6 +180,19 @@ tar -xzf "${ARCHIVE}"
 "./depgraph-${VERSION}-${TARGET}/bin/depgraph" --version
 ```
 
+From the repository root, one command verifies that the package works on the current host.
+It reads the checksum automatically from `<archive>.sha256`.
+
+```sh
+cargo xtask verify-release-archive --archive "/absolute/path/to/${ARCHIVE}"
+```
+
+The command accepts only a native archive for the checkout's version.
+It verifies the integrity of required artifacts declared by the manifest, `doctor`, Web / Rust / Go scans, query / export, MCP onboarding, and operations in temporary directories.
+It does not change tracked source files or the regular Store.
+It runs the complete native package gate, so it can take more than 30 minutes depending on the environment.
+This command checks only the regular archive; post-publish verification separately authenticates the RC tag, public evidence, and compiler-pack archive.
+
 On Windows, download `.zip` and `.zip.sha256` from the same Release, verify
 them with `Get-FileHash -Algorithm SHA256`, and extract with `Expand-Archive`.
 The release SBOM, license inventory, and compatibility information are included

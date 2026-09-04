@@ -32,6 +32,7 @@ use crate::executable_name;
 pub const MCP_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "mcp-package-smoke-v3";
 pub const SUBMIT_DEADLINE_MS: u64 = 2_000;
 pub const EOF_DEADLINE_MS: u64 = 5_000;
+const INITIALIZE_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 const OPERATION_DEADLINE: Duration = Duration::from_secs(60);
 const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
@@ -39,6 +40,14 @@ const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_
 const RELEASE_EVIDENCE_CONTRACT_VERSION: &str = "release-post-publish-evidence-v1";
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
 const README_PATH: &str = "README.en.md";
+
+fn packaged_response_deadline(method: Option<&str>) -> Duration {
+    if method == Some("initialize") {
+        INITIALIZE_RESPONSE_DEADLINE
+    } else {
+        RESPONSE_DEADLINE
+    }
+}
 const DOCUMENTATION_PATH: &str = "docs/50_test/mcp-agent-host-operations.md";
 const DOCUMENTATION_MARKER_PREFIX: &str = "<!-- depgraph-mcp-package-smoke:";
 const ONBOARDING_MARKER_PREFIX: &str = "<!-- depgraph-agent-config:";
@@ -564,7 +573,7 @@ pub fn verify(
         &requirement,
         &documented_profiles,
     )?;
-    let tool_schema_sha256 = sha256_file(&extracted.join(TOOL_SCHEMA_PATH))?;
+    let tool_schema_sha256 = crate::sha256_file(&extracted.join(TOOL_SCHEMA_PATH))?;
     let report = McpPackageSmokeReport {
         schema_version: MCP_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
@@ -1067,7 +1076,7 @@ fn private_store_state(store: &Path) -> Result<BTreeMap<String, String>> {
         let identity = if name.ends_with("-shm") {
             format!("sqlite-read-coordination-bytes:{}", metadata.len())
         } else {
-            sha256_file(&entry.path())?
+            crate::sha256_file(&entry.path())?
         };
         state.insert(name, identity);
     }
@@ -1612,7 +1621,13 @@ impl PackagedMcp {
     }
 
     fn request(&mut self, request: Value) -> Result<Value> {
+        let deadline = packaged_response_deadline(request["method"].as_str());
+        self.request_with_deadline(request, deadline)
+    }
+
+    fn request_with_deadline(&mut self, request: Value, deadline: Duration) -> Result<Value> {
         let expected_id = request["id"].clone();
+        let method = request["method"].as_str().unwrap_or("unknown");
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');
         let stdin = self
@@ -1621,10 +1636,12 @@ impl PackagedMcp {
             .context("packaged MCP stdin is closed")?;
         stdin.write_all(&bytes)?;
         stdin.flush()?;
-        let line = self
-            .lines
-            .recv_timeout(RESPONSE_DEADLINE)
-            .context("packaged MCP response deadline exceeded")??;
+        let line = self.lines.recv_timeout(deadline).with_context(|| {
+            format!(
+                "packaged MCP {method} response deadline exceeded after {}s",
+                deadline.as_secs()
+            )
+        })??;
         self.consumed_stdout.extend_from_slice(&line);
         if !line.ends_with(b"\n") || line == b"\n" {
             bail!("packaged MCP stdout contains a non-message byte sequence");
@@ -1845,7 +1862,7 @@ fn create_release_evidence(
                     .and_then(|name| name.to_str())
                     .context("release-evidence fixture filename is not UTF-8")?
                     .to_owned(),
-                (fs::metadata(path)?.len(), sha256_file(path)?),
+                (fs::metadata(path)?.len(), crate::sha256_file(path)?),
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -1927,7 +1944,7 @@ fn create_release_evidence(
     let mut bytes = serde_json::to_vec_pretty(&evidence)?;
     bytes.push(b'\n');
     fs::write(&path, bytes)?;
-    let digest = sha256_file(&path)?;
+    let digest = crate::sha256_file(&path)?;
     Ok((path, digest))
 }
 
@@ -1999,12 +2016,6 @@ fn canonical_sha256(value: &Value) -> String {
     ))
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(fs::read(path).with_context(
-        || format!("failed to read {}", path.display()),
-    )?)))
-}
-
 fn lowercase_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -2015,6 +2026,22 @@ fn lowercase_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_mcp_allows_cold_initialize_but_keeps_follow_up_requests_bounded() {
+        assert_eq!(INITIALIZE_RESPONSE_DEADLINE, Duration::from_secs(30));
+        assert_eq!(RESPONSE_DEADLINE, Duration::from_secs(10));
+        assert!(INITIALIZE_RESPONSE_DEADLINE > RESPONSE_DEADLINE);
+        assert_eq!(
+            packaged_response_deadline(Some("initialize")),
+            INITIALIZE_RESPONSE_DEADLINE
+        );
+        assert_eq!(
+            packaged_response_deadline(Some("tools/list")),
+            RESPONSE_DEADLINE
+        );
+        assert_eq!(packaged_response_deadline(None), RESPONSE_DEADLINE);
+    }
 
     #[test]
     fn compiler_pack_fixture_uses_native_executable_names() {
