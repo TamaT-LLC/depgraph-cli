@@ -325,8 +325,9 @@ pub use daemon::{
     DaemonHandle, DaemonIncrementalTrace, DaemonPhase, DaemonScanFuture, DaemonScanOutcome,
     DaemonScanRequest, DaemonScanRunner, DaemonStatus, EventCoalescer, IncrementalWorkerExecutor,
     IncrementalWorkerFuture, IncrementalWorkerOutcome, IncrementalWorkerTrace,
-    RepositoryScanRunner, WatchIgnoreRules, WatchPathKind, WatchedPath, acquire_store_writer_lock,
-    coalesce_incremental_changes, start_daemon_with_runner, start_repository_daemon,
+    RepositoryScanRunner, StoreLockGuard, WatchIgnoreRules, WatchPathKind, WatchedPath,
+    acquire_store_writer_lock, coalesce_incremental_changes, start_daemon_with_runner,
+    start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
 pub use export::{
