@@ -207,6 +207,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # rust-cache only restores/saves build artifacts, not measurements,
+          # so it has no effect on the benchmark numbers gated below.
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: benchmark-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -736,6 +742,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: windows-smoke-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
