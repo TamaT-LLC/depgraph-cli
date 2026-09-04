@@ -786,6 +786,7 @@ jobs:
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build
       - name: Report runner disk after the smoke build
+        if: always()
         shell: pwsh
         run: |
           Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize

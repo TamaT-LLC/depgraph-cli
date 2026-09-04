@@ -429,7 +429,11 @@ pub(crate) fn verify_workflow_policy_text(
 /// one hosted runner without `cargo clean` in between. Its resource policy is a
 /// matrix-scoped `Swatinem/rust-cache` entry, so the `-lld` Linux leg and the
 /// incremental/debug bounds never share a cache with `rust` or
-/// `compiler-precise-hostile`, plus disk reports around the heaviest gates so a
+/// `compiler-precise-hostile`; that entry also keeps `cache-on-failure: true` so
+/// a failed 30+ minute gate never forces the rerun to rebuild its dependencies
+/// from a cold cache. Around the heaviest gates the job reports both the
+/// runner's free disk (`df -h`) and the size it already spent on `target/`
+/// (`du -sh target`), and the two post-gate reports carry `if: always()` so a
 /// disk regression shows up in the log instead of as an opaque build failure.
 fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     let integration = workflow_job_block(workflow, "integration")?;
@@ -443,21 +447,47 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     };
     if !cache_step.contains(
         "\n          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
-    ) {
+    ) || !workflow_block_has_line(cache_step, "          cache-on-failure: true")
+    {
         return Ok(false);
     }
+    // The pre-build report runs before anything that can fail, so only the two
+    // post-gate reports need `if: always()` to survive a failing gate.
     let disk_reports = [
-        "name: Report runner disk before the integration build\n",
-        "name: Report runner disk after the Rust semantic gate\n",
-        "name: Report runner disk after the package gate\n",
+        (
+            "name: Report runner disk before the integration build\n",
+            false,
+        ),
+        (
+            "name: Report runner disk after the Rust semantic gate\n",
+            true,
+        ),
+        ("name: Report runner disk after the package gate\n", true),
     ];
-    Ok(disk_reports.iter().all(|header| {
+    Ok(disk_reports.iter().all(|(header, survives_failure)| {
         steps
             .iter()
-            .filter(|step| step.starts_with(header) && step.contains("\n          df -h\n"))
+            .filter(|step| {
+                step.starts_with(header)
+                    && workflow_block_has_line(step, "          df -h")
+                    && workflow_block_has_line(step, INTEGRATION_TARGET_SIZE_REPORT)
+                    && (!*survives_failure || workflow_block_has_line(step, "        if: always()"))
+            })
             .count()
             == 1
     }))
+}
+
+/// The `target/` size line every integration disk report runs after `df -h`:
+/// free space alone cannot tell a `target/` blowup from a runner image change.
+const INTEGRATION_TARGET_SIZE_REPORT: &str =
+    "          du -sh target 2>/dev/null || echo \"target directory is absent\"";
+
+/// Whole-line containment. A step block that ends the surrounding job has no
+/// trailing newline of its own, so substring checks that anchor on `\n` would
+/// silently miss its last line.
+fn workflow_block_has_line(block: &str, line: &str) -> bool {
+    block.lines().any(|candidate| candidate == line)
 }
 
 fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
@@ -2620,14 +2650,18 @@ mod tests {
         let cache_key =
             "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
         assert_eq!(ci.matches(cache_key).count(), 1);
+        let cache_on_failure = "          cache-on-failure: true\n";
+        assert_eq!(ci.matches(cache_on_failure).count(), 1);
+        let target_size_report =
+            "          du -sh target 2>/dev/null || echo \"target directory is absent\"\n";
         for drift in [
             ci.replacen(cache_key, "          key: rust\n", 1),
-            ci.replacen(
-                "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n",
-                "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-all-crates: false\n",
-                1,
-            )
-            .replacen(cache_key, "", 1),
+            // The integration key line is unique to that job, so swapping it
+            // for another `with:` entry drops the key without touching the
+            // `rust` or `compiler-precise-hostile` cache steps.
+            ci.replacen(cache_key, "          cache-all-crates: false\n", 1),
+            ci.replacen(cache_on_failure, "", 1),
+            ci.replacen(cache_on_failure, "          cache-on-failure: false\n", 1),
             ci.replacen(
                 "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
                 "",
@@ -2641,6 +2675,39 @@ mod tests {
             ci.replacen(
                 "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
                 "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          echo skipped\n",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n",
+                "      - name: Report runner disk after the Rust semantic gate\n",
+                1,
+            ),
+            // The integration package gate precedes the windows-smoke one, so a
+            // single replacement lands inside the integration job.
+            ci.replacen(
+                "      - name: Report runner disk after the package gate\n        if: always()\n",
+                "      - name: Report runner disk after the package gate\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
                 1,
             ),
         ] {
