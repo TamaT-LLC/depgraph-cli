@@ -34,13 +34,18 @@ use super::{
     TYPESCRIPT_VERSION, V0_2_RC1_STORE_SCHEMA_VERSION, VERSION, WEB_DEFINITION_SELECTOR,
     WEB_RUNTIME_ARTIFACTS, WebSemanticAttestation, WorkerArtifact, WorkerBackend, copy_directory,
     executable_name, extract_archive, go_semantic_e2e, is_executable, mcp_package_smoke,
-    parse_worker_handshake, prefixed_lowercase_sha256, process_argument_path,
+    parse_worker_handshake, prefixed_lowercase_sha256, process_argument_path, read_bounded_file,
     release_compatibility, rust_backend_from_handshake, rust_semantic_e2e, sha256_file,
     sha256_tree, validate_bounded_query_package_smoke, verified_release_path,
     verify_mcp_tool_schema_bytes, verify_release_artifact, verify_runtime_collector_module,
     verify_rust_backend, verify_rust_sysroot_tree, verify_typescript_compiler,
     verify_web_semantic_attestation, web_semantic_from_handshake, workspace_root,
 };
+
+const MAX_RELEASE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_SBOM_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RELEASE_CONTRACT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RELEASE_LICENSE_INVENTORY_BYTES: u64 = 16 * 1024 * 1024;
 
 fn materialize_cross_language_fixture(
     fixture: &CrossLanguageReleaseFixture,
@@ -424,7 +429,12 @@ pub(crate) fn verify_packaged_cross_language(
     archive_sha256: &str,
 ) -> Result<CrossLanguagePackageSmokeReport> {
     let fixture_path = extracted.join(depgraph_core::CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH);
-    let fixture: CrossLanguageReleaseFixture = serde_json::from_slice(&fs::read(&fixture_path)?)
+    let fixture_bytes = read_bounded_file(
+        &fixture_path,
+        MAX_RELEASE_CONTRACT_FILE_BYTES,
+        "packaged cross-language fixture",
+    )?;
+    let fixture: CrossLanguageReleaseFixture = serde_json::from_slice(&fixture_bytes)
         .context("packaged cross-language fixture has an invalid schema")?;
     let first = tempfile::tempdir()?;
     let second = tempfile::tempdir()?;
@@ -451,6 +461,102 @@ pub(crate) fn verify_packaged_cross_language(
     })
 }
 
+struct ReleaseVerifyTempDir {
+    directory: Option<tempfile::TempDir>,
+}
+
+impl ReleaseVerifyTempDir {
+    fn new(prefix: &str) -> Result<Self> {
+        Ok(Self {
+            directory: Some(tempfile::Builder::new().prefix(prefix).tempdir()?),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.directory
+            .as_ref()
+            .expect("release verification temp directory has already been closed")
+            .path()
+    }
+
+    fn close(mut self) -> Result<()> {
+        let directory = self
+            .directory
+            .take()
+            .expect("release verification temp directory has already been closed");
+        let permissions_result = restore_release_verify_permissions(directory.path());
+        let close_result = directory
+            .close()
+            .context("failed to close release verification temporary directory");
+
+        match (permissions_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(permissions_error), Ok(())) => Err(permissions_error),
+            (Ok(()), Err(close_error)) => Err(close_error),
+            (Err(permissions_error), Err(close_error)) => Err(close_error.context(format!(
+                "failed to restore release verification temporary directory permissions: {permissions_error:#}"
+            ))),
+        }
+    }
+}
+
+impl Drop for ReleaseVerifyTempDir {
+    fn drop(&mut self) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        if let Err(error) = restore_release_verify_permissions(directory.path()) {
+            eprintln!(
+                "failed to restore release verification temporary directory permissions: {error:#}"
+            );
+        }
+        if let Err(error) = directory.close() {
+            eprintln!("failed to close release verification temporary directory: {error:#}");
+        }
+    }
+}
+
+fn restore_release_verify_permissions(root: &Path) -> Result<()> {
+    fn restore(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = metadata.permissions().mode();
+            let mode = if metadata.is_dir() {
+                mode | 0o700
+            } else {
+                mode | 0o600
+            };
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        restore(&path, &metadata)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_archive(
     archive: &Path,
     checksum: &Path,
@@ -461,52 +567,205 @@ pub(crate) fn verify_archive(
     mcp_package_smoke::McpPackageSmokeReport,
 )> {
     let archive_sha256 = sha256_file(archive)?;
-    let verify_root = std::env::temp_dir().join(format!(
-        "depgraph-release-gate-{}-{}",
-        std::process::id(),
-        name
-    ));
-    if verify_root.exists() {
-        fs::remove_dir_all(&verify_root)?;
-    }
-    fs::create_dir_all(&verify_root)?;
-    extract_archive(archive, &verify_root)?;
+    let verify_prefix = format!("depgraph-release-gate-{name}-");
+    let verify_directory = ReleaseVerifyTempDir::new(&verify_prefix)?;
+    let verify_root = verify_directory.path().to_path_buf();
+    let verification = (|| {
+        extract_archive(archive, &verify_root)?;
 
-    let extracted = verify_root.join(name);
-    let executable = extracted.join("bin").join(executable_name("depgraph"));
-    let release_manifest = verify_release_metadata(&extracted)?;
-    #[cfg(unix)]
-    {
-        let symlinked_root = verify_root.join("symlinked-release-root");
-        std::os::unix::fs::symlink(&extracted, &symlinked_root)?;
-        let error = verify_release_metadata(&symlinked_root)
-            .expect_err("release metadata accepted a symlinked release root");
-        if !error
-            .to_string()
-            .contains("release root must not be a symlink")
-        {
-            bail!("release-root symlink gate returned the wrong error: {error:#}");
+        let top_level = fs::read_dir(&verify_root)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if top_level != BTreeSet::from([name.to_owned()]) {
+            bail!("release archive has an unexpected top-level layout: {top_level:?}");
         }
-        fs::remove_file(symlinked_root)?;
+
+        let extracted = verify_root.join(name);
+        let executable = extracted.join("bin").join(executable_name("depgraph"));
+        let release_manifest = verify_release_metadata(&extracted)?;
+        if name != format!("depgraph-{VERSION}-{}", release_manifest.target) {
+            bail!("release archive name does not match its manifest version and target");
+        }
+        #[cfg(unix)]
+        {
+            let symlinked_root = verify_root.join("symlinked-release-root");
+            std::os::unix::fs::symlink(&extracted, &symlinked_root)?;
+            let error = verify_release_metadata(&symlinked_root)
+                .expect_err("release metadata accepted a symlinked release root");
+            if !error
+                .to_string()
+                .contains("release root must not be a symlink")
+            {
+                bail!("release-root symlink gate returned the wrong error: {error:#}");
+            }
+            fs::remove_file(symlinked_root)?;
+        }
+        #[cfg(unix)]
+        verify_release_static_prelaunch_fails_closed(&extracted)?;
+        let mcp_smoke = mcp_package_smoke::verify(
+            &workspace_root(),
+            &extracted,
+            archive,
+            checksum,
+            &release_manifest.target,
+            &archive_sha256,
+            VERSION,
+        )?;
+        let store = verify_root.join("gate.db");
+        // Doctor is intentionally read-only and must not create or migrate a store.
+        // Seed the package-smoke fixture explicitly before exercising that boundary.
+        drop(depgraph_store::Store::open(&store)?);
+        let doctor = verify_packaged_doctor(&executable, &store)?;
+        #[cfg(unix)]
+        let external_alias = {
+            let external_alias = verify_root.join(format!("depgraph-v{VERSION}"));
+            std::os::unix::fs::symlink(&executable, &external_alias)?;
+            let aliased_doctor = verify_packaged_doctor(&external_alias, &store).context(
+                "packaged doctor failed through an external versioned executable symlink",
+            )?;
+            if aliased_doctor != doctor {
+                bail!("external versioned executable symlink changed packaged doctor output");
+            }
+            external_alias
+        };
+
+        let fixture = verify_root.join("web-fixture");
+        copy_directory(
+            &workspace_root().join("workers/web/test/fixtures/polyglot"),
+            &fixture,
+        )?;
+        let first_web_store = verify_root.join("web.db");
+        verify_packaged_scan(&executable, &first_web_store, &fixture, "web")?;
+        #[cfg(unix)]
+        {
+            verify_packaged_scan(
+                &external_alias,
+                &verify_root.join("web-external-alias.db"),
+                &fixture,
+                "web",
+            )
+            .context("packaged Web scan failed through an external versioned executable symlink")?;
+            fs::remove_file(&external_alias)?;
+        }
+        verify_packaged_build_evidence(
+            &executable,
+            &extracted,
+            &verify_root,
+            &fixture,
+            &first_web_store,
+        )?;
+        verify_packaged_project_licenses_fail_closed(
+            &executable,
+            &extracted,
+            &verify_root,
+            &fixture,
+        )?;
+        for marker in [
+            fixture.join("apps/next-app/NEXT_CONFIG_EXECUTED"),
+            fixture.join("apps/astro-app/ASTRO_CONFIG_EXECUTED"),
+        ] {
+            if marker.exists() {
+                bail!(
+                    "safe release gate executed project code: {}",
+                    marker.display()
+                );
+            }
+        }
+        let second_fixture = verify_root.join("web-fixture-checkout-two");
+        copy_directory(&fixture, &second_fixture)?;
+        let second_web_store = verify_root.join("web-two.db");
+        verify_packaged_scan(&executable, &second_web_store, &second_fixture, "web")?;
+        verify_packaged_web_determinism(&executable, &first_web_store, &second_web_store)?;
+        let query_smoke = verify_packaged_bounded_query(
+            &executable,
+            &extracted,
+            &fixture,
+            &first_web_store,
+            &second_fixture,
+            &second_web_store,
+            &release_manifest.target,
+            &archive_sha256,
+        )?;
+        let cross_language_smoke =
+            verify_packaged_cross_language(&extracted, &release_manifest.target, &archive_sha256)?;
+        verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
+        let semantic_complete_fixture = verify_root.join("web-semantic-complete-fixture");
+        copy_directory(
+            &workspace_root().join("workers/web/test/fixtures/semantic-complete"),
+            &semantic_complete_fixture,
+        )?;
+        verify_packaged_web_semantic_complete(
+            &executable,
+            &verify_root.join("web-semantic-complete.db"),
+            &semantic_complete_fixture,
+        )?;
+        verify_packaged_milestone4(&executable, &verify_root, &semantic_complete_fixture)?;
+        let framework_complete_fixture = verify_root.join("web-framework-complete-fixture");
+        copy_directory(
+            &workspace_root().join("workers/web/test/fixtures/framework-complete"),
+            &framework_complete_fixture,
+        )?;
+        verify_packaged_web_framework_completeness(
+            &executable,
+            &verify_root,
+            &framework_complete_fixture,
+        )?;
+
+        let rust_fixture = verify_root.join("rust-security-fixture");
+        copy_directory(
+            &workspace_root().join("workers/rust/tests/fixtures/security"),
+            &rust_fixture,
+        )?;
+        verify_packaged_scan(
+            &executable,
+            &verify_root.join("rust.db"),
+            &rust_fixture,
+            "rust",
+        )?;
+        for marker in [
+            rust_fixture.join("BUILD_SCRIPT_EXECUTED"),
+            rust_fixture.join("PROC_MACRO_EXECUTED"),
+            rust_fixture.join("CONFIG_EXECUTED"),
+        ] {
+            if marker.exists() {
+                bail!(
+                    "safe release gate executed project code: {}",
+                    marker.display()
+                );
+            }
+        }
+        rust_semantic_e2e::verify(&workspace_root(), &executable, None)?;
+        verify_packaged_rust_release_fails_closed(
+            &executable,
+            &extracted,
+            &verify_root,
+            &rust_fixture,
+        )?;
+
+        go_semantic_e2e::verify(&workspace_root(), &executable, None)?;
+        let go_fixture = verify_root.join("go-workspace-fixture");
+        copy_directory(
+            &workspace_root().join("workers/go/internal/worker/testdata/workspace"),
+            &go_fixture,
+        )?;
+        verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
+        Ok((query_smoke, cross_language_smoke, mcp_smoke))
+    })();
+    let cleanup = verify_directory.close();
+    match (verification, cleanup) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "release verification temporary-directory cleanup also failed: {cleanup_error:#}"
+        ))),
     }
-    #[cfg(unix)]
-    verify_release_static_prelaunch_fails_closed(&extracted)?;
-    let mcp_smoke = mcp_package_smoke::verify(
-        &workspace_root(),
-        &extracted,
-        archive,
-        checksum,
-        &release_manifest.target,
-        &archive_sha256,
-        VERSION,
-    )?;
-    let store = verify_root.join("gate.db");
-    // Doctor is intentionally read-only and must not create or migrate a store.
-    // Seed the package-smoke fixture explicitly before exercising that boundary.
-    drop(depgraph_store::Store::open(&store)?);
-    let doctor = Command::new(&executable)
+}
+
+fn verify_packaged_doctor(executable: &Path, store: &Path) -> Result<Value> {
+    let doctor = Command::new(executable)
         .arg("--store")
-        .arg(&store)
+        .arg(store)
         .arg("doctor")
         .arg("--json")
         .output()
@@ -538,95 +797,7 @@ pub(crate) fn verify_archive(
     {
         bail!("packaged doctor did not verify the public release and worker health: {doctor}");
     }
-
-    let fixture = Path::new("workers/web/test/fixtures/polyglot").canonicalize()?;
-    let first_web_store = verify_root.join("web.db");
-    verify_packaged_scan(&executable, &first_web_store, &fixture, "web")?;
-    verify_packaged_build_evidence(
-        &executable,
-        &extracted,
-        &verify_root,
-        &fixture,
-        &first_web_store,
-    )?;
-    verify_packaged_project_licenses_fail_closed(&executable, &extracted, &verify_root, &fixture)?;
-    for marker in [
-        fixture.join("apps/next-app/NEXT_CONFIG_EXECUTED"),
-        fixture.join("apps/astro-app/ASTRO_CONFIG_EXECUTED"),
-    ] {
-        if marker.exists() {
-            bail!(
-                "safe release gate executed project code: {}",
-                marker.display()
-            );
-        }
-    }
-    let second_fixture = verify_root.join("web-fixture-checkout-two");
-    copy_directory(&fixture, &second_fixture)?;
-    let second_web_store = verify_root.join("web-two.db");
-    verify_packaged_scan(&executable, &second_web_store, &second_fixture, "web")?;
-    verify_packaged_web_determinism(&executable, &first_web_store, &second_web_store)?;
-    let query_smoke = verify_packaged_bounded_query(
-        &executable,
-        &extracted,
-        &fixture,
-        &first_web_store,
-        &second_fixture,
-        &second_web_store,
-        &release_manifest.target,
-        &archive_sha256,
-    )?;
-    let cross_language_smoke =
-        verify_packaged_cross_language(&extracted, &release_manifest.target, &archive_sha256)?;
-    verify_packaged_web_runtime_fails_closed(&executable, &extracted, &verify_root, &fixture)?;
-    let semantic_complete_fixture =
-        Path::new("workers/web/test/fixtures/semantic-complete").canonicalize()?;
-    verify_packaged_web_semantic_complete(
-        &executable,
-        &verify_root.join("web-semantic-complete.db"),
-        &semantic_complete_fixture,
-    )?;
-    verify_packaged_milestone4(&executable, &verify_root, &semantic_complete_fixture)?;
-    let framework_complete_fixture =
-        Path::new("workers/web/test/fixtures/framework-complete").canonicalize()?;
-    verify_packaged_web_framework_completeness(
-        &executable,
-        &verify_root,
-        &framework_complete_fixture,
-    )?;
-
-    let rust_fixture = Path::new("workers/rust/tests/fixtures/security").canonicalize()?;
-    verify_packaged_scan(
-        &executable,
-        &verify_root.join("rust.db"),
-        &rust_fixture,
-        "rust",
-    )?;
-    for marker in [
-        rust_fixture.join("BUILD_SCRIPT_EXECUTED"),
-        rust_fixture.join("PROC_MACRO_EXECUTED"),
-        rust_fixture.join("CONFIG_EXECUTED"),
-    ] {
-        if marker.exists() {
-            bail!(
-                "safe release gate executed project code: {}",
-                marker.display()
-            );
-        }
-    }
-    rust_semantic_e2e::verify(&workspace_root(), &executable, None)?;
-    verify_packaged_rust_release_fails_closed(
-        &executable,
-        &extracted,
-        &verify_root,
-        &rust_fixture,
-    )?;
-
-    go_semantic_e2e::verify(&workspace_root(), &executable, None)?;
-    let go_fixture = Path::new("workers/go/internal/worker/testdata/workspace").canonicalize()?;
-    verify_packaged_layout_fails_closed(&executable, &extracted, &verify_root, &go_fixture)?;
-    fs::remove_dir_all(verify_root)?;
-    Ok((query_smoke, cross_language_smoke, mcp_smoke))
+    Ok(doctor)
 }
 
 fn verify_packaged_build_evidence(
@@ -5834,8 +6005,12 @@ fn verify_packaged_bounded_query(
     archive_sha256: &str,
 ) -> Result<BoundedQueryPackageSmokeReport> {
     let fixture_path = release_root.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
-    let query = fs::read_to_string(&fixture_path)
-        .context("packaged bounded query smoke fixture is not valid UTF-8")?;
+    let query = String::from_utf8(read_bounded_file(
+        &fixture_path,
+        MAX_RELEASE_CONTRACT_FILE_BYTES,
+        "packaged bounded query smoke fixture",
+    )?)
+    .context("packaged bounded query smoke fixture is not valid UTF-8")?;
     if query != depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_QUERY {
         bail!("packaged bounded query smoke fixture differs from the compiled contract");
     }
@@ -5997,9 +6172,13 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             bail!("release archive is missing {}", schema.path);
         }
     }
+    let manifest_bytes = read_bounded_file(
+        &extracted.join("release-manifest.json"),
+        MAX_RELEASE_MANIFEST_BYTES,
+        "release manifest",
+    )?;
     let manifest: ReleaseManifest =
-        serde_json::from_slice(&fs::read(extracted.join("release-manifest.json"))?)
-            .context("release manifest is invalid")?;
+        serde_json::from_slice(&manifest_bytes).context("release manifest is invalid")?;
     if manifest.release_version != VERSION
         || manifest.protocol_version != "1.0"
         || manifest.schema_version != "1.0"
@@ -6077,7 +6256,12 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
             .get(path)
             .with_context(|| format!("release manifest is missing project license {path}"))?;
         let verified = verify_release_artifact(extracted, artifact, "project license")?;
-        if fs::read(&verified)? != *expected {
+        if read_bounded_file(
+            &verified,
+            u64::try_from(expected.len())?,
+            "release project license",
+        )? != *expected
+        {
             bail!("release project license {path} differs from the declared source text");
         }
     }
@@ -6362,7 +6546,12 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if worker_adapters != BTreeSet::from(["go", "rust", "web"]) {
         bail!("release manifest must contain exactly the Rust, Go, and Web workers");
     }
-    let sbom: Value = serde_json::from_slice(&fs::read(extracted.join("sbom.spdx.json"))?)?;
+    let sbom_bytes = read_bounded_file(
+        &extracted.join("sbom.spdx.json"),
+        MAX_RELEASE_SBOM_BYTES,
+        "release SBOM",
+    )?;
+    let sbom: Value = serde_json::from_slice(&sbom_bytes)?;
     if sbom["spdxVersion"] != "SPDX-2.3" {
         bail!("release SBOM has an invalid SPDX version");
     }
@@ -6487,7 +6676,11 @@ fn verify_release_metadata(extracted: &Path) -> Result<ReleaseManifest> {
     if root["comment"] != SBOM_SCOPE {
         bail!("release SBOM does not declare its package-manager component boundary");
     }
-    let license_inventory = fs::read_to_string(extracted.join("THIRD_PARTY_LICENSES.txt"))?;
+    let license_inventory = String::from_utf8(read_bounded_file(
+        &extracted.join("THIRD_PARTY_LICENSES.txt"),
+        MAX_RELEASE_LICENSE_INVENTORY_BYTES,
+        "release third-party license inventory",
+    )?)?;
     if !license_inventory.contains(&format!(
         "First-party artifact {RUNTIME_COLLECTOR_ARTIFACT} ({RUNTIME_COLLECTOR_CONTRACT_VERSION}) is licensed under {PROJECT_LICENSE_EXPRESSION}"
     )) {
@@ -6743,4 +6936,28 @@ fn verify_packaged_web_handshake(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn release_verify_temp_directory_restores_permissions_before_close() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = ReleaseVerifyTempDir::new("depgraph-release-cleanup-test-")?;
+        let path = directory.path().to_path_buf();
+        let restricted = path.join("restricted");
+        fs::create_dir(&restricted)?;
+        let file = restricted.join("artifact");
+        fs::write(&file, b"release artifact")?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400))?;
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000))?;
+
+        directory.close()?;
+        assert!(!path.exists());
+        Ok(())
+    }
 }

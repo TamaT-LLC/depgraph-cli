@@ -75,6 +75,55 @@ use depgraph_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const MAX_EXECUTABLE_SYMLINK_DEPTH: usize = 40;
+
+pub(crate) fn canonicalize_executable(path: &Path, description: &str) -> Result<PathBuf> {
+    if let Some(release_root) = executable_release_root(path, description)?
+        && std::fs::symlink_metadata(&release_root)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        && release_root.join("release-manifest.json").is_file()
+    {
+        anyhow::bail!(
+            "failed to canonicalize {description}: release root must be a non-symlink directory"
+        );
+    }
+    path.canonicalize()
+        .with_context(|| format!("failed to canonicalize {description}"))
+}
+
+fn executable_release_root(path: &Path, description: &str) -> Result<Option<PathBuf>> {
+    let mut executable = path.to_path_buf();
+    for depth in 0..=MAX_EXECUTABLE_SYMLINK_DEPTH {
+        let metadata = std::fs::symlink_metadata(&executable).with_context(|| {
+            format!("failed to inspect {description} while resolving its symlink chain")
+        })?;
+        if !metadata.file_type().is_symlink() {
+            let Some(bin) = executable.parent() else {
+                return Ok(None);
+            };
+            return Ok(bin.parent().map(Path::to_path_buf));
+        }
+        if depth == MAX_EXECUTABLE_SYMLINK_DEPTH {
+            anyhow::bail!(
+                "failed to canonicalize {description}: executable symlink chain exceeds {MAX_EXECUTABLE_SYMLINK_DEPTH} links"
+            );
+        }
+        let target = std::fs::read_link(&executable).with_context(|| {
+            format!("failed to read {description} while resolving its symlink chain")
+        })?;
+        executable = if target.is_absolute() {
+            target
+        } else {
+            let Some(parent) = executable.parent() else {
+                return Ok(None);
+            };
+            parent.join(target)
+        };
+    }
+    unreachable!("the executable symlink loop always returns or fails at the configured limit")
+}
+
 pub use bounded_query::{
     BOUNDED_QUERY_CONTRACT_VERSION, BOUNDED_QUERY_CREDENTIAL_POLICY_VERSION, EntityExpression,
     Expression, FieldReference, Literal, MAX_QUERY_AST_NODES, MAX_QUERY_BYTES, MAX_QUERY_DEPTH,
@@ -1740,16 +1789,28 @@ fn parse_release_manifest(path: &Path) -> Result<ReleaseManifest> {
         .with_context(|| format!("invalid release manifest {}", path.display()))
 }
 
-fn load_release_manifest() -> Result<Option<(PathBuf, ReleaseManifest)>> {
+fn canonical_current_executable() -> Result<PathBuf> {
     let executable =
         std::env::current_exe().context("failed to locate the running depgraph executable")?;
+    canonicalize_executable(&executable, "the running depgraph executable")
+}
+
+fn load_release_manifest() -> Result<Option<(PathBuf, ReleaseManifest)>> {
+    let executable = canonical_current_executable()?;
+    load_release_manifest_for_executable(&executable)
+}
+
+fn load_release_manifest_for_executable(
+    executable: &Path,
+) -> Result<Option<(PathBuf, ReleaseManifest)>> {
     let parent = executable
         .parent()
         .context("running depgraph executable has no parent directory")?;
-    for candidate in [
-        parent.join("release-manifest.json"),
-        parent.join("../release-manifest.json"),
-    ] {
+    let mut candidates = vec![parent.join("release-manifest.json")];
+    if let Some(release_root) = parent.parent() {
+        candidates.push(release_root.join("release-manifest.json"));
+    }
+    for candidate in candidates {
         match std::fs::symlink_metadata(&candidate) {
             Ok(_) => {
                 return Ok(Some((
@@ -1772,12 +1833,11 @@ fn load_release_manifest() -> Result<Option<(PathBuf, ReleaseManifest)>> {
 }
 
 fn release_health() -> Result<Option<ReleaseHealth>> {
-    let Some((manifest_path, manifest)) = load_release_manifest()? else {
+    let executable = canonical_current_executable()?;
+    let Some((manifest_path, manifest)) = load_release_manifest_for_executable(&executable)? else {
         return Ok(None);
     };
     let root = manifest_path.parent().unwrap_or(Path::new("."));
-    let executable =
-        std::env::current_exe().context("failed to locate the running depgraph executable")?;
     let query_fixture_integrity = if manifest.query_fixture.path
         != BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH
         || format!("sha256:{}", manifest.query_fixture.sha256)
@@ -1953,6 +2013,7 @@ pub fn open_store_read_only(path: &Path) -> Result<Store> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
     use std::{
         collections::BTreeMap,
         ffi::OsString,
@@ -1961,11 +2022,12 @@ mod tests {
 
     use super::{
         AdapterKind, DoctorWorkerLocation, FRAMEWORK_BUILD_CONVERTER_ARTIFACT,
-        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, STORE_SCHEMA_VERSION,
+        FRAMEWORK_BUILD_GATE_CONTRACT_VERSION, STORE_SCHEMA_VERSION, canonicalize_executable,
         default_doctor_diagnostic_root, doctor_toolchain_remediation, evaluated_worker_health,
-        framework_build_capability_contract, parse_release_manifest, parse_worker_handshake,
-        preflight_doctor_workers, release_compatibility_contract, suppressed_worker_health,
-        verify_release_compatibility, worker,
+        framework_build_capability_contract, load_release_manifest_for_executable,
+        parse_release_manifest, parse_worker_handshake, preflight_doctor_workers,
+        release_compatibility_contract, suppressed_worker_health, verify_release_compatibility,
+        worker,
     };
 
     fn test_worker_spec(adapter: AdapterKind) -> worker::WorkerSpec {
@@ -2173,6 +2235,70 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("invalid release manifest"));
         assert!(message.contains("missing field `compatibility`"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_manifest_lookup_resolves_external_executable_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let release = temp.path().join("release");
+        let executable = release.join("bin/depgraph");
+        std::fs::create_dir_all(
+            executable
+                .parent()
+                .context("test executable has no parent")?,
+        )?;
+        std::fs::write(&executable, b"test executable")?;
+        let manifest = release.join("release-manifest.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "release_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": "1.0",
+                "schema_version": "1.0",
+                "compatibility": release_compatibility_contract(),
+                "target": "test-target",
+                "license_expression": "MIT OR Apache-2.0",
+                "project_licenses": [],
+                "core": {"path": "bin/depgraph", "sha256": "0"},
+                "schema": {"path": "schemas/depgraph-protocol-v1.schema.json", "sha256": "0"},
+                "query_fixture": {"path": "queries/bounded.query", "sha256": "0"},
+                "cross_language_fixture": {"path": "fixtures/cross-language.json", "sha256": "0"},
+                "cross_language_schemas": [],
+                "workers": []
+            }))?,
+        )?;
+        let alias = temp.path().join("depgraph-alias");
+        symlink(&executable, &alias)?;
+
+        let canonical = canonicalize_executable(&alias, "test depgraph executable")?;
+        let (found_manifest, _) = load_release_manifest_for_executable(&canonical)?
+            .context("release manifest was not found through the canonical executable")?;
+        assert_eq!(found_manifest.canonicalize()?, manifest.canonicalize()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_symlink_chain_fails_closed_beyond_the_explicit_limit() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("depgraph");
+        std::fs::write(&executable, b"test executable")?;
+        let mut target = executable;
+        for index in 0..=super::MAX_EXECUTABLE_SYMLINK_DEPTH {
+            let alias = temp.path().join(format!("depgraph-alias-{index}"));
+            symlink(&target, &alias)?;
+            target = alias;
+        }
+
+        let error = canonicalize_executable(&target, "test depgraph executable")
+            .expect_err("an overlong executable symlink chain must fail closed");
+        assert!(error.to_string().contains("symlink chain exceeds 40 links"));
         Ok(())
     }
 

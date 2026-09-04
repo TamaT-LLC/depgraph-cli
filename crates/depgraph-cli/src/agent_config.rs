@@ -50,10 +50,19 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("x86_64-pc-windows-msvc", "zip"),
     ("x86_64-unknown-linux-gnu", "tar.gz"),
 ];
+const INITIALIZE_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 const EOF_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_TOOL_SCHEMA_BYTES: &[u8] =
     include_bytes!("../../../schemas/depgraph-mcp-tools-v1.schema.json");
+
+fn probe_response_deadline(method: Option<&str>) -> Duration {
+    if method == Some("initialize") {
+        INITIALIZE_RESPONSE_DEADLINE
+    } else {
+        RESPONSE_DEADLINE
+    }
+}
 
 pub struct AgentConfigRequest<'a> {
     pub root: &'a Path,
@@ -1236,16 +1245,24 @@ impl Probe {
     }
 
     fn request(&mut self, request: Value) -> Result<Value> {
+        let deadline = probe_response_deadline(request["method"].as_str());
+        self.request_with_deadline(request, deadline)
+    }
+
+    fn request_with_deadline(&mut self, request: Value, deadline: Duration) -> Result<Value> {
         let expected_id = request["id"].clone();
+        let method = request["method"].as_str().unwrap_or("unknown");
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');
         let stdin = self.stdin.as_mut().context("MCP probe stdin is closed")?;
         stdin.write_all(&bytes)?;
         stdin.flush()?;
-        let line = self
-            .lines
-            .recv_timeout(RESPONSE_DEADLINE)
-            .context("Agent host connection probe response deadline exceeded")??;
+        let line = self.lines.recv_timeout(deadline).with_context(|| {
+            format!(
+                "Agent host connection probe {method} response deadline exceeded after {}s",
+                deadline.as_secs()
+            )
+        })??;
         self.consumed_stdout.extend_from_slice(&line);
         if !line.ends_with(b"\n") || line == b"\n" {
             security_bail("MCP probe stdout contains a non-message byte sequence")?;
@@ -1317,6 +1334,22 @@ impl Drop for Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_probe_allows_cold_initialize_but_keeps_follow_up_requests_bounded() {
+        assert_eq!(INITIALIZE_RESPONSE_DEADLINE, Duration::from_secs(30));
+        assert_eq!(RESPONSE_DEADLINE, Duration::from_secs(10));
+        assert!(INITIALIZE_RESPONSE_DEADLINE > RESPONSE_DEADLINE);
+        assert_eq!(
+            probe_response_deadline(Some("initialize")),
+            INITIALIZE_RESPONSE_DEADLINE
+        );
+        assert_eq!(
+            probe_response_deadline(Some("tools/list")),
+            RESPONSE_DEADLINE
+        );
+        assert_eq!(probe_response_deadline(None), RESPONSE_DEADLINE);
+    }
 
     fn release_evidence_fixture(
         directory: &Path,

@@ -2338,6 +2338,66 @@ fn packaged_layout_without_manifest_is_detected() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn external_executable_symlink_uses_the_attested_release_layout() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let release = temp.path().join("release");
+    let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+    let core = release.join("bin").join(executable_name("depgraph"));
+    let alias = temp.path().join("depgraph-alias");
+    symlink(&core, &alias)?;
+
+    let executable = crate::canonicalize_executable(&alias, "test depgraph executable")?;
+    assert_eq!(executable, core.canonicalize()?);
+    let executable_dir = executable
+        .parent()
+        .context("test executable has no parent")?;
+    let manifest = release_manifest_path(executable_dir).context("release manifest not found")?;
+    assert_eq!(
+        manifest.canonicalize()?,
+        test_release.manifest.canonicalize()?
+    );
+
+    let worker = locate_worker_for_executable(AdapterKind::Rust, &executable)?;
+    assert!(worker.release_attested);
+
+    let runtime = locate_web_build_runtime_for_executable(
+        "depgraph-web-build-evidence.mjs",
+        Path::new("/outside-project"),
+        &executable,
+    )?;
+    assert_eq!(
+        runtime,
+        release
+            .join("libexec/depgraph-web-build-evidence.mjs")
+            .canonicalize()?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn external_executable_symlink_cannot_bypass_a_symlinked_release_root() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let real_release = temp.path().join("real-release");
+    write_test_release_manifest(&real_release, Vec::new(), Vec::new())?;
+    let release_alias = temp.path().join("release-alias");
+    symlink(&real_release, &release_alias)?;
+    let alias_target = release_alias.join("bin").join(executable_name("depgraph"));
+    let alias = temp.path().join("depgraph-alias");
+    symlink(&alias_target, &alias)?;
+
+    let error = crate::canonicalize_executable(&alias, "test depgraph executable")
+        .expect_err("a symlinked release root must not be canonicalized away");
+    assert!(error.to_string().contains("release root"));
+    Ok(())
+}
+
 #[test]
 fn parses_runtime_versions_strictly() {
     assert_eq!(parse_version_triplet("24.18.0"), Some((24, 18, 0)));

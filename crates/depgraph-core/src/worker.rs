@@ -290,13 +290,17 @@ pub fn detect_adapters(root: &Path, _follow_symlinks: bool) -> Result<Vec<Adapte
 }
 
 pub fn locate_worker(adapter: AdapterKind) -> Result<WorkerSpec> {
-    let executable = std::env::current_exe().context("failed to locate depgraph executable")?;
+    let executable = canonical_current_executable()?;
+    locate_worker_for_executable(adapter, &executable)
+}
+
+fn locate_worker_for_executable(adapter: AdapterKind, executable: &Path) -> Result<WorkerSpec> {
     let executable_dir = executable.parent().unwrap_or(Path::new("."));
     if let Some(manifest_path) = release_manifest_path(executable_dir) {
         return locate_verified_bundled_worker_for_executable(
             adapter,
             &manifest_path,
-            Some(&executable),
+            Some(executable),
         )
         .context("security policy violation: bundled release verification failed");
     }
@@ -346,10 +350,18 @@ pub fn locate_worker(adapter: AdapterKind) -> Result<WorkerSpec> {
 }
 
 pub(crate) fn locate_web_build_runtime(file_name: &str, root: &Path) -> Result<PathBuf> {
+    let executable = canonical_current_executable()?;
+    locate_web_build_runtime_for_executable(file_name, root, &executable)
+}
+
+fn locate_web_build_runtime_for_executable(
+    file_name: &str,
+    root: &Path,
+    executable: &Path,
+) -> Result<PathBuf> {
     if file_name.contains('/') || file_name.contains('\\') || !file_name.ends_with(".mjs") {
         bail!("security policy violation: invalid Web build runtime artifact name");
     }
-    let executable = std::env::current_exe().context("failed to locate depgraph executable")?;
     let executable_dir = executable.parent().unwrap_or(Path::new("."));
     if let Some(manifest_path) = release_manifest_path(executable_dir) {
         // Verify the complete compatibility unit and the running core before
@@ -357,7 +369,7 @@ pub(crate) fn locate_web_build_runtime(file_name: &str, root: &Path) -> Result<P
         locate_verified_bundled_worker_for_executable(
             AdapterKind::Web,
             &manifest_path,
-            Some(&executable),
+            Some(executable),
         )
         .context("security policy violation: bundled release verification failed")?;
         let release_root = verified_release_root(&manifest_path)?;
@@ -404,6 +416,11 @@ pub(crate) fn locate_web_build_runtime(file_name: &str, root: &Path) -> Result<P
         bail!("security policy violation: Web build runtime is inside the project root");
     }
     Ok(candidate)
+}
+
+fn canonical_current_executable() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("failed to locate depgraph executable")?;
+    crate::canonicalize_executable(&executable, "depgraph executable")
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,12 +511,11 @@ struct BundledWebSemanticAttestation {
 }
 
 fn release_manifest_path(executable_dir: &Path) -> Option<PathBuf> {
-    [
-        executable_dir.join("release-manifest.json"),
-        executable_dir.join("../release-manifest.json"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    let mut candidates = vec![executable_dir.join("release-manifest.json")];
+    if let Some(release_root) = executable_dir.parent() {
+        candidates.push(release_root.join("release-manifest.json"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn looks_like_packaged_layout(executable_dir: &Path) -> bool {

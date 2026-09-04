@@ -174,6 +174,19 @@ tar -xzf "${ARCHIVE}"
 "./depgraph-${VERSION}-${TARGET}/bin/depgraph" --version
 ```
 
+配布物がその環境で正しく動くかは、リポジトリのルートから次の1コマンドで確認できる。
+チェックサムは`<archive>.sha256`から自動で読み取る。
+
+```sh
+cargo xtask verify-release-archive --archive "/absolute/path/to/${ARCHIVE}"
+```
+
+このコマンドは同じバージョンのネイティブアーカイブだけを受け付ける。
+manifestで宣言された必須成果物の整合性、`doctor`、Web / Rust / Go scan、query / export、MCP onboardingとoperationを一時ディレクトリで検証する。
+追跡対象のソースや通常のStoreは変更しない。
+完全なnative package gateを実行するため、環境によっては完了まで30分以上かかる。
+対象は通常アーカイブ単体であり、RC tag、公開後証跡、compiler pack archiveの真正性は公開後検証で別途確認する。
+
 Windowsでは同じリリースから`.zip`と`.zip.sha256`を取得し、`Get-FileHash -Algorithm SHA256`で照合してから`Expand-Archive`で展開する。
 リリースのSBOM、ライセンス一覧、互換性情報はアーカイブに同梱される。
 

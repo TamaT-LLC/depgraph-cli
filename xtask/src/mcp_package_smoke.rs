@@ -32,6 +32,7 @@ use crate::executable_name;
 pub const MCP_PACKAGE_SMOKE_SCHEMA_VERSION: &str = "mcp-package-smoke-v3";
 pub const SUBMIT_DEADLINE_MS: u64 = 2_000;
 pub const EOF_DEADLINE_MS: u64 = 5_000;
+const INITIALIZE_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 const OPERATION_DEADLINE: Duration = Duration::from_secs(60);
 const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
@@ -39,6 +40,14 @@ const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_
 const RELEASE_EVIDENCE_CONTRACT_VERSION: &str = "release-post-publish-evidence-v1";
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
 const README_PATH: &str = "README.en.md";
+
+fn packaged_response_deadline(method: Option<&str>) -> Duration {
+    if method == Some("initialize") {
+        INITIALIZE_RESPONSE_DEADLINE
+    } else {
+        RESPONSE_DEADLINE
+    }
+}
 const DOCUMENTATION_PATH: &str = "docs/50_test/mcp-agent-host-operations.md";
 const DOCUMENTATION_MARKER_PREFIX: &str = "<!-- depgraph-mcp-package-smoke:";
 const ONBOARDING_MARKER_PREFIX: &str = "<!-- depgraph-agent-config:";
@@ -1612,7 +1621,13 @@ impl PackagedMcp {
     }
 
     fn request(&mut self, request: Value) -> Result<Value> {
+        let deadline = packaged_response_deadline(request["method"].as_str());
+        self.request_with_deadline(request, deadline)
+    }
+
+    fn request_with_deadline(&mut self, request: Value, deadline: Duration) -> Result<Value> {
         let expected_id = request["id"].clone();
+        let method = request["method"].as_str().unwrap_or("unknown");
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');
         let stdin = self
@@ -1621,10 +1636,12 @@ impl PackagedMcp {
             .context("packaged MCP stdin is closed")?;
         stdin.write_all(&bytes)?;
         stdin.flush()?;
-        let line = self
-            .lines
-            .recv_timeout(RESPONSE_DEADLINE)
-            .context("packaged MCP response deadline exceeded")??;
+        let line = self.lines.recv_timeout(deadline).with_context(|| {
+            format!(
+                "packaged MCP {method} response deadline exceeded after {}s",
+                deadline.as_secs()
+            )
+        })??;
         self.consumed_stdout.extend_from_slice(&line);
         if !line.ends_with(b"\n") || line == b"\n" {
             bail!("packaged MCP stdout contains a non-message byte sequence");
@@ -2000,9 +2017,20 @@ fn canonical_sha256(value: &Value) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(fs::read(path).with_context(
-        || format!("failed to read {}", path.display()),
-    )?)))
+    let mut input =
+        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn lowercase_sha256(value: &str) -> bool {
@@ -2015,6 +2043,22 @@ fn lowercase_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_mcp_allows_cold_initialize_but_keeps_follow_up_requests_bounded() {
+        assert_eq!(INITIALIZE_RESPONSE_DEADLINE, Duration::from_secs(30));
+        assert_eq!(RESPONSE_DEADLINE, Duration::from_secs(10));
+        assert!(INITIALIZE_RESPONSE_DEADLINE > RESPONSE_DEADLINE);
+        assert_eq!(
+            packaged_response_deadline(Some("initialize")),
+            INITIALIZE_RESPONSE_DEADLINE
+        );
+        assert_eq!(
+            packaged_response_deadline(Some("tools/list")),
+            RESPONSE_DEADLINE
+        );
+        assert_eq!(packaged_response_deadline(None), RESPONSE_DEADLINE);
+    }
 
     #[test]
     fn compiler_pack_fixture_uses_native_executable_names() {

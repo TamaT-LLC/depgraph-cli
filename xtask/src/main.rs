@@ -110,6 +110,14 @@ const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("aarch64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
 ];
+const MAX_RELEASE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RELEASE_ARCHIVE_ENTRIES: usize = 50_000;
+const MAX_RELEASE_ARCHIVE_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_RELEASE_ARCHIVE_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RELEASE_ARCHIVE_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RELEASE_ARCHIVE_MEMBER_NAME_BYTES: usize = 4 * 1024;
+const MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_RELEASE_CHECKSUM_BYTES: u64 = 1024;
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
@@ -141,14 +149,20 @@ const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
     "335945d35d3b99f169a55c3a7101806a21a6a75cd7b3249ee502cee89eb806cf";
-const RELEASE_CARGO_BUILD_TARGETS: &[(&str, Option<&str>, Option<&str>)] = &[
-    ("depgraph-cli", Some("depgraph"), Some("packaged")),
-    ("depgraph-mcp", Some("depgraph-mcp"), None),
+/// Release binaries grouped into the fewest `cargo build --release`
+/// invocations. Every group is one feature unification, so splitting a group
+/// would recompile shared dependencies and relink with thin LTO again. The
+/// distributed CLI must never fall back to development worker overrides when
+/// its signed layout is incomplete, so it always builds with the `packaged`
+/// feature and therefore cannot share a group with the packages that must stay
+/// feature-free.
+const RELEASE_CARGO_BUILD_TARGETS: &[(&[&str], Option<&str>, Option<&str>)] = &[
     (
-        "depgraph-operation",
-        Some("depgraph-operation-runner"),
+        &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"],
+        None,
         None,
     ),
+    (&["depgraph-cli"], Some("depgraph"), Some("packaged")),
 ];
 struct TargetNativeSmokeExpectation {
     target: &'static str,
@@ -292,6 +306,15 @@ enum Task {
         directory: PathBuf,
         #[arg(long)]
         target: Vec<String>,
+    },
+    /// Run the complete native package gate against one downloaded release archive.
+    VerifyReleaseArchive {
+        /// Native release archive to verify.
+        #[arg(long)]
+        archive: PathBuf,
+        /// Checksum sidecar. Defaults to `<archive>.sha256`.
+        #[arg(long)]
+        checksum: Option<PathBuf>,
     },
     StableReleaseGate {
         release_verification: PathBuf,
@@ -905,6 +928,9 @@ fn main() -> Result<()> {
         Task::VerifyReleaseAssets { directory, target } => {
             verify_release_assets(&directory, &target)
         }
+        Task::VerifyReleaseArchive { archive, checksum } => {
+            verify_release_archive(&archive, checksum.as_deref())
+        }
         Task::StableReleaseGate {
             release_verification,
             benchmark_report,
@@ -985,6 +1011,11 @@ fn compiler_pack(source: &Path, output: &Path, spec_path: &Path) -> Result<()> {
 }
 
 fn build(release: bool) -> Result<()> {
+    build_rust_workspace(release)?;
+    build_non_rust_workers()
+}
+
+fn build_rust_workspace(release: bool) -> Result<()> {
     let mut cargo = Command::new("cargo");
     // The running xtask executable cannot be replaced on Windows. It is a
     // build-time tool rather than a release artifact, so exclude it from the
@@ -993,8 +1024,10 @@ fn build(release: bool) -> Result<()> {
     if release {
         cargo.arg("--release");
     }
-    run(&mut cargo)?;
+    run(&mut cargo)
+}
 
+fn build_non_rust_workers() -> Result<()> {
     fs::create_dir_all("workers/go/bin")?;
     run(Command::new("go")
         .args(["build", "-trimpath", "-o"])
@@ -1074,12 +1107,15 @@ fn test() -> Result<()> {
 fn package() -> Result<()> {
     verify_release_tag()?;
     verify_project_metadata(&workspace_root())?;
-    build(true)?;
-    // The distributed CLI must never fall back to development worker
-    // overrides when its signed layout is incomplete.
-    for (package, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
+    // Release binaries come from RELEASE_CARGO_BUILD_TARGETS alone; a separate
+    // `--workspace` release build would only recompile the same dependency
+    // graph under a third feature unification.
+    for (packages, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
         let mut command = Command::new("cargo");
-        command.args(["build", "--locked", "--release", "-p", package]);
+        command.args(["build", "--locked", "--release"]);
+        for package in *packages {
+            command.args(["-p", package]);
+        }
         if let Some(binary) = binary {
             command.args(["--bin", binary]);
         }
@@ -1088,6 +1124,7 @@ fn package() -> Result<()> {
         }
         run(&mut command)?;
     }
+    build_non_rust_workers()?;
     let host = host_target()?;
     let target = std::env::var("DEPGRAPH_TARGET").unwrap_or_else(|_| host.clone());
     if target != host {
@@ -1833,18 +1870,653 @@ fn create_zip_archive(archive: &Path, entries: &[ArchiveEntry]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ZipCentralDirectoryBounds {
+    entry_count: usize,
+    offset: u64,
+    size: u64,
+}
+
+#[derive(Default)]
+struct ReleaseArchiveBudget {
+    entry_count: usize,
+    expanded_bytes: u64,
+}
+
+impl ReleaseArchiveBudget {
+    fn account(&mut self, size: u64) -> Result<()> {
+        if size > MAX_RELEASE_ARCHIVE_ENTRY_BYTES {
+            bail!(
+                "release archive entry is too large: {size} bytes (limit: {MAX_RELEASE_ARCHIVE_ENTRY_BYTES} bytes)"
+            );
+        }
+
+        self.entry_count = self
+            .entry_count
+            .checked_add(1)
+            .context("release archive entry count overflow")?;
+        if self.entry_count > MAX_RELEASE_ARCHIVE_ENTRIES {
+            bail!(
+                "release archive has too many entries: {} (limit: {MAX_RELEASE_ARCHIVE_ENTRIES})",
+                self.entry_count
+            );
+        }
+
+        self.expanded_bytes = self
+            .expanded_bytes
+            .checked_add(size)
+            .context("release archive expanded size overflow")?;
+        if self.expanded_bytes > MAX_RELEASE_ARCHIVE_EXPANDED_BYTES {
+            bail!(
+                "release archive expands to too many bytes: {} (limit: {MAX_RELEASE_ARCHIVE_EXPANDED_BYTES} bytes)",
+                self.expanded_bytes
+            );
+        }
+        Ok(())
+    }
+}
+
+fn normalize_release_archive_member_name(name: &str) -> Result<PathBuf> {
+    if name.is_empty()
+        || name.len() > MAX_RELEASE_ARCHIVE_MEMBER_NAME_BYTES
+        || name.contains('\0')
+        || name.contains('\\')
+    {
+        bail!("release archive contains an unsafe member path: {name:?}");
+    }
+
+    // Directory entries conventionally end in `/`; that separator must not
+    // create a distinct key from the corresponding file path.
+    let name = name.trim_end_matches('/');
+    if name.is_empty() {
+        bail!("release archive contains an empty member path");
+    }
+
+    let path = Path::new(name);
+    if path.is_absolute() {
+        bail!("release archive contains an absolute member path: {name:?}");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => normalized.push(component),
+            _ => bail!("release archive contains an unsafe member path: {name:?}"),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("release archive contains an empty member path");
+    }
+    Ok(normalized)
+}
+
+fn require_explicit_release_archive_parent(
+    path: &Path,
+    directories: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !directories.contains(parent)
+    {
+        bail!(
+            "release archive omits an explicit parent directory for {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn set_release_archive_permissions(path: &Path, mode: u32, directory: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut mode = mode & 0o777;
+        if directory {
+            // Keep temporary verification trees traversable even if an
+            // archive carries a restrictive directory mode. This also makes
+            // cleanup deterministic on an error path.
+            mode |= 0o700;
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, directory);
+    }
+
+    Ok(())
+}
+
+fn copy_exact_release_archive_entry<R: std::io::Read, W: std::io::Write>(
+    input: &mut R,
+    output: &mut W,
+    declared_size: u64,
+    description: &str,
+) -> Result<()> {
+    let mut bounded = std::io::Read::take(input, declared_size);
+    let copied = std::io::copy(&mut bounded, output)?;
+    if copied != declared_size {
+        bail!(
+            "{description} size changed while extracting: expected {declared_size}, copied {copied}"
+        );
+    }
+
+    let input = bounded.into_inner();
+    let mut extra = [0_u8; 1];
+    if std::io::Read::read(input, &mut extra)? != 0 {
+        bail!(
+            "{description} exceeds its declared size while extracting: expected {declared_size} bytes"
+        );
+    }
+    Ok(())
+}
+
+fn validate_release_archive_input(archive: &Path) -> Result<u64> {
+    let metadata = fs::symlink_metadata(archive)?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "release archive is not a regular file: {}",
+            archive.display()
+        );
+    }
+    if metadata.len() == 0 {
+        bail!("release archive is empty: {}", archive.display());
+    }
+    if metadata.len() > MAX_RELEASE_ARCHIVE_BYTES {
+        bail!(
+            "release archive is too large: {} bytes (limit: {MAX_RELEASE_ARCHIVE_BYTES} bytes)",
+            metadata.len()
+        );
+    }
+    Ok(metadata.len())
+}
+
+fn validate_release_archive_destination(destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(destination)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::read_dir(destination)?.next().is_some()
+    {
+        bail!(
+            "release archive extraction destination is not an empty real directory: {}",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_zip_central_directory(
+    archive: &Path,
+    file_len: u64,
+) -> Result<ZipCentralDirectoryBounds> {
+    const EOCD_LEN: usize = 22;
+    const MAX_ZIP_COMMENT_LEN: u64 = 65_535;
+
+    if file_len < EOCD_LEN as u64 {
+        bail!("ZIP release archive is too short to contain an end-of-central-directory record");
+    }
+
+    let tail_len = usize::try_from(file_len.min(EOCD_LEN as u64 + MAX_ZIP_COMMENT_LEN))?;
+    let tail_start = file_len - tail_len as u64;
+    let mut input = fs::File::open(archive)?;
+    std::io::Seek::seek(&mut input, std::io::SeekFrom::Start(tail_start))?;
+    let mut tail = vec![0u8; tail_len];
+    std::io::Read::read_exact(&mut input, &mut tail)?;
+
+    let eocd_index = (0..=tail.len() - EOCD_LEN)
+        .rev()
+        .find(|&index| {
+            tail[index..index + 4] == *b"PK\x05\x06"
+                && index
+                    + EOCD_LEN
+                    + usize::from(u16::from_le_bytes([tail[index + 20], tail[index + 21]]))
+                    == tail.len()
+        })
+        .context("ZIP release archive has no valid end-of-central-directory record")?;
+
+    let eocd_offset = tail_start + eocd_index as u64;
+    let disk_number = u16::from_le_bytes([tail[eocd_index + 4], tail[eocd_index + 5]]);
+    let central_disk = u16::from_le_bytes([tail[eocd_index + 6], tail[eocd_index + 7]]);
+    let entries_on_disk = u16::from_le_bytes([tail[eocd_index + 8], tail[eocd_index + 9]]);
+    let total_entries = u16::from_le_bytes([tail[eocd_index + 10], tail[eocd_index + 11]]);
+    let central_size = u32::from_le_bytes([
+        tail[eocd_index + 12],
+        tail[eocd_index + 13],
+        tail[eocd_index + 14],
+        tail[eocd_index + 15],
+    ]);
+    let central_offset = u32::from_le_bytes([
+        tail[eocd_index + 16],
+        tail[eocd_index + 17],
+        tail[eocd_index + 18],
+        tail[eocd_index + 19],
+    ]);
+
+    if total_entries == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
+        bail!("ZIP64 release archives are unsupported");
+    }
+    if disk_number != 0 || central_disk != 0 || entries_on_disk != total_entries {
+        bail!("multi-disk ZIP release archives are unsupported");
+    }
+
+    let central_size = u64::from(central_size);
+    let central_offset = u64::from(central_offset);
+    if central_size > MAX_RELEASE_ARCHIVE_CENTRAL_DIRECTORY_BYTES {
+        bail!(
+            "ZIP central directory is too large: {central_size} bytes (limit: {MAX_RELEASE_ARCHIVE_CENTRAL_DIRECTORY_BYTES} bytes)"
+        );
+    }
+    let central_end = central_offset
+        .checked_add(central_size)
+        .context("ZIP central directory offset overflow")?;
+    if central_end != eocd_offset {
+        bail!("ZIP release archives with a prefix are unsupported");
+    }
+    if central_end > file_len {
+        bail!("ZIP central directory extends beyond the archive");
+    }
+
+    let expected_entries = usize::from(total_entries);
+    if expected_entries > MAX_RELEASE_ARCHIVE_ENTRIES {
+        bail!(
+            "ZIP release archive has too many entries: {expected_entries} (limit: {MAX_RELEASE_ARCHIVE_ENTRIES})"
+        );
+    }
+
+    // Scan the bounded central directory before ZipArchive::new. Besides
+    // bounding the parser's metadata input, this catches duplicate names that
+    // zip's index can otherwise collapse.
+    let mut central = fs::File::open(archive)?;
+    std::io::Seek::seek(&mut central, std::io::SeekFrom::Start(central_offset))?;
+    let mut consumed = 0u64;
+    let mut actual_entries = 0usize;
+    let mut declared_expanded_bytes = 0u64;
+    let mut seen = BTreeSet::new();
+    while consumed < central_size {
+        if central_size - consumed < 46 {
+            bail!("ZIP central directory contains a truncated entry");
+        }
+
+        let mut header = [0u8; 46];
+        std::io::Read::read_exact(&mut central, &mut header)?;
+        consumed += 46;
+        if header[..4] != *b"PK\x01\x02" {
+            bail!("ZIP central directory contains an invalid entry header");
+        }
+
+        let name_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
+        let extra_len = usize::from(u16::from_le_bytes([header[30], header[31]]));
+        let comment_len = usize::from(u16::from_le_bytes([header[32], header[33]]));
+        let compressed_size = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+        let uncompressed_size =
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+        let disk_start = u16::from_le_bytes([header[34], header[35]]);
+        let local_header_offset =
+            u32::from_le_bytes([header[42], header[43], header[44], header[45]]);
+        if compressed_size == u32::MAX
+            || uncompressed_size == u32::MAX
+            || local_header_offset == u32::MAX
+        {
+            bail!("ZIP64 release archives are unsupported");
+        }
+        if disk_start != 0 {
+            bail!("multi-disk ZIP release archives are unsupported");
+        }
+        if name_len == 0 || name_len > MAX_RELEASE_ARCHIVE_MEMBER_NAME_BYTES {
+            bail!("ZIP release archive contains an invalid member name length: {name_len}");
+        }
+        let uncompressed_size = u64::from(uncompressed_size);
+        if uncompressed_size > MAX_RELEASE_ARCHIVE_ENTRY_BYTES {
+            bail!(
+                "release archive entry is too large: {uncompressed_size} bytes (limit: {MAX_RELEASE_ARCHIVE_ENTRY_BYTES} bytes)"
+            );
+        }
+        declared_expanded_bytes = declared_expanded_bytes
+            .checked_add(uncompressed_size)
+            .context("ZIP release archive expanded size overflow")?;
+        if declared_expanded_bytes > MAX_RELEASE_ARCHIVE_EXPANDED_BYTES {
+            bail!(
+                "release archive expands to too many bytes: {declared_expanded_bytes} (limit: {MAX_RELEASE_ARCHIVE_EXPANDED_BYTES} bytes)"
+            );
+        }
+        let metadata_len = u64::try_from(name_len + extra_len + comment_len)?;
+        if metadata_len > MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES {
+            bail!(
+                "ZIP release archive member metadata is too large: {metadata_len} bytes (limit: {MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES} bytes)"
+            );
+        }
+        if metadata_len > central_size - consumed {
+            bail!("ZIP central directory contains a truncated member metadata field");
+        }
+
+        let mut name = vec![0u8; name_len];
+        std::io::Read::read_exact(&mut central, &mut name)?;
+        consumed += name_len as u64;
+        let name =
+            std::str::from_utf8(&name).context("ZIP release archive member name is not UTF-8")?;
+        let normalized = normalize_release_archive_member_name(name)?;
+        if !seen.insert(normalized) {
+            bail!("ZIP release archive contains a duplicate member path: {name:?}");
+        }
+
+        let skip = extra_len + comment_len;
+        if skip > 0 {
+            std::io::Seek::seek(
+                &mut central,
+                std::io::SeekFrom::Current(i64::try_from(skip)?),
+            )?;
+            consumed += skip as u64;
+        }
+
+        actual_entries = actual_entries
+            .checked_add(1)
+            .context("ZIP central directory entry count overflow")?;
+        if actual_entries > MAX_RELEASE_ARCHIVE_ENTRIES {
+            bail!(
+                "ZIP release archive has too many entries: {actual_entries} (limit: {MAX_RELEASE_ARCHIVE_ENTRIES})"
+            );
+        }
+    }
+    if consumed != central_size || actual_entries != expected_entries {
+        bail!(
+            "ZIP central directory entry count mismatch: expected {expected_entries}, found {actual_entries}"
+        );
+    }
+
+    Ok(ZipCentralDirectoryBounds {
+        entry_count: expected_entries,
+        offset: central_offset,
+        size: central_size,
+    })
+}
+
+fn extract_bounded_zip(archive: &Path, destination: &Path, file_len: u64) -> Result<()> {
+    let central = inspect_zip_central_directory(archive, file_len)?;
+    let input = fs::File::open(archive)?;
+    let mut archive = zip::ZipArchive::new(input)?;
+    if archive.len() != central.entry_count {
+        bail!(
+            "ZIP entry count changed while parsing: expected {}, found {}",
+            central.entry_count,
+            archive.len()
+        );
+    }
+
+    let mut budget = ReleaseArchiveBudget::default();
+    let mut seen = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let name = entry.name().to_owned();
+        let relative = normalize_release_archive_member_name(&name)?;
+        if entry.enclosed_name().is_none() {
+            bail!("ZIP release archive contains an unsafe member path: {name:?}");
+        }
+        if !seen.insert(relative.clone()) {
+            bail!("ZIP release archive contains a duplicate member path: {name:?}");
+        }
+        require_explicit_release_archive_parent(&relative, &directories)?;
+
+        let size = entry.size();
+        budget.account(size)?;
+        if entry.is_symlink() {
+            bail!("ZIP release archives must not contain symlinks: {name:?}");
+        }
+
+        let output = destination.join(&relative);
+        if entry.is_dir() {
+            if size != 0 {
+                bail!("ZIP directory entry has unexpected data: {name:?}");
+            }
+            fs::create_dir(&output)?;
+            set_release_archive_permissions(&output, entry.unix_mode().unwrap_or(0o755), true)?;
+            directories.insert(relative);
+            continue;
+        }
+
+        if let Some(mode) = entry.unix_mode() {
+            let file_type = mode & 0o170000;
+            if file_type != 0 && file_type != 0o100000 {
+                bail!("ZIP release archive contains a special file: {name:?}");
+            }
+        }
+
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)?;
+        copy_exact_release_archive_entry(
+            &mut entry,
+            &mut output_file,
+            size,
+            &format!("ZIP entry {name:?}"),
+        )?;
+        set_release_archive_permissions(&output, entry.unix_mode().unwrap_or(0o644), false)?;
+    }
+
+    let _ = (central.offset, central.size);
+    Ok(())
+}
+
+fn extract_bounded_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
+    let input = fs::File::open(archive)?;
+    let decoder = flate2::read::GzDecoder::new(input);
+    let mut archive = tar::Archive::new(decoder);
+    let mut budget = ReleaseArchiveBudget::default();
+    let mut seen = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    let mut pending_long_name = None;
+
+    for entry in archive.entries()?.raw(true) {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        let size = entry.size();
+        if entry_type.is_gnu_longname() {
+            if pending_long_name.is_some()
+                || size == 0
+                || size > MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES
+            {
+                bail!("release archive contains invalid or unbounded GNU long-name metadata");
+            }
+            budget.account(size)?;
+            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
+            std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+            if u64::try_from(bytes.len())? != size || bytes.last() != Some(&0) {
+                bail!("release archive contains malformed GNU long-name metadata");
+            }
+            bytes.pop();
+            if bytes.is_empty() || bytes.contains(&0) {
+                bail!("release archive contains malformed GNU long-name metadata");
+            }
+            let name = std::str::from_utf8(&bytes)
+                .context("release archive GNU long-name metadata is not UTF-8")?;
+            pending_long_name = Some(normalize_release_archive_member_name(name)?);
+            continue;
+        }
+        if entry_type.is_gnu_longlink()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions()
+        {
+            bail!("release archives must not contain link or PAX metadata entries");
+        }
+
+        let is_directory = entry_type.is_dir();
+        let is_regular = entry_type.is_file();
+        if !is_directory && !is_regular {
+            bail!("release archives must contain only regular files and directories");
+        }
+
+        let relative = if let Some(long_name) = pending_long_name.take() {
+            long_name
+        } else {
+            let path = entry.path()?;
+            let path = path
+                .to_str()
+                .context("release archive member path is not UTF-8")?;
+            normalize_release_archive_member_name(path)?
+        };
+        if !seen.insert(relative.clone()) {
+            bail!(
+                "release archive contains a duplicate member path: {:?}",
+                relative.display()
+            );
+        }
+
+        budget.account(size)?;
+        require_explicit_release_archive_parent(&relative, &directories)?;
+        if is_directory && size != 0 {
+            bail!(
+                "TAR directory entry has unexpected data: {:?}",
+                relative.display()
+            );
+        }
+
+        let output = destination.join(&relative);
+        let mode = entry.header().mode()?;
+        if is_directory {
+            fs::create_dir(&output)?;
+            set_release_archive_permissions(&output, mode, true)?;
+            directories.insert(relative);
+            continue;
+        }
+
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)?;
+        copy_exact_release_archive_entry(
+            &mut entry,
+            &mut output_file,
+            size,
+            &format!("TAR entry {:?}", relative.display()),
+        )?;
+        set_release_archive_permissions(&output, mode, false)?;
+    }
+
+    if pending_long_name.is_some() {
+        bail!("release archive ends with orphaned GNU long-name metadata");
+    }
+
+    Ok(())
+}
+
 fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
+    let file_len = validate_release_archive_input(archive)?;
+    validate_release_archive_destination(destination)?;
+
     if archive
         .extension()
         .is_some_and(|extension| extension == "zip")
     {
-        let input = fs::File::open(archive)?;
-        zip::ZipArchive::new(input)?.extract(destination)?;
+        extract_bounded_zip(archive, destination, file_len)
     } else {
-        let input = fs::File::open(archive)?;
-        let decoder = flate2::read::GzDecoder::new(input);
-        tar::Archive::new(decoder).unpack(destination)?;
+        extract_bounded_tar_gz(archive, destination)
     }
+}
+
+fn release_archive_identity(archive: &Path) -> Result<(&'static str, String)> {
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("release archive filename is not valid UTF-8")?;
+    RELEASE_TARGETS
+        .iter()
+        .find_map(|(target, extension)| {
+            let expected_name = format!("depgraph-{VERSION}-{target}.{extension}");
+            (archive_name == expected_name).then(|| (*target, format!("depgraph-{VERSION}-{target}")))
+        })
+        .with_context(|| {
+            format!(
+                "release archive {archive_name:?} does not match version {VERSION} and a supported target"
+            )
+        })
+}
+
+fn checksum_sidecar_path(archive: &Path) -> PathBuf {
+    let mut path = archive.as_os_str().to_os_string();
+    path.push(".sha256");
+    PathBuf::from(path)
+}
+
+fn verify_release_checksum_name(archive: &Path, checksum: &Path) -> Result<()> {
+    let expected_checksum_name = format!(
+        "{}.sha256",
+        archive
+            .file_name()
+            .context("release archive has no filename")?
+            .to_string_lossy()
+    );
+    if checksum.file_name().and_then(|name| name.to_str()) != Some(&expected_checksum_name) {
+        bail!(
+            "release checksum sidecar must be named {expected_checksum_name:?} for the selected archive"
+        );
+    }
+    Ok(())
+}
+
+fn canonical_regular_release_input(
+    path: &Path,
+    maximum_bytes: u64,
+    description: &str,
+) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{description} is missing: {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > maximum_bytes
+    {
+        bail!(
+            "{description} must be a non-empty bounded regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    path.canonicalize()
+        .with_context(|| format!("failed to canonicalize {description}: {}", path.display()))
+}
+
+fn verify_release_archive(archive: &Path, checksum: Option<&Path>) -> Result<()> {
+    verify_project_metadata(&workspace_root())?;
+    let checksum = checksum
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| checksum_sidecar_path(archive));
+    let archive =
+        canonical_regular_release_input(archive, MAX_RELEASE_ARCHIVE_BYTES, "release archive")?;
+    let checksum = canonical_regular_release_input(
+        &checksum,
+        MAX_RELEASE_CHECKSUM_BYTES,
+        "release checksum sidecar",
+    )?;
+    verify_release_checksum_name(&archive, &checksum)?;
+    let (target, release_name) = release_archive_identity(&archive)?;
+    let host = host_target()?;
+    if target != host {
+        bail!(
+            "release archive target {target} cannot run on native host {host}; verify it on a matching host"
+        );
+    }
+    let archive_sha256 = verify_checksum_sidecar(&archive, &checksum)?;
+    let (query_smoke, cross_language_smoke, mcp_smoke) =
+        verify_archive(&archive, &checksum, &release_name)?;
+    if query_smoke.target != target
+        || query_smoke.archive_sha256 != archive_sha256
+        || cross_language_smoke.target != target
+        || cross_language_smoke.archive_sha256 != archive_sha256
+        || mcp_smoke.target != target
+        || mcp_smoke.archive_sha256 != archive_sha256
+    {
+        bail!("native package smoke output is not bound to the selected release archive");
+    }
+
+    println!("verified native release archive {}", archive.display());
+    println!("  version: {VERSION}");
+    println!("  target: {target}");
+    println!("  sha256: {archive_sha256}");
+    println!(
+        "  checks: integrity, doctor, Web/Rust/Go scans, query/export, MCP onboarding and operations"
+    );
     Ok(())
 }
 
@@ -4202,7 +4874,8 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
-        path::Path,
+        io::Write as _,
+        path::{Path, PathBuf},
         time::{Duration, SystemTime},
     };
 
@@ -4229,8 +4902,10 @@ mod tests {
         BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, FullCiJobEvidence,
-        FullCiRunEvidence, MCP_OPERATION_CONTRACT_VERSION, MCP_PROTOCOL_REVISION, MCP_SDK_VERSION,
-        MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
+        FullCiRunEvidence, MAX_RELEASE_ARCHIVE_ENTRY_BYTES,
+        MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES, MCP_OPERATION_CONTRACT_VERSION,
+        MCP_PROTOCOL_REVISION, MCP_SDK_VERSION, MCP_TOOL_CONTRACT_VERSION,
+        PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
         RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION, RELEASE_TARGETS,
         RUNTIME_COLLECTOR_CONTRACT_VERSION, RUST_SYSROOT_COMPONENT_SHA256,
         ReleasePostPublishEvidence, ReleasePostPublishEvidenceRequest, ReleaseVerificationReport,
@@ -4244,19 +4919,20 @@ mod tests {
         V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH, V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION,
         WEB_SEMANTIC_CAPABILITIES, WEB_SEMANTIC_RUNTIME_ARTIFACTS, WEB_SEMANTIC_RUNTIME_COMPONENTS,
         WebSemanticAttestation, WorkerBackend, archive_entries, canonical_actions_run_url,
-        compiler_pack_identity_binding, create_tar_archive, create_zip_archive,
+        canonical_regular_release_input, checksum_sidecar_path, compiler_pack_identity_binding,
+        copy_exact_release_archive_entry, create_tar_archive, create_zip_archive,
         evaluate_stable_release_gate, executable_name_for_target, expected_release_asset_names,
         extract_archive, github_settings_verify, has_windows_executable_extension,
-        parse_worker_handshake, public_readiness_verify, release_compatibility,
-        release_post_publish_evidence, rust_backend_from_handshake, rustc_source_identity,
-        supported_release_tag, target_native_smoke_expectation,
+        parse_worker_handshake, public_readiness_verify, release_archive_identity,
+        release_compatibility, release_post_publish_evidence, rust_backend_from_handshake,
+        rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, validate_full_ci_run,
         verify_agent_dogfood_release_gate, verify_checksum_sidecar,
         verify_cross_language_package_smoke, verify_pinned_rust_sysroot_digest,
-        verify_release_tag_values, verify_rust_backend, verify_stable_release_source_guard,
-        verify_web_semantic_attestation, web_semantic_from_handshake,
-        without_windows_verbatim_prefix, workspace_root,
+        verify_release_checksum_name, verify_release_tag_values, verify_rust_backend,
+        verify_stable_release_source_guard, verify_web_semantic_attestation,
+        web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
     };
 
     fn post_publish_evidence_fixture(
@@ -4758,8 +5434,8 @@ mod tests {
                 1,
             ),
             ci.replacen(
-                "Reclaim integration build artifacts before the isolated Rust semantic gate",
-                "Do not reclaim integration artifacts before Rust semantic verification",
+                "          key: integration-${{ matrix.target }}\n",
+                "          key: rust\n",
                 1,
             ),
         ] {
@@ -6092,13 +6768,26 @@ jobs:
         assert_eq!(
             RELEASE_CARGO_BUILD_TARGETS,
             [
-                ("depgraph-cli", Some("depgraph"), Some("packaged")),
-                ("depgraph-mcp", Some("depgraph-mcp"), None),
                 (
-                    "depgraph-operation",
-                    Some("depgraph-operation-runner"),
+                    &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"][..],
+                    None,
                     None,
                 ),
+                (&["depgraph-cli"][..], Some("depgraph"), Some("packaged")),
+            ]
+        );
+        // Every packaged executable must be produced by these invocations
+        // alone, because package() no longer runs a workspace release build.
+        assert_eq!(
+            RELEASE_CARGO_BUILD_TARGETS
+                .iter()
+                .flat_map(|(packages, _, _)| packages.iter().copied())
+                .collect::<Vec<_>>(),
+            vec![
+                "depgraph-mcp",
+                "depgraph-operation",
+                "depgraph-rust-worker",
+                "depgraph-cli",
             ]
         );
     }
@@ -6223,6 +6912,260 @@ jobs:
 
         fs::write(&checksum, format!("{digest}  renamed.tar.gz\n"))?;
         assert!(verify_checksum_sidecar(&archive, &checksum).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_identity_is_version_target_and_extension_bound() -> Result<()> {
+        for (target, extension) in RELEASE_TARGETS {
+            let archive = PathBuf::from(format!("depgraph-{VERSION}-{target}.{extension}"));
+            assert_eq!(
+                release_archive_identity(&archive)?,
+                (*target, format!("depgraph-{VERSION}-{target}"))
+            );
+            assert_eq!(
+                checksum_sidecar_path(&archive),
+                PathBuf::from(format!("depgraph-{VERSION}-{target}.{extension}.sha256"))
+            );
+        }
+        for invalid in [
+            format!("depgraph-0.0.0-{}.tar.gz", RELEASE_TARGETS[0].0),
+            format!("depgraph-{VERSION}-unknown-target.tar.gz"),
+            format!("depgraph-{VERSION}-{}.zip", RELEASE_TARGETS[0].0),
+        ] {
+            assert!(release_archive_identity(Path::new(&invalid)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_command_infers_the_checksum_sidecar() -> Result<()> {
+        let archive = format!("depgraph-{VERSION}-aarch64-apple-darwin.tar.gz");
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "verify-release-archive",
+            "--archive",
+            &archive,
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Task::VerifyReleaseArchive {
+                archive: parsed,
+                checksum: None,
+            } if parsed == Path::new(&archive)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_rejects_a_custom_checksum_basename_early() -> Result<()> {
+        let archive = PathBuf::from(format!(
+            "/release/depgraph-{VERSION}-aarch64-apple-darwin.tar.gz"
+        ));
+        verify_release_checksum_name(
+            &archive,
+            &PathBuf::from(format!(
+                "/checksums/depgraph-{VERSION}-aarch64-apple-darwin.tar.gz.sha256"
+            )),
+        )?;
+        assert!(
+            verify_release_checksum_name(&archive, Path::new("/checksums/custom.sha256")).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_inputs_reject_directories() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        assert!(canonical_regular_release_input(temp.path(), 1, "release archive").is_err());
+        let empty = temp.path().join("empty");
+        fs::write(&empty, [])?;
+        assert!(canonical_regular_release_input(&empty, 1, "release archive").is_err());
+        let oversized = temp.path().join("oversized");
+        fs::write(&oversized, b"too large")?;
+        assert!(canonical_regular_release_input(&oversized, 1, "release archive").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_release_archive_inputs_reject_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let archive = temp.path().join("archive.tar.gz");
+        let alias = temp.path().join("archive-alias.tar.gz");
+        fs::write(&archive, b"archive")?;
+        symlink(&archive, &alias)?;
+        assert!(canonical_regular_release_input(&alias, u64::MAX, "release archive").is_err());
+        assert_eq!(
+            canonical_regular_release_input(&archive, u64::MAX, "release archive")?,
+            archive.canonicalize()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_extraction_accepts_bounded_gnu_long_names() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_path = temp.path().join("fixture.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let payload = b"bounded release archive";
+        let long_name = format!("release/{}", "long-name-".repeat(14));
+        let mut root_header = tar::Header::new_gnu();
+        root_header.set_entry_type(tar::EntryType::Directory);
+        root_header.set_size(0);
+        root_header.set_mode(0o755);
+        root_header.set_cksum();
+        archive.append_data(&mut root_header, "release", std::io::empty())?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(payload.len())?);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, &long_name, payload.as_slice())?;
+        archive.into_inner()?.finish()?;
+
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        extract_archive(&archive_path, &destination)?;
+        assert_eq!(fs::read(destination.join(long_name))?, payload);
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_extraction_rejects_oversized_tar_entries_before_payload() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let archive_path = temp.path().join("oversized.tar.gz");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("release/oversized")?;
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(MAX_RELEASE_ARCHIVE_ENTRY_BYTES + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::default(),
+        );
+        encoder.write_all(header.as_bytes())?;
+        encoder.finish()?;
+
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        let error = extract_archive(&archive_path, &destination)
+            .expect_err("oversized TAR entry must be rejected before reading its payload");
+        assert!(error.to_string().contains("entry is too large"));
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_extraction_rejects_unbounded_tar_long_name_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_path = temp.path().join("long-name.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let name = format!(
+            "release/{}",
+            "a".repeat(usize::try_from(MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES)? + 1)
+        );
+        archive.append_data(&mut header, name, b"x".as_slice())?;
+        archive.into_inner()?.finish()?;
+
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        let error = extract_archive(&archive_path, &destination)
+            .expect_err("unbounded GNU long-name metadata must be rejected before allocation");
+        assert!(error.to_string().contains("GNU long-name metadata"));
+        Ok(())
+    }
+
+    #[test]
+    fn single_release_archive_extraction_rejects_duplicate_zip_names_before_extraction()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_path = temp.path().join("duplicate.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&archive_path)?);
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o644);
+        archive.start_file("release/one", options)?;
+        archive.write_all(b"first")?;
+        archive.start_file("release/two", options)?;
+        archive.write_all(b"second")?;
+        archive.finish()?;
+        let mut bytes = fs::read(&archive_path)?;
+        let central_headers = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(index, window)| (window == b"PK\x01\x02").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(central_headers.len(), 2);
+        let second_name = central_headers[1] + 46;
+        bytes[second_name..second_name + "release/two".len()].copy_from_slice(b"release/one");
+        fs::write(&archive_path, bytes)?;
+
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        let error = extract_archive(&archive_path, &destination)
+            .expect_err("duplicate ZIP member names must be rejected");
+        assert!(error.to_string().contains("duplicate member path"));
+        assert!(fs::read_dir(destination)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn release_archive_copy_never_writes_beyond_the_declared_size() -> Result<()> {
+        let mut input = std::io::Cursor::new(b"undeclared payload".to_vec());
+        let mut output = Vec::new();
+        let error = copy_exact_release_archive_entry(&mut input, &mut output, 1, "ZIP entry")
+            .expect_err("data beyond the declared size must be rejected");
+        assert!(error.to_string().contains("exceeds its declared size"));
+        assert_eq!(output, b"u");
+        Ok(())
+    }
+
+    #[test]
+    fn zip_extraction_rejects_underreported_expanded_size_during_copy() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_path = temp.path().join("underreported.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&archive_path)?);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        archive.add_directory("release/", options.unix_permissions(0o755))?;
+        archive.start_file("release/payload", options)?;
+        archive.write_all(&vec![b'x'; 1024 * 1024])?;
+        archive.finish()?;
+
+        let mut bytes = fs::read(&archive_path)?;
+        let central_headers = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(index, window)| (window == b"PK\x01\x02").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(central_headers.len(), 2);
+        let payload_header = central_headers[1];
+        bytes[payload_header + 24..payload_header + 28].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&archive_path, bytes)?;
+
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        let error = extract_archive(&archive_path, &destination)
+            .expect_err("an underreported expanded size must fail during bounded extraction");
+        assert!(
+            error.to_string().contains("exceeds its declared size"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::metadata(destination.join("release/payload"))?.len(), 1);
         Ok(())
     }
 
