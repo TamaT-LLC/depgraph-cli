@@ -5434,8 +5434,8 @@ mod tests {
                 1,
             ),
             ci.replacen(
-                "Reclaim integration build artifacts before the isolated Rust semantic gate",
-                "Do not reclaim integration artifacts before Rust semantic verification",
+                "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+                "          key: rust\n",
                 1,
             ),
         ] {

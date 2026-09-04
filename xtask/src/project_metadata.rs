@@ -270,15 +270,18 @@ pub(crate) fn verify_workflow_policy_text(
                     .matches("RUSTFLAGS: ${{ matrix.rustflags }}")
                     .count()
                     != 1
-                || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 2
-                || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 2
-                || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 2
-                || workflow
-                    .matches(
-                        "Reclaim integration build artifacts before the isolated Rust semantic gate",
-                    )
-                    .count()
-                    != 1
+                // compiler-precise-hostile, integration, and windows-smoke each
+                // pin their own copy of the intermediate-state bound. The
+                // occurrence count this replaces could not tell one job losing
+                // the bound from another gaining it, so the check reads each
+                // job's own env block instead. No workflow-wide count is kept
+                // alongside it: a fourth job that legitimately builds twice on
+                // one runner would need the same bound, and forbidding that is
+                // not a policy this workflow holds.
+                || !job_pins_intermediate_state_bound(workflow, "compiler-precise-hostile")?
+                || !job_pins_intermediate_state_bound(workflow, "integration")?
+                || !job_pins_intermediate_state_bound(workflow, "windows-smoke")?
+                || !integration_job_pins_resource_policy(workflow)?
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
@@ -426,6 +429,127 @@ pub(crate) fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+/// The settings that bound a job's intermediate build state: no incremental
+/// artifacts, and no debug symbols in either the dev or the test profile. A job
+/// that builds twice on one runner without reclaiming `target/` in between
+/// needs all three, so they are checked as a set.
+const INTERMEDIATE_STATE_BOUND: [&str; 3] = [
+    "CARGO_INCREMENTAL: \"0\"",
+    "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+    "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+];
+
+/// Whether `job_name` declares every [`INTERMEDIATE_STATE_BOUND`] setting in
+/// its own job-level `env:` mapping. Only the job-level block counts: a
+/// step-level `env:` would bound that one step and leave the job's second
+/// build unbounded.
+fn job_pins_intermediate_state_bound(workflow: &str, job_name: &str) -> Result<bool> {
+    let job = workflow_job_block(workflow, job_name)?;
+    let environment = job_env_entries(job)?;
+    Ok(INTERMEDIATE_STATE_BOUND
+        .iter()
+        .all(|setting| environment.contains(setting)))
+}
+
+/// The entries of a job's own `env:` mapping, with comments and blank lines
+/// dropped. A job without a job-level `env:` block has no entries.
+fn job_env_entries(job: &str) -> Result<Vec<&str>> {
+    let lines = job.lines().collect::<Vec<_>>();
+    let declarations = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "    env:")
+        .collect::<Vec<_>>();
+    let Some((declaration, _)) = declarations.first() else {
+        return Ok(Vec::new());
+    };
+    if declarations.len() != 1 {
+        bail!("workflow job must declare at most one job-level env block");
+    }
+
+    let mut environment = Vec::new();
+    for line in &lines[declaration + 1..] {
+        let code = line.split('#').next().unwrap_or_default();
+        if code.trim().is_empty() {
+            continue;
+        }
+        let indentation = code.len() - code.trim_start_matches(' ').len();
+        if indentation <= 4 {
+            break;
+        }
+        if indentation != 6 {
+            bail!("workflow job env nesting is malformed");
+        }
+        environment.push(code.trim());
+    }
+    Ok(environment)
+}
+
+/// The integration job builds the debug graph and then the release package on
+/// one hosted runner without `cargo clean` in between. Its resource policy is a
+/// matrix-scoped `Swatinem/rust-cache` entry, so the `-lld` Linux leg and the
+/// incremental/debug bounds never share a cache with `rust` or
+/// `compiler-precise-hostile`; that entry also keeps `cache-on-failure: true` so
+/// a failed 30+ minute gate never forces the rerun to rebuild its dependencies
+/// from a cold cache. Around the heaviest gates the job reports both the
+/// runner's free disk (`df -h`) and the size it already spent on `target/`
+/// (`du -sh target`), and the two post-gate reports carry `if: always()` so a
+/// disk regression shows up in the log instead of as an opaque build failure.
+fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
+    let integration = workflow_job_block(workflow, "integration")?;
+    let steps = integration.split("\n      - ").skip(1).collect::<Vec<_>>();
+    let cache_steps = steps
+        .iter()
+        .filter(|step| step.starts_with("uses: Swatinem/rust-cache@"))
+        .collect::<Vec<_>>();
+    let [cache_step] = cache_steps.as_slice() else {
+        return Ok(false);
+    };
+    if !cache_step.contains(
+        "\n          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+    ) || !workflow_block_has_line(cache_step, "          cache-on-failure: true")
+    {
+        return Ok(false);
+    }
+    // The pre-build report runs before anything that can fail, so only the two
+    // post-gate reports need `if: always()` to survive a failing gate.
+    let disk_reports = [
+        (
+            "name: Report runner disk before the integration build\n",
+            false,
+        ),
+        (
+            "name: Report runner disk after the Rust semantic gate\n",
+            true,
+        ),
+        ("name: Report runner disk after the package gate\n", true),
+    ];
+    Ok(disk_reports.iter().all(|(header, survives_failure)| {
+        steps
+            .iter()
+            .filter(|step| {
+                step.starts_with(header)
+                    && workflow_block_has_line(step, "          df -h")
+                    && workflow_block_has_line(step, INTEGRATION_TARGET_SIZE_REPORT)
+                    && (!*survives_failure || workflow_block_has_line(step, "        if: always()"))
+            })
+            .count()
+            == 1
+    }))
+}
+
+/// The `target/` size line every integration disk report runs after `df -h`:
+/// free space alone cannot tell a `target/` blowup from a runner image change.
+const INTEGRATION_TARGET_SIZE_REPORT: &str =
+    "          du -sh target 2>/dev/null || echo \"target directory is absent\"";
+
+/// Whole-line containment. A step block that ends the surrounding job has no
+/// trailing newline of its own, so substring checks that anchor on `\n` would
+/// silently miss its last line.
+fn workflow_block_has_line(block: &str, line: &str) -> bool {
+    block.lines().any(|candidate| candidate == line)
 }
 
 fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
@@ -2561,4 +2685,203 @@ fn quoted_assignment(source: &str, name: &str) -> Option<String> {
                 .to_owned()
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use super::{integration_job_pins_resource_policy, job_pins_intermediate_state_bound};
+
+    /// The three jobs that build twice on one runner without reclaiming
+    /// `target/` in between.
+    const DOUBLE_BUILD_JOBS: [&str; 3] =
+        ["compiler-precise-hostile", "integration", "windows-smoke"];
+
+    /// The windows-smoke bound, anchored on the comment line that is unique to
+    /// that job: the three settings themselves appear verbatim in all three
+    /// jobs, so a bare `replacen` would land on compiler-precise-hostile.
+    const WINDOWS_SMOKE_BOUND: &str = concat!(
+        "      # target was observed at 12.6 GB with debuginfo included.\n",
+        "      CARGO_INCREMENTAL: \"0\"\n",
+        "      CARGO_PROFILE_DEV_DEBUG: \"0\"\n",
+        "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n",
+    );
+
+    /// The integration bound, anchored on the last line of that job's comment.
+    const INTEGRATION_BOUND: &str =
+        concat!("      # steps below.\n", "      CARGO_INCREMENTAL: \"0\"\n",);
+
+    fn checked_in_ci_workflow() -> String {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask lives directly under the workspace root");
+        fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml is readable")
+    }
+
+    #[test]
+    fn integration_resource_policy_accepts_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        assert!(integration_job_pins_resource_policy(&ci).expect("integration job is extractable"));
+    }
+
+    #[test]
+    fn integration_resource_policy_rejects_cache_and_disk_report_drift() {
+        let ci = checked_in_ci_workflow();
+        let cache_key =
+            "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
+        assert_eq!(ci.matches(cache_key).count(), 1);
+        let cache_on_failure = "          cache-on-failure: true\n";
+        assert_eq!(ci.matches(cache_on_failure).count(), 1);
+        let target_size_report =
+            "          du -sh target 2>/dev/null || echo \"target directory is absent\"\n";
+        for drift in [
+            ci.replacen(cache_key, "          key: rust\n", 1),
+            // The integration key line is unique to that job, so swapping it
+            // for another `with:` entry drops the key without touching the
+            // `rust` or `compiler-precise-hostile` cache steps.
+            ci.replacen(cache_key, "          cache-all-crates: false\n", 1),
+            ci.replacen(cache_on_failure, "", 1),
+            ci.replacen(cache_on_failure, "          cache-on-failure: false\n", 1),
+            ci.replacen(
+                "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
+                "",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the Rust semantic gate\n",
+                "      - name: Report disk after the Rust semantic gate\n",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          echo skipped\n",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n",
+                "      - name: Report runner disk after the Rust semantic gate\n",
+                1,
+            ),
+            // The integration package gate precedes the windows-smoke one, so a
+            // single replacement lands inside the integration job.
+            ci.replacen(
+                "      - name: Report runner disk after the package gate\n        if: always()\n",
+                "      - name: Report runner disk after the package gate\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk after the Rust semantic gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
+                1,
+            ),
+            ci.replacen(
+                &format!(
+                    "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n{target_size_report}"
+                ),
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
+                1,
+            ),
+        ] {
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                !integration_job_pins_resource_policy(&drift).expect("drifted integration job is extractable"),
+                "drifted integration resource policy must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_state_bound_accepts_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        for job in DOUBLE_BUILD_JOBS {
+            assert!(
+                job_pins_intermediate_state_bound(&ci, job).expect("job is extractable"),
+                "{job} must pin the intermediate-state bound"
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_state_bound_rejects_a_job_losing_one_setting() {
+        let ci = checked_in_ci_workflow();
+        assert_eq!(ci.matches(WINDOWS_SMOKE_BOUND).count(), 1);
+        assert_eq!(ci.matches(INTEGRATION_BOUND).count(), 1);
+        for (job, drift) in [
+            (
+                "windows-smoke",
+                ci.replacen(
+                    WINDOWS_SMOKE_BOUND,
+                    &WINDOWS_SMOKE_BOUND.replacen("      CARGO_PROFILE_DEV_DEBUG: \"0\"\n", "", 1),
+                    1,
+                ),
+            ),
+            (
+                "integration",
+                ci.replacen(
+                    INTEGRATION_BOUND,
+                    &INTEGRATION_BOUND.replacen("      CARGO_INCREMENTAL: \"0\"\n", "", 1),
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                !job_pins_intermediate_state_bound(&drift, job)
+                    .expect("drifted job is extractable"),
+                "{job} must be rejected once it loses part of the bound"
+            );
+        }
+    }
+
+    /// The occurrence-count check this replaced passed as long as the workflow
+    /// mentioned each setting three times, so moving the bound off a job that
+    /// needs it and onto one that does not went undetected.
+    #[test]
+    fn intermediate_state_bound_rejects_a_bound_moved_to_another_job() {
+        let ci = checked_in_ci_workflow();
+        let rust_job = "  rust:\n    runs-on: ubuntu-24.04\n    steps:\n";
+        assert_eq!(ci.matches(rust_job).count(), 1);
+        let drift = ci
+            .replacen(
+                WINDOWS_SMOKE_BOUND,
+                "      # target was observed at 12.6 GB with debuginfo included.\n",
+                1,
+            )
+            .replacen(
+                rust_job,
+                concat!(
+                    "  rust:\n",
+                    "    runs-on: ubuntu-24.04\n",
+                    "    env:\n",
+                    "      CARGO_INCREMENTAL: \"0\"\n",
+                    "      CARGO_PROFILE_DEV_DEBUG: \"0\"\n",
+                    "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n",
+                    "    steps:\n",
+                ),
+                1,
+            );
+        assert_ne!(drift, ci, "drift mutation must change the workflow");
+        for setting in super::INTERMEDIATE_STATE_BOUND {
+            assert_eq!(
+                drift.matches(setting).count(),
+                ci.matches(setting).count(),
+                "the mutation must preserve the workflow-wide occurrence count"
+            );
+        }
+        assert!(
+            !job_pins_intermediate_state_bound(&drift, "windows-smoke")
+                .expect("drifted windows-smoke job is extractable"),
+            "windows-smoke must be rejected once its bound moves to another job"
+        );
+    }
 }

@@ -27,7 +27,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep separate from compiler-precise-hostile (different cargo profile / env).
-          key: rust
+          # rust-cache's key does not account for profile settings in the workspace
+          # Cargo.toml (e.g. [profile.dev.package."*"]), only Cargo.lock and env/rustc
+          # inputs. If that profile config changes, an unhashed key restores the old,
+          # differently-optimized artifacts, cargo rebuilds all of them anyway, and
+          # since the key still counts as a full match the rebuilt artifacts are never
+          # saved back - every run after that pays the same full rebuild. Hashing
+          # Cargo.toml here forces a new cache entry whenever the profile changes.
+          key: rust-${{ hashFiles('Cargo.toml') }}
       - name: Install the compiler-precise Linux namespace boundary
         run: |
           sudo apt-get update
@@ -118,7 +125,8 @@ jobs:
         if: steps.decide.outputs.run == 'true'
         with:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
-          key: compiler-precise-hostile
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: compiler-precise-hostile-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.decide.outputs.run == 'true'
         with:
@@ -199,6 +207,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # rust-cache only restores/saves build artifacts, not measurements,
+          # so it has no effect on the benchmark numbers gated below.
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: benchmark-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -243,9 +257,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
-      # This job repeatedly rebuilds the rust-analyzer-heavy debug graph before
-      # its isolated release package. Bound intermediate state so the hosted
-      # runner cannot exhaust its fixed disk before Rust semantic verification.
+      # This job builds the rust-analyzer-heavy debug graph and then the release
+      # package on one runner without reclaiming target/ in between. Keep the
+      # intermediate state bounded (no incremental artifacts, no debug symbols)
+      # and watch the hosted runner's fixed disk via the "Report runner disk"
+      # steps below.
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -253,6 +269,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Separate from rust / compiler-precise-hostile and from the other
+          # matrix leg: the Linux leg pins RUSTFLAGS=-C linker-features=-lld and
+          # both legs build with CARGO_INCREMENTAL=0 and debug symbols off.
+          # rust-cache also hashes RUSTFLAGS and every CARGO_* env into its key,
+          # so those bounds can never be served from another job's cache.
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          # The gates below run for 30+ minutes; keep the dependency artifacts
+          # when a gate fails so the rerun does not start from a cold cache.
+          cache-on-failure: true
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -276,6 +304,11 @@ jobs:
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
         run: cargo test -p depgraph-core --lib --locked daemon::tests
+      - name: Report runner disk before the integration build
+        shell: bash
+        run: |
+          df -h
+          du -sh target 2>/dev/null || echo "target directory is absent"
       - run: cargo xtask build
       - name: Web semantic import/type/call end-to-end and deterministic export
         shell: bash
@@ -682,25 +715,45 @@ jobs:
           test ! -e "$fixture/BUILD_SCRIPT_EXECUTED"
           test ! -e "$fixture/PROC_MACRO_EXECUTED"
           test ! -e "$fixture/CONFIG_EXECUTED"
-      - name: Reclaim integration build artifacts before the isolated Rust semantic gate
-        run: cargo clean
       - name: Rust HIR semantic query, export, and determinism gate
         run: cargo xtask rust-semantic-e2e
-      - name: Reclaim integration build artifacts before the isolated package gate
-        run: cargo clean
+      - name: Report runner disk after the Rust semantic gate
+        if: always()
+        shell: bash
+        run: |
+          df -h
+          du -sh target 2>/dev/null || echo "target directory is absent"
       - name: Packaged semantic and cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
+      - name: Report runner disk after the package gate
+        if: always()
+        shell: bash
+        run: |
+          df -h
+          du -sh target 2>/dev/null || echo "target directory is absent"
 
   windows-smoke:
     needs: [rust, go, web]
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
+    env:
+      # This job builds debug then release on one runner without reclaiming
+      # target/ in between (no `cargo clean`). Keep the intermediate state
+      # bounded (no incremental artifacts, no debug symbols): the Windows
+      # target was observed at 12.6 GB with debuginfo included.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # See the `rust` job above for why Cargo.toml is hashed into the key.
+          key: windows-smoke-${{ hashFiles('Cargo.toml') }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -712,6 +765,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
+      - name: Report runner disk before the smoke build
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
@@ -723,6 +785,16 @@ jobs:
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
       - run: cargo xtask build
+      - name: Report runner disk after the smoke build
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Release metadata and LF-normalized project licenses
         run: cargo test -p xtask --locked repository_release_metadata_is_synchronized
       - name: TypeScript compiler failure lifecycle
@@ -732,12 +804,20 @@ jobs:
       - run: target\debug\depgraph-rust-worker.exe --version
       - run: workers\go\bin\depgraph-go-worker.exe --version
       - run: node workers\web\dist\worker.mjs --version
-      - name: Reclaim smoke build artifacts before the isolated package gate
-        run: cargo clean
       - name: Packaged cross-adapter Build Evidence archive gate
         env:
           DEPGRAPH_TARGET: x86_64-pc-windows-msvc
         run: cargo xtask package
+      - name: Report runner disk after the package gate
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+          if (Test-Path target) {
+            "{0:N2} GB" -f ((Get-ChildItem target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1GB)
+          } else {
+            "target directory is absent"
+          }
       - name: Web TypeChecker import, type-use, and exact-call graph smoke
         shell: pwsh
         run: |

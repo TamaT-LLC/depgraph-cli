@@ -68,6 +68,11 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 zeroize = "1.9"
 walkdir = "2.5"
 
+# 依存クレートだけ最適化する。sha2 と ra_ap_* が無最適化だと桁違いに遅く、
+# rust worker のテストが 15 倍遅くなるため。自前クレートはデバッグのまま。
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

@@ -1,6 +1,6 @@
 use crate::{
-    CancellationToken, Config, ScanCacheMode, ScanOutcome, acquire_store_writer_lock,
-    run_scan_with_cache_mode_and_cancellation, runtime_session_delta,
+    CancellationToken, Config, ScanCacheMode, ScanOutcome, StoreLockGuard,
+    acquire_store_writer_lock, run_scan_with_cache_mode_and_cancellation, runtime_session_delta,
     runtime_trace::runtime_trace_identity,
     scan::{
         DeferredScanOperation, DeferredScanOperationIdentity, PendingScanPromotion,
@@ -56,8 +56,10 @@ pub enum DeferredScanServiceOutcome {
 }
 
 pub struct DeferredScanCompletion {
-    _writer: std::fs::File,
+    // Fields drop in declaration order: close the SQLite connection before
+    // the writer guard releases store exclusion.
     store: Store,
+    _writer: StoreLockGuard,
     outcome: ScanServiceOutcome,
     promotion: PendingScanPromotion,
     operation_id: Option<String>,
@@ -123,7 +125,7 @@ impl DeferredScanCompletion {
 
     /// Cancel the staged scan while retaining the writer exclusion guard for
     /// a caller that must durably terminalize related state before unlock.
-    pub fn cancel_with_writer_guard(mut self) -> DepgraphServiceResult<std::fs::File> {
+    pub fn cancel_with_writer_guard(mut self) -> DepgraphServiceResult<StoreLockGuard> {
         self.cancel_store()?;
         Ok(self._writer)
     }
@@ -317,8 +319,10 @@ pub struct DeferredScanRecovery<'a> {
 }
 
 pub struct DeferredRuntimeImportCompletion {
-    _writer: std::fs::File,
+    // Fields drop in declaration order: close the SQLite connection before
+    // the writer guard releases store exclusion.
     store: Store,
+    _writer: StoreLockGuard,
     operation_id: String,
     outcome: RuntimeImportServiceOutcome,
 }
@@ -351,7 +355,7 @@ impl DeferredRuntimeImportCompletion {
 
     /// Cancel this operation's staged runtime import while retaining the
     /// writer exclusion guard until the caller durably terminalizes it.
-    pub fn cancel_with_writer_guard(mut self) -> DepgraphServiceResult<std::fs::File> {
+    pub fn cancel_with_writer_guard(mut self) -> DepgraphServiceResult<StoreLockGuard> {
         let released = self
             .store
             .cancel_runtime_session_import_for_operation(
@@ -681,7 +685,7 @@ impl DepgraphService {
         session_id: &str,
         trace_digest: &str,
         operation_id: &str,
-    ) -> DepgraphServiceResult<std::fs::File> {
+    ) -> DepgraphServiceResult<StoreLockGuard> {
         self.require_store_write()?;
         let writer = acquire_store_writer_lock(self.config().store_path())
             .map_err(|_| DepgraphServiceError::StoreWriterConflict)?;
@@ -703,7 +707,7 @@ impl DepgraphService {
     pub fn cancel_staged_runtime_import_for_operation(
         &self,
         operation_id: &str,
-    ) -> DepgraphServiceResult<std::fs::File> {
+    ) -> DepgraphServiceResult<StoreLockGuard> {
         self.require_store_write()?;
         let writer = acquire_store_writer_lock(self.config().store_path())
             .map_err(|_| DepgraphServiceError::StoreWriterConflict)?;
@@ -907,7 +911,7 @@ impl DepgraphService {
     pub fn cancel_deferred_scan_for_operation(
         &self,
         operation_id: &str,
-    ) -> DepgraphServiceResult<std::fs::File> {
+    ) -> DepgraphServiceResult<StoreLockGuard> {
         self.require_store_write()?;
         let writer = acquire_store_writer_lock(self.config().store_path())
             .map_err(|_| DepgraphServiceError::StoreWriterConflict)?;
