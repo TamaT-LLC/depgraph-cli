@@ -3139,47 +3139,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn store_lock_guard_drop_releases_lock_while_child_processes_are_spawned() -> Result<()> {
-        // Enough drop/reacquire rounds that a close-on-drop release would
-        // collide with a concurrently inherited descriptor with near certainty.
-        const REACQUISITION_ROUNDS: usize = 2_000;
-
+    fn store_lock_guard_drop_releases_lock_while_a_duplicated_descriptor_is_open() -> Result<()> {
         let root = tempfile::tempdir()?;
         let store_path = root.path().join("graph.db");
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawned = Arc::new(AtomicUsize::new(0));
-        let spawner = {
-            let stop = Arc::clone(&stop);
-            let spawned = Arc::clone(&spawned);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if std::process::Command::new("true").status().is_ok() {
-                        spawned.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-        };
+        let held = acquire_store_writer_lock(&store_path)?;
 
-        let reacquisitions = (|| -> Result<()> {
-            for _ in 0..REACQUISITION_ROUNDS {
-                let held = acquire_store_writer_lock(&store_path)?;
-                // Drop without calling unlock(): the guard alone must release
-                // the lock even while a child holds a duplicated descriptor.
-                drop(held);
-                let reacquired = acquire_store_writer_lock(&store_path)
-                    .context("reacquisition immediately after drop failed")?;
-                drop(reacquired);
-            }
-            Ok(())
-        })();
-        stop.store(true, Ordering::Relaxed);
-        spawner.join().expect("child spawner thread panicked");
+        // A dup'd descriptor shares the open file description, and therefore
+        // the flock, exactly like a descriptor a forked child inherits before
+        // exec. Keeping it open models a concurrently spawned child process
+        // without relying on scheduling: with close-on-drop alone the lock
+        // would stay held through this clone and the reacquisition below would
+        // fail with WouldBlock.
+        let inherited = held.file.try_clone()?;
 
-        reacquisitions?;
-        assert!(
-            spawned.load(Ordering::Relaxed) > 0,
-            "no child process was spawned, so the test exercised nothing"
-        );
+        // Drop without calling unlock(): the guard alone must release the lock.
+        drop(held);
+        let reacquired = acquire_store_writer_lock(&store_path)
+            .context("reacquisition immediately after drop failed")?;
+
+        drop(inherited);
+        drop(reacquired);
         Ok(())
     }
 }
