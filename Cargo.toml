@@ -68,6 +68,22 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 zeroize = "1.9"
 walkdir = "2.5"
 
+# 依存クレートだけ最適化する。sha2 と ra_ap_* が無最適化だと桁違いに遅く、
+# rust worker のテストが 15 倍遅くなるため。自前クレートはデバッグのまま。
+[profile.dev.package."*"]
+opt-level = 2
+
+# ただし Store の SQLite だけは無最適化のまま据え置く。ここを速くすると
+# depgraph-operation の store writer lock を drop 直後に取り直す経路が
+# StoreWriterConflict で落ちる（runner::tests の expired_staged_scan_* と
+# p1c_concurrent_purge_* が再現）。rust worker は rusqlite に依存しないので
+# 上の高速化はそのまま効く。
+[profile.dev.package.libsqlite3-sys]
+opt-level = 0
+
+[profile.dev.package.rusqlite]
+opt-level = 0
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
