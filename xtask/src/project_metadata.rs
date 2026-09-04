@@ -273,12 +273,7 @@ pub(crate) fn verify_workflow_policy_text(
                 || workflow.matches("CARGO_INCREMENTAL: \"0\"").count() != 2
                 || workflow.matches("CARGO_PROFILE_DEV_DEBUG: \"0\"").count() != 2
                 || workflow.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count() != 2
-                || workflow
-                    .matches(
-                        "Reclaim integration build artifacts before the isolated Rust semantic gate",
-                    )
-                    .count()
-                    != 1
+                || !integration_job_pins_resource_policy(workflow)?
                 || top_permissions != ["contents: read"]
                 || contains_expression_context(workflow, "secrets")
                 || !write_permissions.is_empty()
@@ -426,6 +421,39 @@ pub(crate) fn verify_workflow_policy_text(
         }
     }
     Ok(())
+}
+
+/// The integration job builds the debug graph and then the release package on
+/// one hosted runner without `cargo clean` in between. Its resource policy is a
+/// matrix-scoped `Swatinem/rust-cache` entry, so the `-lld` Linux leg and the
+/// incremental/debug bounds never share a cache with `rust` or
+/// `compiler-precise-hostile`, plus disk reports around the heaviest gates so a
+/// disk regression shows up in the log instead of as an opaque build failure.
+fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
+    let integration = workflow_job_block(workflow, "integration")?;
+    let steps = integration.split("\n      - ").skip(1).collect::<Vec<_>>();
+    let cache_steps = steps
+        .iter()
+        .filter(|step| step.starts_with("uses: Swatinem/rust-cache@"))
+        .collect::<Vec<_>>();
+    let [cache_step] = cache_steps.as_slice() else {
+        return Ok(false);
+    };
+    if !cache_step.contains("\n          key: integration-${{ matrix.target }}\n") {
+        return Ok(false);
+    }
+    let disk_reports = [
+        "name: Report runner disk before the integration build\n",
+        "name: Report runner disk after the Rust semantic gate\n",
+        "name: Report runner disk after the package gate\n",
+    ];
+    Ok(disk_reports.iter().all(|header| {
+        steps
+            .iter()
+            .filter(|step| step.starts_with(header) && step.contains("\n          df -h\n"))
+            .count()
+            == 1
+    }))
 }
 
 fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
@@ -2561,4 +2589,61 @@ fn quoted_assignment(source: &str, name: &str) -> Option<String> {
                 .to_owned()
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use super::integration_job_pins_resource_policy;
+
+    fn checked_in_ci_workflow() -> String {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask lives directly under the workspace root");
+        fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml is readable")
+    }
+
+    #[test]
+    fn integration_resource_policy_accepts_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        assert!(integration_job_pins_resource_policy(&ci).expect("integration job is extractable"));
+    }
+
+    #[test]
+    fn integration_resource_policy_rejects_cache_and_disk_report_drift() {
+        let ci = checked_in_ci_workflow();
+        let cache_key = "          key: integration-${{ matrix.target }}\n";
+        assert_eq!(ci.matches(cache_key).count(), 1);
+        for drift in [
+            ci.replacen(cache_key, "          key: rust\n", 1),
+            ci.replacen(
+                "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n",
+                "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n        with:\n          cache-all-crates: false\n",
+                1,
+            )
+            .replacen(cache_key, "", 1),
+            ci.replacen(
+                "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
+                "",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the Rust semantic gate\n",
+                "      - name: Report disk after the Rust semantic gate\n",
+                1,
+            ),
+            ci.replacen(
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          df -h\n",
+                "      - name: Report runner disk after the package gate\n        if: always()\n        shell: bash\n        run: |\n          echo skipped\n",
+                1,
+            ),
+        ] {
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                !integration_job_pins_resource_policy(&drift).expect("drifted integration job is extractable"),
+                "drifted integration resource policy must be rejected"
+            );
+        }
+    }
 }
