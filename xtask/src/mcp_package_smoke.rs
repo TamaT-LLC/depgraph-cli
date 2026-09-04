@@ -573,7 +573,7 @@ pub fn verify(
         &requirement,
         &documented_profiles,
     )?;
-    let tool_schema_sha256 = sha256_file(&extracted.join(TOOL_SCHEMA_PATH))?;
+    let tool_schema_sha256 = crate::sha256_file(&extracted.join(TOOL_SCHEMA_PATH))?;
     let report = McpPackageSmokeReport {
         schema_version: MCP_PACKAGE_SMOKE_SCHEMA_VERSION.to_owned(),
         target: target.to_owned(),
@@ -1076,7 +1076,7 @@ fn private_store_state(store: &Path) -> Result<BTreeMap<String, String>> {
         let identity = if name.ends_with("-shm") {
             format!("sqlite-read-coordination-bytes:{}", metadata.len())
         } else {
-            sha256_file(&entry.path())?
+            crate::sha256_file(&entry.path())?
         };
         state.insert(name, identity);
     }
@@ -1862,7 +1862,7 @@ fn create_release_evidence(
                     .and_then(|name| name.to_str())
                     .context("release-evidence fixture filename is not UTF-8")?
                     .to_owned(),
-                (fs::metadata(path)?.len(), sha256_file(path)?),
+                (fs::metadata(path)?.len(), crate::sha256_file(path)?),
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -1944,7 +1944,7 @@ fn create_release_evidence(
     let mut bytes = serde_json::to_vec_pretty(&evidence)?;
     bytes.push(b'\n');
     fs::write(&path, bytes)?;
-    let digest = sha256_file(&path)?;
+    let digest = crate::sha256_file(&path)?;
     Ok((path, digest))
 }
 
@@ -2014,23 +2014,6 @@ fn canonical_sha256(value: &Value) -> String {
     hex::encode(Sha256::digest(
         depgraph_protocol::canonical_json(value).as_bytes(),
     ))
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut input =
-        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(hex::encode(digest.finalize()))
 }
 
 fn lowercase_sha256(value: &str) -> bool {
