@@ -5434,11 +5434,15 @@ mod tests {
                 1,
             ),
             ci.replacen(
-                "          key: integration-${{ matrix.target }}\n",
-                "          key: rust\n",
+                "Reclaim integration build artifacts before the isolated Rust semantic gate",
+                "Do not reclaim integration artifacts before Rust semantic verification",
                 1,
             ),
         ] {
+            assert_ne!(
+                linker_policy_drift, ci,
+                "workflow drift fixture must mutate the checked-in workflow"
+            );
             assert!(
                 verify_workflow_policy_text(
                     "ci.yml",
