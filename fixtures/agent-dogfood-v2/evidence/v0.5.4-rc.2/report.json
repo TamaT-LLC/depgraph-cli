@@ -1,0 +1,527 @@
+{
+  "aggregates": {
+    "baseline": {
+      "accuracy_percent_median": 0,
+      "accuracy_percent_samples": [
+        0,
+        0,
+        0
+      ],
+      "candidate_or_unresolved_as_exact": 0,
+      "effective_tokens_median": 27061,
+      "effective_tokens_samples": [
+        11006,
+        27061,
+        42477
+      ],
+      "elapsed_ms_median": 52164,
+      "elapsed_ms_samples": [
+        34460,
+        52164,
+        86433
+      ],
+      "false_exact_claims": 0,
+      "major_recall_percent_median": 0,
+      "major_recall_percent_samples": [
+        0,
+        0,
+        0
+      ],
+      "samples": 3,
+      "setup_successes": 3,
+      "tokens_available": true,
+      "tool_calls_median": 5,
+      "tool_calls_samples": [
+        0,
+        5,
+        8
+      ],
+      "tool_result_bytes_median": 7100,
+      "tool_result_bytes_samples": [
+        0,
+        7724,
+        7100
+      ],
+      "total_tokens_median": 143285,
+      "total_tokens_samples": [
+        40190,
+        143285,
+        216301
+      ],
+      "typed_failures": {
+        "agent_misuse": 0,
+        "excessive_context": 0,
+        "host_failure": 0,
+        "setup_blocker": 0,
+        "tool_or_schema_missing": 0
+      }
+    },
+    "mcp": {
+      "accuracy_percent_median": 100,
+      "accuracy_percent_samples": [
+        100,
+        100,
+        100
+      ],
+      "candidate_or_unresolved_as_exact": 0,
+      "effective_tokens_median": 89808,
+      "effective_tokens_samples": [
+        141496,
+        67128,
+        89808
+      ],
+      "elapsed_ms_median": 191071,
+      "elapsed_ms_samples": [
+        198152,
+        191071,
+        190644
+      ],
+      "false_exact_claims": 0,
+      "major_recall_percent_median": 100,
+      "major_recall_percent_samples": [
+        100,
+        100,
+        100
+      ],
+      "samples": 3,
+      "setup_successes": 3,
+      "tokens_available": true,
+      "tool_calls_median": 25,
+      "tool_calls_samples": [
+        24,
+        25,
+        25
+      ],
+      "tool_result_bytes_median": 154368,
+      "tool_result_bytes_samples": [
+        154334,
+        154503,
+        154368
+      ],
+      "total_tokens_median": 1516216,
+      "total_tokens_samples": [
+        1516216,
+        1180472,
+        1562576
+      ],
+      "typed_failures": {
+        "agent_misuse": 0,
+        "excessive_context": 0,
+        "host_failure": 0,
+        "setup_blocker": 0,
+        "tool_or_schema_missing": 0
+      }
+    }
+  },
+  "benchmark_id": "depgraph-agent-dogfood-v2",
+  "gate": {
+    "checks": [
+      {
+        "actual": "100",
+        "name": "mcp_accuracy_each_sample",
+        "passed": true,
+        "threshold": ">=90"
+      },
+      {
+        "actual": "100",
+        "name": "mcp_major_recall_each_sample",
+        "passed": true,
+        "threshold": ">=100"
+      },
+      {
+        "actual": "0",
+        "name": "mcp_false_exact_claims",
+        "passed": true,
+        "threshold": "<=0"
+      },
+      {
+        "actual": "0",
+        "name": "mcp_candidate_or_unresolved_as_exact",
+        "passed": true,
+        "threshold": "<=0"
+      },
+      {
+        "actual": "3",
+        "name": "baseline_setup_successes",
+        "passed": true,
+        "threshold": ">=3"
+      },
+      {
+        "actual": "3",
+        "name": "mcp_setup_successes",
+        "passed": true,
+        "threshold": ">=3"
+      },
+      {
+        "actual": "3/3",
+        "name": "mcp_required_tools_each_sample",
+        "passed": true,
+        "threshold": "3/3"
+      },
+      {
+        "actual": "100/0",
+        "name": "mcp_accuracy_not_below_baseline",
+        "passed": true,
+        "threshold": ">=1"
+      },
+      {
+        "actual": "25",
+        "name": "mcp_median_tool_calls",
+        "passed": true,
+        "threshold": "<=32"
+      },
+      {
+        "actual": "154368",
+        "name": "mcp_median_tool_result_bytes",
+        "passed": true,
+        "threshold": "<=327680"
+      },
+      {
+        "actual": "191071",
+        "name": "mcp_median_elapsed_ms",
+        "passed": true,
+        "threshold": "<=240000"
+      },
+      {
+        "actual": "89808",
+        "name": "mcp_median_effective_tokens",
+        "passed": true,
+        "threshold": "<=100000"
+      },
+      {
+        "actual": "6",
+        "name": "read_only_safety",
+        "passed": true,
+        "threshold": "6/6"
+      },
+      {
+        "actual": "true",
+        "name": "packaged_disconnect_reconnect",
+        "passed": true,
+        "threshold": "true"
+      }
+    ],
+    "efficiency_ratios": {
+      "elapsed_ms": 3.6629,
+      "token_metric": "host_effective_usage",
+      "tool_calls": 5,
+      "tool_result_bytes": 21.742,
+      "total_tokens": 3.3187
+    },
+    "passed": true
+  },
+  "generated_at": "2026-09-05T01:24:59.435Z",
+  "host": {
+    "approval_policy": "never",
+    "architecture": "arm64",
+    "cli_version": "codex-cli 0.150.1",
+    "maximum_tool_calls": 32,
+    "mcp_enabled_tools": [
+      "agent_edges_list",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "agent_node_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list",
+      "health_summary_get"
+    ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "agent_node_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list"
+    ],
+    "model": "gpt-5.6-terra",
+    "platform": "darwin",
+    "program": "codex",
+    "reasoning_effort": "medium",
+    "samples_per_arm": 3,
+    "sandbox": "read-only",
+    "timeout_ms": 300000
+  },
+  "inputs": {
+    "answer_schema_sha256": "5bd30fe69234c3d4d9fea71be0fcb9ba6a424eef07502d1b2c1c6b5006b8bca9",
+    "environment": {
+      "bytes": 1831,
+      "path": "environment.json",
+      "sha256": "adc0e48b3f240a843b2a63bfc88c04047a3bc0ccf4253eb311751774464c96f6"
+    },
+    "prompt_sha256": "de86e6b259b8ee72e6250d2c88c7a1d37f738335a01165d60af15ecb5fa5f995",
+    "safety_schema_sha256": "4e3d00f6c6c8883be5e7de6bf6d999a0c1cc00b928ed211d7586fc8e770e0016",
+    "spec_sha256": "17794567d5978b470f1aba44a778b2b6a568495a285de2c356f286a5c636f131"
+  },
+  "issue": 436,
+  "release": {
+    "archive_sha256": "1580b9abfde117aa805099dee4c299e93c1596f1366f64dc5ec8e305822a40d4",
+    "compiler_pack_archive_sha256": "720dfdc01ed1bb77ac88cdc53d07a9f5367fffbe4fe8b4ff3cd522a20082fbff",
+    "compiler_pack_requirement_sha256": "25230dda5c103d530cc1bfc4b6d1965bb25f4382a102730800780909c94b6fe4",
+    "depgraph_sha256": "f6c1d02d658386e37d465d81db83ba4bd6809a96b3c1125ae59fc460ac27e697",
+    "manifest_sha256": "a3973e778575cad6e3b4779317d2a5d40e02e9d89fbc3ca0a23036a6905b800e",
+    "mcp_binary_sha256": "7cf92537320801d26387812275bb686e408755a3e7e266c17376aed96e5ffb44",
+    "mcp_smoke_sha256": "05f405054b8ae093a808ef262b888c28c1e24e5b5fd02a5eecd08585c56022ba",
+    "tag": "v0.5.4-rc.2",
+    "target": "aarch64-apple-darwin"
+  },
+  "repository": {
+    "baseline_commit": "31cfed0b0fd1363f9c761b603cec3566bfaec351",
+    "baseline_tree": "1fcafe9ccaa4abcaaac2f7a090231c9d4022458e",
+    "candidate_commit": "68aed98d66585c0abcd7ffbedccad347cb4d3fae",
+    "candidate_tree": "e3eee24d660680c025a2fee4ae176007014c6979",
+    "sparse_paths": [
+      "/Cargo.lock",
+      "/Cargo.toml",
+      "/crates/depgraph-cli/Cargo.toml",
+      "/crates/depgraph-cli/src/main.rs",
+      "/crates/depgraph-mcp-tools/Cargo.toml",
+      "/crates/depgraph-mcp-tools/src/catalog.rs",
+      "/crates/depgraph-mcp-tools/src/host_config.rs",
+      "/crates/depgraph-mcp-tools/src/lib.rs",
+      "/crates/depgraph-mcp/Cargo.toml",
+      "/crates/depgraph-mcp/src/main.rs",
+      "/workers/go/cmd/depgraph-go-worker/main.go",
+      "/workers/go/go.mod",
+      "/workers/go/internal/worker/scan.go",
+      "/workers/web/package.json",
+      "/workers/web/src/dogfood/unused-health-probe.ts",
+      "/workers/web/src/imports.ts",
+      "/workers/web/src/scanner.ts",
+      "/workers/web/src/typescript-compiler.ts",
+      "/workers/web/src/typescript-dependencies.ts",
+      "/workers/web/src/typescript-dependency-validation.ts",
+      "/workers/web/src/worker.ts"
+    ]
+  },
+  "safety_baseline": {
+    "daemon_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "journal_sha256": "15df9ae7a75ab8383c84066c9d5e326ba7ef18f1c60655026d3a89be2b7564b9",
+    "relevant_processes": 0,
+    "source_sha256": "1d2a15c85d8d4c2d08fc3e997d8180545a0d357220d2571ac42aab22df2d8ecf",
+    "store_sha256": "19ad8d91804e22f412675af140e0ca849fcc304b68429489b53600ae939bc698"
+  },
+  "samples": [
+    {
+      "answer": {
+        "bytes": 3503,
+        "path": "baseline-1.answer.json",
+        "sha256": "33f9b1ebe10734a13e9fb1c6fecfb1c98058d1412157389151767905d0692c83"
+      },
+      "host_output": {
+        "bytes": 2649,
+        "path": "baseline-1.last-message.txt",
+        "sha256": "3427123eca125723170e7b02633a4c3dc9495351285ae174ff6260dd6883d28f"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-1.safety.json",
+        "sha256": "b16fa7f5fd9c4ee742045db034c9f0bfde633c9a69b8f11f468104f97b718623"
+      },
+      "sample": {
+        "bytes": 4406,
+        "path": "baseline-1.sample.json",
+        "sha256": "9017c10664af8cf4449598118dc26b13d5d85e31338c0ab101d0faf3894ae7d0"
+      },
+      "sample_id": "baseline-1",
+      "trace": {
+        "bytes": 6281,
+        "path": "baseline-1.trace.jsonl",
+        "sha256": "aa0d3b470799bbd34b82f3c452a470391afb848a30f5277599dd6ba2df2ce538"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 3648,
+        "path": "baseline-2.answer.json",
+        "sha256": "ca1a53e843c4c8d211052a4142734aa8f8941f37fbd79fbcb141ce721f42547e"
+      },
+      "host_output": {
+        "bytes": 2794,
+        "path": "baseline-2.last-message.txt",
+        "sha256": "f32b9eaeccf5dca1a1468cce32b862a44b9ac34d80725a6b9827437d9f605d06"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-2.safety.json",
+        "sha256": "43af959e889f1849b8e02978a6a0de04640e37264647868344a19041f89c60b3"
+      },
+      "sample": {
+        "bytes": 4413,
+        "path": "baseline-2.sample.json",
+        "sha256": "2a8d9ddbf4167c6f87e48ebeeb180b1c82e86c5302cdd8f78d42d380d4145c1d"
+      },
+      "sample_id": "baseline-2",
+      "trace": {
+        "bytes": 16670,
+        "path": "baseline-2.trace.jsonl",
+        "sha256": "745d3d86a53cf9e756ea550e44fadc5c78e2adbee1b0d9ef29f9003e6ce72ed6"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 4407,
+        "path": "baseline-3.answer.json",
+        "sha256": "8fe5845ea938eb25405015aaf33b3da37059f1a3e8db03584baead01504ef7a6"
+      },
+      "host_output": {
+        "bytes": 3553,
+        "path": "baseline-3.last-message.txt",
+        "sha256": "c324ad2b5008b37d0271412b161b337d927056a78c314763961df222a4aa96a5"
+      },
+      "safety": {
+        "bytes": 1084,
+        "path": "baseline-3.safety.json",
+        "sha256": "0fb50ca5173de47229acf6fc6ddded3f622ba86df2f1a2c26e84612b80986f6a"
+      },
+      "sample": {
+        "bytes": 4413,
+        "path": "baseline-3.sample.json",
+        "sha256": "572bc322371073b21b257b6601ef1193f7a224b1110dd592d9e4227f25cea6ea"
+      },
+      "sample_id": "baseline-3",
+      "trace": {
+        "bytes": 21817,
+        "path": "baseline-3.trace.jsonl",
+        "sha256": "30e9d936aec2ee0ee271f4bac454726e7e370297259479e3f7fd3a648a22dd31"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 6846,
+        "path": "mcp-1.answer.json",
+        "sha256": "c22e9f7f2fb5d5ac4aa3d82b3d694c6ddae7da591bbdc06064994a81e2c990db"
+      },
+      "host_output": {
+        "bytes": 5227,
+        "path": "mcp-1.last-message.txt",
+        "sha256": "6ec21e81bb9c7229e010f92b21dc418aa89a1596b19c5f3434fffa9cf08a0819"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-1.safety.json",
+        "sha256": "258f1bc8c0d554a6f7ab68b7e4e9fd5c7b05a05a88bdb697bd2982ae72ebd995"
+      },
+      "sample": {
+        "bytes": 4511,
+        "path": "mcp-1.sample.json",
+        "sha256": "0400e3406f31d4fa1d484889938647736777fea23cfd46a7f53e2a5a0628c5b8"
+      },
+      "sample_id": "mcp-1",
+      "trace": {
+        "bytes": 180869,
+        "path": "mcp-1.trace.jsonl",
+        "sha256": "dc07a34d397f2797380dcadf2dace16f02d50c32f6b67881b110a8bd224bd6e0"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 6935,
+        "path": "mcp-2.answer.json",
+        "sha256": "4cf9fb3c3338cf72f7b2423084b0f8da451a2cffaeeb2ed4707dd352e6f97a1e"
+      },
+      "host_output": {
+        "bytes": 5316,
+        "path": "mcp-2.last-message.txt",
+        "sha256": "092307a094de4d811321a20fb330b96d2f7b77a28f70a79ac6639a1a8c9730a3"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-2.safety.json",
+        "sha256": "8c7c02aee3de92cc34fd89a44bcc0fc6afa49f3f2ccf6889dbf5176832d629a1"
+      },
+      "sample": {
+        "bytes": 4510,
+        "path": "mcp-2.sample.json",
+        "sha256": "0ad4d0b3897e166230ee41ef60fb19f465717580bad49f2c7141119af640fe91"
+      },
+      "sample_id": "mcp-2",
+      "trace": {
+        "bytes": 182564,
+        "path": "mcp-2.trace.jsonl",
+        "sha256": "946d3691204daf5df6e12dcf12610dc961c5f85c927132313c983a09f38eb45b"
+      }
+    },
+    {
+      "answer": {
+        "bytes": 6818,
+        "path": "mcp-3.answer.json",
+        "sha256": "0ba901a078885fa4afeffa13e99694c7fd8e4ce83dd95880ac1135e593b22614"
+      },
+      "host_output": {
+        "bytes": 5199,
+        "path": "mcp-3.last-message.txt",
+        "sha256": "b1406c5f78aaa43dbb48b5fc697ce767fc211a6fb25754937107b7f78d66e8e3"
+      },
+      "safety": {
+        "bytes": 1079,
+        "path": "mcp-3.safety.json",
+        "sha256": "bbdce2ba4b85df86e568f440dbf3af4a496a90dca3916ddecc8321e0331bd02f"
+      },
+      "sample": {
+        "bytes": 4510,
+        "path": "mcp-3.sample.json",
+        "sha256": "1fa7561a70bfcfade5a2280fa127c7140a0556565ab1c041f4353e9a7ad54238"
+      },
+      "sample_id": "mcp-3",
+      "trace": {
+        "bytes": 181548,
+        "path": "mcp-3.trace.jsonl",
+        "sha256": "95bcaef84c8e9b8361545a1c3ded57b1ab9f012cf08c5abfef885f2ac2a98975"
+      }
+    }
+  ],
+  "schema_version": "agent-dogfood-report-v2",
+  "security": {
+    "operation_cancel_denied_code": "CAPABILITY_DENIED",
+    "read_catalog_sha256": "3dd479665ce7eb155e4df770d869cefd7f5141149faf7176d414be9b54b8d565",
+    "safe_scan_project_code_executed": false,
+    "safe_scan_recovered_after_eof": true,
+    "safe_scan_terminal_status": "completed",
+    "schema_version": "mcp-package-smoke-v3",
+    "stdin_eof_clean_exit": true,
+    "stdout_json_rpc_only": true
+  },
+  "snapshots": {
+    "baseline_id": "snapshot:sha256:4c699b113616a038c8951f3ea7323670e66ce4e2d16c037a43e9c7f2f57ef144",
+    "baseline_revision": "31cfed0b0fd1363f9c761b603cec3566bfaec351",
+    "candidate_id": "snapshot:sha256:07be48fd997c1733f103457cf65ce297925e5adc722a8c17d2c7f3e47b85bc74",
+    "candidate_revision": "68aed98d66585c0abcd7ffbedccad347cb4d3fae"
+  },
+  "thresholds": {
+    "maximum_candidate_or_unresolved_as_exact": 0,
+    "maximum_false_exact_claims": 0,
+    "maximum_mcp_median_effective_tokens": 100000,
+    "maximum_mcp_median_elapsed_ms": 240000,
+    "maximum_mcp_median_tool_calls": 32,
+    "maximum_mcp_median_tool_result_bytes": 327680,
+    "minimum_mcp_accuracy_percent": 90,
+    "minimum_mcp_major_recall_percent": 100,
+    "minimum_setup_successes_per_arm": 3,
+    "require_mcp_accuracy_not_below_baseline": true,
+    "require_mcp_tool_contract": true,
+    "require_packaged_reconnect": true,
+    "require_read_only_safety": true
+  },
+  "typed_failures": {
+    "agent_misuse": 0,
+    "excessive_context": 0,
+    "host_failure": 0,
+    "setup_blocker": 0,
+    "tool_or_schema_missing": 0
+  }
+}

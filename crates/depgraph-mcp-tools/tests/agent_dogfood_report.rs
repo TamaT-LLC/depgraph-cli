@@ -74,25 +74,55 @@ fn issue_357_report_and_answers_validate_against_their_closed_schemas() {
 }
 
 #[test]
-fn issue_436_v2_schemas_are_closed_and_pending_spec_has_no_evidence() {
+fn issue_436_v2_pinned_report_answers_and_safety_validate_against_closed_schemas() {
     let root = repository_root();
     let fixture = root.join("fixtures/agent-dogfood-v2");
     let spec = read_json(&fixture.join("spec.json"));
     assert_eq!(spec["schema_version"], "agent-dogfood-spec-v2");
-    assert_eq!(spec["release_status"], "pending");
+    assert_eq!(spec["release_status"], "pinned");
+    assert_eq!(spec["release"]["tag"], "v0.5.4-rc.2");
+
+    let evidence = fixture.join("evidence/v0.5.4-rc.2");
     assert!(
-        !fixture.join("evidence").exists(),
-        "pending v2 spec must not have an evidence directory"
+        evidence.is_dir(),
+        "pinned v2 evidence directory is readable"
     );
+
+    let report_schema = read_json(&root.join("schemas/agent-dogfood-report-v2.schema.json"));
+    assert!(jsonschema::draft202012::meta::is_valid(&report_schema));
+    let report_validator =
+        jsonschema::draft202012::new(&report_schema).expect("v2 report schema compiles");
+    assert_closed_draft202012_schema(&report_schema);
+    let report = read_json(&evidence.join("report.json"));
+    assert!(report_validator.is_valid(&report));
+
+    let mut report_with_unknown_field = report.clone();
+    report_with_unknown_field["unreviewed"] = json!(true);
+    assert!(!report_validator.is_valid(&report_with_unknown_field));
+
+    let mut report_with_duplicate_sample = report.clone();
+    report_with_duplicate_sample["samples"][1] = report_with_duplicate_sample["samples"][0].clone();
+    assert!(!report_validator.is_valid(&report_with_duplicate_sample));
+
+    let mut report_with_duplicate_gate = report.clone();
+    report_with_duplicate_gate["gate"]["checks"][1] =
+        report_with_duplicate_gate["gate"]["checks"][0].clone();
+    assert!(!report_validator.is_valid(&report_with_duplicate_gate));
+
+    let mut report_with_unsafe_artifact = report.clone();
+    report_with_unsafe_artifact["inputs"]["environment"]["path"] = json!("..");
+    assert!(!report_validator.is_valid(&report_with_unsafe_artifact));
 
     let answer_schema = read_json(&fixture.join("answer.schema.json"));
     assert!(jsonschema::draft202012::meta::is_valid(&answer_schema));
-    jsonschema::draft202012::new(&answer_schema).expect("v2 answer schema compiles");
+    let answer_validator =
+        jsonschema::draft202012::new(&answer_schema).expect("v2 answer schema compiles");
     assert_closed_draft202012_schema(&answer_schema);
 
     let safety_schema = read_json(&fixture.join("safety.schema.json"));
     assert!(jsonschema::draft202012::meta::is_valid(&safety_schema));
-    jsonschema::draft202012::new(&safety_schema).expect("v2 safety schema compiles");
+    let safety_validator =
+        jsonschema::draft202012::new(&safety_schema).expect("v2 safety schema compiles");
     assert_closed_draft202012_schema(&safety_schema);
 
     let required = answer_schema["properties"]["claims"]["required"]
@@ -108,5 +138,28 @@ fn issue_436_v2_schemas_are_closed_and_pending_spec_has_no_evidence() {
             required.iter().any(|value| value == claim),
             "v2 answer schema must require {claim}"
         );
+    }
+
+    for arm in ["baseline", "mcp"] {
+        for ordinal in 1..=3 {
+            let sample_id = format!("{arm}-{ordinal}");
+            let answer = read_json(&evidence.join(format!("{sample_id}.answer.json")));
+            assert!(
+                answer_validator.is_valid(&answer),
+                "{sample_id} answer does not match the checked-in v2 schema"
+            );
+            let mut answer_with_unknown_field = answer.clone();
+            answer_with_unknown_field["unreviewed"] = json!(true);
+            assert!(!answer_validator.is_valid(&answer_with_unknown_field));
+
+            let safety = read_json(&evidence.join(format!("{sample_id}.safety.json")));
+            assert!(
+                safety_validator.is_valid(&safety),
+                "{sample_id} safety evidence does not match the checked-in v2 schema"
+            );
+            let mut safety_with_unknown_field = safety.clone();
+            safety_with_unknown_field["unreviewed"] = json!(true);
+            assert!(!safety_validator.is_valid(&safety_with_unknown_field));
+        }
     }
 }

@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -22,9 +24,12 @@ import {
   PENDING_RELEASE_SENTINEL,
   PENDING_SPEC_ERROR,
   REPORT_SCHEMA_VERSION,
+  REPORT_SCHEMA_VERSION_V2,
   SPEC_SCHEMA_VERSION,
   SPEC_SCHEMA_VERSION_V2,
   UNUSED_HEALTH_PROBE_PATH,
+  V2_SPARSE_PATHS,
+  agentShellEnvironmentConfig,
   canonicalJson,
   efficiencyRatio,
   expectedPackagedProductVersion,
@@ -36,15 +41,24 @@ import {
   localGitConfigAllowed,
   materializeDogfoodPrompt,
   mcpToolContractPassed,
+  readSparseCheckoutPaths,
   sanitizedAgentEnvironment,
   scoreAnswer,
   sentDogfoodPromptSha256,
   sourceDigests,
   traceMetrics,
   traceSafety,
+  validateLocalGitConfiguration,
+  validateSparseCheckoutPaths,
+  validateSparseCheckoutMaterialization,
+  validateV2McpTrace,
+  validateV2Trace,
   v2PinnedReleaseAssetNames,
   validateAnswer,
   validateSpec,
+  daemonStateFingerprint,
+  verifyExtractedArchiveClosure,
+  verifyCompilerPackClosure,
   verifyReport,
 } from "../agent-dogfood.mjs";
 
@@ -56,6 +70,19 @@ const v2FixtureDir = join(root, "fixtures/agent-dogfood-v2");
 const v2SpecPath = join(v2FixtureDir, "spec.json");
 const v2Spec = JSON.parse(readFileSync(v2SpecPath, "utf8"));
 const v2Prompt = readFileSync(join(v2FixtureDir, "prompt.md"), "utf8");
+const v2McpTracePath = join(
+  v2FixtureDir,
+  "evidence/v0.5.4-rc.2/mcp-1.trace.jsonl",
+);
+const v2BaselineTracePath = join(
+  v2FixtureDir,
+  "evidence/v0.5.4-rc.2/baseline-1.trace.jsonl",
+);
+const gitVersionOutput = execFileSync("git", ["--version"], { encoding: "utf8" }).trim();
+const gitVersionMatch = /^git version (\d+)\.(\d+)(?:\.\d+)?/u.exec(gitVersionOutput);
+const supportsSparseWorktreeConfig = gitVersionMatch !== null
+  && (Number(gitVersionMatch[1]) > 2
+    || Number(gitVersionMatch[1]) === 2 && Number(gitVersionMatch[2]) >= 37);
 const DUMMY_SHA256 = "ab".repeat(32);
 const DUMMY_OID = "cd".repeat(20);
 const SCRIPT = join(root, "scripts/agent-dogfood.mjs");
@@ -70,6 +97,47 @@ function goldenAnswer() {
     }])),
     failure: { code: "none", task: "", remediation: "" },
   };
+}
+
+function readTraceEvents(path) {
+  return readFileSync(path, "utf8")
+    .trim()
+    .split(/\r?\n/u)
+    .map((line) => JSON.parse(line));
+}
+
+function mcpTraceEvent(events, type, callNumber) {
+  return events
+    .filter((event) => event.type === type && event.item?.type === "mcp_tool_call")
+    [callNumber - 1];
+}
+
+function mcpTraceResult(events, callNumber) {
+  return mcpTraceEvent(events, "item.completed", callNumber)
+    .item.result.structured_content.result;
+}
+
+function serializeTraceEvents(events) {
+  return `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+}
+
+function mutatedV2McpTrace(mutate, options = {}) {
+  const events = readTraceEvents(v2McpTracePath);
+  mutate(events);
+  if (options.synchronizeContent !== false) {
+    for (const event of events) {
+      const result = event.type === "item.completed"
+        && event.item?.type === "mcp_tool_call"
+        ? event.item.result
+        : null;
+      if (
+        result?.content?.length === 1
+        && result.content[0]?.type === "text"
+        && result.structured_content !== undefined
+      ) result.content[0].text = canonicalJson(result.structured_content);
+    }
+  }
+  return serializeTraceEvents(events);
 }
 
 test("Agent dogfood spec fixes identities, samples, budgets, and thresholds", () => {
@@ -272,7 +340,18 @@ test("trace safety fails closed on project or compound shell commands", () => {
   assert.equal(safe.project_code_execution_observed, false);
   assert.match(safe.commands_sha256, /^[0-9a-f]{64}$/u);
   assert.equal(
-    observation("/bin/zsh -c \"sed -n '1,10p' README.md\"")
+    observation("/bin/bash -lc 'git status --short'")
+      .project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'git show HEAD:crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation("/bin/zsh -c \"sed -n '1,10p' crates/depgraph-mcp-tools/src/lib.rs\"")
       .project_code_execution_observed,
     false,
   );
@@ -365,11 +444,90 @@ test("trace safety fails closed on project or compound shell commands", () => {
       .project_code_execution_observed,
     true,
   );
+  assert.equal(
+    observation("/bin/bash -lc 'sed -n 1p /etc/passwd'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git show HEAD:.env'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'git show main:crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git log -p'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git rev-parse --git-dir'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'git diff --no-inde /etc/passwd -- crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg token /etc'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg token ../outside'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg -z token workers/web/src/worker.ts'")
+      .project_code_execution_observed,
+    true,
+  );
+  for (const command of [
+    "rg -if /etc/passwd workers/web/src",
+    "rg -if=/etc/passwd workers/web/src",
+    "rg -if/etc/passwd workers/web/src",
+    "rg -Iif /etc/passwd workers/web/src",
+    "rg -zif /etc/passwd workers/web/src",
+    "rg -. token workers/web/src",
+    "rg -L token workers/web/src",
+    "rg -uu token workers/web/src",
+    "rg -zj1 token workers/web/src",
+  ]) {
+    assert.equal(
+      observation(`/bin/bash -lc '${command}'`).project_code_execution_observed,
+      true,
+      command,
+    );
+  }
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'rg -i -f crates/depgraph-mcp-tools/src/lib.rs workers/web/src'",
+    ).project_code_execution_observed,
+    false,
+  );
 });
 
 test("Agent runs discard external Git and ripgrep execution configuration", () => {
   const environment = sanitizedAgentEnvironment({
     PATH: "/trusted/bin",
+    HOME: "/trusted/home",
+    OPENAI_API_KEY: "host-auth-is-for-codex-only",
+    GH_TOKEN: "must-not-reach-codex",
+    GITHUB_TOKEN: "must-not-reach-codex",
+    AWS_SECRET_ACCESS_KEY: "must-not-reach-codex",
+    BASH_ENV: "/tmp/project-bash-env",
+    ENV: "/tmp/project-shell-env",
+    NODE_OPTIONS: "--require=./project-script",
+    PYTHONPATH: "/tmp/project-python",
     GIT_EXTERNAL_DIFF: "./project-script",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "diff.external",
@@ -378,6 +536,17 @@ test("Agent runs discard external Git and ripgrep execution configuration", () =
     ZDOTDIR: "/tmp/host-zdotdir",
   }, "/tmp/fresh-dogfood-output");
   assert.equal(environment.PATH, "/trusted/bin");
+  assert.equal(environment.HOME, "/trusted/home");
+  assert.equal(environment.OPENAI_API_KEY, "host-auth-is-for-codex-only");
+  for (const key of [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "BASH_ENV",
+    "ENV",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+  ]) assert.equal(environment[key], undefined);
   assert.equal(environment.GIT_EXTERNAL_DIFF, undefined);
   assert.equal(environment.GIT_CONFIG_COUNT, "3");
   assert.equal(environment.GIT_CONFIG_KEY_0, "core.fsmonitor");
@@ -401,6 +570,36 @@ test("Agent runs discard external Git and ripgrep execution configuration", () =
     "include.path",
     "pager.diff",
   ]) assert.equal(localGitConfigAllowed([key]), false);
+  assert.equal(localGitConfigAllowed(["extensions.worktreeconfig"]), false);
+  assert.equal(
+    localGitConfigAllowed(["extensions.worktreeconfig"], {
+      allowSparseCheckout: true,
+    }),
+    true,
+  );
+  assert.equal(
+    localGitConfigAllowed(["core.sparsecheckout"], { allowSparseCheckout: true }),
+    false,
+  );
+});
+
+test("Agent shell commands inherit only the fixed read-only environment", () => {
+  const configs = agentShellEnvironmentConfig("/tmp/fresh-dogfood-output");
+  assert.equal(configs[0], "shell_environment_policy.inherit=\"none\"");
+  for (const expected of [
+    "shell_environment_policy.set.GIT_CONFIG_GLOBAL=\"/dev/null\"",
+    "shell_environment_policy.set.GIT_OPTIONAL_LOCKS=\"0\"",
+    "shell_environment_policy.set.GIT_TERMINAL_PROMPT=\"0\"",
+    "shell_environment_policy.set.HOME=\"/tmp/fresh-dogfood-output\"",
+    "shell_environment_policy.set.PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\"",
+    "shell_environment_policy.set.RIPGREP_CONFIG_PATH=\"/dev/null\"",
+    "shell_environment_policy.set.ZDOTDIR=\"/tmp/fresh-dogfood-output\"",
+  ]) assert.equal(configs.includes(expected), true);
+  assert.equal(configs.some((config) => /TOKEN|BASH_ENV|NODE_OPTIONS/u.test(config)), false);
+  assert.throws(
+    () => agentShellEnvironmentConfig("relative-output"),
+    /absolute raw directory/,
+  );
 });
 
 test("efficiency ratios make a zero baseline explicit", () => {
@@ -437,6 +636,12 @@ test("checked-in six-sample report is the deterministic aggregate", async () => 
     verifyReport({ specPath, rawDir, report: forged }),
     /deterministic aggregate/,
   );
+});
+
+test("checked-in v2 evidence verifies every fixed MCP trace", async () => {
+  const rawDir = join(v2FixtureDir, "evidence/v0.5.4-rc.2");
+  const report = JSON.parse(readFileSync(join(rawDir, "report.json"), "utf8"));
+  assert.equal(await verifyReport({ specPath: v2SpecPath, rawDir, report }), true);
 });
 
 test("raw evidence rejects extra entries and symlink substitution", async (context) => {
@@ -537,6 +742,118 @@ function pinV2Spec(pending, expectedValues = {}) {
   return pinned;
 }
 
+function syntheticCompilerPack(options = {}) {
+  const temporary = mkdtempSync(join(tmpdir(), "depgraph-compiler-pack-"));
+  const pinned = pinV2Spec(v2Spec);
+  const rootName = pinned.release.compiler_pack_archive.name.replace(/\.tar\.gz$/u, "");
+  const compilerRoot = join(temporary, rootName);
+  const expectedReference =
+    `release-checksums:v${expectedPackagedProductVersion(pinned)}/compiler-pack-${pinned.release.host_target}`;
+  mkdirSync(join(compilerRoot, "bin"), { recursive: true });
+  mkdirSync(join(compilerRoot, "nested"), { recursive: true });
+  const executable = join(compilerRoot, "bin", "tool");
+  const data = join(compilerRoot, "nested", "data");
+  writeFileSync(executable, "compiler tool\n");
+  writeFileSync(data, "compiler data\n");
+  chmodSync(executable, 0o755);
+  chmodSync(data, 0o644);
+  const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+  const manifest = {
+    schema_version: "depgraph-compiler-pack-manifest-v1",
+    contract_version: "compiler-precise-rust-v1",
+    host: pinned.release.host_target,
+    target: pinned.release.host_target,
+    release_checksum_reference: expectedReference,
+    directories: ["bin", "nested"],
+    files: [
+      {
+        path: "bin/tool",
+        sha256: digest(executable),
+        size: readFileSync(executable).length,
+        executable: true,
+      },
+      {
+        path: "nested/data",
+        sha256: digest(data),
+        size: readFileSync(data).length,
+        executable: false,
+      },
+    ],
+  };
+  options.mutateManifest?.(manifest);
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(join(compilerRoot, "compiler-pack-manifest.json"), manifestBytes);
+  const archive = join(temporary, `${rootName}.tar.gz`);
+  execFileSync("tar", ["-czf", archive, rootName], { cwd: temporary });
+  options.mutateRoot?.(compilerRoot);
+  const requirement = join(temporary, `${rootName}.requirement.json`);
+  writeFileSync(
+    requirement,
+    `${JSON.stringify({
+      root: rootName,
+      expected_manifest_sha256: createHash("sha256").update(manifestBytes).digest("hex"),
+      release_checksum_reference: options.requirementReference ?? expectedReference,
+      host: pinned.release.host_target,
+      target: pinned.release.host_target,
+    }, null, 2)}\n`,
+  );
+  return {
+    temporary,
+    spec: pinned,
+    compilerRoot,
+    runtime: {
+      compilerPackArchive: archive,
+      compilerPackRequirement: requirement,
+    },
+  };
+}
+
+function unpinV2Spec(pinned) {
+  const pending = structuredClone(pinned);
+  pending.release_status = "pending";
+  pending.release.tag = PENDING_RELEASE_SENTINEL;
+  pending.release.candidate_commit = PENDING_RELEASE_SENTINEL;
+  pending.release.candidate_tree = PENDING_RELEASE_SENTINEL;
+  pending.release.archive = {
+    name: "depgraph-aarch64-apple-darwin.tar.gz",
+    sha256: PENDING_RELEASE_SENTINEL,
+  };
+  pending.release.compiler_pack_archive = {
+    name: "depgraph-compiler-pack-aarch64-apple-darwin.tar.gz",
+    sha256: PENDING_RELEASE_SENTINEL,
+  };
+  pending.release.compiler_pack_requirement = {
+    name: "depgraph-compiler-pack-aarch64-apple-darwin.requirement.json",
+    sha256: PENDING_RELEASE_SENTINEL,
+  };
+  pending.release.mcp_smoke = {
+    name: "depgraph-aarch64-apple-darwin.mcp-smoke.json",
+    sha256: PENDING_RELEASE_SENTINEL,
+    schema_version: "mcp-package-smoke-v3",
+    read_catalog_sha256: PENDING_RELEASE_SENTINEL,
+  };
+  for (const key of [
+    "baseline_commit",
+    "baseline_tree",
+    "candidate_commit",
+    "candidate_tree",
+  ]) pending.repository[key] = PENDING_RELEASE_SENTINEL;
+  for (const snapshot of Object.values(pending.snapshots)) {
+    snapshot.id = PENDING_RELEASE_SENTINEL;
+    snapshot.source_revision = PENDING_RELEASE_SENTINEL;
+  }
+  for (const key of Object.keys(pending.safety_baseline)) {
+    pending.safety_baseline[key] = PENDING_RELEASE_SENTINEL;
+  }
+  pending.host.cli_version = PENDING_RELEASE_SENTINEL;
+  pending.host.model = PENDING_RELEASE_SENTINEL;
+  pending.host.reasoning_effort = PENDING_RELEASE_SENTINEL;
+  for (const claim of pending.claims) {
+    claim.expected.value = PENDING_RELEASE_SENTINEL;
+  }
+  return pending;
+}
+
 function goldenV2Answer(pinned) {
   return {
     schema_version: ANSWER_SCHEMA_VERSION,
@@ -592,8 +909,10 @@ test("v1 generation table is canonical-frozen", () => {
     canonicalJson(frozen),
     canonicalJson({
       schema_version: "agent-dogfood-spec-v1",
+      report_schema_version: REPORT_SCHEMA_VERSION,
       requires_release_status: false,
       identity_includes_cli_version: false,
+      sparse_paths: null,
       claim_descriptors: [
         { id: "rust_path", category: "dependency_path", major: true, verdict: "supported", classification: "exact" },
         { id: "go_dependency", category: "dependency", major: true, verdict: "supported", classification: "exact" },
@@ -673,46 +992,578 @@ test("v1 generation table is canonical-frozen", () => {
   );
 });
 
-test("pending-release contract accepts lint-spec only and rejects the four execution paths", () => {
-  assert.equal(lintSpec(v2Spec), v2Spec);
-  assert.equal(lintSpecFile(v2SpecPath).release_status, "pending");
-  assert.throws(() => lintSpec(v2Spec, { pinned: true }), new RegExp(PENDING_SPEC_ERROR));
-  assert.throws(() => validateSpec(v2Spec), new RegExp(PENDING_SPEC_ERROR));
+test("v2 generation selects its report schema and exact sparse paths", () => {
+  const frozen = generationFrozenContract(SPEC_SCHEMA_VERSION_V2);
+  assert.equal(frozen.report_schema_version, REPORT_SCHEMA_VERSION_V2);
+  assert.deepEqual(frozen.sparse_paths, V2_SPARSE_PATHS);
+  assert.equal(Object.isFrozen(V2_SPARSE_PATHS), true);
+  assert.equal(validateSparseCheckoutPaths([...V2_SPARSE_PATHS]), true);
   assert.throws(
-    () => scoreAnswer(v2Spec, goldenV2Answer(pinV2Spec(v2Spec))),
+    () => validateSparseCheckoutPaths([...V2_SPARSE_PATHS].reverse()),
+    /do not exactly match/,
+  );
+  assert.throws(
+    () => validateSparseCheckoutPaths(V2_SPARSE_PATHS.slice(0, -1)),
+    /do not exactly match/,
+  );
+});
+
+test("v2 MCP traces enforce the fixed 24-call chain and baseline isolation", () => {
+  const mcpTrace = readFileSync(v2McpTracePath, "utf8");
+  const baselineTrace = readFileSync(v2BaselineTracePath, "utf8");
+  assert.equal(validateV2McpTrace(v2Spec, mcpTrace), true);
+  assert.equal(validateV2Trace(v2Spec, "mcp", mcpTrace), true);
+  assert.equal(validateV2Trace(v2Spec, "baseline", baselineTrace), true);
+
+  const wrongServer = mutatedV2McpTrace((events) => {
+    mcpTraceEvent(events, "item.started", 1).item.server = "untrusted";
+    mcpTraceEvent(events, "item.completed", 1).item.server = "untrusted";
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, wrongServer), /depgraph MCP server/);
+
+  const wrongSnapshot = mutatedV2McpTrace((events) => {
+    mcpTraceEvent(events, "item.started", 1).item.arguments.snapshot =
+      "agent-tools-baseline";
+    mcpTraceEvent(events, "item.completed", 1).item.arguments.snapshot =
+      "agent-tools-baseline";
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, wrongSnapshot), /fixed plan/);
+
+  const wrongArguments = mutatedV2McpTrace((events) => {
+    mcpTraceEvent(events, "item.started", 1).item.arguments.limit = 9;
+    mcpTraceEvent(events, "item.completed", 1).item.arguments.limit = 9;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, wrongArguments), /fixed plan/);
+
+  const wrongOrder = mutatedV2McpTrace((events) => {
+    const completions = events.filter(
+      (event) => event.type === "item.completed"
+        && event.item?.type === "mcp_tool_call",
+    );
+    const first = events.indexOf(completions[0]);
+    const second = events.indexOf(completions[1]);
+    [events[first], events[second]] = [events[second], events[first]];
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, wrongOrder), /out of started order/);
+
+  const completedBeforeStart = mutatedV2McpTrace((events) => {
+    const startedIndex = events.findIndex(
+      (event) => event.type === "item.started"
+        && event.item?.type === "mcp_tool_call",
+    );
+    const completedIndex = events.findIndex(
+      (event) => event.type === "item.completed"
+        && event.item?.type === "mcp_tool_call",
+    );
+    [events[startedIndex], events[completedIndex]] = [
+      events[completedIndex],
+      events[startedIndex],
+    ];
+  });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, completedBeforeStart),
+    /out of started order|not serial/,
+  );
+
+  const fakeUnchainedNode = mutatedV2McpTrace((events) => {
+    const fake = `module:sha256:${"ff".repeat(32)}`;
+    mcpTraceEvent(events, "item.started", 4).item.arguments.query = fake;
+    mcpTraceEvent(events, "item.completed", 4).item.arguments.query = fake;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, fakeUnchainedNode), /fixed plan|chained node/);
+
+  const fakeCycleNode = mutatedV2McpTrace((events) => {
+    const fake = `file:sha256:${"ff".repeat(32)}`;
+    mcpTraceEvent(events, "item.started", 15).item.arguments.node_id = fake;
+    mcpTraceEvent(events, "item.completed", 15).item.arguments.node_id = fake;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, fakeCycleNode), /fixed plan|call 15/);
+
+  const fakeFinding = mutatedV2McpTrace((events) => {
+    const fake = `finding:sha256:${"ff".repeat(32)}`;
+    mcpTraceEvent(events, "item.started", 22).item.arguments.finding_id = fake;
+    mcpTraceEvent(events, "item.completed", 22).item.arguments.finding_id = fake;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, fakeFinding), /fixed plan|call 22/);
+
+  const unsuccessfulStructuredContent = mutatedV2McpTrace((events) => {
+    mcpTraceEvent(events, "item.completed", 1).item.result.structured_content
+      .snapshot_id = v2Spec.snapshots.baseline.id;
+  });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, unsuccessfulStructuredContent),
+    /successful candidate result/,
+  );
+
+  const baselineWithMcp = `${baselineTrace.trimEnd()}\n${JSON.stringify({
+    type: "item.completed",
+    item: { id: "rogue", type: "mcp_tool_call", server: "depgraph", tool: "get_context" },
+  })}\n`;
+  assert.throws(
+    () => validateV2Trace(v2Spec, "baseline", baselineWithMcp),
+    /baseline trace contains MCP calls/,
+  );
+});
+
+test("v2 MCP structured results cannot fake claims or hide broken chains", () => {
+  assert.equal(validateV2McpTrace(v2Spec, readFileSync(v2McpTracePath, "utf8")), true);
+
+  for (let callNumber = 1; callNumber <= 24; callNumber += 1) {
+    const emptyResult = mutatedV2McpTrace((events) => {
+      const completedResult = mcpTraceEvent(events, "item.completed", callNumber)
+        .item.result.structured_content;
+      completedResult.result = {};
+    });
+    assert.throws(
+      () => validateV2McpTrace(v2Spec, emptyResult),
+      new RegExp(`call ${callNumber}`),
+    );
+  }
+
+  const missingCyclePath = mutatedV2McpTrace((events) => {
+    delete mcpTraceResult(events, 15).display_name;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, missingCyclePath), /repository-relative path/);
+
+  const changedCyclePath = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 15).display_name = "workers/web/src/not-cycle.ts";
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, changedCyclePath), /file paths|file_cycle/);
+
+  const disconnectedImpactStart = mutatedV2McpTrace((events) => {
+    const item = mcpTraceResult(events, 7).impacts.items.find(
+      (candidate) => candidate.depth === 1,
+    );
+    const fake = `file:sha256:${"ff".repeat(32)}`;
+    item.dependency_path[0].source.id = fake;
+    item.dependency_path[0].edge.source_id = fake;
+  });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, disconnectedImpactStart),
+    /connected node-to-root witness/,
+  );
+
+  const disconnectedImpactWindow = mutatedV2McpTrace((events) => {
+    const item = mcpTraceResult(events, 7).impacts.items.find(
+      (candidate) => candidate.depth === 2,
+    );
+    const fake = `file:sha256:${"ee".repeat(32)}`;
+    item.dependency_path[1].source.id = fake;
+    item.dependency_path[1].edge.source_id = fake;
+  });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, disconnectedImpactWindow),
+    /connected node-to-root witness/,
+  );
+
+  const contradictoryText = mutatedV2McpTrace((events) => {
+    mcpTraceEvent(events, "item.completed", 1).item.result.content[0].text = "{}";
+  }, { synchronizeContent: false });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, contradictoryText),
+    /text and structured content differ/,
+  );
+
+  const missingRootLocator = mutatedV2McpTrace((events) => {
+    delete mcpTraceResult(events, 3).root.locator;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, missingRootLocator), /call 3 root/);
+
+  const missingNodeDisplayName = mutatedV2McpTrace((events) => {
+    delete mcpTraceResult(events, 4).items[0].display_name;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, missingNodeDisplayName), /call 4/);
+
+  const incompleteSelectedEvidence = mutatedV2McpTrace((events) => {
+    const edge = mcpTraceResult(events, 3).edges.items.find((candidate) =>
+      candidate.evidence?.some((entry) => entry.span?.start?.line === 10));
+    delete edge.evidence[0].extractor;
+  });
+  assert.throws(
+    () => validateV2McpTrace(v2Spec, incompleteSelectedEvidence),
+    /call 3/,
+  );
+
+  const healthKind = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 21).findings.items[0].kind = "hotspot";
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, healthKind), /call 21/);
+
+  const healthConfidence = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 22).finding.confidence = "probable";
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, healthConfidence), /call 22/);
+
+  const healthBlockers = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 22).finding.blockers = [];
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, healthBlockers), /call 22/);
+
+  const healthDigest = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 21).collection_digest = `collection:sha256:${"00".repeat(32)}`;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, healthDigest), /health_unused_findings|call 21/);
+
+  const packageDiff = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 12).total_changes = 1;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, packageDiff), /call 12/);
+
+  const fileDiffDigest = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 13).collection_digest =
+      `snapshot-diff-collection:sha256:${"00".repeat(32)}`;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, fileDiffDigest), /call 13/);
+
+  const cycleNodeIds = mutatedV2McpTrace((events) => {
+    const nodeIds = mcpTraceResult(events, 14).items[0].node_ids;
+    [nodeIds[0], nodeIds[1]] = [nodeIds[1], nodeIds[0]];
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, cycleNodeIds), /call 14|fixed plan/);
+
+  const coverage = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 20).snapshot.details.coverage.files_analyzed = 21;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, coverage), /call 20/);
+
+  const hotspot = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 23).findings.items[0].hotspot_scores.total = 1;
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, hotspot), /call 23/);
+
+  const audit = mutatedV2McpTrace((events) => {
+    mcpTraceResult(events, 24).changed_oid = "00".repeat(20);
+  });
+  assert.throws(() => validateV2McpTrace(v2Spec, audit), /call 24/);
+});
+
+test("CI provides Git 2.37 or newer for sparse worktree configuration", {
+  skip: process.env.CI !== "true",
+}, () => {
+  assert.equal(
+    supportsSparseWorktreeConfig,
+    true,
+    `Git 2.37 or newer is required; found ${gitVersionOutput}`,
+  );
+});
+
+test("sparse checkout helper rejects full checkouts and preserves ordered patterns", {
+  skip: supportsSparseWorktreeConfig ? false : "requires Git 2.37 or newer",
+}, () => {
+  const repository = mkdtempSync(join(tmpdir(), "depgraph-sparse-checkout-"));
+  try {
+    execFileSync("git", ["init", "--quiet"], { cwd: repository });
+    assert.throws(
+      () => readSparseCheckoutPaths(repository),
+      /not a sparse checkout/,
+    );
+    execFileSync(
+      "git",
+      ["sparse-checkout", "set", "--no-cone", ...V2_SPARSE_PATHS],
+      { cwd: repository },
+    );
+    assert.deepEqual(readSparseCheckoutPaths(repository), V2_SPARSE_PATHS);
+    assert.doesNotThrow(() => validateLocalGitConfiguration(
+      repository,
+      process.env,
+      { allowSparseCheckout: true },
+    ));
+
+    execFileSync("git", ["config", "--worktree", "diff.external", "/tmp/untrusted"], {
+      cwd: repository,
+    });
+    assert.throws(
+      () => validateLocalGitConfiguration(
+        repository,
+        process.env,
+        { allowSparseCheckout: true },
+      ),
+      /unsafe worktree Git config/,
+    );
+    execFileSync("git", ["config", "--worktree", "--unset-all", "diff.external"], {
+      cwd: repository,
+    });
+
+    execFileSync("git", ["config", "--worktree", "core.sparseCheckoutCone", "true"], {
+      cwd: repository,
+    });
+    assert.throws(
+      () => validateLocalGitConfiguration(
+        repository,
+        process.env,
+        { allowSparseCheckout: true },
+      ),
+      /unsafe worktree Git config/,
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("sparse materialization rejects a clean skip-worktree file restored outside the set", {
+  skip: supportsSparseWorktreeConfig ? false : "requires Git 2.37 or newer",
+}, () => {
+  const repository = mkdtempSync(join(tmpdir(), "depgraph-sparse-materialization-"));
+  try {
+    execFileSync("git", ["init", "--quiet"], { cwd: repository });
+    execFileSync("git", ["config", "user.name", "Agent dogfood"], { cwd: repository });
+    execFileSync("git", ["config", "user.email", "dogfood@example.invalid"], {
+      cwd: repository,
+    });
+    writeFileSync(join(repository, "selected.txt"), "selected\n");
+    writeFileSync(join(repository, "hidden.txt"), "hidden\n");
+    execFileSync("git", ["add", "selected.txt", "hidden.txt"], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: repository });
+    execFileSync("git", ["sparse-checkout", "set", "--no-cone", "/selected.txt"], {
+      cwd: repository,
+    });
+    assert.equal(
+      validateSparseCheckoutMaterialization(repository, ["/selected.txt"]),
+      true,
+    );
+    writeFileSync(join(repository, "hidden.txt"), "hidden\n");
+    assert.equal(
+      execFileSync(
+        "git",
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        { cwd: repository, encoding: "utf8" },
+      ),
+      "",
+    );
+    assert.throws(
+      () => validateSparseCheckoutMaterialization(repository, ["/selected.txt"]),
+      /outside the sparse set/,
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("extracted package must exactly match the pinned regular-file archive", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "depgraph-archive-closure-"));
+  try {
+    const packageRoot = join(temporary, "depgraph-test-target");
+    mkdirSync(join(packageRoot, "bin"), { recursive: true });
+    writeFileSync(join(packageRoot, "bin", "depgraph"), "fixed bytes\n");
+    const archive = join(temporary, "depgraph-test-target.tar.gz");
+    execFileSync("tar", ["-czf", archive, "depgraph-test-target"], { cwd: temporary });
+    assert.equal(
+      await verifyExtractedArchiveClosure(archive, packageRoot, "depgraph-test-target"),
+      true,
+    );
+    writeFileSync(join(packageRoot, "libexec-extra"), "not in archive\n");
+    await assert.rejects(
+      verifyExtractedArchiveClosure(archive, packageRoot, "depgraph-test-target"),
+      /does not exactly match/,
+    );
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("compiler pack closure binds the runtime root to the fixed archive", async () => {
+  const mutations = [
+    ["extra file", (compilerRoot) => {
+      writeFileSync(join(compilerRoot, "unlisted"), "not declared\n");
+    }],
+    ["extra directory", (compilerRoot) => {
+      mkdirSync(join(compilerRoot, "unlisted-directory"));
+    }],
+  ];
+  for (const [label, mutateRoot] of mutations) {
+    const fixture = syntheticCompilerPack({ mutateRoot });
+    try {
+      await assert.rejects(
+        verifyCompilerPackClosure(fixture.spec, fixture.runtime),
+        /does not exactly match/,
+        label,
+      );
+    } finally {
+      rmSync(fixture.temporary, { recursive: true, force: true });
+    }
+  }
+
+  const fixture = syntheticCompilerPack();
+  try {
+    assert.equal(typeof await verifyCompilerPackClosure(fixture.spec, fixture.runtime), "string");
+  } finally {
+    rmSync(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test("compiler pack closure checks listed content and archive modes", {
+  skip: process.platform === "win32",
+}, async () => {
+  const mutations = [
+    ["content", (compilerRoot) => {
+      writeFileSync(join(compilerRoot, "nested", "data"), "changed\n");
+    }],
+    ["file mode", (compilerRoot) => {
+      chmodSync(join(compilerRoot, "nested", "data"), 0o600);
+    }],
+    ["directory mode", (compilerRoot) => {
+      chmodSync(join(compilerRoot, "nested"), 0o700);
+    }],
+  ];
+  for (const [label, mutateRoot] of mutations) {
+    const fixture = syntheticCompilerPack({ mutateRoot });
+    try {
+      await assert.rejects(
+        verifyCompilerPackClosure(fixture.spec, fixture.runtime),
+        /does not exactly match/,
+        label,
+      );
+    } finally {
+      rmSync(fixture.temporary, { recursive: true, force: true });
+    }
+  }
+});
+
+test("compiler pack closure rejects malformed manifest paths and sets", async () => {
+  const mutations = [
+    ["duplicate directory", (manifest) => {
+      manifest.directories = ["bin", "nested", "nested"];
+    }],
+    ["dot directory component", (manifest) => {
+      manifest.directories = ["bin", "nested/."];
+    }],
+    ["empty directory component", (manifest) => {
+      manifest.directories = ["bin", "nested//child"];
+    }],
+    ["unsorted directories", (manifest) => {
+      manifest.directories = ["nested", "bin"];
+    }],
+    ["duplicate file", (manifest) => {
+      manifest.files.push({ ...manifest.files[0] });
+    }],
+    ["dot file component", (manifest) => {
+      manifest.files[0].path = "bin/./tool";
+    }],
+    ["empty file component", (manifest) => {
+      manifest.files[0].path = "bin//tool";
+    }],
+    ["directory and file overlap", (manifest) => {
+      manifest.directories = ["bin", "bin/tool", "nested"];
+    }],
+    ["missing parent directory", (manifest) => {
+      manifest.files[0].path = "missing/tool";
+    }],
+  ];
+  for (const [label, mutateManifest] of mutations) {
+    const fixture = syntheticCompilerPack({ mutateManifest });
+    try {
+      await assert.rejects(
+        verifyCompilerPackClosure(fixture.spec, fixture.runtime),
+        /invalid (?:directory closure|file entry)|parent directory|real directory/,
+        label,
+      );
+    } finally {
+      rmSync(fixture.temporary, { recursive: true, force: true });
+    }
+  }
+});
+
+test("compiler pack closure pins the release checksum reference", async () => {
+  const wrongReference = "release-checksums:v8.8.8/compiler-pack-aarch64-apple-darwin";
+  const requirementMismatch = syntheticCompilerPack({
+    requirementReference: wrongReference,
+  });
+  try {
+    await assert.rejects(
+      verifyCompilerPackClosure(requirementMismatch.spec, requirementMismatch.runtime),
+      /requirement identity/,
+    );
+  } finally {
+    rmSync(requirementMismatch.temporary, { recursive: true, force: true });
+  }
+
+  const manifestMismatch = syntheticCompilerPack({
+    mutateManifest: (manifest) => {
+      manifest.release_checksum_reference = wrongReference;
+    },
+  });
+  try {
+    await assert.rejects(
+      verifyCompilerPackClosure(manifestMismatch.spec, manifestMismatch.runtime),
+      /manifest identity/,
+    );
+  } finally {
+    rmSync(manifestMismatch.temporary, { recursive: true, force: true });
+  }
+});
+
+test("daemon state fingerprints unknown store-prefixed sidecars", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "depgraph-daemon-state-"));
+  try {
+    const store = join(temporary, "depgraph.sqlite");
+    writeFileSync(store, "store\n");
+    const before = await daemonStateFingerprint(store);
+    writeFileSync(join(temporary, "depgraph.sqlite.evil"), "untrusted\n");
+    const afterUnknownSidecar = await daemonStateFingerprint(store);
+    assert.notEqual(before, afterUnknownSidecar);
+
+    for (const known of [
+      "depgraph.sqlite-wal",
+      "depgraph.sqlite-shm",
+      "depgraph.sqlite.writer-lock",
+      "depgraph.sqlite.operations.sqlite",
+      "depgraph.sqlite.operations.sqlite-wal",
+      "depgraph.sqlite.operations.sqlite-shm",
+      "depgraph.sqlite.operations.sqlite.purge-lock",
+    ]) writeFileSync(join(temporary, known), "known sidecar\n");
+    assert.equal(await daemonStateFingerprint(store), afterUnknownSidecar);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("pending-release contract accepts lint-spec only and rejects the four execution paths", () => {
+  const pending = unpinV2Spec(v2Spec);
+  assert.equal(lintSpec(pending), pending);
+  assert.throws(() => lintSpec(pending, { pinned: true }), new RegExp(PENDING_SPEC_ERROR));
+  assert.throws(() => validateSpec(pending), new RegExp(PENDING_SPEC_ERROR));
+  assert.throws(
+    () => scoreAnswer(pending, goldenV2Answer(pinV2Spec(pending))),
     new RegExp(PENDING_SPEC_ERROR),
   );
   assert.throws(
-    () => validateAnswer(v2Spec, goldenV2Answer(pinV2Spec(v2Spec))),
+    () => validateAnswer(pending, goldenV2Answer(pinV2Spec(pending))),
     new RegExp(PENDING_SPEC_ERROR),
   );
 
-  const residual = structuredClone(v2Spec);
+  const residual = structuredClone(pending);
   residual.release.archive.sha256 = DUMMY_SHA256;
   assert.throws(() => lintSpec(residual), /missing PENDING-RELEASE sentinels/);
 
-  const excess = structuredClone(v2Spec);
+  const excess = structuredClone(pending);
   excess.release.archive.name = PENDING_RELEASE_SENTINEL;
   assert.throws(() => lintSpec(excess), /PENDING-RELEASE outside the pin set/);
 
-  const leftover = pinV2Spec(v2Spec);
+  const leftover = pinV2Spec(pending);
   leftover.release.tag = PENDING_RELEASE_SENTINEL;
   assert.throws(() => validateSpec(leftover), /still contains PENDING-RELEASE/);
 
-  const linted = runDogfood(["lint-spec", v2SpecPath]);
-  assert.equal(linted.code, 0);
-  assert.match(linted.stdout, /linted Agent dogfood spec/);
-  const pinnedLint = runDogfood(["lint-spec", "--pinned", v2SpecPath]);
-  assert.notEqual(pinnedLint.code, 0);
-  assert.match(`${pinnedLint.stdout}${pinnedLint.stderr}`, new RegExp(PENDING_SPEC_ERROR));
-  const verifyPending = runDogfood([
-    "verify",
-    v2SpecPath,
-    join(v2FixtureDir, "missing-evidence"),
-    join(v2FixtureDir, "missing-report.json"),
-  ]);
-  assert.notEqual(verifyPending.code, 0);
-  assert.match(`${verifyPending.stdout}${verifyPending.stderr}`, new RegExp(PENDING_SPEC_ERROR));
+  const pendingDir = writeTempV2Corpus(pending);
+  try {
+    const pendingPath = join(pendingDir, "spec.json");
+    assert.equal(lintSpecFile(pendingPath).release_status, "pending");
+    const linted = runDogfood(["lint-spec", pendingPath]);
+    assert.equal(linted.code, 0);
+    assert.match(linted.stdout, /linted Agent dogfood spec/);
+    const pinnedLint = runDogfood(["lint-spec", "--pinned", pendingPath]);
+    assert.notEqual(pinnedLint.code, 0);
+    assert.match(`${pinnedLint.stdout}${pinnedLint.stderr}`, new RegExp(PENDING_SPEC_ERROR));
+    const verifyPending = runDogfood([
+      "verify",
+      pendingPath,
+      join(pendingDir, "missing-evidence"),
+      join(pendingDir, "missing-report.json"),
+    ]);
+    assert.notEqual(verifyPending.code, 0);
+    assert.match(`${verifyPending.stdout}${verifyPending.stderr}`, new RegExp(PENDING_SPEC_ERROR));
+  } finally {
+    rmSync(pendingDir, { recursive: true, force: true });
+  }
 });
 
 test("v2 pinned-form spec validates 16 claims and scores health confidence asymmetrically", () => {
@@ -932,7 +1783,7 @@ test("v2 prompt pins baseline commit for runner injection", () => {
     () => lintSpec(pinned, { prompt: v2Prompt.replaceAll(BASELINE_COMMIT_PLACEHOLDER, DUMMY_OID) }),
     /must pin repository\.baseline_commit/,
   );
-  assert.equal(lintSpecFile(v2SpecPath).release_status, "pending");
+  assert.equal(lintSpecFile(v2SpecPath).release_status, "pinned");
 });
 
 test("v2 prompt digest is the materialized bytes sent to the host", () => {

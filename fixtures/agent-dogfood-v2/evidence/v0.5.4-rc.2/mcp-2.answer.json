@@ -1,0 +1,196 @@
+{
+  "claims": {
+    "candidate_coverage": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Candidate snapshot coverage returned.",
+      "value": "files=22;sites=3500;resolved=536;candidates=60;external=1328;unresolved=1576;unsupported=201;project_code_executed=false",
+      "verdict": "supported"
+    },
+    "file_cycle": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": null,
+          "path": "workers/web/src/imports.ts",
+          "source": "mcp"
+        },
+        {
+          "line": null,
+          "path": "workers/web/src/typescript-compiler.ts",
+          "source": "mcp"
+        },
+        {
+          "line": null,
+          "path": "workers/web/src/typescript-dependencies.ts",
+          "source": "mcp"
+        }
+      ],
+      "reason": "One file-level cycle returned and rotated as requested.",
+      "value": "count=1;cycle=file://workers/web/src/imports.ts->file://workers/web/src/typescript-compiler.ts->file://workers/web/src/typescript-dependencies.ts->file://workers/web/src/typescript-dependency-validation.ts->file://workers/web/src/imports.ts",
+      "verdict": "supported"
+    },
+    "go_dependency": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": 10,
+          "path": "workers/go/cmd/depgraph-go-worker/main.go",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Resolved internal package import.",
+      "value": "target=go-package:github.com/TamaT-LLC/depgraph-cli/workers/go/internal/worker;line=10;kind=imports",
+      "verdict": "supported"
+    },
+    "health_audit_base": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Audit returned the supplied baseline snapshot.",
+      "value": "base_present=true;changed_oid=68aed98d66585c0abcd7ffbedccad347cb4d3fae;digest=collection:sha256:cb21ecd7c2ede39ee9ac2127d900fa017116b9673494d756be1d1e154a79e560",
+      "verdict": "supported"
+    },
+    "health_finding_detail": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": null,
+          "path": "workers/web/src/worker.ts",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Minimum-ID unused-file finding returned.",
+      "value": "id=finding:sha256:0d1d739a1f3829fac543260794963f1c1f1af5710b7882285496b429c9403383;kind=unused-file;confidence=indeterminate;blockers=incomplete-coverage",
+      "verdict": "supported"
+    },
+    "health_hotspots": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Pinned-weight hotspot ranking returned.",
+      "value": "top=module:sha256:7ab8e0a7c1f6276c8d443253a4ac788c79d956afc1ff78c998c2e8d0af333cae;score=6499;blockers=runtime-not-observed",
+      "verdict": "supported"
+    },
+    "health_unused_findings": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Unused-file finding collection returned.",
+      "value": "count=7;digest=collection:sha256:25c9a8db2aaa4e1094d94b0eab2541a36676e421c2be970c6a695b3d6a2318a0",
+      "verdict": "supported"
+    },
+    "package_cycles": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "No package-level cycles returned.",
+      "value": "count=0",
+      "verdict": "supported"
+    },
+    "rust_candidate_import": {
+      "classification": "candidate",
+      "evidence": [
+        {
+          "line": 3514,
+          "path": "crates/depgraph-cli/src/main.rs",
+          "source": "mcp"
+        }
+      ],
+      "reason": "use super import is a candidate edge.",
+      "value": "target=rust-module:depgraph-cli:bin:depgraph-cli::;status=candidates;precision=overapprox;line=3514",
+      "verdict": "supported"
+    },
+    "rust_impact": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": 3,
+          "path": "crates/depgraph-mcp-tools/src/lib.rs",
+          "source": "mcp"
+        },
+        {
+          "line": 1,
+          "path": "crates/depgraph-mcp-tools/Cargo.toml",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Complete depth-two reverse impact returned.",
+      "value": "complete=true;items=cargo-target:depgraph-mcp-tools@0.5.4#crates/depgraph-mcp-tools:lib:depgraph_mcp_tools@2,file:crates/depgraph-mcp-tools/src/lib.rs@1,rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::@2",
+      "verdict": "supported"
+    },
+    "rust_path": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": 15,
+          "path": "crates/depgraph-mcp-tools/src/lib.rs",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Shortest path found.",
+      "value": "target=rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::catalog;steps=1;kind=reexports",
+      "verdict": "supported"
+    },
+    "rust_unresolved_type": {
+      "classification": "unresolved",
+      "evidence": [
+        {
+          "line": 42,
+          "path": "crates/depgraph-mcp-tools/src/host_config.rs",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Self type-use is unresolved at heuristic precision.",
+      "value": "target=unknown:rust:rust_type:Self;status=unresolved;precision=heuristic;line=42",
+      "verdict": "supported"
+    },
+    "snapshot_file_diff": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Authoritative file-diff digest returned.",
+      "value": "digest=snapshot-diff-collection:sha256:bce8c51240b2809fbf4de563a9d1ba56fc3682c73c47c33eb4e1e02c32cb0f7a",
+      "verdict": "supported"
+    },
+    "snapshot_package_diff": {
+      "classification": "exact",
+      "evidence": [],
+      "reason": "Package snapshot diff is empty.",
+      "value": "total=0;empty=true;digest=snapshot-diff-collection:sha256:a17e387c0ddb7fcc5078f3c841055fcecb797a8ec1b19e6226a32a32786cef5b",
+      "verdict": "supported"
+    },
+    "web_dependency": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": 17,
+          "path": "workers/web/src/worker.ts",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Resolved scanner import.",
+      "value": "target=file://workers/web/src/scanner.ts;line=17;condition=(mode == \"production\" && environment in [\"browser\", \"server\"])",
+      "verdict": "supported"
+    },
+    "web_dependents": {
+      "classification": "exact",
+      "evidence": [
+        {
+          "line": 17,
+          "path": "workers/web/src/worker.ts",
+          "source": "mcp"
+        },
+        {
+          "line": 1,
+          "path": "workers/web/src/scanner.ts",
+          "source": "mcp"
+        }
+      ],
+      "reason": "Direct incoming edges include the file import and package containment edge.",
+      "value": "count=2;sources=file://workers/web/src/worker.ts,id:package:sha256:31cf1f1219ba2e68d9c7de470c231618594e164fc67bef5f27ca9c10b7b934c4",
+      "verdict": "supported"
+    }
+  },
+  "failure": {
+    "code": "none",
+    "remediation": "",
+    "task": ""
+  },
+  "schema_version": "agent-dogfood-answer-v1"
+}
