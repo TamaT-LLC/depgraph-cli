@@ -1394,6 +1394,69 @@ export const View = () => (
   assert.equal(result.parseErrors.length, 0);
 });
 
+test("TSX scanner does not treat comparison-like JSX text as a tag", () => {
+  const source = `
+export const View = () => (
+  <>
+    2 < 3 && import("./not-a-dependency")
+    <span>{import("./real-expression")}</span>
+  </>
+);
+import after from "./after";
+`;
+  const result = extractDependencies("/repo/view.tsx", "view.tsx", source);
+  assert.deepEqual(result.dependencies.map(({ kind, specifier, literal }) => ({ kind, specifier, literal })), [
+    { kind: "dynamic_import", specifier: "./real-expression", literal: true },
+    { kind: "import", specifier: "./after", literal: true },
+  ]);
+  assert.equal(result.parseErrors.length, 0);
+});
+
+test("nested TSX expressions return to code for later imports and JSX", () => {
+  const source = `
+type Item = { id: number; name: string }
+
+export const Repro = ({
+  items,
+  show,
+}: {
+  items: Item[]
+  show: boolean
+}) => {
+  if (show) {
+    return (
+      <div>
+        {items.map((item) => (
+          <span key={item.id}>{item.name}</span>
+        ))}
+        {({ nested: { enabled: true } }).nested.enabled && (
+          <small>{items[0]?.name}</small>
+        )}
+      </div>
+    )
+  }
+  return <div>empty</div>
+}
+
+import afterStatic from "./after-static"
+const afterDynamic = import("./after-dynamic")
+export { afterExport } from "./after-export"
+const afterRequire = require("./after-require")
+`;
+  const result = extractDependencies("/repo/repro.tsx", "repro.tsx", source);
+  assert.deepEqual(result.dependencies.map(({ kind, specifier, literal }) => ({ kind, specifier, literal })), [
+    { kind: "import", specifier: "./after-static", literal: true },
+    { kind: "dynamic_import", specifier: "./after-dynamic", literal: true },
+    { kind: "reexport", specifier: "./after-export", literal: true },
+    { kind: "require", specifier: "./after-require", literal: true },
+  ]);
+  assert.deepEqual(result.parseErrors, []);
+
+  const malformed = source.replace("        ))}\n", "        ))\n");
+  const malformedResult = extractDependencies("/repo/repro.tsx", "repro.tsx", malformed);
+  assert.ok(malformedResult.parseErrors.some((error) => /CloseBraceToken expected/u.test(error.message)));
+});
+
 test("Astro extraction only scans frontmatter and preserves source spans", () => {
   const source = `---\nimport Card from "../Card.astro";\n---\n<script>import("runtime-only")</script>`;
   const result = extractDependencies("/repo/page.astro", "page.astro", source);
