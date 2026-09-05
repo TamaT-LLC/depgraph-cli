@@ -95,9 +95,11 @@ inputs contain no replacement-root field.
 ## Reproduce the snapshots
 
 Use a new private working directory and a clean, dedicated clone. Node.js
-24.18.0, Git, GitHub CLI, and an authenticated Codex CLI 0.146.0 or newer are
-required. This v1 evidence is intentionally fixed to `aarch64-apple-darwin`;
-another host target requires a new versioned spec and evidence set.
+24.18.0, Git 2.37 or newer, GitHub CLI, and an authenticated Codex CLI 0.146.0
+or newer are required. The sparse worktree tests skip explicitly on older local
+Git versions, while CI fails its environment check below this minimum. This v1
+evidence is intentionally fixed to `aarch64-apple-darwin`; another host target
+requires a new versioned spec and evidence set.
 
 Download these four public assets from `v0.5.0-rc.7` into a new private assets
 directory:

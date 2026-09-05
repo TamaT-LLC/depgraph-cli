@@ -78,6 +78,11 @@ const v2BaselineTracePath = join(
   v2FixtureDir,
   "evidence/v0.5.4-rc.2/baseline-1.trace.jsonl",
 );
+const gitVersionOutput = execFileSync("git", ["--version"], { encoding: "utf8" }).trim();
+const gitVersionMatch = /^git version (\d+)\.(\d+)(?:\.\d+)?/u.exec(gitVersionOutput);
+const supportsSparseWorktreeConfig = gitVersionMatch !== null
+  && (Number(gitVersionMatch[1]) > 2
+    || Number(gitVersionMatch[1]) === 2 && Number(gitVersionMatch[2]) >= 37);
 const DUMMY_SHA256 = "ab".repeat(32);
 const DUMMY_OID = "cd".repeat(20);
 const SCRIPT = join(root, "scripts/agent-dogfood.mjs");
@@ -1209,7 +1214,19 @@ test("v2 MCP structured results cannot fake claims or hide broken chains", () =>
   assert.throws(() => validateV2McpTrace(v2Spec, audit), /call 24/);
 });
 
-test("sparse checkout helper rejects full checkouts and preserves ordered patterns", () => {
+test("CI provides Git 2.37 or newer for sparse worktree configuration", {
+  skip: process.env.CI !== "true",
+}, () => {
+  assert.equal(
+    supportsSparseWorktreeConfig,
+    true,
+    `Git 2.37 or newer is required; found ${gitVersionOutput}`,
+  );
+});
+
+test("sparse checkout helper rejects full checkouts and preserves ordered patterns", {
+  skip: supportsSparseWorktreeConfig ? false : "requires Git 2.37 or newer",
+}, () => {
   const repository = mkdtempSync(join(tmpdir(), "depgraph-sparse-checkout-"));
   try {
     execFileSync("git", ["init", "--quiet"], { cwd: repository });
@@ -1260,7 +1277,9 @@ test("sparse checkout helper rejects full checkouts and preserves ordered patter
   }
 });
 
-test("sparse materialization rejects a clean skip-worktree file restored outside the set", () => {
+test("sparse materialization rejects a clean skip-worktree file restored outside the set", {
+  skip: supportsSparseWorktreeConfig ? false : "requires Git 2.37 or newer",
+}, () => {
   const repository = mkdtempSync(join(tmpdir(), "depgraph-sparse-materialization-"));
   try {
     execFileSync("git", ["init", "--quiet"], { cwd: repository });
