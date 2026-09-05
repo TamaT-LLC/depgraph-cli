@@ -2,12 +2,16 @@
 
 - Status: Accepted
 - Date: 2026-08-13
-- Updated: 2026-09-06
+- Updated: 2026-09-13
 - Decision ID: `PROJ-ARC-001-ADR-007`
 - Issue: `PROJ-ARC-003-TASK-001` / #355
 - Contract: `stable-release-gate-v2`
 
 ## Context
+
+This ADR remains the historical v0.5 contract. The separate v0.6.0 minor
+release, Store schema-19 migration, and code-health API boundary are defined in
+[ADR-011](adr-v0.6-release-contract.md).
 
 At the time of the original decision, the latest published GitHub Release was
 `v0.4.0-rc.6`. No `v0.4.0` stable GitHub Release was published. The reserved `v0.4.0` baseline commit and

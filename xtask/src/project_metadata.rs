@@ -9,19 +9,20 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH, AGENT_DOGFOOD_REPORT_PATH, AGENT_DOGFOOD_REPORT_SHA256,
-    MCP_OPERATION_CONTRACT_VERSION, MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION,
-    PROJECT_LICENSES, RELEASE_TARGETS, RUST_SOURCE_COPYRIGHT, RUST_SOURCE_COPYRIGHT_SHA256,
-    RUST_SOURCE_LICENSE_MIT, RUST_SOURCE_LICENSE_MIT_SHA256, RUST_SYSROOT_TOOLCHAIN_VERSION,
-    STABLE_RELEASE_BASELINE_STATUS, STABLE_RELEASE_GATE_SCHEMA_VERSION,
-    STABLE_RELEASE_MAINTENANCE_BRANCH, STABLE_RELEASE_VERSION, STABLE_UPGRADE_SOURCE_FIXTURE_PATH,
-    STABLE_UPGRADE_SOURCE_FIXTURE_SHA256, STABLE_UPGRADE_SOURCE_VERSION,
-    V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256, V0_4_RC6_AARCH64_APPLE_BINARY_SHA256,
-    V0_4_RC6_TAG_COMMIT, V0_4_STABLE_RELEASE_BASELINE_COMMIT, V0_4_STABLE_RELEASE_BASELINE_DIGEST,
-    V0_4_STABLE_RELEASE_BASELINE_TREE, V0_4_STABLE_RELEASE_MAINTENANCE_BRANCH,
-    V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH, V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION,
-    mcp_package_smoke, read_lf_normalized_text, release_compatibility, sha256_file,
-    v0_4_stable_release_baseline_digest, verify_stable_release_source_guard,
+    AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH, AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
+    AGENT_DOGFOOD_REPORT_PATH, AGENT_DOGFOOD_REPORT_SHA256, MCP_OPERATION_CONTRACT_VERSION,
+    MCP_TOOL_CONTRACT_VERSION, PROJECT_LICENSE_EXPRESSION, PROJECT_LICENSES, RELEASE_TARGETS,
+    RUST_SOURCE_COPYRIGHT, RUST_SOURCE_COPYRIGHT_SHA256, RUST_SOURCE_LICENSE_MIT,
+    RUST_SOURCE_LICENSE_MIT_SHA256, RUST_SYSROOT_TOOLCHAIN_VERSION, STABLE_RELEASE_BASELINE_STATUS,
+    STABLE_RELEASE_GATE_SCHEMA_VERSION, STABLE_RELEASE_MAINTENANCE_BRANCH, STABLE_RELEASE_VERSION,
+    STABLE_UPGRADE_SOURCE_FIXTURE_PATH, STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
+    STABLE_UPGRADE_SOURCE_VERSION, V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,
+    V0_4_RC6_AARCH64_APPLE_BINARY_SHA256, V0_4_RC6_TAG_COMMIT, V0_4_STABLE_RELEASE_BASELINE_COMMIT,
+    V0_4_STABLE_RELEASE_BASELINE_DIGEST, V0_4_STABLE_RELEASE_BASELINE_TREE,
+    V0_4_STABLE_RELEASE_MAINTENANCE_BRANCH, V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH,
+    V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256, VERSION, mcp_package_smoke, read_lf_normalized_text,
+    release_compatibility, sha256_file, v0_4_stable_release_baseline_digest,
+    verify_stable_release_source_guard,
 };
 
 #[derive(Debug, Deserialize)]
@@ -994,9 +995,8 @@ pub(crate) fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
 
 pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
-    let release_package = format!(
-        "`v{VERSION}`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。"
-    );
+    let release_package =
+        format!("次のminor release `v{VERSION}`も同じ5 targetで提供する予定である。");
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
         "現行開発版のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
@@ -1006,7 +1006,7 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
         MCP_OPERATION_CONTRACT_VERSION,
     );
     let current_store_contract = format!(
-        "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
+        "current `main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
         depgraph_store::STORE_SCHEMA_VERSION,
     );
     for required in [
@@ -1258,6 +1258,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     )?;
     let v0_5_release_adr =
         read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.5-release-contract.md"))?;
+    let v0_6_release_adr =
+        read_lf_normalized_text(&root.join("docs/40_arch_design/adr-v0.6-release-contract.md"))?;
     let health_finding_adr = read_lf_normalized_text(
         &root.join("docs/40_arch_design/adr-code-health-finding-contract.md"),
     )?;
@@ -1312,8 +1314,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("English README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-09-06",
-        "| Product / Rust / Go / Web adapter | `0.5.4` |",
+        "updated: 2026-09-13",
+        "| Product / Rust / Go / Web adapter | `0.6.0` (planned stable) |",
         "| SQLite store / scan cache / impact query cache | `19` / `2` / `1` |",
         "| Operation journal / MCP tool / operation DTO | `6` / `depgraph-mcp-tools-v1` / `depgraph-operation-v2` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
@@ -1348,6 +1350,10 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "Issue #176でgreen確認済みのmain commit `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`を`release-baseline-v1`",
         "### ADR-015: Exact Stable Baseline with a Separate Maintenance Line",
         "2026-07-26: Issue #176としてgreenなmain commit",
+        "次のstable minor `v0.6.0`",
+        "`refs/heads/release/0.6`とsigned tag",
+        "[ADR-011](adr-v0.6-release-contract.md)",
+        "[v0.6.0 release note](../releases/v0.6.0.md)",
     ] {
         if !design.contains(required) {
             bail!("system design release metadata is missing {required:?}");
@@ -1368,6 +1374,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "2026-08-13: `PROJ-ARC-001-ADR-007` と v0.5 release contractを追加",
         "| PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |",
         "2026-08-26: `PROJ-ARC-001-ADR-009` と説明可能なコードヘルス解析（CLI / MCP）を追加",
+        "| PROJ-ARC-001-ADR-011 | PROJ-ARC-001 | [v0.6 release, migration, and source contract](../40_arch_design/adr-v0.6-release-contract.md) | Accepted |",
     ] {
         if !docs_index.contains(required) {
             bail!("documentation index is missing Rust compiler ADR metadata {required:?}");
@@ -1634,9 +1641,11 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Acceptance matrix",
         "| Stable release gate passes but history audit is missing |",
         "| All gates pass but organization owner has not authorized visibility | remain private |",
-        "### Preserved v0.4 baseline and v0.5 maintenance line",
+        "### Preserved baselines and maintenance lines",
         "`refs/heads/release/0.4`",
         "`refs/heads/release/0.5`",
+        "`release/0.6` ref",
+        "[`PROJ-ARC-001-ADR-011`](adr-v0.6-release-contract.md)",
         "`maintenance-ref-pinned`",
     ] {
         if !public_oss_adr.contains(required) {
@@ -1667,6 +1676,31 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     ] {
         if !v0_5_release_adr.contains(required) {
             bail!("v0.5 release ADR is missing required contract {required:?}");
+        }
+    }
+    for required in [
+        "- Status: Accepted",
+        "- Decision ID: `PROJ-ARC-001-ADR-011`",
+        "- Contract: `stable-release-gate-v2`",
+        "The next stable release is `v0.6.0`.",
+        "| Product and Rust / Go / Web adapters | `0.6.0` |",
+        "| Previous stable release | `v0.5.4`, Store schema `17` |",
+        "| Worker protocol / graph schema | `1.0` |",
+        "| SQLite Store | schema `19` |",
+        "| Durable operation journal | schema `6` |",
+        "| MCP tool DTO | `depgraph-mcp-tools-v1` |",
+        "| Operation DTO | `depgraph-operation-v2` |",
+        "| Agent host configuration | `depgraph-agent-host-config-v1` |",
+        "| Code-health finding | `depgraph-health-finding-v1` |",
+        "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
+        "| Stable source / release gate | `stable-release-gate-v2` |",
+        "0affa3af15a4854f78a2c6d4b1308e4647c39f88",
+        "ea16edec63e88923c7d169152caedbf4285b4713",
+        "refs/heads/release/0.6",
+        "baseline status is maintenance-ref-pinned",
+    ] {
+        if !v0_6_release_adr.contains(required) {
+            bail!("v0.6 release ADR is missing required contract {required:?}");
         }
     }
     for required in [
@@ -1750,14 +1784,17 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         STABLE_UPGRADE_SOURCE_VERSION,
         STABLE_UPGRADE_SOURCE_FIXTURE_PATH,
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
-        "`v0.5.3`, Store schema `17`",
+        "`v0.5.4`, Store schema `17`",
         "@tamat-llc/depgraph",
         "@tamat-llc/depgraph-win32-x64",
         "npm Trusted Publishing",
-        "release-post-publish-evidence-v0.5.4.json",
+        "release-post-publish-evidence-v0.6.0.json",
         "stable-v0.5.0-packaged-smoke-v1",
-        "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
+        "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
+        "| Code-health finding | `depgraph-health-finding-v1` |",
         "`mcp-package-smoke-v3`を使う",
+        AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH,
+        AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
         "Node.js 24",
         "musl",
     ] {
@@ -1955,6 +1992,10 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "`mcp-package-smoke-v3`",
         "`depgraph-agent-host-config-v1`",
         "`maintenance-ref-pinned`",
+        "maintenance=\"$(git ls-remote origin refs/heads/release/0.6 | awk '{print $1}')\"",
+        "git merge-base --is-ancestor \"$maintenance\" \"$candidate\"",
+        "git push origin \"$candidate:refs/heads/release/0.6\"",
+        "test \"$candidate\" = \"$(git ls-remote origin refs/heads/release/0.6 | awk '{print $1}')\"",
         AGENT_DOGFOOD_REPORT_SHA256,
         "release-post-publish-evidence-v0.5.0.json",
         "`tar`、`zip`とそのtransitive closure",
@@ -1992,7 +2033,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         || compatibility.stable_upgrade_source_fixture_sha256
             != format!("sha256:{STABLE_UPGRADE_SOURCE_FIXTURE_SHA256}")
     {
-        bail!("v0.5 release compatibility tuple is not synchronized");
+        bail!("stable release compatibility tuple is not synchronized");
     }
     verify_stable_release_source_guard(root)?;
     let git_attributes = fs::read_to_string(root.join(".gitattributes"))?;
@@ -2054,6 +2095,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "docs/40_arch_design/adr-default-profile-selection-budget.md",
         "docs/40_arch_design/adr-bounded-graph-query-language.md",
         "docs/40_arch_design/adr-v0.5-release-contract.md",
+        "docs/40_arch_design/adr-v0.6-release-contract.md",
         "docs/40_arch_design/adr-code-health-finding-contract.md",
         "docs/50_test/mcp-agent-host-operations.md",
         "docs/50_test/agent-dogfood-benchmark.md",
@@ -2120,8 +2162,8 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
-        "name: Bind the stable candidate to main, release/0.5, and exact Full CI",
-        "if [[ \"$GITHUB_REF_NAME\" == \"v0.5.4\" ]]",
+        "name: Bind the stable candidate to main, release/0.6, and exact Full CI",
+        "if [[ \"$GITHUB_REF_NAME\" == \"v0.6.0\" ]]",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -2155,7 +2197,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "ci_run_id=\"$(jq -r '.workflow_results.full_ci_run_id // empty' artifacts/stable-release-gate.json)\"",
         "gh release upload \"$GITHUB_REF_NAME\" \"$evidence\"",
         "cmp --silent \"$evidence\"",
-        "git ls-remote origin refs/heads/release/0.5",
+        "git ls-remote origin refs/heads/release/0.6",
         "trusted_evidence_sha256",
         "scripts/release-post-publish-canary.sh",
         "post-publish/canary",
@@ -2494,7 +2536,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "日本語 | [English](README.en.md)",
                 "## プロジェクトの状況と公開コラボレーション",
-                "サポート対象は、検証済みの`v0.5.4`リリースを条件として確定する",
+                "現在のサポート対象は、公開済み`v0.5.4`リリースである。",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2507,7 +2549,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
-                "The supported line is conditionally anchored by the verified `v0.5.4` Release",
+                "The supported line is currently anchored by the published `v0.5.4` Release.",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",

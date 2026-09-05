@@ -507,7 +507,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "depgraph-cli"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-core"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "caseless",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-mcp"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-mcp-tools"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "chacha20poly1305",
  "depgraph-core",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-operation"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "clap",
  "depgraph-core",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-protocol"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "jsonschema",
  "pretty_assertions",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-rust-worker"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-rustc-wrapper"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "depgraph-core",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "depgraph-store"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3733,7 +3733,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-hack"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aho-corasick",
  "bitflags",
@@ -3786,7 +3786,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",

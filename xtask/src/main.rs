@@ -37,9 +37,9 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.5.4";
+const STABLE_RELEASE_VERSION: &str = "0.6.0";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
-const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
+const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.6";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
 const AGENT_DOGFOOD_REPORT_PATH: &str =
     "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json";
@@ -597,15 +597,15 @@ fn v0_4_stable_release_baseline_digest() -> String {
     ))
 }
 
-fn v0_5_stable_release_baseline_record(commit: &str) -> String {
+fn stable_release_baseline_record(commit: &str) -> String {
     format!(
         "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion={STABLE_RELEASE_VERSION}\ncommit={commit}\n"
     )
 }
 
-fn v0_5_stable_release_baseline_digest(commit: &str) -> String {
+fn stable_release_baseline_digest(commit: &str) -> String {
     hex::encode(Sha256::digest(
-        v0_5_stable_release_baseline_record(commit).as_bytes(),
+        stable_release_baseline_record(commit).as_bytes(),
     ))
 }
 
@@ -670,15 +670,19 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "V0_5_2_RELEASE_SOURCE_SHA: 08e077b9b2f7dbe6dd919ae75e0c20f559b14cbb",
         "github.event.workflow_run.head_branch == 'v0.5.3'",
         "V0_5_3_RELEASE_SOURCE_SHA: ebac6e8836905164d5e1522f7c87844d5d8e2fe7",
-        "STABLE_MAINTENANCE_REF: heads/release/0.5",
+        "github.event.workflow_run.head_branch == 'v0.5.4'",
+        "V0_5_4_RELEASE_SOURCE_SHA: ea16edec63e88923c7d169152caedbf4285b4713",
+        "STABLE_MAINTENANCE_REF: heads/release/0.6",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
         "signed tag preserved for retry",
         "http_status\" == \"404\"",
-        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline",
+        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.6 baseline",
     ] {
         if !source_guard.contains(required) {
-            bail!("stable release source guard is missing v0.5 contract {required:?}");
+            bail!(
+                "stable release source guard is missing historical/current contract {required:?}"
+            );
         }
     }
     for required in [
@@ -3877,7 +3881,7 @@ fn validate_post_publish_aggregates(
     let benchmark_sha = required_asset_digest(&digests, "benchmark-report.json")?;
     let full_ci_jobs_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&full_ci.jobs)?));
     let full_ci_run_id = full_ci.run_id.to_string();
-    let expected_baseline_digest = v0_5_stable_release_baseline_digest(source_sha);
+    let expected_baseline_digest = stable_release_baseline_digest(source_sha);
     if stable.schema_version != STABLE_RELEASE_GATE_SCHEMA_VERSION
         || stable.release_version != VERSION
         || stable.upgrade_source_version != STABLE_UPGRADE_SOURCE_VERSION
@@ -4074,7 +4078,7 @@ fn evaluate_stable_release_gate(
         .get("maintenance_head_sha")
         .cloned()
         .unwrap_or_default();
-    let baseline_digest = v0_5_stable_release_baseline_digest(&source_sha);
+    let baseline_digest = stable_release_baseline_digest(&source_sha);
     workflow_results.insert("baseline_digest".to_owned(), baseline_digest.clone());
     let full_ci_matches_source = lowercase_git_sha(&source_sha)
         && full_ci.run_id != 0
@@ -4382,7 +4386,7 @@ fn evaluate_stable_release_gate(
             passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
                 && release_source_matches_tag,
             evidence: format!(
-                "the immutable v0.4.0 and v0.5.0 sources remain enforced; canonical v{STABLE_RELEASE_VERSION}-rc.N tags bind their exact source SHA; stable v{STABLE_RELEASE_VERSION} binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
+                "the immutable v0.4.0 and v0.5.x sources remain enforced; canonical v{STABLE_RELEASE_VERSION}-rc.N tags bind their exact source SHA; stable v{STABLE_RELEASE_VERSION} binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
             ),
         },
         StableReleaseGateCheck {
@@ -5556,7 +5560,7 @@ mod tests {
                     "source_tree": source_tree,
                     "main_head_sha": source_sha,
                     "maintenance_head_sha": source_sha,
-                    "baseline_digest": super::v0_5_stable_release_baseline_digest(&source_sha),
+                    "baseline_digest": super::stable_release_baseline_digest(&source_sha),
                     "agent_dogfood_report_sha256": AGENT_DOGFOOD_REPORT_SHA256,
                     "agent_dogfood_code_health_report_sha256": AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
                     "full_ci_run_id": "123",
@@ -5646,12 +5650,12 @@ mod tests {
         super::project_metadata::verify_japanese_readme_contract(&readme, &english_readme)?;
 
         let store_schema = format!(
-            "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
+            "current `main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             depgraph_store::STORE_SCHEMA_VERSION
         );
         let drifted_schema = readme.replacen(
             &store_schema,
-            "tag後の現行`main`はStore schema `999`を使用し、schema 999へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
+            "current `main`はStore schema `999`を使用し、schema 999へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             1,
         );
         assert_ne!(drifted_schema, readme);

@@ -89,9 +89,11 @@ stable release gate は通常 archive の aggregate report、benchmark report、
 さらに、通常 archive とcompiler packのrelease version、五つのtarget集合、compiler compatibility unitを直接比較し、同一release runの対応するassetだけを許可する。
 未公開のimmutable `v0.4.0` baselineは従来どおり元の固定commitだけを許可し、current packageとしては公開しない。
 公開済み`v0.5.0`のsourceは履歴上の固定SHAだけを許可する。
-現行packageのpack付き公開検証には、同一base versionの`v0.5.4`またはcanonicalな`v0.5.4-rc.N` tagだけを許可する。
+現行packageのpack付き公開検証には、v0.6.0またはcanonicalな`v0.6.0-rc.N` tagだけを許可する。
+公開済み`v0.5.4`のpackとStore schema `17`は履歴検証用であり、v0.6.0のarchiveやschema `19`と混在させない。
 RC tagはworkflowのexact source SHAへ結合し、sequenceは先頭ゼロを含まない正整数に限る。
-stable `v0.5.4`はremote `main`、`release/0.5`、tag、exact Full CIが一致するまで拒否する。
+stable `v0.6.0`はremote `main`、`release/0.6`、tag、exact Full CIが一致するまで拒否する。
+v0.6.0のrelease contractにはStore schema `19`とcode-health契約／APIを含め、通常archive、compiler pack、manifestのversionとtargetを同じsource gateで検証する。
 
 ## 実行
 

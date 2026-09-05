@@ -104,9 +104,10 @@ unused findingの`probable`は使用とhard blockerがないものの、適用�
 `indeterminate`はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。
 hotspotの層の充足は`hotspot_scores.available`で確認する。
 findingの`suppressions`はv1ではwire互換性のため保持するoutput-only/deferred fieldであり、CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返す。
-tag後の現行`main`／評価用RCの監査では、before/afterがschema 18に保存したpolicy digest、analyzer version、finding contract versionを比較する。
+tag後の現行`main`／評価用RCの監査では、before/afterがschema 19に保存したpolicy digest、analyzer version、finding contract versionを比較する。
 provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
 公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
+次のminor release `v0.6.0` は、current `main`のschema 19とcode-health契約／APIを公開する。
 sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
@@ -140,6 +141,8 @@ sourceは自動変更しない。
 
 以下は、公式Releaseと公開後証跡が揃った後に適用される導入案内である。
 `v0.5.4`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
+次のminor release `v0.6.0`も同じ5 targetで提供する予定である。
+`v0.6.0`の導入例は、公式Releaseと公開後証跡が揃うまで実行しない。
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
 
@@ -163,7 +166,7 @@ npm版のランチャーにはNode.js 24以上が必要である。
 公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
 
 ```sh
-VERSION=0.5.4
+VERSION=0.6.0
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -222,22 +225,27 @@ target/debug/depgraph --version
 `main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
+次のminor release `v0.6.0`は、current `main`を基にStore schema `19`と説明可能なcode-health契約／APIを公開する。
+`depgraph-health-finding-v1`、CLIの`health`／`cleanup`／`audit`／`hotspots`、および対応するMCP APIがこの境界に含まれる。
+これは`v0.5.4`のpatchではない。
+
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
 現行開発版のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`6`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v2`を使用する。
 公開済み`v0.5.4` artifactのStore schemaは`17`である。
-tag後の現行`main`はStore schema `19`を使用し、schema 19へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
+current `main`はStore schema `19`を使用し、schema 19へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
 
 `v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
 過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
 完全な互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)を参照する。
+`v0.6.0`の移行条件とAPI差分は、準備中の[`v0.6.0`リリースノート](docs/releases/v0.6.0.md)に記載する。
 
 ## プロジェクトの状況と公開コラボレーション
 
-サポート対象は、検証済みの`v0.5.4`リリースを条件として確定する。
-`v0.5.4`は、公式リリースと公開後証跡の公開後に現在の安定版となる。
-それまでは`v0.5.3`が安定版であり、リリース候補は評価用の過去の配布物である。
+現在のサポート対象は、公開済み`v0.5.4`リリースである。
+`v0.6.0`は、Store schema 19とcode-health契約／APIを含む次のminor releaseとして準備中である。
+公式Releaseと公開後証跡が揃うまでは、`v0.5.4`を安定版として扱い、`v0.6.0`のmain／RC artifactを評価用に限定する。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
 
 利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従う。

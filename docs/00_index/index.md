@@ -19,6 +19,7 @@
 | PROJ-ARC-001-ADR-008 | PROJ-ARC-001 | [npm distribution for the native CLI](../40_arch_design/adr-npm-distribution.md) | Accepted |
 | PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |
 | PROJ-ARC-001-ADR-010 | PROJ-ARC-001 | [Pre-split analysis planning by dependency scope and work estimate](../40_arch_design/adr-presplit-analysis-planning.md) | Implemented |
+| PROJ-ARC-001-ADR-011 | PROJ-ARC-001 | [v0.6 release, migration, and source contract](../40_arch_design/adr-v0.6-release-contract.md) | Accepted |
 
 ## 運用手順
 
@@ -26,6 +27,11 @@
 - [npmリリース手順](../50_test/npm-release-procedure.md)
 - [MCP Agent host operations](../50_test/mcp-agent-host-operations.md)
 - [Packaged MCP Agent dogfood benchmark](../50_test/agent-dogfood-benchmark.md)
+
+## リリースノート
+
+- [v0.6.0](../releases/v0.6.0.md): current `main`を基にしたminor releaseの準備中。Store schema 19とcode-health契約／APIを含む。
+- [v0.5.4](../releases/v0.5.4.md): 公開済みstable。Store schema 17とsource/tagの履歴は不変。
 
 ## 統計
 
@@ -57,6 +63,8 @@
 | mcp-agent-tools | 1 |
 
 ## 更新履歴
+
+- 2026-09-13: `PROJ-ARC-001-ADR-011`と`v0.6.0`リリース契約を追加。Store schema 19、操作ジャーナル6、操作DTO v2、code-healthと分割・再開解析の互換性を明記。
 
 - 2026-09-08: Issue #482として、元の試験対象での scan / health 完了確認を Epic #464 の必須 closer に戻し、[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md) の「Required private-trial closer」と ADR の完了判定を揃えた。公開合成 fixture は必要だが十分ではない
 - 2026-09-07: Issue #479としてmacOSでも`openat`/`O_NOFOLLOW`で`go_reference_fingerprint`を生成し、package semantic checkpointをLinuxと同じ契約で再利用できるようにした

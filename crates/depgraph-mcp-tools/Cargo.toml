@@ -19,7 +19,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
-workspace-hack = { version = "0.5", path = "../../workspace-hack" }
+workspace-hack = { version = "0.6", path = "../../workspace-hack" }
 
 [dev-dependencies]
 jsonschema = { version = "0.47", default-features = false }

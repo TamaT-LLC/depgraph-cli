@@ -9,14 +9,18 @@ repository.
 The supported stable line is the newest stable version whose official GitHub
 Release and matching `release-post-publish-evidence-<tag>.json` asset exist and
 agree.
-During the `v0.5.4` rollout, the
-[`v0.5.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.3)
-remains supported until the same condition is satisfied for
-[`v0.5.4`](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4).
+The published [`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)
+is the current stable baseline while `v0.6.0` is prepared.
+`v0.6.0` becomes supported only after its official Release and matching
+post-publish evidence exist. It is a minor release for Store schema `19` and
+the code-health contract/API; it is not a patch to the `v0.5.4` Store schema
+`17` contract.
 Release candidates and older stable versions are unsupported.
 Fixes land on `main` first.
-For a stable patch release, `release/0.5` advances by fast-forward to the exact
-reviewed `main` commit that passed Full CI; it is not advanced by cherry-pick.
+For a stable patch release, the maintenance ref matching that minor line
+advances by fast-forward to the exact reviewed `main` commit that passed Full
+CI; it is not advanced by cherry-pick. The v0.5 and v0.6 refs are
+`release/0.5` and `release/0.6`, respectively.
 The pinned toolchains, five native archive targets, compatibility contract,
 known limitations, and verified release links are listed in the
 [English README](README.en.md).
