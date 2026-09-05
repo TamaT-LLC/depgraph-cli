@@ -188,6 +188,9 @@ const UNSAFE_GIT_OPTIONS = new Set([
   "--work-tree",
 ]);
 const UNSAFE_RG_OPTIONS = new Set([
+  "-.",
+  "-L",
+  "-u",
   "-z",
   "--follow",
   "--hidden",
@@ -2937,15 +2940,17 @@ function rgPathArguments(words) {
       continue;
     }
     if (!optionsEnded && word.startsWith("-")) {
+      // ripgrep permits clustered short flags (for example, `-if FILE`).
+      // Reject every cluster/attached short value: otherwise a file-reading
+      // `-f` can hide behind an unrelated flag and escape the path check.
+      if (!word.startsWith("--") && word.length > 2) return null;
       const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
-      const shortFileOption = word.startsWith("-f") && word.length > 2;
-      if (RG_PATH_OPTIONS.has(option) || shortFileOption) {
+      if (RG_PATH_OPTIONS.has(option)) {
         const path = word.includes("=")
           ? word.slice(word.indexOf("=") + 1)
-          : shortFileOption
-            ? word.slice(2)
-            : words[++index];
+          : words[++index];
         if (path === undefined || !fixedSparseFilePath(path)) return null;
+        if (option === "-f" || option === "--file") patternSeen = true;
         continue;
       }
       if (RG_OPTIONS_WITH_VALUE.has(option) && !word.includes("=")) {

@@ -491,6 +491,29 @@ test("trace safety fails closed on project or compound shell commands", () => {
       .project_code_execution_observed,
     true,
   );
+  for (const command of [
+    "rg -if /etc/passwd workers/web/src",
+    "rg -if=/etc/passwd workers/web/src",
+    "rg -if/etc/passwd workers/web/src",
+    "rg -Iif /etc/passwd workers/web/src",
+    "rg -zif /etc/passwd workers/web/src",
+    "rg -. token workers/web/src",
+    "rg -L token workers/web/src",
+    "rg -uu token workers/web/src",
+    "rg -zj1 token workers/web/src",
+  ]) {
+    assert.equal(
+      observation(`/bin/bash -lc '${command}'`).project_code_execution_observed,
+      true,
+      command,
+    );
+  }
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'rg -i -f crates/depgraph-mcp-tools/src/lib.rs workers/web/src'",
+    ).project_code_execution_observed,
+    false,
+  );
 });
 
 test("Agent runs discard external Git and ripgrep execution configuration", () => {
