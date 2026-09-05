@@ -152,6 +152,37 @@ fn verify_duplicate_module_root_scan(
     );
 
     let export = runner.export_json(&store)?;
+    let repeated_store = temp.join("duplicate-module-root-repeat.db");
+    let repeated_scan = runner.scan_no_cache(&repeated_store, fixture)?;
+    ensure!(
+        repeated_scan["status"] == "completed"
+            && repeated_scan["exit_code"] == 0
+            && repeated_scan["coverage"]["project_code_executed"] == false,
+        "repeated duplicate-module root scan did not complete safely: {repeated_scan}"
+    );
+    let repeated_export = runner.export_json(&repeated_store)?;
+
+    let copied_fixture = temp.join("nested/duplicate-module-root-copy");
+    write_duplicate_module_path_fixture(&copied_fixture)?;
+    let copied_store = temp.join("duplicate-module-root-copy.db");
+    let copied_scan = runner.scan_no_cache(&copied_store, &copied_fixture)?;
+    ensure!(
+        copied_scan["status"] == "completed"
+            && copied_scan["exit_code"] == 0
+            && copied_scan["coverage"]["project_code_executed"] == false,
+        "copied duplicate-module root scan did not complete safely: {copied_scan}"
+    );
+    let copied_export = runner.export_json(&copied_store)?;
+    let projection = graph_projection(&export)?;
+    ensure!(
+        projection == graph_projection(&repeated_export)?,
+        "duplicate-module canonical graph changed on a repeated no-cache scan"
+    );
+    ensure!(
+        projection == graph_projection(&copied_export)?,
+        "duplicate-module canonical graph changed across checkout paths"
+    );
+
     let graph = export
         .get("graph")
         .context("duplicate-module JSON export has no graph")?;
@@ -243,7 +274,7 @@ fn verify_duplicate_module_root_scan(
         build_units["one"]
     );
 
-    let projection = serde_json::to_string(&graph_projection(&export)?)?;
+    let projection = serde_json::to_string(&projection)?;
     for forbidden in [fixture, temp, runner.module_cache, runner.go_path] {
         ensure!(
             !projection.contains(&forbidden.display().to_string()),
