@@ -47,6 +47,14 @@ const AGENT_DOGFOOD_REPORT_SHA256: &str =
     "3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b";
 const AGENT_DOGFOOD_SPEC_PATH: &str = "fixtures/agent-dogfood-v1/spec.json";
 const AGENT_DOGFOOD_EVIDENCE_DIRECTORY: &str = "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7";
+const AGENT_DOGFOOD_CODE_HEALTH_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v2";
+const AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH: &str =
+    "fixtures/agent-dogfood-v2/evidence/v0.5.4-rc.2/report.json";
+const AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256: &str =
+    "7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f";
+const AGENT_DOGFOOD_CODE_HEALTH_SPEC_PATH: &str = "fixtures/agent-dogfood-v2/spec.json";
+const AGENT_DOGFOOD_CODE_HEALTH_EVIDENCE_DIRECTORY: &str =
+    "fixtures/agent-dogfood-v2/evidence/v0.5.4-rc.2";
 const V0_4_STABLE_RELEASE_BASELINE_COMMIT: &str = "d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f";
 const V0_4_STABLE_RELEASE_BASELINE_TREE: &str = "46555a059070e94c3ed4567af3c58b278dbb0fb4";
 const V0_4_STABLE_RELEASE_BASELINE_DIGEST: &str =
@@ -135,6 +143,7 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
     "five-target-package-closure",
     "mcp-five-target",
     "agent-dogfood-ga",
+    "agent-dogfood-code-health",
     "performance-budget",
     "bounded-query-five-target",
     "profile-selection-five-target",
@@ -321,6 +330,7 @@ enum Task {
         benchmark_report: PathBuf,
         compiler_pack_verification: PathBuf,
         agent_dogfood_report: PathBuf,
+        agent_dogfood_code_health_report: PathBuf,
         full_ci_run: PathBuf,
         #[arg(long)]
         output: PathBuf,
@@ -796,6 +806,7 @@ struct StableReleaseGateInput<'a> {
     benchmark_report_sha256: String,
     compiler_pack_verification_sha256: String,
     agent_dogfood_report_sha256: String,
+    agent_dogfood_code_health_report_sha256: String,
     compiler_pack_verified: bool,
     full_ci: &'a FullCiRunEvidence,
     workflow_results: BTreeMap<String, String>,
@@ -936,6 +947,7 @@ fn main() -> Result<()> {
             benchmark_report,
             compiler_pack_verification,
             agent_dogfood_report,
+            agent_dogfood_code_health_report,
             full_ci_run,
             output,
         } => stable_release_gate(
@@ -943,6 +955,7 @@ fn main() -> Result<()> {
             &benchmark_report,
             &compiler_pack_verification,
             &agent_dogfood_report,
+            &agent_dogfood_code_health_report,
             &full_ci_run,
             &output,
         ),
@@ -2928,6 +2941,7 @@ fn stable_release_gate(
     benchmark_report_path: &Path,
     compiler_pack_verification_path: &Path,
     agent_dogfood_report_path: &Path,
+    agent_dogfood_code_health_report_path: &Path,
     full_ci_run_path: &Path,
     output: &Path,
 ) -> Result<()> {
@@ -2960,6 +2974,8 @@ fn stable_release_gate(
         compiler_pack_release::validate_verification_report(&compiler_pack_verification).is_ok()
             && compiler_pack_release_binding(&release_verification, &compiler_pack_verification);
     let agent_dogfood_report_sha256 = verify_agent_dogfood_release_gate(agent_dogfood_report_path)?;
+    let agent_dogfood_code_health_report_sha256 =
+        verify_agent_dogfood_code_health_release_gate(agent_dogfood_code_health_report_path)?;
     let mut workflow_results = stable_release_workflow_results();
     let source_sha = workflow_results
         .get("source_sha")
@@ -2981,6 +2997,10 @@ fn stable_release_gate(
         "agent_dogfood_report_sha256".to_owned(),
         agent_dogfood_report_sha256.clone(),
     );
+    workflow_results.insert(
+        "agent_dogfood_code_health_report_sha256".to_owned(),
+        agent_dogfood_code_health_report_sha256.clone(),
+    );
 
     let report = evaluate_stable_release_gate(
         &release_verification,
@@ -2990,6 +3010,7 @@ fn stable_release_gate(
             benchmark_report_sha256: sha256_file(benchmark_report_path)?,
             compiler_pack_verification_sha256: sha256_file(compiler_pack_verification_path)?,
             agent_dogfood_report_sha256,
+            agent_dogfood_code_health_report_sha256,
             compiler_pack_verified,
             full_ci: &full_ci,
             workflow_results,
@@ -3060,6 +3081,67 @@ fn verify_agent_dogfood_release_gate(report_path: &Path) -> Result<String> {
         .context("failed to launch the deterministic Agent dogfood verifier")?;
     if !status.success() {
         bail!("deterministic Agent dogfood verification rejected the GA input");
+    }
+    Ok(report_sha256)
+}
+
+fn verify_agent_dogfood_code_health_release_gate(report_path: &Path) -> Result<String> {
+    let report_sha256 = sha256_file(report_path)?;
+    if report_sha256 != AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256 {
+        bail!(
+            "Agent code-health dogfood report digest mismatch: expected {AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256}, found {report_sha256}"
+        );
+    }
+    let report: Value = serde_json::from_slice(&fs::read(report_path).with_context(|| {
+        format!(
+            "failed to read Agent code-health dogfood report {}",
+            report_path.display()
+        )
+    })?)
+    .context("Agent code-health dogfood report is not valid JSON")?;
+    if report["schema_version"] != AGENT_DOGFOOD_CODE_HEALTH_REPORT_SCHEMA_VERSION
+        || report["benchmark_id"] != "depgraph-agent-dogfood-v2"
+        || report["issue"] != 436
+        || report["gate"]["passed"] != Value::Bool(true)
+        || report["gate"]["checks"].as_array().is_none_or(|checks| {
+            checks.len() != 14
+                || checks
+                    .iter()
+                    .any(|check| !check["passed"].as_bool().unwrap_or(false))
+        })
+    {
+        bail!("Agent code-health dogfood report does not contain the exact all-green v2 input");
+    }
+
+    let root = workspace_root();
+    let spec_path = root.join(AGENT_DOGFOOD_CODE_HEALTH_SPEC_PATH);
+    let spec: Value = serde_json::from_slice(&fs::read(&spec_path).with_context(|| {
+        format!(
+            "failed to read Agent code-health dogfood spec {}",
+            spec_path.display()
+        )
+    })?)
+    .context("Agent code-health dogfood spec is not valid JSON")?;
+    if spec["schema_version"] != "agent-dogfood-spec-v2"
+        || spec["issue"] != 436
+        || spec["release_status"] != "pinned"
+    {
+        bail!(
+            "Agent code-health dogfood spec must be the pinned agent-dogfood-spec-v2 issue-436 contract"
+        );
+    }
+
+    let status = Command::new("node")
+        .current_dir(&root)
+        .arg("scripts/agent-dogfood.mjs")
+        .arg("verify")
+        .arg(&spec_path)
+        .arg(root.join(AGENT_DOGFOOD_CODE_HEALTH_EVIDENCE_DIRECTORY))
+        .arg(report_path)
+        .status()
+        .context("failed to launch the deterministic code-health Agent dogfood verifier")?;
+    if !status.success() {
+        bail!("deterministic code-health Agent dogfood verification rejected the v2 input");
     }
     Ok(report_sha256)
 }
@@ -3364,6 +3446,12 @@ fn validate_post_publish_aggregates(
     let stable: StableReleaseGateReport =
         serde_json::from_slice(&fs::read(directory.join("stable-release-gate.json"))?)
             .context("public stable release gate does not satisfy its closed schema")?;
+    let root = workspace_root();
+    let agent_dogfood_report_sha256 =
+        verify_agent_dogfood_release_gate(&root.join(AGENT_DOGFOOD_REPORT_PATH))?;
+    let agent_dogfood_code_health_report_sha256 = verify_agent_dogfood_code_health_release_gate(
+        &root.join(AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH),
+    )?;
     let release_sha = required_asset_digest(&digests, "release-verification.json")?;
     let compiler_sha = required_asset_digest(&digests, "compiler-pack-verification.json")?;
     let benchmark_sha = required_asset_digest(&digests, "benchmark-report.json")?;
@@ -3420,7 +3508,12 @@ fn validate_post_publish_aggregates(
             .workflow_results
             .get("agent_dogfood_report_sha256")
             .map(String::as_str)
-            != Some(AGENT_DOGFOOD_REPORT_SHA256)
+            != Some(agent_dogfood_report_sha256.as_str())
+        || stable
+            .workflow_results
+            .get("agent_dogfood_code_health_report_sha256")
+            .map(String::as_str)
+            != Some(agent_dogfood_code_health_report_sha256.as_str())
         || stable
             .workflow_results
             .get("full_ci_run_id")
@@ -3530,6 +3623,7 @@ fn evaluate_stable_release_gate(
         benchmark_report_sha256,
         compiler_pack_verification_sha256,
         agent_dogfood_report_sha256,
+        agent_dogfood_code_health_report_sha256,
         compiler_pack_verified,
         full_ci,
         mut workflow_results,
@@ -3793,6 +3887,14 @@ fn evaluate_stable_release_gate(
             passed: agent_dogfood_report_sha256 == AGENT_DOGFOOD_REPORT_SHA256,
             evidence: format!(
                 "the exact {AGENT_DOGFOOD_REPORT_SCHEMA_VERSION} report passed all fourteen precommitted accuracy, safety, reconnect, setup, and efficiency gates at sha256:{agent_dogfood_report_sha256}"
+            ),
+        },
+        StableReleaseGateCheck {
+            id: "agent-dogfood-code-health".to_owned(),
+            passed: agent_dogfood_code_health_report_sha256
+                == AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
+            evidence: format!(
+                "the exact {AGENT_DOGFOOD_CODE_HEALTH_REPORT_SCHEMA_VERSION} issue-436 report passed all fourteen precommitted dependency, code-health, safety, reconnect, setup, and efficiency gates at sha256:{agent_dogfood_code_health_report_sha256}"
             ),
         },
         StableReleaseGateCheck {
@@ -4898,6 +5000,7 @@ mod tests {
         verify_mcp_dependencies, verify_rust_analyzer_dependencies, web_runtime_packages,
     };
     use super::{
+        AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH, AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
         AGENT_DOGFOOD_REPORT_PATH, AGENT_DOGFOOD_REPORT_SHA256, ARCHIVE_MTIME,
         BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
@@ -4928,10 +5031,10 @@ mod tests {
         rustc_source_identity, supported_release_tag, target_native_smoke_expectation,
         v0_4_stable_release_baseline_digest, validate_bounded_query_package_smoke,
         validate_cross_language_package_smoke, validate_full_ci_run,
-        verify_agent_dogfood_release_gate, verify_checksum_sidecar,
-        verify_cross_language_package_smoke, verify_pinned_rust_sysroot_digest,
-        verify_release_checksum_name, verify_release_tag_values, verify_rust_backend,
-        verify_stable_release_source_guard, verify_web_semantic_attestation,
+        verify_agent_dogfood_code_health_release_gate, verify_agent_dogfood_release_gate,
+        verify_checksum_sidecar, verify_cross_language_package_smoke,
+        verify_pinned_rust_sysroot_digest, verify_release_checksum_name, verify_release_tag_values,
+        verify_rust_backend, verify_stable_release_source_guard, verify_web_semantic_attestation,
         web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
     };
 
@@ -5021,6 +5124,7 @@ mod tests {
                     "maintenance_head_sha": source_sha,
                     "baseline_digest": super::v0_5_stable_release_baseline_digest(&source_sha),
                     "agent_dogfood_report_sha256": AGENT_DOGFOOD_REPORT_SHA256,
+                    "agent_dogfood_code_health_report_sha256": AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
                     "full_ci_run_id": "123",
                     "full_ci_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/123",
                     "full_ci_head_sha": source_sha,
@@ -6316,6 +6420,24 @@ jobs:
     }
 
     #[test]
+    fn agent_dogfood_code_health_release_gate_is_digest_pinned_and_recomputed() -> Result<()> {
+        let canonical = workspace_root().join(AGENT_DOGFOOD_CODE_HEALTH_REPORT_PATH);
+        assert_eq!(
+            verify_agent_dogfood_code_health_release_gate(&canonical)?,
+            AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256
+        );
+
+        let temp = tempfile::tempdir()?;
+        let tampered = temp.path().join("report.json");
+        let mut bytes = fs::read(canonical)?;
+        bytes.push(b'\n');
+        fs::write(&tampered, bytes)?;
+        let error = verify_agent_dogfood_code_health_release_gate(&tampered).unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+        Ok(())
+    }
+
+    #[test]
     fn stable_release_gate_allows_pinned_ga_and_exact_rc_evidence_and_rejects_drift() {
         let target = |target: &str| TargetVerificationReport {
             target: target.to_owned(),
@@ -6471,6 +6593,8 @@ jobs:
             benchmark_report_sha256: "b".repeat(64),
             compiler_pack_verification_sha256: "c".repeat(64),
             agent_dogfood_report_sha256: AGENT_DOGFOOD_REPORT_SHA256.to_owned(),
+            agent_dogfood_code_health_report_sha256: AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256
+                .to_owned(),
             compiler_pack_verified: true,
             full_ci: &full_ci,
             workflow_results,

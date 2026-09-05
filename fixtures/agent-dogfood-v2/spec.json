@@ -2,62 +2,85 @@
   "schema_version": "agent-dogfood-spec-v2",
   "benchmark_id": "depgraph-agent-dogfood-v2",
   "issue": 436,
-  "release_status": "pending",
+  "release_status": "pinned",
   "release": {
     "repository": "TamaT-LLC/depgraph-cli",
-    "tag": "PENDING-RELEASE",
-    "candidate_commit": "PENDING-RELEASE",
-    "candidate_tree": "PENDING-RELEASE",
+    "tag": "v0.5.4-rc.2",
+    "candidate_commit": "68aed98d66585c0abcd7ffbedccad347cb4d3fae",
+    "candidate_tree": "e3eee24d660680c025a2fee4ae176007014c6979",
     "host_target": "aarch64-apple-darwin",
     "archive": {
-      "name": "depgraph-aarch64-apple-darwin.tar.gz",
-      "sha256": "PENDING-RELEASE"
+      "name": "depgraph-0.5.4-aarch64-apple-darwin.tar.gz",
+      "sha256": "1580b9abfde117aa805099dee4c299e93c1596f1366f64dc5ec8e305822a40d4"
     },
     "compiler_pack_archive": {
-      "name": "depgraph-compiler-pack-aarch64-apple-darwin.tar.gz",
-      "sha256": "PENDING-RELEASE"
+      "name": "depgraph-compiler-pack-0.5.4-aarch64-apple-darwin.tar.gz",
+      "sha256": "720dfdc01ed1bb77ac88cdc53d07a9f5367fffbe4fe8b4ff3cd522a20082fbff"
     },
     "compiler_pack_requirement": {
-      "name": "depgraph-compiler-pack-aarch64-apple-darwin.requirement.json",
-      "sha256": "PENDING-RELEASE"
+      "name": "depgraph-compiler-pack-0.5.4-aarch64-apple-darwin.requirement.json",
+      "sha256": "25230dda5c103d530cc1bfc4b6d1965bb25f4382a102730800780909c94b6fe4"
     },
     "mcp_smoke": {
-      "name": "depgraph-aarch64-apple-darwin.mcp-smoke.json",
-      "sha256": "PENDING-RELEASE",
+      "name": "depgraph-0.5.4-aarch64-apple-darwin.mcp-smoke.json",
+      "sha256": "05f405054b8ae093a808ef262b888c28c1e24e5b5fd02a5eecd08585c56022ba",
       "schema_version": "mcp-package-smoke-v3",
-      "read_catalog_sha256": "PENDING-RELEASE"
+      "read_catalog_sha256": "3dd479665ce7eb155e4df770d869cefd7f5141149faf7176d414be9b54b8d565"
     }
   },
   "repository": {
-    "baseline_commit": "PENDING-RELEASE",
-    "baseline_tree": "PENDING-RELEASE",
-    "candidate_commit": "PENDING-RELEASE",
-    "candidate_tree": "PENDING-RELEASE"
+    "baseline_commit": "31cfed0b0fd1363f9c761b603cec3566bfaec351",
+    "baseline_tree": "1fcafe9ccaa4abcaaac2f7a090231c9d4022458e",
+    "candidate_commit": "68aed98d66585c0abcd7ffbedccad347cb4d3fae",
+    "candidate_tree": "e3eee24d660680c025a2fee4ae176007014c6979",
+    "sparse_paths": [
+      "/Cargo.lock",
+      "/Cargo.toml",
+      "/crates/depgraph-cli/Cargo.toml",
+      "/crates/depgraph-cli/src/main.rs",
+      "/crates/depgraph-mcp-tools/Cargo.toml",
+      "/crates/depgraph-mcp-tools/src/catalog.rs",
+      "/crates/depgraph-mcp-tools/src/host_config.rs",
+      "/crates/depgraph-mcp-tools/src/lib.rs",
+      "/crates/depgraph-mcp/Cargo.toml",
+      "/crates/depgraph-mcp/src/main.rs",
+      "/workers/go/cmd/depgraph-go-worker/main.go",
+      "/workers/go/go.mod",
+      "/workers/go/internal/worker/scan.go",
+      "/workers/web/package.json",
+      "/workers/web/src/dogfood/unused-health-probe.ts",
+      "/workers/web/src/imports.ts",
+      "/workers/web/src/scanner.ts",
+      "/workers/web/src/typescript-compiler.ts",
+      "/workers/web/src/typescript-dependencies.ts",
+      "/workers/web/src/typescript-dependency-validation.ts",
+      "/workers/web/src/worker.ts"
+    ]
   },
   "snapshots": {
     "baseline": {
       "name": "agent-tools-baseline",
-      "id": "PENDING-RELEASE",
-      "source_revision": "PENDING-RELEASE"
+      "id": "snapshot:sha256:4c699b113616a038c8951f3ea7323670e66ce4e2d16c037a43e9c7f2f57ef144",
+      "source_revision": "31cfed0b0fd1363f9c761b603cec3566bfaec351"
     },
     "candidate": {
       "name": "rc-candidate",
-      "id": "PENDING-RELEASE",
-      "source_revision": "PENDING-RELEASE"
+      "id": "snapshot:sha256:07be48fd997c1733f103457cf65ce297925e5adc722a8c17d2c7f3e47b85bc74",
+      "source_revision": "68aed98d66585c0abcd7ffbedccad347cb4d3fae"
     }
   },
   "safety_baseline": {
-    "source_sha256": "PENDING-RELEASE",
-    "store_sha256": "PENDING-RELEASE",
-    "journal_sha256": "PENDING-RELEASE",
-    "daemon_state_sha256": "PENDING-RELEASE",
-    "relevant_processes": "PENDING-RELEASE"
+    "source_sha256": "1d2a15c85d8d4c2d08fc3e997d8180545a0d357220d2571ac42aab22df2d8ecf",
+    "store_sha256": "19ad8d91804e22f412675af140e0ca849fcc304b68429489b53600ae939bc698",
+    "journal_sha256": "15df9ae7a75ab8383c84066c9d5e326ba7ef18f1c60655026d3a89be2b7564b9",
+    "daemon_state_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "relevant_processes": 0
   },
   "host": {
     "program": "codex",
-    "cli_version": "PENDING-RELEASE",
-    "model": "PENDING-RELEASE",
-    "reasoning_effort": "PENDING-RELEASE",
+    "cli_version": "codex-cli 0.150.1",
+    "model": "gpt-5.6-terra",
+    "reasoning_effort": "medium",
     "sandbox": "read-only",
     "approval_policy": "never",
     "ignore_user_config": true,
@@ -75,6 +98,7 @@
       "graph_impact_get",
       "graph_path_get",
       "snapshot_diff_get",
+      "agent_node_get",
       "health_audit_get",
       "health_finding_get",
       "health_findings_list",
@@ -90,6 +114,7 @@
       "graph_impact_get",
       "graph_path_get",
       "snapshot_diff_get",
+      "agent_node_get",
       "health_audit_get",
       "health_finding_get",
       "health_findings_list",
@@ -120,7 +145,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "target=rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::catalog;steps=1;kind=reexports"
       }
     },
     {
@@ -130,7 +155,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "target=go-package:github.com/TamaT-LLC/depgraph-cli/workers/go/internal/worker;line=10;kind=imports"
       }
     },
     {
@@ -140,7 +165,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "target=file://workers/web/src/scanner.ts;line=17;condition=(mode == \"production\" && environment in [\"browser\", \"server\"])"
       }
     },
     {
@@ -150,7 +175,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "count=2;sources=file://workers/web/src/worker.ts,id:package:sha256:31cf1f1219ba2e68d9c7de470c231618594e164fc67bef5f27ca9c10b7b934c4"
       }
     },
     {
@@ -160,7 +185,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "complete=true;items=cargo-target:depgraph-mcp-tools@0.5.4#crates/depgraph-mcp-tools:lib:depgraph_mcp_tools@2,file:crates/depgraph-mcp-tools/src/lib.rs@1,rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::@2"
       }
     },
     {
@@ -170,7 +195,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "unresolved",
-        "value": "PENDING-RELEASE"
+        "value": "target=unknown:rust:rust_type:Self;status=unresolved;precision=heuristic;line=42"
       }
     },
     {
@@ -180,7 +205,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "candidate",
-        "value": "PENDING-RELEASE"
+        "value": "target=rust-module:depgraph-cli:bin:depgraph-cli::;status=candidates;precision=overapprox;line=3514"
       }
     },
     {
@@ -190,7 +215,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "total=0;empty=true;digest=snapshot-diff-collection:sha256:a17e387c0ddb7fcc5078f3c841055fcecb797a8ec1b19e6226a32a32786cef5b"
       }
     },
     {
@@ -200,7 +225,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "digest=snapshot-diff-collection:sha256:bce8c51240b2809fbf4de563a9d1ba56fc3682c73c47c33eb4e1e02c32cb0f7a"
       }
     },
     {
@@ -210,7 +235,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "count=1;cycle=file://workers/web/src/imports.ts->file://workers/web/src/typescript-compiler.ts->file://workers/web/src/typescript-dependencies.ts->file://workers/web/src/typescript-dependency-validation.ts->file://workers/web/src/imports.ts"
       }
     },
     {
@@ -220,7 +245,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "count=0"
       }
     },
     {
@@ -230,7 +255,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "files=22;sites=3500;resolved=536;candidates=60;external=1328;unresolved=1576;unsupported=201;project_code_executed=false"
       }
     },
     {
@@ -240,7 +265,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "count=7;digest=collection:sha256:25c9a8db2aaa4e1094d94b0eab2541a36676e421c2be970c6a695b3d6a2318a0"
       }
     },
     {
@@ -250,7 +275,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "id=finding:sha256:0d1d739a1f3829fac543260794963f1c1f1af5710b7882285496b429c9403383;kind=unused-file;confidence=indeterminate;blockers=incomplete-coverage"
       }
     },
     {
@@ -260,7 +285,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "top=module:sha256:7ab8e0a7c1f6276c8d443253a4ac788c79d956afc1ff78c998c2e8d0af333cae;score=6499;blockers=runtime-not-observed"
       }
     },
     {
@@ -270,7 +295,7 @@
       "expected": {
         "verdict": "supported",
         "classification": "exact",
-        "value": "PENDING-RELEASE"
+        "value": "base_present=true;changed_oid=68aed98d66585c0abcd7ffbedccad347cb4d3fae;digest=collection:sha256:cb21ecd7c2ede39ee9ac2127d900fa017116b9673494d756be1d1e154a79e560"
       }
     }
   ]

@@ -250,19 +250,26 @@ APIは呼ばず、green recovery runを元runとpost-publish evidenceに連結�
 
 ## Agent dogfood v2（code health）Phase 2 pinning
 
-Issue #436 の受け入れ基準は、health 入り RC 配布物だけで実 Agent が 6 サンプルを
-完遂した evidence がチェックインされ、stable-release-gate が v2 report を必須検証
-することである。Phase 1 は `fixtures/agent-dogfood-v2/` を
-`release_status: "pending"` で追加するだけなので、次の RC タグ作成直後にこの手順を
-実施するまで Issue は open のまま維持する。実施者はオーナー実機
-`aarch64-apple-darwin` とする。shallow clone では hotspot の
-`churn-unavailable` が出るため、フルチェックアウトを使う。
+Issue #436 の Phase 2 は、公開済み `v0.5.4-rc.2` を candidate、
+`v0.5.4-rc.1` を baseline に固定する。オーナー実機
+`aarch64-apple-darwin` で baseline / MCP 各 3 サンプルを実行し、その evidence と
+v2 report を stable-release-gate で必須検証する。
+
+リポジトリは shallow でない full-history clone を使う。working tree は
+`fixtures/agent-dogfood-v2/spec.json` に定義した順序付き non-cone sparse-checkout に
+固定する。これにより hotspot の churn 履歴を保ちつつ、配布物の固定
+クエリ上限内で code-health 解析を完遂させる。runner は shallow clone、通常の
+full working tree、sparse path の不一致を実行前に拒否する。
+加えて `.git/config` と worktree 固有 config を別々に閉じて検査し、
+`extensions.worktreeConfig=true`、`core.sparseCheckout=true`、
+`core.sparseCheckoutCone=false` 以外の worktree 設定を拒否する。
 
 1. RC candidate commit のクリーンチェックアウトで
    `depgraph health list --kind unused-file`（または同等の MCP 呼び出し）が
    **1 件以上**であることを実測する。0 件なら Phase 2 を hard fail し、kind
    差し替えや claim 降格は行わない。
-2. baseline / candidate snapshot を再生成し digest を採取する。
+2. `v0.5.4-rc.1` と `v0.5.4-rc.2` の順に safe-scan snapshot を再生成し、
+   baseline を `agent-tools-baseline`、candidate を `rc-candidate` として digest を採取する。
 3. 実走 host identity を exact に確定する: Codex CLI の実測
    `cli_version`（`codex --version` の実測文字列。例: `codex-cli 0.146.0`）、
    model、`reasoning_effort`。sandbox は `read-only`、approval_policy は
@@ -274,14 +281,17 @@ Issue #436 の受け入れ基準は、health 入り RC 配布物だけで実 Age
    `release_status` を `"pinned"` にし、全 `PENDING-RELEASE` を実値へ置換する。
    `prompt.md` の `{{repository.baseline_commit}}` はそのまま残し、runner が
    実走時に pinned baseline OID を注入する。
+   runner は公開 archive を一時展開して package 全体を比較し、compiler-pack は
+   requirement、archive 内 manifest、全ファイルの path / size / mode / sha256 を照合する。
 5. `node scripts/agent-dogfood.mjs lint-spec --pinned fixtures/agent-dogfood-v2/spec.json`
    が、kinds=`unused-file` 固定・claim 13 の `count>=1`・claim 14 の
    `supported` を含めて通ることを確認する。`run` / `verify` / `aggregate` も
    同じ unused-file 不変条件と RC タグ / 資産名 / manifest 版の一致を強制する。
 6. `agent-dogfood.mjs run` で baseline / mcp 各 3 サンプルを実走し、
    `verify` が全 6 サンプルの host identity 完全一致と environment 整合を強制する
-   ことを確認する。gate 閾値（accuracy 90% / major recall 100%）を満たすこと。
-7. `fixtures/agent-dogfood-v2/evidence/<rc-tag>/` に 33 ファイルをチェックインする。
+   ことを確認する。MCP trace は固定順の call plan、引数、candidate snapshot、
+   動的 ID の受け渡しまで一致させる。gate 閾値（accuracy 90% / major recall 100%）を満たすこと。
+7. `fixtures/agent-dogfood-v2/evidence/<rc-tag>/` に 32 ファイルをチェックインする。
 8. `xtask/src/main.rs` へ v2 report path / sha256 pin と
    `release_status == "pinned"` assert を追加し、
    `.github/workflows/release.yml` の stable-release-gate へ v2 report を配線する。

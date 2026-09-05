@@ -7,15 +7,18 @@ import {
   createWriteStream,
   existsSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   readlinkSync,
   realpathSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -26,12 +29,36 @@ export const SAMPLE_SCHEMA_VERSION = "agent-dogfood-sample-v1";
 export const SAFETY_SCHEMA_VERSION = "agent-dogfood-safety-v1";
 export const ENVIRONMENT_SCHEMA_VERSION = "agent-dogfood-environment-v1";
 export const REPORT_SCHEMA_VERSION = "agent-dogfood-report-v1";
+export const REPORT_SCHEMA_VERSION_V2 = "agent-dogfood-report-v2";
 export const PENDING_RELEASE_SENTINEL = "PENDING-RELEASE";
 export const UNUSED_HEALTH_PROBE_PATH =
   "workers/web/src/dogfood/unused-health-probe.ts";
 export const PENDING_SPEC_ERROR =
   "Agent dogfood spec is pending release pinning and cannot be executed or verified";
 export const BASELINE_COMMIT_PLACEHOLDER = "{{repository.baseline_commit}}";
+export const V2_SPARSE_PATHS = Object.freeze([
+  "/Cargo.lock",
+  "/Cargo.toml",
+  "/crates/depgraph-cli/Cargo.toml",
+  "/crates/depgraph-cli/src/main.rs",
+  "/crates/depgraph-mcp-tools/Cargo.toml",
+  "/crates/depgraph-mcp-tools/src/catalog.rs",
+  "/crates/depgraph-mcp-tools/src/host_config.rs",
+  "/crates/depgraph-mcp-tools/src/lib.rs",
+  "/crates/depgraph-mcp/Cargo.toml",
+  "/crates/depgraph-mcp/src/main.rs",
+  "/workers/go/cmd/depgraph-go-worker/main.go",
+  "/workers/go/go.mod",
+  "/workers/go/internal/worker/scan.go",
+  "/workers/web/package.json",
+  "/workers/web/src/dogfood/unused-health-probe.ts",
+  "/workers/web/src/imports.ts",
+  "/workers/web/src/scanner.ts",
+  "/workers/web/src/typescript-compiler.ts",
+  "/workers/web/src/typescript-dependencies.ts",
+  "/workers/web/src/typescript-dependency-validation.ts",
+  "/workers/web/src/worker.ts",
+]);
 const V2_RC_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-rc\.([1-9]\d*)$/u;
 
 const ARM_NAMES = Object.freeze(["baseline", "mcp"]);
@@ -112,6 +139,14 @@ const APPROVED_LOCAL_GIT_CONFIG = Object.freeze([
   /^remote\.[A-Za-z0-9._/-]+\.(?:fetch|url)$/u,
   /^branch\..+\.(?:merge|remote)$/u,
   /^submodule\.active$/u,
+]);
+const APPROVED_SPARSE_LOCAL_GIT_CONFIG = Object.freeze([
+  ...APPROVED_LOCAL_GIT_CONFIG,
+  /^extensions\.worktreeconfig$/u,
+]);
+const V2_WORKTREE_GIT_CONFIG_KEYS = Object.freeze([
+  "core.sparsecheckout",
+  "core.sparsecheckoutcone",
 ]);
 const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
 function freezeClaimDescriptors(descriptors) {
@@ -276,8 +311,10 @@ const HOST_KEYS_V2 = Object.freeze([
 export const DOGFOOD_GENERATIONS = Object.freeze({
   [SPEC_SCHEMA_VERSION]: Object.freeze({
     schema_version: SPEC_SCHEMA_VERSION,
+    report_schema_version: REPORT_SCHEMA_VERSION,
     requires_release_status: false,
     identity_includes_cli_version: false,
+    sparse_paths: null,
     claim_descriptors: DOGFOOD_CLAIM_DESCRIPTORS,
     claim_ids: DOGFOOD_CLAIM_IDS,
     major_count: 5,
@@ -292,17 +329,21 @@ export const DOGFOOD_GENERATIONS = Object.freeze({
   }),
   [SPEC_SCHEMA_VERSION_V2]: Object.freeze({
     schema_version: SPEC_SCHEMA_VERSION_V2,
+    report_schema_version: REPORT_SCHEMA_VERSION_V2,
     requires_release_status: true,
     identity_includes_cli_version: true,
+    sparse_paths: V2_SPARSE_PATHS,
     claim_descriptors: V2_CLAIM_DESCRIPTORS,
     claim_ids: Object.freeze([...DOGFOOD_CLAIM_IDS, ...DOGFOOD_HEALTH_CLAIM_IDS]),
     major_count: 7,
     mcp_enabled_tools: Object.freeze([
       ...DOGFOOD_MCP_TOOLS,
+      "agent_node_get",
       ...DOGFOOD_HEALTH_MCP_TOOLS,
     ]),
     mcp_required_tools: Object.freeze([
       ...DOGFOOD_REQUIRED_MCP_TOOLS,
+      "agent_node_get",
       ...DOGFOOD_HEALTH_REQUIRED_MCP_TOOLS,
     ]),
     thresholds: DOGFOOD_THRESHOLDS_V2,
@@ -347,8 +388,12 @@ export function generationFrozenContract(schemaVersion) {
   }
   return {
     schema_version: generation.schema_version,
+    report_schema_version: generation.report_schema_version,
     requires_release_status: generation.requires_release_status,
     identity_includes_cli_version: generation.identity_includes_cli_version,
+    sparse_paths: generation.sparse_paths === null
+      ? null
+      : [...generation.sparse_paths],
     claim_descriptors: generation.claim_descriptors.map((descriptor) => ({ ...descriptor })),
     claim_ids: [...generation.claim_ids],
     major_count: generation.major_count,
@@ -468,6 +513,11 @@ function validRelativePath(path) {
     && !path.includes("\\")
     && !path.split("/").includes("..")
     && !/[\u0000-\u001f\u007f]/u.test(path);
+}
+
+function validNormalizedRelativePath(path) {
+  return validRelativePath(path)
+    && path.split("/").every((segment) => segment.length > 0 && segment !== ".");
 }
 
 export function validateSpec(spec) {
@@ -711,6 +761,8 @@ function validateV2SharedIdentity(spec, generation) {
     spec.schema_version !== SPEC_SCHEMA_VERSION_V2
     || spec.benchmark_id !== generation.benchmark_id
     || spec.issue !== generation.issue
+    || canonicalJson(spec.repository.sparse_paths)
+      !== canonicalJson(generation.sparse_paths)
     || spec.release.repository !== "TamaT-LLC/depgraph-cli"
     || spec.release.host_target !== "aarch64-apple-darwin"
     || spec.release.mcp_smoke.schema_version !== "mcp-package-smoke-v3"
@@ -808,6 +860,7 @@ function validateV2Shape(spec, generation) {
       "baseline_tree",
       "candidate_commit",
       "candidate_tree",
+      "sparse_paths",
     ])
     || !exactKeys(spec.snapshots, ["baseline", "candidate"])
     || !exactKeys(spec.snapshots.baseline, ["name", "id", "source_revision"])
@@ -1235,6 +1288,1467 @@ export function traceMetrics(text) {
   };
 }
 
+const V2_MCP_TRACE_CALL_COUNT = 24;
+const V2_MCP_CONTRACT_VERSION = "depgraph-mcp-tools-v1";
+const V2_MCP_REPOSITORY_ID = "repository";
+const V2_MCP_MAX_TRAVERSAL = 1_000_000;
+const V2_MCP_CATALOG_LOCATOR =
+  "rust-module:depgraph-mcp-tools:lib:depgraph_mcp_tools::catalog";
+const V2_MCP_HEALTH_HOTSPOTS_DIGEST =
+  "collection:sha256:2596815d4f478507c71ccd7643090abdcd34e79f1ca0c63ae39a6bf2a6a8b8f4";
+
+function parseTraceEvents(text) {
+  if (typeof text !== "string") {
+    throw new Error("Agent dogfood trace is not text");
+  }
+  const events = [];
+  for (const [lineIndex, line] of text.split(/\r?\n/u).entries()) {
+    if (line.length === 0) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      throw new Error(`Codex JSONL trace line ${lineIndex + 1} is invalid`);
+    }
+  }
+  return events;
+}
+
+function v2McpTraceFailure(message) {
+  throw new Error(`Agent dogfood v2 MCP trace ${message}`);
+}
+
+function v2McpRequire(condition, message) {
+  if (!condition) v2McpTraceFailure(message);
+}
+
+function v2McpClaimFields(spec, claimId) {
+  const claim = spec.claims?.find((candidate) => candidate.id === claimId);
+  v2McpRequire(
+    isRecord(claim)
+      && isRecord(claim.expected)
+      && claim.expected.verdict === "supported"
+      && typeof claim.expected.value === "string",
+    `claim ${claimId} is not a supported pinned value`,
+  );
+  const fields = {};
+  for (const part of claim.expected.value.split(";")) {
+    const separator = part.indexOf("=");
+    v2McpRequire(separator > 0, `claim ${claimId} has an invalid expected value`);
+    const key = part.slice(0, separator);
+    v2McpRequire(!Object.hasOwn(fields, key), `claim ${claimId} repeats ${key}`);
+    fields[key] = part.slice(separator + 1);
+  }
+  return fields;
+}
+
+function v2McpRepositoryRelativePath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && !value.startsWith("/")
+    && !value.includes("\\")
+    && !value.includes("://")
+    && !value.split("/").some((segment) => segment === ""
+      || segment === "."
+      || segment === "..");
+}
+
+function v2McpNodePath(result, callNumber) {
+  const repositoryPath = result.repository_path;
+  const displayName = result.display_name;
+  const path = typeof repositoryPath === "string" ? repositoryPath : displayName;
+  v2McpRequire(
+    result.kind === "file"
+      && v2McpRepositoryRelativePath(path)
+      && (repositoryPath === undefined
+        || (v2McpRepositoryRelativePath(repositoryPath)
+          && (displayName === undefined || displayName === repositoryPath))),
+    `call ${callNumber} file node has no repository-relative path`,
+  );
+  return path;
+}
+
+function v2McpExpectedCyclePaths(spec) {
+  const fields = v2McpClaimFields(spec, "file_cycle");
+  const paths = fields.cycle?.split("->").map((locator) => locator.replace(/^file:\/\//u, ""));
+  v2McpRequire(
+    Array.isArray(paths)
+      && paths.length === 5
+      && paths.every((path) => v2McpRepositoryRelativePath(path))
+      && paths[0] === paths[paths.length - 1],
+    "file_cycle claim does not contain a closed repository-relative path",
+  );
+  return paths.slice(0, -1);
+}
+
+function v2McpCommonArgs(snapshot) {
+  return {
+    contract_version: V2_MCP_CONTRACT_VERSION,
+    repository_id: V2_MCP_REPOSITORY_ID,
+    snapshot,
+  };
+}
+
+function resolveV2McpArgs(args) {
+  if (typeof args === "function") return args();
+  return Object.fromEntries(
+    Object.entries(args).map(([key, value]) => [
+      key,
+      typeof value === "function" ? value() : value,
+    ]),
+  );
+}
+
+function v2McpItems(result, callNumber) {
+  v2McpRequire(
+    isRecord(result) && Array.isArray(result.items),
+    `call ${callNumber} did not return an items array`,
+  );
+  return result.items;
+}
+
+function v2McpEdges(result, callNumber) {
+  v2McpRequire(
+    isRecord(result?.edges) && Array.isArray(result.edges.items),
+    `call ${callNumber} did not return an edges.items array`,
+  );
+  return result.edges.items;
+}
+
+function v2McpOne(items, predicate, callNumber, description) {
+  const matches = items.filter(predicate);
+  v2McpRequire(
+    matches.length === 1,
+    `call ${callNumber} did not return exactly one ${description}`,
+  );
+  return matches[0];
+}
+
+function v2McpHasItem(items, id, callNumber) {
+  v2McpRequire(
+    items.some((item) => isRecord(item) && item.id === id),
+    `call ${callNumber} did not return chained node ${id}`,
+  );
+}
+
+function v2McpPage(result, callNumber, expected = {}) {
+  v2McpRequire(
+    isRecord(result)
+      && Array.isArray(result.items)
+      && Number.isSafeInteger(result.returned_items)
+      && result.returned_items >= 0
+      && Number.isSafeInteger(result.total_items)
+      && result.total_items >= result.returned_items
+      && typeof result.complete === "boolean"
+      && result.returned_items === result.items.length,
+    `call ${callNumber} has an invalid result page`,
+  );
+  for (const [key, value] of Object.entries(expected)) {
+    v2McpRequire(result[key] === value, `call ${callNumber} result ${key} is invalid`);
+  }
+  return result.items;
+}
+
+function v2McpNestedPage(result, key, callNumber, expected = {}) {
+  v2McpRequire(isRecord(result?.[key]), `call ${callNumber} has no ${key} page`);
+  return v2McpPage(result[key], callNumber, expected);
+}
+
+function v2McpRoot(result, callNumber, repositoryPath) {
+  const root = result?.root;
+  v2McpRequire(
+    isRecord(root)
+      && /^file:sha256:[0-9a-f]{64}$/u.test(root.id ?? "")
+      && root.kind === "file"
+      && root.locator === `id:${root.id}`
+      && root.display_name === repositoryPath
+      && (root.repository_path === undefined || root.repository_path === repositoryPath),
+    `call ${callNumber} root does not identify ${repositoryPath}`,
+  );
+  return root;
+}
+
+function v2McpEvidenceAt(edge, repositoryPath, line) {
+  return isRecord(edge)
+    && /^edge:sha256:[0-9a-f]{64}$/u.test(edge.id ?? "")
+    && /^[a-z_]+:sha256:[0-9a-f]{64}$/u.test(edge.source_id ?? "")
+    && /^[a-z_]+:sha256:[0-9a-f]{64}$/u.test(edge.target_id ?? "")
+    && typeof edge.kind === "string"
+    && edge.kind.length > 0
+    && typeof edge.phase === "string"
+    && edge.phase.length > 0
+    && typeof edge.resolution_status === "string"
+    && typeof edge.precision === "string"
+    && /^profile:sha256:[0-9a-f]{64}$/u.test(edge.profile_id ?? "")
+    && (edge.kind === "contains"
+      ? edge.site_id === undefined
+      : /^site:sha256:[0-9a-f]{64}$/u.test(edge.site_id ?? ""))
+    && typeof edge.condition === "string"
+    && edge.condition.length > 0
+    && Array.isArray(edge.evidence)
+    && edge.evidence.length > 0
+    && edge.evidence.every((evidence) =>
+      isRecord(evidence)
+      && evidence.kind === "source"
+      && typeof evidence.extractor === "string"
+      && evidence.extractor.length > 0
+      && typeof evidence.extractor_version === "string"
+      && evidence.extractor_version.length > 0
+      && isRecord(evidence.span)
+      && v2McpRepositoryRelativePath(evidence.span.path)
+      && Number.isSafeInteger(evidence.span.start?.line)
+      && evidence.span.start.line > 0
+      && Number.isSafeInteger(evidence.span.start?.column)
+      && evidence.span.start.column > 0
+      && Number.isSafeInteger(evidence.span.end?.line)
+      && evidence.span.end.line >= evidence.span.start.line
+      && Number.isSafeInteger(evidence.span.end?.column)
+      && evidence.span.end.column > 0)
+    && edge.evidence.some((evidence) =>
+      evidence.span.path === repositoryPath
+      && evidence.span.start?.line === line
+      && evidence.span.end?.line === line);
+}
+
+function v2McpExpectedList(value, separator, claimId) {
+  const entries = value?.split(separator);
+  v2McpRequire(
+    Array.isArray(entries) && entries.length > 0 && entries.every((entry) => entry.length > 0),
+    `claim ${claimId} has an invalid list value`,
+  );
+  return entries;
+}
+
+function v2McpExpectedImpactItems(spec) {
+  return v2McpExpectedList(
+    v2McpClaimFields(spec, "rust_impact").items,
+    ",",
+    "rust_impact",
+  ).map((entry) => {
+    const separator = entry.lastIndexOf("@");
+    v2McpRequire(separator > 0, "rust_impact has an invalid item value");
+    const locator = entry.slice(0, separator);
+    const depth = Number(entry.slice(separator + 1));
+    v2McpRequire(Number.isSafeInteger(depth) && depth >= 0, "rust_impact has an invalid depth");
+    return { locator, depth };
+  });
+}
+
+function v2McpExpectedBlockerKinds(value, claimId) {
+  if (value === "none") return [];
+  return v2McpExpectedList(value, ",", claimId);
+}
+
+function validateV2McpClaimResults(spec, results, state) {
+  const claim = (id) => v2McpClaimFields(spec, id);
+  const candidateName = spec.snapshots.candidate.name;
+  const baselineId = spec.snapshots.baseline.id;
+  const candidateId = spec.snapshots.candidate.id;
+  const asInteger = (value, callNumber, field) => {
+    v2McpRequire(
+      Number.isSafeInteger(value) && value >= 0,
+      `call ${callNumber} result ${field} is not a non-negative integer`,
+    );
+    return value;
+  };
+  const pathFor = (locator, callNumber) => {
+    v2McpRequire(
+      typeof locator === "string" && locator.startsWith("file://"),
+      `call ${callNumber} claim locator is not a file locator`,
+    );
+    const path = locator.slice("file://".length);
+    v2McpRequire(
+      v2McpRepositoryRelativePath(path),
+      `call ${callNumber} claim locator is not repository-relative`,
+    );
+    return path;
+  };
+  const expectedPath = (value, callNumber) => pathFor(value, callNumber);
+  const claimInteger = (fields, key, claimId) => {
+    const value = Number(fields[key]);
+    v2McpRequire(
+      Number.isSafeInteger(value) && value >= 0,
+      `claim ${claimId} has an invalid integer ${key}`,
+    );
+    return value;
+  };
+  const first = results[0];
+  const rustPath = claim("rust_path");
+  const catalogItems = v2McpPage(first, 1, {
+    returned_items: 1,
+    total_items: 1,
+    complete: true,
+  });
+  v2McpRequire(
+    catalogItems.length === 1
+      && catalogItems[0].id === state.catalog?.id
+      && /^module:sha256:[0-9a-f]{64}$/u.test(catalogItems[0].id ?? "")
+      && catalogItems[0].kind === "module"
+      && catalogItems[0].locator === rustPath.target
+      && catalogItems[0].display_name === "catalog"
+      && rustPath.target === V2_MCP_CATALOG_LOCATOR,
+    "call 1 catalog result does not support rust_path",
+  );
+
+  const pathResult = results[1];
+  const rustPathSteps = v2McpExpectedList(rustPath.steps, ",", "rust_path");
+  const expectedPathSteps = claimInteger({ steps: rustPathSteps[0] }, "steps", "rust_path");
+  v2McpRequire(
+    pathResult.path_found === true
+      && Array.isArray(pathResult.steps)
+      && pathResult.steps.length === expectedPathSteps
+      && asInteger(pathResult.traversed_edges, 2, "traversed_edges") >= expectedPathSteps
+      && /^file:sha256:[0-9a-f]{64}$/u.test(pathResult.from?.id ?? "")
+      && pathResult.from?.kind === "file"
+      && pathResult.from?.locator === `id:${pathResult.from?.id}`
+      && pathResult.from?.display_name === "crates/depgraph-mcp-tools/src/lib.rs"
+      && pathResult.to?.id === state.catalog?.id
+      && pathResult.to?.kind === "module"
+      && pathResult.to?.locator === rustPath.target
+      && pathResult.to?.display_name === "catalog"
+      && pathResult.to?.repository_path === "crates/depgraph-mcp-tools/src/lib.rs"
+      && v2McpRepositoryRelativePath(pathResult.from?.display_name),
+    "call 2 path result does not support rust_path",
+  );
+  const pathStep = pathResult.steps[0];
+  v2McpRequire(
+    isRecord(pathStep)
+      && pathStep.source?.kind === "file"
+      && pathStep.source?.id === pathResult.from?.id
+      && pathStep.source?.locator === `id:${pathStep.source?.id}`
+      && pathStep.source?.display_name === "crates/depgraph-mcp-tools/src/lib.rs"
+      && pathStep.edge?.source_id === pathStep.source?.id
+      && pathStep.edge?.target_id === state.catalog?.id
+      && pathStep.edge?.kind === rustPath.kind
+      && pathStep.edge?.resolution_status === "resolved"
+      && pathStep.edge?.precision === "exact"
+      && v2McpEvidenceAt(
+        pathStep.edge,
+        "crates/depgraph-mcp-tools/src/lib.rs",
+        15,
+      )
+      && pathStep.target?.id === state.catalog?.id
+      && pathStep.target?.kind === "module"
+      && pathStep.target?.locator === rustPath.target
+      && pathStep.target?.display_name === "catalog"
+      && pathStep.target?.repository_path === "crates/depgraph-mcp-tools/src/lib.rs",
+    "call 2 path step does not support rust_path",
+  );
+
+  const goDependency = claim("go_dependency");
+  const goResult = results[2];
+  const goRoot = v2McpRoot(
+    goResult,
+    3,
+    "workers/go/cmd/depgraph-go-worker/main.go",
+  );
+  const goEdges = v2McpNestedPage(goResult, "edges", 3, {
+    returned_items: 6,
+    total_items: 6,
+    complete: true,
+  });
+  v2McpRequire(
+    goResult.direction === "outgoing"
+      && goResult.transitive === false
+      && goResult.traversal_complete === true
+      && asInteger(goResult.traversed_edges, 3, "traversed_edges") === 6,
+    "call 3 graph result does not support go_dependency",
+  );
+  const goEdge = v2McpOne(
+    goEdges,
+    (entry) => isRecord(entry) && entry.target_id === state.goModuleId,
+    3,
+    "Go dependency edge",
+  );
+  const goLine = Number(goDependency.line);
+  v2McpRequire(
+    goEdge.kind === goDependency.kind
+      && goEdge.resolution_status === "resolved"
+      && goEdge.precision === "exact"
+      && goEdge.source_id === goRoot.id
+      && v2McpEvidenceAt(
+        goEdge,
+        "workers/go/cmd/depgraph-go-worker/main.go",
+        goLine,
+      ),
+    "call 3 selected edge does not support go_dependency",
+  );
+  const goNodeItems = v2McpPage(results[3], 4, {
+    returned_items: 1,
+    total_items: 1,
+    complete: true,
+  });
+  v2McpRequire(
+    goNodeItems.length === 1
+      && goNodeItems[0].id === state.goModuleId
+      && goNodeItems[0].kind === "module"
+      && goNodeItems[0].locator === goDependency.target
+      && goNodeItems[0].display_name === goDependency.target.replace(/^go-package:/u, ""),
+    "call 4 node result does not support go_dependency",
+  );
+
+  const webDependency = claim("web_dependency");
+  const webResult = results[4];
+  const webRoot = v2McpRoot(webResult, 5, "workers/web/src/worker.ts");
+  const webEdges = v2McpNestedPage(webResult, "edges", 5, {
+    returned_items: 10,
+    total_items: 10,
+    complete: true,
+  });
+  v2McpRequire(
+    webResult.direction === "outgoing"
+      && webResult.transitive === false
+      && webResult.traversal_complete === true
+      && asInteger(webResult.traversed_edges, 5, "traversed_edges") === 10,
+    "call 5 graph result does not support web_dependency",
+  );
+  const scannerPath = expectedPath(webDependency.target, 5);
+  const scannerRoot = v2McpRoot(
+    results[5],
+    6,
+    "workers/web/src/scanner.ts",
+  );
+  const scannerEdges = v2McpNestedPage(results[5], "edges", 6, {
+    returned_items: 2,
+    total_items: 2,
+    complete: true,
+  });
+  const scannerEdge = v2McpOne(
+    webEdges,
+    (entry) => isRecord(entry)
+      && entry.target_id === scannerRoot.id
+      && entry.kind === "imports"
+      && v2McpEvidenceAt(entry, "workers/web/src/worker.ts", Number(webDependency.line)),
+    5,
+    "scanner dependency edge",
+  );
+  v2McpRequire(
+    scannerEdge.resolution_status === "resolved"
+      && scannerEdge.precision === "exact"
+      && scannerEdge.condition === webDependency.condition
+      && scannerPath === "workers/web/src/scanner.ts"
+      && scannerEdge.source_id === webRoot.id,
+    "call 5 selected edge does not support web_dependency",
+  );
+  v2McpRequire(
+    results[5].direction === "incoming"
+      && results[5].transitive === false
+      && results[5].traversal_complete === true
+      && asInteger(results[5].traversed_edges, 6, "traversed_edges") === 2,
+    "call 6 graph result does not support web_dependents",
+  );
+  const webDependents = claim("web_dependents");
+  const expectedSources = v2McpExpectedList(webDependents.sources, ",", "web_dependents");
+  const packageSourceLocator = expectedSources.find((source) => source.startsWith("id:package:"));
+  const workerSourceLocator = expectedSources.find((source) => source.startsWith("file://"));
+  v2McpRequire(
+    expectedSources.length === Number(webDependents.count)
+      && packageSourceLocator !== undefined
+      && workerSourceLocator !== undefined,
+    "web_dependents claim has an invalid source set",
+  );
+  const packageSourceId = packageSourceLocator.slice("id:".length);
+  const incomingPackage = v2McpOne(
+    scannerEdges,
+    (entry) => isRecord(entry)
+      && entry.source_id === packageSourceId
+      && entry.target_id === scannerRoot.id
+      && entry.kind === "contains",
+    6,
+    "package dependent edge",
+  );
+  const incomingWorker = v2McpOne(
+    scannerEdges,
+    (entry) => isRecord(entry)
+      && entry.source_id === webRoot.id
+      && entry.target_id === scannerRoot.id
+      && entry.kind === "imports",
+    6,
+    "worker dependent edge",
+  );
+  v2McpRequire(
+    incomingPackage.resolution_status === "resolved"
+      && incomingPackage.precision === "exact"
+      && v2McpEvidenceAt(incomingPackage, "workers/web/src/scanner.ts", 1)
+      && incomingWorker.resolution_status === "resolved"
+      && incomingWorker.precision === "exact"
+      && incomingWorker.condition === webDependency.condition
+      && v2McpEvidenceAt(incomingWorker, "workers/web/src/worker.ts", 17),
+    "call 6 incoming edges do not support web_dependents",
+  );
+  const actualSources = [workerSourceLocator, packageSourceLocator].sort();
+  v2McpRequire(
+    canonicalJson(actualSources) === canonicalJson(expectedSources),
+    "call 6 source locators do not support web_dependents",
+  );
+
+  const rustImpact = claim("rust_impact");
+  const impactResult = results[6];
+  v2McpRoot(impactResult, 7, "crates/depgraph-mcp-tools/src/catalog.rs");
+  const impactItems = v2McpNestedPage(impactResult, "impacts", 7, {
+    returned_items: 4,
+    total_items: 4,
+    complete: true,
+  });
+  v2McpRequire(impactResult.root_impacted === true, "call 7 root impact is not established");
+  const expectedImpacts = v2McpExpectedImpactItems(spec);
+  const actualImpacts = impactItems.map((item) => {
+    v2McpRequire(
+      isRecord(item)
+        && isRecord(item.node)
+        && Number.isSafeInteger(item.depth)
+        && item.depth >= 0
+        && item.depth <= 2
+        && Array.isArray(item.dependency_path)
+        && item.dependency_path.length === item.depth
+        && item.changed_node_id === impactResult.root.id,
+      "call 7 impact item is incomplete",
+    );
+    v2McpRequire(
+      typeof item.node.id === "string"
+        && typeof item.node.kind === "string"
+        && typeof item.node.locator === "string"
+        && typeof item.node.display_name === "string",
+      "call 7 impact node is incomplete",
+    );
+    for (const step of item.dependency_path) {
+      v2McpRequire(
+        isRecord(step)
+          && isRecord(step.source)
+          && isRecord(step.edge)
+          && isRecord(step.target)
+          && typeof step.edge.kind === "string"
+          && step.source.id === step.edge.source_id
+          && step.target.id === step.edge.target_id,
+        "call 7 impact path is incomplete",
+      );
+    }
+    v2McpRequire(
+      item.dependency_path.length === 0
+        ? item.node.id === impactResult.root.id
+        : item.dependency_path[0].source.id === item.node.id
+          && item.dependency_path.at(-1).target.id === impactResult.root.id
+          && item.dependency_path.slice(1).every(
+            (step, index) =>
+              item.dependency_path[index].target.id === step.source.id,
+          ),
+      "call 7 impact path is not a connected node-to-root witness",
+    );
+    const locator = item.node.kind === "file"
+      ? `file:${item.node.display_name}`
+      : item.node.locator;
+    v2McpRequire(
+      (item.node.kind !== "file" || v2McpRepositoryRelativePath(item.node.display_name))
+        && (item.node.kind !== "file"
+          || item.node.locator === `id:${item.node.id}`),
+      "call 7 impact file node is not repository-relative",
+    );
+    return { locator, depth: item.depth };
+  }).filter((item) => item.depth > 0)
+    .sort((left, right) => codeUnitCompare(left.locator, right.locator));
+  const rootImpactItems = impactItems.filter((item) => item?.depth === 0);
+  v2McpRequire(
+    rootImpactItems.length === 1
+      && rootImpactItems[0].node?.id === impactResult.root?.id
+      && rootImpactItems[0].node?.kind === "file"
+      && rootImpactItems[0].node?.display_name
+        === "crates/depgraph-mcp-tools/src/catalog.rs"
+      && canonicalJson(actualImpacts) === canonicalJson(expectedImpacts)
+      && rustImpact.complete === "true",
+    "call 7 impact result does not support rust_impact",
+  );
+
+  const unresolvedType = claim("rust_unresolved_type");
+  const unresolvedResult = results[7];
+  const unresolvedRoot = v2McpRoot(
+    unresolvedResult,
+    8,
+    "crates/depgraph-mcp-tools/src/host_config.rs",
+  );
+  const unresolvedEdges = v2McpNestedPage(unresolvedResult, "edges", 8, {
+    returned_items: 10,
+    total_items: 66,
+    complete: false,
+  });
+  v2McpRequire(
+    unresolvedResult.direction === "outgoing"
+      && unresolvedResult.transitive === false
+      && unresolvedResult.traversal_complete === true
+      && asInteger(unresolvedResult.traversed_edges, 8, "traversed_edges") === 66
+      && typeof unresolvedResult.edges.next_cursor === "string"
+      && unresolvedResult.edges.next_cursor.length > 0,
+    "call 8 graph result does not support rust_unresolved_type",
+  );
+  const unresolvedLine = claimInteger(unresolvedType, "line", "rust_unresolved_type");
+  const unresolvedEdge = v2McpOne(
+    unresolvedEdges,
+    (entry) => isRecord(entry)
+      && entry.target_id === state.selfUnknownId
+      && entry.kind === "type_uses",
+    8,
+    "Self unresolved type edge",
+  );
+  v2McpRequire(
+    unresolvedEdge.source_id === unresolvedRoot.id
+      && unresolvedEdge.resolution_status === unresolvedType.status
+      && unresolvedEdge.precision === unresolvedType.precision
+      && v2McpEvidenceAt(
+        unresolvedEdge,
+        "crates/depgraph-mcp-tools/src/host_config.rs",
+        unresolvedLine,
+      ),
+    "call 8 selected edge does not support rust_unresolved_type",
+  );
+  const unresolvedNodeItems = v2McpPage(results[8], 9, {
+    returned_items: 1,
+    total_items: 1,
+    complete: true,
+  });
+  v2McpRequire(
+    unresolvedNodeItems.length === 1
+      && unresolvedNodeItems[0].id === state.selfUnknownId
+      && unresolvedNodeItems[0].kind === "unknown_target"
+      && unresolvedNodeItems[0].locator === unresolvedType.target
+      && unresolvedNodeItems[0].display_name === "Self",
+    "call 9 node result does not support rust_unresolved_type",
+  );
+
+  const candidateImport = claim("rust_candidate_import");
+  const candidateImportResult = results[9];
+  const candidateImportRoot = v2McpRoot(
+    candidateImportResult,
+    10,
+    "crates/depgraph-cli/src/main.rs",
+  );
+  const candidateImportEdges = v2McpNestedPage(candidateImportResult, "edges", 10, {
+    returned_items: 10,
+    total_items: 1213,
+    complete: false,
+  });
+  v2McpRequire(
+    candidateImportResult.direction === "outgoing"
+      && candidateImportResult.transitive === false
+      && candidateImportResult.traversal_complete === true
+      && asInteger(candidateImportResult.traversed_edges, 10, "traversed_edges") === 1213
+      && typeof candidateImportResult.edges.next_cursor === "string"
+      && candidateImportResult.edges.next_cursor.length > 0,
+    "call 10 graph result does not support rust_candidate_import",
+  );
+  const candidateImportLine = claimInteger(candidateImport, "line", "rust_candidate_import");
+  const candidateImportEdge = v2McpOne(
+    candidateImportEdges,
+    (entry) => isRecord(entry)
+      && entry.target_id === state.cliModuleId
+      && entry.kind === "imports",
+    10,
+    "candidate Rust import edge",
+  );
+  v2McpRequire(
+    candidateImportEdge.source_id === candidateImportRoot.id
+      && candidateImportEdge.resolution_status === candidateImport.status
+      && candidateImportEdge.precision === candidateImport.precision
+      && candidateImportEdge.condition === "defined(rust.cfg.test)"
+      && v2McpEvidenceAt(
+        candidateImportEdge,
+        "crates/depgraph-cli/src/main.rs",
+        candidateImportLine,
+      ),
+    "call 10 selected edge does not support rust_candidate_import",
+  );
+  const candidateImportNodeItems = v2McpPage(results[10], 11, {
+    returned_items: 1,
+    total_items: 1,
+    complete: true,
+  });
+  v2McpRequire(
+    candidateImportNodeItems.length === 1
+      && candidateImportNodeItems[0].id === state.cliModuleId
+      && candidateImportNodeItems[0].kind === "module"
+      && candidateImportNodeItems[0].locator === candidateImport.target
+      && candidateImportNodeItems[0].display_name === "depgraph-cli",
+    "call 11 node result does not support rust_candidate_import",
+  );
+
+  const validateDiff = (result, callNumber, claimId) => {
+    const fields = claim(claimId);
+    v2McpRequire(
+      isRecord(result)
+        && result.schema_version === "depgraph-snapshot-diff-service-v1"
+        && result.from_snapshot_id === baselineId
+        && result.to_snapshot_id === candidateId
+        && Number.isSafeInteger(result.total_changes)
+        && result.total_changes >= 0
+        && typeof result.empty === "boolean"
+        && Array.isArray(result.changes)
+        && result.changes.length === result.total_changes
+        && typeof result.collection_digest === "string"
+        && result.collection_digest === fields.digest,
+      `call ${callNumber} diff result is incomplete`,
+    );
+    const expectedTotal = fields.total === undefined ? 0 : claimInteger(fields, "total", claimId);
+    const expectedEmpty = fields.empty === undefined ? expectedTotal === 0 : fields.empty === "true";
+    v2McpRequire(
+      result.total_changes === expectedTotal && result.empty === expectedEmpty,
+      `call ${callNumber} diff result does not support ${claimId}`,
+    );
+  };
+  validateDiff(results[11], 12, "snapshot_package_diff");
+  validateDiff(results[12], 13, "snapshot_file_diff");
+
+  const fileCycle = claim("file_cycle");
+  const cycleResult = results[13];
+  const cycleItems = v2McpPage(cycleResult, 14, {
+    returned_items: 1,
+    total_items: 1,
+    complete: true,
+  });
+  const cycle = cycleItems[0];
+  const expectedCyclePaths = v2McpExpectedCyclePaths(spec);
+  const expectedCycleCount = claimInteger(fileCycle, "count", "file_cycle");
+  v2McpRequire(
+    expectedCycleCount === 1
+      && isRecord(cycle)
+      && cycle.level === "file"
+      && Array.isArray(cycle.node_ids)
+      && cycle.node_ids.length === expectedCyclePaths.length + 1
+      && cycle.node_ids[0] === cycle.node_ids[cycle.node_ids.length - 1]
+      && canonicalJson(cycle.node_ids) === canonicalJson([
+        ...state.cycleNodeIds,
+        state.cycleNodeIds?.[0],
+      ]),
+    "call 14 cycle result does not support file_cycle",
+  );
+  v2McpRequire(
+    Array.isArray(state.cycleNodePaths)
+      && state.cycleNodePaths.length === expectedCyclePaths.length
+      && state.cycleNodePaths.every(v2McpRepositoryRelativePath)
+      && new Set(state.cycleNodePaths).size === expectedCyclePaths.length,
+    "calls 15-18 did not resolve four distinct cycle paths",
+  );
+  const cycleStart = state.cycleNodePaths.indexOf(expectedCyclePaths[0]);
+  v2McpRequire(cycleStart >= 0, "calls 15-18 did not resolve the file_cycle start path");
+  const observedCyclePaths = expectedCyclePaths.map((_, offset) =>
+    state.cycleNodePaths[(cycleStart + offset) % state.cycleNodePaths.length]);
+  v2McpRequire(
+    canonicalJson(observedCyclePaths) === canonicalJson(expectedCyclePaths),
+    "calls 15-18 file paths do not support file_cycle order",
+  );
+  for (let offset = 0; offset < expectedCyclePaths.length; offset += 1) {
+    const node = results[14 + offset];
+    const path = state.cycleNodePaths[offset];
+    v2McpRequire(
+      isRecord(node)
+        && node.id === state.cycleNodeIds[offset]
+        && node.kind === "file"
+        && node.locator === `id:${node.id}`
+        && v2McpNodePath(node, 15 + offset) === path,
+      `call ${15 + offset} node result does not support file_cycle`,
+    );
+  }
+
+  const packageCycles = claim("package_cycles");
+  const packageCycleItems = v2McpPage(results[18], 19, {
+    returned_items: 0,
+    total_items: 0,
+    complete: true,
+  });
+  v2McpRequire(
+    claimInteger(packageCycles, "count", "package_cycles") === 0
+      && packageCycleItems.length === 0,
+    "call 19 package cycle result does not support package_cycles",
+  );
+
+  const coverageClaim = claim("candidate_coverage");
+  const contextResult = results[19];
+  const contextDetails = contextResult.snapshot?.details;
+  const coverage = contextDetails?.coverage;
+  v2McpRequire(
+    contextResult.repository_id === V2_MCP_REPOSITORY_ID
+      && Array.isArray(contextResult.enabled_capabilities)
+      && canonicalJson(contextResult.enabled_capabilities) === canonicalJson(["read"])
+      && contextResult.snapshot?.available === true
+      && isRecord(contextDetails)
+      && contextDetails.snapshot_id === candidateId
+      && Array.isArray(contextDetails.names)
+      && canonicalJson(contextDetails.names) === canonicalJson([candidateName])
+      && contextDetails.status === "completed"
+      && contextDetails.source_kind === "scan"
+      && contextDetails.parent_snapshot_id === baselineId
+      && contextDetails.source_revision === spec.repository.candidate_commit
+      && Array.isArray(contextDetails.profile_ids)
+      && isRecord(coverage),
+    "call 20 context does not report candidate coverage",
+  );
+  const coverageValues = {
+    files: "files_analyzed",
+    sites: "dependency_sites",
+    resolved: "resolved",
+    candidates: "candidates",
+    external: "external",
+    unresolved: "unresolved",
+    unsupported: "unsupported_syntax",
+  };
+  v2McpRequire(
+    asInteger(coverage.profiles, 20, "coverage.profiles") === 3,
+    "call 20 coverage.profiles is invalid",
+  );
+  for (const [claimKey, resultKey] of Object.entries(coverageValues)) {
+    v2McpRequire(
+      asInteger(coverage[resultKey], 20, `coverage.${resultKey}`)
+        === claimInteger(coverageClaim, claimKey, "candidate_coverage"),
+      `call 20 coverage.${resultKey} does not support candidate_coverage`,
+    );
+  }
+  v2McpRequire(
+    asInteger(coverage.files_discovered, 20, "coverage.files_discovered")
+      === claimInteger(coverageClaim, "files", "candidate_coverage")
+      && asInteger(coverage.files_skipped, 20, "coverage.files_skipped") === 0
+      && coverage.project_code_executed === (coverageClaim.project_code_executed === "true")
+      && Array.isArray(coverage.completeness)
+      && Array.isArray(coverage.reasons)
+      && coverage.reasons.length > 0
+      && contextDetails.profile_ids.length === coverage.profiles,
+    "call 20 coverage metadata does not support candidate_coverage",
+  );
+
+  const unusedFindings = claim("health_unused_findings");
+  const unusedResult = results[20];
+  const unusedItems = v2McpNestedPage(unusedResult, "findings", 21, {
+    returned_items: 7,
+    total_items: 7,
+    complete: true,
+  });
+  const unusedCount = claimInteger(unusedFindings, "count", "health_unused_findings");
+  v2McpRequire(
+    unusedResult.collection_digest === unusedFindings.digest
+      && unusedItems.length === unusedCount
+      && new Set(unusedItems.map((item) => item?.id)).size === unusedItems.length,
+    "call 21 health findings result does not support health_unused_findings",
+  );
+  for (const item of unusedItems) {
+    v2McpRequire(
+      isRecord(item)
+        && /^finding:sha256:[0-9a-f]{64}$/u.test(item.id ?? "")
+        && item.kind === "unused-file"
+        && item.severity === "warning"
+        && item.confidence === "indeterminate"
+        && /^file:sha256:[0-9a-f]{64}$/u.test(item.subject_id ?? "")
+        && item.subject_kind === "file"
+        && typeof item.reason === "string"
+        && item.reason.length > 0
+        && Array.isArray(item.blockers)
+        && item.blockers.some((blocker) => blocker?.kind === "incomplete-coverage")
+        && Array.isArray(item.evidence)
+        && Array.isArray(item.remediations)
+        && Array.isArray(item.suppressions)
+        && typeof item.analyzer_version === "string"
+        && /^sha256:[0-9a-f]{64}$/u.test(item.fingerprint ?? ""),
+      "call 21 health finding is incomplete",
+    );
+  }
+  v2McpRequire(
+    unusedItems[0]?.id === state.findingId
+      && unusedItems[0]?.location?.path === "workers/web/src/worker.ts"
+      && unusedItems[0]?.subject_id === webRoot.id,
+    "call 21 first finding is not chained to the candidate worker",
+  );
+
+  const findingDetail = claim("health_finding_detail");
+  const detailResult = results[21];
+  const detailFinding = detailResult.finding;
+  const expectedDetailBlockers = v2McpExpectedBlockerKinds(
+    findingDetail.blockers,
+    "health_finding_detail",
+  );
+  v2McpRequire(
+    detailResult.input_scope === "snapshot-scoped"
+      && isRecord(detailFinding)
+      && detailFinding.id === findingDetail.id
+      && detailFinding.id === state.findingId
+      && detailFinding.kind === findingDetail.kind
+      && detailFinding.kind === "unused-file"
+      && detailFinding.severity === "warning"
+      && detailFinding.confidence === findingDetail.confidence
+      && detailFinding.subject_kind === "file"
+      && detailFinding.subject_id === webRoot.id
+      && detailFinding.location?.path === "workers/web/src/worker.ts"
+      && typeof detailFinding.reason === "string"
+      && detailFinding.reason.length > 0
+      && Array.isArray(detailFinding.blockers)
+      && canonicalJson(detailFinding.blockers.map((blocker) => blocker?.kind).sort())
+        === canonicalJson([...expectedDetailBlockers].sort())
+      && Array.isArray(detailFinding.evidence)
+      && Array.isArray(detailFinding.remediations)
+      && Array.isArray(detailFinding.suppressions)
+      && typeof detailFinding.analyzer_version === "string"
+      && /^sha256:[0-9a-f]{64}$/u.test(detailFinding.fingerprint ?? ""),
+    "call 22 finding result does not support health_finding_detail",
+  );
+
+  const hotspotsClaim = claim("health_hotspots");
+  const hotspotsResult = results[22];
+  const hotspotItems = v2McpNestedPage(hotspotsResult, "findings", 23, {
+    returned_items: 10,
+    total_items: 136,
+    complete: false,
+  });
+  v2McpRequire(
+    hotspotsResult.collection_digest === V2_MCP_HEALTH_HOTSPOTS_DIGEST
+      && typeof hotspotsResult.findings.next_cursor === "string"
+      && hotspotsResult.findings.next_cursor.length > 0,
+    "call 23 hotspots page is incomplete",
+  );
+  const expectedHotspotBlockers = v2McpExpectedBlockerKinds(
+    hotspotsClaim.blockers,
+    "health_hotspots",
+  );
+  const expectedHotspotScore = claimInteger(hotspotsClaim, "score", "health_hotspots");
+  for (let index = 0; index < hotspotItems.length; index += 1) {
+    const item = hotspotItems[index];
+    const scores = item?.hotspot_scores;
+    v2McpRequire(
+      isRecord(item)
+        && /^finding:sha256:[0-9a-f]{64}$/u.test(item.id ?? "")
+        && item.kind === "hotspot"
+        && item.severity === "info"
+        && item.confidence === "probable"
+        && typeof item.subject_id === "string"
+        && typeof item.subject_kind === "string"
+        && v2McpRepositoryRelativePath(item.location?.path)
+        && typeof item.reason === "string"
+        && item.reason.length > 0
+        && isRecord(scores)
+        && Number.isSafeInteger(scores.total)
+        && scores.total >= 0
+        && ["fan_in", "fan_out", "reverse_impact", "git_churn", "runtime"].every((layer) => {
+          const score = scores[layer];
+          return isRecord(score)
+            && Number.isSafeInteger(score.raw)
+            && Number.isSafeInteger(score.normalized_basis_points)
+            && Number.isSafeInteger(score.weight_basis_points)
+            && typeof score.available === "boolean";
+        })
+        && Array.isArray(item.blockers)
+        && item.blockers.length > 0
+        && item.blockers.every((blocker) =>
+          isRecord(blocker)
+            && typeof blocker.kind === "string"
+            && typeof blocker.detail === "string")
+        && Array.isArray(item.evidence)
+        && Array.isArray(item.remediations)
+        && Array.isArray(item.suppressions)
+        && typeof item.analyzer_version === "string"
+        && /^sha256:[0-9a-f]{64}$/u.test(item.fingerprint ?? "")
+        && (index === 0 || hotspotItems[index - 1].hotspot_scores.total >= scores.total),
+      "call 23 hotspot finding is incomplete",
+    );
+  }
+  v2McpRequire(
+    hotspotItems[0]?.subject_id === hotspotsClaim.top
+      && hotspotItems[0]?.hotspot_scores?.total === expectedHotspotScore
+      && canonicalJson(hotspotItems[0]?.blockers?.map((blocker) => blocker.kind).sort())
+        === canonicalJson([...expectedHotspotBlockers].sort()),
+    "call 23 top hotspot does not support health_hotspots",
+  );
+
+  const auditClaim = claim("health_audit_base");
+  const auditResult = results[23];
+  const auditFindings = v2McpNestedPage(auditResult, "findings", 24, {
+    returned_items: 0,
+    total_items: 0,
+    complete: true,
+  });
+  v2McpRequire(
+    auditResult.after_snapshot_id === candidateId
+      && auditResult.before_snapshot_id === baselineId
+      && auditResult.changed_oid === auditClaim.changed_oid
+      && auditResult.collection_digest === auditClaim.digest
+      && auditFindings.length === 0,
+    "call 24 audit result does not support health_audit_base",
+  );
+}
+
+function v2McpPlan(spec, state) {
+  const candidateName = spec.snapshots.candidate.name;
+  const baselineName = spec.snapshots.baseline.name;
+  const candidateSnapshotId = spec.snapshots.candidate.id;
+  const common = () => v2McpCommonArgs(candidateName);
+  const fixed = (tool, args, observe = null) => ({ tool, args, observe });
+  const listDependencies = (selector, transitive = false) => fixed(
+    "graph_dependencies_list",
+    {
+      ...common(),
+      selector,
+      transitive,
+      limit: 10,
+      max_traversal: V2_MCP_MAX_TRAVERSAL,
+    },
+  );
+  return [
+    fixed(
+      "agent_nodes_list",
+      {
+        ...common(),
+        query: "catalog",
+        match_mode: "exact",
+        limit: 10,
+      },
+      (result) => {
+        const item = v2McpOne(
+          v2McpItems(result, 1),
+          (entry) => isRecord(entry)
+            && entry.kind === "module"
+            && entry.locator === V2_MCP_CATALOG_LOCATOR
+            && typeof entry.id === "string",
+          1,
+          "catalog module",
+        );
+        state.catalog = item;
+      },
+    ),
+    fixed(
+      "graph_path_get",
+      {
+        ...common(),
+        from: "path:crates/depgraph-mcp-tools/src/lib.rs",
+        to: V2_MCP_CATALOG_LOCATOR,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+      (result) => {
+        v2McpRequire(
+          result.path_found === true
+            && isRecord(result.to)
+            && result.to.locator === V2_MCP_CATALOG_LOCATOR
+            && result.to.id === state.catalog?.id,
+          "call 2 path result is not chained to call 1",
+        );
+      },
+    ),
+    fixed(
+      "graph_dependencies_list",
+      {
+        ...common(),
+        selector: "path:workers/go/cmd/depgraph-go-worker/main.go",
+        transitive: false,
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+      (result) => {
+        const edge = v2McpOne(
+          v2McpEdges(result, 3),
+          (entry) => isRecord(entry)
+            && entry.kind === "imports"
+            && /^module:sha256:[0-9a-f]{64}$/u.test(entry.target_id ?? ""),
+          3,
+          "internal Go module edge",
+        );
+        state.goModuleId = edge.target_id;
+      },
+    ),
+    fixed(
+      "agent_nodes_list",
+      {
+        ...common(),
+        query: () => state.goModuleId,
+        match_mode: "exact",
+        limit: 10,
+      },
+      (result) => v2McpHasItem(v2McpItems(result, 4), state.goModuleId, 4),
+    ),
+    listDependencies("path:workers/web/src/worker.ts"),
+    fixed(
+      "graph_dependents_list",
+      {
+        ...common(),
+        selector: "path:workers/web/src/scanner.ts",
+        transitive: false,
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+    ),
+    fixed(
+      "graph_impact_get",
+      {
+        ...common(),
+        selector: "path:crates/depgraph-mcp-tools/src/catalog.rs",
+        depth: 2,
+        limit: 10,
+        max_nodes: V2_MCP_MAX_TRAVERSAL,
+        max_edges: V2_MCP_MAX_TRAVERSAL,
+      },
+    ),
+    fixed(
+      "graph_dependencies_list",
+      {
+        ...common(),
+        selector: "path:crates/depgraph-mcp-tools/src/host_config.rs",
+        transitive: false,
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+      (result) => {
+        const edge = v2McpOne(
+          v2McpEdges(result, 8),
+          (entry) => isRecord(entry)
+            && entry.kind === "type_uses"
+            && /^unknown_target:sha256:[0-9a-f]{64}$/u.test(entry.target_id ?? ""),
+          8,
+          "Self unresolved type edge",
+        );
+        state.selfUnknownId = edge.target_id;
+      },
+    ),
+    fixed(
+      "agent_nodes_list",
+      {
+        ...common(),
+        query: () => state.selfUnknownId,
+        match_mode: "exact",
+        limit: 10,
+      },
+      (result) => v2McpHasItem(v2McpItems(result, 9), state.selfUnknownId, 9),
+    ),
+    fixed(
+      "graph_dependencies_list",
+      {
+        ...common(),
+        selector: "path:crates/depgraph-cli/src/main.rs",
+        transitive: false,
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+      (result) => {
+        const edge = v2McpOne(
+          v2McpEdges(result, 10),
+          (entry) => isRecord(entry)
+            && entry.kind === "imports"
+            && /^module:sha256:[0-9a-f]{64}$/u.test(entry.target_id ?? ""),
+          10,
+          "internal CLI module edge",
+        );
+        state.cliModuleId = edge.target_id;
+      },
+    ),
+    fixed(
+      "agent_nodes_list",
+      {
+        ...common(),
+        query: () => state.cliModuleId,
+        match_mode: "exact",
+        limit: 10,
+      },
+      (result) => v2McpHasItem(v2McpItems(result, 11), state.cliModuleId, 11),
+    ),
+    fixed(
+      "snapshot_diff_get",
+      {
+        contract_version: V2_MCP_CONTRACT_VERSION,
+        repository_id: V2_MCP_REPOSITORY_ID,
+        from: baselineName,
+        to: candidateName,
+        kinds: ["package"],
+      },
+    ),
+    fixed(
+      "snapshot_diff_get",
+      {
+        contract_version: V2_MCP_CONTRACT_VERSION,
+        repository_id: V2_MCP_REPOSITORY_ID,
+        from: baselineName,
+        to: candidateName,
+        kinds: ["file"],
+      },
+    ),
+    fixed(
+      "graph_cycles_list",
+      {
+        ...common(),
+        level: "file",
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+      (result) => {
+        const cycle = v2McpOne(
+          v2McpItems(result, 14),
+          (entry) => isRecord(entry) && entry.level === "file"
+            && Array.isArray(entry.node_ids),
+          14,
+          "file cycle",
+        );
+        const nodeIds = cycle.node_ids;
+        v2McpRequire(
+          nodeIds.length === 5
+            && nodeIds[0] === nodeIds[nodeIds.length - 1]
+            && nodeIds.slice(0, -1).every(
+              (nodeId) => /^file:sha256:[0-9a-f]{64}$/u.test(nodeId),
+            )
+            && new Set(nodeIds.slice(0, -1)).size === 4,
+          "call 14 file cycle does not contain the four closed node IDs",
+        );
+        state.cycleNodeIds = nodeIds.slice(0, -1);
+      },
+    ),
+    ...[0, 1, 2, 3].map((offset) => fixed(
+      "agent_node_get",
+      {
+        ...common(),
+        node_id: () => state.cycleNodeIds?.[offset],
+      },
+      (result, observedState, callNumber) => {
+        v2McpRequire(
+          result.id === observedState.cycleNodeIds?.[offset]
+            && result.kind === "file",
+          `call ${callNumber} node result is not chained to call 14`,
+        );
+        const path = v2McpNodePath(result, callNumber);
+        observedState.cycleNodePaths ??= [];
+        observedState.cycleNodePaths[offset] = path;
+      },
+    )),
+    fixed(
+      "graph_cycles_list",
+      {
+        ...common(),
+        level: "package",
+        limit: 10,
+        max_traversal: V2_MCP_MAX_TRAVERSAL,
+      },
+    ),
+    fixed(
+      "get_context",
+      {
+        contract_version: V2_MCP_CONTRACT_VERSION,
+        repository_id: V2_MCP_REPOSITORY_ID,
+      },
+      (result) => {
+        v2McpRequire(
+          result.repository_id === V2_MCP_REPOSITORY_ID
+            && result.snapshot?.available === true
+            && result.snapshot.details?.snapshot_id === candidateSnapshotId
+            && result.snapshot.details?.status === "completed"
+            && result.snapshot.details?.source_revision === spec.repository.candidate_commit,
+          "call 20 context does not report the candidate snapshot",
+        );
+      },
+    ),
+    fixed(
+      "health_findings_list",
+      {
+        ...common(),
+        kinds: ["unused-file"],
+        limit: 10,
+      },
+      (result) => {
+        const findings = result.findings?.items;
+        const findingIds = Array.isArray(findings)
+          ? findings.map((finding) => finding?.id)
+          : [];
+        v2McpRequire(
+          Array.isArray(findings) && findings.length > 0
+            && typeof findings[0]?.id === "string"
+            && /^finding:sha256:[0-9a-f]{64}$/u.test(findings[0].id),
+          "call 21 did not return a finding ID",
+        );
+        v2McpRequire(
+          findingIds.every((findingId) =>
+            /^finding:sha256:[0-9a-f]{64}$/u.test(findingId ?? ""))
+            && findings[0].id === [...findingIds].sort()[0],
+          "call 21 findings are not ordered by their minimum ID",
+        );
+        state.findingId = findings[0].id;
+      },
+    ),
+    fixed(
+      "health_finding_get",
+      {
+        ...common(),
+        finding_id: () => state.findingId,
+      },
+      (result) => {
+        v2McpRequire(
+          result.finding?.id === state.findingId,
+          "call 22 finding result is not chained to call 21",
+        );
+      },
+    ),
+    fixed(
+      "health_hotspots_list",
+      {
+        ...common(),
+        limit: 10,
+        weight_fan_in: 2500,
+        weight_fan_out: 1500,
+        weight_reverse_impact: 2500,
+        weight_git_churn: 2000,
+        weight_runtime: 1500,
+        churn_commit_limit: 512,
+      },
+    ),
+    fixed(
+      "health_audit_get",
+      {
+        ...common(),
+        base_snapshot: baselineName,
+        changed: spec.repository.baseline_commit,
+        limit: 10,
+      },
+    ),
+  ].map((descriptor, index) => ({ ...descriptor, callNumber: index + 1 }));
+}
+
+export function validateV2McpTrace(spec, text) {
+  if (generationOf(spec).schema_version !== SPEC_SCHEMA_VERSION_V2) {
+    throw new Error("Agent dogfood v2 MCP trace validator received a non-v2 spec");
+  }
+  const events = parseTraceEvents(text);
+  const mcpItems = events.filter((event) => event?.item?.type === "mcp_tool_call");
+  const started = mcpItems.filter((event) => event.type === "item.started");
+  const completed = mcpItems.filter((event) => event.type === "item.completed");
+  v2McpRequire(
+    mcpItems.length === V2_MCP_TRACE_CALL_COUNT * 2
+      && started.length === V2_MCP_TRACE_CALL_COUNT
+      && completed.length === V2_MCP_TRACE_CALL_COUNT,
+    `expected ${V2_MCP_TRACE_CALL_COUNT} started/completed MCP calls`,
+  );
+  for (let index = 0; index < V2_MCP_TRACE_CALL_COUNT; index += 1) {
+    const startedEvent = mcpItems[index * 2];
+    const completedEvent = mcpItems[index * 2 + 1];
+    v2McpRequire(
+      startedEvent.type === "item.started"
+        && completedEvent.type === "item.completed"
+        && typeof startedEvent.item?.id === "string"
+        && startedEvent.item.id === completedEvent.item?.id,
+      `call ${index + 1} completion is out of started order or not serial`,
+    );
+  }
+
+  const byId = (items, kind) => {
+    const result = new Map();
+    for (const event of items) {
+      const item = event.item;
+      v2McpRequire(
+        typeof item.id === "string" && item.id.length > 0,
+        `${kind} MCP call has no ID`,
+      );
+      v2McpRequire(!result.has(item.id), `${kind} MCP call IDs are not unique`);
+      result.set(item.id, event);
+    }
+    return result;
+  };
+  const startedById = byId(started, "started");
+  const completedById = byId(completed, "completed");
+  v2McpRequire(
+    startedById.size === completedById.size
+      && [...startedById.keys()].every((id) => completedById.has(id)),
+    "started/completed MCP call IDs do not match",
+  );
+
+  const state = {};
+  const results = [];
+  const plan = v2McpPlan(spec, state);
+  v2McpRequire(
+    plan.length === V2_MCP_TRACE_CALL_COUNT,
+    "fixed MCP call plan has the wrong length",
+  );
+  for (let index = 0; index < plan.length; index += 1) {
+    const expected = plan[index];
+    const startItem = started[index].item;
+    const completedItem = completed[index].item;
+    const callLabel = `call ${expected.callNumber}`;
+    v2McpRequire(
+      startItem.id === completedItem.id,
+      `${callLabel} completion is out of started order`,
+    );
+    v2McpRequire(
+      startItem.server === "depgraph"
+        && completedItem.server === "depgraph",
+      `${callLabel} does not use the depgraph MCP server`,
+    );
+    v2McpRequire(
+      startItem.tool === expected.tool
+        && completedItem.tool === expected.tool,
+      `${callLabel} tool/order does not match the fixed plan`,
+    );
+    v2McpRequire(
+      startItem.status === "in_progress"
+        && startItem.error === null
+        && startItem.result === null,
+      `${callLabel} started item is not an in-progress MCP call`,
+    );
+    v2McpRequire(
+      completedItem.status === "completed"
+        && completedItem.error === null,
+      `${callLabel} completed item is not successful`,
+    );
+    v2McpRequire(
+      canonicalJson(startItem.arguments) === canonicalJson(completedItem.arguments),
+      `${callLabel} started/completed arguments differ`,
+    );
+    v2McpRequire(
+      startedById.get(startItem.id) === started[index]
+        && completedById.get(completedItem.id) === completed[index],
+      `${callLabel} started/completed ID correspondence is invalid`,
+    );
+    const result = completedItem.result;
+    const structured = result?.structured_content;
+    v2McpRequire(
+      isRecord(startItem.arguments)
+        && isRecord(result)
+        && exactKeys(result, ["content", "structured_content"])
+        && result.isError !== true
+        && result.is_error !== true
+        && Array.isArray(result.content)
+        && result.content.length === 1
+        && exactKeys(result.content[0], ["type", "text"])
+        && result.content[0].type === "text"
+        && typeof result.content[0].text === "string"
+        && exactKeys(structured, [
+          "contract_version",
+          "repository_id",
+          "snapshot_id",
+          "result",
+        ])
+        && structured.contract_version === V2_MCP_CONTRACT_VERSION
+        && structured.repository_id === V2_MCP_REPOSITORY_ID
+        && structured.snapshot_id === spec.snapshots.candidate.id
+        && isRecord(structured.result),
+      `${callLabel} structured_content is not a successful candidate result`,
+    );
+    let textEnvelope;
+    try {
+      textEnvelope = JSON.parse(result.content[0].text);
+    } catch {
+      v2McpTraceFailure(`${callLabel} text content is not JSON`);
+    }
+    v2McpRequire(
+      canonicalJson(textEnvelope) === canonicalJson(structured),
+      `${callLabel} text and structured content differ`,
+    );
+    const expectedArgs = resolveV2McpArgs(expected.args);
+    v2McpRequire(
+      canonicalJson(startItem.arguments) === canonicalJson(expectedArgs),
+      `${callLabel} arguments do not match the fixed plan`,
+    );
+    results.push(structured.result);
+    expected.observe?.(structured.result, state, expected.callNumber);
+  }
+  validateV2McpClaimResults(spec, results, state);
+  return true;
+}
+
+export function validateV2Trace(spec, arm, text) {
+  if (generationOf(spec).schema_version !== SPEC_SCHEMA_VERSION_V2) return true;
+  const events = parseTraceEvents(text);
+  if (arm === "baseline") {
+    v2McpRequire(
+      !events.some((event) => event?.item?.type === "mcp_tool_call"),
+      "baseline trace contains MCP calls",
+    );
+    return true;
+  }
+  if (arm !== "mcp") v2McpTraceFailure(`has an unknown arm: ${arm}`);
+  return validateV2McpTrace(spec, text);
+}
+
 function codeUnitCompare(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -1295,7 +2809,7 @@ function shellCommandPayload(command) {
   if (
     words === null
     || words.length !== 3
-    || words[0] !== "/bin/zsh"
+    || !["/bin/bash", "/bin/zsh"].includes(words[0])
     || !["-c", "-lc"].includes(words[1])
   ) return null;
   return words[2];
@@ -1590,6 +3104,7 @@ async function validateSample(spec, rawDir, sample, expectedIdentity) {
   const traceText = readFileSync(tracePath, "utf8");
   const metrics = traceMetrics(traceText);
   const traceObservation = traceSafety(traceText);
+  validateV2Trace(spec, sample.arm, traceText);
   for (const key of [
     "tool_calls",
     "tool_result_bytes",
@@ -2056,6 +3571,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
   specPath = resolve(specPath);
   rawDir = resolve(rawDir);
   const spec = validateSpec(jsonFile(specPath));
+  const generation = generationOf(spec);
   const digests = sourceDigests(specPath, spec);
   validateCorpusPrompt(spec, readFileSync(digests.promptPath, "utf8"));
   validateRawDirectory(rawDir, spec);
@@ -2088,7 +3604,7 @@ export async function aggregateSamples({ specPath, rawDir }) {
     ]),
   );
   const report = {
-    schema_version: REPORT_SCHEMA_VERSION,
+    schema_version: generation.report_schema_version,
     benchmark_id: spec.benchmark_id,
     generated_at: samples.map((sample) => sample.finished_at).sort().at(-1),
     issue: spec.issue,
@@ -2151,6 +3667,83 @@ function commandOutput(program, args, options = {}) {
   }).trim();
 }
 
+export function validateSparseCheckoutPaths(actual, expected = V2_SPARSE_PATHS) {
+  if (
+    !Array.isArray(actual)
+    || canonicalJson(actual) !== canonicalJson(expected)
+  ) {
+    throw new Error(
+      "dogfood repository sparse-checkout paths do not exactly match the pinned v2 paths",
+    );
+  }
+  return true;
+}
+
+export function readSparseCheckoutPaths(repository, environment = process.env) {
+  try {
+    const output = execFileSync(
+      "git",
+      ["sparse-checkout", "list"],
+      {
+        cwd: repository,
+        encoding: "utf8",
+        env: environment,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    return output.split(/\r?\n/u).filter((path) => path.length > 0);
+  } catch {
+    throw new Error(
+      "dogfood v2 repository is not a sparse checkout (git sparse-checkout list failed)",
+    );
+  }
+}
+
+function validateRepositorySparseCheckout(spec, repository, environment) {
+  const expected = generationOf(spec).sparse_paths;
+  if (expected === null) return;
+  validateSparseCheckoutPaths(readSparseCheckoutPaths(repository, environment), expected);
+}
+
+export function validateSparseCheckoutMaterialization(
+  repository,
+  expected = V2_SPARSE_PATHS,
+  environment = process.env,
+) {
+  const selected = new Set(expected.map((path) => path.slice(1)));
+  const entries = execFileSync(
+    "git",
+    ["ls-files", "-t", "-z"],
+    {
+      cwd: repository,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 32 * 1024 * 1024,
+    },
+  ).split("\0").filter(Boolean);
+  const observedSelected = new Set();
+  for (const entry of entries) {
+    const match = /^([A-Z]) (.+)$/u.exec(entry);
+    if (match === null) {
+      throw new Error("dogfood v2 repository has an invalid sparse index entry");
+    }
+    const [, tag, path] = match;
+    const materialized = existsSync(join(repository, path));
+    if (selected.has(path)) {
+      if (tag !== "H" || !materialized) {
+        throw new Error("dogfood v2 repository is missing a selected sparse path");
+      }
+      observedSelected.add(path);
+    } else if (tag !== "S" || materialized) {
+      throw new Error("dogfood v2 repository materialized a path outside the sparse set");
+    }
+  }
+  if (canonicalJson([...observedSelected].sort()) !== canonicalJson([...selected].sort())) {
+    throw new Error("dogfood v2 repository sparse selection is incomplete");
+  }
+  return true;
+}
+
 export function sanitizedAgentEnvironment(sourceEnvironment, zDotDir) {
   const environment = {};
   for (const [key, value] of Object.entries(sourceEnvironment)) {
@@ -2183,14 +3776,17 @@ export function sanitizedAgentEnvironment(sourceEnvironment, zDotDir) {
   };
 }
 
-export function localGitConfigAllowed(keys) {
+export function localGitConfigAllowed(keys, options = {}) {
+  const approved = options.allowSparseCheckout
+    ? APPROVED_SPARSE_LOCAL_GIT_CONFIG
+    : APPROVED_LOCAL_GIT_CONFIG;
   return Array.isArray(keys) && keys.every((key) =>
     typeof key === "string"
-    && APPROVED_LOCAL_GIT_CONFIG.some((pattern) => pattern.test(key))
+    && approved.some((pattern) => pattern.test(key))
   );
 }
 
-function validateLocalGitConfiguration(repository, environment) {
+export function validateLocalGitConfiguration(repository, environment, options = {}) {
   const keys = execFileSync(
     "git",
     ["config", "--local", "--includes", "--name-only", "--null", "--list"],
@@ -2201,8 +3797,41 @@ function validateLocalGitConfiguration(repository, environment) {
       maxBuffer: 4 * 1024 * 1024,
     },
   ).split("\0").filter(Boolean);
-  if (!localGitConfigAllowed(keys)) {
+  if (!localGitConfigAllowed(keys, options)) {
     throw new Error("dogfood repository has unsafe local Git config");
+  }
+  if (!options.allowSparseCheckout) return;
+
+  const worktreeKeys = execFileSync(
+    "git",
+    ["config", "--worktree", "--includes", "--name-only", "--null", "--list"],
+    {
+      cwd: repository,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  ).split("\0").filter(Boolean);
+  const configValues = (scope, key) => execFileSync(
+    "git",
+    ["config", scope, "--null", "--get-all", key],
+    {
+      cwd: repository,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  ).split("\0").filter(Boolean);
+  if (
+    canonicalJson([...worktreeKeys].sort()) !== canonicalJson(V2_WORKTREE_GIT_CONFIG_KEYS)
+    || canonicalJson(configValues("--local", "extensions.worktreeConfig"))
+      !== canonicalJson(["true"])
+    || canonicalJson(configValues("--worktree", "core.sparseCheckout"))
+      !== canonicalJson(["true"])
+    || canonicalJson(configValues("--worktree", "core.sparseCheckoutCone"))
+      !== canonicalJson(["false"])
+  ) {
+    throw new Error("dogfood v2 repository has unsafe worktree Git config");
   }
 }
 
@@ -2317,6 +3946,228 @@ async function fingerprintTree(root, excluded = new Set()) {
   return hash.digest("hex");
 }
 
+function archiveMemberNames(archive, expectedRoot) {
+  let names;
+  let verbose;
+  try {
+    names = execFileSync("tar", ["-tzf", archive], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    }).trimEnd().split(/\r?\n/u);
+    verbose = execFileSync("tar", ["-tvzf", archive], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    }).trimEnd().split(/\r?\n/u);
+  } catch {
+    throw new Error("cannot inspect the fixed public archive");
+  }
+  if (names.length === 0 || names.length !== verbose.length) {
+    throw new Error("public archive inventory is incomplete");
+  }
+  const observed = new Set();
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index].replace(/\/$/u, "");
+    const segments = name.split("/");
+    if (
+      (verbose[index][0] !== "-" && verbose[index][0] !== "d")
+      || name !== expectedRoot && !name.startsWith(`${expectedRoot}/`)
+      || segments.some((segment) => segment === "" || segment === "." || segment === "..")
+      || name.includes("\\")
+      || /[\u0000-\u001f\u007f]/u.test(name)
+      || observed.has(name)
+    ) {
+      throw new Error("public archive has an unsafe or duplicate member");
+    }
+    observed.add(name);
+  }
+  if (!observed.has(expectedRoot)) {
+    throw new Error("public archive is missing its fixed root directory");
+  }
+  return observed;
+}
+
+function assertRegularTree(root) {
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const metadata = lstatSync(path);
+      if (entry.isDirectory() && !metadata.isSymbolicLink()) visit(path);
+      else if (!entry.isFile() || metadata.isSymbolicLink()) {
+        throw new Error("extracted public archive contains a non-regular entry");
+      }
+    }
+  };
+  visit(root);
+}
+
+export async function verifyExtractedArchiveClosure(archive, packageRoot, archiveRoot) {
+  archiveMemberNames(archive, archiveRoot);
+  assertRegularTree(packageRoot);
+  const temporary = mkdtempSync(join(tmpdir(), "depgraph-dogfood-archive-"));
+  try {
+    execFileSync("tar", ["-xzf", archive, "-C", temporary], {
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const extracted = join(temporary, archiveRoot);
+    if (!existsSync(extracted) || !lstatSync(extracted).isDirectory()) {
+      throw new Error("public archive did not extract to its fixed root");
+    }
+    assertRegularTree(extracted);
+    if (await fingerprintTree(packageRoot) !== await fingerprintTree(extracted)) {
+      throw new Error("extracted package does not exactly match the fixed public archive");
+    }
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+  return true;
+}
+
+export async function verifyCompilerPackClosure(spec, runtime) {
+  const requirement = jsonFile(runtime.compilerPackRequirement);
+  const compilerRootName = spec.release.compiler_pack_archive.name.replace(/\.tar\.gz$/u, "");
+  const expectedChecksumReference =
+    `release-checksums:v${expectedPackagedProductVersion(spec)}/compiler-pack-${spec.release.host_target}`;
+  if (
+    !exactKeys(requirement, [
+      "root",
+      "expected_manifest_sha256",
+      "release_checksum_reference",
+      "host",
+      "target",
+    ])
+    || requirement.root !== compilerRootName
+    || requirement.release_checksum_reference !== expectedChecksumReference
+    || requirement.host !== spec.release.host_target
+    || requirement.target !== spec.release.host_target
+  ) throw new Error("compiler-pack requirement identity mismatch");
+  assertDigest(requirement.expected_manifest_sha256, "compiler-pack manifest");
+  const requirementParent = realpathSync(dirname(runtime.compilerPackRequirement));
+  const compilerRoot = canonicalExisting(
+    join(requirementParent, compilerRootName),
+    "compiler-pack root",
+    "directory",
+  );
+  if (dirname(compilerRoot) !== requirementParent) {
+    throw new Error("compiler-pack root escapes its requirement directory");
+  }
+  const members = archiveMemberNames(runtime.compilerPackArchive, compilerRootName);
+  await verifyExtractedArchiveClosure(
+    runtime.compilerPackArchive,
+    compilerRoot,
+    compilerRootName,
+  );
+  const manifestPath = join(compilerRoot, "compiler-pack-manifest.json");
+  if (
+    !existsSync(manifestPath)
+    || await sha256File(manifestPath) !== requirement.expected_manifest_sha256
+  ) throw new Error("compiler-pack manifest does not match its public requirement");
+  let archiveManifest;
+  try {
+    archiveManifest = execFileSync(
+      "tar",
+      ["-xOf", runtime.compilerPackArchive, `${compilerRootName}/compiler-pack-manifest.json`],
+      { maxBuffer: 16 * 1024 * 1024 },
+    );
+  } catch {
+    throw new Error("cannot read the compiler-pack manifest from the public archive");
+  }
+  if (!archiveManifest.equals(readFileSync(manifestPath))) {
+    throw new Error("extracted compiler-pack manifest is not from the fixed public archive");
+  }
+  const manifest = jsonFile(manifestPath);
+  if (
+    manifest.schema_version !== "depgraph-compiler-pack-manifest-v1"
+    || manifest.host !== spec.release.host_target
+    || manifest.target !== spec.release.host_target
+    || manifest.release_checksum_reference !== expectedChecksumReference
+    || !Array.isArray(manifest.directories)
+    || !Array.isArray(manifest.files)
+    || manifest.directories.length > 100_000
+    || manifest.files.length < 1
+    || manifest.files.length > 250_000
+  ) throw new Error("compiler-pack manifest identity mismatch");
+
+  const directorySet = new Set();
+  const expectedMembers = new Set([
+    compilerRootName,
+    `${compilerRootName}/compiler-pack-manifest.json`,
+  ]);
+  let previousDirectory = null;
+  for (const directory of manifest.directories) {
+    if (
+      !validNormalizedRelativePath(directory)
+      || directory === "compiler-pack-manifest.json"
+      || directorySet.has(directory)
+      || previousDirectory !== null && previousDirectory >= directory
+    ) throw new Error("compiler-pack manifest contains an invalid directory closure");
+    previousDirectory = directory;
+    directorySet.add(directory);
+    expectedMembers.add(`${compilerRootName}/${directory}`);
+    const path = join(compilerRoot, directory);
+    let metadata;
+    try {
+      metadata = lstatSync(path);
+    } catch {
+      throw new Error("compiler-pack is missing a manifest directory");
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("compiler-pack manifest directory is not a real directory");
+    }
+  }
+
+  const parentPaths = (path) => {
+    const segments = path.split("/");
+    return Array.from({ length: segments.length - 1 }, (_, index) =>
+      segments.slice(0, index + 1).join("/"));
+  };
+  const requireParents = (path) => {
+    for (const parent of parentPaths(path)) {
+      if (!directorySet.has(parent)) {
+        throw new Error("compiler-pack manifest is missing a parent directory");
+      }
+    }
+  };
+  for (const directory of manifest.directories) requireParents(directory);
+
+  const seenFiles = new Set();
+  let previousFilePath = null;
+  for (const file of manifest.files) {
+    if (
+      !isRecord(file)
+      || typeof file.path !== "string"
+      || !validNormalizedRelativePath(file.path)
+      || file.path === "compiler-pack-manifest.json"
+      || directorySet.has(file.path)
+      || seenFiles.has(file.path)
+      || previousFilePath !== null && previousFilePath >= file.path
+      || !Number.isSafeInteger(file.size)
+      || file.size < 0
+      || typeof file.executable !== "boolean"
+    ) throw new Error("compiler-pack manifest contains an invalid file entry");
+    assertDigest(file.sha256, "compiler-pack file");
+    previousFilePath = file.path;
+    seenFiles.add(file.path);
+    requireParents(file.path);
+    expectedMembers.add(`${compilerRootName}/${file.path}`);
+    const path = join(compilerRoot, file.path);
+    if (!existsSync(path)) {
+      throw new Error("compiler-pack is missing a manifest file");
+    }
+    const metadata = lstatSync(path);
+    if (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.size !== file.size
+      || (metadata.mode & 0o111) !== (file.executable ? 0o111 : 0)
+      || await sha256File(path) !== file.sha256
+    ) throw new Error("compiler-pack file does not match its manifest");
+  }
+  if (canonicalJson([...members].sort()) !== canonicalJson([...expectedMembers].sort())) {
+    throw new Error("compiler-pack archive inventory does not match its manifest");
+  }
+  return compilerRoot;
+}
+
 async function fingerprintFileSet(paths) {
   const hash = createHash("sha256");
   for (const path of paths) {
@@ -2342,11 +4193,14 @@ function journalPaths(store) {
   return [journal, `${journal}-wal`, `${journal}-shm`, `${journal}.purge-lock`];
 }
 
-async function daemonStateFingerprint(store) {
+export async function daemonStateFingerprint(store) {
   const directory = dirname(store);
-  const storeName = basename(store);
+  const excluded = new Set([
+    ...storePaths(store).map((path) => basename(path)),
+    ...journalPaths(store).map((path) => basename(path)),
+  ]);
   const paths = readdirSync(directory)
-    .filter((name) => !name.startsWith(storeName))
+    .filter((name) => !excluded.has(name))
     .sort()
     .map((name) => join(directory, name));
   return fingerprintFileSet(paths);
@@ -2381,6 +4235,80 @@ function snapshotShow(depgraph, store, name, cwd) {
   )).data;
 }
 
+function validateRepositoryCheckout(spec, repository, environment) {
+  const generation = generationOf(spec);
+  validateLocalGitConfiguration(repository, environment, {
+    allowSparseCheckout: generation.sparse_paths !== null,
+  });
+  validateRepositorySparseCheckout(spec, repository, environment);
+  if (generation.sparse_paths !== null) {
+    if (commandOutput("git", ["rev-parse", "--is-shallow-repository"], {
+      cwd: repository,
+      env: environment,
+    }) !== "false") {
+      throw new Error("dogfood v2 repository must retain full Git history");
+    }
+    const alternates = resolve(repository, commandOutput(
+      "git",
+      ["rev-parse", "--git-path", "objects/info/alternates"],
+      { cwd: repository, env: environment },
+    ));
+    if (existsSync(alternates)) {
+      throw new Error("dogfood v2 repository must not use alternate object stores");
+    }
+    try {
+      execFileSync(
+        "git",
+        [
+          "merge-base",
+          "--is-ancestor",
+          spec.repository.baseline_commit,
+          spec.repository.candidate_commit,
+        ],
+        {
+          cwd: repository,
+          env: environment,
+          stdio: "pipe",
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+    } catch {
+      throw new Error("dogfood v2 repository does not retain the baseline ancestry");
+    }
+    validateSparseCheckoutMaterialization(
+      repository,
+      generation.sparse_paths,
+      environment,
+    );
+  }
+  const candidateCommit = commandOutput("git", ["rev-parse", "HEAD"], {
+    cwd: repository,
+    env: environment,
+  });
+  const candidateTree = commandOutput("git", ["rev-parse", "HEAD^{tree}"], {
+    cwd: repository,
+    env: environment,
+  });
+  const baselineTree = commandOutput(
+    "git",
+    ["rev-parse", `${spec.repository.baseline_commit}^{tree}`],
+    { cwd: repository, env: environment },
+  );
+  if (
+    candidateCommit !== spec.repository.candidate_commit
+    || candidateTree !== spec.repository.candidate_tree
+    || baselineTree !== spec.repository.baseline_tree
+  ) throw new Error("dogfood repository is not the fixed candidate checkout");
+  const repositoryStatus = commandOutput(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    { cwd: repository, env: environment },
+  );
+  if (repositoryStatus.length !== 0) {
+    throw new Error("dogfood repository must be a clean fixed candidate checkout");
+  }
+}
+
 async function preflight(spec, runtime, agentEnvironment) {
   if (await sha256File(runtime.releaseArchive) !== spec.release.archive.sha256) {
     throw new Error("public release archive digest mismatch");
@@ -2396,37 +4324,17 @@ async function preflight(spec, runtime, agentEnvironment) {
   if (await sha256File(runtime.mcpSmoke) !== spec.release.mcp_smoke.sha256) {
     throw new Error("public MCP smoke digest mismatch");
   }
-  validateLocalGitConfiguration(runtime.repository, agentEnvironment);
-  const candidateCommit = commandOutput("git", ["rev-parse", "HEAD"], {
-    cwd: runtime.repository,
-    env: agentEnvironment,
-  });
-  const candidateTree = commandOutput("git", ["rev-parse", "HEAD^{tree}"], {
-    cwd: runtime.repository,
-    env: agentEnvironment,
-  });
-  const baselineTree = commandOutput(
-    "git",
-    ["rev-parse", `${spec.repository.baseline_commit}^{tree}`],
-    { cwd: runtime.repository, env: agentEnvironment },
-  );
-  if (
-    candidateCommit !== spec.repository.candidate_commit
-    || candidateTree !== spec.repository.candidate_tree
-    || baselineTree !== spec.repository.baseline_tree
-  ) throw new Error("dogfood repository is not the fixed candidate checkout");
-  const repositoryStatus = commandOutput(
-    "git",
-    ["status", "--porcelain=v1", "--untracked-files=all"],
-    { cwd: runtime.repository, env: agentEnvironment },
-  );
-  if (repositoryStatus.length !== 0) {
-    throw new Error("dogfood repository must be a clean fixed candidate checkout");
-  }
+  validateRepositoryCheckout(spec, runtime.repository, agentEnvironment);
   const archiveRoot = spec.release.archive.name.replace(/\.tar\.gz$/u, "");
   if (basename(runtime.packageRoot) !== archiveRoot) {
     throw new Error("extracted release package root has the wrong identity");
   }
+  await verifyExtractedArchiveClosure(
+    runtime.releaseArchive,
+    runtime.packageRoot,
+    archiveRoot,
+  );
+  await verifyCompilerPackClosure(spec, runtime);
   const manifestPath = join(runtime.packageRoot, "release-manifest.json");
   const depgraph = join(runtime.packageRoot, "bin", "depgraph");
   const mcp = join(runtime.packageRoot, "bin", "depgraph-mcp");
@@ -2613,6 +4521,10 @@ async function runCodex({
     ];
     args.push(
       "--config",
+      "mcp_servers.depgraph.enabled=true",
+      "--config",
+      "mcp_servers.depgraph.required=true",
+      "--config",
       `mcp_servers.depgraph.command=${JSON.stringify(preflightResult.mcp)}`,
       "--config",
       `mcp_servers.depgraph.args=${JSON.stringify(mcpArgs)}`,
@@ -2706,6 +4618,7 @@ async function runCodex({
   const elapsedMs = Number((process.hrtime.bigint() - startNs) / 1_000_000n);
   await new Promise((finish) => setTimeout(finish, 250));
   const finishedAt = new Date();
+  validateRepositoryCheckout(spec, runtime.repository, agentEnvironment);
   const after = await safetySnapshot(runtime);
   if (interruptedSignal !== null) {
     if (after.relevant_processes !== 0) {

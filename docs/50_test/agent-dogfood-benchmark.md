@@ -215,24 +215,50 @@ schemas, evidence, and report digest pin are not edited.
 unreferenced TypeScript file in the Web analysis profile. It exists so the
 candidate snapshot has at least one `unused-file` finding. Do not import it.
 
-### Pending → pinned lifecycle
+### Pinned v2 evidence
 
-v2 ships with `release_status: "pending"` and every pin field set to the
-literal `PENDING-RELEASE`. `node scripts/agent-dogfood.mjs lint-spec` is the
-only command that accepts that authoring state. `run`, `verify`, `aggregate`,
-and scoring reject a pending spec.
+v2 is pinned to the public `v0.5.4-rc.2` package. The baseline is
+`v0.5.4-rc.1`, and the candidate is `v0.5.4-rc.2`. The checked-in evidence is
+under `fixtures/agent-dogfood-v2/evidence/v0.5.4-rc.2/`; ordinary CI verifies
+all six samples and the deterministic report without invoking an Agent host.
 
-Phase 2, immediately after the next health-capable RC tag, pins the public
-archive digests, snapshot IDs, host identity, and golden values, sets
-`release_status: "pinned"`, and checks in six real Agent samples under
-`fixtures/agent-dogfood-v2/evidence/<rc-tag>/`. The tag must be a canonical
-`vX.Y.Z-rc.N`. Asset names are derived from that product version
-(`depgraph-X.Y.Z-aarch64-apple-darwin.tar.gz` and the matching compiler-pack
-and MCP smoke names), and the packaged manifest product version must equal
-`X.Y.Z`. `validateSpec` / `run` / `verify` / `aggregate` then require the
-unused-file kinds filter, `count>=1`, and a supported finding detail. The
-runner substitutes `{{repository.baseline_commit}}` in `prompt.md` with the
-pinned baseline OID, and `prompt_sha256` is the digest of those sent bytes. Until that pinning PR lands, Issue #436 stays open.
+The snapshots come from a non-shallow, full-history clone with the exact
+non-cone sparse-checkout paths declared in `spec.json`. Full Git history keeps
+hotspot churn available, while the fixed path set keeps code-health analysis
+inside the packaged query budget. The runner rejects a shallow clone, a normal
+full working tree, alternate object storage, missing baseline ancestry, or any
+sparse path/index drift before starting a sample. It repeats the repository
+identity, config, index, and cleanliness checks after every Agent run.
+
+Preflight reconstructs the fixed public archive in a temporary directory and
+compares the complete regular-file tree with the supplied package. It also
+checks every compiler-pack file against the manifest embedded in the pinned
+compiler-pack archive and the adjacent pinned requirement file.
+
+The pinned MCP arm exposes 15 read tools and must complete 13 workflow tools in
+every sample. `agent_node_get` resolves opaque file-cycle node IDs through the
+public DTO before the Agent renders repository paths; source imports are not
+accepted as an ID-to-path mapping.
+The verifier binds each started/completed MCP call to server `depgraph`, the
+candidate snapshot, the fixed ordered arguments, and the preceding result IDs
+used for node and finding lookups.
+
+All three MCP samples reached 100% accuracy and 100% major-claim recall. The
+median was 25 tool calls, 154,368 tool-result bytes, 191,071 ms, and 89,808
+effective tokens. All six samples passed the read-only safety check. The
+deterministic report is pinned at
+`sha256:7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`.
+
+`validateSpec`, `run`, `verify`, and `aggregate` require the unused-file filter,
+`count>=1`, and a supported finding detail. The runner substitutes
+`{{repository.baseline_commit}}` in `prompt.md` with the RC1 OID, and
+`prompt_sha256` records the exact bytes sent to the host.
+
+The runner still accepts a `release_status: "pending"` authoring spec through
+`lint-spec` only. Every future pin field must contain the literal
+`PENDING-RELEASE`; execution, verification, aggregation, and scoring reject
+that state. A pinned tag must use `vX.Y.Z-rc.N`, and all asset names and the
+packaged manifest must identify the same product version.
 
 v2 host identity is an exact tuple (`cli_version`, model, reasoning effort,
 sandbox `read-only`, approval policy `never`). Pin `cli_version` to the

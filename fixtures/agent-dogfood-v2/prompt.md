@@ -7,8 +7,8 @@ stop a daemon, or execute project code. Read-only source and Git inspection are
 allowed. If the `depgraph` MCP server is available, use only its read-capability
 tools; you may combine those graph results with the same read-only source and
 Git inspection available to the baseline arm. Every MCP run must complete the
-ordered claim plan and call all twelve required workflow tools:
-`agent_nodes_list`, `get_context`, `graph_cycles_list`,
+ordered claim plan and call all thirteen required workflow tools:
+`agent_node_get`, `agent_nodes_list`, `get_context`, `graph_cycles_list`,
 `graph_dependencies_list`, `graph_dependents_list`, `graph_impact_get`,
 `graph_path_get`, `snapshot_diff_get`, `health_findings_list`,
 `health_finding_get`, `health_hotspots_list`, and `health_audit_get`.
@@ -27,7 +27,8 @@ shell invocation. Every source/Git shell invocation must contain exactly one
 redirection, or project executable. Unrecognized commands conservatively fail
 the read-only safety gate.
 
-For this fixed large snapshot, use `path:<repository-relative-path>` for file
+For this fixed full-history sparse-checkout snapshot, use
+`path:<repository-relative-path>` for file
 selectors. Set `max_traversal` to `1000000` for dependency, path, and cycle
 queries, and use `max_nodes: 1000000` plus `max_edges: 1000000` for impact.
 Use a page limit of 10 for the targeted dependency/dependent/impact/cycle
@@ -64,13 +65,11 @@ Apply these public-result rendering rules consistently:
   elides part of the `changes` array. Do not recount that array and do not mark
   the file-diff claim insufficient when the digest is present.
 - Render Web file-cycle nodes as `file://<repository_path>`, then rotate the
-  cycle as requested. If the cycle DTO exposes only node IDs, use at most one
-  bounded source command across `workers/web/src` to investigate that single
-  claim; related files for one claim may be inspected together. Source imports
-  alone do not prove which repository paths correspond to opaque graph IDs. If
-  no public result establishes that correspondence, you MUST report the claim
-  as `insufficient`/`not_applicable`/`unknown`; never choose a plausible source
-  cycle and label it exact. Run separate file- and package-level cycle queries.
+  cycle as requested. If the cycle DTO exposes only node IDs, call
+  `agent_node_get` once for each distinct cycle node ID and use its public
+  `display_name` as the repository-relative path. Do not infer an ID-to-path
+  mapping from source imports. Run separate file- and package-level cycle
+  queries.
 - In candidate coverage, map `files` to `files_analyzed`, `sites` to
   `dependency_sites`, and `unsupported` to `unsupported_syntax`.
 - Deterministic snapshot-diff, cycle-count, snapshot-coverage, and
@@ -115,15 +114,14 @@ discovery for a graph query that already accepts a `path:` selector:
 5. For `rust_impact`, call `graph_impact_get` directly on the catalog file
    `path:` selector.
 6. For `rust_unresolved_type`, call `graph_dependencies_list` directly on
-   `crates/depgraph-mcp/src/main.rs` via `path:`, select the `DepgraphService`
-   type-use edge, then resolve that edge target ID with exact
+   `crates/depgraph-mcp-tools/src/host_config.rs` via `path:`, select the
+   `Self` type-use edge at line 42, then resolve that edge target ID with exact
    `agent_nodes_list`.
 7. For `rust_candidate_import`, do the same on
    `crates/depgraph-cli/src/main.rs` for the `use super` import edge.
 8. Call `snapshot_diff_get` once for package and once for file.
-9. Call `graph_cycles_list` for file. If it returns opaque IDs, use exactly one
-   source command:
-   `rg -n '^import .*from ' workers/web/src --glob '*.ts'`.
+9. Call `graph_cycles_list` for file. If it returns opaque IDs, resolve each
+   distinct cycle node with `agent_node_get` before rendering and rotating it.
 10. Call `graph_cycles_list` for package, then call `get_context` for coverage.
 11. For `health_unused_findings`, call `health_findings_list` on the candidate
     snapshot with `kinds:["unused-file"]`. Report the item count and
@@ -175,8 +173,8 @@ Use the exact value format requested below, without Markdown.
    `crates/depgraph-mcp-tools/src/catalog.rs`, list every non-root impacted
    locator through depth 2 with its depth, sorted lexicographically by locator.
    Value: `complete=<true-or-false>;items=<locator>@<depth>,...`.
-6. `rust_unresolved_type`: Classify the `DepgraphService` type-use edge in
-   `crates/depgraph-mcp/src/main.rs`. Value:
+6. `rust_unresolved_type`: Classify the `Self` type-use edge at line 42 in
+   `crates/depgraph-mcp-tools/src/host_config.rs`. Value:
    `target=<locator>;status=<status>;precision=<precision>;line=<decimal>`.
 7. `rust_candidate_import`: Classify the `use super` import edge in
    `crates/depgraph-cli/src/main.rs`. Value:

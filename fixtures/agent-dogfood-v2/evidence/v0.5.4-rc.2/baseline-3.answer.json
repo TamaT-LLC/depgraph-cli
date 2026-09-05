@@ -1,0 +1,122 @@
+{
+  "claims": {
+    "candidate_coverage": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required snapshot coverage aggregate is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "file_cycle": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish the canonical graph cycle.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "go_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish graph resolution.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_audit_base": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required health-audit result is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_finding_detail": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "No depgraph health finding can be selected without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_hotspots": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required hotspot result is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_unused_findings": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required code-health finding aggregate is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "package_cycles": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required graph cycle count is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_candidate_import": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish depgraph edge status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_impact": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish complete graph impact.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_path": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish graph path resolution.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_unresolved_type": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish depgraph edge status or precision.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_file_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required snapshot-diff aggregate is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_package_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The required snapshot-diff aggregate is unavailable without the depgraph MCP server.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish graph resolution.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependents": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "The depgraph MCP server is unavailable; source inspection cannot establish complete direct graph dependents.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    }
+  },
+  "failure": {
+    "code": "none",
+    "remediation": "",
+    "task": ""
+  },
+  "schema_version": "agent-dogfood-answer-v1"
+}
