@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,14 +20,16 @@ type goSemanticExtractor struct {
 	state                 *scannerState
 	sources               map[string]*sourceFile
 	contexts              []*goSemanticPackage
-	typeNodesByResolver   map[string]string
-	symbolNodesByResolver map[string]string
+	typeNodesByResolver   map[string][]string
+	symbolNodesByResolver map[string][]string
 	nodeResolvers         map[string]string
 	symbolOrigins         map[string][]goSemanticSymbolOrigin
+	typeOrigins           map[string][]goSemanticSymbolOrigin
+	typeNodesByObject     map[types.Object]string
 	symbolNodesByObject   map[types.Object]string
 	symbolNodesBySyntax   map[ast.Node]string
 	closureNodesBySpan    map[goSemanticSourceSpanKey]string
-	functionInstances     map[string]string
+	functionInstances     map[string][]string
 	symbolVariants        map[string]map[string]bool
 	diagnosticIDs         map[string]bool
 	pendingCalls          []goSemanticPendingCall
@@ -57,6 +60,8 @@ type goSemanticNamedType struct {
 	nodeID        string
 	named         *types.Named
 	interfaceType *types.Interface
+	moduleDir     string
+	packagePath   string
 	evidence      []Evidence
 	condition     Condition
 	generated     bool
@@ -74,14 +79,16 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	extractor := &goSemanticExtractor{
 		state:                 s,
 		sources:               make(map[string]*sourceFile, len(sources)),
-		typeNodesByResolver:   map[string]string{},
-		symbolNodesByResolver: map[string]string{},
+		typeNodesByResolver:   map[string][]string{},
+		symbolNodesByResolver: map[string][]string{},
 		nodeResolvers:         map[string]string{},
 		symbolOrigins:         map[string][]goSemanticSymbolOrigin{},
+		typeOrigins:           map[string][]goSemanticSymbolOrigin{},
+		typeNodesByObject:     map[types.Object]string{},
 		symbolNodesByObject:   map[types.Object]string{},
 		symbolNodesBySyntax:   map[ast.Node]string{},
 		closureNodesBySpan:    map[goSemanticSourceSpanKey]string{},
-		functionInstances:     map[string]string{},
+		functionInstances:     map[string][]string{},
 		symbolVariants:        map[string]map[string]bool{},
 		diagnosticIDs:         map[string]bool{},
 		complete:              true,
@@ -184,7 +191,7 @@ func (p *goSemanticPackage) recordUniverseNamedTypes() {
 				return true
 			}
 			resolver := object.Pkg().Path() + "." + object.Name()
-			nodeID := p.extractor.typeNodesByResolver[resolver]
+			nodeID := p.visibleTypeNode(resolver, object.Pkg().Path())
 			if nodeID == "" {
 				return true
 			}
@@ -215,7 +222,13 @@ func (p *goSemanticPackage) recordImportedInterfaces() {
 				continue
 			}
 			resolver := imported.Path() + "." + object.Name()
-			nodeID := p.extractor.typeNodesByResolver[resolver]
+			nodeID := p.extractor.typeNodesByObject[object]
+			if nodeID != "" && !p.typeNodeVisible(nodeID, imported.Path()) {
+				nodeID = ""
+			}
+			if nodeID == "" {
+				nodeID = p.visibleTypeNode(resolver, imported.Path())
+			}
 			if nodeID == "" || p.namedTypeIDs[nodeID] {
 				continue
 			}
@@ -231,9 +244,14 @@ func (p *goSemanticPackage) recordImportedInterfaces() {
 			if !ok {
 				continue
 			}
+			moduleDir, packagePath := reference.moduleDir, reference.packagePath
+			if packagePath == "" {
+				packagePath = imported.Path()
+			}
 			p.namedTypeIDs[nodeID] = true
 			p.namedTypes = append(p.namedTypes, goSemanticNamedType{
 				nodeID: nodeID, named: named, interfaceType: interfaceType.Complete(),
+				moduleDir: moduleDir, packagePath: packagePath,
 				evidence:  append([]Evidence(nil), reference.evidence...),
 				condition: reference.condition, generated: reference.generated,
 			})
@@ -257,21 +275,132 @@ func (e *goSemanticExtractor) packageNodeID(pkg goTypedPackage) string {
 	if pkg.ForTest != "" {
 		wants["go-package:"+pkg.ForTest] = true
 	}
-	var matches []string
+	moduleRelativeDir := cleanSlash(pkg.ModuleRelativeDir)
+	expectedManifest := cleanSlash(filepath.Join(moduleRelativeDir, "go.mod"))
+	var exact []string
+	var fallback []string
 	for id, node := range e.state.nodes {
-		if node.Kind == "module" && wants[node.Locator] {
-			matches = append(matches, id)
+		if node.Kind != "module" || !wants[node.Locator] {
+			continue
+		}
+		fallback = append(fallback, id)
+		if manifest, ok := node.Properties["manifest_path"].(string); ok && cleanSlash(manifest) == expectedManifest {
+			exact = append(exact, id)
 		}
 	}
-	if len(matches) == 0 {
+	if len(exact) > 0 {
+		sort.Strings(exact)
+		return exact[0]
+	}
+	if len(fallback) == 0 {
 		return e.state.workspaceNodeID
 	}
-	sort.Strings(matches)
-	return matches[0]
+	sort.Strings(fallback)
+	return fallback[0]
 }
 
 func goSemanticPackageLocator(pkg goTypedPackage) string {
-	return "go:" + pkg.ModulePath + "@workspace#" + pkg.PkgPath
+	moduleRelativeDir := cleanSlash(pkg.ModuleRelativeDir)
+	if moduleRelativeDir == "." {
+		return "go:" + pkg.ModulePath + "@workspace#" + pkg.PkgPath
+	}
+	return "go:" + pkg.ModulePath + "@workspace#" + moduleRelativeDir + "#" + pkg.PkgPath
+}
+
+// registerTypeOrigin retains the module instance that owns a semantic type.
+// The absolute path is used only for in-memory visibility checks. Canonical
+// IDs include the repository-relative module scope, never the checkout path.
+func (e *goSemanticExtractor) registerTypeOrigin(nodeID string, pkg goTypedPackage) {
+	if nodeID == "" {
+		return
+	}
+	origin := goSemanticSymbolOrigin{
+		moduleDir:   filepath.Clean(filepath.Join(e.state.root, filepath.FromSlash(cleanSlash(pkg.ModuleRelativeDir)))),
+		packagePath: pkg.PkgPath,
+	}
+	for _, existing := range e.typeOrigins[nodeID] {
+		if existing == origin {
+			return
+		}
+	}
+	e.typeOrigins[nodeID] = append(e.typeOrigins[nodeID], origin)
+	sort.Slice(e.typeOrigins[nodeID], func(left, right int) bool {
+		if e.typeOrigins[nodeID][left].moduleDir != e.typeOrigins[nodeID][right].moduleDir {
+			return e.typeOrigins[nodeID][left].moduleDir < e.typeOrigins[nodeID][right].moduleDir
+		}
+		return e.typeOrigins[nodeID][left].packagePath < e.typeOrigins[nodeID][right].packagePath
+	})
+}
+
+func (e *goSemanticExtractor) inheritTypeOrigins(nodeID, originNodeID string) {
+	for _, origin := range e.typeOrigins[originNodeID] {
+		duplicate := false
+		for _, existing := range e.typeOrigins[nodeID] {
+			if existing == origin {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			e.typeOrigins[nodeID] = append(e.typeOrigins[nodeID], origin)
+		}
+	}
+	sort.Slice(e.typeOrigins[nodeID], func(left, right int) bool {
+		if e.typeOrigins[nodeID][left].moduleDir != e.typeOrigins[nodeID][right].moduleDir {
+			return e.typeOrigins[nodeID][left].moduleDir < e.typeOrigins[nodeID][right].moduleDir
+		}
+		return e.typeOrigins[nodeID][left].packagePath < e.typeOrigins[nodeID][right].packagePath
+	})
+}
+
+func (p *goSemanticPackage) visibleTypeNode(resolver, importPath string) string {
+	if resolver == "" {
+		return ""
+	}
+	if importPath == "" {
+		importPath = goSemanticResolverPackagePath(resolver)
+	}
+	resolvers := []string{resolver}
+	sourceDir := p.moduleDir()
+	if _, rewritten, replaced := p.extractor.state.moduleResolution.replacementImport(sourceDir, importPath); replaced {
+		if rewrittenResolver := goSemanticRewriteResolver(resolver, importPath, rewritten); rewrittenResolver != resolver {
+			resolvers = append(resolvers, rewrittenResolver)
+		}
+	}
+	for _, candidate := range resolvers {
+		nodeIDs := append([]string(nil), p.extractor.typeNodesByResolver[candidate]...)
+		sort.Strings(nodeIDs)
+		for _, nodeID := range nodeIDs {
+			if p.typeNodeVisible(nodeID, importPath) {
+				return nodeID
+			}
+		}
+	}
+	return ""
+}
+
+func (p *goSemanticPackage) typeNodeVisible(nodeID, importPath string) bool {
+	if importPath == "" {
+		return false
+	}
+	sourceDir := p.moduleDir()
+	targetDir, rewritten, replaced := p.extractor.state.moduleResolution.replacementImport(sourceDir, importPath)
+	for _, origin := range p.extractor.typeOrigins[nodeID] {
+		if origin.packagePath == importPath && p.extractor.state.moduleResolution.directlyVisible(sourceDir, origin.moduleDir) {
+			return true
+		}
+		if replaced && origin.moduleDir == targetDir && origin.packagePath == rewritten {
+			return true
+		}
+	}
+	return false
+}
+
+func goSemanticResolverPackagePath(resolver string) string {
+	if index := strings.LastIndex(resolver, "."); index >= 0 {
+		return resolver[:index]
+	}
+	return resolver
 }
 
 func goSemanticParentMap(root ast.Node) map[ast.Node]ast.Node {
@@ -624,9 +753,11 @@ func (p *goSemanticPackage) ensureType(object *types.TypeName, identifier *ast.I
 	}
 	p.objectNodes[object] = nodeID
 	p.objectResolvers[object] = resolver
+	p.extractor.typeNodesByObject[object] = nodeID
 	p.extractor.nodeResolvers[nodeID] = resolver
 	if object.Parent() == p.typed.Types.Scope() {
 		p.extractor.registerResolver(p.extractor.typeNodesByResolver, resolver, nodeID, file.Path)
+		p.extractor.registerTypeOrigin(nodeID, p.typed)
 	}
 	if declaredBy != "" {
 		p.extractor.addRelation("declares", declaredBy, nodeID, p.condition(file.Path), evidence, p.generated(file.Path))
@@ -824,7 +955,7 @@ func (p *goSemanticPackage) methodOwner(function *types.Func) (string, string) {
 	receiverResolver := named.Obj().Pkg().Path() + "." + named.Obj().Name()
 	ownerID := p.objectNodes[named.Obj()]
 	if ownerID == "" {
-		ownerID = p.extractor.typeNodesByResolver[receiverResolver]
+		ownerID = p.visibleTypeNode(receiverResolver, named.Obj().Pkg().Path())
 	}
 	return ownerID, goSemanticMethodResolver(receiverResolver, function.Name(), pointer)
 }
@@ -876,8 +1007,13 @@ func (p *goSemanticPackage) recordNamedType(nodeID string, object *types.TypeNam
 	if named == nil {
 		return
 	}
+	moduleDir := p.moduleDir()
+	packagePath := p.typed.PkgPath
+	if object.Pkg() != nil {
+		packagePath = object.Pkg().Path()
+	}
 	record := goSemanticNamedType{
-		nodeID: nodeID, named: named,
+		nodeID: nodeID, named: named, moduleDir: moduleDir, packagePath: packagePath,
 		evidence:  p.evidence(file, identifier, object.Name(), nil),
 		condition: p.condition(file.Path), generated: p.generated(file.Path),
 	}
@@ -919,7 +1055,7 @@ func goSemanticNamedFromType(value types.Type) *types.Named {
 
 func (p *goSemanticPackage) emitExtends() {
 	for _, relation := range p.extends {
-		targetID := p.extractor.typeNodesByResolver[relation.targetResolver]
+		targetID := p.visibleTypeNode(relation.targetResolver, goSemanticResolverPackagePath(relation.targetResolver))
 		if targetID == "" {
 			targetID = p.extractor.ensureExternalType(relation.targetResolver, goSemanticResolverName(relation.targetResolver))
 		}
@@ -935,6 +1071,14 @@ func (e *goSemanticExtractor) emitImplements() {
 	for _, concrete := range namedTypes {
 		for _, contract := range namedTypes {
 			if contract.interfaceType == nil || concrete.nodeID == contract.nodeID {
+				continue
+			}
+			// A repository may contain multiple module instances with the same
+			// module and package paths. Their go/types universes are independent;
+			// do not infer an implements edge between sibling instances unless the
+			// module-resolution model says the contract is directly visible.
+			if concrete.moduleDir != "" && contract.moduleDir != "" &&
+				!e.semanticModulesVisible(concrete.moduleDir, contract.moduleDir) {
 				continue
 			}
 			// go/types deliberately leaves Implements behavior unspecified for
@@ -965,6 +1109,30 @@ func (e *goSemanticExtractor) emitImplements() {
 			e.addRelation("implements", concrete.nodeID, contract.nodeID, condition, evidence, concrete.generated || contract.generated)
 		}
 	}
+}
+
+// semanticModulesVisible includes local replacement targets in addition to
+// ordinary same-module and workspace visibility. A replacement is recorded
+// from the importing module to the replaced module, but implements relations
+// are structural and may have either type as the concrete side. Check both
+// directions while requiring an exact discovered module directory, so sibling
+// modules that merely share a module path remain isolated.
+func (e *goSemanticExtractor) semanticModulesVisible(leftDir, rightDir string) bool {
+	resolution := e.state.moduleResolution
+	if resolution.directlyVisible(leftDir, rightDir) {
+		return true
+	}
+	return semanticReplacementTargets(resolution, leftDir, rightDir) ||
+		semanticReplacementTargets(resolution, rightDir, leftDir)
+}
+
+func semanticReplacementTargets(resolution localModuleResolution, sourceDir, targetDir string) bool {
+	for _, replacementDir := range resolution.replacementTarget[sourceDir] {
+		if replacementDir == targetDir {
+			return true
+		}
+	}
+	return false
 }
 
 func goSemanticUninstantiatedGeneric(named *types.Named) bool {
@@ -1178,7 +1346,11 @@ func (p *goSemanticPackage) typeUseTarget(object *types.TypeName) (string, strin
 		return targetID, "resolved", "exact", p.objectResolvers[object]
 	}
 	resolver := goSemanticTypeResolver(object)
-	if targetID := p.extractor.typeNodesByResolver[resolver]; targetID != "" {
+	importPath := ""
+	if object.Pkg() != nil {
+		importPath = object.Pkg().Path()
+	}
+	if targetID := p.visibleTypeNode(resolver, importPath); targetID != "" {
 		return targetID, "resolved", "exact", resolver
 	}
 	targetID := p.extractor.ensureExternalType(resolver, object.Name())
@@ -1235,7 +1407,11 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 		originResolver = goSemanticTypeResolver(typed)
 		originNodeID = p.objectNodes[typed]
 		if originNodeID == "" {
-			originNodeID = p.extractor.typeNodesByResolver[originResolver]
+			packagePath := ""
+			if typed.Pkg() != nil {
+				packagePath = typed.Pkg().Path()
+			}
+			originNodeID = p.visibleTypeNode(originResolver, packagePath)
 		}
 	case *types.Func:
 		nodeKind = "symbol"
@@ -1330,6 +1506,7 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 		p.extractor.registerSymbolVariant(nodeID, p.condition(file.Path))
 	}
 	if nodeKind == "type" {
+		p.extractor.inheritTypeOrigins(nodeID, originNodeID)
 		p.recordInstanceNamedType(nodeID, instance.Type, evidence, file.Path)
 	}
 	p.extractor.addRelation("instantiates", ownerID, nodeID, p.condition(file.Path), evidence, p.generated(file.Path))
@@ -1343,8 +1520,18 @@ func (p *goSemanticPackage) recordInstanceNamedType(nodeID string, value types.T
 	if named == nil {
 		return
 	}
+	moduleDir := p.moduleDir()
+	packagePath := p.typed.PkgPath
+	if named.Obj() != nil && named.Obj().Pkg() != nil {
+		packagePath = named.Obj().Pkg().Path()
+	}
+	if origins := p.extractor.typeOrigins[nodeID]; len(origins) > 0 {
+		moduleDir = origins[0].moduleDir
+		packagePath = origins[0].packagePath
+	}
 	record := goSemanticNamedType{
-		nodeID: nodeID, named: named, evidence: append([]Evidence(nil), evidence...),
+		nodeID: nodeID, named: named, moduleDir: moduleDir, packagePath: packagePath,
+		evidence:  append([]Evidence(nil), evidence...),
 		condition: p.condition(path), generated: p.generated(path),
 	}
 	if interfaceType, ok := named.Underlying().(*types.Interface); ok {
@@ -1557,12 +1744,37 @@ func (e *goSemanticExtractor) addNode(node Node, path string) bool {
 	return true
 }
 
-func (e *goSemanticExtractor) registerResolver(index map[string]string, resolver, nodeID, path string) {
-	if old := index[resolver]; old != "" && old != nodeID {
-		e.fail("go_semantic_identity_conflict", path, fmt.Sprintf("resolver %q maps to both %s and %s", resolver, old, nodeID))
+func (e *goSemanticExtractor) registerResolver(index map[string][]string, resolver, nodeID, path string) {
+	if resolver == "" || nodeID == "" {
 		return
 	}
-	index[resolver] = nodeID
+	for _, existing := range index[resolver] {
+		if existing == nodeID {
+			return
+		}
+		// A resolver is intentionally a package-local lookup key. Distinct
+		// module instances may share it, but two different nodes under the same
+		// package locator still indicate a semantic identity conflict and must
+		// remain fail-closed.
+		if e.resolverPackageLocator(existing) == e.resolverPackageLocator(nodeID) {
+			e.fail("go_semantic_identity_conflict", path, fmt.Sprintf("resolver %q maps to both %s and %s within package locator %q", resolver, existing, nodeID, e.resolverPackageLocator(nodeID)))
+			return
+		}
+	}
+	index[resolver] = append(index[resolver], nodeID)
+	sort.Strings(index[resolver])
+}
+
+func (e *goSemanticExtractor) resolverPackageLocator(nodeID string) string {
+	if e == nil || e.state == nil {
+		return ""
+	}
+	node, ok := e.state.nodes[nodeID]
+	if !ok || node.Properties == nil {
+		return ""
+	}
+	locator, _ := node.Properties["package_locator"].(string)
+	return locator
 }
 
 func (e *goSemanticExtractor) addRelation(kind, sourceID, targetID string, condition Condition, evidence []Evidence, generated bool) {

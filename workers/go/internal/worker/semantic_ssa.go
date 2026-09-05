@@ -771,9 +771,12 @@ func (p *goSemanticPackage) visibleGoSSAFunctionInstance(resolver string, object
 		}
 	}
 	for _, candidate := range resolvers {
-		nodeID := p.extractor.functionInstances[candidate]
-		if nodeID != "" && p.ssaSymbolVisible(nodeID, object) {
-			return nodeID
+		nodeIDs := append([]string(nil), p.extractor.functionInstances[candidate]...)
+		sort.Strings(nodeIDs)
+		for _, nodeID := range nodeIDs {
+			if p.ssaSymbolVisible(nodeID, object) {
+				return nodeID
+			}
 		}
 	}
 	return ""
