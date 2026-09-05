@@ -79,6 +79,7 @@ pub(crate) fn verify(
     let fallback_root = root.path().join("fallback-workspace");
     let dependency_root_a = root.path().join("dependency-snapshot-a");
     let dependency_root_b = root.path().join("nested/dependency-snapshot-b");
+    let duplicate_module_root = root.path().join("duplicate-module-root");
     copy_tree(
         &workspace_root.join("workers/go/internal/worker/testdata/semantic"),
         &semantic_root,
@@ -101,6 +102,7 @@ pub(crate) fn verify(
             destination,
         )?;
     }
+    write_duplicate_module_path_fixture(&duplicate_module_root)?;
 
     let module_cache = root.path().join("empty-module-cache");
     let go_path = root.path().join("empty-gopath");
@@ -117,7 +119,138 @@ pub(crate) fn verify(
     verify_vta_graph(&runner, root.path(), &vta_root)?;
     verify_fallback_safety(&runner, root.path(), &fallback_root)?;
     verify_dependency_snapshot(&runner, root.path(), &dependency_root_a, &dependency_root_b)?;
+    verify_duplicate_module_root_scan(&runner, root.path(), &duplicate_module_root)?;
     println!("Go semantic CLI end-to-end gate passed");
+    Ok(())
+}
+
+fn write_duplicate_module_path_fixture(root: &Path) -> Result<()> {
+    for relative_dir in ["one", "two"] {
+        let module = root.join(relative_dir);
+        fs::create_dir_all(&module)?;
+        fs::write(
+            module.join("go.mod"),
+            "module example.test/shared\n\ngo 1.26\n",
+        )?;
+        fs::write(module.join("shared.go"), "package shared\n")?;
+    }
+    Ok(())
+}
+
+fn verify_duplicate_module_root_scan(
+    runner: &Runner<'_>,
+    temp: &Path,
+    fixture: &Path,
+) -> Result<()> {
+    let store = temp.join("duplicate-module-root.db");
+    let scan = runner.scan_no_cache(&store, fixture)?;
+    ensure!(
+        scan["status"] == "completed"
+            && scan["exit_code"] == 0
+            && scan["coverage"]["project_code_executed"] == false,
+        "duplicate-module root scan did not complete safely: {scan}"
+    );
+
+    let export = runner.export_json(&store)?;
+    let graph = export
+        .get("graph")
+        .context("duplicate-module JSON export has no graph")?;
+    let nodes = graph_array(graph, "nodes")?;
+    let edges = graph_array(graph, "edges")?;
+    let nodes_by_id = nodes
+        .iter()
+        .filter_map(|node| {
+            required_str(node, "id", "duplicate-module node")
+                .ok()
+                .map(|id| (id, node))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let module_instances = nodes
+        .iter()
+        .filter(|node| {
+            node["kind"] == "package_instance"
+                && node["properties"]["module_path"] == "example.test/shared"
+        })
+        .filter_map(|node| {
+            Some((
+                node["properties"]["relative_dir"].as_str()?,
+                required_str(node, "id", "duplicate module instance").ok()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let packages = nodes
+        .iter()
+        .filter(|node| {
+            node["kind"] == "module" && node["properties"]["package_path"] == "example.test/shared"
+        })
+        .filter_map(|node| {
+            Some((
+                node["properties"]["relative_dir"].as_str()?,
+                required_str(node, "id", "duplicate module package").ok()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        module_instances.len() == 2
+            && packages.len() == 2
+            && packages.get("one") != packages.get("two"),
+        "duplicate module instances or package IDs were merged: instances={module_instances:?} packages={packages:?}"
+    );
+
+    let has_contains_edge = |source: &str, target: &str| {
+        edges.iter().any(|edge| {
+            edge["kind"] == "contains" && edge["source"] == source && edge["target"] == target
+        })
+    };
+    let mut build_units = BTreeMap::new();
+    for relative_dir in ["one", "two"] {
+        let module_id = module_instances[relative_dir];
+        let package_id = packages[relative_dir];
+        ensure!(
+            has_contains_edge(module_id, package_id),
+            "module {relative_dir} does not contain its package"
+        );
+        let units = edges
+            .iter()
+            .filter(|edge| edge["kind"] == "contains" && edge["source"] == package_id)
+            .filter_map(|edge| edge["target"].as_str())
+            .filter(|target| {
+                nodes_by_id
+                    .get(target)
+                    .is_some_and(|node| node["kind"] == "build_unit")
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            units.len() == 1,
+            "module {relative_dir} emitted {} build units instead of one",
+            units.len()
+        );
+        let file_locator = format!("file:{relative_dir}/shared.go");
+        let file_id = nodes
+            .iter()
+            .find(|node| node["kind"] == "file" && node["locator"] == file_locator)
+            .with_context(|| format!("module {relative_dir} has no file node"))
+            .and_then(|node| required_str(node, "id", "duplicate module file"))?;
+        ensure!(
+            has_contains_edge(units[0], file_id),
+            "build unit for {relative_dir} does not contain its file"
+        );
+        build_units.insert(relative_dir, units[0]);
+    }
+    ensure!(
+        build_units["one"] != build_units["two"],
+        "duplicate module instances shared build unit {}",
+        build_units["one"]
+    );
+
+    let projection = serde_json::to_string(&graph_projection(&export)?)?;
+    for forbidden in [fixture, temp, runner.module_cache, runner.go_path] {
+        ensure!(
+            !projection.contains(&forbidden.display().to_string()),
+            "duplicate-module graph leaked host path {}",
+            forbidden.display()
+        );
+    }
     Ok(())
 }
 
@@ -328,6 +461,17 @@ impl Runner<'_> {
 
     fn scan(&self, store: &Path, fixture: &Path) -> Result<Value> {
         self.scan_with_optional_path(store, fixture, None)
+    }
+
+    fn scan_no_cache(&self, store: &Path, fixture: &Path) -> Result<Value> {
+        let mut command = self.command();
+        command
+            .arg("--store")
+            .arg(store)
+            .arg("scan")
+            .arg(fixture)
+            .args(["--no-cache", "--json"]);
+        checked_json(&mut command, "scan the duplicate-module Go fixture")
     }
 
     fn scan_with_path(&self, store: &Path, fixture: &Path, path: &Path) -> Result<Value> {
