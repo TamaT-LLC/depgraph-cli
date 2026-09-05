@@ -59,6 +59,49 @@ export const V2_SPARSE_PATHS = Object.freeze([
   "/workers/web/src/typescript-dependency-validation.ts",
   "/workers/web/src/worker.ts",
 ]);
+const FIXED_SPARSE_RELATIVE_PATHS = Object.freeze(
+  V2_SPARSE_PATHS.map((path) => path.slice(1)),
+);
+const APPROVED_DOGFOOD_SOURCE_DIRECTORIES = Object.freeze([
+  "workers/web/src",
+]);
+const AGENT_HOST_ENVIRONMENT_KEYS = new Set([
+  "ALL_PROXY",
+  "CODEX_ACCESS_TOKEN",
+  "CODEX_API_KEY",
+  "CODEX_APP_TOOLS_PIPE_PATH",
+  "CODEX_CI",
+  "CODEX_HOME",
+  "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+  "CODEX_MCP_NODE_PATH",
+  "COLORTERM",
+  "CURL_CA_BUNDLE",
+  "HOME",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NIX_SSL_CERT_FILE",
+  "NO_COLOR",
+  "NO_PROXY",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_PROJECT",
+  "PATH",
+  "REQUESTS_CA_BUNDLE",
+  "SHELL",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "TERM",
+  "TMPDIR",
+  "TZ",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+]);
 const V2_RC_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-rc\.([1-9]\d*)$/u;
 
 const ARM_NAMES = Object.freeze(["baseline", "mcp"]);
@@ -131,9 +174,68 @@ const DOGFOOD_SAFETY_BASELINE = Object.freeze({
   daemon_state_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   relevant_processes: 0,
 });
-const APPROVED_GIT_COMMAND = /^git (?:diff|log|ls-files|rev-parse|show|status)(?:\s|$)/u;
-const UNSAFE_GIT_OPTIONS = new Set(["--ext-diff", "--output", "--textconv"]);
-const UNSAFE_RG_OPTIONS = new Set(["--hostname-bin", "--pre", "--pre-glob"]);
+const TRUSTED_SHELL_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const SHELL_LOCALE = "C.UTF-8";
+const UNSAFE_GIT_OPTIONS = new Set([
+  "--config",
+  "--exec-path",
+  "--ext-diff",
+  "--git-dir",
+  "--no-index",
+  "--output",
+  "--textconv",
+  "--upload-pack",
+  "--work-tree",
+]);
+const UNSAFE_RG_OPTIONS = new Set([
+  "-z",
+  "--follow",
+  "--hidden",
+  "--hostname-bin",
+  "--no-ignore",
+  "--no-ignore-dot",
+  "--no-ignore-global",
+  "--no-ignore-parent",
+  "--no-ignore-vcs",
+  "--pre",
+  "--pre-glob",
+  "--search-zip",
+]);
+const RG_OPTIONS_WITH_VALUE = new Set([
+  "-A",
+  "-B",
+  "-C",
+  "-E",
+  "-f",
+  "-g",
+  "-m",
+  "-t",
+  "-T",
+  "--after-context",
+  "--before-context",
+  "--binary-files",
+  "--block-buffered",
+  "--color",
+  "--colors",
+  "--context",
+  "--encoding",
+  "--glob",
+  "--iglob",
+  "--ignore-file",
+  "--max-columns",
+  "--max-count",
+  "--max-depth",
+  "--path-separator",
+  "--replace",
+  "--sort",
+  "--sortr",
+  "--threads",
+  "--type",
+  "--type-add",
+  "--type-clear",
+  "--type-not",
+]);
+const RG_PATH_OPTIONS = new Set(["-f", "--file", "--ignore-file"]);
 const APPROVED_LOCAL_GIT_CONFIG = Object.freeze([
   /^core\.(?:bare|filemode|ignorecase|logallrefupdates|precomposeunicode|repositoryformatversion)$/u,
   /^remote\.[A-Za-z0-9._/-]+\.(?:fetch|url)$/u,
@@ -148,7 +250,7 @@ const V2_WORKTREE_GIT_CONFIG_KEYS = Object.freeze([
   "core.sparsecheckout",
   "core.sparsecheckoutcone",
 ]);
-const APPROVED_SED_PRINT = /^sed -n (["'])?\d+(?:,\d+)?p\1 [A-Za-z0-9_./*-]+$/u;
+const SED_PRINT_RANGE = /^\d+(?:,\d+)?p$/u;
 function freezeClaimDescriptors(descriptors) {
   return Object.freeze(descriptors.map((descriptor) => Object.freeze({ ...descriptor })));
 }
@@ -2804,6 +2906,118 @@ function hasUnsafeOption(payload, argumentOffset, unsafeOptions) {
   ));
 }
 
+function fixedSparseFilePath(path) {
+  return validNormalizedRelativePath(path)
+    && FIXED_SPARSE_RELATIVE_PATHS.includes(path);
+}
+
+function fixedSparseReadPath(path) {
+  return fixedSparseFilePath(path)
+    || validNormalizedRelativePath(path)
+    && APPROVED_DOGFOOD_SOURCE_DIRECTORIES.includes(path);
+}
+
+function gitRevisionPath(path) {
+  const separator = path.indexOf(":");
+  return separator > 0
+    && separator < path.length - 1
+    && /^(?:HEAD|[0-9a-f]{40})$/u.test(path.slice(0, separator))
+    && fixedSparseFilePath(path.slice(separator + 1));
+}
+
+function rgPathArguments(words) {
+  const filesOnly = words.slice(1).some((word) => word === "--files");
+  const paths = [];
+  let patternSeen = filesOnly;
+  let optionsEnded = false;
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (!optionsEnded && word === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && word.startsWith("-")) {
+      const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
+      const shortFileOption = word.startsWith("-f") && word.length > 2;
+      if (RG_PATH_OPTIONS.has(option) || shortFileOption) {
+        const path = word.includes("=")
+          ? word.slice(word.indexOf("=") + 1)
+          : shortFileOption
+            ? word.slice(2)
+            : words[++index];
+        if (path === undefined || !fixedSparseFilePath(path)) return null;
+        continue;
+      }
+      if (RG_OPTIONS_WITH_VALUE.has(option) && !word.includes("=")) {
+        if (++index >= words.length) return null;
+      }
+      continue;
+    }
+    if (!patternSeen) {
+      patternSeen = true;
+      continue;
+    }
+    paths.push(word);
+  }
+  if (!patternSeen || paths.length === 0 || !paths.every(fixedSparseReadPath)) return null;
+  return paths;
+}
+
+function gitPathArguments(words) {
+  const subcommand = words[1];
+  const argumentsAfterSubcommand = words.slice(2);
+  const separator = argumentsAfterSubcommand.indexOf("--");
+  const beforeSeparator = separator === -1
+    ? argumentsAfterSubcommand
+    : argumentsAfterSubcommand.slice(0, separator);
+  const afterSeparator = separator === -1
+    ? []
+    : argumentsAfterSubcommand.slice(separator + 1);
+  if (!afterSeparator.every(fixedSparseFilePath)) return null;
+
+  if (subcommand === "show") {
+    return separator === -1
+      && beforeSeparator.length === 1
+      && gitRevisionPath(beforeSeparator[0]);
+  }
+  if (subcommand === "status") {
+    return separator === -1
+      && beforeSeparator.length === 1
+      && ["--porcelain=v1", "--short"].includes(beforeSeparator[0]);
+  }
+  if (subcommand === "ls-files") {
+    return separator !== -1
+      && afterSeparator.length > 0
+      && beforeSeparator.every((word) => [
+        "--cached",
+        "--exclude-standard",
+        "--others",
+      ].includes(word));
+  }
+  if (subcommand === "diff") {
+    return separator !== -1
+      && afterSeparator.length > 0
+      && beforeSeparator.every((word) =>
+        ["--name-only", "--no-ext-diff", "--no-textconv", "--stat"].includes(word)
+        || /^(?:HEAD|[0-9a-f]{40})(?:\.\.(?:HEAD|[0-9a-f]{40}))?$/u.test(word));
+  }
+  if (subcommand === "log") {
+    return separator !== -1 && afterSeparator.length > 0
+      && beforeSeparator.every((word) =>
+        /^-[1-9]\d*$/u.test(word)
+        || word === "--oneline"
+        || /^[0-9a-f]{40}$/u.test(word));
+  }
+  if (subcommand === "rev-parse") {
+    return separator === -1
+      && beforeSeparator.length === 1
+      && (beforeSeparator[0] === "HEAD"
+        || beforeSeparator[0] === "HEAD^{tree}"
+        || /^[0-9a-f]{40}(?:\^\{tree\})?$/u.test(beforeSeparator[0]));
+  }
+  return false;
+}
+
 function shellCommandPayload(command) {
   const words = shellWords(command);
   if (
@@ -2819,13 +3033,28 @@ function approvedReadOnlyCommand(command) {
   if (typeof command !== "string") return false;
   const payload = shellCommandPayload(command);
   if (payload === null || hasUnsafeShellSyntax(payload)) return false;
-  if (APPROVED_GIT_COMMAND.test(payload)) {
-    return !hasUnsafeOption(payload, 2, UNSAFE_GIT_OPTIONS);
+  const words = shellWords(payload);
+  if (words === null || words.length === 0) return false;
+  if (words[0] === "git" && words.length >= 2 && [
+    "diff",
+    "log",
+    "ls-files",
+    "rev-parse",
+    "show",
+    "status",
+  ].includes(words[1])) {
+    return !hasUnsafeOption(payload, 2, UNSAFE_GIT_OPTIONS)
+      && gitPathArguments(words) === true;
   }
-  if (/^rg(?:\s|$)/u.test(payload)) {
-    return !hasUnsafeOption(payload, 1, UNSAFE_RG_OPTIONS);
+  if (words[0] === "rg") {
+    return !hasUnsafeOption(payload, 1, UNSAFE_RG_OPTIONS)
+      && rgPathArguments(words) !== null;
   }
-  return APPROVED_SED_PRINT.test(payload);
+  return words.length === 4
+    && words[0] === "sed"
+    && words[1] === "-n"
+    && SED_PRINT_RANGE.test(words[2])
+    && fixedSparseFilePath(words[3]);
 }
 
 function hasUnsafeShellSyntax(payload) {
@@ -3749,9 +3978,7 @@ export function sanitizedAgentEnvironment(sourceEnvironment, zDotDir) {
   for (const [key, value] of Object.entries(sourceEnvironment)) {
     if (
       value === undefined
-      || key.startsWith("GIT_")
-      || key === "RIPGREP_CONFIG_PATH"
-      || key === "ZDOTDIR"
+      || !AGENT_HOST_ENVIRONMENT_KEYS.has(key)
     ) continue;
     environment[key] = value;
   }
@@ -3774,6 +4001,42 @@ export function sanitizedAgentEnvironment(sourceEnvironment, zDotDir) {
     RIPGREP_CONFIG_PATH: "/dev/null",
     ZDOTDIR: zDotDir,
   };
+}
+
+export function agentShellEnvironmentConfig(rawDir) {
+  if (typeof rawDir !== "string" || !isAbsolute(rawDir)) {
+    throw new Error("Agent dogfood shell HOME must be an absolute raw directory");
+  }
+  const fixed = {
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_KEY_0: "core.fsmonitor",
+    GIT_CONFIG_KEY_1: "core.hooksPath",
+    GIT_CONFIG_KEY_2: "core.attributesFile",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_VALUE_1: "/dev/null",
+    GIT_CONFIG_VALUE_2: "/dev/null",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "",
+    GIT_TERMINAL_PROMPT: "0",
+    HOME: rawDir,
+    LANG: SHELL_LOCALE,
+    LC_ALL: SHELL_LOCALE,
+    PAGER: "",
+    PATH: TRUSTED_SHELL_PATH,
+    RIPGREP_CONFIG_PATH: "/dev/null",
+    ZDOTDIR: rawDir,
+  };
+  return [
+    "shell_environment_policy.inherit=\"none\"",
+    ...Object.entries(fixed)
+      .sort(([left], [right]) => codeUnitCompare(left, right))
+      .map(([key, value]) =>
+        `shell_environment_policy.set.${key}=${JSON.stringify(value)}`),
+  ];
 }
 
 export function localGitConfigAllowed(keys, options = {}) {
@@ -4495,6 +4758,7 @@ async function runCodex({
     "--json",
     "--ephemeral",
     "--ignore-user-config",
+    "--strict-config",
     "--ignore-rules",
     "--output-schema",
     answerSchema,
@@ -4511,6 +4775,9 @@ async function runCodex({
     "--cd",
     runtime.repository,
   ];
+  for (const config of agentShellEnvironmentConfig(rawDir)) {
+    args.push("--config", config);
+  }
   if (arm === "mcp") {
     const mcpArgs = [
       "--root", runtime.repository,
@@ -4777,6 +5044,10 @@ export async function runBenchmark({ specPath, rawDir, output }) {
         rawDir,
         agentEnvironment,
       });
+      // Re-run the complete public-artifact closure before accepting each sample.
+      // This binds the binaries and compiler tree used by the host to the same
+      // immutable release inputs that passed the initial preflight.
+      await preflight(spec, runtime, agentEnvironment);
       sample.identity = identity;
       writeJson(join(rawDir, `${sample.sample_id}.sample.json`), sample);
       if (!safetyPassed(sample)) {

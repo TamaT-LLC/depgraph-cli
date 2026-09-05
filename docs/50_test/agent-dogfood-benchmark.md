@@ -80,7 +80,11 @@ non-compound `git`, `rg`, or `sed` read command. The live runner clears inherite
 Git and ripgrep configuration, disables system/global Git configuration,
 fsmonitor, hooks, external attributes, optional locks, and pager execution,
 rejects local Git config outside the closed clone-metadata allowlist, and uses
-the fresh raw directory as `ZDOTDIR`. All six samples preserved the state,
+the fresh raw directory as `ZDOTDIR`. Host authentication reaches Codex through
+an explicit environment allowlist, while model-generated shell commands inherit
+no host environment and receive only a fixed read-only command environment.
+Their source paths are confined to the pinned sparse corpus. All six samples
+preserved the state,
 exposed no privileged MCP tool, executed no project code, and left no process
 behind. The exact downloaded package smoke is digest-bound into the
 report and proves safe-scan completion after stdio EOF, terminal recovery from
@@ -233,7 +237,10 @@ identity, config, index, and cleanliness checks after every Agent run.
 Preflight reconstructs the fixed public archive in a temporary directory and
 compares the complete regular-file tree with the supplied package. It also
 checks every compiler-pack file against the manifest embedded in the pinned
-compiler-pack archive and the adjacent pinned requirement file.
+compiler-pack archive and the adjacent pinned requirement file. The same full
+preflight runs after every sample before its evidence is accepted, so a package,
+compiler tree, requirement, or smoke artifact changed during execution fails
+the whole live run.
 
 The pinned MCP arm exposes 15 read tools and must complete 13 workflow tools in
 every sample. `agent_node_get` resolves opaque file-cycle node IDs through the

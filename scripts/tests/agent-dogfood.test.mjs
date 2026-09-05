@@ -29,6 +29,7 @@ import {
   SPEC_SCHEMA_VERSION_V2,
   UNUSED_HEALTH_PROBE_PATH,
   V2_SPARSE_PATHS,
+  agentShellEnvironmentConfig,
   canonicalJson,
   efficiencyRatio,
   expectedPackagedProductVersion,
@@ -339,7 +340,13 @@ test("trace safety fails closed on project or compound shell commands", () => {
     false,
   );
   assert.equal(
-    observation("/bin/zsh -c \"sed -n '1,10p' README.md\"")
+    observation(
+      "/bin/bash -lc 'git show HEAD:crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    false,
+  );
+  assert.equal(
+    observation("/bin/zsh -c \"sed -n '1,10p' crates/depgraph-mcp-tools/src/lib.rs\"")
       .project_code_execution_observed,
     false,
   );
@@ -432,11 +439,67 @@ test("trace safety fails closed on project or compound shell commands", () => {
       .project_code_execution_observed,
     true,
   );
+  assert.equal(
+    observation("/bin/bash -lc 'sed -n 1p /etc/passwd'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git show HEAD:.env'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'git show main:crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git log -p'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'git rev-parse --git-dir'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation(
+      "/bin/bash -lc 'git diff --no-inde /etc/passwd -- crates/depgraph-mcp-tools/src/lib.rs'",
+    ).project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg token /etc'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg token ../outside'")
+      .project_code_execution_observed,
+    true,
+  );
+  assert.equal(
+    observation("/bin/bash -lc 'rg -z token workers/web/src/worker.ts'")
+      .project_code_execution_observed,
+    true,
+  );
 });
 
 test("Agent runs discard external Git and ripgrep execution configuration", () => {
   const environment = sanitizedAgentEnvironment({
     PATH: "/trusted/bin",
+    HOME: "/trusted/home",
+    OPENAI_API_KEY: "host-auth-is-for-codex-only",
+    GH_TOKEN: "must-not-reach-codex",
+    GITHUB_TOKEN: "must-not-reach-codex",
+    AWS_SECRET_ACCESS_KEY: "must-not-reach-codex",
+    BASH_ENV: "/tmp/project-bash-env",
+    ENV: "/tmp/project-shell-env",
+    NODE_OPTIONS: "--require=./project-script",
+    PYTHONPATH: "/tmp/project-python",
     GIT_EXTERNAL_DIFF: "./project-script",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "diff.external",
@@ -445,6 +508,17 @@ test("Agent runs discard external Git and ripgrep execution configuration", () =
     ZDOTDIR: "/tmp/host-zdotdir",
   }, "/tmp/fresh-dogfood-output");
   assert.equal(environment.PATH, "/trusted/bin");
+  assert.equal(environment.HOME, "/trusted/home");
+  assert.equal(environment.OPENAI_API_KEY, "host-auth-is-for-codex-only");
+  for (const key of [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "BASH_ENV",
+    "ENV",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+  ]) assert.equal(environment[key], undefined);
   assert.equal(environment.GIT_EXTERNAL_DIFF, undefined);
   assert.equal(environment.GIT_CONFIG_COUNT, "3");
   assert.equal(environment.GIT_CONFIG_KEY_0, "core.fsmonitor");
@@ -478,6 +552,25 @@ test("Agent runs discard external Git and ripgrep execution configuration", () =
   assert.equal(
     localGitConfigAllowed(["core.sparsecheckout"], { allowSparseCheckout: true }),
     false,
+  );
+});
+
+test("Agent shell commands inherit only the fixed read-only environment", () => {
+  const configs = agentShellEnvironmentConfig("/tmp/fresh-dogfood-output");
+  assert.equal(configs[0], "shell_environment_policy.inherit=\"none\"");
+  for (const expected of [
+    "shell_environment_policy.set.GIT_CONFIG_GLOBAL=\"/dev/null\"",
+    "shell_environment_policy.set.GIT_OPTIONAL_LOCKS=\"0\"",
+    "shell_environment_policy.set.GIT_TERMINAL_PROMPT=\"0\"",
+    "shell_environment_policy.set.HOME=\"/tmp/fresh-dogfood-output\"",
+    "shell_environment_policy.set.PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\"",
+    "shell_environment_policy.set.RIPGREP_CONFIG_PATH=\"/dev/null\"",
+    "shell_environment_policy.set.ZDOTDIR=\"/tmp/fresh-dogfood-output\"",
+  ]) assert.equal(configs.includes(expected), true);
+  assert.equal(configs.some((config) => /TOKEN|BASH_ENV|NODE_OPTIONS/u.test(config)), false);
+  assert.throws(
+    () => agentShellEnvironmentConfig("relative-output"),
+    /absolute raw directory/,
   );
 });
 
