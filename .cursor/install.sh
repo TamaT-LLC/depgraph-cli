@@ -104,7 +104,7 @@ ensure_bubblewrap
 
 # Corepack activates the pnpm version pinned in workers/web/package.json.
 log "Activating pnpm via Corepack"
-corepack prepare --activate 2>/dev/null || true
+(cd "$REPO_ROOT/workers/web" && corepack install) 2>/dev/null || true
 
 # Make the repo-pinned Rust the global default. rust-toolchain.toml already
 # overrides the channel inside the repo, but the supervised build feature stages
