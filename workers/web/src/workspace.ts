@@ -338,6 +338,7 @@ interface WorkspaceRule {
 function isWorkspacePackagePath(relative: string, rules: readonly WorkspaceRule[]): boolean {
   return rules.some((rule) => {
     const local = normalizeRelative(path.relative(rule.root, relative));
+    if (local === ".." || local.startsWith("../")) return false;
     return local === "." || isWorkspacePath(local, rule.patterns);
   });
 }

@@ -211,36 +211,59 @@ function nextCodePointOffset(source: string, offset: number): number {
   return Math.min(source.length, offset + (codePoint !== undefined && codePoint > 0xffff ? 2 : 1));
 }
 
-function jsxClosingTagSearchSource(source: string, offset: number, tagEnd: number): string {
-  const previous = source.slice(0, offset);
-  const following = source.slice(tagEnd + 1);
-  // A type argument list in a call or declaration has an identifier-like
-  // expression immediately before `<` and an opening parenthesis after `>`
-  // (`read<T>({})`, `function read<T>()`). JSX can legitimately begin with
-  // parenthesized text (`<T>(text)</T>`), so require both sides of this
-  // generic boundary before suppressing the closing-tag search.
-  if (!/[$_\p{ID_Continue}\)\]\.\?]$/u.test(previous)) return following;
-  if (!/^\s*\(/u.test(following)) return following;
-  return "";
+const GENERIC_TSX_CALL_PREDECESSORS = new Set([
+  SyntaxKind.Identifier,
+  SyntaxKind.PrivateIdentifier,
+  SyntaxKind.CloseParenToken,
+  SyntaxKind.CloseBracketToken,
+  SyntaxKind.ThisKeyword,
+  SyntaxKind.SuperKeyword,
+  SyntaxKind.FunctionKeyword,
+]);
+
+const GENERIC_ARROW_PARAMETER_DELIMITERS = new Set([SyntaxKind.CommaToken, SyntaxKind.EqualsToken]);
+const JSX_EXTENDS_ATTRIBUTE_FOLLOWERS = new Set([
+  SyntaxKind.EqualsToken,
+  SyntaxKind.GreaterThanToken,
+  SyntaxKind.EndOfFile,
+]);
+
+function startsGenericArrowParameters(scanner: ReturnType<typeof createScanner>, first: SyntaxKind): boolean {
+  if (first !== SyntaxKind.Identifier) return false;
+  const next = scanner.scan();
+  if (GENERIC_ARROW_PARAMETER_DELIMITERS.has(next)) return true;
+  // `extends` alone or followed by `=` can be a JSX attribute. An actual
+  // type constraint disambiguates an arrow before its parameter list.
+  return next === SyntaxKind.ExtendsKeyword && !JSX_EXTENDS_ATTRIBUTE_FOLLOWERS.has(scanner.scan());
 }
 
-function looksLikeJsxElementStart(source: string, offset: number): boolean {
+function looksLikeGenericTsxConstruct(source: string, offset: number, previous: Token | undefined): boolean {
+  // A callee or declaration name remains the predecessor across whitespace
+  // and comments. JSX expressions instead follow tokens such as `=`,
+  // `return`, `(`, or `=>`, so parenthesized JSX text stays in JSX mode.
+  if (previous !== undefined && GENERIC_TSX_CALL_PREDECESSORS.has(previous.kind)) return true;
+  const scanner = createScanner(true, LanguageVariant.Standard, source, offset);
+  scanner.scan(); // `<`
+  let first = scanner.scan();
+  if (first === SyntaxKind.ConstKeyword) first = scanner.scan();
+  return startsGenericArrowParameters(scanner, first);
+}
+
+function looksLikeNamedJsxElementStart(source: string, offset: number, tagName: string): boolean {
+  const tagEnd = source.indexOf(">", offset + tagName.length + 1);
+  if (tagEnd < 0) return false;
+  if (/\/\s*$/u.test(source.slice(offset, tagEnd))) return true;
+  // Match the entire tag name: `<T>` must not consume a later `</Text>`.
+  const escapedTagName = tagName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`</${escapedTagName}\\s*>`, "u").test(source.slice(tagEnd + 1));
+}
+
+function looksLikeJsxElementStart(source: string, offset: number, previous?: Token): boolean {
   const match = source.slice(offset).match(/^<([$_\p{ID_Start}][$_\p{ID_Continue}.:-]*|>)/u);
   if (!match?.[1]) return false;
   if (match[1] === ">") return source.indexOf("</>", offset + 2) >= 0;
-  const tagEnd = source.indexOf(">", offset + match[0].length);
-  if (tagEnd < 0) return false;
-  if (/\/\s*$/u.test(source.slice(offset, tagEnd))) return true;
-  // A generic type argument such as `<T>` can precede a JSX component whose
-  // name starts with the same character (`<Text>...</Text>`). A prefix-only
-  // search would treat the latter closing tag as `</T>` and switch the scanner
-  // into JSX mode before it reaches the actual component. Require the complete
-  // closing tag name and its delimiter instead. A type argument list in a
-  // call or declaration is followed by an opening parenthesis
-  // (`read<T>({})`, `function read<T>()`), so exclude that boundary in the
-  // same bounded search, even when a same-name JSX closing tag appears later.
-  const escapedTagName = match[1].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  return new RegExp(`</${escapedTagName}\\s*>`, "u").test(jsxClosingTagSearchSource(source, offset, tagEnd));
+  if (looksLikeGenericTsxConstruct(source, offset, previous)) return false;
+  return looksLikeNamedJsxElementStart(source, offset, match[1]);
 }
 
 function looksLikeJsxClosingElement(source: string, offset: number): boolean {
@@ -314,6 +337,7 @@ function scanTokens(
       end,
       unterminated: scanner.isUnterminated(),
     };
+    const previousToken = previousSignificantToken;
     tokens.push(token);
     if (
       kind !== SyntaxKind.WhitespaceTrivia
@@ -329,7 +353,7 @@ function scanTokens(
       if (
         modeAtScan === "code"
         && kind === SyntaxKind.LessThanToken
-        && looksLikeJsxElementStart(source, start)
+        && looksLikeJsxElementStart(source, start, previousToken)
       ) {
         if (jsxExpressions.length > 0) jsxCodeReturnDepths.push(jsxDepth);
         jsxMode = "tag";

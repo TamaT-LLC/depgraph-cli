@@ -1507,6 +1507,64 @@ export const parenthesizedText = () => <T>(text)</T>;
   assert.deepEqual(result.parseErrors, []);
 });
 
+test("TSX generic boundaries preserve dependencies before a later same-name JSX element", async () => {
+  const longComment = "x".repeat(700);
+  const constructs = [
+    "read <T>({});",
+    "read\n<T>({});",
+    "read /* before */ <T> /* after */ ({});",
+    `read<T> /* ${longComment} */ ({});`,
+    "function declaration\n<T>(value: T): T { return value; }",
+    "const map = <T,>(value: T): T => value;",
+    `const map = <T,>(value: T /* ${longComment} */): T => value;`,
+    "const map = <T extends object>(value: T) => value;",
+    "const map = <T = unknown>(value: T) => value;",
+    "const map = <const T,>(value: T) => value;",
+    "const specialized = read<T>;",
+    "class Container<T> {}",
+    "function render() { return <T>(import('./ignored-text'))</T>; }",
+    "const control = <T extends>(import('./ignored-text'))</T>;",
+    "const control = <T extends={true}>(import('./ignored-text'))</T>;",
+    "const control = <$>(import('./ignored-text'))</$>;",
+  ];
+  const sources = new Map<string, string>([
+    ["before-static.ts", "export default 1;\n"],
+    ["before-require.ts", "export default 2;\n"],
+    ["before-dynamic.ts", "export default 3;\n"],
+    ["inside-jsx.ts", "export default 4;\n"],
+    ["after-static.ts", "export default 5;\n"],
+  ]);
+  for (const [index, construct] of constructs.entries()) {
+    const file = `generic-boundary-${index}.tsx`;
+    const source = `
+declare const T: any;
+declare const $: any;
+type T = unknown;
+declare function read<U>(value: unknown): U;
+${construct}
+import beforeStatic from "./before-static";
+const beforeRequire = require("./before-require");
+const beforeDynamic = import("./before-dynamic");
+const rendered = <T>{import("./inside-jsx")}</T>;
+import afterStatic from "./after-static";
+export { beforeStatic, beforeRequire, beforeDynamic, rendered, afterStatic };
+`;
+    const result = extractDependencies(`/repo/${file}`, file, source);
+    assert.deepEqual(result.dependencies.map(({ kind, specifier }) => ({ kind, specifier })), [
+      { kind: "import", specifier: "./before-static" },
+      { kind: "require", specifier: "./before-require" },
+      { kind: "dynamic_import", specifier: "./before-dynamic" },
+      { kind: "dynamic_import", specifier: "./inside-jsx" },
+      { kind: "import", specifier: "./after-static" },
+    ], construct);
+    assert.deepEqual(result.parseErrors, [], construct);
+    sources.set(file, source);
+  }
+  const analysis = await analyzeTypeScriptProject(sources);
+  assert.equal(analysis.project.status, "ready");
+  for (const [file] of sources) assert.deepEqual(analysis.get(file), [], file);
+});
+
 test("nested TSX expressions return to code for later imports and JSX", () => {
   const source = `
 type Item = { id: number; name: string }
