@@ -80,6 +80,19 @@ ensure_node() {
   link_priority pnpm
 }
 
+ensure_bubblewrap() {
+  # The supervised build feature enforces a root-owned, non-writable bubblewrap
+  # namespace boundary; several depgraph-core/CLI tests require it. CI installs
+  # it before `cargo test --workspace`.
+  if [ -x /usr/bin/bwrap ] || [ -x /bin/bwrap ]; then
+    log "bubblewrap already present"
+  else
+    log "Installing bubblewrap"
+    as_root apt-get update -qq
+    as_root apt-get install -y --no-install-recommends bubblewrap
+  fi
+}
+
 log "Toolchain versions before bootstrap"
 rustc --version || true
 go version 2>/dev/null || echo "go: missing"
@@ -87,6 +100,7 @@ node --version 2>/dev/null || echo "node: missing"
 
 ensure_go
 ensure_node
+ensure_bubblewrap
 
 # Corepack activates the pnpm version pinned in workers/web/package.json.
 log "Activating pnpm via Corepack"
