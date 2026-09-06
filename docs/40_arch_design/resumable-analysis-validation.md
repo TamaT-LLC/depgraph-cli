@@ -68,6 +68,17 @@ former file/profile traversal alone required 8,192. The configured health
 limits are unchanged, and required blocker generation remains budgeted and
 cancellable.
 
+Health also builds applicable profile membership, missing-profile metadata, and
+completeness once for each language family needed by the snapshot. It preserves
+explicit profile additions and cross-language fixture profiles, and checks usage
+against the profiles that actually supplied an edge. The public
+`issue_467_shared_applicable_profile_set_bounds_many_web_subjects` fixture uses
+48 Web profiles plus one fixture profile and 120 file/symbol/type subjects. It
+finishes within 4,000 work steps and preserves the used subject and missing-profile
+semantics. This removes repeated profile work without merging distinct Web
+profiles. Health requests still have an aggregate work budget; a sufficiently
+large graph can reach that limit even after these repeated evaluations are shared.
+
 The Web input identity cases then change `frontend/apps/web/tsconfig.json`
 and verify that the Web application unit is rerun while unrelated workspace
 units remain reusable. The repository-wide Go unit is also rerun because its
@@ -116,7 +127,9 @@ Rust tests in 50 suites, Node launcher/release tests, Go race/vet and real-worke
 E2E, Rust real-worker E2E, 270 passing Web tests, and the resumable integration
 fixture. One opt-in Web benchmark test is skipped in the regular suite; its
 separate measured run is documented in the linked benchmark report.
-`pnpm quality` also passed. CI repeats the relevant checks against the PR head
+`pnpm quality` also passed. The subsequent shared-applicability optimization
+passed all 715 Core library tests, including 28 unused-analysis tests, along with
+formatting and Core clippy. CI repeats the relevant checks against the PR head
 and retains its integration report separately from these local measurements.
 
 | Issue | Acceptance boundary | Test or command | Evidence status |
@@ -153,7 +166,10 @@ The integration fixture complements these focused checks:
   project benchmark and the limits of native compiler context reuse.
 - Core executor tests cover inactivity, explicit total budgets, process-group
   memory, protocol/output limits, cancellation, invalid checkpoints, and a
-  typed checkpoint surviving a failed semantic stage.
+  typed checkpoint surviving a failed semantic stage. Resource-limit enforcement
+  and checkpoint retention are verified at their shared executor boundaries; the
+  large Go compiler-context benchmark does not deliberately force a memory-limit
+  failure.
   `progressing_scheduler_outlives_legacy_aggregate_deadline_with_fake_clock`
   advances virtual time past the former 300-second aggregate deadline. The
   normal configuration completes all four fixture units; the same clock with
@@ -168,7 +184,9 @@ The integration fixture complements these focused checks:
 - MCP process tests exercise durable scan submission, client reconnection,
   terminal v2 results, and completed snapshot naming. Operation journal tests
   cover recovery and lease races. Daemon tests observe the same executor's
-  live unit progress.
+  live unit progress. These service fixtures do not measure nonempty Go/Web
+  checkpoint reuse themselves; the real-worker interruption/reuse measurement
+  is the CLI fixture above, which uses the shared executor.
 
 Worker unit tests and the existing Rust workspace, Go race/vet, Web quality,
 protocol/schema, and release compatibility gates remain part of validation.

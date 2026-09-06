@@ -133,3 +133,6 @@ The benchmark is a repeatable performance guard and a resource observation;
 it does not impose a machine-specific time or RSS threshold. The worker keeps
 the typed load and SSA build atomic, so the semantic row measures their full
 compiler context and cannot claim typed-object reuse across separate units.
+This benchmark observes a successful compiler load; it does not force a memory
+limit failure. The common executor tests separately cover worker-tree memory
+enforcement and preservation of validated checkpoints after stage failure.

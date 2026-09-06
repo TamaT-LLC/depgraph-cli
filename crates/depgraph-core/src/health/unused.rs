@@ -47,9 +47,9 @@ pub fn analyze_unused_cancellable(
     Ok(findings)
 }
 
-fn analyze_subject(
-    index: &SnapshotIndex<'_>,
-    node: &NodeRecord,
+fn analyze_subject<'a>(
+    index: &SnapshotIndex<'a>,
+    node: &'a NodeRecord,
     kind: FindingKind,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
@@ -106,24 +106,27 @@ fn analyze_subject(
             detail,
         });
     }
-    for profile in &applicable {
-        budget.step(is_cancelled)?;
-        if !index.profiles_by_id.contains_key(profile.as_str()) {
-            let missing_profiles = if is_go_subject {
-                go_profile_group_members(&index.go_condition_group_members, profile.as_str())
-            } else {
-                vec![profile.as_str()]
-            };
-            for missing_profile in missing_profiles {
-                budget.step(is_cancelled)?;
-                blockers.push(FindingBlocker {
-                    kind: BlockerKind::ProfileNotAnalyzed,
-                    detail: format!(
-                        "profile {missing_profile} is applicable but missing from the snapshot"
-                    ),
-                });
-            }
-        }
+    for profile_id in &applicable.base.missing_ids {
+        append_missing_profile_blockers(
+            index,
+            profile_id,
+            is_go_subject,
+            &mut blockers,
+            budget,
+            is_cancelled,
+        )?;
+    }
+    if let Some(profile_id) = applicable.explicit_extra()
+        && !index.profiles_by_id.contains_key(profile_id)
+    {
+        append_missing_profile_blockers(
+            index,
+            profile_id,
+            is_go_subject,
+            &mut blockers,
+            budget,
+            is_cancelled,
+        )?;
     }
     let mut usage_profiles = BTreeSet::new();
     for edge in &usage {
@@ -168,11 +171,12 @@ fn analyze_subject(
         );
     }
     let mut unused_across_profiles = true;
-    for profile in &applicable {
+    // Usage is sparse in the common case. Scan the profiles that actually
+    // supplied definite usage evidence instead of visiting every applicable
+    // profile, while still rejecting usage from missing profile records.
+    for profile_id in &usage_profiles {
         budget.step(is_cancelled)?;
-        if index.profiles_by_id.contains_key(profile.as_str())
-            && usage_profiles.contains(profile.as_str())
-        {
+        if index.profiles_by_id.contains_key(profile_id) && applicable.contains(profile_id) {
             unused_across_profiles = false;
             break;
         }
@@ -192,7 +196,7 @@ fn analyze_subject(
         go_profiles_satisfy(
             index,
             &applicable,
-            GoCompletenessKind::Semantic,
+            CompletenessKind::Semantic,
             budget,
             is_cancelled,
         )?
@@ -200,7 +204,7 @@ fn analyze_subject(
         profiles_satisfy(
             index,
             &applicable,
-            profile_is_semantically_complete,
+            CompletenessKind::Semantic,
             budget,
             is_cancelled,
         )?
@@ -209,7 +213,7 @@ fn analyze_subject(
         go_profiles_satisfy(
             index,
             &applicable,
-            GoCompletenessKind::Syntax,
+            CompletenessKind::Syntax,
             budget,
             is_cancelled,
         )?
@@ -217,7 +221,7 @@ fn analyze_subject(
         profiles_satisfy(
             index,
             &applicable,
-            profile_has_syntax_coverage,
+            CompletenessKind::Syntax,
             budget,
             is_cancelled,
         )?
@@ -280,6 +284,51 @@ fn analyze_subject(
     )))
 }
 
+#[derive(Clone, Copy)]
+struct ProfileCompleteness {
+    semantic: bool,
+    syntax: bool,
+}
+
+struct ApplicableProfileSet<'a> {
+    // Keep the merged profile IDs sorted so a subject can use binary search
+    // without materializing a per-subject set.
+    ids: Vec<&'a str>,
+    // Missing IDs are shared too. A subject still materializes the same
+    // ProfileNotAnalyzed blockers when this list is non-empty, but complete
+    // snapshots avoid probing every profile for every subject.
+    missing_ids: Vec<&'a str>,
+    completeness: ProfileCompleteness,
+}
+
+impl ApplicableProfileSet<'_> {
+    fn contains(&self, profile_id: &str) -> bool {
+        self.ids
+            .binary_search_by(|candidate| (*candidate).cmp(profile_id))
+            .is_ok()
+    }
+}
+
+struct ApplicableProfiles<'a> {
+    base: &'a ApplicableProfileSet<'a>,
+    explicit: Option<&'a str>,
+}
+
+impl ApplicableProfiles<'_> {
+    fn contains(&self, profile_id: &str) -> bool {
+        self.base.contains(profile_id) || self.explicit == Some(profile_id)
+    }
+
+    fn explicit_extra(&self) -> Option<&str> {
+        self.explicit
+            .filter(|profile_id| !self.base.contains(profile_id))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.base.ids.is_empty() && self.explicit_extra().is_none()
+    }
+}
+
 struct SnapshotIndex<'a> {
     incoming: HashMap<&'a str, Vec<&'a EdgeRecord>>,
     // Go imports are resolved to package/module nodes because a Go package is
@@ -307,17 +356,12 @@ struct SnapshotIndex<'a> {
     // same environment and feature axes. Conditions only inspect those axes,
     // so keep stage IDs for provenance while sharing the expensive condition
     // evaluation through a deterministic representative profile.
-    go_condition_profile_ids: Vec<&'a str>,
     go_profile_representatives: HashMap<&'a str, &'a str>,
     go_condition_group_members: HashMap<&'a str, Vec<&'a str>>,
     go_group_semantic_complete: HashMap<&'a str, bool>,
     go_group_syntax_coverage: HashMap<&'a str, bool>,
-    profile_ids_by_language: HashMap<String, Vec<&'a str>>,
-    fixture_profile_ids: Vec<&'a str>,
-    all_profile_ids: Vec<&'a str>,
-    matrix_profile_ids_by_language: HashMap<String, Vec<&'a str>>,
-    fixture_matrix_profile_ids: Vec<&'a str>,
-    all_matrix_profile_ids: Vec<&'a str>,
+    applicable_profiles_by_language: HashMap<String, ApplicableProfileSet<'a>>,
+    applicable_profiles_all: Option<ApplicableProfileSet<'a>>,
     analysis_coverage_incomplete: bool,
 }
 
@@ -671,8 +715,22 @@ impl<'a> SnapshotIndex<'a> {
         let mut go_package_identity_by_id = HashMap::<&str, GoPackageIdentity<'a>>::new();
         let mut go_package_scopes_by_path = HashMap::<&str, BTreeSet<GoPackageIdentity<'a>>>::new();
         let mut go_main_package_scopes = HashSet::<GoPackageIdentity<'a>>::new();
+        let mut required_applicable_languages = BTreeSet::new();
+        let mut needs_all_applicable_profiles = false;
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
+            if matches!(node.kind.as_str(), "file" | "symbol" | "type") {
+                if let Some(language) = node
+                    .properties
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    required_applicable_languages
+                        .insert(health_language_family(language).to_owned());
+                } else {
+                    needs_all_applicable_profiles = true;
+                }
+            }
             if node.kind != "module"
                 || node
                     .properties
@@ -698,6 +756,48 @@ impl<'a> SnapshotIndex<'a> {
                 }
             }
         }
+        let mut applicable_profiles_by_language = HashMap::new();
+        for language in required_applicable_languages {
+            let mut profile_ids = Vec::new();
+            if language == "go" {
+                profile_ids.extend(go_condition_profile_ids.iter().copied());
+            } else {
+                if let Some(ids) = profile_ids_by_language.get(&language) {
+                    profile_ids.extend(ids.iter().copied());
+                }
+                if let Some(ids) = matrix_profile_ids_by_language.get(&language) {
+                    profile_ids.extend(ids.iter().copied());
+                }
+            }
+            profile_ids.extend(fixture_profile_ids.iter().copied());
+            profile_ids.extend(fixture_matrix_profile_ids.iter().copied());
+            let profile_set = build_applicable_profile_set(
+                profile_ids,
+                &profiles_by_id,
+                &go_group_semantic_complete,
+                &go_group_syntax_coverage,
+                language == "go",
+                budget,
+                is_cancelled,
+            )?;
+            applicable_profiles_by_language.insert(language, profile_set);
+        }
+        let applicable_profiles_all = if needs_all_applicable_profiles {
+            let mut profile_ids = Vec::new();
+            profile_ids.extend(all_profile_ids.iter().copied());
+            profile_ids.extend(all_matrix_profile_ids.iter().copied());
+            Some(build_applicable_profile_set(
+                profile_ids,
+                &profiles_by_id,
+                &go_group_semantic_complete,
+                &go_group_syntax_coverage,
+                false,
+                budget,
+                is_cancelled,
+            )?)
+        } else {
+            None
+        };
         let mut go_package_usage_profiles =
             HashMap::<GoPackageIdentity<'a>, HashSet<&'a str>>::new();
         let mut go_package_uncertain_profiles =
@@ -1018,17 +1118,12 @@ impl<'a> SnapshotIndex<'a> {
             targetless_dynamic,
             coverage_omitted_paths,
             profiles_by_id,
-            go_condition_profile_ids,
             go_profile_representatives,
             go_condition_group_members,
             go_group_semantic_complete,
             go_group_syntax_coverage,
-            profile_ids_by_language,
-            fixture_profile_ids,
-            all_profile_ids,
-            matrix_profile_ids_by_language,
-            fixture_matrix_profile_ids,
-            all_matrix_profile_ids,
+            applicable_profiles_by_language,
+            applicable_profiles_all,
             analysis_coverage_incomplete,
         })
     }
@@ -1578,12 +1673,12 @@ fn collect_coverage_blockers(
     Ok(())
 }
 
-fn applicable_profiles(
-    index: &SnapshotIndex<'_>,
-    node: &NodeRecord,
+fn applicable_profiles<'a>(
+    index: &'a SnapshotIndex<'a>,
+    node: &'a NodeRecord,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<BTreeSet<String>, HealthAnalysisError> {
+) -> Result<ApplicableProfiles<'a>, HealthAnalysisError> {
     let explicit_profile = node
         .properties
         .get("profile_id")
@@ -1592,64 +1687,27 @@ fn applicable_profiles(
         .properties
         .get("language")
         .and_then(|value| value.as_str());
-    let mut profiles = BTreeSet::new();
-    if let Some(profile_id) = explicit_profile {
+    let explicit = if let Some(profile_id) = explicit_profile {
         budget.step(is_cancelled)?;
-        let profile_id = if language == Some("go") {
+        Some(if language == Some("go") {
             go_profile_representative(&index.go_profile_representatives, profile_id)
         } else {
             profile_id
-        };
-        profiles.insert(profile_id.to_owned());
-    }
-    if let Some(language) = language {
-        let language = health_language_family(language);
-        if language == "go" {
-            for profile_id in &index.go_condition_profile_ids {
-                budget.step(is_cancelled)?;
-                profiles.insert((*profile_id).to_owned());
-            }
-            // Fixture profiles are intentionally cross-language and remain
-            // applicable to Go subjects, as in the pre-grouped analysis.
-            for profile_id in index
-                .fixture_profile_ids
-                .iter()
-                .chain(&index.fixture_matrix_profile_ids)
-            {
-                budget.step(is_cancelled)?;
-                profiles.insert((*profile_id).to_owned());
-            }
-        } else {
-            for profile_id in index
-                .profile_ids_by_language
-                .get(language)
-                .into_iter()
-                .flatten()
-                .chain(&index.fixture_profile_ids)
-                .chain(
-                    index
-                        .matrix_profile_ids_by_language
-                        .get(language)
-                        .into_iter()
-                        .flatten(),
-                )
-                .chain(&index.fixture_matrix_profile_ids)
-            {
-                budget.step(is_cancelled)?;
-                profiles.insert((*profile_id).to_owned());
-            }
-        }
+        })
     } else {
-        for profile_id in index
-            .all_profile_ids
-            .iter()
-            .chain(&index.all_matrix_profile_ids)
-        {
-            budget.step(is_cancelled)?;
-            profiles.insert((*profile_id).to_owned());
-        }
-    }
-    Ok(profiles)
+        None
+    };
+    let base = match language.map(health_language_family) {
+        Some(language) => index
+            .applicable_profiles_by_language
+            .get(language)
+            .expect("a subject has an applicable profile set for its language"),
+        None => index
+            .applicable_profiles_all
+            .as_ref()
+            .expect("a subject without a language has an applicable profile set"),
+    };
+    Ok(ApplicableProfiles { base, explicit })
 }
 
 fn health_language_family(language: &str) -> &str {
@@ -1659,61 +1717,167 @@ fn health_language_family(language: &str) -> &str {
     }
 }
 
-fn profiles_satisfy(
-    index: &SnapshotIndex<'_>,
-    applicable: &BTreeSet<String>,
-    predicate: fn(&depgraph_store::ProfileRecord) -> bool,
+fn append_missing_profile_blockers<'a>(
+    index: &SnapshotIndex<'a>,
+    profile_id: &'a str,
+    is_go_subject: bool,
+    blockers: &mut Vec<FindingBlocker>,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<bool, HealthAnalysisError> {
-    for profile_id in applicable {
+) -> Result<(), HealthAnalysisError> {
+    let missing_profiles = if is_go_subject {
+        go_profile_group_members(&index.go_condition_group_members, profile_id)
+    } else {
+        vec![profile_id]
+    };
+    for missing_profile in missing_profiles {
         budget.step(is_cancelled)?;
-        let matching = index.profiles_by_id.get(profile_id.as_str()).copied();
-        if !matching.is_some_and(predicate) {
-            return Ok(false);
-        }
+        blockers.push(FindingBlocker {
+            kind: BlockerKind::ProfileNotAnalyzed,
+            detail: format!(
+                "profile {missing_profile} is applicable but missing from the snapshot"
+            ),
+        });
     }
-    Ok(true)
+    Ok(())
+}
+
+fn sorted_unique_profile_ids(mut profile_ids: Vec<&str>) -> Vec<&str> {
+    profile_ids.sort_unstable();
+    profile_ids.dedup();
+    profile_ids
 }
 
 #[derive(Clone, Copy)]
-enum GoCompletenessKind {
+enum CompletenessKind {
     Semantic,
     Syntax,
 }
 
-fn go_profiles_satisfy(
+impl ProfileCompleteness {
+    fn satisfies(self, kind: CompletenessKind) -> bool {
+        match kind {
+            CompletenessKind::Semantic => self.semantic,
+            CompletenessKind::Syntax => self.syntax,
+        }
+    }
+}
+
+fn direct_profile_completeness(
+    profiles: &HashMap<&str, &depgraph_store::ProfileRecord>,
+    profile_id: &str,
+    kind: CompletenessKind,
+) -> bool {
+    profiles.get(profile_id).is_some_and(|profile| match kind {
+        CompletenessKind::Semantic => profile_is_semantically_complete(profile),
+        CompletenessKind::Syntax => profile_has_syntax_coverage(profile),
+    })
+}
+
+fn go_profile_completeness(
+    profiles: &HashMap<&str, &depgraph_store::ProfileRecord>,
+    semantic_complete: &HashMap<&str, bool>,
+    syntax_coverage: &HashMap<&str, bool>,
+    profile_id: &str,
+    kind: CompletenessKind,
+) -> bool {
+    let grouped = match kind {
+        CompletenessKind::Semantic => semantic_complete.get(profile_id).copied(),
+        CompletenessKind::Syntax => syntax_coverage.get(profile_id).copied(),
+    };
+    grouped
+        .or_else(|| {
+            profiles.get(profile_id).map(|profile| match kind {
+                CompletenessKind::Semantic => profile_is_semantically_complete(profile),
+                CompletenessKind::Syntax => profile_has_syntax_coverage(profile),
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn build_applicable_profile_set<'a>(
+    profile_ids: Vec<&'a str>,
+    profiles: &HashMap<&'a str, &'a depgraph_store::ProfileRecord>,
+    go_group_semantic_complete: &HashMap<&'a str, bool>,
+    go_group_syntax_coverage: &HashMap<&'a str, bool>,
+    use_go_condition_groups: bool,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<ApplicableProfileSet<'a>, HealthAnalysisError> {
+    let profile_ids = sorted_unique_profile_ids(profile_ids);
+    let mut missing_ids = Vec::new();
+    let mut completeness = ProfileCompleteness {
+        semantic: true,
+        syntax: true,
+    };
+    for profile_id in &profile_ids {
+        budget.step(is_cancelled)?;
+        if !profiles.contains_key(profile_id) {
+            missing_ids.push(*profile_id);
+        }
+        let is_complete = |kind| {
+            if use_go_condition_groups {
+                go_profile_completeness(
+                    profiles,
+                    go_group_semantic_complete,
+                    go_group_syntax_coverage,
+                    profile_id,
+                    kind,
+                )
+            } else {
+                direct_profile_completeness(profiles, profile_id, kind)
+            }
+        };
+        completeness.semantic &= is_complete(CompletenessKind::Semantic);
+        completeness.syntax &= is_complete(CompletenessKind::Syntax);
+    }
+    Ok(ApplicableProfileSet {
+        ids: profile_ids,
+        missing_ids,
+        completeness,
+    })
+}
+
+fn profiles_satisfy(
     index: &SnapshotIndex<'_>,
-    applicable: &BTreeSet<String>,
-    kind: GoCompletenessKind,
+    applicable: &ApplicableProfiles<'_>,
+    kind: CompletenessKind,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<bool, HealthAnalysisError> {
-    for profile_id in applicable {
+    if !applicable.base.completeness.satisfies(kind) {
+        return Ok(false);
+    }
+    if let Some(profile_id) = applicable.explicit_extra() {
         budget.step(is_cancelled)?;
-        let matching = match kind {
-            GoCompletenessKind::Semantic => index
-                .go_group_semantic_complete
-                .get(profile_id.as_str())
-                .copied(),
-            GoCompletenessKind::Syntax => index
-                .go_group_syntax_coverage
-                .get(profile_id.as_str())
-                .copied(),
-        }
-        .or_else(|| {
-            index
-                .profiles_by_id
-                .get(profile_id.as_str())
-                .map(|profile| match kind {
-                    GoCompletenessKind::Semantic => profile_is_semantically_complete(profile),
-                    GoCompletenessKind::Syntax => profile_has_syntax_coverage(profile),
-                })
-        })
-        .unwrap_or(false);
-        if !matching {
-            return Ok(false);
-        }
+        return Ok(direct_profile_completeness(
+            &index.profiles_by_id,
+            profile_id,
+            kind,
+        ));
+    }
+    Ok(true)
+}
+
+fn go_profiles_satisfy(
+    index: &SnapshotIndex<'_>,
+    applicable: &ApplicableProfiles<'_>,
+    kind: CompletenessKind,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, HealthAnalysisError> {
+    if !applicable.base.completeness.satisfies(kind) {
+        return Ok(false);
+    }
+    if let Some(profile_id) = applicable.explicit_extra() {
+        budget.step(is_cancelled)?;
+        return Ok(go_profile_completeness(
+            &index.profiles_by_id,
+            &index.go_group_semantic_complete,
+            &index.go_group_syntax_coverage,
+            profile_id,
+            kind,
+        ));
     }
     Ok(true)
 }
@@ -3014,7 +3178,7 @@ mod tests {
         let mut cancelled = || false;
         let index = SnapshotIndex::build(&graph, &mut budget, &mut cancelled)
             .expect("synthetic Go snapshot indexes");
-        assert_eq!(index.go_condition_profile_ids.len(), 2);
+        assert_eq!(index.go_condition_group_members.len(), 2);
         let incoming = index
             .incoming
             .get("go:file")
@@ -3536,6 +3700,72 @@ mod tests {
             findings.is_empty(),
             "each production file is used by the package imports"
         );
+    }
+
+    #[test]
+    fn issue_467_shared_applicable_profile_set_bounds_many_web_subjects() {
+        let mut profiles = Vec::new();
+        for index in 0..48 {
+            profiles.push(profile(
+                &format!("typescript:stage-{index:02}"),
+                "typescript",
+                true,
+            ));
+        }
+        // Fixture profiles apply across language families and therefore remain
+        // part of the shared web profile set.
+        profiles.push(profile("fixture:shared", "fixture", true));
+
+        let mut nodes = Vec::new();
+        for index in 0..120 {
+            let kind = match index % 3 {
+                0 => "file",
+                1 => "symbol",
+                _ => "type",
+            };
+            let extra = if index == 0 {
+                json!({"profile_id": "typescript:stage-00"})
+            } else if kind == "file" {
+                json!({})
+            } else {
+                json!({"exported": true})
+            };
+            nodes.push(node(
+                &format!("web:subject-{index:03}"),
+                kind,
+                "typescript",
+                &format!("src/subject-{index:03}.ts"),
+                extra,
+            ));
+        }
+        let graph = snapshot(
+            profiles,
+            nodes,
+            vec![edge(
+                "edge:one-used-profile",
+                "web:subject-001",
+                "web:subject-000",
+                "imports",
+                "typescript:stage-00",
+            )],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        // The old node/profile traversal spent roughly four profile passes per
+        // subject. A shared set and completeness summary keep this public
+        // many-profile fixture within the existing bounded-work contract.
+        let findings = analyze_unused_cancellable(&graph, 128, 4_000, || false)
+            .expect("many same-language profiles should use shared applicability work");
+        assert_eq!(findings.len(), 119);
+        assert!(findings.iter().all(|finding| {
+            finding.subject_id != "web:subject-000"
+                && finding
+                    .blockers
+                    .iter()
+                    .all(|blocker| blocker.kind != BlockerKind::ProfileNotAnalyzed)
+        }));
     }
 
     #[test]
