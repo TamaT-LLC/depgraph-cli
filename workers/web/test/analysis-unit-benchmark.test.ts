@@ -17,11 +17,12 @@ type ProgressEvent = {
   phase: string;
   detail: ProgressDetail;
   at: number;
+  rssBytes: number;
 };
 
 function recordingProgress(events: ProgressEvent[]): ProgressReporter {
   const record = (status: ProgressEvent["status"], phase: string, detail: ProgressDetail = {}): void => {
-    events.push({ status, phase, detail, at: performance.now() });
+    events.push({ status, phase, detail, at: performance.now(), rssBytes: process.memoryUsage().rss });
   };
   return {
     start: (phase, detail) => record("start", phase, detail),
@@ -117,6 +118,7 @@ test("1024-file source-batch benchmark reports bounded transfer and rebuild metr
   let semanticEdgeCount = 0;
   const chunkMetrics: Array<Record<string, number>> = [];
   const phaseTotals = new Map<string, number>();
+  const phaseObservedRss = new Map<string, number>();
   for (const request of chunks) {
     const events: ProgressEvent[] = [];
     const beforeRss = process.memoryUsage().rss;
@@ -125,6 +127,10 @@ test("1024-file source-batch benchmark reports bounded transfer and rebuild metr
     const durationMs = performance.now() - startedAt;
     const afterRss = process.memoryUsage().rss;
     peakRssBytes = Math.max(peakRssBytes, beforeRss, afterRss);
+    for (const event of events) {
+      peakRssBytes = Math.max(peakRssBytes, event.rssBytes);
+      phaseObservedRss.set(event.phase, Math.max(phaseObservedRss.get(event.phase) ?? 0, event.rssBytes));
+    }
     const transfer = events.find((event) => event.status === "complete" && event.phase === "typescript_ast_transfer");
     const transferFiles = typeof transfer?.detail.ast_retained_source_files === "number"
       ? transfer.detail.ast_retained_source_files
@@ -222,6 +228,9 @@ test("1024-file source-batch benchmark reports bounded transfer and rebuild metr
       max_source_bytes_per_chunk: maxTransferSourceBytes,
     },
     phase_duration_ms: Object.fromEntries([...phaseTotals.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)),
+    // These samples are taken at Node progress events. They neither sample
+    // between events nor include the native compiler's child-process RSS.
+    phase_rss_observed_max_bytes: Object.fromEntries([...phaseObservedRss.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)),
     chunks: chunkMetrics,
   };
   console.log(JSON.stringify(metrics));

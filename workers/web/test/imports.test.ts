@@ -130,6 +130,67 @@ test("repository-root scans discover nested pnpm workspaces and resolve local pa
   );
 });
 
+test("inline pnpm workspace lists preserve nested package ownership and imports", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-inline-pnpm-workspace-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const relatives = [
+    "frontend/package.json",
+    "frontend/pnpm-workspace.yaml",
+    "frontend/apps/web/package.json",
+    "frontend/apps/web/index.ts",
+    "frontend/packages/shared/package.json",
+    "frontend/packages/shared/index.ts",
+    "frontend/packages/excluded/package.json",
+  ];
+  const contents = [
+    JSON.stringify({ name: "frontend", private: true, packageManager: "pnpm@10.33.0" }),
+    "packages: [\"packages/*\", 'apps/*', \"!packages/excluded\"] # static inline list\n",
+    JSON.stringify({ name: "@example/web", dependencies: { "@example/shared": "workspace:*" } }),
+    'import { answer } from "@example/shared"; export const result = answer;\n',
+    JSON.stringify({ name: "@example/shared", version: "1.0.0", exports: "./index.ts" }),
+    "export const answer = 42;\n",
+    JSON.stringify({ name: "@example/excluded", version: "1.0.0" }),
+  ];
+  const files = await Promise.all(relatives.map(async (relative, index) => {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, contents[index]!);
+    return file;
+  }));
+  const workspace = await discoverWorkspace(root, files);
+  assert.deepEqual(workspace.packages.map((record) => record.relativePath), [
+    "frontend",
+    "frontend/apps/web",
+    "frontend/packages/excluded",
+    "frontend/packages/shared",
+  ]);
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/apps/web")?.workspaceRoot, "frontend");
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/packages/shared")?.workspaceRoot, "frontend");
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/packages/excluded")?.workspaceRoot, "frontend/packages/excluded");
+
+  const resolver = await ModuleResolver.create(workspace, files);
+  const owner = workspace.packages.find((record) => record.relativePath === "frontend/apps/web")!;
+  const resolution = await resolver.resolve(rawDependency("@example/shared"), files[3]!, owner);
+  assert.equal(resolution.status, "resolved");
+  assert.deepEqual(
+    resolution.targets.map((target) => target.kind === "file"
+      ? path.relative(root, target.absolutePath).replaceAll("\\", "/")
+      : null),
+    ["frontend/packages/shared/index.ts"],
+  );
+
+  await writeFile(files[1]!, "packages:\n- 'packages/*'\n- \"apps/*\" # don't include generated\n- '!packages/excluded'\n");
+  const indentless = await discoverWorkspace(root, files);
+  assert.equal(
+    indentless.packages.find((record) => record.relativePath === "frontend/apps/web")?.workspaceRoot,
+    "frontend",
+  );
+  assert.equal(
+    indentless.packages.find((record) => record.relativePath === "frontend/packages/excluded")?.workspaceRoot,
+    "frontend/packages/excluded",
+  );
+});
+
 test("independent nested workspaces keep same-name packages and lock scopes separate", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-workspace-scopes-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

@@ -1631,6 +1631,12 @@ fn manifest_directory(path: &str) -> &str {
         .map_or(REPOSITORY_ROOT, |(parent, _)| parent)
 }
 
+#[derive(Clone, Copy)]
+enum PnpmQuote {
+    Single,
+    Double,
+}
+
 /// Read only the static packages list. YAML aliases, tags and executable
 /// configuration are deliberately unsupported; they must not widen scope.
 fn parse_pnpm_workspace_members(text: &str) -> Result<Vec<String>> {
@@ -1647,35 +1653,95 @@ fn parse_pnpm_workspace_members(text: &str) -> Result<Vec<String>> {
             if rest.is_empty() || rest.starts_with('#') {
                 continue;
             }
-            let end = rest
-                .rfind(']')
-                .context("pnpm packages must be a static list")?;
-            if !rest.starts_with('[')
-                || !rest[end + 1..].trim().is_empty() && !rest[end + 1..].trim().starts_with('#')
-            {
+            if !rest.starts_with('[') {
                 bail!("pnpm packages must be a static list");
             }
             let mut quote = None;
-            let mut start = 1;
-            for (index, ch) in rest
-                .char_indices()
-                .take_while(|(index, _)| *index < end)
-                .skip(1)
-            {
-                if matches!(ch, '\'' | '"') {
-                    if quote == Some(ch) {
-                        quote = None;
-                    } else if quote.is_none() {
-                        quote = Some(ch);
+            let mut escaped = false;
+            let mut end = None;
+            let mut chars = rest.char_indices().peekable();
+            let _ = chars.next();
+            while let Some((index, ch)) = chars.next() {
+                match quote {
+                    Some(PnpmQuote::Double) => {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            quote = None;
+                        }
                     }
-                }
-                if ch == ',' && quote.is_none() {
-                    members.push(pnpm_pattern(&rest[start..index])?);
-                    start = index + 1;
+                    Some(PnpmQuote::Single) => {
+                        if ch == '\'' {
+                            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                                let _ = chars.next();
+                            } else {
+                                quote = None;
+                            }
+                        }
+                    }
+                    None => match ch {
+                        '\'' => quote = Some(PnpmQuote::Single),
+                        '"' => quote = Some(PnpmQuote::Double),
+                        ']' => {
+                            end = Some(index);
+                            break;
+                        }
+                        _ => {}
+                    },
                 }
             }
-            if !rest[start..end].trim().is_empty() {
-                members.push(pnpm_pattern(&rest[start..end])?);
+            let end = end.context("pnpm packages must be a static list")?;
+            if quote.is_some() || escaped {
+                bail!("pnpm packages must be a static list");
+            }
+            let suffix = rest[end + 1..].trim();
+            if !suffix.is_empty() && !suffix.starts_with('#') {
+                bail!("pnpm packages must be a static list");
+            }
+
+            let values = &rest[1..end];
+            quote = None;
+            escaped = false;
+            let mut start = 0;
+            let mut chars = values.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                match quote {
+                    Some(PnpmQuote::Double) => {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            quote = None;
+                        }
+                    }
+                    Some(PnpmQuote::Single) => {
+                        if ch == '\'' {
+                            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                                let _ = chars.next();
+                            } else {
+                                quote = None;
+                            }
+                        }
+                    }
+                    None => match ch {
+                        '\'' => quote = Some(PnpmQuote::Single),
+                        '"' => quote = Some(PnpmQuote::Double),
+                        ',' => {
+                            members.push(pnpm_pattern(&values[start..index])?);
+                            start = index + 1;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            if quote.is_some() || escaped {
+                bail!("pnpm packages must be a static list");
+            }
+            if !values[start..].trim().is_empty() {
+                members.push(pnpm_pattern(&values[start..])?);
             }
             continue;
         }
@@ -1707,7 +1773,19 @@ fn pnpm_pattern(text: &str) -> Result<String> {
         }
         value
     } else if let Some(tail) = text.strip_prefix('\'') {
-        let end = tail.rfind('\'').context("unterminated pnpm pattern")?;
+        let mut chars = tail.char_indices().peekable();
+        let mut end = None;
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    let _ = chars.next();
+                } else {
+                    end = Some(index);
+                    break;
+                }
+            }
+        }
+        let end = end.context("unterminated pnpm pattern")?;
         let suffix = tail[end + 1..].trim();
         if !suffix.is_empty() && !suffix.starts_with('#') {
             bail!("invalid pnpm pattern suffix");
@@ -3897,9 +3975,16 @@ mod tests {
     #[test]
     fn workspace_static_patterns_are_anchored_and_support_flow_lists() -> Result<()> {
         let patterns = parse_pnpm_workspace_members(
-            "packages: ['packages/*', \"!packages/excluded\"] # static\ncatalog: {}\n",
+            r#"packages: ["packages/*", "packages/with\"quote/*", 'packages/with,comma/*', "!packages/excluded"] # static [comment]
+catalog: {}
+"#,
         )?;
         assert!(web_workspace_includes(&patterns, "packages/shared"));
+        assert!(web_workspace_includes(
+            &patterns,
+            "packages/with\"quote/lib"
+        ));
+        assert!(web_workspace_includes(&patterns, "packages/with,comma/lib"));
         assert!(!web_workspace_includes(&patterns, "packages/excluded"));
         assert!(!glob_matches("packages/shared", "packages/not-shared"));
         assert!(glob_matches(
@@ -3907,6 +3992,73 @@ mod tests {
             "packages/a/b/src/index.ts"
         ));
         assert!(parse_pnpm_workspace_members("packages: *dynamic\n").is_err());
+        assert_eq!(
+            parse_pnpm_workspace_members(
+                "packages:\n- 'apps/*' # don't change scope\n- 'packages/it''s/*' # quoted 'comment'\n"
+            )?,
+            ["apps/*", "packages/it's/*"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_workspace_list_with_comment_preserves_nested_member_scope() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("frontend/apps/web/src"))?;
+        fs::create_dir_all(root.path().join("frontend/packages/shared/src"))?;
+        fs::write(
+            root.path().join("frontend/pnpm-workspace.yaml"),
+            r#"packages: ["apps/*", "packages/*"] # trailing comment [not a member]
+"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/apps/web/package.json"),
+            r#"{"name":"web","dependencies":{"@example/shared":"workspace:*"}}"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/packages/shared/package.json"),
+            r#"{"name":"@example/shared","version":"1.0.0"}"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/apps/web/src/index.ts"),
+            "import { shared } from \"@example/shared\";\nexport const web = shared;\n",
+        )?;
+        fs::write(
+            root.path().join("frontend/packages/shared/src/index.ts"),
+            "export const shared = 1;\n",
+        )?;
+
+        let plan = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let project = |unit_root: &str| {
+            plan.units
+                .iter()
+                .find(|unit| {
+                    unit.kind == AnalysisUnitKind::WebProject && unit.unit_root == unit_root
+                })
+                .unwrap()
+        };
+        let app = project("frontend/apps/web");
+        let shared = project("frontend/packages/shared");
+        let workspace = plan
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == AnalysisUnitKind::WebWorkspace && unit.unit_root == "frontend"
+            })
+            .unwrap();
+
+        assert!(
+            app.manifest_paths
+                .contains(&"frontend/pnpm-workspace.yaml".to_owned())
+        );
+        assert!(
+            shared
+                .manifest_paths
+                .contains(&"frontend/pnpm-workspace.yaml".to_owned())
+        );
+        assert!(app.dependency_ids.contains(&shared.id));
+        assert!(workspace.dependency_ids.contains(&app.id));
+        assert!(workspace.dependency_ids.contains(&shared.id));
         Ok(())
     }
 

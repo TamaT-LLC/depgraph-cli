@@ -61,8 +61,8 @@ RSS, phase duration, context rebuild count, and retained AST counts/bytes:
 DEPGRAPH_WEB_BENCHMARK=1 pnpm exec tsx --test test/analysis-unit-benchmark.test.ts
 ```
 
-The following result was measured on 2026-09-06 at 20:30+09:00 on Darwin
-25.3.0 arm64 with Node.js v24.20.0 and pnpm 10.33.0.
+The following result was measured on 2026-09-06 at 21:57+09:00 on Darwin
+25.3.0 arm64 with Node.js v24.18.0 and pnpm 10.33.0.
 It ran sequentially in one process with the bundled TypeScript 7.0.2 worker.
 The result is a measurement of this fixture and process, rather than a fixed
 memory guarantee.
@@ -76,36 +76,39 @@ memory guarantee.
 | Native compiler context rebuilds | 4 |
 | Semantic sites | 6,139 |
 | Semantic edges | 6,139 |
-| Peak process RSS | 447,725,568 bytes |
+| Maximum observed Node process RSS | 431,898,624 bytes |
 | Peak retained AST source files | 257 |
 | Peak retained AST source bytes (witness) | 62,562 bytes |
 | Retained AST source bytes across chunks | 249,743 bytes |
 | Peak context target files | 1 |
 | Context source-file input occurrences | 4,096 |
 
-Measured phase totals across the four requests were:
+The table records phase totals across the four requests. RSS was sampled at each
+start, checkpoint, and completion event in the Node process; the native compiler
+child process is outside this measurement. Nested phase durations overlap, so
+their totals cannot be added to obtain scan elapsed time.
 
-| Phase | Total |
-| --- | ---: |
-| `framework_semantic` | 0.14 ms |
-| `graph_finalize` | 492.35 ms |
-| `module_resolver_initialization` | 9.51 ms |
-| `route_discovery` | 1.87 ms |
-| `source_preparation` | 544.63 ms |
-| `source_read` | 517.22 ms |
-| `syntax_dependency_resolution` | 163.13 ms |
-| `syntax_preextraction` | 504.57 ms |
-| `typescript_ast_selection` | 70.92 ms |
-| `typescript_ast_transfer` | 131.95 ms |
-| `typescript_compiler_setup` | 100.54 ms |
-| `typescript_context_rebuild` | 5,839.50 ms |
-| `typescript_definition_graph` | 357.02 ms |
-| `typescript_dependency_graph` | 3,566.03 ms |
-| `typescript_project_open` | 1,578.05 ms |
-| `typescript_semantic_diagnostics` | 72.91 ms |
-| `typescript_semantic_refinement` | 440.01 ms |
-| `typescript_syntax_diagnostics` | 1.18 ms |
-| `workspace_discovery` | 12.24 ms |
+| Phase | Total duration | Maximum observed Node RSS |
+| --- | ---: | ---: |
+| `framework_semantic` | 0.20 ms | 425,721,856 bytes |
+| `graph_finalize` | 502.14 ms | 426,016,768 bytes |
+| `module_resolver_initialization` | 11.20 ms | 418,938,880 bytes |
+| `route_discovery` | 2.44 ms | 418,922,496 bytes |
+| `source_preparation` | 670.44 ms | 423,723,008 bytes |
+| `source_read` | 640.36 ms | 423,723,008 bytes |
+| `syntax_dependency_resolution` | 165.03 ms | 425,508,864 bytes |
+| `syntax_preextraction` | 626.85 ms | 423,723,008 bytes |
+| `typescript_ast_selection` | 77.31 ms | 424,902,656 bytes |
+| `typescript_ast_transfer` | 196.40 ms | 360,464,384 bytes |
+| `typescript_compiler_setup` | 124.38 ms | 431,898,624 bytes |
+| `typescript_context_rebuild` | 8,027.37 ms | 425,000,960 bytes |
+| `typescript_definition_graph` | 467.24 ms | 369,065,984 bytes |
+| `typescript_dependency_graph` | 4,997.32 ms | 424,968,192 bytes |
+| `typescript_project_open` | 2,131.17 ms | 431,898,624 bytes |
+| `typescript_semantic_diagnostics` | 77.43 ms | 425,000,960 bytes |
+| `typescript_semantic_refinement` | 490.98 ms | 425,721,856 bytes |
+| `typescript_syntax_diagnostics` | 7.66 ms | 360,464,384 bytes |
+| `workspace_discovery` | 13.01 ms | 418,922,496 bytes |
 
 The TypeScript API has no operation that serializes a project-independent
 semantic graph while retaining the original `Program` and `TypeChecker`.

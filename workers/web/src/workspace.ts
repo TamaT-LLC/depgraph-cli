@@ -290,6 +290,256 @@ async function loadManifest(root: string, file: string): Promise<{ manifest: Rec
   }
 }
 
+const MAX_PNPM_PATTERN_BYTES = 4_096;
+
+function hasValidPnpmScalarSuffix(text: string, consumed: number): boolean {
+  const suffix = text.slice(consumed).trim();
+  return suffix.length === 0 || suffix.startsWith("#");
+}
+
+function parsePnpmJsonString(text: string): string | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePnpmDoubleQuotedPattern(text: string): string | null {
+  const match = text.match(/^"(?:\\[\s\S]|[^"\\])*"/u);
+  if (match === null) return null;
+  if (!hasValidPnpmScalarSuffix(text, match[0].length)) return null;
+  return parsePnpmJsonString(match[0]);
+}
+
+function parsePnpmSingleQuotedPattern(text: string): string | null {
+  const match = text.match(/^'((?:''|[^'])*)'/u);
+  if (match === null) return null;
+  if (!hasValidPnpmScalarSuffix(text, match[0].length)) return null;
+  return match[1]!.replaceAll("''", "'");
+}
+
+function parsePnpmPlainPattern(text: string): string | null {
+  const value = text.split(" #", 1)[0]!.trim();
+  return value.length > 0 ? value : null;
+}
+
+function isPnpmControlCharacter(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+}
+
+function hasPnpmControlCharacter(value: string): boolean {
+  return [...value].some(isPnpmControlCharacter);
+}
+
+/**
+ * Parse one static pnpm workspace scalar without evaluating YAML features.
+ * This mirrors the planner's conservative parser: quoted strings are
+ * decoded, plain scalars retain `#` unless it starts a comment, and aliases,
+ * tags, and flow collections are rejected instead of widening the workspace.
+ */
+function decodePnpmPattern(trimmed: string): string | null {
+  if (trimmed.startsWith('"')) return parsePnpmDoubleQuotedPattern(trimmed);
+  if (trimmed.startsWith("'")) return parsePnpmSingleQuotedPattern(trimmed);
+  return parsePnpmPlainPattern(trimmed);
+}
+
+function hasPnpmPatternBounds(value: string): boolean {
+  return value.length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_PNPM_PATTERN_BYTES
+    && !hasPnpmControlCharacter(value);
+}
+
+function isPnpmPatternPrefixAllowed(value: string, trimmed: string): boolean {
+  return !/^[&*[{]/u.test(value) || /^['"]/u.test(trimmed);
+}
+
+function parsePnpmPattern(text: string): string | null {
+  const trimmed = text.trim();
+  const value = decodePnpmPattern(trimmed);
+  if (value === null || !hasPnpmPatternBounds(value)) return null;
+  return isPnpmPatternPrefixAllowed(value, trimmed) ? value : null;
+}
+
+interface PnpmFlowScan {
+  closing: number;
+  commas: number[];
+}
+
+type PnpmFlowQuote = '"' | "'" | null;
+type PnpmFlowDelimiter = "," | "]" | null;
+
+interface PnpmFlowStep {
+  quote: PnpmFlowQuote;
+  escaped: boolean;
+  skip: number;
+  delimiter: PnpmFlowDelimiter;
+}
+
+function scanPnpmDoubleQuote(text: string, index: number, escaped: boolean): PnpmFlowStep {
+  const character = text[index]!;
+  if (escaped) return { quote: '"', escaped: false, skip: 0, delimiter: null };
+  if (character === "\\") return { quote: '"', escaped: true, skip: 0, delimiter: null };
+  return { quote: character === '"' ? null : '"', escaped: false, skip: 0, delimiter: null };
+}
+
+function scanPnpmSingleQuote(text: string, index: number): PnpmFlowStep {
+  const character = text[index]!;
+  if (character !== "'") return { quote: "'", escaped: false, skip: 0, delimiter: null };
+  if (text[index + 1] === "'") return { quote: "'", escaped: false, skip: 1, delimiter: null };
+  return { quote: null, escaped: false, skip: 0, delimiter: null };
+}
+
+function scanPnpmQuote(character: string): PnpmFlowQuote {
+  if (character === '"') return '"';
+  if (character === "'") return "'";
+  return null;
+}
+
+function scanPnpmDelimiter(character: string): PnpmFlowDelimiter {
+  if (character === ",") return ",";
+  if (character === "]") return "]";
+  return null;
+}
+
+function scanPnpmUnquoted(text: string, index: number): PnpmFlowStep {
+  const character = text[index]!;
+  const quote = scanPnpmQuote(character);
+  if (quote !== null) return { quote, escaped: false, skip: 0, delimiter: null };
+  return { quote: null, escaped: false, skip: 0, delimiter: scanPnpmDelimiter(character) };
+}
+
+function scanPnpmFlowStep(text: string, index: number, quote: PnpmFlowQuote, escaped: boolean): PnpmFlowStep {
+  if (quote === '"') return scanPnpmDoubleQuote(text, index, escaped);
+  if (quote === "'") return scanPnpmSingleQuote(text, index);
+  return scanPnpmUnquoted(text, index);
+}
+
+function scanPnpmFlow(text: string): PnpmFlowScan | null {
+  let quote: PnpmFlowQuote = null;
+  let escaped = false;
+  const commas: number[] = [];
+  for (let index = 1; index < text.length; index += 1) {
+    const step = scanPnpmFlowStep(text, index, quote, escaped);
+    quote = step.quote;
+    escaped = step.escaped;
+    index += step.skip;
+    if (step.delimiter === ",") commas.push(index);
+    else if (step.delimiter === "]") return { closing: index, commas };
+  }
+  return null;
+}
+
+function appendPnpmFlowPattern(patterns: string[], text: string, start: number, end: number): boolean {
+  const pattern = parsePnpmPattern(text.slice(start, end).trim());
+  if (pattern === null) return false;
+  patterns.push(pattern);
+  return true;
+}
+
+function appendPnpmFlowFinal(patterns: string[], text: string, scan: PnpmFlowScan, start: number): string[] | null {
+  const final = text.slice(start, scan.closing).trim();
+  if (final.length === 0) return patterns;
+  return appendPnpmFlowPattern(patterns, final, 0, final.length) ? patterns : null;
+}
+
+function parsePnpmFlowValues(text: string, scan: PnpmFlowScan): string[] | null {
+  const patterns: string[] = [];
+  let start = 1;
+  for (const comma of scan.commas) {
+    if (!appendPnpmFlowPattern(patterns, text, start, comma)) return null;
+    start = comma + 1;
+  }
+  return appendPnpmFlowFinal(patterns, text, scan, start);
+}
+
+function parsePnpmFlowList(text: string): string[] | null {
+  if (!text.startsWith("[")) return null;
+  const scan = scanPnpmFlow(text);
+  if (scan === null) return null;
+  const { closing } = scan;
+  if (!hasValidPnpmScalarSuffix(text, closing + 1)) return null;
+  return parsePnpmFlowValues(text, scan);
+}
+
+type PnpmWorkspaceLine =
+  | { kind: "ignore" }
+  | { kind: "item"; value: string }
+  | { kind: "end" }
+  | { kind: "invalid" }
+  | { kind: "duplicate" };
+
+interface PnpmWorkspaceDeclaration {
+  rest: string;
+  body: string[];
+}
+
+function isPnpmIgnoredWorkspaceLine(line: string): boolean {
+  return line.trim().length === 0 || line.trimStart().startsWith("#");
+}
+
+function classifyPnpmWorkspaceBoundary(line: string): PnpmWorkspaceLine {
+  return /^\s/u.test(line) ? { kind: "invalid" } : { kind: "end" };
+}
+
+function classifyPnpmWorkspaceLine(line: string): PnpmWorkspaceLine {
+  if (line.startsWith("packages:")) return { kind: "duplicate" };
+  const trimmed = line.trimStart();
+  if (isPnpmIgnoredWorkspaceLine(line)) return { kind: "ignore" };
+  if (trimmed.startsWith("- ")) return { kind: "item", value: trimmed.slice(2) };
+  return classifyPnpmWorkspaceBoundary(line);
+}
+
+function nonIgnoredPnpmWorkspaceLines(lines: string[]): PnpmWorkspaceLine[] {
+  return lines.flatMap((rawLine) => {
+    const line = classifyPnpmWorkspaceLine(rawLine.trimEnd());
+    return line.kind === "ignore" ? [] : [line];
+  });
+}
+
+function findPnpmWorkspaceDeclaration(lines: string[]): PnpmWorkspaceDeclaration | null {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trimEnd();
+    if (line.startsWith("packages:")) {
+      return { rest: line.slice("packages:".length).trim(), body: lines.slice(index + 1) };
+    }
+  }
+  return null;
+}
+
+function parsePnpmWorkspaceDeclaration(rest: string): string[] | null {
+  if (rest.length === 0 || rest.startsWith("#")) return [];
+  return parsePnpmFlowList(rest);
+}
+
+function parsePnpmWorkspaceItemPattern(line: PnpmWorkspaceLine): string | null {
+  return line.kind === "item" ? parsePnpmPattern(line.value) : null;
+}
+
+function parsePnpmWorkspaceItems(lines: string[]): string[] | null {
+  const patterns: string[] = [];
+  for (const line of nonIgnoredPnpmWorkspaceLines(lines)) {
+    if (line.kind === "end") break;
+    const pattern = parsePnpmWorkspaceItemPattern(line);
+    if (pattern === null) return null;
+    patterns.push(pattern);
+  }
+  return patterns;
+}
+
+/** Read the static `packages` list in a pnpm workspace declaration. */
+function parsePnpmWorkspacePatterns(source: string): string[] {
+  const declaration = findPnpmWorkspaceDeclaration(source.split(/\r?\n/u));
+  if (declaration === null) return [];
+  const inline = parsePnpmWorkspaceDeclaration(declaration.rest);
+  if (inline === null) return [];
+  const items = parsePnpmWorkspaceItems(declaration.body);
+  if (items === null) return [];
+  return [...inline, ...items];
+}
+
 function workspacePatterns(manifest: Record<string, unknown> | null, pnpmSource: string | null): string[] {
   const result: string[] = [];
   // pnpm treats pnpm-workspace.yaml as the workspace declaration for that
@@ -304,16 +554,7 @@ function workspacePatterns(manifest: Record<string, unknown> | null, pnpmSource:
       if (Array.isArray(packages)) result.push(...packages.filter((item): item is string => typeof item === "string"));
     }
   } else {
-    let inPackages = false;
-    for (const line of pnpmSource.split(/\r?\n/u)) {
-      if (/^packages\s*:/u.test(line)) {
-        inPackages = true;
-        continue;
-      }
-      if (inPackages && /^\S/u.test(line) && line.trim() !== "") break;
-      const match = inPackages ? line.match(/^\s*-\s*['"]?([^'"#]+?)['"]?\s*$/u) : null;
-      if (match?.[1]) result.push(match[1].trim());
-    }
+    result.push(...parsePnpmWorkspacePatterns(pnpmSource));
   }
   const expanded = result.flatMap((value) => {
     const match = value.match(/^(.*?)\{([^{}]+)\}(.*)$/u);

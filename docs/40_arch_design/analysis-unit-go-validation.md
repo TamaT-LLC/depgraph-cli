@@ -49,6 +49,12 @@ reuse serialized compiler objects. A worker killed before the typed stream is
 validated cannot produce a typed checkpoint; an SSA failure leaves a typed
 checkpoint eligible while keeping semantic reuse disabled.
 
+Typed loading and SSA retain the full declared compiler context and remain
+subject to the configured worker memory budget. A context that exceeds that
+budget leaves its unit incomplete, while earlier validated units remain
+reusable. Syntax source-batch size controls syntax work; the typed/SSA memory
+requirement follows the complete dependency context.
+
 Run the focused check with:
 
 ```text

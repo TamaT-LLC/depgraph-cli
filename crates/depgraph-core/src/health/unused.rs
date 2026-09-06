@@ -86,6 +86,11 @@ fn analyze_subject(
             detail: "one or more analysis units or dependency ranges were not analysed".to_owned(),
         });
     }
+    let is_go_subject = node
+        .properties
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        == Some("go");
     let applicable = applicable_profiles(index, node, budget, is_cancelled)?;
     if applicable.is_empty() {
         let detail = node
@@ -104,24 +109,33 @@ fn analyze_subject(
     for profile in &applicable {
         budget.step(is_cancelled)?;
         if !index.profiles_by_id.contains_key(profile.as_str()) {
-            blockers.push(FindingBlocker {
-                kind: BlockerKind::ProfileNotAnalyzed,
-                detail: format!("profile {profile} is applicable but missing from the snapshot"),
-            });
+            let missing_profiles = if is_go_subject {
+                go_profile_group_members(&index.go_condition_group_members, profile.as_str())
+            } else {
+                vec![profile.as_str()]
+            };
+            for missing_profile in missing_profiles {
+                budget.step(is_cancelled)?;
+                blockers.push(FindingBlocker {
+                    kind: BlockerKind::ProfileNotAnalyzed,
+                    detail: format!(
+                        "profile {missing_profile} is applicable but missing from the snapshot"
+                    ),
+                });
+            }
         }
     }
     let mut usage_profiles = BTreeSet::new();
     for edge in &usage {
         budget.step(is_cancelled)?;
-        usage_profiles.insert(edge.profile_id.as_str());
+        let profile_id = if is_go_subject {
+            go_profile_representative(&index.go_profile_representatives, edge.profile_id.as_str())
+        } else {
+            edge.profile_id.as_str()
+        };
+        usage_profiles.insert(profile_id);
     }
-    if kind == FindingKind::UnusedFile
-        && node
-            .properties
-            .get("language")
-            .and_then(serde_json::Value::as_str)
-            == Some("go")
-    {
+    if kind == FindingKind::UnusedFile && is_go_subject {
         // The Go worker's import edge targets the package/module node, not an
         // arbitrary source file.  An exact package import therefore accounts
         // for every source file in that package for the matching profile.
@@ -174,20 +188,40 @@ fn analyze_subject(
             detail: "incoming usage exists in a non-applicable profile only".to_owned(),
         });
     }
-    let profiles_complete = profiles_satisfy(
-        index,
-        &applicable,
-        profile_is_semantically_complete,
-        budget,
-        is_cancelled,
-    )?;
-    let profiles_have_minimum_coverage = profiles_satisfy(
-        index,
-        &applicable,
-        profile_has_syntax_coverage,
-        budget,
-        is_cancelled,
-    )?;
+    let profiles_complete = if is_go_subject {
+        go_profiles_satisfy(
+            index,
+            &applicable,
+            GoCompletenessKind::Semantic,
+            budget,
+            is_cancelled,
+        )?
+    } else {
+        profiles_satisfy(
+            index,
+            &applicable,
+            profile_is_semantically_complete,
+            budget,
+            is_cancelled,
+        )?
+    };
+    let profiles_have_minimum_coverage = if is_go_subject {
+        go_profiles_satisfy(
+            index,
+            &applicable,
+            GoCompletenessKind::Syntax,
+            budget,
+            is_cancelled,
+        )?
+    } else {
+        profiles_satisfy(
+            index,
+            &applicable,
+            profile_has_syntax_coverage,
+            budget,
+            is_cancelled,
+        )?
+    };
     if !profiles_have_minimum_coverage
         && !blockers
             .iter()
@@ -269,6 +303,15 @@ struct SnapshotIndex<'a> {
     targetless_dynamic: bool,
     coverage_omitted_paths: HashSet<&'a str>,
     profiles_by_id: HashMap<&'a str, &'a depgraph_store::ProfileRecord>,
+    // Go analysis stages often produce distinct profile records with the
+    // same environment and feature axes. Conditions only inspect those axes,
+    // so keep stage IDs for provenance while sharing the expensive condition
+    // evaluation through a deterministic representative profile.
+    go_condition_profile_ids: Vec<&'a str>,
+    go_profile_representatives: HashMap<&'a str, &'a str>,
+    go_condition_group_members: HashMap<&'a str, Vec<&'a str>>,
+    go_group_semantic_complete: HashMap<&'a str, bool>,
+    go_group_syntax_coverage: HashMap<&'a str, bool>,
     profile_ids_by_language: HashMap<String, Vec<&'a str>>,
     fixture_profile_ids: Vec<&'a str>,
     all_profile_ids: Vec<&'a str>,
@@ -283,6 +326,247 @@ struct GoPackageIdentity<'a> {
     package_path: &'a str,
     module_path: Option<&'a str>,
     manifest_path: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct GoConditionKey {
+    // Keep missing profile records distinct from a present profile whose
+    // environment happens to be empty. Missing records must remain unknown.
+    present: bool,
+    environment: String,
+    features: Vec<String>,
+}
+
+fn go_condition_key(profile: Option<&depgraph_store::ProfileRecord>) -> GoConditionKey {
+    let Some(profile) = profile else {
+        return GoConditionKey {
+            present: false,
+            environment: String::new(),
+            features: Vec::new(),
+        };
+    };
+    let mut features = profile.features.clone();
+    features.sort_unstable();
+    features.dedup();
+    GoConditionKey {
+        present: true,
+        environment: depgraph_protocol::canonical_json(&profile.environment),
+        features,
+    }
+}
+
+fn go_profile_group_members<'a>(
+    groups: &HashMap<&'a str, Vec<&'a str>>,
+    representative: &'a str,
+) -> Vec<&'a str> {
+    groups
+        .get(representative)
+        .cloned()
+        .unwrap_or_else(|| vec![representative])
+}
+
+fn go_profile_representative<'a>(
+    representatives: &HashMap<&'a str, &'a str>,
+    profile_id: &'a str,
+) -> &'a str {
+    representatives
+        .get(profile_id)
+        .copied()
+        .unwrap_or(profile_id)
+}
+
+type GoProfilesByGroup<'a> = HashMap<&'a str, HashSet<&'a str>>;
+type GoPackageProfileGroups<'a> = HashMap<GoPackageIdentity<'a>, GoProfilesByGroup<'a>>;
+
+fn group_go_package_profiles<'a>(
+    packages: HashMap<GoPackageIdentity<'a>, HashSet<&'a str>>,
+    representatives: &HashMap<&'a str, &'a str>,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<GoPackageProfileGroups<'a>, HealthAnalysisError> {
+    let mut grouped = HashMap::new();
+    for (package, profiles) in packages {
+        budget.step(is_cancelled)?;
+        let groups = grouped.entry(package).or_insert_with(HashMap::new);
+        for profile_id in profiles {
+            budget.step(is_cancelled)?;
+            let representative = go_profile_representative(representatives, profile_id);
+            groups
+                .entry(representative)
+                .or_insert_with(HashSet::new)
+                .insert(profile_id);
+        }
+    }
+    Ok(grouped)
+}
+
+#[derive(Default)]
+struct GoConditionOverrides<'a> {
+    profiles: HashMap<&'a str, GoConditionState>,
+    true_count: usize,
+    unknown_count: usize,
+}
+
+struct GoFileConditions<'a> {
+    default: GoConditionState,
+    // Only an actual contains edge can change the no-edge default. Keep those
+    // exceptions by condition group without expanding every stage per file.
+    overrides: HashMap<&'a str, GoConditionOverrides<'a>>,
+}
+
+impl<'a> GoFileConditions<'a> {
+    fn build(
+        has_build_constraint: bool,
+        incoming: Option<&[&'a EdgeRecord]>,
+        representatives: &HashMap<&'a str, &'a str>,
+        profiles: &HashMap<&str, &depgraph_store::ProfileRecord>,
+        budget: &mut HealthAnalysisBudget,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self, HealthAnalysisError> {
+        let default = if has_build_constraint {
+            GoConditionState::Unknown
+        } else {
+            GoConditionState::True
+        };
+        let mut states = HashMap::<&str, (Vec<GoConditionState>, bool)>::new();
+        // The cache is local to this file, so its retained size follows actual
+        // incoming evidence. Equivalent stage conditions share evaluation.
+        let mut cache = HashMap::<(&str, String), GoConditionState>::new();
+        for edge in incoming.unwrap_or_default() {
+            budget.step(is_cancelled)?;
+            if edge.kind != "contains" {
+                continue;
+            }
+            let profile_id = edge.profile_id.as_str();
+            let Some(&representative) = representatives.get(profile_id) else {
+                continue;
+            };
+            let key = (
+                representative,
+                depgraph_protocol::canonical_json(&edge.condition),
+            );
+            let state = if let Some(state) = cache.get(&key) {
+                *state
+            } else {
+                let state = go_condition_state(
+                    &edge.condition,
+                    profile_id,
+                    profiles,
+                    budget,
+                    is_cancelled,
+                )?;
+                cache.insert(key, state);
+                state
+            };
+            let (conditions, fallback) = states.entry(profile_id).or_default();
+            conditions.push(state);
+            *fallback |= has_build_constraint && go_condition_is_always(&edge.condition);
+        }
+        let mut overrides = HashMap::<&str, GoConditionOverrides<'a>>::new();
+        for (profile_id, (conditions, fallback)) in states {
+            budget.step(is_cancelled)?;
+            let state = if fallback {
+                GoConditionState::Unknown
+            } else {
+                combine_go_condition_states(conditions)
+            };
+            if state == default {
+                continue;
+            }
+            let group = overrides.entry(representatives[profile_id]).or_default();
+            group.true_count += usize::from(state == GoConditionState::True);
+            group.unknown_count += usize::from(state == GoConditionState::Unknown);
+            group.profiles.insert(profile_id, state);
+        }
+        Ok(Self { default, overrides })
+    }
+
+    fn state(&self, representative: &str, profile_id: &str) -> GoConditionState {
+        self.overrides
+            .get(representative)
+            .and_then(|group| group.profiles.get(profile_id))
+            .copied()
+            .unwrap_or(self.default)
+    }
+
+    fn group_has_state(&self, representative: &str, size: usize, wanted: GoConditionState) -> bool {
+        let group = self.overrides.get(representative);
+        if self.default == wanted {
+            return group.map_or(0, |group| group.profiles.len()) < size;
+        }
+        group.is_some_and(|group| match wanted {
+            GoConditionState::True => group.true_count > 0,
+            GoConditionState::Unknown => group.unknown_count > 0,
+            GoConditionState::False => {
+                group.profiles.len() > group.true_count + group.unknown_count
+            }
+        })
+    }
+
+    fn has_usage(
+        &self,
+        representative: &str,
+        usage: &HashSet<&str>,
+        budget: &mut HealthAnalysisBudget,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, HealthAnalysisError> {
+        if usage.is_empty() {
+            return Ok(false);
+        }
+        let Some(group) = self.overrides.get(representative) else {
+            return Ok(self.default == GoConditionState::True);
+        };
+        if usage.len() < group.profiles.len() {
+            for profile_id in usage {
+                budget.step(is_cancelled)?;
+                if self.state(representative, profile_id) == GoConditionState::True {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let mut exceptional_usage = 0;
+        for (profile_id, state) in &group.profiles {
+            budget.step(is_cancelled)?;
+            if usage.contains(profile_id) {
+                if *state == GoConditionState::True {
+                    return Ok(true);
+                }
+                exceptional_usage += 1;
+            }
+        }
+        Ok(self.default == GoConditionState::True && exceptional_usage < usage.len())
+    }
+
+    fn add_unknown_blockers(
+        &self,
+        representative: &str,
+        members: &[&str],
+        node: &NodeRecord,
+        blockers: &mut Vec<FindingBlocker>,
+        budget: &mut HealthAnalysisBudget,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), HealthAnalysisError> {
+        if !self.group_has_state(representative, members.len(), GoConditionState::Unknown) {
+            return Ok(());
+        }
+        if self.default == GoConditionState::Unknown {
+            for profile_id in members {
+                budget.step(is_cancelled)?;
+                if self.state(representative, profile_id) == GoConditionState::Unknown {
+                    blockers.push(go_incomplete_condition_blocker(node, profile_id));
+                }
+            }
+        } else if let Some(group) = self.overrides.get(representative) {
+            for (profile_id, state) in &group.profiles {
+                budget.step(is_cancelled)?;
+                if *state == GoConditionState::Unknown {
+                    blockers.push(go_incomplete_condition_blocker(node, profile_id));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'a> SnapshotIndex<'a> {
@@ -343,6 +627,45 @@ impl<'a> SnapshotIndex<'a> {
                     }
                 }
             }
+        }
+
+        let mut go_condition_members_by_key = BTreeMap::<GoConditionKey, BTreeSet<&str>>::new();
+        for profile_id in &go_profile_ids {
+            budget.step(is_cancelled)?;
+            let key = go_condition_key(profiles_by_id.get(profile_id).copied());
+            go_condition_members_by_key
+                .entry(key)
+                .or_default()
+                .insert(*profile_id);
+        }
+        let mut go_condition_profile_ids = Vec::new();
+        let mut go_profile_representatives = HashMap::new();
+        let mut go_condition_group_members = HashMap::new();
+        let mut go_group_semantic_complete = HashMap::new();
+        let mut go_group_syntax_coverage = HashMap::new();
+        for members in go_condition_members_by_key.values() {
+            let representative = *members
+                .first()
+                .expect("a Go condition group always has a profile");
+            let members = members.iter().copied().collect::<Vec<_>>();
+            for profile_id in &members {
+                budget.step(is_cancelled)?;
+                go_profile_representatives.insert(*profile_id, representative);
+            }
+            let semantic_complete = members.iter().all(|profile_id| {
+                profiles_by_id
+                    .get(profile_id)
+                    .is_some_and(|profile| profile_is_semantically_complete(profile))
+            });
+            let syntax_coverage = members.iter().all(|profile_id| {
+                profiles_by_id
+                    .get(profile_id)
+                    .is_some_and(|profile| profile_has_syntax_coverage(profile))
+            });
+            go_condition_profile_ids.push(representative);
+            go_group_semantic_complete.insert(representative, semantic_complete);
+            go_group_syntax_coverage.insert(representative, syntax_coverage);
+            go_condition_group_members.insert(representative, members);
         }
 
         let mut go_package_identity_by_id = HashMap::<&str, GoPackageIdentity<'a>>::new();
@@ -446,15 +769,44 @@ impl<'a> SnapshotIndex<'a> {
                     .insert(site.profile_id.as_str());
             }
         }
+        let go_package_usage_profiles = group_go_package_profiles(
+            go_package_usage_profiles,
+            &go_profile_representatives,
+            budget,
+            is_cancelled,
+        )?;
+        let go_package_uncertain_profiles = group_go_package_profiles(
+            go_package_uncertain_profiles,
+            &go_profile_representatives,
+            budget,
+            is_cancelled,
+        )?;
+        let go_package_candidate_profiles = group_go_package_profiles(
+            go_package_candidate_profiles,
+            &go_profile_representatives,
+            budget,
+            is_cancelled,
+        )?;
+        // Ambiguous file ownership needs the union of candidate evidence from
+        // every package scope with that path, preserving each stage identity.
+        let mut candidates_by_path = HashMap::<&str, GoProfilesByGroup<'a>>::new();
+        for (scope, groups) in &go_package_candidate_profiles {
+            budget.step(is_cancelled)?;
+            let path_groups = candidates_by_path.entry(scope.package_path).or_default();
+            for (representative, profiles) in groups {
+                budget.step(is_cancelled)?;
+                let members = path_groups.entry(*representative).or_default();
+                for profile_id in profiles {
+                    budget.step(is_cancelled)?;
+                    members.insert(*profile_id);
+                }
+            }
+        }
+
         let mut go_file_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
         let mut go_file_blockers = HashMap::<&str, Vec<FindingBlocker>>::new();
         let mut go_file_active_profiles = HashMap::<&str, HashSet<&str>>::new();
-        let mut go_file_unknown_profiles = HashMap::<&str, HashSet<&str>>::new();
         let mut go_main_file_ids = HashSet::<&str>::new();
-
-        // First evaluate the worker's structured contains conditions once for
-        // every Go file/profile pair. The result is also used below when
-        // package-level import evidence is projected onto source files.
         for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
             if node.kind != "file"
@@ -467,171 +819,143 @@ impl<'a> SnapshotIndex<'a> {
                 continue;
             }
             let node_id = node.id.as_str();
-            let mut active_profiles = HashSet::new();
-            let mut unknown_profiles = HashSet::new();
-            for profile_id in &go_profile_ids {
-                budget.step(is_cancelled)?;
-                match go_file_condition_state(
-                    node,
-                    profile_id,
-                    incoming.get(node_id),
-                    &profiles_by_id,
-                    budget,
-                    is_cancelled,
-                )? {
-                    GoConditionState::True => {
-                        active_profiles.insert(*profile_id);
-                    }
-                    GoConditionState::False => {}
-                    GoConditionState::Unknown => {
-                        unknown_profiles.insert(*profile_id);
-                        go_file_blockers
-                            .entry(node_id)
-                            .or_default()
-                            .push(go_incomplete_condition_blocker(node, profile_id));
-                    }
-                }
-            }
             let has_build_constraint = node
                 .properties
                 .get("build_constraint")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|constraint| !constraint.trim().is_empty());
-            if has_build_constraint && active_profiles.is_empty() && unknown_profiles.is_empty() {
-                go_file_blockers
-                    .entry(node_id)
-                    .or_default()
-                    .push(go_inactive_condition_blocker(node));
+            let conditions = GoFileConditions::build(
+                has_build_constraint,
+                incoming.get(node_id).map(Vec::as_slice),
+                &go_profile_representatives,
+                &profiles_by_id,
+                budget,
+                is_cancelled,
+            )?;
+            let blockers = go_file_blockers.entry(node_id).or_default();
+            let mut eligible_groups = Vec::new();
+            let mut active_groups = HashSet::new();
+            for representative in &go_condition_profile_ids {
+                budget.step(is_cancelled)?;
+                let members = &go_condition_group_members[representative];
+                let active = conditions.group_has_state(
+                    representative,
+                    members.len(),
+                    GoConditionState::True,
+                );
+                let unknown = conditions.group_has_state(
+                    representative,
+                    members.len(),
+                    GoConditionState::Unknown,
+                );
+                if active {
+                    active_groups.insert(*representative);
+                }
+                if active || unknown {
+                    eligible_groups.push(*representative);
+                }
+                conditions.add_unknown_blockers(
+                    representative,
+                    members,
+                    node,
+                    blockers,
+                    budget,
+                    is_cancelled,
+                )?;
             }
-            if !active_profiles.is_empty() {
-                go_file_active_profiles.insert(node_id, active_profiles);
+            if has_build_constraint && eligible_groups.is_empty() {
+                blockers.push(go_inactive_condition_blocker(node));
             }
-            if !unknown_profiles.is_empty() {
-                go_file_unknown_profiles.insert(node_id, unknown_profiles);
+            if !active_groups.is_empty() {
+                go_file_active_profiles.insert(node_id, active_groups);
             }
-        }
 
-        // Package imports point at a package node. Project exact, uncertain,
-        // and candidate package evidence onto each production file only when
-        // that file is active in the same profile.
-        for node in &snapshot.nodes {
-            budget.step(is_cancelled)?;
-            if node.kind != "file"
-                || node
-                    .properties
-                    .get("language")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("go")
-                || node
-                    .properties
-                    .get("test")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
+            if node
+                .properties
+                .get("test")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
             {
                 continue;
             }
-            let Some(package_path) = node
-                .properties
-                .get("package_path")
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
             let Some(file_identity) = go_package_identity(node) else {
                 continue;
             };
-            let active_profiles = go_file_active_profiles.get(node.id.as_str());
-            let unknown_profiles = go_file_unknown_profiles.get(node.id.as_str());
-            let mut file_profiles = BTreeSet::new();
-            if let Some(profiles) = active_profiles {
-                for profile_id in profiles {
-                    budget.step(is_cancelled)?;
-                    file_profiles.insert(*profile_id);
-                }
-            }
-            if let Some(profiles) = unknown_profiles {
-                for profile_id in profiles {
-                    budget.step(is_cancelled)?;
-                    file_profiles.insert(*profile_id);
-                }
-            }
-            let Some(scopes) = go_package_scopes_by_path.get(package_path) else {
-                for profile_id in file_profiles {
-                    budget.step(is_cancelled)?;
-                    go_file_blockers.entry(node.id.as_str()).or_default().push(
-                        go_unresolved_package_scope_blocker(package_path, profile_id),
-                    );
-                }
-                continue;
-            };
+            let package_path = file_identity.package_path;
             let mut matching_scopes = Vec::new();
-            for scope in scopes {
-                budget.step(is_cancelled)?;
-                if go_package_scope_matches(file_identity, *scope) {
-                    matching_scopes.push(*scope);
+            if let Some(scopes) = go_package_scopes_by_path.get(package_path) {
+                for scope in scopes {
+                    budget.step(is_cancelled)?;
+                    if go_package_scope_matches(file_identity, *scope) {
+                        matching_scopes.push(*scope);
+                    }
                 }
             }
             if matching_scopes.len() != 1 {
-                // A file that cannot be assigned to exactly one package scope
-                // must not inherit a sibling module's usage. Preserve the
-                // uncertainty for both zero and multiple matching scopes: a
-                // stale file identity can otherwise turn package usage into a
-                // Confirmed unused-file result.
-                for profile_id in file_profiles {
+                // Materialize stage IDs only when their unresolved scope is
+                // part of the finding. Inactive stages cannot supply a blocker.
+                for representative in eligible_groups {
                     budget.step(is_cancelled)?;
-                    go_file_blockers.entry(node.id.as_str()).or_default().push(
-                        go_unresolved_package_scope_blocker(package_path, profile_id),
-                    );
-                    let mut has_candidate = false;
-                    for scope in scopes {
+                    let candidates = candidates_by_path
+                        .get(package_path)
+                        .and_then(|groups| groups.get(representative));
+                    for profile_id in &go_condition_group_members[representative] {
                         budget.step(is_cancelled)?;
-                        if go_package_candidate_profiles
-                            .get(scope)
-                            .is_some_and(|profiles| profiles.contains(profile_id))
-                        {
-                            has_candidate = true;
-                            break;
+                        if conditions.state(representative, profile_id) == GoConditionState::False {
+                            continue;
                         }
-                    }
-                    if has_candidate {
-                        go_file_blockers
-                            .entry(node.id.as_str())
-                            .or_default()
-                            .push(go_candidate_package_blocker(package_path, profile_id));
+                        blockers.push(go_unresolved_package_scope_blocker(
+                            package_path,
+                            profile_id,
+                        ));
+                        if candidates.is_some_and(|profiles| profiles.contains(profile_id)) {
+                            budget.step(is_cancelled)?;
+                            blockers.push(go_candidate_package_blocker(package_path, profile_id));
+                        }
                     }
                 }
                 continue;
             }
             let scope = matching_scopes[0];
             if go_main_package_scopes.contains(&scope) {
-                go_main_file_ids.insert(node.id.as_str());
+                go_main_file_ids.insert(node_id);
             }
-            let package_profiles = go_package_usage_profiles.get(&scope);
-            if let Some(active_profiles) = active_profiles {
-                for profile_id in active_profiles {
-                    budget.step(is_cancelled)?;
-                    if package_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
-                        go_file_usage_profiles
-                            .entry(node.id.as_str())
-                            .or_default()
-                            .insert(*profile_id);
+            for representative in eligible_groups {
+                budget.step(is_cancelled)?;
+                if let Some(usage) = go_package_usage_profiles
+                    .get(&scope)
+                    .and_then(|groups| groups.get(representative))
+                    && conditions.has_usage(representative, usage, budget, is_cancelled)?
+                {
+                    go_file_usage_profiles
+                        .entry(node_id)
+                        .or_default()
+                        .insert(representative);
+                }
+                if let Some(uncertain) = go_package_uncertain_profiles
+                    .get(&scope)
+                    .and_then(|groups| groups.get(representative))
+                {
+                    for profile_id in uncertain {
+                        budget.step(is_cancelled)?;
+                        if conditions.state(representative, profile_id) != GoConditionState::False {
+                            blockers.push(go_incomplete_package_usage_blocker(
+                                package_path,
+                                profile_id,
+                            ));
+                        }
                     }
                 }
-            }
-            let uncertain_profiles = go_package_uncertain_profiles.get(&scope);
-            let candidate_profiles = go_package_candidate_profiles.get(&scope);
-            for profile_id in file_profiles {
-                budget.step(is_cancelled)?;
-                if uncertain_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
-                    go_file_blockers.entry(node.id.as_str()).or_default().push(
-                        go_incomplete_package_usage_blocker(package_path, profile_id),
-                    );
-                }
-                if candidate_profiles.is_some_and(|profiles| profiles.contains(profile_id)) {
-                    go_file_blockers
-                        .entry(node.id.as_str())
-                        .or_default()
-                        .push(go_candidate_package_blocker(package_path, profile_id));
+                if let Some(candidates) = go_package_candidate_profiles
+                    .get(&scope)
+                    .and_then(|groups| groups.get(representative))
+                {
+                    for profile_id in candidates {
+                        budget.step(is_cancelled)?;
+                        if conditions.state(representative, profile_id) != GoConditionState::False {
+                            blockers.push(go_candidate_package_blocker(package_path, profile_id));
+                        }
+                    }
                 }
             }
         }
@@ -694,6 +1018,11 @@ impl<'a> SnapshotIndex<'a> {
             targetless_dynamic,
             coverage_omitted_paths,
             profiles_by_id,
+            go_condition_profile_ids,
+            go_profile_representatives,
+            go_condition_group_members,
+            go_group_semantic_complete,
+            go_group_syntax_coverage,
             profile_ids_by_language,
             fixture_profile_ids,
             all_profile_ids,
@@ -801,6 +1130,7 @@ fn go_condition_state(
     evaluate_go_condition(&condition, profile, 0, budget, is_cancelled)
 }
 
+#[cfg(test)]
 fn go_file_condition_state(
     node: &NodeRecord,
     profile_id: &str,
@@ -1265,27 +1595,49 @@ fn applicable_profiles(
     let mut profiles = BTreeSet::new();
     if let Some(profile_id) = explicit_profile {
         budget.step(is_cancelled)?;
+        let profile_id = if language == Some("go") {
+            go_profile_representative(&index.go_profile_representatives, profile_id)
+        } else {
+            profile_id
+        };
         profiles.insert(profile_id.to_owned());
     }
     if let Some(language) = language {
         let language = health_language_family(language);
-        for profile_id in index
-            .profile_ids_by_language
-            .get(language)
-            .into_iter()
-            .flatten()
-            .chain(&index.fixture_profile_ids)
-            .chain(
-                index
-                    .matrix_profile_ids_by_language
-                    .get(language)
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(&index.fixture_matrix_profile_ids)
-        {
-            budget.step(is_cancelled)?;
-            profiles.insert((*profile_id).to_owned());
+        if language == "go" {
+            for profile_id in &index.go_condition_profile_ids {
+                budget.step(is_cancelled)?;
+                profiles.insert((*profile_id).to_owned());
+            }
+            // Fixture profiles are intentionally cross-language and remain
+            // applicable to Go subjects, as in the pre-grouped analysis.
+            for profile_id in index
+                .fixture_profile_ids
+                .iter()
+                .chain(&index.fixture_matrix_profile_ids)
+            {
+                budget.step(is_cancelled)?;
+                profiles.insert((*profile_id).to_owned());
+            }
+        } else {
+            for profile_id in index
+                .profile_ids_by_language
+                .get(language)
+                .into_iter()
+                .flatten()
+                .chain(&index.fixture_profile_ids)
+                .chain(
+                    index
+                        .matrix_profile_ids_by_language
+                        .get(language)
+                        .into_iter()
+                        .flatten(),
+                )
+                .chain(&index.fixture_matrix_profile_ids)
+            {
+                budget.step(is_cancelled)?;
+                profiles.insert((*profile_id).to_owned());
+            }
         }
     } else {
         for profile_id in index
@@ -1318,6 +1670,48 @@ fn profiles_satisfy(
         budget.step(is_cancelled)?;
         let matching = index.profiles_by_id.get(profile_id.as_str()).copied();
         if !matching.is_some_and(predicate) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+enum GoCompletenessKind {
+    Semantic,
+    Syntax,
+}
+
+fn go_profiles_satisfy(
+    index: &SnapshotIndex<'_>,
+    applicable: &BTreeSet<String>,
+    kind: GoCompletenessKind,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, HealthAnalysisError> {
+    for profile_id in applicable {
+        budget.step(is_cancelled)?;
+        let matching = match kind {
+            GoCompletenessKind::Semantic => index
+                .go_group_semantic_complete
+                .get(profile_id.as_str())
+                .copied(),
+            GoCompletenessKind::Syntax => index
+                .go_group_syntax_coverage
+                .get(profile_id.as_str())
+                .copied(),
+        }
+        .or_else(|| {
+            index
+                .profiles_by_id
+                .get(profile_id.as_str())
+                .map(|profile| match kind {
+                    GoCompletenessKind::Semantic => profile_is_semantically_complete(profile),
+                    GoCompletenessKind::Syntax => profile_has_syntax_coverage(profile),
+                })
+        })
+        .unwrap_or(false);
+        if !matching {
             return Ok(false);
         }
     }
@@ -2554,6 +2948,100 @@ mod tests {
     }
 
     #[test]
+    fn issue_467_same_go_condition_axes_share_budget_without_changing_finding() {
+        let mut staged_profiles = Vec::new();
+        for stage in ["syntax", "typed", "semantic"] {
+            let mut staged = profile(&format!("go:{stage}"), "go", true);
+            staged.environment = json!({
+                "GOOS": "linux",
+                "GOARCH": "amd64",
+                "CGO_ENABLED": "0",
+                "GO_TAGS": ""
+            });
+            staged.properties = json!({"analysis_stage": stage});
+            staged_profiles.push(staged);
+        }
+        let graph = snapshot(
+            staged_profiles,
+            vec![node("go:unused", "file", "go", "pkg/unused.go", json!({}))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        // This ceiling is deliberately below the old profile fanout while
+        // leaving enough room for the single condition-group evaluation and
+        // the ordinary finding construction. It exercises the same bounded
+        // path used by the service health request.
+        let findings = analyze_unused_cancellable(&graph, usize::MAX, 120, || false)
+            .expect("equivalent Go stage profiles should share condition work");
+        let finding = findings
+            .iter()
+            .find(|finding| finding.subject_id == "go:unused")
+            .expect("unused Go file");
+        assert_eq!(finding.confidence, Confidence::Confirmed);
+        assert!(finding.blockers.is_empty());
+    }
+
+    #[test]
+    fn issue_467_go_condition_groups_keep_distinct_environment_axes() {
+        let mut linux = profile("go:linux", "go", true);
+        linux.environment = json!({"GOOS": "linux", "GOARCH": "amd64"});
+        let mut windows = profile("go:windows", "go", true);
+        windows.environment = json!({"GOOS": "windows", "GOARCH": "amd64"});
+        let mut build_edge = edge(
+            "edge:linux-condition",
+            "go:unit",
+            "go:file",
+            "contains",
+            "go:linux",
+        );
+        build_edge.condition = json!({"op":"eq","key":"GOOS","value":"linux"});
+        let mut windows_edge = build_edge.clone();
+        windows_edge.id = "edge:windows-condition".to_owned();
+        windows_edge.profile_id = "go:windows".to_owned();
+        windows_edge.condition = json!({"op":"eq","key":"GOOS","value":"windows"});
+        let graph = snapshot(
+            vec![linux, windows],
+            vec![node("go:file", "file", "go", "pkg/file.go", json!({}))],
+            vec![build_edge, windows_edge],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        let mut budget = HealthAnalysisBudget::new(usize::MAX);
+        let mut cancelled = || false;
+        let index = SnapshotIndex::build(&graph, &mut budget, &mut cancelled)
+            .expect("synthetic Go snapshot indexes");
+        assert_eq!(index.go_condition_profile_ids.len(), 2);
+        let incoming = index
+            .incoming
+            .get("go:file")
+            .expect("contains edges indexed");
+        let linux_state = go_file_condition_state(
+            &graph.nodes[0],
+            "go:linux",
+            Some(incoming),
+            &index.profiles_by_id,
+            &mut budget,
+            &mut cancelled,
+        )
+        .expect("linux condition evaluates");
+        let windows_state = go_file_condition_state(
+            &graph.nodes[0],
+            "go:windows",
+            Some(incoming),
+            &index.profiles_by_id,
+            &mut budget,
+            &mut cancelled,
+        )
+        .expect("windows condition evaluates");
+        assert_eq!(linux_state, GoConditionState::True);
+        assert_eq!(windows_state, GoConditionState::True);
+    }
+
+    #[test]
     fn issue_423_targetless_unresolved_sites_block_confirmation_and_internal_symbols_are_skipped() {
         let graph = snapshot(
             vec![profile("rust:lib", "rust", true)],
@@ -2728,5 +3216,347 @@ mod tests {
             kinds.contains(&BlockerKind::Candidate) || kinds.contains(&BlockerKind::Unresolved)
         );
         assert!(kinds.contains(&BlockerKind::CoverageOmission));
+    }
+
+    #[test]
+    fn issue_467_stage_condition_mismatch_does_not_project_inactive_package_usage() {
+        let mut first = profile("go:a", "go", true);
+        first.environment = json!({"GOOS": "linux", "GOARCH": "amd64"});
+        let mut second = profile("go:b", "go", true);
+        second.environment = first.environment.clone();
+
+        let mut first_contains = edge("edge:contains-a", "go:unit", "go:file", "contains", "go:a");
+        first_contains.condition = json!({"op":"eq","key":"GOOS","value":"linux"});
+        let mut second_contains = edge("edge:contains-b", "go:unit", "go:file", "contains", "go:b");
+        second_contains.condition = json!({"op":"eq","key":"GOOS","value":"windows"});
+
+        // The package import exists only for b. Since the file is inactive in b,
+        // this must not be projected onto the active a stage.
+        let package_import = edge(
+            "edge:package-import-b",
+            "go:caller",
+            "go:package",
+            "imports",
+            "go:b",
+        );
+        let graph = snapshot(
+            vec![first, second],
+            vec![
+                node(
+                    "go:caller",
+                    "file",
+                    "go",
+                    "cmd/main.go",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/app/cmd",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:package",
+                    "module",
+                    "go",
+                    "pkg",
+                    json!({
+                        "package_path": "example.com/app/pkg",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod"
+                    }),
+                ),
+                node(
+                    "go:file",
+                    "file",
+                    "go",
+                    "pkg/linux.go",
+                    json!({
+                        "package_path": "example.com/app/pkg",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod",
+                        "test": false
+                    }),
+                ),
+            ],
+            vec![first_contains, second_contains, package_import],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:file")
+            .expect("the file is unused in its only active stage");
+        assert_eq!(finding.confidence, Confidence::Confirmed);
+        assert!(finding.blockers.is_empty());
+    }
+
+    #[test]
+    fn issue_467_missing_stage_contains_is_unknown_only_for_that_stage() {
+        let mut first = profile("go:a", "go", true);
+        first.environment = json!({"GOOS": "linux", "GOARCH": "amd64"});
+        let mut second = profile("go:b", "go", true);
+        second.environment = first.environment.clone();
+
+        let mut first_contains = edge(
+            "edge:contains-a-only",
+            "go:unit",
+            "go:file",
+            "contains",
+            "go:a",
+        );
+        first_contains.condition = json!({"op":"eq","key":"GOOS","value":"linux"});
+        let graph = snapshot(
+            vec![first, second],
+            vec![node(
+                "go:file",
+                "file",
+                "go",
+                "pkg/linux.go",
+                json!({"build_constraint": "linux-only"}),
+            )],
+            vec![first_contains],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:file")
+            .expect("unused file remains visible");
+        let condition_blockers = finding
+            .blockers
+            .iter()
+            .filter(|blocker| {
+                blocker.kind == BlockerKind::IncompleteCoverage
+                    && blocker.detail.contains("Go build condition")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(condition_blockers.len(), 1);
+        assert!(condition_blockers[0].detail.contains("profile go:b"));
+        assert!(!condition_blockers[0].detail.contains("profile go:a"));
+    }
+
+    #[test]
+    fn issue_467_ambiguous_scope_candidate_keeps_nonrepresentative_stage_provenance() {
+        let mut first = profile("go:a", "go", true);
+        first.environment = json!({"GOOS": "linux", "GOARCH": "amd64"});
+        let mut second = profile("go:b", "go", true);
+        second.environment = first.environment.clone();
+
+        let mut candidate = edge(
+            "edge:candidate-b",
+            "go:caller",
+            "go:package-first",
+            "imports",
+            "go:b",
+        );
+        candidate.resolution_status = "candidates".to_owned();
+        let graph = snapshot(
+            vec![first, second],
+            vec![
+                node(
+                    "go:caller",
+                    "file",
+                    "go",
+                    "cmd/main.go",
+                    json!({
+                        "package_name": "main",
+                        "package_path": "example.com/app/cmd",
+                        "module_path": "example.com/app",
+                        "manifest_path": "go.mod",
+                        "test": false
+                    }),
+                ),
+                node(
+                    "go:package-first",
+                    "module",
+                    "go",
+                    "pkg-first",
+                    json!({
+                        "package_path": "example.com/app/shared",
+                        "module_path": "example.com/first",
+                        "manifest_path": "first/go.mod"
+                    }),
+                ),
+                node(
+                    "go:package-second",
+                    "module",
+                    "go",
+                    "pkg-second",
+                    json!({
+                        "package_path": "example.com/app/shared",
+                        "module_path": "example.com/second",
+                        "manifest_path": "second/go.mod"
+                    }),
+                ),
+                node(
+                    "go:stale-file",
+                    "file",
+                    "go",
+                    "pkg/stale.go",
+                    json!({
+                        "package_path": "example.com/app/shared",
+                        "module_path": "example.com/stale",
+                        "manifest_path": "stale/go.mod",
+                        "test": false
+                    }),
+                ),
+            ],
+            vec![candidate],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:stale-file")
+            .expect("ambiguous package scope remains visible");
+        assert!(finding.blockers.iter().any(|blocker| {
+            blocker.kind == BlockerKind::Candidate && blocker.detail.contains("profile go:b")
+        }));
+        assert!(finding.blockers.iter().all(|blocker| {
+            blocker.kind != BlockerKind::Candidate || !blocker.detail.contains("profile go:a")
+        }));
+    }
+
+    #[test]
+    fn issue_467_missing_profile_records_keep_distinct_contains_provenance() {
+        let mut matrix = ProfileMatrixRecord::default();
+        matrix
+            .entries
+            .push(depgraph_store::ProfileMatrixEntryRecord {
+                id: "entry:missing-go".to_owned(),
+                effective_input_id: "entry:missing-go".to_owned(),
+                language: "go".to_owned(),
+                profile_ids: vec!["go:missing-a".to_owned(), "go:missing-b".to_owned()],
+                parent_profile_ids: Vec::new(),
+                phases: vec!["syntax".to_owned()],
+                condition_union: json!({}),
+                phase_coverage: BTreeMap::new(),
+                selection_reasons: Vec::new(),
+                axis_conflicts: Vec::new(),
+            });
+        let graph = snapshot(
+            Vec::new(),
+            vec![node("go:file", "file", "go", "pkg/file.go", json!({}))],
+            vec![edge(
+                "edge:missing-a-contains",
+                "go:unit",
+                "go:file",
+                "contains",
+                "go:missing-a",
+            )],
+            Vec::new(),
+            Vec::new(),
+            matrix,
+        );
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:file")
+            .expect("missing profile proof must leave the unused candidate visible");
+        assert_ne!(finding.confidence, Confidence::Confirmed);
+        for profile_id in ["go:missing-a", "go:missing-b"] {
+            assert!(finding.blockers.iter().any(|blocker| {
+                blocker.kind == BlockerKind::ProfileNotAnalyzed
+                    && blocker.detail.contains(profile_id)
+            }));
+        }
+        let condition_blockers = finding
+            .blockers
+            .iter()
+            .filter(|blocker| {
+                blocker.kind == BlockerKind::IncompleteCoverage
+                    && blocker.detail.contains("Go build condition")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(condition_blockers.len(), 1);
+        assert!(
+            condition_blockers[0]
+                .detail
+                .contains("profile go:missing-a")
+        );
+        assert!(
+            !condition_blockers[0]
+                .detail
+                .contains("profile go:missing-b")
+        );
+    }
+    #[test]
+    fn issue_467_many_stage_imports_share_package_projection_work() {
+        let mut profiles = Vec::new();
+        let mut imports = Vec::new();
+        for index in 0..64 {
+            let id = format!("go:stage-{index:02}");
+            let mut stage = profile(&id, "go", true);
+            stage.environment = json!({"GOOS":"linux", "GOARCH":"amd64"});
+            profiles.push(stage);
+            imports.push(edge(
+                &format!("edge:import-{index}"),
+                "go:caller",
+                "go:package",
+                "imports",
+                &id,
+            ));
+        }
+        let identity = json!({
+            "package_path":"example.test/shared", "module_path":"example.test/shared",
+            "manifest_path":"go.mod", "test":false
+        });
+        let mut nodes = vec![
+            node("go:package", "module", "go", "pkg", identity.clone()),
+            node("go:caller", "module", "go", "cmd", json!({})),
+        ];
+        for index in 0..128 {
+            nodes.push(node(
+                &format!("go:file-{index}"),
+                "file",
+                "go",
+                &format!("pkg/file{index}.go"),
+                identity.clone(),
+            ));
+        }
+        let graph = snapshot(
+            profiles,
+            nodes,
+            imports,
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        // The former file/profile traversal alone required 8,192 work steps.
+        // Exact package usage now shares its group index across all 128 files.
+        let findings = analyze_unused_cancellable(&graph, 128, 4_000, || false)
+            .expect("equivalent stage imports must fit the bounded shared-work path");
+        assert!(
+            findings.is_empty(),
+            "each production file is used by the package imports"
+        );
+    }
+
+    #[test]
+    fn issue_467_condition_group_keeps_incomplete_stage_confidence() {
+        let mut semantic = profile("go:semantic", "go", true);
+        semantic.environment = json!({"GOOS":"linux", "GOARCH":"amd64"});
+        let mut typed = profile("go:typed", "go", false);
+        typed.environment = semantic.environment.clone();
+        let graph = snapshot(
+            vec![semantic, typed],
+            vec![node("go:unused", "file", "go", "pkg/unused.go", json!({}))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        let finding = analyze_unused(&graph)
+            .into_iter()
+            .find(|finding| finding.subject_id == "go:unused")
+            .expect("unused file remains visible");
+        assert_eq!(finding.confidence, Confidence::Probable);
+        assert!(finding.blockers.is_empty());
     }
 }

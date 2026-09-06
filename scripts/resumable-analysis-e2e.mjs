@@ -53,18 +53,31 @@ function scan(store) {
   assert.ok(output.analysis.units.every((unit) => unit.status === "completed"));
   return { output, duration_ms: Math.round(performance.now() - start) };
 }
-function graph(store) {
-  const exported = run(store, ["export", "--format", "json"]);
+function stageSummary(outcome) {
+  const stages = new Map();
+  for (const unit of outcome.analysis.units) {
+    const key = `${unit.adapter}:${unit.stage}`;
+    const stage = stages.get(key) ?? { units: 0, completed: 0, reused: 0, worker_duration_ms: 0 };
+    stage.units += 1;
+    stage.completed += Number(unit.status === "completed");
+    stage.reused += Number(unit.reused);
+    stage.worker_duration_ms += unit.duration_ms;
+    stages.set(key, stage);
+  }
+  return Object.fromEntries([...stages].sort(([left], [right]) => left.localeCompare(right)));
+}
+function graph(store, attemptId) {
+  const exported = run(store, ["export", "--format", "json", ...(attemptId ? ["--scan-id", `attempt:${attemptId}`] : [])]);
   assert.ok(exported.nodes.length > 0 && exported.edges.length > 0);
   // CLI JSON export intentionally projects nodes and edges. Compare every
   // persisted graph payload as well, so profiles, sites, evidence, conditions,
   // diagnostics, and coverage cannot disappear behind that projection.
   const database = new DatabaseSync(store, { readOnly: true });
   try {
-    const { scan_id: scanId } = database.prepare(`
+    const scanId = attemptId ?? database.prepare(`
       SELECT s.scan_id FROM completed_snapshots s
       JOIN current_completed_snapshot c ON c.snapshot_id = s.id
-    `).get();
+    `).get().scan_id;
     const payloads = (table, column) => database.prepare(
       `SELECT ${column} AS payload FROM ${table} WHERE scan_id = ? ORDER BY id`,
     ).all(scanId).map((row) => JSON.parse(row.payload));
@@ -87,6 +100,15 @@ function graph(store) {
         skipped_sites, skipped, reason, adapter FROM file_coverage
         WHERE scan_id = ? ORDER BY path, adapter`).all(scanId),
     };
+  } finally {
+    database.close();
+  }
+}
+function currentCompletedSnapshot(store) {
+  const database = new DatabaseSync(store, { readOnly: true });
+  try {
+    return database.prepare(`SELECT s.id, s.scan_id FROM completed_snapshots s
+      JOIN current_completed_snapshot c ON c.snapshot_id = s.id`).get();
   } finally {
     database.close();
   }
@@ -146,6 +168,10 @@ async function verifyWebSemanticInterruptionAndResume(expected) {
   const { wrapper, interruptionSentinel } = makeWebWorkerWrapper("web-worker-interruption.mjs", { pauseSemantic: true });
   const store = path.join(parent, "web-semantic-interruption.sqlite");
   configure(128, 1);
+  scan(store);
+  const completedBefore = currentCompletedSnapshot(store);
+  assert.ok(completedBefore, "interruption fixture has no completed snapshot to preserve");
+  assert.deepEqual(graph(store), expected, "interruption fixture baseline differs from the public graph");
   environment.DEPGRAPH_WEB_WORKER = wrapper;
   const child = spawn(cli, ["--store", store, "scan", root, "--json"], {
     cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"],
@@ -175,6 +201,22 @@ async function verifyWebSemanticInterruptionAndResume(expected) {
     const partial = run(store, ["export", "--scan-id", `attempt:${interrupted.scan_id}`, "--format", "json"]);
     assert.equal(partial.partial.analysis_complete, false);
     assert.ok(partial.nodes.length > 0, "semantic interruption discarded all validated partial graph data");
+    assert.deepEqual(currentCompletedSnapshot(store), completedBefore, "partial attempt replaced the existing completed snapshot");
+    assert.deepEqual(graph(store), expected, "partial attempt changed the default completed graph");
+    const partialGraph = graph(store, interrupted.scan_id);
+    const partialQueries = [
+      ["deps", ["path:frontend/apps/web/src/index.ts", "--transitive", "--all"]],
+      ["dependents", ["path:frontend/packages/shared/src/index.ts", "--transitive", "--all"]],
+      ["why", ["path:frontend/apps/web/src/index.ts", "path:frontend/packages/shared/src/index.ts"]],
+      ["impact", ["path:frontend/packages/shared/src/index.ts"]],
+    ];
+    for (const [command, args] of partialQueries) {
+      const output = run(store, [command, ...args, "--scan-id", `attempt:${interrupted.scan_id}`, "--json"]);
+      assert.ok(output.data, `${command} returned no partial graph result`);
+      assert.equal(output.partial?.attempt_id, interrupted.scan_id, `${command} selected a different attempt`);
+      assert.equal(output.partial?.analysis_complete, false, `${command} claimed complete analysis for the partial attempt`);
+      assertWorkspaceQuery(command, output.data, partialGraph);
+    }
     const health = run(store, ["health", "list", "--scan-id", `attempt:${interrupted.scan_id}`, "--kind", "unused-file", "--all", "--json"]);
     assert.ok((health.data?.findings ?? []).every((finding) => finding.confidence !== "confirmed"), "partial Web scan promoted an unused finding to confirmed");
 
@@ -188,6 +230,8 @@ async function verifyWebSemanticInterruptionAndResume(expected) {
       stopped_web_units: interruptedWebUnits.filter((unit) => unit.status === "cancelled" || unit.status === "failed").length,
       resumed_reused: resumed.output.analysis.units.filter((unit) => unit.reused).length,
       partial_unused_findings: health.data?.findings?.length ?? 0,
+      partial_queries: partialQueries.map(([command]) => command),
+      current_completed_preserved: true,
     };
   } finally {
     if (!ended) { child.kill("SIGINT"); await completion; }
@@ -376,7 +420,7 @@ try {
   write("tools/independent/go.mod", "module example.test/independent\n\ngo 1.26.1\n");
   write("tools/independent/value.go", "package independent\nfunc Value() int { return 1 }\n");
   if (includeWeb) {
-    write("frontend/pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n  - 'packages/*'\n");
+    write("frontend/pnpm-workspace.yaml", "packages: ['apps/*', 'packages/*'] # nested workspace\n");
     write("frontend/package.json", { name: "fixture-frontend", private: true });
     write("frontend/apps/web/package.json", {
       name: "fixture-web", version: "1.0.0", dependencies: { "@fixture/shared": "workspace:*" },
@@ -412,6 +456,19 @@ try {
     }), "Go local replacement lost its internal target");
   }
   if (includeWeb) {
+    const sharedPackage = expected.nodes.find((node) => (
+      node.kind === "package_instance" && node.display_name === "@fixture/shared"
+        && node.properties.workspace === true
+    ));
+    assert.ok(sharedPackage, "inline pnpm workspace lost its internal package");
+    const workspaceDependency = expected.sites.filter((site) => (
+      site.kind === "package_dependency" && site.specifier === "@fixture/shared"
+    ));
+    assert.ok(workspaceDependency.length > 0, "inline pnpm workspace dependency is missing");
+    for (const site of workspaceDependency) {
+      assert.equal(site.resolution_status, "resolved", "inline pnpm workspace dependency was not resolved internally");
+      assert.deepEqual(site.target_ids, [sharedPackage.id], "inline pnpm workspace dependency lost its internal target");
+    }
     for (const relative of unicodeSourcePaths) {
       assert.ok(expected.nodes.some((node) => node.kind === "file" && node.properties.path === relative), `Unicode source ${relative} is missing from the baseline graph`);
     }
@@ -486,6 +543,7 @@ try {
     baseline: { duration_ms: baseline.duration_ms, units: baseline.output.analysis.units.length },
     split: { duration_ms: split.duration_ms, units: split.output.analysis.units.length },
     resumed: { duration_ms: resumed.duration_ms, reused: resumed.output.analysis.units.filter((unit) => unit.reused).length },
+    stages: { baseline: stageSummary(baseline.output), split: stageSummary(split.output), resumed: stageSummary(resumed.output) },
     interrupted, web_interruption, web_reexecution, invalidation,
     profiles: expected.profiles.length, nodes: expected.nodes.length, edges: expected.edges.length,
     evidence: expected.evidence.length,

@@ -611,12 +611,33 @@ pub(crate) fn validate_work_inputs(
     input_proof: Option<&AnalysisInputProof>,
     validation: AnalysisInputValidation,
 ) -> bool {
+    validate_work_inputs_with_execution_digest(
+        context,
+        item,
+        store_path,
+        profile_plan_id,
+        input_proof,
+        validation,
+        None,
+    )
+}
+
+fn validate_work_inputs_with_execution_digest(
+    context: &AnalysisExecutionContext<'_>,
+    item: &AnalysisWorkItem,
+    store_path: Option<&Path>,
+    profile_plan_id: &str,
+    input_proof: Option<&AnalysisInputProof>,
+    validation: AnalysisInputValidation,
+    forced_execution_digest: Option<&str>,
+) -> bool {
     let Some(key) = item.checkpoint_key.as_ref() else {
         return false;
     };
-    if execution_digest(context, &item.spec, profile_plan_id).as_ref()
-        != Some(&key.execution_digest)
-    {
+    let execution_digest = forced_execution_digest
+        .map(str::to_owned)
+        .or_else(|| execution_digest(context, &item.spec, profile_plan_id));
+    if execution_digest.as_deref() != Some(&key.execution_digest) {
         return false;
     }
     if item
@@ -692,8 +713,18 @@ fn execution_digest(
     let workers = [(spec.adapter, spec.clone())];
     let adapter = fingerprint_adapters(&workers).ok()?;
     let toolchain = fingerprint_toolchains(context.root, &workers).ok()?;
+    execution_digest_from_identities(context, spec, profile_plan_id, &adapter, &toolchain)
+}
+
+fn execution_digest_from_identities(
+    context: &AnalysisExecutionContext<'_>,
+    spec: &WorkerSpec,
+    profile_plan_id: &str,
+    adapter_identity: &str,
+    toolchain_identity: &str,
+) -> Option<String> {
     let bytes = serde_json::to_vec(&json!({"contract":"depgraph-analysis-execution-v1",
-        "adapter":adapter,"toolchain":toolchain,"config":context.config,"profile_plan_id":profile_plan_id,
+        "adapter":adapter_identity,"toolchain":toolchain_identity,"config":context.config,"profile_plan_id":profile_plan_id,
         "program":spec.program,"arguments":spec.leading_args})).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -1039,5 +1070,156 @@ mod tests {
             go_syntax_checkpoint_input_digest("content-a", "unit-a"),
             go_syntax_checkpoint_input_digest("content-a", "unit-b")
         );
+    }
+
+    #[test]
+    fn analysis_unit_execution_digest_rejects_profile_config_artifact_and_toolchain_changes_for_go_and_web()
+    -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repository");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("main.go"), "package fixture\n")?;
+        std::fs::write(root.join("main.ts"), "export const fixture = 1;\n")?;
+        let input_digest = fingerprint_scan_inputs(&root, None)?;
+        let proof = AnalysisInputProof::new(input_digest.clone());
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let config = crate::Config::default();
+        let cancellation = crate::CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "execution-digest-admission",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+
+        for adapter in [AdapterKind::Go, AdapterKind::Web] {
+            let artifact = fixture.path().join(format!("{}-worker", adapter.name()));
+            let artifact_bytes = format!("synthetic {} worker\n", adapter.name());
+            std::fs::write(&artifact, &artifact_bytes)?;
+            let spec = WorkerSpec {
+                adapter,
+                program: artifact.clone().into_os_string(),
+                leading_args: Vec::new(),
+                display: format!("synthetic {} worker", adapter.name()),
+                artifact_path: artifact.clone(),
+                runtime_requirement: None,
+                expected_version: None,
+                release_attested: false,
+                attested_rust_sysroot: None,
+            };
+            let unit_id = format!("{}:semantic:chunk", adapter.name());
+            let item = AnalysisWorkItem {
+                unit_id: unit_id.clone(),
+                request: Some(json!({
+                    "contract_version": SOURCE_BATCH_CONTRACT,
+                    "unit_id": unit_id,
+                    "adapter": adapter.name(),
+                    "unit_root": ".",
+                    "source_paths": ["main.go", "main.ts"],
+                    "context_paths": ["main.go", "main.ts"],
+                    "auxiliary_paths": [],
+                    "context_fingerprint": input_digest,
+                    "stage": "semantic",
+                    "chunk_id": "synthetic-chunk",
+                    "chunk_index": 0,
+                    "chunk_count": 1,
+                })),
+                checkpoint_key: None,
+                spec: spec.clone(),
+            };
+            let execution = execution_digest(&context, &spec, &profile_plan_id)
+                .expect("Go/Web toolchain identities must be available in the test environment");
+            let actual_adapter_identity = fingerprint_adapters(&[(adapter, spec.clone())])
+                .expect("synthetic worker artifact must be fingerprintable");
+            let actual_toolchain_identity =
+                fingerprint_toolchains(&root, &[(adapter, spec.clone())])
+                    .expect("Go/Web toolchain must be fingerprintable");
+            assert_eq!(
+                Some(execution.clone()),
+                execution_digest_from_identities(
+                    &context,
+                    &spec,
+                    &profile_plan_id,
+                    &actual_adapter_identity,
+                    &actual_toolchain_identity,
+                )
+            );
+
+            let mut item = item;
+            item.checkpoint_key = Some(UnitCheckpointKey {
+                unit_id: item.unit_id.clone(),
+                input_digest: input_digest.clone(),
+                execution_digest: execution,
+                root_digest: root_digest(&root),
+            });
+            assert!(validate_work_inputs(
+                &context,
+                &item,
+                None,
+                &profile_plan_id,
+                Some(&proof),
+                AnalysisInputValidation::Reuse,
+            ));
+
+            let changed_profile_plan = format!("profile-selection-plan:sha256:{}", "2".repeat(64));
+            assert!(!validate_work_inputs(
+                &context,
+                &item,
+                None,
+                &changed_profile_plan,
+                Some(&proof),
+                AnalysisInputValidation::Reuse,
+            ));
+
+            let mut changed_config = config.clone();
+            changed_config.scan.max_stderr_bytes += 1;
+            let changed_context = AnalysisExecutionContext {
+                root: context.root,
+                scan_id: context.scan_id,
+                config: &changed_config,
+                cache_mode: context.cache_mode,
+                cancellation: context.cancellation,
+            };
+            assert!(!validate_work_inputs(
+                &changed_context,
+                &item,
+                None,
+                &profile_plan_id,
+                Some(&proof),
+                AnalysisInputValidation::Reuse,
+            ));
+
+            std::fs::write(&artifact, format!("{artifact_bytes}changed\n"))?;
+            assert!(!validate_work_inputs(
+                &context,
+                &item,
+                None,
+                &profile_plan_id,
+                Some(&proof),
+                AnalysisInputValidation::Reuse,
+            ));
+            std::fs::write(&artifact, artifact_bytes)?;
+
+            let changed_toolchain_identity = format!("{actual_toolchain_identity}:changed");
+            let changed_execution = execution_digest_from_identities(
+                &context,
+                &spec,
+                &profile_plan_id,
+                &actual_adapter_identity,
+                &changed_toolchain_identity,
+            )
+            .expect("execution digest serialization must succeed");
+            assert!(!validate_work_inputs_with_execution_digest(
+                &context,
+                &item,
+                None,
+                &profile_plan_id,
+                Some(&proof),
+                AnalysisInputValidation::Reuse,
+                Some(&changed_execution),
+            ));
+        }
+        Ok(())
     }
 }

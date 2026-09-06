@@ -138,6 +138,58 @@ fn publish_unit_progress(progress: &AnalysisExecutionProgress, index: usize) {
     });
 }
 
+/// The executor uses one monotonic clock for per-unit elapsed time and the
+/// optional scan budget. The private seam lets scheduler tests advance time
+/// without sleeping; production uses the process monotonic clock.
+trait AnalysisClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct MonotonicAnalysisClock;
+
+impl AnalysisClock for MonotonicAnalysisClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// One optional scan-wide budget is shared by the real timer and the
+/// scheduler's observation point. The timer remains responsible for waking a
+/// scan during synchronous work; the scheduler check makes the same policy
+/// deterministic for tests and catches a budget that expires between units.
+struct AnalysisBudget {
+    started: Option<Instant>,
+    seconds: Option<u64>,
+}
+
+impl AnalysisBudget {
+    fn start(seconds: Option<u64>, clock: &dyn AnalysisClock) -> Self {
+        Self {
+            started: seconds.map(|_| clock.now()),
+            seconds,
+        }
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        self.seconds.map(Duration::from_secs)
+    }
+
+    fn expired(&self, clock: &dyn AnalysisClock) -> bool {
+        let (Some(started), Some(seconds)) = (self.started, self.seconds) else {
+            return false;
+        };
+        clock.now().saturating_duration_since(started) >= Duration::from_secs(seconds)
+    }
+}
+
+fn elapsed_millis(clock: &dyn AnalysisClock, started: Instant) -> u64 {
+    clock
+        .now()
+        .saturating_duration_since(started)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// A caller's optional total budget also runs while static discovery performs
 /// synchronous IO. Dropping the guard wakes and joins its thread immediately.
 pub(crate) struct ScanBudgetGuard {
@@ -147,14 +199,17 @@ pub(crate) struct ScanBudgetGuard {
 
 impl ScanBudgetGuard {
     pub(crate) fn start(seconds: Option<u64>, cancellation: &CancellationToken) -> Option<Self> {
-        let seconds = seconds?;
+        let clock = MonotonicAnalysisClock;
+        let budget = AnalysisBudget::start(seconds, &clock);
+        let duration = budget.duration()?;
         let cancellation = cancellation.clone();
         let (stop, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             if matches!(
-                receiver.recv_timeout(Duration::from_secs(seconds)),
+                receiver.recv_timeout(duration),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ) {
+            ) && budget.expired(&clock)
+            {
                 cancellation.cancel_for_budget();
             }
         });
@@ -186,6 +241,22 @@ pub(crate) async fn execute_analysis_units<F, V>(
     store: &mut Store,
     context: &AnalysisExecutionContext<'_>,
     work: Vec<AnalysisWorkItem>,
+    consume: F,
+    validate_inputs: V,
+) -> Result<AnalysisExecutionProgress>
+where
+    F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
+    V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
+{
+    let clock = MonotonicAnalysisClock;
+    execute_analysis_units_with_clock(store, context, work, &clock, consume, validate_inputs).await
+}
+
+async fn execute_analysis_units_with_clock<F, V>(
+    store: &mut Store,
+    context: &AnalysisExecutionContext<'_>,
+    work: Vec<AnalysisWorkItem>,
+    clock: &dyn AnalysisClock,
     mut consume: F,
     validate_inputs: V,
 ) -> Result<AnalysisExecutionProgress>
@@ -213,6 +284,7 @@ where
     } else {
         None
     };
+    let budget = AnalysisBudget::start(config.scan.total_budget_seconds, clock);
     let prerequisites = stage_prerequisites(&work)?;
     let mut progress = AnalysisExecutionProgress {
         units: work
@@ -253,7 +325,7 @@ where
                 output.failure_kind.map(|kind| kind.as_str().to_owned());
             progress.units[next_ingest].duration_ms = started
                 .remove(&next_ingest)
-                .map(|time| time.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .map(|time| elapsed_millis(clock, time))
                 .unwrap_or(0);
             let complete = consume(store, &unit_id, output)?;
             if complete
@@ -278,6 +350,9 @@ where
             publish_unit_progress(&progress, next_ingest);
             tracing::info!(unit_id, complete, reused, "analysis unit finished");
             next_ingest += 1;
+        }
+        if budget.expired(clock) {
+            cancellation.cancel_for_budget();
         }
         // A bounded reorder window makes Store ingestion independent of worker
         // timing without retaining outputs for the whole repository in memory.
@@ -308,7 +383,7 @@ where
                 }
             }
             progress.units[index].status = "running".into();
-            started.insert(index, Instant::now());
+            started.insert(index, clock.now());
             publish_unit_progress(&progress, index);
             tracing::info!(unit_id = item.unit_id, "analysis unit started");
             let root = root.to_path_buf();
@@ -699,6 +774,38 @@ mod tests {
     use crate::worker::AdapterKind;
     use serde_json::json;
 
+    struct AdvancingAnalysisClock {
+        epoch: Instant,
+        step: Duration,
+        ticks: std::sync::atomic::AtomicU64,
+    }
+
+    impl AdvancingAnalysisClock {
+        fn new(step: Duration) -> Self {
+            Self {
+                epoch: Instant::now(),
+                step,
+                ticks: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.step
+                .saturating_mul(self.ticks.load(std::sync::atomic::Ordering::Relaxed) as u32)
+        }
+    }
+
+    impl AnalysisClock for AdvancingAnalysisClock {
+        fn now(&self) -> Instant {
+            let tick = self
+                .ticks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.epoch
+                .checked_add(self.step.saturating_mul(tick as u32))
+                .expect("test clock must remain representable")
+        }
+    }
+
     #[tokio::test]
     async fn progress_observers_are_isolated_between_concurrent_scan_futures() {
         let first = AnalysisProgressObserver::default();
@@ -750,6 +857,134 @@ mod tests {
         drop(ScanBudgetGuard::start(Some(300), &active));
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(!active.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn progressing_scheduler_outlives_legacy_aggregate_deadline_with_fake_clock() -> Result<()>
+    {
+        const LEGACY_AGGREGATE_DEADLINE: Duration = Duration::from_secs(300);
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let worker = temp.path().join("worker.mjs");
+        std::fs::write(
+            &worker,
+            r#"
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const arg = key => args[args.indexOf(key) + 1];
+const request = JSON.parse(fs.readFileSync(arg('--analysis-unit'), 'utf8'));
+const common = { protocol_version:'1.0', scan_id:arg('--scan-id'), adapter:'go', adapter_version:'0.1.0' };
+const coverage = { profiles:1, files_discovered:0, files_analyzed:0, files_skipped:0, dependency_sites:0, resolved:0, candidates:0, external:0, unresolved:0, unsupported_syntax:0, project_code_executed:false, completeness:['syntax-complete'], reasons:[] };
+const profile = { id:'go:'+request.unit_id, language:'go', features:[], environment:{}, properties:{ analysis_unit_contract:request.contract_version, analysis_unit_id:request.unit_id, analysis_unit_root:request.unit_root, analysis_stage:request.stage } };
+for (const event of [
+  { event:'scan_started', seq:1, root:arg('--root'), project_code_executed:false, safe_mode:true },
+  { event:'profile_declared', seq:2, profile },
+  { event:'profile_completed', seq:3, profile_id:profile.id, coverage },
+  { event:'scan_completed', seq:4, coverage },
+]) console.log(JSON.stringify({...common, ...event}));
+"#,
+        )?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: "node".into(),
+            leading_args: vec![worker.clone().into_os_string()],
+            display: "fake-clock scheduler fixture".into(),
+            artifact_path: worker,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let work = || {
+            (0..4)
+                .map(|index| {
+                    let unit_id = format!("unit-{index}");
+                    AnalysisWorkItem {
+                        unit_id: unit_id.clone(),
+                        request: Some(json!({
+                            "contract_version":"depgraph-analysis-unit-v1",
+                            "unit_id":unit_id,
+                            "unit_root":".",
+                            "stage":"syntax",
+                            "source_paths":[]
+                        })),
+                        checkpoint_key: None,
+                        spec: spec.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = Config::default();
+        assert_eq!(config.scan.total_budget_seconds, None);
+        let cancellation = CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "fake-clock-progress",
+            config: &config,
+            cache_mode: ScanCacheMode::Disabled,
+            cancellation: &cancellation,
+        };
+        let store_path = temp.path().join("store.sqlite");
+        let mut store = Store::open(&store_path)?;
+        let clock = AdvancingAnalysisClock::new(Duration::from_secs(600));
+        let progress = execute_analysis_units_with_clock(
+            &mut store,
+            &context,
+            work(),
+            &clock,
+            |_, _, output| Ok(output.error.is_none()),
+            |_, _| true,
+        )
+        .await?;
+
+        assert!(
+            clock.elapsed() > LEGACY_AGGREGATE_DEADLINE,
+            "fixture must advance beyond the removed aggregate deadline"
+        );
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(progress.stop_reason, None);
+        assert_eq!(progress.units.len(), 4);
+        assert!(progress.units.iter().all(|unit| unit.status == "completed"));
+        assert!(
+            progress
+                .units
+                .iter()
+                .all(|unit| { unit.duration_ms >= LEGACY_AGGREGATE_DEADLINE.as_millis() as u64 })
+        );
+
+        let mut explicit_config = config.clone();
+        explicit_config.scan.total_budget_seconds = Some(300);
+        let explicit_cancellation = CancellationToken::new();
+        let explicit_context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "fake-clock-explicit-budget",
+            config: &explicit_config,
+            cache_mode: ScanCacheMode::Disabled,
+            cancellation: &explicit_cancellation,
+        };
+        let explicit_store_path = temp.path().join("explicit-budget.sqlite");
+        let mut explicit_store = Store::open(&explicit_store_path)?;
+        let explicit_clock = AdvancingAnalysisClock::new(Duration::from_secs(600));
+        let explicit = execute_analysis_units_with_clock(
+            &mut explicit_store,
+            &explicit_context,
+            work(),
+            &explicit_clock,
+            |_, _, output| Ok(output.error.is_none()),
+            |_, _| true,
+        )
+        .await?;
+        assert!(explicit_clock.elapsed() > LEGACY_AGGREGATE_DEADLINE);
+        assert!(explicit_cancellation.is_budget_exhausted());
+        assert_eq!(
+            explicit.stop_reason.as_deref(),
+            Some("total-budget-exceeded")
+        );
+        assert!(explicit.units.iter().all(|unit| unit.status == "cancelled"));
+        Ok(())
     }
 
     #[test]
