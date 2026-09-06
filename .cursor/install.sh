@@ -77,8 +77,14 @@ ensure_go() {
 }
 
 ensure_node() {
+  local corepack_bin
   if command -v node >/dev/null 2>&1 && [ "$(node --version 2>/dev/null)" = "v${NODE_VERSION}" ]; then
     log "Node.js ${NODE_VERSION} already present"
+    # Use the Corepack that ships next to the already-present Node, wherever it
+    # lives, rather than assuming an /usr/local/nodejs layout we did not create.
+    local node_path
+    node_path="$(readlink -f "$(command -v node)")"
+    corepack_bin="$(dirname "$node_path")/corepack"
   else
     log "Installing Node.js ${NODE_VERSION}"
     local tmp
@@ -91,12 +97,17 @@ ensure_node() {
     as_root ln -sf /usr/local/nodejs/bin/node /usr/local/bin/node
     as_root ln -sf /usr/local/nodejs/bin/npm /usr/local/bin/npm
     as_root ln -sf /usr/local/nodejs/bin/npx /usr/local/bin/npx
+    corepack_bin="/usr/local/nodejs/bin/corepack"
     rm -rf "$tmp"
   fi
   # Always (re)generate the Corepack shims regardless of whether Node was
   # already present: a correct Node runtime can still ship a missing or broken
-  # Corepack/pnpm shim, and the pnpm gate below depends on them.
-  as_root /usr/local/nodejs/bin/corepack enable --install-directory /usr/local/bin
+  # Corepack/pnpm shim, and the pnpm gate below depends on them. Fall back to a
+  # Corepack already on PATH if none sits next to the resolved Node.
+  if [ ! -x "$corepack_bin" ]; then
+    corepack_bin="corepack"
+  fi
+  as_root "$corepack_bin" enable --install-directory /usr/local/bin
   link_priority node
   link_priority npm
   link_priority npx
