@@ -63,6 +63,30 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      # Keep the release evidence's eight-job identity while extending the Go
+      # gate with the shared scheduler and both real unit-capable adapters.
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: resumable-analysis-${{ hashFiles('Cargo.toml') }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.0
+          standalone: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - name: Verify real-worker batching, reuse, and cross-unit queries
+        working-directory: .
+        env:
+          DEPGRAPH_RESUMABLE_REPORT: ${{ runner.temp }}/depgraph-resumable-report.json
+        run: cargo xtask resumable-analysis-e2e
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resumable-analysis-report
+          path: ${{ runner.temp }}/depgraph-resumable-report.json
+          if-no-files-found: error
 
   web:
     runs-on: ubuntu-24.04

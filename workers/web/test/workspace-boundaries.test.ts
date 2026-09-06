@@ -35,15 +35,26 @@ for (const declaration of ["package.json", "pnpm-workspace.yaml"] as const) {
     const workspace = await discoverWorkspace(root, files);
     assert.deepEqual(workspace.packages.map((record) => record.relativePath), [
       ".",
+      "apps",
       "apps/frontend",
+      "apps/frontend-extra",
       "apps/frontend/packages/shared",
       "apps/independent",
       "apps/independent/packages/own",
+      "tools",
     ]);
-    assert.deepEqual(workspace.ignoredManifestPaths, [
+    assert.deepEqual(workspace.packages
+      .filter((record) => record.relativePath === "apps/frontend-extra" || record.relativePath === "apps" || record.relativePath === "tools")
+      .map((record) => [record.relativePath, record.workspaceRoot]), [
+      ["apps", "apps"],
+      ["apps/frontend-extra", "apps/frontend-extra"],
+      ["tools", "tools"],
+    ]);
+    assert.deepEqual(workspace.standaloneManifestPaths, [
       "apps/frontend-extra/package.json",
       "apps/package.json",
       "tools/package.json",
     ]);
+    assert.deepEqual(workspace.ignoredManifestPaths, []);
   });
 }

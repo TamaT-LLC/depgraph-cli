@@ -104,6 +104,22 @@ export interface TypeScriptStaticConfig {
   pathMappings?: number;
 }
 
+export interface TypeScriptAnalysisOptions {
+  /** Source files whose AST/semantic DTOs may be returned to the scanner. */
+  sourcePaths?: ReadonlySet<string>;
+  /**
+   * Source files whose ASTs may be transferred from the native Program.
+   * `sourcePaths` remains the ownership boundary for emitted DTOs; this set
+   * may also contain context-only declaration targets needed to resolve those
+   * DTOs against the same TypeChecker.
+   */
+  astPaths?: ReadonlySet<string>;
+  /** A bounded AST selection could not include every required context target. */
+  astSelectionTruncated?: boolean;
+  /** Syntax units defer semantic graph extraction to their semantic stage. */
+  stage?: "syntax" | "semantic";
+}
+
 /**
  * A parser-confirmed source range whose dependency is erased from runtime
  * JavaScript. `import_type` also covers ImportType nodes attached to JSDoc,
@@ -124,6 +140,12 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
   readonly typeUseSpans = new Map<string, TypeScriptTypeUseValidationSpan[]>();
   readonly callSpans = new Map<string, TypeScriptCallValidationSpan[]>();
   readonly semanticDiagnostics: TypeScriptSemanticDiagnostic[] = [];
+  /** True when the scanner's bounded context-target closure was truncated. */
+  astSelectionTruncated = false;
+  /** Number of ASTs actually requested from the native Program. */
+  astRetainedSourceFiles = 0;
+  /** UTF-8 source bytes corresponding to the retained AST selection. */
+  astRetainedSourceBytes = 0;
   definitionGraph: TypeScriptRawDefinitionDelta = {
     definitions: [],
     relations: [],
@@ -665,6 +687,7 @@ async function analyzeTypeScriptProjectInner(
   staticConfig: TypeScriptStaticConfig,
   testRuntime?: TypeScriptAnalysisTestRuntime,
   progress: ProgressReporter = NOOP_PROGRESS,
+  options: TypeScriptAnalysisOptions = {},
 ): Promise<TypeScriptProjectAnalysis> {
   progress.start("typescript_compiler_setup", { source_files: sources.size });
   // Validate the selected compiler even for repositories with no TS/JS
@@ -747,18 +770,37 @@ async function analyzeTypeScriptProjectInner(
       if (projects.length !== 1) throw new Error(`TypeScript native project analysis opened ${projects.length} projects instead of one neutral project`);
       const project = projects[0]!;
       progress.complete("typescript_project_open", { source_files: sources.size });
-      progress.start("typescript_ast_transfer", { source_files: sources.size });
+      // The async compiler API does not expose the serialized AST payload
+      // size. Report the exact UTF-8 source payload corresponding to the ASTs
+      // admitted to the transfer boundary. The complete source map remains in
+      // the isolated VFS so the native Program and TypeChecker retain their
+      // project-wide resolution context.
+      const contextSourceBytes = [...sources.values()].reduce((total, source) => total + Buffer.byteLength(source, "utf8"), 0);
+      const requestedAstPaths = options.astPaths === undefined
+        ? new Set(sources.keys())
+        : new Set([...options.astPaths].filter((relativePath) => sources.has(relativePath)));
+      const requestedAstBytes = [...requestedAstPaths].reduce(
+        (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
+        0,
+      );
+      result.astSelectionTruncated = options.astSelectionTruncated === true;
+      progress.start("typescript_ast_transfer", {
+        context_source_files: sources.size,
+        context_source_bytes: contextSourceBytes,
+        requested_source_files: requestedAstPaths.size,
+        requested_source_bytes: requestedAstBytes,
+      });
       const actualRoots = new Set(project.rootFiles.map(pathKey));
       const sourceFiles = new Map<string, SourceFile>();
       const dependencyValidationQueryBudget = { value: 0 };
-      const definitionSourceLimitExceeded = virtualToRelative.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
+      const definitionSourceLimitExceeded = requestedAstPaths.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
       if (definitionSourceLimitExceeded) {
         result.definitionGraph = {
           definitions: [],
           relations: [],
           issues: [{
             code: "typescript_semantic_source_limit_exceeded",
-            message: `TypeScript semantic definition extraction received ${virtualToRelative.size} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
+            message: `TypeScript semantic definition extraction received ${requestedAstPaths.size} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
             relativePath: null,
             fatal: true,
           }],
@@ -766,12 +808,13 @@ async function analyzeTypeScriptProjectInner(
         };
       }
       for (const virtualPath of virtualToRelative.keys()) {
-        if (!actualRoots.has(virtualPath)) throw new Error(`TypeScript native project analysis omitted ${virtualToRelative.get(virtualPath)}`);
+        const relativePath = virtualToRelative.get(virtualPath)!;
+        if (!actualRoots.has(virtualPath)) throw new Error(`TypeScript native project analysis omitted ${relativePath}`);
+        if (!requestedAstPaths.has(relativePath)) continue;
         // Source count can be rejected before transferring remote ASTs. The
         // node-count guard necessarily runs after getSourceFile because the
         // async compiler API transfers each syntax tree as one remote object.
         if (definitionSourceLimitExceeded) continue;
-        const relativePath = virtualToRelative.get(virtualPath)!;
         const sourceFile = await project.program.getSourceFile(virtualPath);
         if (sourceFile === undefined) throw new Error(`TypeScript native project analysis could not read AST for ${relativePath}`);
         const inventorySource = sources.get(relativePath);
@@ -785,7 +828,9 @@ async function analyzeTypeScriptProjectInner(
           throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
         }
         sourceFiles.set(relativePath, sourceFile);
-        result.semanticSourceFiles.set(relativePath, sourceFile);
+        if (options.sourcePaths === undefined || options.sourcePaths.has(relativePath)) {
+          result.semanticSourceFiles.set(relativePath, sourceFile);
+        }
         result.importTypeModuleSpans.set(relativePath, []);
         result.nonLiteralModuleSpans.set(relativePath, []);
         result.moduleCallSpans.set(relativePath, []);
@@ -818,8 +863,26 @@ async function analyzeTypeScriptProjectInner(
       }
       progress.complete("typescript_ast_transfer", {
         program_files: programFiles.length,
-        source_files: sources.size,
+        context_source_files: sources.size,
+        context_source_bytes: contextSourceBytes,
+        requested_source_files: requestedAstPaths.size,
+        requested_source_bytes: requestedAstBytes,
+        source_files: sourceFiles.size,
+        source_bytes: [...sourceFiles.keys()].reduce(
+          (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
+          0,
+        ),
+        ast_retained_source_files: sourceFiles.size,
+        ast_retained_source_bytes: [...sourceFiles.keys()].reduce(
+          (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
+          0,
+        ),
       });
+      result.astRetainedSourceFiles = sourceFiles.size;
+      result.astRetainedSourceBytes = [...sourceFiles.keys()].reduce(
+        (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
+        0,
+      );
       progress.start("typescript_syntax_diagnostics", { source_files: sources.size });
       const syntacticallyInvalidPaths = new Set<string>();
       for (const diagnostic of await project.program.getSyntacticDiagnostics()) {
@@ -855,7 +918,7 @@ async function analyzeTypeScriptProjectInner(
       if (await project.checker.typeToString(intrinsicString) !== "string") {
         throw new Error("TypeScript native TypeChecker smoke query returned an unexpected intrinsic string type");
       }
-      if (!definitionSourceLimitExceeded) {
+      if (!definitionSourceLimitExceeded && options.stage !== "syntax") {
         const semanticSources = [...sourceFiles.entries()]
           .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
           .map(([relativePath, sourceFile]) => ({
@@ -875,19 +938,41 @@ async function analyzeTypeScriptProjectInner(
           source_files: semanticSources.length,
         });
         if (!result.definitionGraph.issues.some((issue) => issue.fatal)) {
-          progress.start("typescript_dependency_graph", { source_files: semanticSources.length });
+          // Keep the full project source list for canonical definition and
+          // export identity, but traverse dependency/call occurrences only
+          // for this batch. The TypeChecker still resolves each occurrence
+          // against the same Program, so imports, re-exports and calls into a
+          // context-only file retain their targets without retaining a second
+          // dependency DTO for every sibling source.
+          const dependencySources = options.sourcePaths === undefined
+            ? semanticSources
+            : semanticSources.filter((source) => options.sourcePaths!.has(source.relativePath));
+          progress.start("typescript_dependency_graph", {
+            source_files: dependencySources.length,
+            context_source_files: sources.size,
+          });
           result.dependencyGraph = await extractTypeScriptRawDependencyDelta(
             project.checker,
             semanticSources,
             result.definitionGraph,
             result.definitionGraph.typeCheckerQueries,
             result,
+            options.sourcePaths === undefined ? {} : { sourcePaths: options.sourcePaths },
           );
           progress.complete("typescript_dependency_graph", {
             dependency_sites: result.dependencyGraph.sites.length,
-            source_files: semanticSources.length,
+            source_files: dependencySources.length,
+            context_source_files: sources.size,
           });
         }
+        // Context-only SourceFile objects are no longer needed once both raw
+        // semantic DTOs have been extracted. Owned ASTs remain reachable only
+        // through semanticSourceFiles for framework collectors.
+        semanticSources.length = 0;
+        sourceFiles.clear();
+      } else {
+        // Syntax units retain no AST beyond the type-only span refinement.
+        sourceFiles.clear();
       }
       const typeCheckerQueries = 1
         + result.definitionGraph.typeCheckerQueries
@@ -929,12 +1014,15 @@ async function analyzeTypeScriptProjectInner(
         typeCheckerQueries,
         semanticDiagnostics: uniqueDiagnostics.length,
         emittedSemanticDiagnostics: result.semanticDiagnostics.length,
-        definitionGraphStatus: [...result.definitionGraph.issues, ...result.dependencyGraph.issues].some((issue) => issue.fatal) ? "failed" : "ready",
-        semanticNodes: result.definitionGraph.definitions.length,
-        semanticRelations: result.definitionGraph.relations.length,
-        semanticSites: result.dependencyGraph.sites.length + result.dependencyGraph.calls.length,
-        semanticCallSites: result.dependencyGraph.calls.length,
-        semanticIssues: result.definitionGraph.issues.length + result.dependencyGraph.issues.length,
+        definitionGraphStatus: options.stage === "syntax"
+          || [...result.definitionGraph.issues, ...result.dependencyGraph.issues].some((issue) => issue.fatal)
+          ? "failed"
+          : "ready",
+        semanticNodes: options.stage === "syntax" ? 0 : result.definitionGraph.definitions.length,
+        semanticRelations: options.stage === "syntax" ? 0 : result.definitionGraph.relations.length,
+        semanticSites: options.stage === "syntax" ? 0 : result.dependencyGraph.sites.length + result.dependencyGraph.calls.length,
+        semanticCallSites: options.stage === "syntax" ? 0 : result.dependencyGraph.calls.length,
+        semanticIssues: options.stage === "syntax" ? 0 : result.definitionGraph.issues.length + result.dependencyGraph.issues.length,
       };
     } finally {
       await snapshot.dispose();
@@ -1036,9 +1124,10 @@ export async function analyzeTypeScriptProject(
   sources: ReadonlyMap<string, string>,
   staticConfig: TypeScriptStaticConfig = { configFiles: 0, paths: {} },
   progress: ProgressReporter = NOOP_PROGRESS,
+  options: TypeScriptAnalysisOptions = {},
 ): Promise<TypeScriptProjectAnalysis> {
   try {
-    return await analyzeTypeScriptProjectInner(sources, staticConfig, undefined, progress);
+    return await analyzeTypeScriptProjectInner(sources, staticConfig, undefined, progress, options);
   } catch (error) {
     throw projectFailure(error);
   }

@@ -2430,7 +2430,11 @@ export class ModuleResolver {
     }
     const installed = await this.#loadExternalPackages(packageName, lookup);
     const subpath = subpathOf(specifier, packageName);
-    const candidateInstances = selectedInstances ?? this.#workspace.lockInstances.get(packageName) ?? [];
+    const scoped = this.#workspace.scopes.find((scope) => scope.root === owner.workspaceRoot);
+    const candidateInstances = selectedInstances
+      ?? (scoped === undefined
+        ? this.#workspace.lockInstances.get(packageName) ?? []
+        : scoped.lockInstances.get(packageName) ?? []);
     if (installed.length > 0) {
       const inspected = await Promise.all(installed.map(async (record) => ({
         record,
@@ -2446,10 +2450,10 @@ export class ModuleResolver {
         const instances = locked.length > 0
           ? locked
           : entry.record.version !== null
-            ? [{ version: entry.record.version, locator: `${this.#workspace.manager}:${packageName}@${entry.record.version}` }]
+            ? [{ version: entry.record.version, locator: `${owner.manager}:${packageName}@${entry.record.version}` }]
             : [{
               version: owner.dependencies.get(packageName)?.range ?? "unknown",
-              locator: `${this.#workspace.manager}:${packageName}@${owner.dependencies.get(packageName)?.range ?? "unknown"}`,
+              locator: `${owner.manager}:${packageName}@${owner.dependencies.get(packageName)?.range ?? "unknown"}`,
             }];
         for (const instance of instances) {
           byLocator.set(instance.locator, {
@@ -2506,7 +2510,7 @@ export class ModuleResolver {
     const locked = candidateInstances;
     const instances = locked.length > 0
       ? locked
-      : [{ version: declared, locator: `${this.#workspace.manager}:${packageName}@${declared}` }];
+      : [{ version: declared, locator: `${owner.manager}:${packageName}@${declared}` }];
     return {
       status: instances.length === 1 ? "external" : "candidates",
       precision: instances.length === 1 ? "heuristic" : "overapprox",
@@ -2763,13 +2767,16 @@ export class ModuleResolver {
       const self = await this.#resolveWorkspacePackages(specifier, [owner], useTypesCondition, moduleKind);
       return self.targets.length > 0 ? self : { ...self, reason: unresolvedReason(self.reason) };
     }
+    const scopedPackages = this.#workspace.packageByScopeName.get(owner.workspaceRoot);
     const selection = selectPackageInstallCandidates(
       this.#workspace,
       owner,
       packageName,
       owner.dependencies.get(packageName)?.range ?? null,
       owner.name === packageName
-        ? new Set((this.#workspace.packageByName.get(packageName) ?? []).map((record) => record.id))
+        ? new Set((scopedPackages === undefined
+          ? this.#workspace.packageByName.get(packageName) ?? []
+          : scopedPackages.get(packageName) ?? []).map((record) => record.id))
         : new Set(),
     );
     if (selection.workspacePackages.length === 0 && selection.externalInstances.length === 0) {

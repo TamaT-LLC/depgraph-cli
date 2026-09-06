@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     process::{Command, Output},
@@ -17,6 +17,8 @@ const EXTERNAL_CALL: &str = "example.com/semantic/model.ExternalCall";
 const INPUT: &str = "example.com/semantic/model.Input";
 const OUTPUT_TO_INPUT: &str = "example.com/semantic/model.outputToInput";
 const WORKER: &str = "example.com/semantic/model.Worker";
+
+type BoundaryOccurrence = (String, String, u64, u64, u64, u64, String);
 
 pub(crate) fn run_development(workspace_root: &Path, target_dir: &Path) -> Result<()> {
     let workspace_root = workspace_root
@@ -262,7 +264,8 @@ fn verify_duplicate_module_root_scan(
                     format!("split duplicate-module profile {profile_id} has no analysis_stage")
                 })?;
             ensure!(
-                matches!(unit_root, "one" | "two") && matches!(stage, "syntax" | "semantic"),
+                matches!(unit_root, "one" | "two")
+                    && matches!(stage, "syntax" | "typed" | "semantic"),
                 "duplicate-module profile has invalid unit scope: id={profile_id} root={unit_root} stage={stage}"
             );
             let stage_profiles = profiles_by_module.entry(unit_root).or_default();
@@ -283,11 +286,12 @@ fn verify_duplicate_module_root_scan(
         ensure!(
             profiles_by_module.len() == 2
                 && profiles_by_module.values().all(|stages| {
-                    stages.len() == 2
+                    stages.len() == 3
                         && stages.contains_key("syntax")
+                        && stages.contains_key("typed")
                         && stages.contains_key("semantic")
                 }),
-            "duplicate-module graph must have exactly one syntax and semantic profile per module: {profiles_by_module:?}"
+            "duplicate-module graph must have exactly one syntax, typed, and semantic profile per module: {profiles_by_module:?}"
         );
     } else {
         ensure!(
@@ -857,8 +861,39 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
         ("reflection_method_lookup", 2),
         ("unsafe", 1),
     ]);
-    let mut counts = BTreeMap::<&str, u64>::new();
+    // The typed checkpoint deliberately retains the go/types-derived prefix,
+    // including type-resolved calls and their explicit reflection boundaries.
+    // The semantic stage repeats that prefix while adding SSA facts.  Native
+    // and assembly boundaries are source-level syntax evidence, so they are
+    // emitted by the syntax stage and discarded by typed/semantic projections.
+    // Keep the stage contracts explicit so a production fix cannot hide typed
+    // evidence merely to satisfy an aggregate count from the pre-typed pipeline.
+    let expected_typed = BTreeSet::from([
+        "reflection_call",
+        "reflection_call_slice",
+        "reflection_field_lookup",
+        "reflection_make_func",
+        "reflection_method_lookup",
+    ]);
     let mut counts_by_profile = BTreeMap::<&str, u64>::new();
+    let mut occurrence_stages = BTreeMap::<BoundaryOccurrence, BTreeSet<&str>>::new();
+    let profiles = graph_array(graph, "profiles")?;
+    let profile_stages = profiles
+        .iter()
+        .filter(|profile| profile["language"] == "go")
+        .map(|profile| {
+            Ok((
+                required_str(profile, "id", "boundary Go profile")?,
+                required_str(
+                    profile
+                        .get("properties")
+                        .context("boundary Go profile has no properties")?,
+                    "analysis_stage",
+                    "boundary Go profile",
+                )?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut unresolved_boundary_ids = Vec::<String>::new();
     for primary in evidence.iter().filter(|item| {
         item["owner_type"] == "site" && item["properties"]["callgraph_boundary"].as_str().is_some()
@@ -870,7 +905,6 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
             "callgraph_boundary",
             "boundary evidence",
         )?;
-        *counts.entry(boundary).or_default() += 1;
         let site_id = required_str(primary, "owner_id", "boundary evidence")?;
         let site = sites
             .iter()
@@ -883,9 +917,38 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
             !reason.is_empty() && site["profile_id"].as_str().is_some(),
             "boundary site lost reason/profile identity: site={site} evidence={primary}"
         );
-        *counts_by_profile
-            .entry(required_str(site, "profile_id", "boundary site")?)
-            .or_default() += 1;
+        let profile_id = required_str(site, "profile_id", "boundary site")?;
+        *counts_by_profile.entry(profile_id).or_default() += 1;
+        let stage = profile_stages
+            .get(profile_id)
+            .copied()
+            .with_context(|| format!("boundary site {site_id} has no Go profile {profile_id}"))?;
+        let occurrence = (
+            boundary.to_owned(),
+            required_str(primary, "path", "boundary evidence")?.to_owned(),
+            primary["start_line"]
+                .as_u64()
+                .context("boundary evidence has no start_line")?,
+            primary["start_column"]
+                .as_u64()
+                .context("boundary evidence has no start_column")?,
+            primary["end_line"]
+                .as_u64()
+                .context("boundary evidence has no end_line")?,
+            primary["end_column"]
+                .as_u64()
+                .context("boundary evidence has no end_column")?,
+            reason.to_owned(),
+        );
+        let first_stage_evidence = occurrence_stages
+            .entry(occurrence)
+            .or_default()
+            .insert(stage);
+        ensure!(
+            first_stage_evidence,
+            "Go boundary occurrence was emitted more than once by one stage: site={site_id} boundary={boundary} path={} reason={reason}",
+            primary["path"]
+        );
         let diagnostic = diagnostics
             .iter()
             .find(|diagnostic| {
@@ -918,19 +981,31 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
             );
         }
     }
+    let mut physical_counts = BTreeMap::<&str, u64>::new();
+    for ((boundary, path, start_line, start_column, end_line, end_column, reason), stages) in
+        &occurrence_stages
+    {
+        let expected_stages = if expected_typed.contains(boundary.as_str()) {
+            BTreeSet::from(["semantic", "typed"])
+        } else {
+            BTreeSet::from(["syntax"])
+        };
+        ensure!(
+            stages == &expected_stages,
+            "Go boundary occurrence has an unexpected stage projection: boundary={boundary} path={path}:{start_line}:{start_column}-{end_line}:{end_column} reason={reason} stages={stages:?}"
+        );
+        *physical_counts.entry(boundary.as_str()).or_default() += 1;
+    }
     ensure!(
-        counts == expected,
-        "Go boundary fixture counts changed: {counts:?}"
+        physical_counts == expected,
+        "Go physical boundary fixture counts changed: {physical_counts:?}"
     );
-    let expected_total = expected.values().sum::<u64>();
-    let mut observed_total = 0;
-    for profile in graph_array(graph, "profiles")?
+    for profile in profiles
         .iter()
         .filter(|profile| profile["language"] == "go")
     {
         let profile_id = required_str(profile, "id", "boundary Go profile")?;
         let count = counts_by_profile.remove(profile_id).unwrap_or_default();
-        observed_total += count;
         ensure!(
             profile["properties"]["go_callgraph_boundary_status"]
                 == if count == 0 { "none" } else { "observed" }
@@ -945,7 +1020,6 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
     }
     ensure!(
         counts_by_profile.is_empty()
-            && observed_total == expected_total
             && string_array_contains(&graph["coverage"]["completeness"], "semantic-complete"),
         "Go boundary graph lost profile ownership or aggregate completeness"
     );

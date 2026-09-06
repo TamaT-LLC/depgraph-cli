@@ -130,6 +130,176 @@ test("repository-root scans discover nested pnpm workspaces and resolve local pa
   );
 });
 
+test("inline pnpm workspace lists preserve nested package ownership and imports", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-inline-pnpm-workspace-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const relatives = [
+    "frontend/package.json",
+    "frontend/pnpm-workspace.yaml",
+    "frontend/apps/web/package.json",
+    "frontend/apps/web/index.ts",
+    "frontend/packages/shared/package.json",
+    "frontend/packages/shared/index.ts",
+    "frontend/packages/excluded/package.json",
+  ];
+  const contents = [
+    JSON.stringify({ name: "frontend", private: true, packageManager: "pnpm@10.33.0" }),
+    "packages: [\"packages/*\", 'apps/*', \"!packages/excluded\"] # static inline list\n",
+    JSON.stringify({ name: "@example/web", dependencies: { "@example/shared": "workspace:*" } }),
+    'import { answer } from "@example/shared"; export const result = answer;\n',
+    JSON.stringify({ name: "@example/shared", version: "1.0.0", exports: "./index.ts" }),
+    "export const answer = 42;\n",
+    JSON.stringify({ name: "@example/excluded", version: "1.0.0" }),
+  ];
+  const files = await Promise.all(relatives.map(async (relative, index) => {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, contents[index]!);
+    return file;
+  }));
+  const workspace = await discoverWorkspace(root, files);
+  assert.deepEqual(workspace.packages.map((record) => record.relativePath), [
+    "frontend",
+    "frontend/apps/web",
+    "frontend/packages/excluded",
+    "frontend/packages/shared",
+  ]);
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/apps/web")?.workspaceRoot, "frontend");
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/packages/shared")?.workspaceRoot, "frontend");
+  assert.equal(workspace.packages.find((record) => record.relativePath === "frontend/packages/excluded")?.workspaceRoot, "frontend/packages/excluded");
+
+  const resolver = await ModuleResolver.create(workspace, files);
+  const owner = workspace.packages.find((record) => record.relativePath === "frontend/apps/web")!;
+  const resolution = await resolver.resolve(rawDependency("@example/shared"), files[3]!, owner);
+  assert.equal(resolution.status, "resolved");
+  assert.deepEqual(
+    resolution.targets.map((target) => target.kind === "file"
+      ? path.relative(root, target.absolutePath).replaceAll("\\", "/")
+      : null),
+    ["frontend/packages/shared/index.ts"],
+  );
+
+  await writeFile(files[1]!, "packages:\n- 'packages/*'\n- \"apps/*\" # don't include generated\n- '!packages/excluded'\n");
+  const indentless = await discoverWorkspace(root, files);
+  assert.equal(
+    indentless.packages.find((record) => record.relativePath === "frontend/apps/web")?.workspaceRoot,
+    "frontend",
+  );
+  assert.equal(
+    indentless.packages.find((record) => record.relativePath === "frontend/packages/excluded")?.workspaceRoot,
+    "frontend/packages/excluded",
+  );
+});
+
+test("independent nested workspaces keep same-name packages and lock scopes separate", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-workspace-scopes-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const files = [
+    "frontend/package.json",
+    "frontend/pnpm-workspace.yml",
+    "frontend/apps/shared/package.json",
+    "frontend/apps/shared/index.ts",
+    "frontend/apps/web/package.json",
+    "frontend/apps/web/index.ts",
+    "backend/package.json",
+    "backend/pnpm-workspace.yaml",
+    "backend/apps/shared/package.json",
+    "backend/apps/shared/index.ts",
+    "backend/apps/web/package.json",
+    "backend/apps/web/index.ts",
+    "backend/apps/only/package.json",
+  ].map((relative) => path.join(root, relative));
+  const contents = [
+    JSON.stringify({ name: "frontend", packageManager: "pnpm@10.33.0" }),
+    "packages:\n  - \"apps/*\"\n",
+    JSON.stringify({ name: "@example/shared", version: "1.0.0", exports: "./index.ts" }),
+    "export const origin = \"frontend\";\n",
+    JSON.stringify({ name: "web", dependencies: { "@example/shared": "workspace:*", "@backend/only": "workspace:*" } }),
+    "import { origin } from \"@example/shared\"; export const value = origin;\n",
+    JSON.stringify({ name: "backend", packageManager: "pnpm@10.33.0" }),
+    "packages:\n  - \"apps/*\"\n",
+    JSON.stringify({ name: "@example/shared", version: "2.0.0", exports: "./index.ts" }),
+    "export const origin = \"backend\";\n",
+    JSON.stringify({ name: "web", dependencies: { "@example/shared": "workspace:*", "@backend/only": "workspace:*" } }),
+    "import { origin } from \"@example/shared\"; export const value = origin;\n",
+    JSON.stringify({ name: "@backend/only", version: "1.0.0", exports: "./index.ts" }),
+  ];
+  await Promise.all(files.map(async (file, index) => {
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, contents[index]!);
+  }));
+  const workspace = await discoverWorkspace(root, files);
+  assert.deepEqual(workspace.packages.map((record) => [record.relativePath, record.workspaceRoot]), [
+    ["backend", "backend"],
+    ["backend/apps/only", "backend"],
+    ["backend/apps/shared", "backend"],
+    ["backend/apps/web", "backend"],
+    ["frontend", "frontend"],
+    ["frontend/apps/shared", "frontend"],
+    ["frontend/apps/web", "frontend"],
+  ]);
+  assert.equal(workspace.scopes.find((scope) => scope.root === "frontend")?.manager, "pnpm");
+  assert.equal(workspace.scopes.find((scope) => scope.root === "backend")?.manager, "pnpm");
+  const resolver = await ModuleResolver.create(workspace, files);
+  const frontendOwner = workspace.packages.find((record) => record.relativePath === "frontend/apps/web")!;
+  const backendOwner = workspace.packages.find((record) => record.relativePath === "backend/apps/web")!;
+  const shared = rawDependency("@example/shared");
+  const frontendResolution = await resolver.resolve(shared, files[5]!, frontendOwner);
+  const backendResolution = await resolver.resolve(shared, files[11]!, backendOwner);
+  const resolvedPaths = (resolution: Awaited<ReturnType<ModuleResolver["resolve"]>>) => resolution.targets
+    .filter((target): target is Extract<(typeof resolution.targets)[number], { kind: "file" }> => target.kind === "file")
+    .map((target) => path.relative(root, target.absolutePath).replaceAll("\\", "/"));
+  assert.equal(frontendResolution.status, "resolved");
+  assert.deepEqual(resolvedPaths(frontendResolution), ["frontend/apps/shared/index.ts"]);
+  assert.equal(backendResolution.status, "resolved");
+  assert.deepEqual(resolvedPaths(backendResolution), ["backend/apps/shared/index.ts"]);
+  const missing = await resolver.resolve(rawDependency("@backend/only"), files[11]!, frontendOwner);
+  assert.equal(missing.status, "unresolved");
+});
+
+test("pnpm workspace declarations own their scope and keep exclusions absolute", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-pnpm-scope-precedence-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const relatives = [
+    "package.json",
+    "pnpm-workspace.yml",
+    "packages/from-package-json/package.json",
+    "apps/included/package.json",
+    "apps/excluded/package.json",
+  ];
+  const contents = [
+    JSON.stringify({ name: "scope-root", workspaces: ["packages/*"] }),
+    "packages:\n  - \"apps/*\"\n  - \"!apps/excluded\"\n",
+    JSON.stringify({ name: "from-package-json" }),
+    JSON.stringify({ name: "included" }),
+    JSON.stringify({ name: "excluded" }),
+  ];
+  const files = await Promise.all(relatives.map(async (relative, index) => {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, contents[index]!);
+    return file;
+  }));
+  const workspace = await discoverWorkspace(root, files);
+  assert.deepEqual(workspace.packages.map((record) => record.relativePath), [
+    ".",
+    "apps/excluded",
+    "apps/included",
+    "packages/from-package-json",
+  ]);
+  assert.deepEqual(workspace.packages
+    .filter((record) => record.relativePath === "apps/excluded" || record.relativePath === "packages/from-package-json")
+    .map((record) => [record.relativePath, record.workspaceRoot]), [
+    ["apps/excluded", "apps/excluded"],
+    ["packages/from-package-json", "packages/from-package-json"],
+  ]);
+  assert.deepEqual(workspace.standaloneManifestPaths, [
+    "apps/excluded/package.json",
+    "packages/from-package-json/package.json",
+  ]);
+  assert.deepEqual(workspace.ignoredManifestPaths, []);
+});
+
 test("TypeScript path mappings preserve declaration order without locale-dependent sorting", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-path-ordering-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

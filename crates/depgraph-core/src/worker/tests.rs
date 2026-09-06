@@ -7386,6 +7386,43 @@ async fn verified_web_release_worker_receives_the_typescript_release_gate() -> R
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_memory_budget_terminates_a_live_process_without_waiting_for_timeout() -> Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let program = resolve_safe_executable("sh", root.path())?;
+    let spec = WorkerSpec {
+        adapter: AdapterKind::Go,
+        artifact_path: program.clone(),
+        program: program.into_os_string(),
+        leading_args: vec!["-c".into(), "exec sleep 30".into()],
+        display: "memory-budget-fixture".into(),
+        runtime_requirement: None,
+        expected_version: None,
+        release_attested: false,
+        attested_rust_sysroot: None,
+    };
+    let started = std::time::Instant::now();
+    let execution = execute_worker_inner_with_cancellation(
+        &spec,
+        root.path(),
+        "memory-budget",
+        &ScanConfig {
+            max_worker_memory_bytes: 1,
+            worker_timeout_seconds: 30,
+            ..ScanConfig::default()
+        },
+        &ProfileConfig::default(),
+        None,
+        std::future::pending::<std::io::Result<()>>(),
+    )
+    .await?;
+    assert_eq!(execution.failure_kind, Some(WorkerFailureKind::MemoryLimit));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn timeout_keeps_the_worker_prefix_and_caps_stderr() -> Result<()> {
@@ -7442,6 +7479,7 @@ exec sleep 10
             max_protocol_bytes: 64 * 1024,
             max_stderr_bytes: 8,
             follow_symlinks: false,
+            ..ScanConfig::default()
         },
         &ProfileConfig::default(),
         None,
@@ -7509,6 +7547,7 @@ setInterval(() => undefined, 1_000);
             max_protocol_bytes: 64 * 1024,
             max_stderr_bytes: 4096,
             follow_symlinks: false,
+            ..ScanConfig::default()
         },
         &ProfileConfig::default(),
         None,
@@ -7587,6 +7626,7 @@ exec sleep 30
             max_protocol_bytes: 64 * 1024,
             max_stderr_bytes: 1024,
             follow_symlinks: false,
+            ..ScanConfig::default()
         },
         &ProfileConfig::default(),
         None,
@@ -7660,6 +7700,7 @@ printf 'operational log' >&2
             max_protocol_bytes: 64 * 1024,
             max_stderr_bytes: 1024,
             follow_symlinks: false,
+            ..ScanConfig::default()
         },
         ProfileConfig::default(),
     )
@@ -7766,6 +7807,7 @@ async fn normal_worker_exit_reaps_pipe_holding_descendants() -> Result<()> {
             max_protocol_bytes: 64 * 1024,
             max_stderr_bytes: 1024,
             follow_symlinks: false,
+            ..ScanConfig::default()
         },
         ProfileConfig::default(),
     )

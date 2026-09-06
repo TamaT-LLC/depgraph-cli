@@ -2417,6 +2417,14 @@ pub(crate) fn validate_web_definition_graph(
                 site.id, site.profile_id
             ));
         }
+        let logical_profile_id =
+            depgraph_protocol::semantic_identity_profile_id(&site.profile_id, &protocol.profiles)
+                .map_err(|error| {
+                format!(
+                    "Web semantic dependency site {} has an invalid profile identity: {error}",
+                    site.id
+                )
+            })?;
         let expected_edge_kind = web_semantic_edge_kind_for_site(&site.kind, site.resolution_status).ok_or_else(|| {
             format!(
                 "Web cumulative semantic profile emitted forbidden semantic dependency site kind {:?}",
@@ -2976,7 +2984,7 @@ pub(crate) fn validate_web_definition_graph(
                         "unknown",
                         &serde_json::json!({
                             "repository": repository_identity,
-                            "profile": site.profile_id,
+                            "profile": logical_profile_id,
                             "language": "web",
                             "identity": "unresolved_dependency_target",
                         }),

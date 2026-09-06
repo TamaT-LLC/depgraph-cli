@@ -1,7 +1,7 @@
 //! Schema migrations and schema/row validation for the SQLite store.
 //!
 //! `Store::migrate` owns every `PRAGMA user_version` transition (v1 through
-//! v18) and the DDL statements each step applies. The free functions
+//! v19) and the DDL statements each step applies. The free functions
 //! alongside it authenticate a pre-migration store's shape and validate that
 //! a migrated schema -- and, where a migration also captures existing rows,
 //! those rows -- exactly match the expected shape. Extracted from `lib.rs`
@@ -967,9 +967,58 @@ impl Store {
             tx.execute_batch("PRAGMA user_version = 18;")?;
             tx.commit()?;
         }
+        if current < 19 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS analysis_scan_metadata (
+                    scan_id TEXT PRIMARY KEY
+                        REFERENCES scans(id) ON DELETE CASCADE,
+                    contract_version TEXT NOT NULL,
+                    plan_id TEXT,
+                    input_digest TEXT,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS analysis_unit_ledger (
+                    scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    contract_version TEXT NOT NULL,
+                    unit_id TEXT NOT NULL,
+                    adapter TEXT NOT NULL,
+                    unit_root TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    chunk_index INTEGER,
+                    chunk_count INTEGER,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('queued', 'running', 'completed',
+                                          'failed', 'cancelled', 'unanalysed', 'unknown')),
+                    reused INTEGER NOT NULL CHECK (reused IN (0, 1)),
+                    source_paths_json TEXT NOT NULL,
+                    context_paths_json TEXT NOT NULL,
+                    auxiliary_paths_json TEXT NOT NULL,
+                    context_fingerprint TEXT,
+                    input_fingerprint TEXT,
+                    dependency_ids_json TEXT NOT NULL,
+                    unknown_dependencies INTEGER NOT NULL CHECK (unknown_dependencies IN (0, 1)),
+                    error TEXT,
+                    PRIMARY KEY (scan_id, unit_id, unit_root, stage, chunk_id),
+                    CHECK ((chunk_index IS NULL AND chunk_count IS NULL)
+                        OR (chunk_index >= 0 AND chunk_count > 0
+                            AND chunk_index < chunk_count))
+                 );
+                 CREATE INDEX IF NOT EXISTS analysis_unit_ledger_scan_status
+                    ON analysis_unit_ledger(scan_id, status, unit_id, stage, chunk_id);
+                 CREATE INDEX IF NOT EXISTS analysis_unit_ledger_unit
+                    ON analysis_unit_ledger(scan_id, unit_id, unit_root, stage, chunk_index);
+                 PRAGMA user_version = 19;",
+            )?;
+            validate_analysis_unit_ledger_schema_and_rows(&tx)?;
+            validate_store_foreign_keys(&tx, 19)?;
+            tx.commit()?;
+        }
         validate_runtime_import_operation_ownership_schema_and_rows(&self.connection)?;
         validate_scan_operation_staging_schema_and_rows(&self.connection)?;
         validate_health_provenance_schema_and_rows(&self.connection)?;
+        validate_analysis_unit_ledger_schema_and_rows(&self.connection)?;
         validate_store_foreign_keys(&self.connection, STORE_SCHEMA_VERSION)?;
         Ok(())
     }
@@ -1476,6 +1525,57 @@ fn validate_health_provenance_schema_and_rows(connection: &Connection) -> Result
             }
             _ => bail!("scan {scan_id} has a partial health provenance tuple"),
         }
+    }
+    Ok(())
+}
+
+fn validate_analysis_unit_ledger_schema_and_rows(connection: &Connection) -> Result<()> {
+    if !table_exists(connection, "analysis_scan_metadata")?
+        || !table_exists(connection, "analysis_unit_ledger")?
+    {
+        bail!("store schema 19 is missing analysis unit ledger tables");
+    }
+    let invalid_rows: u64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM analysis_unit_ledger
+          WHERE typeof(scan_id)!='text' OR length(CAST(scan_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(contract_version)!='text' OR length(contract_version)=0
+             OR typeof(unit_id)!='text' OR length(CAST(unit_id AS BLOB)) NOT BETWEEN 1 AND 4096
+             OR typeof(adapter)!='text' OR length(adapter)=0
+             OR typeof(unit_root)!='text' OR length(CAST(unit_root AS BLOB)) NOT BETWEEN 1 AND 4096
+             OR typeof(stage)!='text' OR length(stage)=0
+             OR typeof(chunk_id)!='text' OR length(CAST(chunk_id AS BLOB)) > 4096
+             OR status NOT IN ('queued', 'running', 'completed', 'failed',
+                               'cancelled', 'unanalysed', 'unknown')
+             OR reused NOT IN (0, 1)
+             OR json_valid(source_paths_json)=0
+             OR json_valid(context_paths_json)=0
+             OR json_valid(auxiliary_paths_json)=0
+             OR json_valid(dependency_ids_json)=0
+             OR unknown_dependencies NOT IN (0, 1)
+             OR (chunk_index IS NULL AND chunk_count IS NOT NULL)
+             OR (chunk_index IS NOT NULL AND (chunk_count IS NULL OR chunk_index < 0
+                                               OR chunk_count <= 0 OR chunk_index >= chunk_count))
+             OR NOT EXISTS (SELECT 1 FROM scans WHERE scans.id=analysis_unit_ledger.scan_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    let metadata_invalid: u64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM analysis_scan_metadata
+          WHERE typeof(scan_id)!='text' OR length(CAST(scan_id AS BLOB)) NOT BETWEEN 1 AND 512
+             OR typeof(contract_version)!='text' OR length(contract_version)=0
+             OR (plan_id IS NOT NULL AND length(plan_id)=0)
+             OR (input_digest IS NOT NULL AND length(input_digest)=0)
+             OR typeof(created_at)!='text' OR length(created_at)=0
+             OR NOT EXISTS (SELECT 1 FROM scans WHERE scans.id=analysis_scan_metadata.scan_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_rows != 0 || metadata_invalid != 0 {
+        bail!(
+            "analysis unit ledger rows are inconsistent: {invalid_rows} invalid rows, {metadata_invalid} invalid metadata"
+        );
     }
     Ok(())
 }

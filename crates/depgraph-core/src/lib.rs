@@ -1,3 +1,4 @@
+mod analysis_canonical;
 mod analysis_checkpoint;
 pub mod analysis_execution;
 pub mod analysis_plan;
@@ -22,6 +23,7 @@ pub mod export;
 pub mod ffi;
 pub mod ffi_link;
 pub mod github_settings;
+pub(crate) mod go_dependency_witness;
 mod graphml;
 pub mod graphql;
 pub mod health;
@@ -62,6 +64,7 @@ mod service_repository;
 mod service_snapshot;
 mod service_store_write;
 pub mod worker;
+mod worker_memory;
 mod worker_progress;
 mod worker_web_semantic;
 
@@ -499,10 +502,10 @@ pub use service::{
     HealthAuditRequest, HealthAuditResult, HealthCoverageOverview, HealthFindingGetRequest,
     HealthFindingsRequest, HealthFindingsResult, HealthHotspotsRequest, HealthHotspotsResult,
     HealthSummaryRequest, HealthSummaryResult, ImpactRequest, ImpactServiceResult,
-    OpenedRepositoryFile, PinnedHealthSnapshot, ProfilePlanRequest, RepositoryFileError,
-    RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath, RequestReadStore,
-    RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
-    UnresolvedRequest, UnresolvedServiceResult,
+    OpenedRepositoryFile, PartialSnapshotMetadata, PinnedHealthSnapshot, ProfilePlanRequest,
+    RepositoryFileError, RepositoryPathError, RepositoryPathSelector, RepositoryRelativePath,
+    RequestReadStore, RequestReadStoreFactory, ResolvedSnapshotId, SnapshotLocator,
+    SnapshotReadRequest, UnresolvedRequest, UnresolvedServiceResult,
 };
 
 use worker::{
@@ -1127,9 +1130,9 @@ pub fn release_compatibility_contract() -> ReleaseCompatibilityHealth {
     ReleaseCompatibilityHealth {
         worker_protocol_version: depgraph_protocol::PROTOCOL_VERSION.to_owned(),
         store_schema_version: STORE_SCHEMA_VERSION,
-        operation_journal_schema_version: 5,
+        operation_journal_schema_version: 6,
         mcp_tool_contract_version: "depgraph-mcp-tools-v1".to_owned(),
-        mcp_operation_contract_version: "depgraph-operation-v1".to_owned(),
+        mcp_operation_contract_version: "depgraph-operation-v2".to_owned(),
         minimum_migratable_store_schema_version: 1,
         previous_release_version: "0.5.3".to_owned(),
         previous_release_store_schema_version: 17,
@@ -2091,14 +2094,14 @@ mod tests {
         verify_release_compatibility(&compatible).unwrap();
         assert_eq!(compatible.worker_protocol_version, "1.0");
         assert_eq!(compatible.store_schema_version, STORE_SCHEMA_VERSION);
-        assert_eq!(compatible.operation_journal_schema_version, 5);
+        assert_eq!(compatible.operation_journal_schema_version, 6);
         assert_eq!(
             compatible.mcp_tool_contract_version,
             "depgraph-mcp-tools-v1"
         );
         assert_eq!(
             compatible.mcp_operation_contract_version,
-            "depgraph-operation-v1"
+            "depgraph-operation-v2"
         );
         assert_eq!(compatible.stable_release_version, "0.5.4");
         assert_eq!(compatible.previous_release_version, "0.5.3");

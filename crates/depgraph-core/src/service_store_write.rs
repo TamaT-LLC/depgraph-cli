@@ -1137,6 +1137,9 @@ fn validate_selector(selector: &SnapshotNameCreateSelector) -> DepgraphServiceRe
         SnapshotNameCreateSelector::Completed(SnapshotLocator::StableId(id)) => {
             SnapshotLocator::parse(id).map(|_| ())
         }
+        SnapshotNameCreateSelector::Completed(SnapshotLocator::Attempt(_)) => {
+            Err(DepgraphServiceError::InvalidInput)
+        }
         SnapshotNameCreateSelector::CompletedForScan(scan_id)
             if !scan_id.is_empty()
                 && scan_id.len() <= 256
@@ -1162,6 +1165,9 @@ fn resolve_completed_snapshot(
         SnapshotNameCreateSelector::Completed(SnapshotLocator::StableId(snapshot_id)) => store
             .completed_snapshot(snapshot_id)
             .map(|snapshot| snapshot.map(|snapshot| snapshot.id)),
+        SnapshotNameCreateSelector::Completed(SnapshotLocator::Attempt(_)) => {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
         SnapshotNameCreateSelector::CompletedForScan(scan_id) => {
             store.snapshot_id_for_scan_selection(scan_id)
         }

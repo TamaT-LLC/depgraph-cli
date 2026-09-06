@@ -405,7 +405,7 @@ impl AnalysisPlan {
 
         let mut current_dependents = BTreeMap::<String, Vec<String>>::new();
         for unit in &current.units {
-            for dependency_id in &unit.dependency_ids {
+            for dependency_id in input_dependency_ids(unit) {
                 current_dependents
                     .entry(dependency_id.clone())
                     .or_default()
@@ -431,7 +431,7 @@ impl AnalysisPlan {
         }
         for removed in &removed_ids {
             for old_unit in &previous.units {
-                if old_unit.dependency_ids.iter().any(|id| id == removed)
+                if input_dependency_ids(old_unit).any(|id| id == removed)
                     && let Some(current_unit) = current_by_id.get(old_unit.id.as_str())
                 {
                     let entry = reasons.entry(current_unit.id.clone()).or_default();
@@ -561,6 +561,7 @@ fn discover_analysis_plan_with_exclusions(
         bail!("analysis plan exceeds its closed unit limit");
     }
     attach_active_go_workspace_manifests(&mut units, &parsed);
+    let web_scopes = attach_web_workspace_manifests(&mut units, &parsed);
     let active_go_workspace_member_ids = active_go_workspace_member_ids(&units, &parsed);
 
     let manifest_to_package_id = units
@@ -583,7 +584,11 @@ fn discover_analysis_plan_with_exclusions(
         })
         .collect::<BTreeMap<_, _>>();
     let go_replacements_by_module = go_replacements_by_module(&parsed, &manifest_to_go_module_id);
-    let web_name_to_project_ids = web_name_index(&units);
+    let web_name_to_project_ids = web_name_index(&units, &web_scopes);
+    let web_resolution = WebResolutionContext {
+        scopes: &web_scopes,
+        name_index: &web_name_to_project_ids,
+    };
     let package_root_index = package_root_index(&units);
 
     let mut references = units
@@ -611,11 +616,14 @@ fn discover_analysis_plan_with_exclusions(
                     &units,
                     &manifest_to_package_id,
                     &manifest_to_go_module_id,
-                    &web_name_to_project_ids,
+                    &web_resolution,
                     &go_resolution,
                 ));
         }
         for member in &manifest.workspace_members {
+            if manifest.adapter == AnalysisAdapter::Web {
+                continue;
+            }
             let Some(workspace_owner_id) = find_workspace_owner(manifest, &units) else {
                 continue;
             };
@@ -631,15 +639,19 @@ fn discover_analysis_plan_with_exclusions(
                 ));
         }
     }
-    add_context_edges(&units, &mut references);
+    add_context_edges(&units, &web_scopes, &mut references);
+    add_web_workspace_members(&units, &web_scopes, &mut references);
     add_static_source_imports(
         &canonical_root,
         &files,
         &mut units,
         &package_root_index,
         &mut references,
-        &go_replacements_by_module,
-        active_go_workspace_member_ids.as_ref(),
+        &SourceImportPlanContext {
+            go_replacements: &go_replacements_by_module,
+            active_go_workspace: active_go_workspace_member_ids.as_ref(),
+            web: &web_resolution,
+        },
     )?;
     if parsed.iter().any(|manifest| {
         manifest.adapter == AnalysisAdapter::Go
@@ -795,6 +807,7 @@ enum FileKind {
     GoManifest,
     GoWorkspace,
     WebManifest,
+    WebWorkspace,
     Config,
 }
 
@@ -806,7 +819,11 @@ impl FileKind {
     const fn is_manifest(self) -> bool {
         matches!(
             self,
-            Self::CargoManifest | Self::GoManifest | Self::GoWorkspace | Self::WebManifest
+            Self::CargoManifest
+                | Self::GoManifest
+                | Self::GoWorkspace
+                | Self::WebManifest
+                | Self::WebWorkspace
         )
     }
 
@@ -818,7 +835,7 @@ impl FileKind {
         match self {
             Self::RustSource | Self::CargoManifest => Some(AnalysisAdapter::Rust),
             Self::GoSource | Self::GoManifest | Self::GoWorkspace => Some(AnalysisAdapter::Go),
-            Self::WebSource | Self::WebManifest => Some(AnalysisAdapter::Web),
+            Self::WebSource | Self::WebManifest | Self::WebWorkspace => Some(AnalysisAdapter::Web),
             Self::Other | Self::Config => None,
         }
     }
@@ -831,6 +848,7 @@ fn classify_file(path: &str) -> FileKind {
         "go.mod" => FileKind::GoManifest,
         "go.work" => FileKind::GoWorkspace,
         "package.json" => FileKind::WebManifest,
+        "pnpm-workspace.yaml" | "pnpm-workspace.yml" => FileKind::WebWorkspace,
         ".depgraph.toml"
         | ".npmrc"
         | ".pnpmfile.cjs"
@@ -844,8 +862,6 @@ fn classify_file(path: &str) -> FileKind {
         | "go.work.sum"
         | "Cargo.lock"
         | "pnpm-lock.yaml"
-        | "pnpm-workspace.yaml"
-        | "pnpm-workspace.yml"
         | "package-lock.json"
         | "npm-shrinkwrap.json"
         | "yarn.lock"
@@ -906,6 +922,21 @@ fn classify_file(path: &str) -> FileKind {
     }
 }
 
+/// Returns whether a path classified for a particular language is relevant to
+/// that adapter's input context. Unclassified files and shared configuration
+/// remain eligible for the existing ownership rules, while source and
+/// manifest files belonging to another adapter must not invalidate this one.
+pub(crate) fn path_belongs_to_adapter(path: &str, adapter: AnalysisAdapter) -> bool {
+    classify_file(path)
+        .adapter()
+        .is_none_or(|path_adapter| path_adapter == adapter)
+}
+
+pub(crate) fn source_path_belongs_to_adapter(path: &str, adapter: AnalysisAdapter) -> bool {
+    let kind = classify_file(path);
+    kind.is_source() && kind.adapter() == Some(adapter)
+}
+
 #[derive(Clone, Debug)]
 struct RawDependency {
     specifier: String,
@@ -944,6 +975,17 @@ struct GoImportResolutionContext<'a> {
     replacements: &'a [GoReplacement],
     active_workspace_member_ids: Option<&'a BTreeSet<String>>,
     source_unit_id: &'a str,
+}
+
+struct WebResolutionContext<'a> {
+    scopes: &'a BTreeMap<String, String>,
+    name_index: &'a BTreeMap<(String, String), Vec<String>>,
+}
+
+struct SourceImportPlanContext<'a> {
+    go_replacements: &'a BTreeMap<String, Vec<GoReplacement>>,
+    active_go_workspace: Option<&'a BTreeSet<String>>,
+    web: &'a WebResolutionContext<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -1113,6 +1155,20 @@ fn build_drafts(files: &BTreeMap<String, FileKind>, parsed: &[ParsedManifest]) -
                 unit_root: root,
                 manifest_paths: vec![manifest.path.clone()],
             }),
+            (AnalysisAdapter::Web, "pnpm-workspace.yaml" | "pnpm-workspace.yml") => {
+                if !parsed.iter().any(|candidate| {
+                    candidate.path == join_relative(&root, "package.json").unwrap_or_default()
+                }) {
+                    add(UnitDraft {
+                        adapter: AnalysisAdapter::Web,
+                        role: AnalysisUnitRole::Context,
+                        kind: AnalysisUnitKind::WebWorkspace,
+                        locator: manifest.path.clone(),
+                        unit_root: root,
+                        manifest_paths: vec![manifest.path.clone()],
+                    });
+                }
+            }
             (AnalysisAdapter::Web, "package.json") => {
                 if manifest.workspace {
                     add(UnitDraft {
@@ -1320,9 +1376,38 @@ fn parse_manifests(root: &Path, paths: &[String]) -> Result<Vec<ParsedManifest>>
             FileKind::GoManifest => parse_go_mod_manifest(path, &text)?,
             FileKind::GoWorkspace => parse_go_work_manifest(path, &text)?,
             FileKind::WebManifest => parse_web_manifest(path, &text)?,
+            FileKind::WebWorkspace => ParsedManifest {
+                path: path.clone(),
+                adapter: AnalysisAdapter::Web,
+                locator: path.clone(),
+                dependencies: Vec::new(),
+                go_replacements: Vec::new(),
+                workspace_members: parse_pnpm_workspace_members(&text)?,
+                workspace: true,
+            },
             _ => continue,
         };
         parsed.push(manifest);
+    }
+    // pnpm's own workspace declaration takes precedence over package.json.
+    // Keep both files as inputs while exposing one workspace context.
+    let pnpm_members = parsed
+        .iter()
+        .filter(|manifest| classify_file(&manifest.path) == FileKind::WebWorkspace)
+        .map(|manifest| {
+            (
+                manifest_directory(&manifest.path).to_owned(),
+                manifest.workspace_members.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for manifest in &mut parsed {
+        if classify_file(&manifest.path) == FileKind::WebManifest
+            && let Some(members) = pnpm_members.get(manifest_directory(&manifest.path))
+        {
+            manifest.workspace = true;
+            manifest.workspace_members = members.clone();
+        }
     }
     parsed.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(parsed)
@@ -1398,19 +1483,15 @@ fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         if line.is_empty() {
             continue;
         }
-        if line == "require (" || line == "replace (" {
-            block = Some(if line.starts_with("require") {
-                "require"
-            } else {
-                "replace"
-            });
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() == 2 && fields[1] == "(" && matches!(fields[0], "require" | "replace") {
+            block = Some(fields[0]);
             continue;
         }
         if line == ")" {
             block = None;
             continue;
         }
-        let fields = line.split_whitespace().collect::<Vec<_>>();
         if let Some(kind) = block {
             match kind {
                 "require" if !fields.is_empty() => {
@@ -1430,7 +1511,7 @@ fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         }
         match fields.first().copied() {
             Some("module") if fields.len() >= 2 => locator = fields[1].to_owned(),
-            Some("require") if fields.len() >= 2 => dependencies.push(RawDependency {
+            Some("require") if fields.len() >= 3 => dependencies.push(RawDependency {
                 specifier: fields[1].to_owned(),
                 version: fields.get(2).map(|value| (*value).to_owned()),
                 kind: AnalysisDependencyKind::ManifestDependency,
@@ -1500,12 +1581,9 @@ fn parse_go_work_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
             .split_once("//")
             .map_or(raw_line, |(line, _)| line)
             .trim();
-        if line == "use (" || line == "replace (" {
-            block = Some(if line.starts_with("use") {
-                "use"
-            } else {
-                "replace"
-            });
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() == 2 && fields[1] == "(" && matches!(fields[0], "use" | "replace") {
+            block = Some(fields[0]);
             continue;
         }
         if line == ")" {
@@ -1527,14 +1605,14 @@ fn parse_go_work_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
                 }
                 _ => {}
             }
-        } else if let Some(value) = line.strip_prefix("use ") {
-            let value = value.trim();
-            if !value.is_empty() {
-                members.push(value.to_owned());
+        } else {
+            match fields.first().copied() {
+                Some("use") if fields.len() >= 2 => members.push(fields[1].to_owned()),
+                Some("replace") if fields.len() >= 2 => {
+                    add_go_replacement(path, &fields[1..], &mut go_replacements)
+                }
+                _ => {}
             }
-        } else if let Some(value) = line.strip_prefix("replace ") {
-            let fields = value.split_whitespace().collect::<Vec<_>>();
-            add_go_replacement(path, &fields, &mut go_replacements);
         }
     }
     Ok(ParsedManifest {
@@ -1546,6 +1624,303 @@ fn parse_go_work_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         workspace_members: members,
         workspace: true,
     })
+}
+
+fn manifest_directory(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map_or(REPOSITORY_ROOT, |(parent, _)| parent)
+}
+
+#[derive(Clone, Copy)]
+enum PnpmQuote {
+    Single,
+    Double,
+}
+
+/// Read only the static packages list. YAML aliases, tags and executable
+/// configuration are deliberately unsupported; they must not widen scope.
+fn parse_pnpm_workspace_members(text: &str) -> Result<Vec<String>> {
+    let mut members = Vec::new();
+    let mut in_packages = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("packages:") {
+            if in_packages {
+                bail!("duplicate pnpm packages declaration");
+            }
+            in_packages = true;
+            let rest = rest.trim();
+            if rest.is_empty() || rest.starts_with('#') {
+                continue;
+            }
+            if !rest.starts_with('[') {
+                bail!("pnpm packages must be a static list");
+            }
+            let mut quote = None;
+            let mut escaped = false;
+            let mut end = None;
+            let mut chars = rest.char_indices().peekable();
+            let _ = chars.next();
+            while let Some((index, ch)) = chars.next() {
+                match quote {
+                    Some(PnpmQuote::Double) => {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            quote = None;
+                        }
+                    }
+                    Some(PnpmQuote::Single) => {
+                        if ch == '\'' {
+                            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                                let _ = chars.next();
+                            } else {
+                                quote = None;
+                            }
+                        }
+                    }
+                    None => match ch {
+                        '\'' => quote = Some(PnpmQuote::Single),
+                        '"' => quote = Some(PnpmQuote::Double),
+                        ']' => {
+                            end = Some(index);
+                            break;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            let end = end.context("pnpm packages must be a static list")?;
+            if quote.is_some() || escaped {
+                bail!("pnpm packages must be a static list");
+            }
+            let suffix = rest[end + 1..].trim();
+            if !suffix.is_empty() && !suffix.starts_with('#') {
+                bail!("pnpm packages must be a static list");
+            }
+
+            let values = &rest[1..end];
+            quote = None;
+            escaped = false;
+            let mut start = 0;
+            let mut chars = values.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                match quote {
+                    Some(PnpmQuote::Double) => {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            quote = None;
+                        }
+                    }
+                    Some(PnpmQuote::Single) => {
+                        if ch == '\'' {
+                            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                                let _ = chars.next();
+                            } else {
+                                quote = None;
+                            }
+                        }
+                    }
+                    None => match ch {
+                        '\'' => quote = Some(PnpmQuote::Single),
+                        '"' => quote = Some(PnpmQuote::Double),
+                        ',' => {
+                            members.push(pnpm_pattern(&values[start..index])?);
+                            start = index + 1;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            if quote.is_some() || escaped {
+                bail!("pnpm packages must be a static list");
+            }
+            if !values[start..].trim().is_empty() {
+                members.push(pnpm_pattern(&values[start..])?);
+            }
+            continue;
+        }
+        if !in_packages || line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            members.push(pnpm_pattern(item)?);
+        } else if !line.starts_with(char::is_whitespace) {
+            break;
+        } else {
+            bail!("pnpm packages contains an unsupported static pattern");
+        }
+    }
+    Ok(members)
+}
+
+fn pnpm_pattern(text: &str) -> Result<String> {
+    let text = text.trim();
+    let value = if text.starts_with('"') {
+        // The deserializer also handles escaped characters without evaluating
+        // YAML tags or interpolation. Trailing comments are outside the scalar.
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<String>();
+        let value = stream.next().context("empty pnpm pattern")??;
+        let tail = text[stream.byte_offset()..].trim();
+        if !tail.is_empty() && !tail.starts_with('#') {
+            bail!("invalid pnpm pattern suffix");
+        }
+        value
+    } else if let Some(tail) = text.strip_prefix('\'') {
+        let mut chars = tail.char_indices().peekable();
+        let mut end = None;
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    let _ = chars.next();
+                } else {
+                    end = Some(index);
+                    break;
+                }
+            }
+        }
+        let end = end.context("unterminated pnpm pattern")?;
+        let suffix = tail[end + 1..].trim();
+        if !suffix.is_empty() && !suffix.starts_with('#') {
+            bail!("invalid pnpm pattern suffix");
+        }
+        tail[..end].replace("''", "'")
+    } else {
+        text.split(" #")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if value.starts_with(['&', '*', '[', '{']) {
+        // A leading '*' without a slash is ambiguous with a YAML alias. A
+        // quoted glob is always accepted by the branches above.
+        if !text.starts_with(['\'', '"']) {
+            bail!("pnpm pattern must be a plain or quoted path");
+        }
+    }
+    if value.is_empty() || value.len() > MAX_PLAN_PATH_CHARS || value.chars().any(char::is_control)
+    {
+        bail!("invalid pnpm pattern");
+    }
+    Ok(value)
+}
+
+/// A nearest workspace owns only its declared members. An excluded manifest
+/// remains a standalone project, with its own package-name resolution scope.
+fn attach_web_workspace_manifests(
+    units: &mut [AnalysisUnit],
+    parsed: &[ParsedManifest],
+) -> BTreeMap<String, String> {
+    let mut workspaces = BTreeMap::<String, (&ParsedManifest, Vec<String>)>::new();
+    for manifest in parsed
+        .iter()
+        .filter(|manifest| manifest.adapter == AnalysisAdapter::Web && manifest.workspace)
+    {
+        let root = manifest_directory(&manifest.path).to_owned();
+        let entry = workspaces.entry(root).or_insert((manifest, Vec::new()));
+        entry.1.push(manifest.path.clone());
+        if classify_file(&manifest.path) == FileKind::WebWorkspace {
+            entry.0 = manifest;
+        }
+    }
+    let mut scopes = BTreeMap::new();
+    for unit in units
+        .iter_mut()
+        .filter(|unit| unit.adapter == AnalysisAdapter::Web)
+    {
+        let owner = workspaces
+            .iter()
+            .filter(|(root, _)| is_within(&unit.unit_root, root))
+            .max_by_key(|(root, _)| root.len());
+        let Some((root, (workspace, paths))) = owner else {
+            scopes.insert(unit.id.clone(), unit.unit_root.clone());
+            continue;
+        };
+        let relative = if unit.unit_root == *root {
+            REPOSITORY_ROOT
+        } else if root == REPOSITORY_ROOT {
+            &unit.unit_root
+        } else {
+            unit.unit_root
+                .strip_prefix(&(root.clone() + "/"))
+                .unwrap_or_default()
+        };
+        if relative == REPOSITORY_ROOT
+            || web_workspace_includes(&workspace.workspace_members, relative)
+        {
+            scopes.insert(unit.id.clone(), root.clone());
+            unit.manifest_paths.extend(paths.iter().cloned());
+            unit.manifest_paths.sort();
+            unit.manifest_paths.dedup();
+        } else {
+            scopes.insert(unit.id.clone(), unit.unit_root.clone());
+        }
+    }
+    scopes
+}
+
+fn web_workspace_includes(patterns: &[String], path: &str) -> bool {
+    let matches = |pattern: &str| {
+        if let Some(open) = pattern.find('{')
+            && let Some(close) = pattern[open..].find('}')
+        {
+            let close = open + close;
+            pattern[open + 1..close].split(',').any(|choice| {
+                glob_matches(
+                    &format!(
+                        "{}{}{}",
+                        &pattern[..open],
+                        choice.trim(),
+                        &pattern[close + 1..]
+                    ),
+                    path,
+                )
+            })
+        } else {
+            glob_matches(pattern, path)
+        }
+    };
+    patterns
+        .iter()
+        .any(|pattern| !pattern.starts_with('!') && matches(pattern))
+        && !patterns
+            .iter()
+            .any(|pattern| pattern.strip_prefix('!').is_some_and(matches))
+}
+
+fn add_web_workspace_members(
+    units: &[AnalysisUnit],
+    scopes: &BTreeMap<String, String>,
+    references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
+) {
+    for workspace in units
+        .iter()
+        .filter(|unit| unit.kind == AnalysisUnitKind::WebWorkspace)
+    {
+        for member in units.iter().filter(|unit| {
+            unit.kind == AnalysisUnitKind::WebProject
+                && unit.unit_root != workspace.unit_root
+                && scopes.get(&unit.id) == Some(&workspace.unit_root)
+        }) {
+            references
+                .entry(workspace.id.clone())
+                .or_default()
+                .push(AnalysisDependencyReference {
+                    target_unit_id: Some(member.id.clone()),
+                    specifier: member.unit_root.clone(),
+                    kind: AnalysisDependencyKind::WorkspaceMember,
+                    resolution: AnalysisDependencyResolution::Resolved,
+                    evidence_path: workspace.manifest_paths.first().cloned(),
+                });
+        }
+    }
 }
 
 fn parse_web_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
@@ -1575,7 +1950,7 @@ fn parse_web_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    let workspace = !workspace_members.is_empty();
+    let workspace = value.get("workspaces").is_some();
     let mut dependencies = Vec::new();
     for section in [
         "dependencies",
@@ -1623,6 +1998,10 @@ fn find_manifest_owner(manifest: &ParsedManifest, units: &[AnalysisUnit]) -> Opt
     units
         .iter()
         .filter(|unit| unit.adapter == manifest.adapter)
+        .filter(|unit| {
+            manifest.adapter != AnalysisAdapter::Web
+                || unit.unit_root == manifest_directory(&manifest.path)
+        })
         .filter(|unit| unit.manifest_paths.contains(&manifest.path))
         .filter(|unit| {
             if manifest.adapter == AnalysisAdapter::Go && manifest.path == "go.work" {
@@ -1777,7 +2156,7 @@ fn resolve_manifest_dependency(
     units: &[AnalysisUnit],
     manifest_to_package_id: &BTreeMap<String, String>,
     manifest_to_go_module_id: &BTreeMap<String, String>,
-    web_name_to_project_ids: &BTreeMap<String, Vec<String>>,
+    web_resolution: &WebResolutionContext<'_>,
     go_resolution: &GoResolutionContext<'_>,
 ) -> AnalysisDependencyReference {
     let mut target = None;
@@ -1842,7 +2221,13 @@ fn resolve_manifest_dependency(
             AnalysisDependencyResolution::Unknown
         };
     } else if manifest.adapter == AnalysisAdapter::Web {
-        if let Some(ids) = web_name_to_project_ids.get(&raw.specifier) {
+        let scope = find_manifest_owner(manifest, units)
+            .and_then(|id| web_resolution.scopes.get(&id).cloned())
+            .unwrap_or_else(|| manifest_directory(&manifest.path).to_owned());
+        if let Some(ids) = web_resolution
+            .name_index
+            .get(&(scope, raw.specifier.clone()))
+        {
             if ids.len() == 1 {
                 target = ids.first().cloned();
                 resolution = AnalysisDependencyResolution::Resolved;
@@ -2001,12 +2386,27 @@ fn resolve_workspace_member(
 
 fn add_context_edges(
     units: &[AnalysisUnit],
+    web_scopes: &BTreeMap<String, String>,
     references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
 ) {
     for executable in units.iter().filter(|unit| unit.is_executable()) {
         for context in units.iter().filter(|unit| {
             unit.adapter == executable.adapter
                 && unit.role == AnalysisUnitRole::Context
+                && (unit.adapter != AnalysisAdapter::Web
+                    || web_scopes.get(&executable.id) == Some(&unit.unit_root))
+                && (unit.kind != AnalysisUnitKind::GoPackage
+                    || most_specific_executable(
+                        &format!("{}/_", unit.unit_root),
+                        AnalysisAdapter::Go,
+                        units,
+                    )
+                    .is_some_and(|owner| owner.id == executable.id))
+                && (unit.kind != AnalysisUnitKind::GoWorkspace
+                    || unit
+                        .manifest_paths
+                        .iter()
+                        .any(|path| executable.manifest_paths.contains(path)))
                 && (is_within(&unit.unit_root, &executable.unit_root)
                     || is_within(&executable.unit_root, &unit.unit_root))
         }) {
@@ -2023,15 +2423,24 @@ fn add_context_edges(
     }
 }
 
-fn web_name_index(units: &[AnalysisUnit]) -> BTreeMap<String, Vec<String>> {
-    let mut index = BTreeMap::<String, Vec<String>>::new();
+fn web_name_index(
+    units: &[AnalysisUnit],
+    scopes: &BTreeMap<String, String>,
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut index = BTreeMap::<(String, String), Vec<String>>::new();
     for unit in units
         .iter()
         .filter(|unit| unit.kind == AnalysisUnitKind::WebProject)
     {
         if !unit.locator.is_empty() {
             index
-                .entry(unit.locator.clone())
+                .entry((
+                    scopes
+                        .get(&unit.id)
+                        .cloned()
+                        .unwrap_or_else(|| unit.unit_root.clone()),
+                    unit.locator.clone(),
+                ))
                 .or_default()
                 .push(unit.id.clone());
         }
@@ -2062,8 +2471,7 @@ fn add_static_source_imports(
     units: &mut [AnalysisUnit],
     package_root_index: &BTreeMap<(AnalysisAdapter, String), String>,
     references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
-    go_replacements_by_module: &BTreeMap<String, Vec<GoReplacement>>,
-    active_go_workspace_member_ids: Option<&BTreeSet<String>>,
+    context: &SourceImportPlanContext<'_>,
 ) -> Result<()> {
     for (path, kind) in files {
         if !kind.is_source() {
@@ -2086,22 +2494,62 @@ fn add_static_source_imports(
         let owner_id = owner.id.clone();
         let go_resolution = GoImportResolutionContext {
             replacements: (adapter == AnalysisAdapter::Go)
-                .then(|| go_replacements_by_module.get(&owner_id))
+                .then(|| context.go_replacements.get(&owner_id))
                 .flatten()
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
-            active_workspace_member_ids: active_go_workspace_member_ids,
+            active_workspace_member_ids: context.active_go_workspace,
             source_unit_id: &owner_id,
         };
         for specifier in imports {
-            let (target, resolution) = resolve_source_import(
-                adapter,
-                path,
-                &specifier,
-                units,
-                package_root_index,
-                &go_resolution,
-            );
+            let (target, resolution) = if adapter == AnalysisAdapter::Web
+                && !specifier.starts_with(['.', '/'])
+            {
+                let package = web_import_package_name(&specifier);
+                let scope = context
+                    .web
+                    .scopes
+                    .get(&owner_id)
+                    .unwrap_or(&owner.unit_root);
+                match context
+                    .web
+                    .name_index
+                    .get(&(scope.clone(), package.to_owned()))
+                    .map(Vec::as_slice)
+                {
+                    Some([id]) => (Some(id.clone()), AnalysisDependencyResolution::Resolved),
+                    Some(_) => (None, AnalysisDependencyResolution::Unknown),
+                    None => {
+                        let declared = references
+                            .get(&owner_id)
+                            .into_iter()
+                            .flatten()
+                            .find(|reference| reference.specifier == package);
+                        (
+                            None,
+                            if specifier.starts_with("node:")
+                                || specifier.contains("://")
+                                || declared.is_some_and(|reference| {
+                                    reference.resolution == AnalysisDependencyResolution::External
+                                })
+                            {
+                                AnalysisDependencyResolution::External
+                            } else {
+                                AnalysisDependencyResolution::Unknown
+                            },
+                        )
+                    }
+                }
+            } else {
+                resolve_source_import(
+                    adapter,
+                    path,
+                    &specifier,
+                    units,
+                    package_root_index,
+                    &go_resolution,
+                )
+            };
             references
                 .entry(owner_id.clone())
                 .or_default()
@@ -2191,9 +2639,7 @@ fn extract_web_imports(root: &Path, path: &str) -> Result<Vec<String>> {
                 let Some(value) = quoted_value(rest) else {
                     break;
                 };
-                if (value.starts_with(".") || value.starts_with("/"))
-                    && imports.len() < MAX_IMPORTS_PER_FILE
-                {
+                if imports.len() < MAX_IMPORTS_PER_FILE {
                     imports.push(value);
                 }
                 let Some(end) = rest.find(['"', '\'']) else {
@@ -2211,6 +2657,16 @@ fn extract_web_imports(root: &Path, path: &str) -> Result<Vec<String>> {
     imports.sort();
     imports.dedup();
     Ok(imports)
+}
+
+fn web_import_package_name(specifier: &str) -> &str {
+    let mut boundaries = specifier.match_indices('/');
+    if specifier.starts_with('@') {
+        boundaries.next();
+    }
+    boundaries
+        .next()
+        .map_or(specifier, |(end, _)| &specifier[..end])
 }
 
 fn quoted_value(value: &str) -> Option<String> {
@@ -2449,11 +2905,12 @@ fn finalize_units(
             all_config_paths
                 .iter()
                 .filter(|path| {
-                    // Root-level workspace metadata governs nested units. A
-                    // unit also owns configuration below its source root.
+                    // Ancestor metadata keeps nested workspace lockfiles and
+                    // compiler configuration in the unit's input proof.
                     *path == ".depgraph.toml"
                         || !path.contains('/')
                         || is_within(path, &unit.unit_root)
+                        || is_within(&unit.unit_root, manifest_directory(path))
                 })
                 .cloned()
                 .collect()
@@ -2497,13 +2954,13 @@ fn finalize_units(
             "references": unit.dependency_references,
         });
         let mut closure = BTreeSet::new();
-        let mut queue = VecDeque::from_iter(unit.dependency_ids.iter().cloned());
+        let mut queue = VecDeque::from_iter(input_dependency_ids(unit).cloned());
         while let Some(target_id) = queue.pop_front() {
             if !closure.insert(target_id.clone()) {
                 continue;
             }
             if let Some(target) = by_id.get(&target_id) {
-                queue.extend(target.dependency_ids.iter().cloned());
+                queue.extend(input_dependency_ids(target).cloned());
             }
         }
         let closure_signatures = closure
@@ -2549,6 +3006,19 @@ fn finalize_units(
             .collect();
     }
     Ok(())
+}
+
+/// Workspace membership describes topology, not an input read by every
+/// sibling compiler context. Preserve those graph edges without invalidating
+/// all siblings whenever an unrelated member's source changes.
+pub(crate) fn input_dependency_ids(unit: &AnalysisUnit) -> impl Iterator<Item = &String> {
+    unit.dependency_references
+        .iter()
+        .filter(|reference| {
+            reference.kind != AnalysisDependencyKind::WorkspaceMember
+                && reference.resolution == AnalysisDependencyResolution::Resolved
+        })
+        .filter_map(|reference| reference.target_unit_id.as_ref())
 }
 
 fn profile_scope(unit: &AnalysisUnit, definition_ids: &[String]) -> Result<AnalysisProfileScope> {
@@ -3112,6 +3582,7 @@ fn kind_name(kind: FileKind) -> &'static str {
         FileKind::GoManifest => "go_manifest",
         FileKind::GoWorkspace => "go_workspace",
         FileKind::WebManifest => "web_manifest",
+        FileKind::WebWorkspace => "web_workspace",
         FileKind::Config => "config",
     }
 }
@@ -3334,31 +3805,44 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 }
 
 fn glob_segments(pattern: Vec<&str>, value: Vec<&str>) -> bool {
-    if pattern.is_empty() {
-        return value.is_empty();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for segment in pattern {
+        let mut next = vec![false; value.len() + 1];
+        if segment == "**" {
+            next[0] = matched[0];
+        }
+        for index in 0..value.len() {
+            next[index + 1] = if segment == "**" {
+                matched[index + 1] || next[index]
+            } else {
+                matched[index] && segment_matches(segment, value[index])
+            };
+        }
+        matched = next;
     }
-    if pattern[0] == "**" {
-        return glob_segments(pattern[1..].to_vec(), value.clone())
-            || (!value.is_empty() && glob_segments(pattern, value[1..].to_vec()));
-    }
-    if value.is_empty() || !segment_matches(pattern[0], value[0]) {
-        return false;
-    }
-    glob_segments(pattern[1..].to_vec(), value[1..].to_vec())
+    matched[value.len()]
 }
 
 fn segment_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    let value = value.chars().collect::<Vec<_>>();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for ch in pattern.chars() {
+        let mut next = vec![false; value.len() + 1];
+        if ch == '*' {
+            next[0] = matched[0];
+        }
+        for index in 0..value.len() {
+            next[index + 1] = if ch == '*' {
+                matched[index + 1] || next[index]
+            } else {
+                matched[index] && (ch == '?' || ch == value[index])
+            };
+        }
+        matched = next;
     }
-    let mut remaining = value;
-    for part in pattern.split('*').filter(|part| !part.is_empty()) {
-        let Some(index) = remaining.find(part) else {
-            return false;
-        };
-        remaining = &remaining[index + part.len()..];
-    }
-    pattern.ends_with('*') || remaining.is_empty()
+    matched[value.len()]
 }
 
 #[cfg(test)]
@@ -3372,6 +3856,210 @@ mod tests {
 
     fn input() -> AnalysisPlanInput {
         AnalysisPlanInput::new(["profile:web:source"], "web-worker@unit-test")
+    }
+
+    #[test]
+    fn nested_pnpm_scopes_bind_all_members_and_isolate_names_and_inputs() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(
+            root.path().join("go.mod"),
+            "module example.test/root\ngo 1.23\n",
+        )?;
+        fs::write(root.path().join("main.go"), "package root\n")?;
+        for scope in ["frontend", "tools"] {
+            for relative in [
+                "apps/web",
+                "packages/shared",
+                "packages/unused",
+                "packages/excluded",
+            ] {
+                let directory = root.path().join(scope).join(relative);
+                fs::create_dir_all(&directory)?;
+                let manifest = if relative == "apps/web" {
+                    json!({"name":"app","dependencies":{"@example/shared":"workspace:*","missing-here":"workspace:*"}})
+                } else {
+                    json!({"name": if relative == "packages/shared" { "@example/shared" } else if scope == "tools" && relative == "packages/unused" { "missing-here" } else { relative }})
+                };
+                fs::write(directory.join("package.json"), manifest.to_string())?;
+                fs::write(directory.join("index.ts"), "export const value = 42;\n")?;
+            }
+            fs::write(
+                root.path().join(scope).join("package.json"),
+                json!({"name":scope,"packageManager":"pnpm@10","workspaces":["wrong/*"]})
+                    .to_string(),
+            )?;
+            fs::write(
+                root.path().join(scope).join("pnpm-workspace.yaml"),
+                "packages:\n  - '{apps,packages}/*'\n  - '!packages/excluded' # keep it standalone\n",
+            )?;
+            fs::write(
+                root.path().join(scope).join("pnpm-lock.yaml"),
+                "lockfileVersion: '9.0'\n",
+            )?;
+        }
+        let before = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let project = |root: &str| {
+            before
+                .units
+                .iter()
+                .find(|unit| unit.kind == AnalysisUnitKind::WebProject && unit.unit_root == root)
+                .unwrap()
+        };
+        let app = project("frontend/apps/web");
+        let shared = project("frontend/packages/shared");
+        assert!(app.dependency_ids.contains(&shared.id));
+        assert!(
+            !app.dependency_ids
+                .contains(&project("tools/packages/shared").id)
+        );
+        assert!(
+            app.dependency_references
+                .iter()
+                .any(|reference| reference.specifier == "missing-here"
+                    && reference.resolution == AnalysisDependencyResolution::Unknown)
+        );
+        assert!(
+            app.manifest_paths
+                .contains(&"frontend/pnpm-workspace.yaml".to_owned())
+        );
+        assert!(
+            app.config_paths
+                .contains(&"frontend/pnpm-lock.yaml".to_owned())
+        );
+        assert!(
+            !app.config_paths
+                .contains(&"tools/pnpm-lock.yaml".to_owned())
+        );
+        let workspace = before
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == AnalysisUnitKind::WebWorkspace && unit.unit_root == "frontend"
+            })
+            .unwrap();
+        let members = workspace
+            .dependency_references
+            .iter()
+            .filter(|reference| reference.kind == AnalysisDependencyKind::WorkspaceMember)
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 3);
+        assert!(
+            !workspace
+                .dependency_ids
+                .contains(&project("frontend/packages/excluded").id)
+        );
+
+        // Use the independently resolved shared package for selective reuse:
+        // the app intentionally contains an unknown dependency above.
+        fs::write(
+            root.path().join("tools/packages/shared/index.ts"),
+            "export const value = 99;\n",
+        )?;
+        let after = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        assert_eq!(
+            before.unit(&shared.id).unwrap().input_fingerprint,
+            after.unit(&shared.id).unwrap().input_fingerprint
+        );
+        fs::write(
+            root.path().join("frontend/pnpm-lock.yaml"),
+            "lockfileVersion: '9.1'\n",
+        )?;
+        let changed = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        assert_ne!(
+            before.unit(&shared.id).unwrap().input_fingerprint,
+            changed.unit(&shared.id).unwrap().input_fingerprint
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_static_patterns_are_anchored_and_support_flow_lists() -> Result<()> {
+        let patterns = parse_pnpm_workspace_members(
+            r#"packages: ["packages/*", "packages/with\"quote/*", 'packages/with,comma/*', "!packages/excluded"] # static [comment]
+catalog: {}
+"#,
+        )?;
+        assert!(web_workspace_includes(&patterns, "packages/shared"));
+        assert!(web_workspace_includes(
+            &patterns,
+            "packages/with\"quote/lib"
+        ));
+        assert!(web_workspace_includes(&patterns, "packages/with,comma/lib"));
+        assert!(!web_workspace_includes(&patterns, "packages/excluded"));
+        assert!(!glob_matches("packages/shared", "packages/not-shared"));
+        assert!(glob_matches(
+            "packages/**/src/*",
+            "packages/a/b/src/index.ts"
+        ));
+        assert!(parse_pnpm_workspace_members("packages: *dynamic\n").is_err());
+        assert_eq!(
+            parse_pnpm_workspace_members(
+                "packages:\n- 'apps/*' # don't change scope\n- 'packages/it''s/*' # quoted 'comment'\n"
+            )?,
+            ["apps/*", "packages/it's/*"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_workspace_list_with_comment_preserves_nested_member_scope() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("frontend/apps/web/src"))?;
+        fs::create_dir_all(root.path().join("frontend/packages/shared/src"))?;
+        fs::write(
+            root.path().join("frontend/pnpm-workspace.yaml"),
+            r#"packages: ["apps/*", "packages/*"] # trailing comment [not a member]
+"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/apps/web/package.json"),
+            r#"{"name":"web","dependencies":{"@example/shared":"workspace:*"}}"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/packages/shared/package.json"),
+            r#"{"name":"@example/shared","version":"1.0.0"}"#,
+        )?;
+        fs::write(
+            root.path().join("frontend/apps/web/src/index.ts"),
+            "import { shared } from \"@example/shared\";\nexport const web = shared;\n",
+        )?;
+        fs::write(
+            root.path().join("frontend/packages/shared/src/index.ts"),
+            "export const shared = 1;\n",
+        )?;
+
+        let plan = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let project = |unit_root: &str| {
+            plan.units
+                .iter()
+                .find(|unit| {
+                    unit.kind == AnalysisUnitKind::WebProject && unit.unit_root == unit_root
+                })
+                .unwrap()
+        };
+        let app = project("frontend/apps/web");
+        let shared = project("frontend/packages/shared");
+        let workspace = plan
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == AnalysisUnitKind::WebWorkspace && unit.unit_root == "frontend"
+            })
+            .unwrap();
+
+        assert!(
+            app.manifest_paths
+                .contains(&"frontend/pnpm-workspace.yaml".to_owned())
+        );
+        assert!(
+            shared
+                .manifest_paths
+                .contains(&"frontend/pnpm-workspace.yaml".to_owned())
+        );
+        assert!(app.dependency_ids.contains(&shared.id));
+        assert!(workspace.dependency_ids.contains(&app.id));
+        assert!(workspace.dependency_ids.contains(&shared.id));
+        Ok(())
     }
 
     fn polyglot_fixture(root: &Path) -> Result<()> {
@@ -3686,6 +4374,25 @@ mod tests {
                 && reference.resolution == AnalysisDependencyResolution::Unknown
                 && reference.evidence_path.as_deref() == Some("go.work")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn go_manifest_and_workspace_directives_accept_tab_separated_forms() -> Result<()> {
+        let go_mod = parse_go_mod_manifest(
+            "app/go.mod",
+            "module\texample.test/app\n\ngo 1.26\nrequire\t(\n\texample.test/shared v1.0.0\n)\nreplace\t(\n\texample.test/shared => ./../shared\n)\n",
+        )?;
+        assert_eq!(go_mod.locator, "example.test/app");
+        assert_eq!(go_mod.dependencies.len(), 1);
+        assert_eq!(go_mod.go_replacements.len(), 1);
+
+        let go_work = parse_go_work_manifest(
+            "go.work",
+            "go 1.26\nuse\t(\n\t./app\n)\nreplace\texample.test/shared => ./shared\n",
+        )?;
+        assert_eq!(go_work.workspace_members, vec!["./app"]);
+        assert_eq!(go_work.go_replacements.len(), 1);
         Ok(())
     }
 

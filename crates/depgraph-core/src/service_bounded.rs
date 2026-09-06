@@ -472,6 +472,15 @@ impl DepgraphService {
         cancellation: &CancellationToken,
         migration_compatible: bool,
     ) -> DepgraphServiceResult<SnapshotReadRequest> {
+        check_cancellation(cancellation)?;
+        // Bounded-query and runtime-validation v1 contracts bind a completed
+        // snapshot digest. Partial attempts use the explicit graph-query APIs.
+        if matches!(
+            selector,
+            ServiceSnapshotSelector::Locator(SnapshotLocator::Attempt(_))
+        ) {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
         match selector {
             ServiceSnapshotSelector::Locator(locator) if migration_compatible => {
                 self.start_snapshot_request_at_before_migration(locator, cancellation)

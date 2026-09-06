@@ -100,6 +100,12 @@ impl IncrementalReplacementScope {
 }
 
 impl Store {
+    /// Legacy graph deltas cannot preserve the immutable analysis-unit ledger.
+    /// Follow sparse overlays as well, since their effective graph is inherited.
+    pub fn completed_snapshot_uses_analysis_units(&self, snapshot_id: &str) -> Result<bool> {
+        snapshot_uses_analysis_units(&self.connection, snapshot_id)
+    }
+
     pub fn delta_base_graph(&self, snapshot_id: &str) -> Result<DeltaBaseGraph> {
         load_delta_base_graph(&self.connection, snapshot_id)
     }
@@ -448,6 +454,7 @@ impl Store {
         if base.source_kind != "scan" {
             bail!("incremental replacement requires a completed scan snapshot base");
         }
+        ensure_legacy_delta_base(&self.connection, base_snapshot_id)?;
         if self.current_snapshot_id()?.as_deref() != Some(base_snapshot_id) {
             bail!("incremental base snapshot is not the current completed snapshot");
         }
@@ -484,6 +491,7 @@ impl Store {
         }
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
+        ensure_legacy_delta_base(&tx, base_snapshot_id)?;
         let parent: Option<String> = tx.query_row(
             "SELECT parent_snapshot_id FROM scans WHERE id=?1",
             [scan_id],
@@ -632,7 +640,46 @@ fn load_staged_delta(
     })
 }
 
+fn snapshot_uses_analysis_units(connection: &Connection, snapshot_id: &str) -> Result<bool> {
+    let mut current = snapshot_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            bail!("completed snapshot parent cycle detected while checking analysis units");
+        }
+        let record = load_completed_snapshot_record(connection, &current)?
+            .with_context(|| format!("completed snapshot {current} was not found"))?;
+        if record.source_kind != "scan" {
+            return Ok(false);
+        }
+        let scan_id = record.scan_id.as_str();
+        let scoped: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM analysis_scan_metadata WHERE scan_id=?1
+                           AND contract_version != 'depgraph-analysis-unit-legacy')
+             OR EXISTS(SELECT 1 FROM profiles WHERE scan_id=?1
+                       AND json_extract(json, '$.properties.analysis_unit_contract') IS NOT NULL)",
+            [scan_id],
+            |row| row.get(0),
+        )?;
+        if scoped {
+            return Ok(true);
+        }
+        if !scan_is_semantic_noop_overlay(connection, scan_id)? {
+            return Ok(false);
+        }
+        current = incremental_parent(connection, scan_id)?;
+    }
+}
+
+fn ensure_legacy_delta_base(connection: &Connection, snapshot_id: &str) -> Result<()> {
+    if snapshot_uses_analysis_units(connection, snapshot_id)? {
+        bail!("analysis-unit snapshots require the resumable scheduler, not a legacy graph delta");
+    }
+    Ok(())
+}
+
 fn load_delta_base_graph(connection: &Connection, snapshot_id: &str) -> Result<DeltaBaseGraph> {
+    ensure_legacy_delta_base(connection, snapshot_id)?;
     let mut current = snapshot_id.to_owned();
     let mut visited = BTreeSet::new();
     let mut overlays = Vec::new();
@@ -677,6 +724,9 @@ fn semantic_noop_delta_base(
     snapshot_id: &str,
     path: &str,
 ) -> Result<Option<DeltaBaseGraph>> {
+    if snapshot_uses_analysis_units(connection, snapshot_id)? {
+        return Ok(None);
+    }
     let record = load_completed_snapshot_record(connection, snapshot_id)?
         .with_context(|| format!("completed delta base snapshot {snapshot_id} was not found"))?;
     if record.source_kind != "scan" {
@@ -2433,6 +2483,101 @@ mod tests {
             store.current_snapshot_id().unwrap().as_deref(),
             Some(base_id.as_str())
         );
+    }
+
+    #[test]
+    fn analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger() {
+        let mut store = Store::open_in_memory().unwrap();
+        let scan_id = "analysis-base";
+        let (events, _) = stable_graph_events(scan_id);
+        store
+            .start_scan(scan_id, Path::new("/fixture"), false)
+            .unwrap();
+        store
+            .initialize_analysis_unit_ledger(
+                scan_id,
+                "depgraph-analysis-unit-v2",
+                Some("plan"),
+                Some("input"),
+                &[],
+            )
+            .unwrap();
+        store
+            .ingest_events(&events.iter().collect::<Vec<_>>())
+            .unwrap();
+        store.validate_scan(scan_id).unwrap();
+        store.finish_scan(scan_id, "completed", None, true).unwrap();
+        let snapshot = store.current_snapshot_id().unwrap().unwrap();
+        assert!(
+            store
+                .completed_snapshot_uses_analysis_units(&snapshot)
+                .unwrap()
+        );
+        assert!(
+            store
+                .semantic_noop_delta_base(&snapshot, "src/index.ts")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .delta_base_graph(&snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("resumable scheduler")
+        );
+        assert!(
+            store
+                .start_incremental_scan_with_revision(
+                    "bad-target",
+                    Path::new("/fixture"),
+                    false,
+                    &snapshot,
+                    None
+                )
+                .is_err()
+        );
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM scans WHERE id='bad-target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "rejected legacy delta left an untracked staging scan"
+        );
+        assert_eq!(
+            store.current_snapshot_id().unwrap().as_deref(),
+            Some(snapshot.as_str())
+        );
+        assert!(store.analysis_coverage(scan_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors() {
+        let (store, snapshot, base_scan, _, _) =
+            completed_semantic_noop_fixture("analysis-overlay");
+        // Model a snapshot made before this guard existed. A sparse overlay
+        // has no profiles or analysis metadata of its own, so inspect its base.
+        store.connection.execute(
+            "INSERT INTO analysis_scan_metadata(scan_id, contract_version, plan_id, input_digest, created_at)
+             VALUES (?1, 'depgraph-analysis-unit-v2', 'plan', 'input', 'fixture')", [&base_scan],
+        ).unwrap();
+        assert!(
+            store
+                .completed_snapshot_uses_analysis_units(&snapshot)
+                .unwrap()
+        );
+        assert!(
+            store
+                .semantic_noop_delta_base(&snapshot, "src/index.ts")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.delta_base_graph(&snapshot).is_err());
     }
 
     #[test]

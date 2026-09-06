@@ -33,6 +33,114 @@ use tempfile::TempDir;
 const NOW: i64 = 1_800_000_000_000;
 const DEADLINE: i64 = NOW + 60_000;
 
+#[test]
+fn unbounded_scan_survives_the_old_deadline_and_starts_retention_at_completion() {
+    let (_root, _store, config, mut journal) = journal();
+    let deadline = depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64;
+    let submitted = journal
+        .submit(
+            &request(&config, json!({"strict":false}), b"unbounded", deadline),
+            NOW,
+        )
+        .unwrap();
+    let id = submitted.operation_id().clone();
+    let two_hours = NOW + 2 * 60 * 60 * 1_000;
+    journal
+        .acquire_lease(
+            &repository(),
+            &id,
+            &LeaseOwner::parse("runner").unwrap(),
+            b"lease",
+            NOW + 1,
+            two_hours + 10_000,
+        )
+        .unwrap();
+    journal
+        .update_progress(
+            &repository(),
+            &id,
+            b"lease",
+            OperationProgress::new(0, 4).unwrap(),
+            NOW + 2,
+        )
+        .unwrap();
+    journal
+        .update_progress(
+            &repository(),
+            &id,
+            b"lease",
+            OperationProgress::new(2, 4).unwrap(),
+            two_hours,
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.update_progress(
+            &repository(),
+            &id,
+            b"lease",
+            OperationProgress::new(2, 5).unwrap(),
+            two_hours + 1
+        ),
+        Err(JournalError::InvalidArgument)
+    ));
+    let completed = journal
+        .complete(
+            &repository(),
+            &id,
+            b"lease",
+            CanonicalJson::new(json!({"ok":true})).unwrap(),
+            two_hours + 2,
+        )
+        .unwrap();
+    assert_eq!(completed.status(), OperationStatus::Completed);
+    assert_eq!(
+        completed.retain_until_ms(),
+        two_hours + 2 + TERMINAL_RETENTION_MS
+    );
+    journal.validate().unwrap();
+    drop(journal);
+    OperationJournal::open(&config).unwrap().validate().unwrap();
+}
+
+#[test]
+fn only_scan_operations_can_omit_their_execution_deadline() {
+    let (_root, _store, config, _journal) = journal();
+    assert!(matches!(
+        SubmitRequest::new(
+            &config,
+            OperationKind::DaemonStop,
+            &json!({}),
+            b"unbounded-stop",
+            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64
+        ),
+        Err(JournalError::InvalidArgument)
+    ));
+}
+
+#[test]
+fn bounded_v5_journal_migrates_without_rewriting_existing_deadlines() {
+    let (_root, _store, config, mut journal) = journal();
+    let submitted = journal
+        .submit(&request(&config, json!({}), b"v5", DEADLINE), NOW)
+        .unwrap();
+    let id = submitted.operation_id().clone();
+    drop(journal);
+    let path = operation_journal_path(&config);
+    let connection = Connection::open(path).unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    drop(connection);
+    let journal = OperationJournal::open(&config).unwrap();
+    assert_eq!(journal.schema_version().unwrap(), JOURNAL_SCHEMA_VERSION);
+    assert_eq!(
+        journal
+            .get(&repository(), &id, NOW + 1)
+            .unwrap()
+            .execution_deadline_ms(),
+        DEADLINE
+    );
+    journal.validate().unwrap();
+}
+
 fn repository() -> LogicalRepositoryId {
     LogicalRepositoryId::parse("repo-primary").unwrap()
 }
@@ -812,7 +920,7 @@ fn current_schema_integrity_binding_metadata_and_required_objects_are_validated(
     drop(second);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 6")
+        .pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION + 1)
         .unwrap();
     assert!(matches!(
         OperationJournal::open(&config),

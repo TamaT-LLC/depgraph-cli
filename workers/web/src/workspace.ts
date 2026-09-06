@@ -12,7 +12,19 @@ export interface PackageRecord {
   version: string;
   locator: string;
   id: string;
+  /** Repository-relative workspace root which owns this package. */
+  workspaceRoot: string;
+  /** Manager and lockfile selected within this workspace scope. */
+  manager: string;
+  lockfile: string | null;
   dependencies: Map<string, { range: string; section: DependencySection }>;
+}
+
+export interface WorkspaceScope {
+  root: string;
+  manager: string;
+  lockfile: string | null;
+  lockInstances: Map<string, LockInstance[]>;
 }
 
 export interface LockInstance {
@@ -40,11 +52,15 @@ export interface Workspace {
   rootManifest: Record<string, unknown> | null;
   packages: PackageRecord[];
   packageByName: Map<string, PackageRecord[]>;
+  packageByScopeName: Map<string, Map<string, PackageRecord[]>>;
+  scopes: WorkspaceScope[];
   manager: string;
   lockfile: string | null;
   lockInstances: Map<string, LockInstance[]>;
   workspaceNode: GraphNode;
   issues: WorkspaceIssue[];
+  /** Valid manifests excluded by a workspace glob, retained as standalone scopes. */
+  standaloneManifestPaths: string[];
   ignoredManifestPaths: string[];
 }
 
@@ -192,7 +208,8 @@ export function selectPackageInstallCandidates(
   declared: string | null = owner.dependencies.get(name)?.range ?? null,
   excludedWorkspacePackageIds: ReadonlySet<string> = new Set(),
 ): PackageInstallSelection {
-  const local = (workspace.packageByName.get(name) ?? [])
+  const scopedPackages = workspace.packageByScopeName.get(owner.workspaceRoot);
+  const local = (scopedPackages === undefined ? workspace.packageByName.get(name) ?? [] : scopedPackages.get(name) ?? [])
     .filter((record) => !excludedWorkspacePackageIds.has(record.id));
   if (declared !== null) {
     const explicit = explicitLocalPackages(owner, declared, local, workspace.packages);
@@ -206,7 +223,10 @@ export function selectPackageInstallCandidates(
     }
   }
 
-  const locked = workspace.lockInstances.get(name) ?? [];
+  const scoped = workspace.scopes.find((scope) => scope.root === owner.workspaceRoot);
+  const locked = scoped === undefined
+    ? workspace.lockInstances.get(name) ?? []
+    : scoped.lockInstances.get(name) ?? [];
   const localMatches = declared === null
     ? local
     : local.filter((record) => semverSatisfies(record.version, declared) !== false);
@@ -217,7 +237,7 @@ export function selectPackageInstallCandidates(
     ? lockedMatches
     : [{
       version: declared ?? "unknown",
-      locator: `${workspace.manager}:${name}@${declared ?? "unknown"}`,
+      locator: `${owner.manager}:${name}@${declared ?? "unknown"}`,
     }];
   const candidateCount = localMatches.length + externalInstances.length;
   const mixed = localMatches.length > 0 && externalInstances.length > 0;
@@ -270,26 +290,271 @@ async function loadManifest(root: string, file: string): Promise<{ manifest: Rec
   }
 }
 
+const MAX_PNPM_PATTERN_BYTES = 4_096;
+
+function hasValidPnpmScalarSuffix(text: string, consumed: number): boolean {
+  const suffix = text.slice(consumed).trim();
+  return suffix.length === 0 || suffix.startsWith("#");
+}
+
+function parsePnpmJsonString(text: string): string | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePnpmDoubleQuotedPattern(text: string): string | null {
+  const match = text.match(/^"(?:\\[\s\S]|[^"\\])*"/u);
+  if (match === null) return null;
+  if (!hasValidPnpmScalarSuffix(text, match[0].length)) return null;
+  return parsePnpmJsonString(match[0]);
+}
+
+function parsePnpmSingleQuotedPattern(text: string): string | null {
+  const match = text.match(/^'((?:''|[^'])*)'/u);
+  if (match === null) return null;
+  if (!hasValidPnpmScalarSuffix(text, match[0].length)) return null;
+  return match[1]!.replaceAll("''", "'");
+}
+
+function parsePnpmPlainPattern(text: string): string | null {
+  const value = text.split(" #", 1)[0]!.trim();
+  return value.length > 0 ? value : null;
+}
+
+function isPnpmControlCharacter(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+}
+
+function hasPnpmControlCharacter(value: string): boolean {
+  return [...value].some(isPnpmControlCharacter);
+}
+
+/**
+ * Parse one static pnpm workspace scalar without evaluating YAML features.
+ * This mirrors the planner's conservative parser: quoted strings are
+ * decoded, plain scalars retain `#` unless it starts a comment, and aliases,
+ * tags, and flow collections are rejected instead of widening the workspace.
+ */
+function decodePnpmPattern(trimmed: string): string | null {
+  if (trimmed.startsWith('"')) return parsePnpmDoubleQuotedPattern(trimmed);
+  if (trimmed.startsWith("'")) return parsePnpmSingleQuotedPattern(trimmed);
+  return parsePnpmPlainPattern(trimmed);
+}
+
+function hasPnpmPatternBounds(value: string): boolean {
+  return value.length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_PNPM_PATTERN_BYTES
+    && !hasPnpmControlCharacter(value);
+}
+
+function isPnpmPatternPrefixAllowed(value: string, trimmed: string): boolean {
+  return !/^[&*[{]/u.test(value) || /^['"]/u.test(trimmed);
+}
+
+function parsePnpmPattern(text: string): string | null {
+  const trimmed = text.trim();
+  const value = decodePnpmPattern(trimmed);
+  if (value === null || !hasPnpmPatternBounds(value)) return null;
+  return isPnpmPatternPrefixAllowed(value, trimmed) ? value : null;
+}
+
+interface PnpmFlowScan {
+  closing: number;
+  commas: number[];
+}
+
+type PnpmFlowQuote = '"' | "'" | null;
+type PnpmFlowDelimiter = "," | "]" | null;
+
+interface PnpmFlowStep {
+  quote: PnpmFlowQuote;
+  escaped: boolean;
+  skip: number;
+  delimiter: PnpmFlowDelimiter;
+}
+
+function scanPnpmDoubleQuote(text: string, index: number, escaped: boolean): PnpmFlowStep {
+  const character = text[index]!;
+  if (escaped) return { quote: '"', escaped: false, skip: 0, delimiter: null };
+  if (character === "\\") return { quote: '"', escaped: true, skip: 0, delimiter: null };
+  return { quote: character === '"' ? null : '"', escaped: false, skip: 0, delimiter: null };
+}
+
+function scanPnpmSingleQuote(text: string, index: number): PnpmFlowStep {
+  const character = text[index]!;
+  if (character !== "'") return { quote: "'", escaped: false, skip: 0, delimiter: null };
+  if (text[index + 1] === "'") return { quote: "'", escaped: false, skip: 1, delimiter: null };
+  return { quote: null, escaped: false, skip: 0, delimiter: null };
+}
+
+function scanPnpmQuote(character: string): PnpmFlowQuote {
+  if (character === '"') return '"';
+  if (character === "'") return "'";
+  return null;
+}
+
+function scanPnpmDelimiter(character: string): PnpmFlowDelimiter {
+  if (character === ",") return ",";
+  if (character === "]") return "]";
+  return null;
+}
+
+function scanPnpmUnquoted(text: string, index: number): PnpmFlowStep {
+  const character = text[index]!;
+  const quote = scanPnpmQuote(character);
+  if (quote !== null) return { quote, escaped: false, skip: 0, delimiter: null };
+  return { quote: null, escaped: false, skip: 0, delimiter: scanPnpmDelimiter(character) };
+}
+
+function scanPnpmFlowStep(text: string, index: number, quote: PnpmFlowQuote, escaped: boolean): PnpmFlowStep {
+  if (quote === '"') return scanPnpmDoubleQuote(text, index, escaped);
+  if (quote === "'") return scanPnpmSingleQuote(text, index);
+  return scanPnpmUnquoted(text, index);
+}
+
+function scanPnpmFlow(text: string): PnpmFlowScan | null {
+  let quote: PnpmFlowQuote = null;
+  let escaped = false;
+  const commas: number[] = [];
+  for (let index = 1; index < text.length; index += 1) {
+    const step = scanPnpmFlowStep(text, index, quote, escaped);
+    quote = step.quote;
+    escaped = step.escaped;
+    index += step.skip;
+    if (step.delimiter === ",") commas.push(index);
+    else if (step.delimiter === "]") return { closing: index, commas };
+  }
+  return null;
+}
+
+function appendPnpmFlowPattern(patterns: string[], text: string, start: number, end: number): boolean {
+  const pattern = parsePnpmPattern(text.slice(start, end).trim());
+  if (pattern === null) return false;
+  patterns.push(pattern);
+  return true;
+}
+
+function appendPnpmFlowFinal(patterns: string[], text: string, scan: PnpmFlowScan, start: number): string[] | null {
+  const final = text.slice(start, scan.closing).trim();
+  if (final.length === 0) return patterns;
+  return appendPnpmFlowPattern(patterns, final, 0, final.length) ? patterns : null;
+}
+
+function parsePnpmFlowValues(text: string, scan: PnpmFlowScan): string[] | null {
+  const patterns: string[] = [];
+  let start = 1;
+  for (const comma of scan.commas) {
+    if (!appendPnpmFlowPattern(patterns, text, start, comma)) return null;
+    start = comma + 1;
+  }
+  return appendPnpmFlowFinal(patterns, text, scan, start);
+}
+
+function parsePnpmFlowList(text: string): string[] | null {
+  if (!text.startsWith("[")) return null;
+  const scan = scanPnpmFlow(text);
+  if (scan === null) return null;
+  const { closing } = scan;
+  if (!hasValidPnpmScalarSuffix(text, closing + 1)) return null;
+  return parsePnpmFlowValues(text, scan);
+}
+
+type PnpmWorkspaceLine =
+  | { kind: "ignore" }
+  | { kind: "item"; value: string }
+  | { kind: "end" }
+  | { kind: "invalid" }
+  | { kind: "duplicate" };
+
+interface PnpmWorkspaceDeclaration {
+  rest: string;
+  body: string[];
+}
+
+function isPnpmIgnoredWorkspaceLine(line: string): boolean {
+  return line.trim().length === 0 || line.trimStart().startsWith("#");
+}
+
+function classifyPnpmWorkspaceBoundary(line: string): PnpmWorkspaceLine {
+  return /^\s/u.test(line) ? { kind: "invalid" } : { kind: "end" };
+}
+
+function classifyPnpmWorkspaceLine(line: string): PnpmWorkspaceLine {
+  if (line.startsWith("packages:")) return { kind: "duplicate" };
+  const trimmed = line.trimStart();
+  if (isPnpmIgnoredWorkspaceLine(line)) return { kind: "ignore" };
+  if (trimmed.startsWith("- ")) return { kind: "item", value: trimmed.slice(2) };
+  return classifyPnpmWorkspaceBoundary(line);
+}
+
+function nonIgnoredPnpmWorkspaceLines(lines: string[]): PnpmWorkspaceLine[] {
+  return lines.flatMap((rawLine) => {
+    const line = classifyPnpmWorkspaceLine(rawLine.trimEnd());
+    return line.kind === "ignore" ? [] : [line];
+  });
+}
+
+function findPnpmWorkspaceDeclaration(lines: string[]): PnpmWorkspaceDeclaration | null {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trimEnd();
+    if (line.startsWith("packages:")) {
+      return { rest: line.slice("packages:".length).trim(), body: lines.slice(index + 1) };
+    }
+  }
+  return null;
+}
+
+function parsePnpmWorkspaceDeclaration(rest: string): string[] | null {
+  if (rest.length === 0 || rest.startsWith("#")) return [];
+  return parsePnpmFlowList(rest);
+}
+
+function parsePnpmWorkspaceItemPattern(line: PnpmWorkspaceLine): string | null {
+  return line.kind === "item" ? parsePnpmPattern(line.value) : null;
+}
+
+function parsePnpmWorkspaceItems(lines: string[]): string[] | null {
+  const patterns: string[] = [];
+  for (const line of nonIgnoredPnpmWorkspaceLines(lines)) {
+    if (line.kind === "end") break;
+    const pattern = parsePnpmWorkspaceItemPattern(line);
+    if (pattern === null) return null;
+    patterns.push(pattern);
+  }
+  return patterns;
+}
+
+/** Read the static `packages` list in a pnpm workspace declaration. */
+function parsePnpmWorkspacePatterns(source: string): string[] {
+  const declaration = findPnpmWorkspaceDeclaration(source.split(/\r?\n/u));
+  if (declaration === null) return [];
+  const inline = parsePnpmWorkspaceDeclaration(declaration.rest);
+  if (inline === null) return [];
+  const items = parsePnpmWorkspaceItems(declaration.body);
+  if (items === null) return [];
+  return [...inline, ...items];
+}
+
 function workspacePatterns(manifest: Record<string, unknown> | null, pnpmSource: string | null): string[] {
   const result: string[] = [];
-  const workspaces = manifest?.workspaces;
-  if (Array.isArray(workspaces)) {
-    result.push(...workspaces.filter((item): item is string => typeof item === "string"));
-  } else if (workspaces !== null && typeof workspaces === "object") {
-    const packages = (workspaces as Record<string, unknown>).packages;
-    if (Array.isArray(packages)) result.push(...packages.filter((item): item is string => typeof item === "string"));
-  }
-  if (pnpmSource !== null) {
-    let inPackages = false;
-    for (const line of pnpmSource.split(/\r?\n/u)) {
-      if (/^packages\s*:/u.test(line)) {
-        inPackages = true;
-        continue;
-      }
-      if (inPackages && /^\S/u.test(line) && line.trim() !== "") break;
-      const match = inPackages ? line.match(/^\s*-\s*['"]?([^'"#]+?)['"]?\s*$/u) : null;
-      if (match?.[1]) result.push(match[1].trim());
+  // pnpm treats pnpm-workspace.yaml as the workspace declaration for that
+  // root. Do not merge package.json workspaces into it: doing so can make a
+  // package selected by one declaration appear in the other manager's scope.
+  if (pnpmSource === null) {
+    const workspaces = manifest?.workspaces;
+    if (Array.isArray(workspaces)) {
+      result.push(...workspaces.filter((item): item is string => typeof item === "string"));
+    } else if (workspaces !== null && typeof workspaces === "object") {
+      const packages = (workspaces as Record<string, unknown>).packages;
+      if (Array.isArray(packages)) result.push(...packages.filter((item): item is string => typeof item === "string"));
     }
+  } else {
+    result.push(...parsePnpmWorkspacePatterns(pnpmSource));
   }
   const expanded = result.flatMap((value) => {
     const match = value.match(/^(.*?)\{([^{}]+)\}(.*)$/u);
@@ -301,6 +566,13 @@ function workspacePatterns(manifest: Record<string, unknown> | null, pnpmSource:
   // to exclude a path included by an earlier positive rule. Keep declaration
   // order while removing exact duplicates.
   return [...new Set(expanded.map((value) => normalizeRelative(value.replace(/\/$/u, ""))))];
+}
+
+function pnpmWorkspaceFileFor(relativeRoot: string, files: ReadonlySet<string>): string | null {
+  const yaml = relativeRoot === "." ? "pnpm-workspace.yaml" : normalizeRelative(path.join(relativeRoot, "pnpm-workspace.yaml"));
+  if (files.has(yaml)) return yaml;
+  const yml = relativeRoot === "." ? "pnpm-workspace.yml" : normalizeRelative(path.join(relativeRoot, "pnpm-workspace.yml"));
+  return files.has(yml) ? yml : null;
 }
 
 function globRegex(pattern: string): RegExp {
@@ -321,11 +593,15 @@ function globRegex(pattern: string): RegExp {
 function isWorkspacePath(relative: string, patterns: string[]): boolean {
   if (relative === ".") return true;
   if (patterns.length === 0) return false;
+  // Exclusions are absolute for ownership. This matches the planner's
+  // fail-closed interpretation: a later positive glob must not re-admit a
+  // package explicitly excluded by the workspace declaration.
+  if (patterns.some((pattern) => pattern.startsWith("!") && globRegex(pattern.slice(1)).test(relative))) {
+    return false;
+  }
   let included = false;
   for (const pattern of patterns) {
-    if (pattern.startsWith("!")) {
-      if (globRegex(pattern.slice(1)).test(relative)) included = false;
-    } else if (globRegex(pattern).test(relative)) included = true;
+    if (!pattern.startsWith("!") && globRegex(pattern).test(relative)) included = true;
   }
   return included;
 }
@@ -333,14 +609,6 @@ function isWorkspacePath(relative: string, patterns: string[]): boolean {
 interface WorkspaceRule {
   root: string;
   patterns: string[];
-}
-
-function isWorkspacePackagePath(relative: string, rules: readonly WorkspaceRule[]): boolean {
-  return rules.some((rule) => {
-    const local = normalizeRelative(path.relative(rule.root, relative));
-    if (local === ".." || local.startsWith("../")) return false;
-    return local === "." || isWorkspacePath(local, rule.patterns);
-  });
 }
 
 function normalizeRemote(value: string): string {
@@ -629,7 +897,8 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
   const rootLoad = relativeFiles.has("package.json") ? await loadManifest(root, rootManifestPath) : { manifest: null };
   const rootManifest = rootLoad.manifest;
   if (rootLoad.issue) issues.push(rootLoad.issue);
-  const pnpmSource = await readUtf8(root, path.join(root, "pnpm-workspace.yaml"));
+  const rootPnpmWorkspaceFile = pnpmWorkspaceFileFor(".", relativeFiles);
+  const pnpmSource = rootPnpmWorkspaceFile === null ? null : await readUtf8(root, path.join(root, rootPnpmWorkspaceFile));
   const manifestCandidates = allFiles
     .filter((file) => path.basename(file) === "package.json")
     .map((file) => ({ file, relative: normalizeRelative(path.relative(root, path.dirname(file))) }));
@@ -643,31 +912,53 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
   // Keep each rule relative to the directory which declares it so nested
   // package globs are not accidentally interpreted from the repository root.
   const workspaceRootPaths = new Set<string>(["."]);
+  const pnpmWorkspaceNames = new Set(["pnpm-workspace.yaml", "pnpm-workspace.yml"]);
   for (const file of allFiles) {
-    if (path.basename(file) !== "pnpm-workspace.yaml") continue;
+    if (!pnpmWorkspaceNames.has(path.basename(file))) continue;
     workspaceRootPaths.add(normalizeRelative(path.relative(root, path.dirname(file))));
   }
   for (const candidate of manifestCandidates) {
     const manifest = manifestLoads.get(candidate.relative)?.manifest;
-    const yamlPath = candidate.relative === "."
-      ? "pnpm-workspace.yaml"
-      : normalizeRelative(path.join(candidate.relative, "pnpm-workspace.yaml"));
+    const yamlPath = pnpmWorkspaceFileFor(candidate.relative, relativeFiles);
     if (manifest !== null && manifest !== undefined && (
       Object.hasOwn(manifest, "workspaces")
-      || relativeFiles.has(yamlPath)
+      || yamlPath !== null
     )) workspaceRootPaths.add(candidate.relative);
   }
   const workspaceRules: WorkspaceRule[] = [];
   for (const workspaceRoot of [...workspaceRootPaths].sort(compareUtf8)) {
     const manifest = manifestLoads.get(workspaceRoot)?.manifest ?? null;
-    const yamlPath = workspaceRoot === "."
-      ? "pnpm-workspace.yaml"
-      : normalizeRelative(path.join(workspaceRoot, "pnpm-workspace.yaml"));
-    const yaml = workspaceRoot === "." ? pnpmSource : relativeFiles.has(yamlPath)
-      ? await readUtf8(root, path.join(root, ...yamlPath.split("/")))
-      : null;
+    const yamlPath = pnpmWorkspaceFileFor(workspaceRoot, relativeFiles);
+    const yaml = workspaceRoot === "." ? pnpmSource : yamlPath === null
+      ? null
+      : await readUtf8(root, path.join(root, ...yamlPath.split("/")));
     workspaceRules.push({ root: workspaceRoot, patterns: workspacePatterns(manifest, yaml) });
   }
+  const containingWorkspaceRule = (relative: string): WorkspaceRule | undefined => workspaceRules
+    .filter((rule) => {
+      const local = normalizeRelative(path.relative(rule.root, relative));
+      return local === "." || (local !== ".." && !local.startsWith("../"));
+    })
+    .sort((left, right) => right.root.length - left.root.length || compareUtf8(left.root, right.root))[0];
+  // Every manifest is an analysis unit. A manifest excluded by its nearest
+  // workspace declaration keeps an isolated package/lock scope, so it can be
+  // scanned and its own dependencies can be resolved without becoming a
+  // candidate for the containing workspace or a sibling workspace.
+  const packageScopeRoots = new Map<string, string>();
+  const standalonePackagePaths = new Set<string>();
+  for (const candidate of manifestCandidates) {
+    const rule = containingWorkspaceRule(candidate.relative);
+    if (rule === undefined) {
+      packageScopeRoots.set(candidate.relative, candidate.relative);
+      if (candidate.relative !== ".") standalonePackagePaths.add(candidate.relative);
+      continue;
+    }
+    const local = normalizeRelative(path.relative(rule.root, candidate.relative));
+    const included = local === "." || isWorkspacePath(local, rule.patterns);
+    packageScopeRoots.set(candidate.relative, included ? rule.root : candidate.relative);
+    if (!included) standalonePackagePaths.add(candidate.relative);
+  }
+  const scopeRootPaths = new Set([...workspaceRootPaths, ...packageScopeRoots.values()]);
   const repository = await repositoryIdentity(root, rootManifest, allFiles);
   const { manager, lockfile, ambiguousLockfiles } = detectManager(rootManifest, relativeFiles);
   for (const ambiguous of ambiguousLockfiles) {
@@ -725,9 +1016,61 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
       for (const [name, instances] of pnpLoad.instances) lockInstances.set(name, instances);
     }
   }
-  const manifests = manifestCandidates.filter(({ relative }) => isWorkspacePackagePath(relative, workspaceRules));
+  // Keep package-manager metadata scoped to the workspace root which declares
+  // it. A repository may contain independent nested pnpm/yarn workspaces;
+  // merging their lock catalogs would resolve an owner against a sibling
+  // workspace with the same package name.
+  const scopes: WorkspaceScope[] = [];
+  for (const workspaceRoot of [...scopeRootPaths].sort(compareUtf8)) {
+    if (workspaceRoot === ".") {
+      scopes.push({ root: ".", manager, lockfile, lockInstances });
+      continue;
+    }
+    const scopeFiles = new Set(
+      [...relativeFiles]
+        .filter((relative) => relative === workspaceRoot || relative.startsWith(`${workspaceRoot}/`))
+        .map((relative) => normalizeRelative(path.relative(workspaceRoot, relative))),
+    );
+    const scopeManifest = manifestLoads.get(workspaceRoot)?.manifest ?? null;
+    const detected = detectManager(scopeManifest, scopeFiles);
+    const scopeIssuesPath = (value: string): string => normalizeRelative(path.join(workspaceRoot, value));
+    for (const ambiguous of detected.ambiguousLockfiles) {
+      issues.push({
+        code: "web.package_manager_ambiguous",
+        path: scopeIssuesPath(ambiguous),
+        reason: `package manager is ambiguous in workspace ${workspaceRoot}: ${detected.ambiguousLockfiles.join(", ")}; no lockfile was selected`,
+      });
+    }
+    if (detected.lockfile === "bun.lockb") {
+      issues.push({
+        code: "web.lockfile_unsupported",
+        path: scopeIssuesPath(detected.lockfile),
+        reason: "binary bun.lockb cannot be interpreted by the safe static scanner; use Bun's text bun.lock format for exact package versions",
+      });
+    }
+    const loaded = await loadLockInstances(path.join(root, workspaceRoot), detected.manager, detected.lockfile);
+    if (detected.lockfile !== null && loaded.invalidReason !== null) {
+      issues.push({ code: "web.lockfile_invalid", path: scopeIssuesPath(detected.lockfile), reason: loaded.invalidReason });
+    }
+    scopes.push({
+      root: workspaceRoot,
+      manager: detected.manager,
+      lockfile: detected.lockfile === null ? null : scopeIssuesPath(detected.lockfile),
+      lockInstances: loaded.instances,
+    });
+  }
+  if (scopes.length === 0) scopes.push({ root: ".", manager, lockfile, lockInstances });
+  const scopeForPackage = (relative: string): WorkspaceScope => {
+    const scopeRoot = packageScopeRoots.get(relative) ?? ".";
+    return scopes.find((scope) => scope.root === scopeRoot) ?? scopes[0]!;
+  };
+  const manifests = manifestCandidates;
+  const standaloneManifestPaths = manifestCandidates
+    .filter(({ relative }) => standalonePackagePaths.has(relative) && manifestLoads.get(relative)?.manifest !== null)
+    .map(({ file }) => normalizeRelative(path.relative(root, file)))
+    .sort();
   const ignoredManifestPaths = manifestCandidates
-    .filter(({ relative }) => !isWorkspacePackagePath(relative, workspaceRules))
+    .filter(({ relative }) => manifestLoads.get(relative)?.manifest === null)
     .map(({ file }) => normalizeRelative(path.relative(root, file)))
     .sort();
   const packages: PackageRecord[] = [];
@@ -736,9 +1079,10 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
     if (loaded.issue) issues.push(loaded.issue);
     const manifest = loaded.manifest;
     if (!manifest) continue;
+    const scope = scopeForPackage(relative);
     const name = stringValue(manifest.name, relative === "." ? "workspace-root" : path.basename(relative));
     const version = stringValue(manifest.version, "0.0.0-workspace");
-    const locator = `${manager}:workspace:${name}@${version}#${relative}`;
+    const locator = `${scope.manager}:workspace:${name}@${version}#${relative}`;
     packages.push({
       absolutePath: path.dirname(file),
       relativePath: relative,
@@ -747,7 +1091,10 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
       name,
       version,
       locator,
-      id: stableId("package", { repository, workspace: relative, manager, locator }),
+      workspaceRoot: scope.root,
+      manager: scope.manager,
+      lockfile: scope.lockfile,
+      id: stableId("package", { repository, workspace: relative, workspace_root: scope.root, manager: scope.manager, locator }),
       dependencies: dependenciesOf(manifest),
     });
   }
@@ -762,12 +1109,21 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
       name,
       version: "0.0.0",
       locator,
+      workspaceRoot: ".",
+      manager: "synthetic",
+      lockfile: null,
       id: stableId("package", { repository, workspace: ".", manager: "synthetic", locator }),
       dependencies: new Map(),
     });
   }
   const packageByName = new Map<string, PackageRecord[]>();
   for (const record of packages) packageByName.set(record.name, [...(packageByName.get(record.name) ?? []), record]);
+  const packageByScopeName = new Map<string, Map<string, PackageRecord[]>>();
+  for (const record of packages) {
+    const byName = packageByScopeName.get(record.workspaceRoot) ?? new Map<string, PackageRecord[]>();
+    byName.set(record.name, [...(byName.get(record.name) ?? []), record]);
+    packageByScopeName.set(record.workspaceRoot, byName);
+  }
   const workspaceId = stableId("workspace", { repository, root: "." });
   const workspaceNode: GraphNode = {
     id: workspaceId,
@@ -787,11 +1143,14 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
     rootManifest,
     packages,
     packageByName,
+    packageByScopeName,
+    scopes,
     manager,
     lockfile,
     lockInstances,
     workspaceNode,
     issues: issues.sort((left, right) => compareUtf8(`${left.path}\0${left.code}`, `${right.path}\0${right.code}`)),
+    standaloneManifestPaths,
     ignoredManifestPaths,
   };
 }

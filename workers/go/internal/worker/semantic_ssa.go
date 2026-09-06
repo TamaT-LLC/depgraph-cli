@@ -81,6 +81,11 @@ func (e *goSemanticExtractor) emitSSACalls() {
 	vtaFallbackByInput := map[*goSSAInput]string{}
 	completeByInput := map[*goSSAInput]bool{}
 	buildFailures := map[*goSSAInput]bool{}
+	completedInputs := 0
+	reportInputCompleted := func() {
+		completedInputs++
+		e.state.reportProgress("go_ssa", "progress", completedInputs)
+	}
 	for _, input := range inputs {
 		build, err := buildGoSSA(input)
 		if err != nil {
@@ -90,6 +95,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 			e.complete = false
 			e.addSSABuildDiagnostic(input, err)
+			reportInputCompleted()
 			continue
 		}
 		completeByInput[input] = build.complete
@@ -107,6 +113,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			buildFailures[input] = true
 			e.complete = false
 			e.addSSABuildDiagnostic(input, fmt.Errorf("CHA construction failed: %w", err))
+			reportInputCompleted()
 			continue
 		}
 		chaByInput[input] = indexGoSSAGraph(input, chaGraph)
@@ -143,6 +150,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		if !buildFailures[input] {
 			rtaByInput[input] = rtaIndex
 		}
+		reportInputCompleted()
 	}
 
 	for _, pending := range e.pendingCalls {
@@ -217,7 +225,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			pending, algorithm, selectionReason, fallbackReason, len(targetIDs), outcome.requestedVTA,
 		)
 		if !e.addCandidateCall(pending, targetIDs, evidence) {
-			siteID := goSSAPendingSiteID(e.state.profile.ID, pending, evidence)
+			siteID := goSSAPendingSiteID(e.state.identityProfileID(), pending, evidence)
 			if _, exists := e.state.sites[siteID]; !exists {
 				e.addSSASiteDiagnostic(
 					pending,
@@ -283,6 +291,11 @@ func (e *goSemanticExtractor) recordSSAPolicy() {
 	e.state.profile.Properties["go_call_graph_library_partial"] = "cha"
 	e.state.profile.Properties["go_call_graph_vta_prerequisites"] = "complete-program,instantiate-generics,serial-ssa"
 	e.state.profile.Properties["go_call_graph_vta_engine"] = goVTACallGraphEngine
+	if e.state.analysisUnit != nil {
+		e.state.profile.Properties["go_typed_load_progress_granularity"] = "package-boundary-after-packages-load"
+		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build"
+		e.state.profile.Properties["go_analysis_atomic_operations"] = "go_packages_load,ssa_program_build"
+	}
 }
 
 func (e *goSemanticExtractor) recordSSAOutcome(outcome *goSSAOutcome) {
@@ -928,7 +941,7 @@ func (e *goSemanticExtractor) addSSABuildDiagnostic(input *goSSAInput, err error
 	}
 	detail := normalizeGoPackagesMessage(e.state.root, err.Error())
 	message := "Go SSA call graph could not be constructed; dynamic calls remain unresolved: " + detail
-	identity := map[string]any{"code": "go_ssa_build_failed", "path": path, "profile_id": e.state.profile.ID, "message": message}
+	identity := map[string]any{"code": "go_ssa_build_failed", "path": path, "profile_id": e.state.identityProfileID(), "message": message}
 	diagnostic := Diagnostic{
 		ID: stableIDFromValue("diagnostic", identity), Code: "go_ssa_build_failed", Severity: "warning",
 		Message: message, ProfileID: e.state.profile.ID, Path: path, Recoverable: true,
@@ -952,7 +965,7 @@ func (e *goSemanticExtractor) addSSAPartialDiagnostic(input *goSSAInput, reason 
 	}
 	message := "Go SSA dependency bodies are incomplete; CHA is used instead of " + requested + ": " + normalizeGoPackagesMessage(e.state.root, reason)
 	identity := map[string]any{
-		"code": "go_ssa_partial_program", "path": path, "profile_id": e.state.profile.ID,
+		"code": "go_ssa_partial_program", "path": path, "profile_id": e.state.identityProfileID(),
 		"reason": reason,
 	}
 	diagnostic := Diagnostic{
@@ -976,7 +989,7 @@ func (e *goSemanticExtractor) addSSAVTAFallbackDiagnostic(input *goSSAInput, err
 	detail := normalizeGoPackagesMessage(e.state.root, err.Error())
 	message := "Go VTA construction failed; the default RTA/CHA policy is used: " + detail
 	identity := map[string]any{
-		"code": "go_ssa_vta_fallback", "path": path, "profile_id": e.state.profile.ID,
+		"code": "go_ssa_vta_fallback", "path": path, "profile_id": e.state.identityProfileID(),
 		"reason": "vta_construction_failed_fallback", "message": message,
 	}
 	diagnostic := Diagnostic{
@@ -999,7 +1012,7 @@ func (e *goSemanticExtractor) addSSASiteDiagnostic(pending goSemanticPendingCall
 	}
 	primary := pending.evidence[0]
 	identity := map[string]any{
-		"code": code, "path": pending.file.Path, "profile_id": e.state.profile.ID,
+		"code": code, "path": pending.file.Path, "profile_id": e.state.identityProfileID(),
 		"span": goSemanticSpan(primary),
 	}
 	diagnostic := Diagnostic{

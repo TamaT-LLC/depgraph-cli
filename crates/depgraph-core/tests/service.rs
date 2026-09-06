@@ -744,6 +744,92 @@ fn snapshot_requests_pin_completed_stable_ids_and_keep_path_selectors_separate()
 }
 
 #[test]
+fn terminal_partial_attempts_are_explicitly_pinned_without_a_completed_snapshot() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_directory = temporary.path().join("cache");
+    let store_path = store_directory.join("graph.db");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&store_directory)?;
+
+    let mut writer = Store::open(&store_path)?;
+    writer.start_scan("partial-attempt", &root, false)?;
+    writer.initialize_analysis_unit_ledger(
+        "partial-attempt",
+        "depgraph-analysis-unit-v2",
+        Some(
+            "analysis-plan:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        &[depgraph_store::AnalysisUnitLedgerRecord {
+            scan_id: "partial-attempt".to_owned(),
+            contract_version: "depgraph-analysis-unit-v2".to_owned(),
+            unit_id: "go:module".to_owned(),
+            adapter: "go".to_owned(),
+            unit_root: ".".to_owned(),
+            stage: "syntax".to_owned(),
+            chunk_id: "chunk-0".to_owned(),
+            chunk_index: Some(0),
+            chunk_count: Some(1),
+            status: "unanalysed".to_owned(),
+            reused: false,
+            source_paths: vec!["main.go".to_owned()],
+            context_paths: vec!["main.go".to_owned()],
+            auxiliary_paths: Vec::new(),
+            context_fingerprint: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            input_fingerprint: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            dependency_ids: Vec::new(),
+            unknown_dependencies: true,
+            error: None,
+        }],
+    )?;
+    writer.finish_scan(
+        "partial-attempt",
+        "partial",
+        Some("worker budget exhausted"),
+        false,
+    )?;
+    assert!(writer.current_snapshot_id()?.is_none());
+
+    let service = read_only_service(&root, &store_path)?;
+    let request = service.start_snapshot_request("attempt:partial-attempt")?;
+    assert!(request.is_partial());
+    assert_eq!(request.snapshot_id().as_str(), "attempt:partial-attempt");
+    let metadata = request.partial_metadata().expect("partial metadata");
+    assert_eq!(metadata.attempt_id(), "partial-attempt");
+    assert_eq!(metadata.status(), "partial");
+    assert_eq!(metadata.root(), root.to_string_lossy());
+    assert_eq!(metadata.error(), Some("worker budget exhausted"));
+    let coverage = metadata
+        .analysis_coverage()
+        .expect("analysis ledger summary");
+    assert_eq!(coverage.expected_units, 1);
+    assert!(!coverage.complete);
+
+    let found = service.find_nodes_page(
+        request.snapshot_id(),
+        "main",
+        NodeMatchMode::Contains,
+        &[],
+        0,
+        10,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(found.snapshot_id().as_str(), "attempt:partial-attempt");
+    assert_eq!(found.total_items(), 0);
+
+    assert!(matches!(
+        service.start_snapshot_request("attempt:missing"),
+        Err(DepgraphServiceError::NotFound)
+    ));
+    Ok(())
+}
+
+#[test]
 fn each_read_request_uses_a_read_only_store_without_cache_mutation() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("repository");

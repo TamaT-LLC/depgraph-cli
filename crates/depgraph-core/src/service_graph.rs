@@ -1316,10 +1316,14 @@ pub(crate) fn load_pinned_snapshot(
         return Err(DepgraphServiceError::Cancelled);
     }
     let snapshot_id = request.snapshot_id().as_str().to_owned();
+    let attempt_id = request.snapshot_id().attempt_id().map(str::to_owned);
     let cancellation_check = cancellation.clone();
     let loaded = request.store().interruptible_read(
         move || cancellation_check.is_cancelled(),
-        |store| store.load_completed_snapshot(&snapshot_id),
+        |store| match attempt_id {
+            Some(attempt_id) => store.load_snapshot(&attempt_id),
+            None => store.load_completed_snapshot(&snapshot_id),
+        },
     );
     if cancellation.is_cancelled() {
         return Err(DepgraphServiceError::Cancelled);

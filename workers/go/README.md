@@ -41,6 +41,51 @@ stderr. Build a release binary with:
 go build -trimpath -o bin/depgraph-go-worker ./cmd/depgraph-go-worker
 ```
 
+## Resumable source batches
+
+The worker advertises `analysis-source-batch-v1` and
+`analysis-unit-typed-v1`, and accepts the `depgraph-analysis-unit-v2` request
+through `--analysis-unit`. The repository root and full inventory stay fixed
+for every request. `context_paths` describes the complete source set owned by
+the logical module or project for Store partitioning; the full repository
+inventory supplies dependency closure to the compiler separately.
+`source_paths` is the exact source scope whose files, definitions, sites, and
+coverage the request may emit. Syntax requests may divide that scope into
+sorted `chunk_id` batches.
+`auxiliary_paths` assigns each module manifest, workspace file, and assembly
+source to one syntax batch so metadata is not counted repeatedly. The worker
+echoes `chunk_id`, its index/count, and the context fingerprint in profile
+properties.
+
+Semantic requests retain the complete owned module source scope and use the
+closure only for type resolution and context-only declarations. Semantic sites
+and edges remain restricted to owned source evidence. Structural package,
+build-unit, file, and contains identities are independent of syntax chunk
+identity, allowing the core to join batches without duplicate targets.
+
+Workers that advertise `analysis-unit-typed-v1` also accept a single `typed`
+request for a complete module. This stage keeps the full module context while
+emitting type declarations, type references, implements relations, and calls
+that `go/types` resolves without SSA. It emits a normal COMPLETE stream with
+`syntax-complete` only and the profile property
+`go_typed_stage_complete="true"` after a successful typed load and extraction.
+An incomplete load or extraction emits the same stream with the property set
+to `"false"` and never claims `semantic-complete`. Legacy v1 requests retain
+the existing syntax/semantic behavior.
+
+Progress is reported at parsed-file, completed-package, and completed-SSA-input
+boundaries. A single `go/packages` load and a single SSA program build are
+atomic operations in the Go APIs, so no heartbeat is fabricated while either
+operation is running; profile properties record these granularity limits and
+incomplete loads retain explicit fallback diagnostics.
+
+The typed graph is the durable boundary used by the core for resumable
+semantic work. Go `types.Package`, `types.Info`, and SSA objects are process
+local and are not serialized. A resumed semantic stage therefore reconstructs
+the compiler universe from the same repository inventory and reuses the
+validated typed graph; it does not claim to reuse compiler objects. SSA must
+complete before the semantic profile can claim `semantic-complete`.
+
 ## Static coverage
 
 - `go.work` membership and workspace-level replacements
@@ -141,12 +186,14 @@ The `go_packages_status` profile property is:
 - `fallback`: no module produced retained typed packages
 
 `partial` and `fallback` add `go-packages-parser-fallback` to the coverage
-ledger. Only `loaded` plus a successful semantic/SSA pass adds
-`semantic-complete`; a semantic failure after a loaded typed pass adds
-`go-semantic-incomplete`. `semantic-complete` means that retained typed input
-was processed without an extractor failure. It does not mean every dynamic or
-native call was resolved, so it may coexist with `unresolved-sites` or
-`go_callgraph_limit` diagnostics. The profile records this policy as
+ledger. A typed stage adds `go-typed-incomplete` when its load or extraction
+does not complete and never adds `semantic-complete`. Only `loaded` plus a
+successful semantic/SSA pass adds `semantic-complete`; a semantic failure
+after a loaded typed pass adds `go-semantic-incomplete`.
+`semantic-complete` means that retained typed input was processed without an
+extractor failure. It does not mean every dynamic or native call was resolved,
+so it may coexist with `unresolved-sites` or `go_callgraph_limit` diagnostics.
+The profile records this policy as
 `go_callgraph_boundary_completeness_policy=semantic-complete-allowed-with-explicit-boundaries`.
 
 Safe scans always report `project_code_executed=false`.

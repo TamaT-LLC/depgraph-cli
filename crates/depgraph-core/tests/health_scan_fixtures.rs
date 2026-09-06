@@ -22,6 +22,65 @@ const RUST_FIXTURE: &str = include_str!("fixtures/health/issue437-rust.ndjson");
 const GO_FIXTURE: &str = include_str!("fixtures/health/issue437-go.ndjson");
 const WEB_FIXTURE: &str = include_str!("fixtures/health/issue437-web.ndjson");
 
+#[test]
+fn incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    for (language, fixture) in [
+        ("rust", RUST_FIXTURE),
+        ("go", GO_FIXTURE),
+        ("web", WEB_FIXTURE),
+    ] {
+        let snapshot =
+            load_protocol_fixture(&temporary, &format!("incomplete-{language}"), fixture)?;
+        let confirmed = analyze_unused(&snapshot)
+            .into_iter()
+            .filter(|finding| finding.confidence == depgraph_core::Confidence::Confirmed)
+            .map(|finding| finding.subject_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !confirmed.is_empty(),
+            "fixture must have a confirmed unused subject"
+        );
+        for reason in [
+            "status:partial",
+            "status:failed",
+            "status:cancelled",
+            "analysis-unit-unanalysed",
+            "analysis-unit-failed",
+            "analysis-unit-cancelled",
+            "analysis-unit-context-mismatch",
+            "analysis-input-changed-during-scan",
+        ] {
+            let mut incomplete = snapshot.clone();
+            if let Some(status) = reason.strip_prefix("status:") {
+                incomplete.scan.status = status.to_owned();
+            } else {
+                incomplete.coverage.reasons.push(reason.to_owned());
+            }
+            let findings = analyze_unused(&incomplete);
+            for subject in &confirmed {
+                let finding = findings
+                    .iter()
+                    .find(|finding| &finding.subject_id == subject)
+                    .expect("an incomplete result must retain the finding for review");
+                assert_ne!(
+                    finding.confidence,
+                    depgraph_core::Confidence::Confirmed,
+                    "{language}: {reason}"
+                );
+                assert!(
+                    finding
+                        .blockers
+                        .iter()
+                        .any(|blocker| blocker.kind == BlockerKind::IncompleteCoverage)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_protocol_fixture(
     temporary: &tempfile::TempDir,
     scan_id: &str,

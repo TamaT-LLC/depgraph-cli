@@ -1412,7 +1412,11 @@ test("pnpm workspace negations retain declaration order", async () => {
     .filter((event) => event.node?.kind === "package_instance")
     .map((event) => event.node.properties.name);
   assert.ok(packageNames.includes("workspace-included"));
-  assert.ok(!packageNames.includes("workspace-excluded"));
+  assert.ok(packageNames.includes("workspace-excluded"));
+  assert.ok(result.events.some((event) => (
+    event.diagnostic?.code === "web.package_manifest_standalone"
+    && event.diagnostic?.path === "packages/excluded/package.json"
+  )));
 });
 
 test("multiple locked package instances remain explicit candidates", async () => {
@@ -1564,10 +1568,10 @@ test("recognized Web metadata files are represented in the per-file ledger", asy
     assert.equal(ledgers.get(metadataPath)?.discovered_sites, ledgers.get(metadataPath)?.emitted_sites, metadataPath);
   }
   assert.ok(result.events.some((event) => (
-    event.diagnostic?.code === "web.package_manifest_outside_workspace"
+    event.diagnostic?.code === "web.package_manifest_standalone"
     && event.diagnostic?.path === "examples/nested/package.json"
   )));
-  assert.ok(!result.events.some((event) => event.node?.kind === "package_instance" && event.node?.properties.name === "not-a-workspace"));
+  assert.ok(result.events.some((event) => event.node?.kind === "package_instance" && event.node?.properties.name === "not-a-workspace"));
   assert.equal(result.events.at(-1)?.coverage.files_skipped, 0);
   assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 0);
 });
@@ -3373,7 +3377,7 @@ test("worker exposes the release and protocol handshake", async () => {
   const result = await execute(process.execPath, [worker, "--version"]);
   assert.equal(
     result.stdout,
-    "depgraph-web-worker 0.5.4 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)\n",
+    "depgraph-web-worker 0.5.4 (protocol 1.0; typescript 7.0.2; capabilities analysis-source-batch-v1,astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)\n",
   );
   assert.equal(result.stderr, "");
 });

@@ -24,28 +24,31 @@ pub use contract::{
     SuccessEnvelope,
 };
 pub use dto::{
-    AgentBuildHostRisk, AgentBuildIsolationStrength, AgentBuildMutationDiagnostic,
-    AgentBuildNetworkIsolation, AgentBuildOutcome, AgentBuildStatus, AgentChangedSince,
-    AgentCompletedSnapshot, AgentContext, AgentCorrelationDifference, AgentCorrelationStatus,
-    AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel, AgentDependenciesResponse,
-    AgentDependencyDirection, AgentEdge, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
-    AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse,
-    AgentGraphExportSchemaVersion, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
+    AGENT_SCAN_OUTCOME_CONTRACT_VERSION, AgentAnalysisCoverage, AgentAnalysisProgress,
+    AgentAnalysisStage, AgentAnalysisUnitProgress, AgentAnalysisUnitStatus, AgentBuildHostRisk,
+    AgentBuildIsolationStrength, AgentBuildMutationDiagnostic, AgentBuildNetworkIsolation,
+    AgentBuildOutcome, AgentBuildStatus, AgentChangedSince, AgentCompletedSnapshot, AgentContext,
+    AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot,
+    AgentCycle, AgentCycleLevel, AgentDependenciesResponse, AgentDependencyDirection, AgentEdge,
+    AgentEvidence, AgentEvidenceKind, AgentExportOutcome, AgentGraphExportFormat,
+    AgentGraphExportMediaType, AgentGraphExportResponse, AgentGraphExportSchemaVersion,
+    AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
     AgentPolicyAnnotationLevel, AgentPolicyApiChange, AgentPolicyApiChangeKind,
     AgentPolicyEvaluationResponse, AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation,
     AgentPrecision, AgentProjectExecution, AgentQueryDirection, AgentQueryRow, AgentQueryValue,
     AgentRepositoryInitOutcome, AgentResolutionStatus, AgentRuntimeLocatorMatch,
     AgentRuntimeMatchStatus, AgentRuntimeOutcome, AgentRuntimeProfileMatch, AgentRuntimeStatus,
     AgentRuntimeTraceEvent, AgentRuntimeTraceSummary, AgentRuntimeValidationResponse,
-    AgentScanOutcome, AgentScanStatus, AgentSite, AgentSnapshot, AgentSnapshotAvailability,
-    AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
-    AgentSnapshotDiffResponse, AgentSnapshotDiffSchemaVersion, AgentSourcePosition,
-    AgentSourceSpan, AgentUnresolved, BoundedQueryProjectionFailure, MAX_AGENT_ARTIFACT_ITEMS,
-    MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CORRELATION_REASONS,
-    MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES,
-    MAX_AGENT_QUERY_TEXT_BYTES, MAX_AGENT_QUERY_VALUES, MAX_AGENT_SNAPSHOT_METADATA_ITEMS,
-    MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows, project_bounded_query_rows_cancellable,
+    AgentScanOutcome, AgentScanOutcomeV2, AgentScanStatus, AgentScanStatusV2, AgentSite,
+    AgentSnapshot, AgentSnapshotAvailability, AgentSnapshotDiffChange, AgentSnapshotDiffChangeType,
+    AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse, AgentSnapshotDiffSchemaVersion,
+    AgentSourcePosition, AgentSourceSpan, AgentUnresolved, BoundedQueryProjectionFailure,
+    MAX_AGENT_ARTIFACT_ITEMS, MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS, MAX_AGENT_CHANGED_FIELDS,
+    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS,
+    MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES, MAX_AGENT_QUERY_TEXT_BYTES, MAX_AGENT_QUERY_VALUES,
+    MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows,
+    project_bounded_query_rows_cancellable,
 };
 pub use health_dto::{
     AgentFindingKind, AgentFindingKindScope, AgentHealthAudit, AgentHealthBlocker,
@@ -72,7 +75,8 @@ pub use operation::{
     DurableSubmitResult, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
     OperationAcceptedResultType, OperationRecoveryTools, PortableTerminalOutput,
     PortableTerminalOutputContract, PortableTerminalOutputError, TASK_POLL_INTERVAL_MS,
-    TaskAccepted, TaskResultType, TasksNegotiation,
+    TaskAccepted, TaskResultType, TasksNegotiation, UNBOUNDED_SCAN_DEADLINE_MS,
+    UNBOUNDED_SCAN_RETAIN_UNTIL_MS,
 };
 pub use response::{
     CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,
@@ -82,8 +86,8 @@ pub use response::{
 };
 pub use scalar::{
     AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
-    AgentLocator, AgentPolicyText, AgentToken, ContractValueError, Cursor, IdempotencyKey,
-    LogicalRepositoryId, MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_CONDITION_BYTES,
+    AgentLocator, AgentPolicyText, AgentToken, AnalysisInputDigest, ContractValueError, Cursor,
+    IdempotencyKey, LogicalRepositoryId, MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_FIELD_NAME_BYTES, MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES, MAX_AGENT_ID_BYTES,
     MAX_AGENT_LABEL_BYTES, MAX_AGENT_LOCATOR_BYTES, MAX_AGENT_POLICY_TEXT_BYTES,
     MAX_AGENT_TOKEN_BYTES, MAX_CURSOR_BYTES, MAX_IDEMPOTENCY_KEY_CHARS,
@@ -93,6 +97,7 @@ pub use scalar::{
     TaskId,
 };
 pub use schema::{
-    CanonicalJsonError, MCP_TOOLS_SCHEMA_ID, canonical_json_bytes, canonical_json_sha256,
+    AGENT_SCAN_OUTCOME_V2_SCHEMA_ID, CanonicalJsonError, MCP_TOOLS_SCHEMA_ID,
+    agent_scan_outcome_v2_schema, canonical_json_bytes, canonical_json_sha256,
     canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
 };

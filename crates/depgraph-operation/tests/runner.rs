@@ -251,6 +251,46 @@ fn production_dispatcher_fails_unwired_operations_with_a_closed_error() {
 }
 
 #[test]
+fn deferred_empty_scan_preserves_v2_coverage_and_snapshot_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = config(directory.path());
+    std::fs::write(
+        config.canonical_root().join("README.md"),
+        "empty source fixture\n",
+    )
+    .unwrap();
+    let service = DepgraphService::new(config.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prepared = runtime
+        .block_on(service.scan_deferred_cancellable(
+            &depgraph_core::service::ScanRequest::new(false, depgraph_core::ScanCacheMode::Enabled),
+            CancellationToken::new(),
+        ))
+        .expect("empty scan preparation must preserve a valid staging snapshot");
+    let depgraph_core::service::DeferredScanServiceOutcome::Pending(completion) = prepared else {
+        panic!("empty scan must still have a completed snapshot");
+    };
+    let source = completion.outcome();
+    let result = depgraph_mcp_tools::AgentScanOutcomeV2::try_from(source)
+        .unwrap_or_else(|error| panic!("v2 conversion failed: {error:?}; {:?}", source.outcome()));
+    let snapshot = SnapshotId::parse(source.completed_snapshot_id().unwrap().as_str()).unwrap();
+    let envelope = SuccessEnvelope::new(repository(&config), Some(snapshot), result);
+    let wire = serde_json::to_value(&envelope).unwrap();
+    let decoded: SuccessEnvelope<depgraph_mcp_tools::AgentScanOutcomeV2> =
+        serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        decoded.snapshot_id(),
+        decoded.result().completed_snapshot_id()
+    );
+    completion
+        .promote()
+        .expect("empty scan staging must remain publishable");
+}
+
+#[test]
 fn production_scan_dispatcher_executes_safe_scan_and_persists_closed_terminal_output() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
@@ -288,6 +328,14 @@ fn production_scan_dispatcher_executes_safe_scan_and_persists_closed_terminal_ou
     {
         OperationOutcome::Completed(output) => {
             let value: serde_json::Value = serde_json::from_str(output.as_str()).unwrap();
+            assert_eq!(
+                value["result"]["contract_version"],
+                "depgraph-agent-scan-outcome-v2"
+            );
+            assert_eq!(
+                value["result"]["completed_snapshot_id"],
+                value["snapshot_id"]
+            );
             assert_eq!(value["result"]["status"], "completed");
             assert_eq!(value["result"]["project_code_executed"], false);
             assert!(

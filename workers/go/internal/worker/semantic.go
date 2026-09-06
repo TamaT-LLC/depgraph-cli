@@ -134,14 +134,24 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	for _, context := range extractor.contexts {
 		context.emitCalls()
 	}
+	// Everything above this point is derived from go/types and is safe to
+	// retain as the typed checkpoint prefix. A typed request also emits
+	// implements relations here because they do not depend on SSA. Keep the
+	// established semantic ordering (SSA before implements) for legacy and
+	// existing semantic streams so their canonical graph remains unchanged.
+	if s.analysisStage == AnalysisUnitStageTyped {
+		extractor.emitImplements()
+	}
+	s.typedStageComplete = s.goPackages.Status == "loaded" && extractor.complete && !s.hasSkippedFiles()
 	if s.analysisUnit != nil && s.analysisStage == AnalysisUnitStageSemantic {
 		s.reportProgress("go_ssa", "progress", 0)
-	}
-	extractor.emitSSACalls()
-	if s.analysisUnit != nil && s.analysisStage == AnalysisUnitStageSemantic {
+		extractor.emitSSACalls()
 		s.reportProgress("go_ssa", "completed", len(extractor.contexts))
+		extractor.emitImplements()
+	} else if s.analysisUnit == nil {
+		extractor.emitSSACalls()
+		extractor.emitImplements()
 	}
-	extractor.emitImplements()
 	// Typed loading includes the dependency closure so imported declarations can
 	// be resolved, but a unit stream owns only its requested source paths. Drop
 	// semantic relations whose evidence belongs to a closure module before the
@@ -153,6 +163,15 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	if s.goPackages.Status == "loaded" && extractor.complete {
 		s.semanticIncomplete = false
 	}
+}
+
+func (s *scannerState) hasSkippedFiles() bool {
+	for _, file := range s.files {
+		if file.Skipped {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *goSemanticExtractor) newPackage(typed goTypedPackage) *goSemanticPackage {
@@ -1796,7 +1815,7 @@ func (e *goSemanticExtractor) addRelation(kind, sourceID, targetID string, condi
 	condition = canonicalCondition(condition)
 	primary := evidence[0]
 	identity := map[string]any{
-		"condition": condition, "kind": kind, "profile_id": e.state.profile.ID,
+		"condition": condition, "kind": kind, "profile_id": e.state.identityProfileID(),
 		"source": sourceID, "target": targetID, "path": primary.Path,
 		"span": goSemanticSpan(primary),
 	}
@@ -1821,7 +1840,7 @@ func (e *goSemanticExtractor) addTypeUse(sourceID, targetID, specifier, status, 
 	primary := evidence[0]
 	siteIdentity := map[string]any{
 		"condition": condition, "kind": "type_use", "path": primary.Path,
-		"profile_id": e.state.profile.ID, "source": sourceID,
+		"profile_id": e.state.identityProfileID(), "source": sourceID,
 		"span": goSemanticSpan(primary),
 	}
 	site := Site{

@@ -198,11 +198,13 @@ type scannerState struct {
 	root               string
 	workspaceIdentity  string
 	profile            Profile
+	logicalProfileID   string
 	progress           AnalysisProgressFunc
 	analysisUnit       *AnalysisUnitRequest
 	ownedModules       map[string]bool
 	contextModules     map[string]bool
 	ownedSourcePaths   map[string]bool
+	contextSourcePaths map[string]bool
 	analysisStage      AnalysisUnitStage
 	goPackages         goPackagesInventory
 	moduleResolution   localModuleResolution
@@ -213,13 +215,26 @@ type scannerState struct {
 	diagnostics        []Diagnostic
 	files              []FileCompletion
 	unsupported        int
+	typedStageComplete bool
 	semanticIncomplete bool
 	unknownNodeID      string
 	workspaceNodeID    string
 }
 
 func (s *scannerState) scopedID(kind string, parts ...string) string {
-	return profileScopedID(kind, s.workspaceIdentity, s.profile.ID, parts...)
+	return profileScopedID(kind, s.workspaceIdentity, s.identityProfileID(), parts...)
+}
+
+// identityProfileID is the profile namespace used when deriving stable graph
+// identities. Analysis-unit chunks have distinct wire profiles so the core can
+// validate each complete stream, but chunks in one logical stage must still
+// describe the same sites, edges, and diagnostics. Legacy whole-repository
+// scans retain their historical profile-scoped identities.
+func (s *scannerState) identityProfileID() string {
+	if s.analysisUnit != nil && s.logicalProfileID != "" {
+		return s.logicalProfileID
+	}
+	return s.profile.ID
 }
 
 // targetID identifies repository definitions and structural targets. Unit
@@ -231,6 +246,26 @@ func (s *scannerState) targetID(kind string, parts ...string) string {
 		return stableID(kind, s.workspaceIdentity, parts...)
 	}
 	return s.scopedID(kind, parts...)
+}
+
+// structuralProfileID is deliberately independent of a source chunk. A
+// package/build-unit and its contains edges describe one canonical repository
+// target; emitting a different identity for every syntax batch would create
+// duplicate structural nodes when the core joins the batches. Site and
+// dependency edge IDs use the logical stage profile while their wire payloads
+// continue to reference the declared chunk profile.
+func (s *scannerState) structuralProfileID() string {
+	return s.identityProfileID()
+}
+
+// edgeID derives a stable identity without changing the profile carried on
+// the wire. In analysis-unit mode, the logical stage profile keeps the same
+// edge ID across source batches; callers still emit Edge.ProfileID as the
+// currently declared chunk profile.
+func (s *scannerState) edgeID(edge Edge) string {
+	identity := edge
+	identity.ProfileID = s.identityProfileID()
+	return edgeID(s.workspaceIdentity, identity)
 }
 
 func Scan(root string) (Result, error) {
@@ -259,6 +294,7 @@ func ScanWithAnalysisUnitProgress(root string, inventoryFile string, request Ana
 	if err := request.Validate(); err != nil {
 		return Result{}, err
 	}
+	request = request.normalized()
 	var inventory *repositoryInventory
 	var err error
 	if inventoryFile != "" {
@@ -275,6 +311,10 @@ func scan(root string, inventory *repositoryInventory, analysisUnit *AnalysisUni
 }
 
 func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
+	if analysisUnit != nil {
+		normalized := analysisUnit.normalized()
+		analysisUnit = &normalized
+	}
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Result{}, fmt.Errorf("normalize root: %w", err)
@@ -387,7 +427,9 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 	ownedModules := map[string]bool{}
 	contextModules := map[string]bool{}
 	ownedSourcePaths := map[string]bool{}
+	contextSourcePaths := map[string]bool{}
 	selectedModules := modules
+	moduleResolution := buildLocalModuleResolution(absRoot, modules, work)
 	if analysisUnit != nil {
 		if err := analysisUnit.ValidateForRoot(absRoot); err != nil {
 			return Result{}, err
@@ -407,11 +449,40 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 				return Result{}, fmt.Errorf("analysis unit source path %q belongs to a different module", sourcePath)
 			}
 		}
-		contextModules = analysisContextModules(modules, ownedModules, buildLocalModuleResolution(absRoot, modules, work))
+		contextModules = analysisContextModules(modules, ownedModules, moduleResolution)
 		selectedModules = make([]Module, 0, len(contextModules))
 		for _, module := range modules {
 			if contextModules[module.Dir] {
 				selectedModules = append(selectedModules, module)
+			}
+		}
+		for _, contextPath := range analysisUnit.ContextPaths {
+			contextSourcePaths[contextPath] = true
+			module := moduleForPath(modules, filepath.Join(absRoot, filepath.FromSlash(contextPath)))
+			if module == nil || !contextModules[module.Dir] {
+				return Result{}, fmt.Errorf("analysis unit context path %q is outside the local module closure", contextPath)
+			}
+		}
+		for _, auxiliaryPath := range analysisUnit.AuxiliaryPaths {
+			if auxiliaryPath == "go.work" {
+				if analysisUnit.UnitRoot != "." {
+					return Result{}, fmt.Errorf("analysis unit go.work auxiliary path requires the repository unit root")
+				}
+				continue
+			}
+			if filepath.Base(filepath.FromSlash(auxiliaryPath)) == "go.mod" {
+				module := moduleForPath(modules, filepath.Join(absRoot, filepath.FromSlash(auxiliaryPath)))
+				if module == nil || !ownedModules[module.Dir] || cleanSlash(relativePath(absRoot, module.ManifestPath)) != auxiliaryPath {
+					return Result{}, fmt.Errorf("analysis unit go.mod auxiliary path %q is not the owned module manifest", auxiliaryPath)
+				}
+				continue
+			}
+			if isGoAssemblyPath(auxiliaryPath) {
+				module := moduleForPath(modules, filepath.Join(absRoot, filepath.FromSlash(auxiliaryPath)))
+				if module == nil || !ownedModules[module.Dir] {
+					return Result{}, fmt.Errorf("analysis unit assembly auxiliary path %q belongs to a different module", auxiliaryPath)
+				}
+				continue
 			}
 		}
 	}
@@ -430,16 +501,16 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		if analysisUnit != nil {
 			loadModules = selectedModules
 		}
-		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic && progress != nil {
+		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax && progress != nil {
 			progress("go_typed_load", "progress", 0)
 		}
-		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic {
+		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax {
 			goPackages = loadGoPackagesInventoryForModulesProgress(absRoot, loadModules, modules, goPackagesWork, configuredTags, progress)
 		} else {
 			goPackages = loadGoPackagesInventoryForModules(absRoot, loadModules, modules, goPackagesWork, configuredTags)
 		}
-		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic && progress != nil {
-			progress("go_typed_load", "completed", goPackages.ModuleCount)
+		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax && progress != nil {
+			progress("go_typed_load", "completed", goPackages.PackageCount)
 		}
 	}
 	initialDiagnostics = append(initialDiagnostics, goPackages.Diagnostics...)
@@ -447,7 +518,7 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 	// effective cgo state are profile axes even when no custom build tags were
 	// requested; otherwise host scans on different platforms would share IDs.
 	const cgoEnabled = "0"
-	profileID := goProfileID(
+	baseProfileID := goProfileID(
 		runtime.GOOS,
 		runtime.GOARCH,
 		cgoEnabled,
@@ -456,19 +527,44 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		goPackages.DependencySnapshot.Status,
 		goPackages.DependencySnapshot.Fingerprint,
 	)
+	profileID := baseProfileID
 	if analysisUnit != nil {
 		profileID = analysisUnitProfileID(profileID, *analysisUnit)
+	}
+	logicalProfileID := profileID
+	if analysisUnit != nil {
+		logicalProfileID = analysisUnitLogicalProfileID(baseProfileID, *analysisUnit)
 	}
 	profileProperties := map[string]string{
 		"variants": "normal,internal_test,external_test", "safe_scan": "true", "configured_tags": strings.Join(configuredTags, ","),
 		"go_call_graph_requested": configuredProfile.CallGraph,
 	}
 	if analysisUnit != nil {
-		profileProperties["analysis_unit_contract"] = AnalysisUnitContractVersion
+		profileProperties["analysis_unit_contract"] = analysisUnit.ContractVersion
 		profileProperties["analysis_unit_id"] = analysisUnit.UnitID
 		profileProperties["analysis_unit_root"] = analysisUnit.UnitRoot
 		profileProperties["analysis_stage"] = string(analysisUnit.Stage)
+		profileProperties["analysis_base_profile_id"] = baseProfileID
+		profileProperties["analysis_logical_profile_id"] = logicalProfileID
 		profileProperties["analysis_source_path_count"] = strconv.Itoa(len(analysisUnit.SourcePaths))
+		profileProperties["analysis_context_path_count"] = strconv.Itoa(len(analysisUnit.ContextPaths))
+		profileProperties["analysis_chunk_id"] = analysisUnit.ChunkID
+		profileProperties["analysis_chunk_index"] = strconv.Itoa(analysisUnit.ChunkIndex)
+		profileProperties["analysis_chunk_count"] = strconv.Itoa(analysisUnit.ChunkCount)
+		profileProperties["analysis_context_fingerprint"] = analysisUnit.ContextFingerprint
+		if analysisUnit.Stage == AnalysisUnitStageSyntax {
+			profileProperties["analysis_scope"] = "source_batch"
+		} else {
+			profileProperties["analysis_scope"] = "full_module"
+		}
+		// The typed boundary is advertised on typed streams (and echoed on a
+		// semantic stream once its type-only prefix has completed). The value is
+		// filled in by result after extraction; keeping it a string preserves the
+		// existing profile property contract.
+		if analysisUnit.ContractVersion == AnalysisUnitContractVersion &&
+			(analysisUnit.Stage == AnalysisUnitStageTyped || analysisUnit.Stage == AnalysisUnitStageSemantic) {
+			profileProperties["go_typed_stage_complete"] = "false"
+		}
 	}
 	for key, value := range inventoryProperties(goPackages) {
 		profileProperties[key] = value
@@ -480,11 +576,11 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		Properties:  profileProperties,
 	}
 	state := &scannerState{
-		root: absRoot, workspaceIdentity: workspaceIdentity, profile: profile, goPackages: goPackages,
+		root: absRoot, workspaceIdentity: workspaceIdentity, profile: profile, logicalProfileID: logicalProfileID, goPackages: goPackages,
 		progress:     progress,
 		analysisUnit: analysisUnit, ownedModules: ownedModules, contextModules: contextModules,
-		ownedSourcePaths: ownedSourcePaths, analysisStage: analysisUnitStage(analysisUnit),
-		moduleResolution: buildLocalModuleResolution(absRoot, modules, work),
+		ownedSourcePaths: ownedSourcePaths, contextSourcePaths: contextSourcePaths, analysisStage: analysisUnitStage(analysisUnit),
+		moduleResolution: moduleResolution,
 		inventory:        inventory,
 		nodes:            map[string]Node{}, edges: map[string]Edge{}, sites: map[string]Site{}, diagnostics: initialDiagnostics,
 		files: skippedMetadata,
@@ -506,7 +602,14 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 	if err != nil {
 		return Result{}, err
 	}
-	allSources, err := state.discoverAndParseFiles(modules)
+	parsePaths := map[string]bool(nil)
+	if analysisUnit != nil {
+		parsePaths = map[string]bool{}
+		for path := range analysisUnit.sourcePathSet() {
+			parsePaths[path] = true
+		}
+	}
+	allSources, err := state.discoverAndParseFiles(modules, parsePaths)
 	if err != nil {
 		return Result{}, err
 	}
@@ -519,7 +622,15 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 	if work.Path != "" && (analysisUnit == nil || analysisUnit.UnitRoot == ".") {
 		discoveredFiles++
 	}
-	groups, err := state.addPackagesAndFiles(sources, moduleNodes, allSources)
+	contextSources := allSources
+	if analysisUnit != nil {
+		contextSources, err = state.discoverSourceMetadata(modules)
+		if err != nil {
+			return Result{}, err
+		}
+		contextSources = mergeParsedSourceMetadata(contextSources, allSources)
+	}
+	groups, err := state.addPackagesAndFiles(sources, moduleNodes, contextSources)
 	if err != nil {
 		return Result{}, err
 	}
@@ -534,10 +645,10 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		state.extractFileDependencies(source, groups)
 	}
 	state.semanticIncomplete = true
-	if analysisUnit == nil || analysisUnit.Stage == AnalysisUnitStageSemantic {
+	if analysisUnit == nil || analysisUnit.Stage == AnalysisUnitStageTyped || analysisUnit.Stage == AnalysisUnitStageSemantic {
 		state.extractGoSemanticGraph(sources)
 	}
-	if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic {
+	if analysisUnit != nil && (analysisUnit.Stage == AnalysisUnitStageTyped || analysisUnit.Stage == AnalysisUnitStageSemantic) {
 		state.retainSemanticStageGraph()
 	}
 	if analysisUnit != nil {
@@ -560,7 +671,20 @@ func analysisUnitStage(request *AnalysisUnitRequest) AnalysisUnitStage {
 }
 
 func analysisUnitProfileID(base string, request AnalysisUnitRequest) string {
-	return stableID("profile", "go-analysis-unit-v1", base, request.UnitID, string(request.Stage))
+	if request.ContractVersion == LegacyAnalysisUnitContractVersion {
+		return stableID("profile", "go-analysis-unit-v1", base, request.UnitID, string(request.Stage))
+	}
+	return stableID("profile", "go-analysis-unit-v2", base, request.UnitID, string(request.Stage), request.ChunkID, strconv.Itoa(request.ChunkIndex), strconv.Itoa(request.ChunkCount))
+}
+
+// analysisUnitLogicalProfileID identifies the stage-level structural graph.
+// Chunk identity belongs on the event/profile stream, while canonical target
+// and contains identities must survive the union of all source batches.
+func analysisUnitLogicalProfileID(base string, request AnalysisUnitRequest) string {
+	if request.ContractVersion == LegacyAnalysisUnitContractVersion {
+		return stableID("profile", "go-analysis-unit-v1", base, request.UnitID, string(request.Stage))
+	}
+	return stableID("profile", "go-analysis-unit-v2-logical", base, request.UnitID, string(request.Stage))
 }
 
 func ownedManifestPaths(paths []string, modules []Module) []string {
@@ -625,6 +749,9 @@ func (s *scannerState) addManifestCompletions(modules []Module, work WorkFile) {
 			continue
 		}
 		rel := relativePath(s.root, module.ManifestPath)
+		if s.analysisUnit != nil && !s.ownsAuxiliaryPath(rel) {
+			continue
+		}
 		completion := FileCompletion{
 			Path: rel, DiscoveredSites: len(module.Requirements), EmittedSites: len(module.Requirements),
 		}
@@ -645,7 +772,7 @@ func (s *scannerState) addManifestCompletions(modules []Module, work WorkFile) {
 		}
 		s.files = append(s.files, completion)
 	}
-	if work.Path != "" && (s.analysisUnit == nil || s.analysisUnit.UnitRoot == ".") {
+	if work.Path != "" && (s.analysisUnit == nil || s.ownsAuxiliaryPath(relativePath(s.root, work.Path))) {
 		rel := relativePath(s.root, work.Path)
 		completion := FileCompletion{Path: rel}
 		if s.hasReadDiagnostic("go_work_read", rel) {
@@ -680,6 +807,14 @@ func (s *scannerState) ownsSourcePath(relative string) bool {
 	return s.ownedSourcePaths[cleanSlash(relative)]
 }
 
+func (s *scannerState) ownsAuxiliaryPath(relative string) bool {
+	if s.analysisUnit == nil {
+		return true
+	}
+	_, ok := s.analysisUnit.auxiliaryPathSet()[cleanSlash(relative)]
+	return ok
+}
+
 func (s *scannerState) reportProgress(phase, status string, items int) {
 	if s.progress != nil && s.analysisUnit != nil {
 		s.progress(phase, status, items)
@@ -712,7 +847,8 @@ func (s *scannerState) retainOwnedFileCompletions() {
 	}
 	owned := s.files[:0]
 	for _, completion := range s.files {
-		if s.ownsSourcePath(completion.Path) {
+		if s.ownsAnalysisFilePath(completion.Path) || s.ownsManifestPath(completion.Path) ||
+			(cleanSlash(completion.Path) == "go.work" && s.analysisUnit.UnitRoot == ".") {
 			owned = append(owned, completion)
 		}
 	}
@@ -725,7 +861,7 @@ func (s *scannerState) retainAnalysisScopeDiagnostics() {
 	}
 	owned := s.diagnostics[:0]
 	for _, diagnostic := range s.diagnostics {
-		if diagnostic.Path == "" || diagnostic.Path == "go.work" || s.ownsAnalysisFilePath(diagnostic.Path) || s.ownsManifestPath(diagnostic.Path) {
+		if diagnostic.Path == "" || s.ownsAnalysisFilePath(diagnostic.Path) || s.ownsManifestPath(diagnostic.Path) {
 			owned = append(owned, diagnostic)
 		}
 	}
@@ -742,7 +878,7 @@ func (s *scannerState) ownsManifestPath(relative string) bool {
 }
 
 func (s *scannerState) retainSemanticStageGraph() {
-	if s.analysisUnit == nil || s.analysisStage != AnalysisUnitStageSemantic {
+	if s.analysisUnit == nil || (s.analysisStage != AnalysisUnitStageTyped && s.analysisStage != AnalysisUnitStageSemantic) {
 		return
 	}
 	removedSiteIDs := map[string]bool{}
@@ -869,17 +1005,20 @@ func (s *scannerState) ownsAnalysisFilePath(relative string) bool {
 	if s.ownsSourcePath(relative) {
 		return true
 	}
-	if !isGoAssemblyPath(relative) {
+	if !s.ownsAuxiliaryPath(relative) {
 		return false
 	}
-	assemblyPath := filepath.Clean(filepath.Join(s.root, filepath.FromSlash(relative)))
-	if !isWithinRoot(s.root, assemblyPath) {
+	if !isGoAssemblyPath(relative) {
+		return true
+	}
+	absolute := filepath.Clean(filepath.Join(s.root, filepath.FromSlash(relative)))
+	if !isWithinRoot(s.root, absolute) {
 		return false
 	}
 	nearestModuleDir := ""
 	for moduleDir := range s.moduleResolution.modulesByDir {
 		moduleDir = filepath.Clean(moduleDir)
-		if !isWithinRoot(moduleDir, assemblyPath) {
+		if !isWithinRoot(moduleDir, absolute) {
 			continue
 		}
 		if nearestModuleDir == "" || len(moduleDir) > len(nearestModuleDir) {
@@ -929,7 +1068,7 @@ func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]N
 	return moduleNodes, nil
 }
 
-func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, error) {
+func (s *scannerState) discoverAndParseFiles(modules []Module, requestedPaths map[string]bool) ([]*sourceFile, error) {
 	var paths []string
 	parsedItems := 0
 	if s.analysisUnit != nil {
@@ -945,6 +1084,9 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 		if entry.Type()&os.ModeSymlink != 0 {
 			if strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
 				originalPath := relativePath(s.root, path)
+				if requestedPaths != nil && !requestedPaths[originalPath] {
+					continue
+				}
 				if !s.ownsSourcePath(originalPath) {
 					continue
 				}
@@ -971,7 +1113,10 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 			continue
 		}
 		if strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
-			paths = append(paths, path)
+			relative := relativePath(s.root, path)
+			if requestedPaths == nil || requestedPaths[relative] {
+				paths = append(paths, path)
+			}
 		}
 	}
 	sort.Strings(paths)
@@ -1051,6 +1196,92 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 	return sources, nil
 }
 
+// discoverSourceMetadata builds the package grouping context without parsing
+// every file in the repository. Syntax source batches parse only their owned
+// paths; context modules still need package names and stable file identities so
+// imports can resolve to declarations emitted by another unit.
+func (s *scannerState) discoverSourceMetadata(modules []Module) ([]*sourceFile, error) {
+	entries, err := repositoryFileEntries(s.root, s.inventory)
+	if err != nil {
+		return nil, fmt.Errorf("discover Go source metadata: %w", err)
+	}
+	metadata := make([]*sourceFile, 0)
+	for _, candidate := range entries {
+		path := candidate.path
+		entry := candidate.entry
+		if entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(entry.Name(), ".go") ||
+			strings.HasPrefix(entry.Name(), ".") || strings.HasPrefix(entry.Name(), "_") {
+			continue
+		}
+		relative := relativePath(s.root, path)
+		if s.analysisUnit != nil && !s.contextSourcePaths[relative] {
+			continue
+		}
+		module := moduleForPath(modules, path)
+		if module == nil || !s.moduleIsVisible(module) {
+			continue
+		}
+		packageName := readPackageNameMetadata(path)
+		source := &sourceFile{
+			AbsPath: path, RelPath: relative, Dir: filepath.Dir(path), Module: module,
+			PackageName: packageName, IsTest: strings.HasSuffix(path, "_test.go"),
+			Condition: AlwaysCondition(),
+		}
+		source.ImportPath = packageImportPath(s.root, *module, source.Dir)
+		source.FileNodeID = s.targetID("file", module.Path, source.RelPath)
+		metadata = append(metadata, source)
+	}
+	sort.Slice(metadata, func(left, right int) bool { return metadata[left].RelPath < metadata[right].RelPath })
+	return metadata, nil
+}
+
+func readPackageNameMetadata(file string) string {
+	handle, err := os.Open(file)
+	if err != nil {
+		return "unknown"
+	}
+	defer handle.Close()
+	scanner := bufio.NewScanner(handle)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
+			continue
+		}
+		if strings.HasPrefix(line, "package ") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "package "))
+			if index := strings.IndexAny(name, " \t{"); index >= 0 {
+				name = name[:index]
+			}
+			if name != "" {
+				return name
+			}
+		}
+		// Build constraints and package comments precede the declaration. Any
+		// other first token means the file is malformed; grouping it as unknown
+		// keeps the context target while the owned parse reports the error.
+	}
+	return "unknown"
+}
+
+func mergeParsedSourceMetadata(metadata, parsed []*sourceFile) []*sourceFile {
+	if len(metadata) == 0 {
+		return parsed
+	}
+	byPath := make(map[string]*sourceFile, len(metadata)+len(parsed))
+	for _, source := range metadata {
+		byPath[source.RelPath] = source
+	}
+	for _, source := range parsed {
+		byPath[source.RelPath] = source
+	}
+	merged := make([]*sourceFile, 0, len(byPath))
+	for _, source := range byPath {
+		merged = append(merged, source)
+	}
+	sort.Slice(merged, func(left, right int) bool { return merged[left].RelPath < merged[right].RelPath })
+	return merged
+}
+
 func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes map[string]Node, contextSources []*sourceFile) (map[string][]*packageGroup, error) {
 	groupsByDir := map[string]*packageGroup{}
 	allSources := contextSources
@@ -1080,13 +1311,13 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 		if !s.moduleIsVisible(group.Module) {
 			continue
 		}
-		ownedGroup := false
+		ownedFiles := make([]*sourceFile, 0, len(group.Files))
 		for _, source := range group.Files {
 			if s.ownsSourcePath(source.RelPath) {
-				ownedGroup = true
-				break
+				ownedFiles = append(ownedFiles, source)
 			}
 		}
+		ownedGroup := len(ownedFiles) > 0
 		if group.BaseName == "" && len(group.Files) > 0 {
 			group.BaseName = strings.TrimSuffix(group.Files[0].PackageName, "_test")
 		}
@@ -1126,9 +1357,9 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 		variants := variantsForGroup(group)
 		for _, variant := range variants {
 			unit := Node{
-				ID: s.scopedID("build_unit", group.Module.Path, moduleInstanceScope, group.ImportPath, variant), Kind: "build_unit",
+				ID: profileScopedID("build_unit", s.workspaceIdentity, s.structuralProfileID(), group.Module.Path, moduleInstanceScope, group.ImportPath, variant), Kind: "build_unit",
 				Locator: "go-unit:" + group.ImportPath + "#" + variant, DisplayName: group.ImportPath + " (" + variant + ")",
-				Properties: map[string]any{"language": "go", "package_path": group.ImportPath, "variant": variant, "profile_id": s.profile.ID},
+				Properties: map[string]any{"language": "go", "package_path": group.ImportPath, "variant": variant, "profile_id": s.structuralProfileID()},
 			}
 			if err := addNode(s.nodes, unit); err != nil {
 				return nil, err
@@ -1137,7 +1368,7 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 			s.addStructuralEdge(packageNode.ID, unit.ID, "contains", AlwaysCondition(), packageEvidence)
 		}
 
-		for _, source := range group.Files {
+		for _, source := range ownedFiles {
 			fileNode := Node{
 				ID: source.FileNodeID, Kind: "file", Locator: "file:" + source.RelPath, DisplayName: source.RelPath,
 				Properties: map[string]any{
@@ -1312,6 +1543,9 @@ func (s *scannerState) addModuleRequirements(modules []Module, work WorkFile, mo
 		}
 	}
 	for _, module := range modules {
+		if s.analysisUnit != nil && !s.ownsAuxiliaryPath(relativePath(s.root, module.ManifestPath)) {
+			continue
+		}
 		sourceNode := moduleNodes[module.Dir]
 		moduleReplacements := map[string]Replacement{}
 		for _, replacement := range module.Replacements {
@@ -1570,7 +1804,7 @@ func (s *scannerState) addCallGraphLimitDiagnostic(siteID, boundary, reason, mes
 	}
 	primary := site.Evidence[0]
 	identity := map[string]any{
-		"code": "go_callgraph_limit", "profile_id": s.profile.ID, "site_id": siteID,
+		"code": "go_callgraph_limit", "profile_id": s.identityProfileID(), "site_id": siteID,
 		"boundary": boundary, "reason": reason,
 	}
 	diagnostic := Diagnostic{
@@ -1615,7 +1849,7 @@ func (s *scannerState) addSiteWithEdges(site Site, edgeKind string) {
 			Condition: site.Condition, Precision: site.Precision, Generated: generated,
 			Evidence: append([]Evidence(nil), site.Evidence...),
 		}
-		edge.ID = edgeID(s.workspaceIdentity, edge)
+		edge.ID = s.edgeID(edge)
 		s.edges[edge.ID] = edge
 	}
 }
@@ -1635,10 +1869,12 @@ func (s *scannerState) addStructuralEdge(source, target, kind string, condition 
 	}
 	edge := Edge{
 		Source: source, Target: target, Kind: kind, Phase: "source", Environment: "any",
-		ResolutionStatus: "resolved", ProfileID: s.profile.ID, Condition: condition,
+		ResolutionStatus: "resolved", ProfileID: s.structuralProfileID(), Condition: condition,
 		Precision: "exact", Generated: generated, Evidence: evidence,
 	}
-	edge.ID = edgeID(s.workspaceIdentity, edge)
+	edge.ID = s.edgeID(edge)
+	// The wire must reference the declared chunk profile; identity remains logical.
+	edge.ProfileID = s.profile.ID
 	s.edges[edge.ID] = edge
 }
 
@@ -1655,6 +1891,13 @@ func (s *scannerState) ensureUnknownNode() string {
 }
 
 func (s *scannerState) result(discoveredFiles int) Result {
+	if s.analysisUnit != nil && s.analysisUnit.ContractVersion == AnalysisUnitContractVersion &&
+		(s.analysisStage == AnalysisUnitStageTyped || s.analysisStage == AnalysisUnitStageSemantic) {
+		if s.profile.Properties == nil {
+			s.profile.Properties = map[string]string{}
+		}
+		s.profile.Properties["go_typed_stage_complete"] = strconv.FormatBool(s.typedStageComplete)
+	}
 	s.recordCallGraphBoundaryProfile()
 	result := Result{Root: s.root, Profile: s.profile, Diagnostics: s.diagnostics, Files: s.files}
 	for _, node := range s.nodes {
@@ -1693,13 +1936,17 @@ func (s *scannerState) result(discoveredFiles int) Result {
 	if result.Coverage.FilesSkipped == 0 && result.Coverage.UnsupportedSyntax == 0 {
 		result.Coverage.Completeness = append(result.Coverage.Completeness, "syntax-complete")
 	}
-	if s.goPackages.Status == "loaded" && !s.semanticIncomplete {
+	if s.analysisStage != AnalysisUnitStageTyped && s.goPackages.Status == "loaded" && !s.semanticIncomplete {
 		result.Coverage.Completeness = append(result.Coverage.Completeness, "semantic-complete")
 	}
 	if s.goPackages.Fallback {
 		result.Coverage.Reasons = append(result.Coverage.Reasons, "go-packages-parser-fallback")
 	}
-	if s.goPackages.Status == "loaded" && s.semanticIncomplete {
+	if s.analysisStage == AnalysisUnitStageTyped {
+		if !s.typedStageComplete {
+			result.Coverage.Reasons = append(result.Coverage.Reasons, "go-typed-incomplete")
+		}
+	} else if s.goPackages.Status == "loaded" && s.semanticIncomplete {
 		result.Coverage.Reasons = append(result.Coverage.Reasons, "go-semantic-incomplete")
 	}
 	if result.Coverage.FilesSkipped > 0 {

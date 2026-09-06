@@ -10,12 +10,16 @@ import (
 
 func TestAnalysisUnitRequestRejectsUnsafeScopes(t *testing.T) {
 	valid := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:test",
-		Adapter:         AdapterName,
-		UnitRoot:        "module",
-		SourcePaths:     []string{"module/main.go"},
-		Stage:           AnalysisUnitStageSyntax,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:test",
+		Adapter:            AdapterName,
+		UnitRoot:           "module",
+		SourcePaths:        []string{"module/main.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"module/main.go"},
+		ChunkID:            "chunk-0",
+		ChunkCount:         1,
+		ContextFingerprint: "test-context",
 	}
 	tests := []struct {
 		name   string
@@ -48,12 +52,18 @@ func TestReadAnalysisUnitRequestRejectsUnknownFieldsAndTrailingData(t *testing.T
 	root := t.TempDir()
 	requestPath := filepath.Join(root, "request.json")
 	valid := map[string]any{
-		"contract_version": AnalysisUnitContractVersion,
-		"unit_id":          "analysis-unit:test",
-		"adapter":          AdapterName,
-		"unit_root":        ".",
-		"source_paths":     []string{"main.go"},
-		"stage":            string(AnalysisUnitStageSyntax),
+		"contract_version":    AnalysisUnitContractVersion,
+		"unit_id":             "analysis-unit:test",
+		"adapter":             AdapterName,
+		"unit_root":           ".",
+		"source_paths":        []string{"main.go"},
+		"stage":               string(AnalysisUnitStageSyntax),
+		"context_paths":       []string{"main.go"},
+		"chunk_id":            "chunk-0",
+		"chunk_index":         0,
+		"chunk_count":         1,
+		"auxiliary_paths":     []string{},
+		"context_fingerprint": "test-context",
 	}
 	encoded, err := json.Marshal(valid)
 	if err != nil {
@@ -77,6 +87,303 @@ func TestReadAnalysisUnitRequestRejectsUnknownFieldsAndTrailingData(t *testing.T
 	}
 }
 
+func TestAnalysisUnitV2ValidatesSourceBatchesAndContextMetadata(t *testing.T) {
+	valid := AnalysisUnitRequest{
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:batch",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/a.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/a.go", "shared/shared.go"},
+		ChunkID:            "chunk-0",
+		ChunkIndex:         0,
+		ChunkCount:         2,
+		AuxiliaryPaths:     []string{"app/go.mod"},
+		ContextFingerprint: "context-sha256:test",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*AnalysisUnitRequest)
+		want   string
+	}{
+		{name: "context outside path list", mutate: func(request *AnalysisUnitRequest) {
+			request.SourcePaths = []string{"app/b.go"}
+		}, want: "not included in context_paths"},
+		{name: "context order", mutate: func(request *AnalysisUnitRequest) {
+			request.ContextPaths = []string{"shared/shared.go", "app/a.go"}
+		}, want: "context_paths must be sorted"},
+		{name: "invalid chunk", mutate: func(request *AnalysisUnitRequest) {
+			request.ChunkIndex = 2
+		}, want: "chunk_index/count"},
+		{name: "unsupported auxiliary", mutate: func(request *AnalysisUnitRequest) {
+			request.AuxiliaryPaths = []string{"app/README.md"}
+		}, want: "auxiliary path"},
+		{name: "semantic metadata", mutate: func(request *AnalysisUnitRequest) {
+			request.Stage = AnalysisUnitStageSemantic
+		}, want: "auxiliary_paths are only valid"},
+		{name: "missing fingerprint", mutate: func(request *AnalysisUnitRequest) {
+			request.ContextFingerprint = ""
+		}, want: "context_fingerprint"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := valid
+			test.mutate(&request)
+			if err := request.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestScanAnalysisUnitV2SourceBatchesRetainCanonicalTargets(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/app\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "app", "a.go"), "package app\n\nfunc A() {}\n")
+	writeTestFile(t, filepath.Join(root, "app", "b.go"), "package app\n\nfunc B() {}\n")
+	writeTestFile(t, filepath.Join(root, "shared", "go.mod"), "module example.com/shared\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "shared", "shared.go"), "package shared\n\nfunc Shared() {}\n")
+
+	base := AnalysisUnitRequest{
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:batch",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/a.go", "app/b.go"},
+		ChunkCount:         2,
+		ContextFingerprint: "context-sha256:batch",
+	}
+	firstRequest := base
+	firstRequest.SourcePaths = []string{"app/a.go"}
+	firstRequest.ChunkID = "chunk-0"
+	firstRequest.ChunkIndex = 0
+	firstRequest.AuxiliaryPaths = []string{"app/go.mod"}
+	secondRequest := base
+	secondRequest.SourcePaths = []string{"app/b.go"}
+	secondRequest.ChunkID = "chunk-1"
+	secondRequest.ChunkIndex = 1
+
+	first, err := ScanWithAnalysisUnit(root, "", firstRequest)
+	if err != nil {
+		t.Fatalf("first source batch failed: %v", err)
+	}
+	second, err := ScanWithAnalysisUnit(root, "", secondRequest)
+	if err != nil {
+		t.Fatalf("second source batch failed: %v", err)
+	}
+	for name, result := range map[string]Result{"first": first, "second": second} {
+		for _, file := range result.Files {
+			if file.Path != "app/a.go" && file.Path != "app/b.go" && file.Path != "app/go.mod" {
+				t.Fatalf("%s batch emitted out-of-scope completion: %+v", name, file)
+			}
+		}
+	}
+	if !hasFileCompletion(first.Files, "app/a.go") || hasFileCompletion(first.Files, "app/b.go") {
+		t.Fatalf("first batch file ledger does not match source_paths: %+v", first.Files)
+	}
+	if !hasFileCompletion(second.Files, "app/b.go") || hasFileCompletion(second.Files, "app/a.go") || hasFileCompletion(second.Files, "app/go.mod") {
+		t.Fatalf("second batch file ledger does not match source_paths/auxiliary owner: %+v", second.Files)
+	}
+	firstUnit := findNodeProperty(first.Nodes, "build_unit", "package_path", "example.com/app")
+	secondUnit := findNodeProperty(second.Nodes, "build_unit", "package_path", "example.com/app")
+	if firstUnit == nil || secondUnit == nil || firstUnit.ID != secondUnit.ID {
+		t.Fatalf("build unit identity changed between source batches: first=%+v second=%+v", firstUnit, secondUnit)
+	}
+	firstPayload, err := json.Marshal(firstUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPayload, err := json.Marshal(secondUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstPayload) != string(secondPayload) {
+		t.Fatalf("build unit payload changed between source batches: first=%s second=%s", firstPayload, secondPayload)
+	}
+	firstFileA := findNodeProperty(first.Nodes, "file", "path", "app/a.go")
+	firstFileB := findNodeProperty(first.Nodes, "file", "path", "app/b.go")
+	secondFileA := findNodeProperty(second.Nodes, "file", "path", "app/a.go")
+	secondFileB := findNodeProperty(second.Nodes, "file", "path", "app/b.go")
+	if firstFileA == nil || firstFileB != nil || secondFileA != nil || secondFileB == nil {
+		t.Fatalf("source batch file nodes are not scoped: first=%+v second=%+v", firstFileA, secondFileB)
+	}
+	if !hasContainsEdgeToFile(first.Edges, firstUnit.ID, firstFileA.ID) {
+		t.Fatalf("first batch contains edges escaped source scope: %+v", first.Edges)
+	}
+	if !hasContainsEdgeToFile(second.Edges, secondUnit.ID, secondFileB.ID) {
+		t.Fatalf("second batch contains edges escaped source scope: %+v", second.Edges)
+	}
+}
+
+func TestAnalysisUnitChunkProfilesDoNotChangeGraphIdentity(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/app\n\ngo 1.26.1\n\nrequire example.com/dep v0.0.0\n\nreplace example.com/dep => ../dep\n")
+	writeTestFile(t, filepath.Join(root, "app", "a.go"), "package app\n\nimport (\n\tdep \"example.com/dep\"\n\t\"unsafe\"\n)\n\nfunc A() int { return dep.Value() + int(unsafe.Sizeof(0)) }\n")
+	writeTestFile(t, filepath.Join(root, "dep", "go.mod"), "module example.com/dep\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "dep", "dep.go"), "package dep\n\nfunc Value() int { return 1 }\n")
+
+	base := AnalysisUnitRequest{
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:stable-identities",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/a.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/a.go", "dep/dep.go"},
+		ChunkCount:         2,
+		ContextFingerprint: "context-sha256:stable-identities",
+	}
+	chunkRequest := base
+	chunkRequest.ChunkID = "chunk-0"
+	chunkRequest.ChunkIndex = 0
+	chunkRequest.AuxiliaryPaths = []string{"app/go.mod"}
+	singleRequest := base
+	singleRequest.ChunkID = "single"
+	singleRequest.ChunkCount = 1
+	singleRequest.AuxiliaryPaths = []string{"app/go.mod"}
+
+	chunk, err := ScanWithAnalysisUnit(root, "", chunkRequest)
+	if err != nil {
+		t.Fatalf("chunk scan failed: %v", err)
+	}
+	single, err := ScanWithAnalysisUnit(root, "", singleRequest)
+	if err != nil {
+		t.Fatalf("single scan failed: %v", err)
+	}
+	if chunk.Profile.ID == single.Profile.ID {
+		t.Fatalf("chunk and single requests unexpectedly share wire profile: %q", chunk.Profile.ID)
+	}
+	if chunk.Profile.Properties["analysis_logical_profile_id"] == "" ||
+		chunk.Profile.Properties["analysis_logical_profile_id"] != single.Profile.Properties["analysis_logical_profile_id"] {
+		t.Fatalf("logical profile changed with chunk identity: chunk=%+v single=%+v", chunk.Profile.Properties, single.Profile.Properties)
+	}
+
+	chunkSites := sitesWithEvidencePath(chunk.Sites, "app/a.go")
+	singleSites := sitesWithEvidencePath(single.Sites, "app/a.go")
+	if len(chunkSites) == 0 || len(chunkSites) != len(singleSites) {
+		t.Fatalf("chunk and single site counts differ: chunk=%d single=%d", len(chunkSites), len(singleSites))
+	}
+	for _, site := range chunkSites {
+		if site.ProfileID != chunk.Profile.ID {
+			t.Fatalf("chunk site %q references undeclared profile %q", site.ID, site.ProfileID)
+		}
+		matching := findSiteByStableFields(singleSites, site.Kind, site.Specifier)
+		if matching == nil || matching.ID != site.ID {
+			t.Fatalf("site identity changed with chunk identity: chunk=%+v single=%+v", site, matching)
+		}
+		if matching.ProfileID != single.Profile.ID {
+			t.Fatalf("single site %q references undeclared profile %q", matching.ID, matching.ProfileID)
+		}
+	}
+
+	chunkEdges := edgesWithEvidencePath(chunk.Edges, "app/a.go")
+	singleEdges := edgesWithEvidencePath(single.Edges, "app/a.go")
+	if len(chunkEdges) == 0 || len(chunkEdges) != len(singleEdges) {
+		t.Fatalf("chunk and single edge counts differ: chunk=%d single=%d", len(chunkEdges), len(singleEdges))
+	}
+	for _, edge := range chunkEdges {
+		if edge.ProfileID != chunk.Profile.ID {
+			t.Fatalf("chunk edge %q references undeclared profile %q", edge.ID, edge.ProfileID)
+		}
+		matching := findEdgeByStableFields(singleEdges, edge.Kind, edge.SiteID, edge.Source, edge.Target)
+		if matching == nil || matching.ID != edge.ID {
+			t.Fatalf("edge identity changed with chunk identity: chunk=%+v single=%+v", edge, matching)
+		}
+		if matching.ProfileID != single.Profile.ID {
+			t.Fatalf("single edge %q references undeclared profile %q", matching.ID, matching.ProfileID)
+		}
+	}
+
+	chunkDiagnostics := diagnosticsWithEvidencePath(chunk.Diagnostics, "app/a.go")
+	singleDiagnostics := diagnosticsWithEvidencePath(single.Diagnostics, "app/a.go")
+	if len(chunkDiagnostics) != len(singleDiagnostics) {
+		t.Fatalf("chunk and single diagnostic counts differ: chunk=%d single=%d", len(chunkDiagnostics), len(singleDiagnostics))
+	}
+	for _, diagnostic := range chunkDiagnostics {
+		matching := findDiagnosticByStableFields(singleDiagnostics, diagnostic.Code, diagnostic.Path, diagnostic.Message)
+		if matching == nil || matching.ID != diagnostic.ID {
+			t.Fatalf("diagnostic identity changed with chunk identity: chunk=%+v single=%+v", diagnostic, matching)
+		}
+	}
+}
+
+func sitesWithEvidencePath(sites []Site, path string) []Site {
+	matched := make([]Site, 0)
+	for _, site := range sites {
+		if len(site.Evidence) > 0 && site.Evidence[0].Path == path {
+			matched = append(matched, site)
+		}
+	}
+	return matched
+}
+
+func edgesWithEvidencePath(edges []Edge, path string) []Edge {
+	matched := make([]Edge, 0)
+	for _, edge := range edges {
+		if len(edge.Evidence) > 0 && edge.Evidence[0].Path == path {
+			matched = append(matched, edge)
+		}
+	}
+	return matched
+}
+
+func diagnosticsWithEvidencePath(diagnostics []Diagnostic, path string) []Diagnostic {
+	matched := make([]Diagnostic, 0)
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Path == path || (len(diagnostic.Evidence) > 0 && diagnostic.Evidence[0].Path == path) {
+			matched = append(matched, diagnostic)
+		}
+	}
+	return matched
+}
+
+func findSiteByStableFields(sites []Site, kind, specifier string) *Site {
+	for index := range sites {
+		if sites[index].Kind == kind && sites[index].Specifier == specifier {
+			return &sites[index]
+		}
+	}
+	return nil
+}
+
+func findEdgeByStableFields(edges []Edge, kind, siteID, source, target string) *Edge {
+	for index := range edges {
+		if edges[index].Kind == kind && edges[index].SiteID == siteID && edges[index].Source == source && edges[index].Target == target {
+			return &edges[index]
+		}
+	}
+	return nil
+}
+
+func findDiagnosticByStableFields(diagnostics []Diagnostic, code, path, message string) *Diagnostic {
+	for index := range diagnostics {
+		if diagnostics[index].Code == code && diagnostics[index].Path == path && diagnostics[index].Message == message {
+			return &diagnostics[index]
+		}
+	}
+	return nil
+}
+
+func hasFileCompletion(files []FileCompletion, path string) bool {
+	for _, file := range files {
+		if file.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContainsEdgeToFile(edges []Edge, source, target string) bool {
+	for _, edge := range edges {
+		if edge.Kind == "contains" && edge.Source == source && edge.Target == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestScanAnalysisUnitPreservesDuplicateModuleIdentityAndScope(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/duplicate\n\ngo 1.26.1\n\nrequire example.com/shared v1.0.0\n")
@@ -88,17 +395,23 @@ func TestScanAnalysisUnitPreservesDuplicateModuleIdentityAndScope(t *testing.T) 
 	writeTestFile(t, filepath.Join(root, "go.work"), "go 1.26.1\n\nuse (\n\t./app\n\t./other\n\t./shared\n)\n")
 
 	appRequest := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:app",
-		Adapter:         AdapterName,
-		UnitRoot:        "app",
-		SourcePaths:     []string{"app/main.go"},
-		Stage:           AnalysisUnitStageSyntax,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:app",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/main.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/main.go", "shared/shared.go"},
+		ChunkID:            "chunk-0",
+		ChunkCount:         1,
+		ContextFingerprint: "duplicate-context",
 	}
 	otherRequest := appRequest
 	otherRequest.UnitID = "analysis-unit:other"
 	otherRequest.UnitRoot = "other"
 	otherRequest.SourcePaths = []string{"other/other.go"}
+	otherRequest.ContextPaths = []string{"other/other.go"}
+	otherRequest.ContextFingerprint = "other-context"
 
 	app, err := ScanWithAnalysisUnit(root, "", appRequest)
 	if err != nil {
@@ -113,6 +426,11 @@ func TestScanAnalysisUnitPreservesDuplicateModuleIdentityAndScope(t *testing.T) 
 	}
 	if app.Profile.Properties["analysis_stage"] != "syntax" || app.Profile.Properties["analysis_unit_root"] != "app" {
 		t.Fatalf("app profile omitted analysis scope: %+v", app.Profile)
+	}
+	if app.Profile.Properties["analysis_base_profile_id"] == "" ||
+		app.Profile.Properties["analysis_logical_profile_id"] == "" ||
+		app.Profile.Properties["analysis_logical_profile_id"] == app.Profile.ID {
+		t.Fatalf("app profile omitted distinct base/logical identity metadata: %+v", app.Profile)
 	}
 	if !containsString(app.Coverage.Completeness, "syntax-complete") || containsString(app.Coverage.Completeness, "semantic-complete") {
 		t.Fatalf("syntax unit advertised semantic completeness: %+v", app.Coverage)
@@ -149,12 +467,16 @@ func TestScanAnalysisUnitPreservesDuplicateModuleIdentityAndScope(t *testing.T) 
 	appSemanticRequest := appRequest
 	appSemanticRequest.Stage = AnalysisUnitStageSemantic
 	sharedRequest := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:shared",
-		Adapter:         AdapterName,
-		UnitRoot:        "shared",
-		SourcePaths:     []string{"shared/shared.go"},
-		Stage:           AnalysisUnitStageSyntax,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:shared",
+		Adapter:            AdapterName,
+		UnitRoot:           "shared",
+		SourcePaths:        []string{"shared/shared.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"shared/shared.go"},
+		ChunkID:            "chunk-0",
+		ChunkCount:         1,
+		ContextFingerprint: "shared-context",
 	}
 	sharedSemanticRequest := sharedRequest
 	sharedSemanticRequest.Stage = AnalysisUnitStageSemantic
@@ -240,12 +562,17 @@ replace example.com/replaced => ../replaced
 	writeTestFile(t, filepath.Join(root, "replaced", "go.mod"), "module example.com/replaced\n\ngo 1.26.1\n")
 	writeTestFile(t, filepath.Join(root, "replaced", "pkg", "pkg.go"), "package pkg\n")
 	request := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:replacement",
-		Adapter:         AdapterName,
-		UnitRoot:        "app",
-		SourcePaths:     []string{"app/main.go"},
-		Stage:           AnalysisUnitStageSyntax,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:replacement",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/main.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/main.go", "replaced/pkg/pkg.go"},
+		ChunkID:            "chunk-0",
+		ChunkCount:         1,
+		AuxiliaryPaths:     []string{"app/go.mod"},
+		ContextFingerprint: "replacement-context",
 	}
 	result, err := ScanWithAnalysisUnit(root, "", request)
 	if err != nil {
@@ -275,12 +602,16 @@ func TestScanAnalysisUnitSemanticStageDoesNotRepeatSourceGraph(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/semantic-unit\n\ngo 1.26.1\n")
 	writeTestFile(t, filepath.Join(root, "main.go"), "package semantic\n\nimport \"fmt\"\n\nfunc Target() {}\nfunc Caller() { fmt.Sprint(1); Target() }\n")
 	request := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:semantic",
-		Adapter:         AdapterName,
-		UnitRoot:        ".",
-		SourcePaths:     []string{"main.go"},
-		Stage:           AnalysisUnitStageSemantic,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:semantic",
+		Adapter:            AdapterName,
+		UnitRoot:           ".",
+		SourcePaths:        []string{"main.go"},
+		Stage:              AnalysisUnitStageSemantic,
+		ContextPaths:       []string{"main.go"},
+		ChunkID:            "semantic",
+		ChunkCount:         1,
+		ContextFingerprint: "semantic-context",
 	}
 	result, err := ScanWithAnalysisUnit(root, "", request)
 	if err != nil {
@@ -335,12 +666,16 @@ type Value struct { Number int }
 type Wrapper struct { Value Value }
 `)
 	request := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:closure-scope",
-		Adapter:         AdapterName,
-		UnitRoot:        "app",
-		SourcePaths:     []string{"app/main.go"},
-		Stage:           AnalysisUnitStageSemantic,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:closure-scope",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/main.go"},
+		Stage:              AnalysisUnitStageSemantic,
+		ContextPaths:       []string{"app/main.go", "shared/types.go"},
+		ChunkID:            "semantic",
+		ChunkCount:         1,
+		ContextFingerprint: "closure-context",
 	}
 	result, err := ScanWithAnalysisUnit(root, "", request)
 	if err != nil {
@@ -376,12 +711,17 @@ func TestScanAnalysisUnitAssemblyOwnershipUsesNearestModule(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, "app", "nested", "nested.s"), "TEXT ·nested(SB),$0-0\n\tRET\n")
 
 	request := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:assembly-ownership",
-		Adapter:         AdapterName,
-		UnitRoot:        "app",
-		SourcePaths:     []string{"app/limits.go"},
-		Stage:           AnalysisUnitStageSyntax,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:assembly-ownership",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/limits.go"},
+		Stage:              AnalysisUnitStageSyntax,
+		ContextPaths:       []string{"app/limits.go"},
+		ChunkID:            "chunk-0",
+		ChunkCount:         1,
+		AuxiliaryPaths:     []string{"app/bridge.s", "app/upper.S"},
+		ContextFingerprint: "assembly-context",
 	}
 	result, err := ScanWithAnalysisUnit(root, "", request)
 	if err != nil {
@@ -447,12 +787,16 @@ func TestScanAnalysisUnitSemanticStageDropsDiagnosticsForRemovedSourceSites(t *t
 	writeTestFile(t, filepath.Join(root, "app", "limits.go"), "package app\n\nimport _ \"unsafe\"\n\nfunc assemblyEntry()\n")
 	writeTestFile(t, filepath.Join(root, "app", "bridge.s"), "TEXT ·bridge(SB),$0-0\n\tRET\n")
 	request := AnalysisUnitRequest{
-		ContractVersion: AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:semantic-boundaries",
-		Adapter:         AdapterName,
-		UnitRoot:        "app",
-		SourcePaths:     []string{"app/limits.go"},
-		Stage:           AnalysisUnitStageSemantic,
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:semantic-boundaries",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/limits.go"},
+		Stage:              AnalysisUnitStageSemantic,
+		ContextPaths:       []string{"app/limits.go"},
+		ChunkID:            "semantic",
+		ChunkCount:         1,
+		ContextFingerprint: "boundary-context",
 	}
 	result, err := ScanWithAnalysisUnit(root, "", request)
 	if err != nil {

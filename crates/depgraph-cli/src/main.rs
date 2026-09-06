@@ -1,8 +1,10 @@
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     process::ExitCode,
 };
+
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -23,11 +25,10 @@ use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
     CancellationToken, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
     DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
-    ExportFormat, GraphQueryFilter, HotspotWeights, ImpactFilters, ImpactResult,
-    InteractiveQueryPage, InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic,
-    QueryFailureClass, RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem,
-    TypedProjection, UnresolvedResult, default_store_path, export_filtered,
-    export_graphml_filtered_to_writer, open_store, paginate_interactive_query,
+    GraphQueryFilter, HotspotWeights, ImpactFilters, ImpactResult, InteractiveQueryPage,
+    InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic, QueryFailureClass,
+    RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem, TypedProjection,
+    UnresolvedResult, default_store_path, paginate_interactive_query,
     profile_selection_human_summary, read_compiler_pack_requirement, render_condition,
     render_github_annotations, traversal_summary, unresolved_summary,
     validate_interactive_query_bounds,
@@ -60,6 +61,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     store: Option<PathBuf>,
 
+    /// Select a completed scan ID, or explicitly inspect a partial result as attempt:<ID>.
     #[arg(long, global = true, value_name = "ID")]
     scan_id: Option<String>,
 
@@ -1512,18 +1514,21 @@ async fn run(cli: Cli) -> Result<u8> {
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_structured(
-                    "deps",
-                    result.scan_id().to_owned(),
-                    result.traversal(),
-                    json,
-                )?;
+                print_graph_structured("deps", &snapshot, result.traversal(), json)?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
                 }
             } else {
-                let page = interactive_dependencies_page(&result, "deps", &request, &output)?;
-                print_interactive_page(&page, json)?;
+                let page =
+                    interactive_dependencies_page(&result, "deps", &request, &output, &snapshot)?;
+                print_graph_page(
+                    &page,
+                    json,
+                    &snapshot,
+                    output
+                        .max_bytes
+                        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
+                )?;
                 if !json {
                     for item in &page.items {
                         print_path_steps(std::slice::from_ref(&item.step));
@@ -1560,18 +1565,26 @@ async fn run(cli: Cli) -> Result<u8> {
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_structured(
-                    "dependents",
-                    result.scan_id().to_owned(),
-                    result.traversal(),
-                    json,
-                )?;
+                print_graph_structured("dependents", &snapshot, result.traversal(), json)?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
                 }
             } else {
-                let page = interactive_dependencies_page(&result, "dependents", &request, &output)?;
-                print_interactive_page(&page, json)?;
+                let page = interactive_dependencies_page(
+                    &result,
+                    "dependents",
+                    &request,
+                    &output,
+                    &snapshot,
+                )?;
+                print_graph_page(
+                    &page,
+                    json,
+                    &snapshot,
+                    output
+                        .max_bytes
+                        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
+                )?;
                 if !json {
                     for item in &page.items {
                         print_path_steps(std::slice::from_ref(&item.step));
@@ -1603,7 +1616,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 )?,
                 &CancellationToken::new(),
             )?;
-            print_structured("why", result.scan_id().to_owned(), result.path(), json)?;
+            print_graph_structured("why", &snapshot, result.path(), json)?;
             if !json {
                 if result.path().path_found {
                     println!("{}", result.path().from.locator);
@@ -1640,7 +1653,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 &ImpactRequest::try_new(selector, changed, filters)?,
                 &CancellationToken::new(),
             )?;
-            print_structured("impact", result.scan_id().to_owned(), result.impact(), json)?;
+            print_graph_structured("impact", &snapshot, result.impact(), json)?;
             if !json {
                 print_human_impact(result.impact());
             }
@@ -1668,12 +1681,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 )?,
                 &CancellationToken::new(),
             )?;
-            print_structured(
-                "cycles",
-                result.scan_id().to_owned(),
-                &result.cycles(),
-                json,
-            )?;
+            print_graph_structured("cycles", &snapshot, &result.cycles(), json)?;
             if !json {
                 if result.cycles().is_empty() {
                     println!("no cycles");
@@ -1698,12 +1706,7 @@ async fn run(cli: Cli) -> Result<u8> {
             )?;
             let result = service.unresolved(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_structured(
-                    "unresolved",
-                    result.scan_id().to_owned(),
-                    &result.items(),
-                    json,
-                )?;
+                print_graph_structured("unresolved", &snapshot, &result.items(), json)?;
                 if !json {
                     print_unresolved_items(result.items());
                 }
@@ -1732,14 +1735,21 @@ async fn run(cli: Cli) -> Result<u8> {
                         context: &context,
                         cursor: output.cursor.as_deref(),
                         max_items,
-                        max_bytes,
+                        max_bytes: partial_page_budget(&snapshot, max_bytes)?,
                         traversal_complete: true,
                         traversed_items: result.items().len().try_into().unwrap_or(u64::MAX),
                         root: None,
                         diagnostics: Vec::new(),
                     },
                 )?;
-                print_interactive_page(&page, json)?;
+                print_graph_page(
+                    &page,
+                    json,
+                    &snapshot,
+                    output
+                        .max_bytes
+                        .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
+                )?;
                 if !json {
                     print_unresolved_items(&page.items);
                 }
@@ -2085,9 +2095,9 @@ async fn run(cli: Cli) -> Result<u8> {
                     &HealthSummaryRequest::try_new(kinds)?,
                     &CancellationToken::new(),
                 )?;
-                print_structured(
+                print_graph_structured(
                     "health",
-                    result.scan_id().to_owned(),
+                    &snapshot,
                     &health_render::CliHealthSummaryView {
                         snapshot_id: result.snapshot_id().as_str(),
                         scan_id: result.scan_id(),
@@ -2132,12 +2142,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     &HealthFindingGetRequest::try_new(finding_id)?,
                     &CancellationToken::new(),
                 )?;
-                print_structured(
-                    "health.show",
-                    snapshot.scan_id().to_owned(),
-                    &result.finding,
-                    json,
-                )?;
+                print_graph_structured("health.show", &snapshot, &result.finding, json)?;
                 if !json {
                     health_render::print_findings_human(std::slice::from_ref(&result.finding));
                 }
@@ -2210,6 +2215,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     }),
                     &output,
                     json,
+                    None,
                 )?;
             }
             Ok(0)
@@ -2239,9 +2245,9 @@ async fn run(cli: Cli) -> Result<u8> {
             let result =
                 service.health_hotspots(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_structured(
+                print_graph_structured(
                     "hotspots",
-                    result.scan_id().to_owned(),
+                    &snapshot,
                     &health_render::CliHealthFindingsView {
                         snapshot_id: result.snapshot_id().as_str(),
                         scan_id: result.scan_id(),
@@ -2267,6 +2273,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     }),
                     &output,
                     json,
+                    Some(&snapshot),
                 )?;
             }
             Ok(0)
@@ -2281,115 +2288,50 @@ async fn run(cli: Cli) -> Result<u8> {
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let format = match format {
-                ExportFormatArg::Json => ExportFormat::Json,
-                ExportFormatArg::Dot => ExportFormat::Dot,
-                ExportFormatArg::Mermaid => ExportFormat::Mermaid,
-                ExportFormatArg::Graphml => ExportFormat::Graphml,
+                ExportFormatArg::Json => GraphExportFormat::Json,
+                ExportFormatArg::Dot => GraphExportFormat::Dot,
+                ExportFormatArg::Mermaid => GraphExportFormat::Mermaid,
+                ExportFormatArg::Graphml => GraphExportFormat::Graphml,
             };
-            {
-                let root = canonical_directory(std::env::current_dir()?)?;
-                let store_path = store_path(cli.store.clone(), &root)?;
-                let service = if output.is_some() {
-                    repository_write_service(&root, &store_path)?
-                } else {
-                    snapshot_read_service(&root, &store_path)?
-                };
-                let snapshot = if let Some(scan_id) = cli.scan_id.as_deref() {
-                    match service
-                        .start_snapshot_request_for_scan(scan_id, &CancellationToken::new())
-                    {
-                        Ok(pinned) => Some(SnapshotLocator::StableId(
-                            pinned.snapshot_id().as_str().to_owned(),
-                        )),
-                        // Explicit failed or partial scans remain inspectable through the legacy
-                        // CLI-only projection. Agent-facing reads never enter this path.
-                        Err(DepgraphServiceError::Integrity | DepgraphServiceError::NotFound) => {
-                            None
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                } else {
-                    Some(SnapshotLocator::Current)
-                };
-                if let Some(snapshot) = snapshot {
-                    let service_format = match format {
-                        ExportFormat::Json => GraphExportFormat::Json,
-                        ExportFormat::Dot => GraphExportFormat::Dot,
-                        ExportFormat::Mermaid => GraphExportFormat::Mermaid,
-                        ExportFormat::Graphml => GraphExportFormat::Graphml,
-                    };
-                    let request = GraphExportRequest::try_new(
-                        snapshot,
-                        service_format,
-                        None,
-                        filter.clone(),
-                        MAX_GRAPH_EXPORT_NODES,
-                        MAX_GRAPH_EXPORT_EDGES,
-                    )?;
-                    if let Some(output) = output.as_ref() {
-                        let output_path = normalize_cli_repository_output(&root, output)?;
-                        service.export_file(
-                            &ExportFileRequest::raw_compatible(
-                                request,
-                                output_path,
-                                RepositoryOverwritePolicy::Overwrite,
-                            ),
-                            &CancellationToken::new(),
-                        )?;
-                    } else {
-                        let rendered = service.graph_export(&request, &CancellationToken::new())?;
-                        print!("{}", rendered.content);
-                    }
-                    return Ok(0);
+            let root = canonical_directory(std::env::current_dir()?)?;
+            let store_path = store_path(cli.store, &root)?;
+            let service = if output.is_some() {
+                repository_write_service(&root, &store_path)?
+            } else {
+                snapshot_read_service(&root, &store_path)?
+            };
+            let locator = match cli.scan_id.as_deref() {
+                Some(selector) if selector.starts_with("attempt:") => {
+                    SnapshotLocator::parse(selector)?
                 }
-            }
-            let (snapshot, _) = load_snapshot(cli.store.clone(), cli.scan_id.as_deref(), false)?;
-            let service_format = match format {
-                ExportFormat::Json => GraphExportFormat::Json,
-                ExportFormat::Dot => GraphExportFormat::Dot,
-                ExportFormat::Mermaid => GraphExportFormat::Mermaid,
-                ExportFormat::Graphml => GraphExportFormat::Graphml,
+                Some(scan_id) => {
+                    let pinned = service
+                        .start_snapshot_request_for_scan(scan_id, &CancellationToken::new())?;
+                    SnapshotLocator::StableId(pinned.snapshot_id().as_str().to_owned())
+                }
+                None => SnapshotLocator::Current,
             };
-            if format == ExportFormat::Graphml {
-                if let Some(path) = output.as_ref() {
-                    let root = canonical_directory(std::env::current_dir()?)?;
-                    let store_path = store_path(cli.store.clone(), &root)?;
-                    let service = repository_write_service(&root, &store_path)?;
-                    let output_path = normalize_cli_repository_output(&root, path)?;
-                    let mut rendered = Vec::new();
-                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut rendered)?;
-                    service.export_rendered_file(
-                        &output_path,
+            let request = GraphExportRequest::try_new(
+                locator,
+                format,
+                None,
+                filter,
+                MAX_GRAPH_EXPORT_NODES,
+                MAX_GRAPH_EXPORT_EDGES,
+            )?;
+            if let Some(output) = output.as_ref() {
+                let output_path = normalize_cli_repository_output(&root, output)?;
+                service.export_file(
+                    &ExportFileRequest::raw_compatible(
+                        request,
+                        output_path,
                         RepositoryOverwritePolicy::Overwrite,
-                        service_format,
-                        &rendered,
-                        &CancellationToken::new(),
-                    )?;
-                } else {
-                    let stdout = std::io::stdout();
-                    let mut writer = stdout.lock();
-                    export_graphml_filtered_to_writer(&snapshot, &filter, &mut writer)?;
-                    writer
-                        .flush()
-                        .context("failed to write GraphML to stdout")?;
-                }
-                return Ok(0);
-            }
-            let rendered = export_filtered(&snapshot, format, &filter)?;
-            if let Some(path) = output.as_ref() {
-                let root = canonical_directory(std::env::current_dir()?)?;
-                let store_path = store_path(cli.store, &root)?;
-                let service = repository_write_service(&root, &store_path)?;
-                let output_path = normalize_cli_repository_output(&root, path)?;
-                service.export_rendered_file(
-                    &output_path,
-                    RepositoryOverwritePolicy::Overwrite,
-                    service_format,
-                    rendered.as_bytes(),
+                    ),
                     &CancellationToken::new(),
                 )?;
             } else {
-                print!("{rendered}");
+                let rendered = service.graph_export(&request, &CancellationToken::new())?;
+                print!("{}", rendered.content);
             }
             Ok(0)
         }
@@ -2552,10 +2494,14 @@ fn normalize_cli_repository_output(
 }
 
 fn cli_snapshot_selector(scan_id: Option<String>) -> ServiceSnapshotSelector {
-    scan_id.map_or_else(
-        ServiceSnapshotSelector::current,
-        ServiceSnapshotSelector::ScanId,
-    )
+    scan_id.map_or_else(ServiceSnapshotSelector::current, |id| {
+        match id.strip_prefix("attempt:") {
+            Some(attempt) => {
+                ServiceSnapshotSelector::Locator(SnapshotLocator::Attempt(attempt.to_owned()))
+            }
+            None => ServiceSnapshotSelector::ScanId(id),
+        }
+    })
 }
 
 fn unsafe_profiles_file(reason: &'static str) -> DepgraphServiceError {
@@ -2610,19 +2556,6 @@ fn print_agent_doctor_human(report: &serde_json::Value, details: bool) {
     }
 }
 
-fn load_snapshot(
-    explicit_store: Option<PathBuf>,
-    requested_scan_id: Option<&str>,
-    latest_attempt: bool,
-) -> Result<(depgraph_core::GraphSnapshot, String)> {
-    let root = std::env::current_dir()?;
-    let store_path = store_path(explicit_store, &root)?;
-    let store = open_store(&store_path)?;
-    let scan_id = store.resolve_scan_id(requested_scan_id, latest_attempt)?;
-    let snapshot = store.load_snapshot(&scan_id)?;
-    Ok((snapshot, scan_id))
-}
-
 fn graph_snapshot_request(
     explicit_store: Option<PathBuf>,
     requested_scan_id: Option<&str>,
@@ -2651,6 +2584,11 @@ fn snapshot_request(
     let bootstrap_service = snapshot_read_service(&invocation_root, &store_path)?;
     let cancellation = CancellationToken::new();
     let mut request = match requested_scan_id {
+        Some(selector) if selector.starts_with("attempt:") => bootstrap_service
+            .start_snapshot_request_at_cancellable(
+                &SnapshotLocator::parse(selector)?,
+                &cancellation,
+            )?,
         Some(scan_id) => {
             bootstrap_service.start_snapshot_request_for_scan(scan_id, &cancellation)?
         }
@@ -2695,9 +2633,9 @@ fn run_health_findings(
         HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?;
     let result = service.health_findings(&mut snapshot, &request, &CancellationToken::new())?;
     if output.all {
-        print_structured(
+        print_graph_structured(
             "health.list",
-            result.scan_id().to_owned(),
+            &snapshot,
             &health_render::CliHealthFindingsView {
                 snapshot_id: result.snapshot_id().as_str(),
                 scan_id: result.scan_id(),
@@ -2723,6 +2661,7 @@ fn run_health_findings(
             }),
             output,
             json,
+            Some(&snapshot),
         )?;
     }
     if health_render::evaluate_baseline_gate(
@@ -2738,6 +2677,7 @@ fn run_health_findings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_health_finding_page(
     command: &'static str,
     scan_id: &str,
@@ -2746,6 +2686,7 @@ fn print_health_finding_page(
     context: &serde_json::Value,
     output: &InteractiveOutputArgs,
     json: bool,
+    snapshot: Option<&SnapshotReadRequest>,
 ) -> Result<()> {
     let max_items = output
         .max_items
@@ -2764,14 +2705,20 @@ fn print_health_finding_page(
             context,
             cursor: output.cursor.as_deref(),
             max_items,
-            max_bytes,
+            max_bytes: snapshot.map_or(Ok(max_bytes), |snapshot| {
+                partial_page_budget(snapshot, max_bytes)
+            })?,
             traversal_complete: true,
             traversed_items: findings.len().try_into().unwrap_or(u64::MAX),
             root: None,
             diagnostics: Vec::new(),
         },
     )?;
-    print_interactive_page(&page, json)?;
+    if let Some(snapshot) = snapshot {
+        print_graph_page(&page, json, snapshot, max_bytes)?;
+    } else {
+        print_interactive_page(&page, json)?;
+    }
     if !json {
         health_render::print_findings_human(&page.items);
     }
@@ -3119,6 +3066,7 @@ fn interactive_dependencies_page(
     command: &'static str,
     request: &DependenciesRequest,
     output: &InteractiveOutputArgs,
+    snapshot: &SnapshotReadRequest,
 ) -> Result<InteractiveQueryPage<TraversalPageItem>> {
     let max_items = output
         .max_items
@@ -3145,13 +3093,89 @@ fn interactive_dependencies_page(
             context: &context,
             cursor: output.cursor.as_deref(),
             max_items,
-            max_bytes,
+            max_bytes: partial_page_budget(snapshot, max_bytes)?,
             traversal_complete: execution.complete(),
             traversed_items: execution.traversed_edges(),
             root: Some(&execution.traversal().root),
             diagnostics: execution.diagnostics().to_vec(),
         },
     )
+}
+
+fn partial_query_metadata(snapshot: &SnapshotReadRequest) -> Option<serde_json::Value> {
+    snapshot.partial_metadata().map(|partial| {
+        serde_json::json!({
+            "contract_version":"depgraph-partial-result-v1",
+            "attempt_id":partial.attempt_id(), "status":partial.status(),
+            "analysis_complete":false, "analysis_coverage":partial.analysis_coverage(),
+        })
+    })
+}
+
+fn partial_page_budget(snapshot: &SnapshotReadRequest, max_bytes: usize) -> Result<usize> {
+    let reserved =
+        partial_query_metadata(snapshot).map_or(0, |metadata| canonical_json(&metadata).len() + 32);
+    max_bytes
+        .checked_sub(reserved)
+        .context("partial analysis metadata exceeds the output budget")
+}
+
+fn print_graph_page<T: Serialize>(
+    page: &InteractiveQueryPage<T>,
+    json_output: bool,
+    snapshot: &SnapshotReadRequest,
+    max_bytes: usize,
+) -> Result<()> {
+    let Some(partial) = partial_query_metadata(snapshot) else {
+        return print_interactive_page(page, json_output);
+    };
+    if !json_output {
+        println!(
+            "partial analysis: {} (only analyzed dependencies are available)",
+            snapshot.scan_id()
+        );
+        return print_interactive_page(page, false);
+    }
+    let mut value = serde_json::to_value(page)?;
+    value["partial"] = partial;
+    // Include the metadata and the length field itself in the byte contract.
+    loop {
+        let encoded = canonical_json(&value);
+        if encoded.len() > max_bytes {
+            anyhow::bail!("partial analysis metadata exceeds the output budget");
+        }
+        if value["serialized_output_bytes"].as_u64() == Some(encoded.len() as u64) {
+            println!("{encoded}");
+            return Ok(());
+        }
+        value["serialized_output_bytes"] = serde_json::json!(encoded.len());
+    }
+}
+
+fn print_graph_structured<T: Serialize>(
+    command: &'static str,
+    snapshot: &SnapshotReadRequest,
+    data: &T,
+    json_output: bool,
+) -> Result<()> {
+    let Some(partial) = partial_query_metadata(snapshot) else {
+        return print_structured(command, snapshot.scan_id().to_owned(), data, json_output);
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version":"1.0", "command":command, "scan_id":snapshot.scan_id(),
+                "partial":partial, "data":data,
+            }))?
+        );
+    } else {
+        println!(
+            "partial analysis: {} (only analyzed dependencies are available)",
+            snapshot.scan_id()
+        );
+    }
+    Ok(())
 }
 
 fn print_interactive_page<T: Serialize>(

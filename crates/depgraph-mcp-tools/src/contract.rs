@@ -102,6 +102,7 @@ impl SnapshotSelector {
             Ok(CoreSnapshotLocator::StableId(snapshot_id)) => Ok(Self::Id {
                 snapshot_id: SnapshotId::parse(snapshot_id)?,
             }),
+            Ok(CoreSnapshotLocator::Attempt(_)) => Err(ContractValueError::SnapshotName),
             Err(_) => Err(ContractValueError::SnapshotName),
         }
     }
@@ -127,6 +128,7 @@ impl TryFrom<CoreSnapshotLocator> for SnapshotSelector {
             CoreSnapshotLocator::StableId(snapshot_id) => Ok(Self::Id {
                 snapshot_id: SnapshotId::parse(snapshot_id)?,
             }),
+            CoreSnapshotLocator::Attempt(_) => Err(ContractValueError::SnapshotName),
         }
     }
 }

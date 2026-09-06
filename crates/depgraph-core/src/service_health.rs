@@ -1320,6 +1320,7 @@ fn resolve_before_snapshot(
                     .ok_or(DepgraphServiceError::NotFound)?;
                 ResolvedSnapshotId::from_completed(id)?
             }
+            SnapshotLocator::Attempt(_) => return Err(DepgraphServiceError::InvalidInput),
         };
         let loaded = load_snapshot_by_id(after_request, id.as_str(), cancellation)?;
         if loaded.scan.source_revision.as_deref() != Some(target_oid) {

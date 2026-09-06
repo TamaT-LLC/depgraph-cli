@@ -256,6 +256,94 @@ fn portable_terminal_output_is_deserialized_only_by_its_originating_tool_contrac
         .remove("snapshot_id");
     assert!(scan.deserialize(snapshotless_scan).is_err());
 
+    let v2_completed = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repo-1",
+        "snapshot_id": SNAPSHOT_ID,
+        "result": {
+            "contract_version": "depgraph-agent-scan-outcome-v2",
+            "scan_id": "scan:v2-completed",
+            "status": "completed",
+            "project_code_executed": false,
+            "cache": {"hits": 1, "misses": 0},
+            "coverage": {
+                "profiles": 1,
+                "files_discovered": 1,
+                "files_analyzed": 1,
+                "files_skipped": 0,
+                "dependency_sites": 0,
+                "resolved": 0,
+                "candidates": 0,
+                "external": 0,
+                "unresolved": 0,
+                "unsupported_syntax": 0,
+                "project_code_executed": false,
+                "completeness": ["syntax-complete"],
+                "reasons": []
+            },
+            "completed_snapshot_id": SNAPSHOT_ID,
+            "analysis_coverage": {
+                "contract_version": "depgraph-analysis-unit-v2",
+                "expected_units": 1,
+                "completed_units": 1,
+                "failed_units": 0,
+                "unanalysed_units": 0,
+                "cancelled_units": 0,
+                "semantic_complete_units": 0,
+                "complete": true,
+                "reasons": []
+            }
+        }
+    });
+    assert!(scan.deserialize(v2_completed.clone()).is_ok());
+
+    let v2_partial = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repo-1",
+        "snapshot_id": null,
+        "result": {
+            "contract_version": "depgraph-agent-scan-outcome-v2",
+            "scan_id": "scan:v2-partial",
+            "status": "partial",
+            "project_code_executed": false,
+            "cache": {"hits": 0, "misses": 1},
+            "coverage": {
+                "profiles": 1,
+                "files_discovered": 1,
+                "files_analyzed": 0,
+                "files_skipped": 1,
+                "dependency_sites": 0,
+                "resolved": 0,
+                "candidates": 0,
+                "external": 0,
+                "unresolved": 0,
+                "unsupported_syntax": 0,
+                "project_code_executed": false,
+                "completeness": [],
+                "reasons": ["analysis-unit-incomplete"]
+            },
+            "analysis_coverage": {
+                "contract_version": "depgraph-analysis-unit-v2",
+                "expected_units": 1,
+                "completed_units": 0,
+                "failed_units": 0,
+                "unanalysed_units": 1,
+                "cancelled_units": 0,
+                "semantic_complete_units": 0,
+                "complete": false,
+                "reasons": ["analysis-unit-incomplete"]
+            }
+        }
+    });
+    assert!(scan.deserialize(v2_partial.clone()).is_ok());
+
+    let mut completed_snapshot_mismatch = v2_completed;
+    completed_snapshot_mismatch["snapshot_id"] = serde_json::Value::Null;
+    assert!(scan.deserialize(completed_snapshot_mismatch).is_err());
+    let mut partial_snapshot_mismatch = v2_partial;
+    partial_snapshot_mismatch["snapshot_id"] = json!(SNAPSHOT_ID);
+    assert!(scan.deserialize(partial_snapshot_mismatch).is_err());
+
     let runtime_outcome: AgentRuntimeOutcome = serde_json::from_value(json!({
         "import_id":"runtime-import:fixture",
         "session_id":"runtime-session:fixture",
@@ -1403,8 +1491,8 @@ fn agent_operation_is_closed_and_validates_status_progress_and_timestamps() {
     assert_eq!(operation.timestamps().created_at_ms(), 1000);
     assert_eq!(operation.timestamps().updated_at_ms(), 1100);
     assert_eq!(operation.timestamps().terminal_at_ms(), None);
-    assert_eq!(operation.retention().execution_deadline_ms(), 2000);
-    assert_eq!(operation.retention().retain_until_ms(), 3000);
+    assert_eq!(operation.retention().execution_deadline_ms(), Some(2000));
+    assert_eq!(operation.retention().retain_until_ms(), Some(3000));
 
     let mut unknown = valid.clone();
     unknown["journal"] = json!({"lease": "must-not-be-public"});
@@ -1449,6 +1537,35 @@ fn agent_operation_is_closed_and_validates_status_progress_and_timestamps() {
     ] {
         assert!(serde_json::from_value::<AgentOperation>(invalid).is_err());
     }
+}
+
+#[test]
+fn unbounded_scan_operation_requires_v2_and_terminal_retention_is_finite() {
+    let running = json!({
+        "operation_contract_version":"depgraph-operation-v2",
+        "operation_id":OPERATION_ID,"status":"running",
+        "progress":{"completed_units":2,"total_units":4},
+        "timestamps":{"created_at_ms":1000,"updated_at_ms":7_201_000},
+        "retention":{"execution_deadline_ms":null,"retain_until_ms":null}
+    });
+    let operation: AgentOperation = serde_json::from_value(running.clone()).unwrap();
+    assert_eq!(operation.retention().execution_deadline_ms(), None);
+    assert_eq!(operation.retention().retain_until_ms(), None);
+    assert_eq!(serde_json::to_value(operation).unwrap(), running);
+    let mut legacy = running.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("operation_contract_version");
+    assert!(serde_json::from_value::<AgentOperation>(legacy).is_err());
+    let mut completed = running;
+    completed["status"] = json!("completed");
+    completed["progress"]["completed_units"] = json!(4);
+    completed["timestamps"]["terminal_at_ms"] = json!(7_201_000);
+    assert!(serde_json::from_value::<AgentOperation>(completed.clone()).is_err());
+    completed["retention"]["retain_until_ms"] = json!(612_001_000);
+    let terminal: AgentOperation = serde_json::from_value(completed.clone()).unwrap();
+    assert_eq!(serde_json::to_value(terminal).unwrap(), completed);
 }
 
 #[test]

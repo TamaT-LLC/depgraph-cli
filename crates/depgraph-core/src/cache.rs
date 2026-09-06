@@ -22,6 +22,10 @@ use crate::{
     compiler_pack::{COMPILER_PRECISE_CONTRACT_VERSION, CompilerPackAttestation},
     compiler_precise::RustCargoUnitGraph,
     config::Config,
+    go_dependency_witness::{
+        GO_DEPENDENCY_WITNESS_SCHEMA, GoDependencyWitness, compute_go_dependency_witness,
+        recompute_go_dependency_witness,
+    },
     repository_inventory::build_repository_file_inventory,
     worker::{AdapterKind, WorkerSpec, resolve_safe_executable, sanitized_path},
 };
@@ -45,6 +49,7 @@ pub(crate) struct ScanCachePlan {
     pub syntax: CacheKey,
     pub semantic: Option<CacheKey>,
     pub semantic_reject_reason: Option<&'static str>,
+    pub(crate) go_dependency_witness: GoDependencyWitness,
     pub(crate) symlink_proofs: Vec<SymlinkProof>,
 }
 
@@ -110,7 +115,7 @@ struct InventoryFingerprints {
     all: String,
     manifests: String,
     generated: String,
-    go_dependency_rescan_required: bool,
+    go_dependency_witness: GoDependencyWitness,
     symlink_proofs: Vec<SymlinkProof>,
 }
 
@@ -143,11 +148,12 @@ pub(crate) fn prepare_scan_cache(
             ("scan_contract".to_owned(), scan_contract),
         ]),
     );
-    if inventory.go_dependency_rescan_required {
+    if !inventory.go_dependency_witness.is_cacheable() {
         return ScanCachePreparation::Ready(ScanCachePlan {
             syntax,
             semantic: None,
-            semantic_reject_reason: Some("dependency-fingerprint-requires-rescan"),
+            semantic_reject_reason: Some("dependency-witness-unavailable"),
+            go_dependency_witness: inventory.go_dependency_witness,
             symlink_proofs: inventory.symlink_proofs,
         });
     }
@@ -158,6 +164,7 @@ pub(crate) fn prepare_scan_cache(
                 syntax,
                 semantic: None,
                 semantic_reject_reason: Some("toolchain-fingerprint-unavailable"),
+                go_dependency_witness: inventory.go_dependency_witness,
                 symlink_proofs: inventory.symlink_proofs,
             });
         }
@@ -170,6 +177,14 @@ pub(crate) fn prepare_scan_cache(
             (
                 "dependency_snapshot".to_owned(),
                 inventory.manifests.clone(),
+            ),
+            (
+                "go_dependency_witness".to_owned(),
+                inventory.go_dependency_witness.fingerprint().to_owned(),
+            ),
+            (
+                "go_dependency_witness_schema".to_owned(),
+                GO_DEPENDENCY_WITNESS_SCHEMA.to_owned(),
             ),
             ("generated_artifact".to_owned(), inventory.generated),
             ("manifest_lock_config".to_owned(), inventory.manifests),
@@ -186,6 +201,7 @@ pub(crate) fn prepare_scan_cache(
         syntax,
         semantic: Some(semantic),
         semantic_reject_reason: None,
+        go_dependency_witness: inventory.go_dependency_witness,
         symlink_proofs: inventory.symlink_proofs,
     })
 }
@@ -196,6 +212,12 @@ pub(crate) fn validate_scan_cache_hit_inputs(
 ) -> Result<(), CacheRejection> {
     for proof in &plan.symlink_proofs {
         validate_symlink_proof(root, proof)?;
+    }
+    let observed = recompute_go_dependency_witness(root);
+    if observed != plan.go_dependency_witness {
+        return Err(CacheRejection::new(
+            "go-dependency-witness-changed-before-cache-hit-promotion",
+        ));
     }
     Ok(())
 }
@@ -438,8 +460,8 @@ fn fingerprint_inventory(
     let mut total = 0_u64;
     let inventory = build_repository_file_inventory(&root)
         .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
-    for relative in inventory.paths {
-        let path = root.join(&relative);
+    for relative in &inventory.paths {
+        let path = root.join(relative);
         if is_store_artifact(&path, store_path.as_deref()) {
             continue;
         }
@@ -451,9 +473,9 @@ fn fingerprint_inventory(
             return Err(CacheRejection::new("invalid-relative-path"));
         }
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| CacheRejection::at_path("inventory-unavailable", &relative))?;
+            .map_err(|_| CacheRejection::at_path("inventory-unavailable", relative))?;
         let (content_path, length, symlink) = if metadata.file_type().is_symlink() {
-            let observation = observe_confined_symlink(&root, &path, &relative)?;
+            let observation = observe_confined_symlink(&root, &path, relative)?;
             (
                 observation.canonical_target.clone(),
                 observation.length,
@@ -464,25 +486,25 @@ fn fingerprint_inventory(
         } else {
             return Err(CacheRejection::at_path(
                 "unsupported-filesystem-entry",
-                &relative,
+                relative,
             ));
         };
         if length > CACHE_MAX_FILE_BYTES {
-            return Err(CacheRejection::at_path("file-size-limit", &relative));
+            return Err(CacheRejection::at_path("file-size-limit", relative));
         }
         total = total
             .checked_add(length)
-            .ok_or_else(|| CacheRejection::at_path("inventory-size-limit", &relative))?;
+            .ok_or_else(|| CacheRejection::at_path("inventory-size-limit", relative))?;
         if total > CACHE_MAX_TOTAL_BYTES {
-            return Err(CacheRejection::at_path("inventory-size-limit", &relative));
+            return Err(CacheRejection::at_path("inventory-size-limit", relative));
         }
         if files.len() >= CACHE_MAX_FILES {
-            return Err(CacheRejection::at_path("inventory-file-limit", &relative));
+            return Err(CacheRejection::at_path("inventory-file-limit", relative));
         }
         files.push(InventoryFile {
-            manifest: is_manifest_lock_or_config(&relative),
-            generated: is_generated_artifact(&relative),
-            relative,
+            manifest: is_manifest_lock_or_config(relative),
+            generated: is_generated_artifact(relative),
+            relative: relative.to_owned(),
             path: content_path,
             length,
             symlink,
@@ -496,7 +518,6 @@ fn fingerprint_inventory(
     manifests.update(b"depgraph-cache-manifests-v1\0");
     let mut generated = Sha256::new();
     generated.update(b"depgraph-cache-generated-v1\0");
-    let mut go_dependency_rescan_required = false;
     let mut symlink_proofs = Vec::new();
     for file in files {
         let bytes = fs::read(&file.path)
@@ -515,9 +536,6 @@ fn fingerprint_inventory(
         }
         if file.generated {
             update_inventory_entry_digest(&mut generated, &file, &bytes);
-        }
-        if file.relative.ends_with("go.mod") && go_mod_requires_dependencies(&bytes) {
-            go_dependency_rescan_required = true;
         }
         let observed = fs::metadata(&file.path)
             .map_err(|_| CacheRejection::at_path("inventory-read-failed", &file.relative))?;
@@ -543,11 +561,18 @@ fn fingerprint_inventory(
             });
         }
     }
+    let witness_paths = inventory
+        .paths
+        .iter()
+        .filter(|relative| !is_store_artifact(&root.join(relative), store_path.as_deref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let go_dependency_witness = compute_go_dependency_witness(&root, &witness_paths);
     Ok(InventoryFingerprints {
         all: finish_digest(all),
         manifests: finish_digest(manifests),
         generated: finish_digest(generated),
-        go_dependency_rescan_required,
+        go_dependency_witness,
         symlink_proofs,
     })
 }
@@ -1327,15 +1352,6 @@ fn is_generated_artifact(path: &str) -> bool {
         || lower.ends_with("routetree.gen.ts")
 }
 
-fn go_mod_requires_dependencies(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.lines().any(|line| {
-            let line = line.trim_start();
-            line == "require (" || line.starts_with("require\t") || line.starts_with("require ")
-        })
-    })
-}
-
 fn update_inventory_entry_digest(hasher: &mut Sha256, file: &InventoryFile, bytes: &[u8]) {
     let Some(symlink) = &file.symlink else {
         update_entry_digest(hasher, &file.relative, bytes);
@@ -1859,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn go_dependency_snapshot_fails_closed_to_a_rescan() {
+    fn go_dependency_witness_fails_closed_to_a_rescan() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join("go.mod"),
@@ -1878,8 +1894,9 @@ mod tests {
         assert!(plan.semantic.is_none());
         assert_eq!(
             plan.semantic_reject_reason,
-            Some("dependency-fingerprint-requires-rescan")
+            Some("dependency-witness-unavailable")
         );
+        assert_eq!(plan.go_dependency_witness.status(), "unavailable");
     }
 
     #[test]

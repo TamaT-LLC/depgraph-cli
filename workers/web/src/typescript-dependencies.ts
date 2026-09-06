@@ -3561,6 +3561,7 @@ export async function extractTypeScriptRawDependencyDelta(
   definitions: TypeScriptRawDefinitionDelta,
   priorTypeCheckerQueries = 0,
   validationTarget?: TypeScriptDependencyValidationTarget,
+  options: { sourcePaths?: ReadonlySet<string> } = {},
 ): Promise<TypeScriptRawDependencyDelta> {
   const counter: QueryCounter = { value: 0, prior: priorTypeCheckerQueries };
   const sites: TypeScriptRawDependencySite[] = [];
@@ -3900,7 +3901,10 @@ export async function extractTypeScriptRawDependencyDelta(
       for (const jsDoc of node.jsDoc ?? []) await visitDetachedJSDoc(jsDoc, childContext, depth + 1);
     };
 
-    for (const source of [...sources].sort((left, right) => compareStrings(left.relativePath, right.relativePath))) {
+    const dependencySources = options.sourcePaths === undefined
+      ? sources
+      : sources.filter((source) => options.sourcePaths!.has(source.relativePath));
+    for (const source of [...dependencySources].sort((left, right) => compareStrings(left.relativePath, right.relativePath))) {
       const externalBindings = new BindingProvenanceMap();
       const validation = validationByPath.get(source.relativePath);
       if (validation === undefined) {

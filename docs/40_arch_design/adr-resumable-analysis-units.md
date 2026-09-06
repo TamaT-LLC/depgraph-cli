@@ -1,15 +1,20 @@
 # ADR: Static analysis-unit planning for resumable scans
 
-- Status: Proposed
+- Status: Implemented
 - Date: 2026-09-06
 - Issue: #465
 - Contract: depgraph-analysis-plan-v1
-- Worker capability: analysis-unit-v1 (advertised by `--version` capabilities)
+- Worker capabilities: analysis-source-batch-v1 (v2), analysis-unit-v1 (legacy Go v1)
+
+The acceptance matrix in
+[resumable-analysis-validation.md](resumable-analysis-validation.md) records
+the passing pinned local gate, public integration fixture, and separate
+benchmark measurements. CI verification is required before merge.
 
 ## Context
 
-The scan command currently receives a repository root and starts a language
-worker for the whole adapter. A large repository can therefore spend its
+The previous scan command started one language worker for each adapter at the
+repository root. A large repository can therefore spend its
 entire job budget in one worker even when a large part of the result is
 already usable. A timeout also discards the distinction between a slow unit,
 a failed unit, and a repository that is still making progress.
@@ -63,7 +68,7 @@ stable ID is derived from the contract, adapter, unit kind, unit root, and
 locator. Absolute checkout paths, timestamps, inode values, locale, and
 directory iteration order are excluded.
 
-The initial static planner emits these unit kinds:
+The static planner emits these unit kinds:
 
 | Adapter | Executable units | Context units |
 | --- | --- | --- |
@@ -82,9 +87,11 @@ The repository root remains fixed while a worker processes a unit. Unit root
 is a source ownership and scheduling hint; it does not authorize resolving
 outside the repository root or executing project code. A unit-capable worker
 must receive the repository root binding separately from the portable unit
-root and source paths. An executable unit request uses
-`contract_version = depgraph-analysis-unit-v1`; this is distinct from the
-`analysis-unit-v1` capability name returned by `--version`.
+root and source paths. Source batches use
+`contract_version = depgraph-analysis-unit-v2` after negotiating
+`analysis-source-batch-v1`. The legacy Go `analysis-unit-v1` capability retains
+its v1 request shape. See [the execution contract](adr-analysis-unit-execution.md)
+for stage, full-context, auxiliary-input, and checkpoint bindings.
 
 ## Dependency graph
 
@@ -104,6 +111,14 @@ Package names and module names are not unique identity by themselves. The
 canonical unit identity includes its repository-relative root. If duplicate
 module or project names make a source reference ambiguous, the reference is
 unknown and the affected adapter is conservatively invalidated.
+
+Web resolution uses the nearest workspace that includes the package. A pnpm
+workspace file, including a YAML-only root, takes precedence over the root
+package's JSON workspace list. Negative patterns exclude members. An excluded
+package remains an independent executable project with its own resolution
+scope. Package and lockfile lookup never falls through into a sibling
+workspace. Workspace-member edges retain topology; only actual dependency
+edges propagate input invalidation.
 
 Go replacement planning follows the worker's active-workspace boundary. Only
 the repository-root `go.work` is active for a root scan; a module listed by its
@@ -139,20 +154,16 @@ fingerprint for every unit in the same adapter. This is deliberately
 conservative: an unknown repository-local edge cannot allow a stale result to
 be reused.
 
-Go syntax checkpoints add a repository-wide content witness to the static
-unit-ownership fingerprint. The witness covers every file selected by the
-repository inventory, including auxiliary files such as assembly sources and
-embedding inputs. When the bounded persistent-cache fingerprint is eligible,
-its `file_content` digest is reused; when cache limits reject that fingerprint,
-the executor streams the same inventory without those cache limits. Store
-databases and their WAL or SHM sidecars, `.depgraph` state, and the existing
-generated-state exclusions remain outside the witness. A shared witness is
-checked once before checkpoint reuse, then recomputed before each newly written
-checkpoint and again before publication so a file change during execution
-cannot be saved under the earlier key. If the witness cannot be obtained, the
-Go unit capability is not scheduled and the repository-worker fallback keeps
-the ordinary scan available. Legacy whole-adapter scans retain their existing
-cache and publication safeguards.
+Source-batch syntax checkpoints use a dependency-scoped content witness.
+The witness includes the unit's sources, manifests, ancestor configuration,
+auxiliary inputs, and the transitive dependency closure. Unknown dependencies
+conservatively include the adapter scope. A change in an unrelated known unit
+does not invalidate this key. A repository-wide witness is checked before
+reuse and before writing or publishing new work to reject changes during a
+scan. Store files, sidecars, checkpoints, and generated state are excluded.
+Legacy Go v1 requests retain their repository-wide syntax witness. Semantic
+reuse additionally requires the adapter's compiler and external-dependency
+proof; static unit planning alone cannot establish it.
 
 AnalysisPlan::invalidation_from reports Added, Removed, SourceChanged,
 ManifestChanged, ConfigChanged, ProfileChanged, AnalyzerChanged,
@@ -166,9 +177,10 @@ completeness.
 Input profile IDs are stable definition IDs. Each unit derives scoped
 execution IDs from the adapter, unit ID, and definition ID. This prevents two
 unit ledgers from colliding while preserving definition IDs for stable graph
-nodes and snapshots. Until workers negotiate depgraph-analysis-unit-v1, the
-existing whole-adapter worker may continue using the definition profile
-selection at its repository fallback boundary.
+nodes and snapshots. Chunk execution IDs are validated on the wire and then
+normalized to the logical unit-stage profile before graph ingestion. Chunk
+identity and progress remain in the execution ledger. Workers without a
+negotiated capability retain the whole-adapter fallback.
 
 Profile planning and unit planning remain separate contracts. Profile planning
 chooses target, environment, mode, and feature or tag candidates. Unit
@@ -197,11 +209,11 @@ are outside static discovery.
 
 ## Compatibility and rejected alternatives
 
-The plan is an additive core contract. Existing whole-adapter worker requests,
-Store snapshots, and operation journal records remain valid until their
-respective execution and integration issues adopt the plan. Checkpoint
-persistence, worker scheduling, process supervision, and graph integration are
-separate responsibilities.
+The plan remains an additive v1 contract. Source-batch execution uses worker
+contract v2, Store schema 19, and operation journal schema 6. Existing
+whole-adapter requests remain supported; completed snapshots and finite v1
+operation records remain readable. The execution ADR specifies migrations,
+partial-attempt selection, and the failure behavior for incompatible state.
 
 Treating every directory as an independent unit was rejected because it loses
 workspace and compiler resolution context. Increasing one repository-wide

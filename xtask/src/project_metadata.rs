@@ -976,7 +976,7 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
     );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
-        "v0.5のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
+        "現行開発版のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
         depgraph_protocol::PROTOCOL_VERSION,
         depgraph_operation::JOURNAL_SCHEMA_VERSION,
         MCP_TOOL_CONTRACT_VERSION,
@@ -1244,6 +1244,16 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         depgraph_store::STORE_SCHEMA_VERSION,
         depgraph_store::STORE_SCHEMA_VERSION,
     );
+    let english_current_compatibility = format!(
+        "Store\nschema `{}`, operation journal schema `{}`, `{}`, and\n`{}`",
+        depgraph_store::STORE_SCHEMA_VERSION,
+        depgraph_operation::JOURNAL_SCHEMA_VERSION,
+        MCP_TOOL_CONTRACT_VERSION,
+        MCP_OPERATION_CONTRACT_VERSION,
+    );
+    let english_runner_contract = format!(
+        "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `{MCP_TOOL_CONTRACT_VERSION}`, and `{MCP_OPERATION_CONTRACT_VERSION}`",
+    );
     for required in [
         "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
         "TypeScript/JavaScript symbol/type/import/re-export/type-use",
@@ -1260,11 +1270,11 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "## Compiler pack and release verification",
         "gh release download \"$release_tag\" \\\n  --repo TamaT-LLC/depgraph-cli",
         "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
-        "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v1`",
+        english_runner_contract.as_str(),
         "no `v0.4.0` stable GitHub",
         "The published `v0.5.4` artifact uses Store schema `17`.",
         english_current_store_contract.as_str(),
-        "Store\nschema `18`, operation journal schema `5`, `depgraph-mcp-tools-v1`, and\n`depgraph-operation-v1`",
+        english_current_compatibility.as_str(),
     ] {
         if !english_readme.contains(required) {
             bail!("English README release metadata is missing {required:?}");
@@ -1279,10 +1289,10 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("English README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-08-26",
+        "updated: 2026-09-06",
         "| Product / Rust / Go / Web adapter | `0.5.4` |",
-        "| SQLite store / scan cache / impact query cache | `18` / `2` / `1` |",
-        "| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |",
+        "| SQLite store / scan cache / impact query cache | `19` / `2` / `1` |",
+        "| Operation journal / MCP tool / operation DTO | `6` / `depgraph-mcp-tools-v1` / `depgraph-operation-v2` |",
         "Milestone 4のrelease candidateは`v0.4.0-rc.1`",
         "stable GitHub Releaseは公開されなかった",
         "`stable-release-gate-v2`",
@@ -1625,7 +1635,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "| Agent host configuration | `depgraph-agent-host-config-v1` |",
         "| Agent onboarding release evidence | `release-post-publish-evidence-v1` |",
         "| Packaged MCP smoke | `mcp-package-smoke-v2` |",
-        "Post-tag `main` uses Store schema 18 and packaged MCP smoke v3.",
+        "Post-tag `main` uses Store schema 19 and packaged MCP smoke v3.",
         STABLE_UPGRADE_SOURCE_FIXTURE_SHA256,
         V0_4_RC6_TAG_COMMIT,
         V0_4_RC6_AARCH64_APPLE_ARCHIVE_SHA256,

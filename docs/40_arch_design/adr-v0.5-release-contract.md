@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-13
-- Updated: 2026-08-31
+- Updated: 2026-09-06
 - Decision ID: `PROJ-ARC-001-ADR-007`
 - Issue: `PROJ-ARC-003-TASK-001` / #355
 - Contract: `stable-release-gate-v2`
@@ -16,8 +16,10 @@ At the time of the original decision, the latest published GitHub Release was
 the source and the compatibility boundary.
 
 The signed v0.5.4 artifact writes Store schema `17`; post-tag `main` writes
-schema `18`. The canonical rc.6 upgrade source writes schema `13`. MCP also
-introduces a separate operation journal at schema `5` and two public Agent
+schema `19`. The canonical rc.6 upgrade source writes schema `13`. The published
+MCP artifact introduced a separate operation journal at schema `5`; current
+`main` uses journal schema `6` and operation DTO `depgraph-operation-v2`.
+The original release introduced two public Agent
 contracts. Those surfaces need one minor-release identity and an explicit
 upgrade source before another release candidate can be built.
 
@@ -47,8 +49,8 @@ The v0.5 compatibility tuple is:
 | Packaged smoke | `stable-v0.5.0-packaged-smoke-v1` |
 
 The published v0.5.0 through v0.5.4 artifacts use Store schema 17 and packaged
-MCP smoke v2. Post-tag `main` uses Store schema 18 and packaged MCP smoke v3.
-Schema 18 is an unpublished development contract and does not alter the signed
+MCP smoke v2. Post-tag `main` uses Store schema 19 and packaged MCP smoke v3.
+Schema 19 is an unpublished development contract and does not alter the signed
 v0.5.4 artifact.
 
 The existing `v0.4.0-rc.N` tags, GitHub Releases, reserved `v0.4.0` baseline
@@ -73,17 +75,26 @@ migrated it to schema 13 without changing the completed snapshot identity.
 The published v0.5 package and unit gates verify fixture checksum,
 transactional migration to schema 17, the exact immutable snapshot ID,
 node/site/edge/evidence counts, integrity, and post-migration snapshot naming.
-Post-tag `main` extends that gate to schema 18, including legacy v1 seal
-verification and v2 provenance-aware resealing. The rc.1 schema-11 and v0.2
+Post-tag `main` extends that gate to schema 19, including legacy v1 seal
+verification, v2 provenance-aware resealing, and the durable analysis-unit ledger. The rc.1 schema-11 and v0.2
 schema-5 fixtures remain independent historical migration tests.
 
 Before migration, operators stop all writers and copy the database together
 with any WAL/SHM files. Tests retain the pre-upgrade database bytes and prove
-the rollback copy is unchanged. A Store migrated to schema 18 by post-tag
+the rollback copy is unchanged. A Store migrated to schema 19 by post-tag
 `main` must not be opened by the published v0.5.4 or an older binary. Rollback
-means stopping the new binary, preserving the schema-18 database for diagnosis,
+means stopping the new binary, preserving the schema-19 database for diagnosis,
 restoring the complete byte-for-byte pre-upgrade backup set, and only then
 starting the old binary.
+
+Release asset verification is bound to the source revision that produced the
+archive. Rechecking the published `v0.5.4` assets uses `xtask` from the immutable
+`v0.5.4` tag. Post-tag `main` verifies its own compiled compatibility tuple,
+MCP catalog bytes, operation contract, and standalone scan-outcome v2 schema.
+It does not select an older contract from the product version string, which
+can remain `0.5.4` during development. Historical archives remain unchanged;
+the schema-17 migration fixtures verify that the new Store can read their
+persisted data without treating an old archive as a current release build.
 
 ## Candidate, baseline, and maintenance policy
 
@@ -164,7 +175,7 @@ The signed `v0.5.4` tag, its source, the release/0.5 baseline, assets, and
 post-publish evidence remain immutable history. At publication time, the signed
 tag, remote `main`, and `release/0.5` must identify one reviewed Full-CI-green
 commit. The v0.5.4 Store contract is schema 17. Post-tag `main` advances the
-Store to schema 18 for health provenance and provenance-aware snapshot seals;
+Store to schema 19 for health provenance, snapshot seals, and resumable analysis units;
 that development contract is not part of the v0.5.4 artifact.
 
 ## Consequences
@@ -174,7 +185,7 @@ that development contract is not part of the v0.5.4 artifact.
 - v0.5 RCs validate real packages while stable publication remains fail-closed
   unless the exact main/maintenance/tag/Full-CI identity is present.
 - Published v0.5.0 through v0.5.4 artifacts use Store schema 17; post-tag
-  `main` uses schema 18 as a separate unpublished development contract.
+  `main` uses schema 19 as a separate unpublished development contract.
 - Store and operation-journal compatibility remain separate and explicit.
 - Fixture, version, tag, manifest, and documentation drift fail tests before
   publication.
