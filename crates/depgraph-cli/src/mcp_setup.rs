@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use depgraph_core::{
-    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, acquire_store_writer_lock,
-    compiler_pack_host_target, default_store_path,
+    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, StoreLockGuard,
+    acquire_store_writer_lock, compiler_pack_host_target, default_store_path,
 };
 use depgraph_mcp_tools::{
     AgentHostCapabilityProfile, AgentHostFormat, agent_host_launch_arguments,
@@ -2415,7 +2415,7 @@ fn atomic_write(host: McpHost, path: &Path, contents: &[u8]) -> Result<()> {
 
 struct RepositoryStateExclusion {
     _operation_runner: OperationRunnerExclusionGuard,
-    _store_writer: File,
+    _store_writer: StoreLockGuard,
 }
 
 fn acquire_repository_state_exclusion(
