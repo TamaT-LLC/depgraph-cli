@@ -1,0 +1,38 @@
+{
+  "benchmark_id": "depgraph-agent-dogfood-v2",
+  "captured_at": "2026-09-05T01:12:23.896Z",
+  "host": {
+    "architecture": "arm64",
+    "cli_version": "codex-cli 0.150.1",
+    "platform": "darwin",
+    "program": "codex"
+  },
+  "packaged_security": {
+    "operation_cancel_denied_code": "CAPABILITY_DENIED",
+    "read_catalog_sha256": "3dd479665ce7eb155e4df770d869cefd7f5141149faf7176d414be9b54b8d565",
+    "safe_scan_project_code_executed": false,
+    "safe_scan_recovered_after_eof": true,
+    "safe_scan_terminal_status": "completed",
+    "schema_version": "mcp-package-smoke-v3",
+    "stdin_eof_clean_exit": true,
+    "stdout_json_rpc_only": true
+  },
+  "release": {
+    "archive_sha256": "1580b9abfde117aa805099dee4c299e93c1596f1366f64dc5ec8e305822a40d4",
+    "compiler_pack_archive_sha256": "720dfdc01ed1bb77ac88cdc53d07a9f5367fffbe4fe8b4ff3cd522a20082fbff",
+    "compiler_pack_requirement_sha256": "25230dda5c103d530cc1bfc4b6d1965bb25f4382a102730800780909c94b6fe4",
+    "depgraph_sha256": "f6c1d02d658386e37d465d81db83ba4bd6809a96b3c1125ae59fc460ac27e697",
+    "manifest_sha256": "a3973e778575cad6e3b4779317d2a5d40e02e9d89fbc3ca0a23036a6905b800e",
+    "mcp_binary_sha256": "7cf92537320801d26387812275bb686e408755a3e7e266c17376aed96e5ffb44",
+    "mcp_smoke_sha256": "05f405054b8ae093a808ef262b888c28c1e24e5b5fd02a5eecd08585c56022ba",
+    "tag": "v0.5.4-rc.2",
+    "target": "aarch64-apple-darwin"
+  },
+  "schema_version": "agent-dogfood-environment-v1",
+  "snapshots": {
+    "baseline_id": "snapshot:sha256:4c699b113616a038c8951f3ea7323670e66ce4e2d16c037a43e9c7f2f57ef144",
+    "baseline_revision": "31cfed0b0fd1363f9c761b603cec3566bfaec351",
+    "candidate_id": "snapshot:sha256:07be48fd997c1733f103457cf65ce297925e5adc722a8c17d2c7f3e47b85bc74",
+    "candidate_revision": "68aed98d66585c0abcd7ffbedccad347cb4d3fae"
+  }
+}

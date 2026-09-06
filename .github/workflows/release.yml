@@ -359,6 +359,7 @@ jobs:
           benchmark/benchmark-report.json
           compiler-artifacts/compiler-pack-verification.json
           fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json
+          fixtures/agent-dogfood-v2/evidence/v0.5.4-rc.2/report.json
           artifacts/full-ci.json
           --output artifacts/stable-release-gate.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

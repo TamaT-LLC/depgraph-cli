@@ -221,6 +221,12 @@ function looksLikeJsxElementStart(source: string, offset: number): boolean {
   return source.indexOf(`</${match[1]}`, tagEnd + 1) >= 0;
 }
 
+function looksLikeJsxClosingElement(source: string, offset: number): boolean {
+  const remainder = source.slice(offset);
+  if (remainder.startsWith("</>")) return true;
+  return /^<\/[$_\p{ID_Start}][$_\p{ID_Continue}.:-]*\s*>/u.test(remainder);
+}
+
 function scanTokens(
   source: string,
   languageVariant: LanguageVariant,
@@ -235,7 +241,7 @@ function scanTokens(
   let jsxMode: "code" | "tag" | "text" = "code";
   let jsxDepth = 0;
   let jsxClosingTag = false;
-  let jsxExpression: { returnMode: "tag" | "text"; depth: number } | null = null;
+  const jsxExpressions: Array<{ returnMode: "tag" | "text"; depth: number }> = [];
   const jsxCodeReturnDepths: number[] = [];
   for (;;) {
     const modeAtScan = jsxMode;
@@ -303,20 +309,24 @@ function scanTokens(
         && kind === SyntaxKind.LessThanToken
         && looksLikeJsxElementStart(source, start)
       ) {
-        if (jsxExpression !== null) jsxCodeReturnDepths.push(jsxDepth);
+        if (jsxExpressions.length > 0) jsxCodeReturnDepths.push(jsxDepth);
         jsxMode = "tag";
         jsxClosingTag = false;
       } else if (modeAtScan === "text") {
-        if (kind === SyntaxKind.LessThanToken || kind === SyntaxKind.LessThanSlashToken) {
+        const startsOpeningElement = kind === SyntaxKind.LessThanToken
+          && looksLikeJsxElementStart(source, start);
+        const startsClosingElement = kind === SyntaxKind.LessThanSlashToken
+          && looksLikeJsxClosingElement(source, start);
+        if (startsOpeningElement || startsClosingElement) {
           jsxMode = "tag";
-          jsxClosingTag = kind === SyntaxKind.LessThanSlashToken;
+          jsxClosingTag = startsClosingElement;
         } else if (kind === SyntaxKind.OpenBraceToken) {
-          jsxExpression = { returnMode: "text", depth: 1 };
+          jsxExpressions.push({ returnMode: "text", depth: 1 });
           jsxMode = "code";
         }
       } else if (modeAtScan === "tag") {
         if (kind === SyntaxKind.OpenBraceToken) {
-          jsxExpression = { returnMode: "tag", depth: 1 };
+          jsxExpressions.push({ returnMode: "tag", depth: 1 });
           jsxMode = "code";
         } else if (kind === SyntaxKind.GreaterThanToken) {
           const selfClosing = tokens.at(-2)?.kind === SyntaxKind.SlashToken;
@@ -331,13 +341,14 @@ function scanTokens(
             jsxMode = jsxDepth > 0 ? "text" : "code";
           }
         }
-      } else if (modeAtScan === "code" && jsxExpression !== null) {
+      } else if (modeAtScan === "code" && jsxExpressions.length > 0) {
+        const jsxExpression = jsxExpressions.at(-1)!;
         if (kind === SyntaxKind.OpenBraceToken) jsxExpression.depth += 1;
         else if (kind === SyntaxKind.CloseBraceToken) {
           jsxExpression.depth -= 1;
           if (jsxExpression.depth === 0) {
             jsxMode = jsxExpression.returnMode;
-            jsxExpression = null;
+            jsxExpressions.pop();
           }
         }
       }

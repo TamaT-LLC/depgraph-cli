@@ -622,8 +622,13 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 		if group.BaseName == "" && len(group.Files) > 0 {
 			group.BaseName = strings.TrimSuffix(group.Files[0].PackageName, "_test")
 		}
+		// The repository-relative module directory distinguishes independent module
+		// instances that intentionally declare the same module and package paths.
+		// This identity migration is cache-safe because scan cache keys include the
+		// exact worker artifact digest and therefore reject graphs from older workers.
+		moduleInstanceScope := group.Module.RelativeDir
 		packageNode := Node{
-			ID: s.scopedID("module", group.Module.Path, group.ImportPath), Kind: "module",
+			ID: s.scopedID("module", group.Module.Path, moduleInstanceScope, group.ImportPath), Kind: "module",
 			Locator: "go-package:" + group.ImportPath, DisplayName: group.ImportPath,
 			Properties: map[string]any{
 				"language": "go", "module_path": group.Module.Path, "package_path": group.ImportPath, "package_name": group.BaseName,
@@ -645,7 +650,7 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 		variants := variantsForGroup(group)
 		for _, variant := range variants {
 			unit := Node{
-				ID: s.scopedID("build_unit", group.Module.Path, group.ImportPath, variant), Kind: "build_unit",
+				ID: s.scopedID("build_unit", group.Module.Path, moduleInstanceScope, group.ImportPath, variant), Kind: "build_unit",
 				Locator: "go-unit:" + group.ImportPath + "#" + variant, DisplayName: group.ImportPath + " (" + variant + ")",
 				Properties: map[string]any{"language": "go", "package_path": group.ImportPath, "variant": variant, "profile_id": s.profile.ID},
 			}

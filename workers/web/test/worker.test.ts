@@ -822,6 +822,117 @@ test("pure TypeScript semantic profiles allow candidate and external calls", asy
   assert.ok(semanticCalls.some((site) => site.resolution_status === "external"));
 });
 
+test("valid nested TSX stays syntax-complete and safe while retaining later dependencies", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-issue-454-tsx-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const source = [
+    "declare global {",
+    "  namespace JSX {",
+    "    interface IntrinsicElements { [element: string]: any }",
+    "  }",
+    "}",
+    "const require = (specifier: string): unknown => specifier;",
+    "",
+    "type Item = { id: number; name: string }",
+    "",
+    "export const Repro = ({",
+    "  items,",
+    "  show,",
+    "}: {",
+    "  items: Item[]",
+    "  show: boolean",
+    "}) => {",
+    "  if (show) {",
+    "    return (",
+    "      <div>",
+    "        {items.map((item) => (",
+    "          <span key={item.id}>{item.name}</span>",
+    "        ))}",
+    "        {({ nested: { enabled: true } }).nested.enabled && (",
+    "          <small>{items[0]?.name}</small>",
+    "        )}",
+    "      </div>",
+    "    )",
+    "  }",
+    "  return <div>empty</div>",
+    "}",
+    "",
+    'import afterStatic from "./after-static"',
+    'const afterDynamic = import("./after-dynamic")',
+    'export { afterExport } from "./after-export"',
+    'const afterRequire = require("./after-require")',
+    "void afterStatic; void afterDynamic; void afterRequire;",
+    "",
+  ].join("\n");
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "issue-454-tsx", version: "1.0.0", private: true })),
+    writeFile(path.join(root, "repro.tsx"), source),
+    writeFile(path.join(root, "after-static.ts"), "export default 1;\n"),
+    writeFile(path.join(root, "after-dynamic.ts"), "export default 2;\n"),
+    writeFile(path.join(root, "after-export.ts"), "export const afterExport = 3;\n"),
+    writeFile(path.join(root, "after-require.ts"), "export const required = 4;\n"),
+  ]);
+
+  const result = await run("issue-454-tsx", root);
+  const completed = result.events.at(-1)?.coverage;
+  const profile = result.events.find((event) => event.event === "profile_declared")?.profile;
+  const reproSites = result.events
+    .filter((event) => event.site?.evidence?.[0]?.path === "repro.tsx")
+    .map((event) => event.site)
+    .filter((site) => ["import", "dynamic_import", "reexport", "require"].includes(site.kind));
+  const expectedSites = [
+    ["import", "./after-static"],
+    ["dynamic_import", "./after-dynamic"],
+    ["reexport", "./after-export"],
+    ["require", "./after-require"],
+  ];
+
+  assert.equal(result.events.at(-1)?.event, "scan_completed");
+  assert.equal(completed?.unsupported_syntax, 0);
+  assert.equal(completed?.project_code_executed, false);
+  assert.equal(profile?.properties.project_code_executed, "false");
+  assert.ok(completed?.completeness.includes("syntax-complete"));
+  assert.deepEqual(
+    reproSites.map((site) => [site.kind, site.specifier]).sort(),
+    expectedSites.sort(),
+  );
+  assert.ok(reproSites.every((site) => site.resolution_status === "resolved"));
+  const semanticStaticImport = result.events.find((event) => (
+    event.site?.kind === "web_import"
+    && event.site?.specifier === "./after-static"
+    && event.site?.evidence?.[0]?.kind === "semantic"
+    && event.site?.evidence?.[0]?.path === "repro.tsx"
+  ))?.site;
+  assert.ok(semanticStaticImport);
+  assert.equal(semanticStaticImport.evidence[0]?.properties.occurrence_kind, "default_import");
+  assert.ok(!result.events.some((event) => (
+    event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === "repro.tsx"
+  )));
+  const ledger = result.events.find((event) => event.event === "file_completed" && event.path === "repro.tsx");
+  assert.equal(ledger?.skipped, false);
+  assert.equal(ledger?.skipped_sites, 0);
+  assert.equal(ledger?.discovered_sites, ledger?.emitted_sites);
+
+  const malformedSource = source.replace("        ))}\n", "        ))\n");
+  await writeFile(path.join(root, "repro.tsx"), malformedSource);
+  const malformed = await run("issue-454-tsx-malformed", root);
+  const malformedCoverage = malformed.events.at(-1)?.coverage;
+  assert.equal(malformed.events.at(-1)?.event, "scan_completed");
+  assert.ok(malformed.events.some((event) => (
+    event.diagnostic?.code === "web.unsupported_syntax"
+    && event.diagnostic?.path === "repro.tsx"
+    && /CloseBraceToken expected/u.test(event.diagnostic?.message ?? "")
+  )));
+  assert.ok(malformedCoverage?.unsupported_syntax > 0);
+  assert.ok(!malformedCoverage?.completeness.includes("syntax-complete"));
+  assert.ok(malformedCoverage?.reasons.includes("unsupported_syntax"));
+  assert.equal(malformedCoverage?.project_code_executed, false);
+  assert.equal(
+    malformed.events.find((event) => event.event === "profile_declared")?.profile?.properties?.project_code_executed,
+    "false",
+  );
+});
+
 test("Next JSX import correlation preserves CRLF offsets", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-next-crlf-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

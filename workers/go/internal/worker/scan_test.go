@@ -726,6 +726,160 @@ func TestScanIsStableAcrossRootLocations(t *testing.T) {
 	}
 }
 
+func TestScanScopesDuplicateModulePathsToRepositoryModuleInstance(t *testing.T) {
+	rootA := filepath.Join(t.TempDir(), "checkout-a")
+	rootB := filepath.Join(t.TempDir(), "unrelated", "checkout-b")
+	writeDuplicateModulePathFixture(t, rootA)
+	writeDuplicateModulePathFixture(t, rootB)
+
+	first, err := Scan(rootA)
+	if err != nil {
+		t.Fatalf("Scan(first) error = %v", err)
+	}
+	again, err := Scan(rootA)
+	if err != nil {
+		t.Fatalf("Scan(again) error = %v", err)
+	}
+	otherCheckout, err := Scan(rootB)
+	if err != nil {
+		t.Fatalf("Scan(other checkout) error = %v", err)
+	}
+
+	assertDuplicateModulePathGraph(t, first)
+	if !reflect.DeepEqual(first.Nodes, again.Nodes) ||
+		!reflect.DeepEqual(first.Sites, again.Sites) ||
+		!reflect.DeepEqual(first.Edges, again.Edges) ||
+		!reflect.DeepEqual(first.Coverage, again.Coverage) {
+		t.Fatal("duplicate-module graph changed on a repeated scan")
+	}
+	if !reflect.DeepEqual(first.Nodes, otherCheckout.Nodes) ||
+		!reflect.DeepEqual(first.Sites, otherCheckout.Sites) ||
+		!reflect.DeepEqual(first.Edges, otherCheckout.Edges) ||
+		!reflect.DeepEqual(first.Coverage, otherCheckout.Coverage) {
+		t.Fatal("duplicate-module graph changed across checkout paths")
+	}
+
+	canonicalGraph, err := json.Marshal(struct {
+		Nodes []Node
+		Sites []Site
+		Edges []Edge
+	}{first.Nodes, first.Sites, first.Edges})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hostPath := range []string{rootA, rootB, os.TempDir(), os.Getenv("GOCACHE")} {
+		if hostPath != "" && bytes.Contains(canonicalGraph, []byte(hostPath)) {
+			t.Fatalf("canonical graph leaked host path %q", hostPath)
+		}
+	}
+	if first.Coverage.ProjectCodeExecuted {
+		t.Fatal("duplicate-module safe scan reported project code execution")
+	}
+}
+
+func assertDuplicateModulePathGraph(t *testing.T, result Result) {
+	t.Helper()
+	nodesByID := make(map[string]Node, len(result.Nodes))
+	moduleInstances := map[string]string{}
+	packages := map[string]string{}
+	subpackages := map[string]string{}
+	files := map[string]string{}
+	for _, node := range result.Nodes {
+		nodesByID[node.ID] = node
+		switch {
+		case node.Kind == "package_instance" && strings.HasPrefix(node.Locator, "gomod:example.test/shared"):
+			moduleInstances[node.Properties["relative_dir"].(string)] = node.ID
+		case node.Kind == "module" && node.Locator == "go-package:example.test/shared":
+			packages[node.Properties["relative_dir"].(string)] = node.ID
+		case node.Kind == "module" && node.Locator == "go-package:example.test/shared/sub":
+			manifest := node.Properties["manifest_path"].(string)
+			moduleDir := strings.TrimSuffix(filepath.ToSlash(manifest), "/go.mod")
+			subpackages[moduleDir] = node.ID
+		case node.Kind == "file" && strings.HasPrefix(node.Locator, "file:"):
+			files[strings.TrimPrefix(node.Locator, "file:")] = node.ID
+		}
+	}
+	if len(moduleInstances) != 2 || len(packages) != 2 || len(subpackages) != 2 {
+		t.Fatalf("duplicate modules were not kept distinct: instances=%v packages=%v subpackages=%v", moduleInstances, packages, subpackages)
+	}
+	if packages["one"] == packages["two"] {
+		t.Fatalf("duplicate module packages shared ID %q", packages["one"])
+	}
+	if subpackages["one"] == subpackages["two"] {
+		t.Fatalf("duplicate module subpackages shared ID %q", subpackages["one"])
+	}
+
+	hasEdge := func(source, target string) bool {
+		for _, edge := range result.Edges {
+			if edge.Kind == "contains" && edge.Source == source && edge.Target == target {
+				return true
+			}
+		}
+		return false
+	}
+	buildUnits := map[string]string{}
+	for _, relativeDir := range []string{"one", "two"} {
+		packageID := packages[relativeDir]
+		if !hasEdge(moduleInstances[relativeDir], packageID) {
+			t.Fatalf("module %q does not contain its package", relativeDir)
+		}
+		if !hasEdge(moduleInstances[relativeDir], subpackages[relativeDir]) {
+			t.Fatalf("module %q does not contain its subpackage", relativeDir)
+		}
+		for _, edge := range result.Edges {
+			if edge.Kind != "contains" || edge.Source != packageID || nodesByID[edge.Target].Kind != "build_unit" {
+				continue
+			}
+			if buildUnits[relativeDir] != "" {
+				t.Fatalf("module %q emitted duplicate normal build units", relativeDir)
+			}
+			buildUnits[relativeDir] = edge.Target
+		}
+		if buildUnits[relativeDir] == "" {
+			t.Fatalf("module %q emitted no build unit", relativeDir)
+		}
+		for _, name := range []string{"shared.go", "extra.go"} {
+			path := filepath.ToSlash(filepath.Join(relativeDir, name))
+			if !hasEdge(buildUnits[relativeDir], files[path]) {
+				t.Fatalf("build unit for %q does not contain %s", relativeDir, path)
+			}
+		}
+
+		subpackageID := subpackages[relativeDir]
+		var subpackageBuildUnit string
+		for _, edge := range result.Edges {
+			if edge.Kind == "contains" && edge.Source == subpackageID && nodesByID[edge.Target].Kind == "build_unit" {
+				if subpackageBuildUnit != "" {
+					t.Fatalf("module %q emitted duplicate subpackage build units", relativeDir)
+				}
+				subpackageBuildUnit = edge.Target
+			}
+		}
+		subPath := filepath.ToSlash(filepath.Join(relativeDir, "sub", "token.go"))
+		if subpackageBuildUnit == "" || !hasEdge(subpackageBuildUnit, files[subPath]) {
+			t.Fatalf("subpackage build unit for %q does not contain %s", relativeDir, subPath)
+		}
+
+		importPath := filepath.ToSlash(filepath.Join(relativeDir, "extra.go"))
+		matchedImport := false
+		for _, site := range result.Sites {
+			if site.Source != files[importPath] || site.Kind != "import" || site.Specifier != "example.test/shared/sub" {
+				continue
+			}
+			matchedImport = true
+			if site.ResolutionStatus != "resolved" || !reflect.DeepEqual(site.TargetIDs, []string{subpackageID}) {
+				t.Fatalf("module %q import crossed module instances: %+v", relativeDir, site)
+			}
+		}
+		if !matchedImport {
+			t.Fatalf("module %q emitted no local subpackage import", relativeDir)
+		}
+	}
+	if buildUnits["one"] == buildUnits["two"] {
+		t.Fatalf("duplicate module build units shared ID %q", buildUnits["one"])
+	}
+}
+
 func TestScanDoesNotTraverseGoWorkPathOutsideRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "repo")
@@ -988,6 +1142,17 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writeDuplicateModulePathFixture(t *testing.T, root string) {
+	t.Helper()
+	for _, relativeDir := range []string{"one", "two"} {
+		moduleRoot := filepath.Join(root, relativeDir)
+		writeTestFile(t, filepath.Join(moduleRoot, "go.mod"), "module example.test/shared\n\ngo 1.26\n")
+		writeTestFile(t, filepath.Join(moduleRoot, "shared.go"), "package shared\n\ntype Shared struct{}\n")
+		writeTestFile(t, filepath.Join(moduleRoot, "extra.go"), "package shared\n\nimport \"example.test/shared/sub\"\n\nfunc Value() sub.Token { return sub.New() }\n")
+		writeTestFile(t, filepath.Join(moduleRoot, "sub", "token.go"), "package sub\n\ntype Token struct{}\n\nfunc New() Token { return Token{} }\n")
 	}
 }
 

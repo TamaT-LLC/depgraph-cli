@@ -24,7 +24,7 @@ const (
 	semanticExternalTestPath       = semanticPackagePath + "_test"
 	semanticExternalTestLocator    = "go:" + semanticModulePath + "@workspace#" + semanticExternalTestPath
 	semanticModelRelativePath      = "model/model.go"
-	semanticGoodPackageLocator     = "go:example.com/good@workspace#example.com/good"
+	semanticGoodPackageLocator     = "go:example.com/good@workspace#good#example.com/good"
 	semanticEvidenceExtractor      = "go-types"
 	semanticParserFallbackCoverage = "go-packages-parser-fallback"
 )
@@ -843,6 +843,37 @@ func TestGoSemanticImplementsAcrossPackages(t *testing.T) {
 	semanticRequireSiteLessRelation(t, result, "implements", service.ID, runner.ID)
 }
 
+func TestGoSemanticImplementsAcrossLocalReplacement(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "lib", "go.mod"), "module example.com/implements-new\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "lib.go"), "package lib\n\ntype Service struct{}\nfunc (Service) Run() {}\n")
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), `module example.com/implements-app
+
+go 1.26.1
+
+require example.com/implements-old v0.0.0
+replace example.com/implements-old => ../lib
+`)
+	writeTestFile(t, filepath.Join(root, "app", "app.go"), `package app
+
+import old "example.com/implements-old"
+
+type Runner interface { Run() }
+var _ Runner = old.Service{}
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if got := result.Profile.Properties["go_packages_status"]; got != "loaded" {
+		t.Fatalf("local replacement typed status = %q, want loaded; diagnostics=%+v", got, result.Diagnostics)
+	}
+	runner := semanticFindNamedNode(t, result, "type", "interface", "example.com/implements-app.Runner")
+	service := semanticFindNamedNode(t, result, "type", "struct", "example.com/implements-new.Service")
+	semanticRequireSiteLessRelation(t, result, "implements", service.ID, runner.ID)
+}
+
 func TestGoSemanticImplementsAcrossWorkspaceModules(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "go.work"), "go 1.26.1\n\nuse (\n\t./api\n\t./service\n\t./shared\n)\n")
@@ -979,6 +1010,133 @@ func TestGoSemanticPartialTypedFailureIsDiagnosed(t *testing.T) {
 		!hasDiagnostic(result.Diagnostics, "go_packages_load_failed") &&
 		!hasDiagnostic(result.Diagnostics, "go_packages_typed_incomplete") {
 		t.Fatalf("typed failure diagnostic missing: %+v", result.Diagnostics)
+	}
+}
+
+func TestGoSemanticScopesDuplicateModuleInstances(t *testing.T) {
+	root := t.TempDir()
+	for _, relativeDir := range []string{"one", "two"} {
+		moduleRoot := filepath.Join(root, relativeDir)
+		writeTestFile(t, filepath.Join(moduleRoot, "go.mod"), "module example.test/shared\n\ngo 1.26\n")
+		writeTestFile(t, filepath.Join(moduleRoot, "shared.go"), `package shared
+
+import "example.test/shared/sub"
+
+type Shared struct{}
+
+func Value() Shared { return Shared{} }
+
+func UseSub(value sub.Token) sub.Token {
+	sub.Run()
+	return value
+}
+`)
+		writeTestFile(t, filepath.Join(moduleRoot, "sub", "sub.go"), `package sub
+
+type Token struct{}
+
+func Run() Token { return Token{} }
+`)
+	}
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if got := result.Profile.Properties["go_packages_status"]; got != "loaded" {
+		t.Fatalf("go_packages_status = %q, want loaded; diagnostics=%+v", got, result.Diagnostics)
+	}
+
+	packageIDs := map[string]string{}
+	for _, node := range result.Nodes {
+		if node.Kind != "module" || node.Locator != "go-package:example.test/shared" {
+			continue
+		}
+		manifest, _ := node.Properties["manifest_path"].(string)
+		manifest = strings.TrimSuffix(filepath.ToSlash(manifest), "/go.mod")
+		packageIDs[manifest] = node.ID
+	}
+	if len(packageIDs) != 2 {
+		t.Fatalf("duplicate module package nodes = %v, want one and two", packageIDs)
+	}
+
+	resolverPackages := map[string]string{
+		"example.test/shared.Shared":    "example.test/shared",
+		"example.test/shared.Value":     "example.test/shared",
+		"example.test/shared.UseSub":    "example.test/shared",
+		"example.test/shared/sub.Token": "example.test/shared/sub",
+		"example.test/shared/sub.Run":   "example.test/shared/sub",
+	}
+	allResolvers := []string{
+		"example.test/shared.Shared",
+		"example.test/shared.Value",
+		"example.test/shared.UseSub",
+		"example.test/shared/sub.Token",
+		"example.test/shared/sub.Run",
+	}
+	semanticNodes := map[string]map[string]Node{"one": {}, "two": {}}
+	for _, node := range result.Nodes {
+		if node.Kind != "type" && node.Kind != "symbol" {
+			continue
+		}
+		identity := semanticIdentity(t, node)
+		resolver, _ := identity["resolver_identity"].(string)
+		packagePath, wanted := resolverPackages[resolver]
+		if !wanted {
+			continue
+		}
+		locator, _ := node.Properties["package_locator"].(string)
+		for _, relativeDir := range []string{"one", "two"} {
+			want := "go:example.test/shared@workspace#" + relativeDir + "#" + packagePath
+			if locator == want {
+				semanticNodes[relativeDir][resolver] = node
+			}
+		}
+	}
+	rootResolvers := []string{
+		"example.test/shared.Shared",
+		"example.test/shared.Value",
+		"example.test/shared.UseSub",
+	}
+	for _, relativeDir := range []string{"one", "two"} {
+		for _, resolver := range allResolvers {
+			node, ok := semanticNodes[relativeDir][resolver]
+			if !ok {
+				t.Fatalf("module %q semantic node %q missing: %+v", relativeDir, resolver, semanticNodes[relativeDir])
+			}
+			if containsString(rootResolvers, resolver) {
+				declared := false
+				for _, edge := range result.Edges {
+					if edge.Kind == "declares" && edge.Source == packageIDs[relativeDir] && edge.Target == node.ID {
+						declared = true
+						break
+					}
+				}
+				if !declared {
+					t.Fatalf("module %q package %s does not declare semantic node %s", relativeDir, packageIDs[relativeDir], node.ID)
+				}
+			}
+		}
+	}
+	for _, resolver := range allResolvers {
+		if semanticNodes["one"][resolver].ID == semanticNodes["two"][resolver].ID {
+			t.Fatalf("duplicate module semantic identity %q collided", resolver)
+		}
+	}
+	for _, relativeDir := range []string{"one", "two"} {
+		otherDir := "one"
+		if relativeDir == "one" {
+			otherDir = "two"
+		}
+		useSub := semanticNodes[relativeDir]["example.test/shared.UseSub"]
+		token := semanticNodes[relativeDir]["example.test/shared/sub.Token"]
+		run := semanticNodes[relativeDir]["example.test/shared/sub.Run"]
+		otherToken := semanticNodes[otherDir]["example.test/shared/sub.Token"]
+		otherRun := semanticNodes[otherDir]["example.test/shared/sub.Run"]
+		semanticRequireStrictTypeUse(t, result, useSub.ID, token.ID)
+		semanticRequireStrictCall(t, result, useSub.ID, run.ID)
+		semanticForbidRelation(t, result, "type_uses", useSub.ID, otherToken.ID)
+		semanticForbidRelation(t, result, "calls", useSub.ID, otherRun.ID)
 	}
 }
 

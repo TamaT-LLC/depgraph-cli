@@ -293,9 +293,12 @@ func (p *goSemanticPackage) visibleSymbolNode(resolver, importPath string) strin
 		}
 	}
 	for _, candidate := range resolvers {
-		nodeID := p.extractor.symbolNodesByResolver[candidate]
-		if nodeID != "" && p.symbolNodeVisible(nodeID, importPath) {
-			return nodeID
+		nodeIDs := append([]string(nil), p.extractor.symbolNodesByResolver[candidate]...)
+		sort.Strings(nodeIDs)
+		for _, nodeID := range nodeIDs {
+			if p.symbolNodeVisible(nodeID, importPath) {
+				return nodeID
+			}
 		}
 	}
 	return ""

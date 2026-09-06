@@ -1329,6 +1329,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_cache_fingerprint_invalidates_graphs_when_worker_identity_code_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worker = temporary.path().join("depgraph-go-worker");
+        fs::write(&worker, b"worker-before-node-identity-change").unwrap();
+        let workers = vec![(
+            AdapterKind::Go,
+            WorkerSpec {
+                adapter: AdapterKind::Go,
+                program: worker.as_os_str().to_owned(),
+                leading_args: Vec::new(),
+                display: "test Go worker".to_owned(),
+                artifact_path: worker.clone(),
+                runtime_requirement: None,
+                expected_version: Some("0.5.4".to_owned()),
+                release_attested: false,
+                attested_rust_sysroot: None,
+            },
+        )];
+        let before = fingerprint_adapters(&workers).unwrap();
+
+        fs::write(&worker, b"worker-after-node-identity-change").unwrap();
+        let after = fingerprint_adapters(&workers).unwrap();
+
+        assert_ne!(
+            before, after,
+            "worker node-ID changes must invalidate old syntax and semantic cache entries"
+        );
+    }
+
+    #[test]
     fn compiler_precise_cache_key_is_input_only_and_separate_from_build_cache() {
         let input = compiler_cache_input();
         let original = compiler_precise_cache_key(&input);

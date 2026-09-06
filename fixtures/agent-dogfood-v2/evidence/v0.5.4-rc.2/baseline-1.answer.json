@@ -1,0 +1,122 @@
+{
+  "claims": {
+    "candidate_coverage": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Snapshot graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "file_cycle": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "go_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_audit_base": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Code-health graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_finding_detail": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Code-health graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_hotspots": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Code-health graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "health_unused_findings": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Code-health graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "package_cycles": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_candidate_import": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_impact": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_path": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "rust_unresolved_type": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_file_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Snapshot graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "snapshot_package_diff": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Snapshot graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependency": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    },
+    "web_dependents": {
+      "classification": "not_applicable",
+      "evidence": [],
+      "reason": "Graph evidence is unavailable.",
+      "value": "unknown",
+      "verdict": "insufficient"
+    }
+  },
+  "failure": {
+    "code": "none",
+    "remediation": "",
+    "task": ""
+  },
+  "schema_version": "agent-dogfood-answer-v1"
+}

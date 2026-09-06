@@ -1,0 +1,149 @@
+{
+  "arm": "mcp",
+  "artifacts": {
+    "answer": {
+      "bytes": 6818,
+      "path": "mcp-3.answer.json",
+      "sha256": "0ba901a078885fa4afeffa13e99694c7fd8e4ce83dd95880ac1135e593b22614"
+    },
+    "host_output": {
+      "bytes": 5199,
+      "path": "mcp-3.last-message.txt",
+      "sha256": "b1406c5f78aaa43dbb48b5fc697ce767fc211a6fb25754937107b7f78d66e8e3"
+    },
+    "safety": {
+      "bytes": 1079,
+      "path": "mcp-3.safety.json",
+      "sha256": "bbdce2ba4b85df86e568f440dbf3af4a496a90dca3916ddecc8321e0331bd02f"
+    },
+    "trace": {
+      "bytes": 181548,
+      "path": "mcp-3.trace.jsonl",
+      "sha256": "95bcaef84c8e9b8361545a1c3ded57b1ab9f012cf08c5abfef885f2ac2a98975"
+    }
+  },
+  "failure": null,
+  "finished_at": "2026-09-05T01:24:59.435Z",
+  "identity": {
+    "answer_schema_sha256": "5bd30fe69234c3d4d9fea71be0fcb9ba6a424eef07502d1b2c1c6b5006b8bca9",
+    "approval_policy": "never",
+    "benchmark_id": "depgraph-agent-dogfood-v2",
+    "cli_version": "codex-cli 0.150.1",
+    "environment_sha256": "adc0e48b3f240a843b2a63bfc88c04047a3bc0ccf4253eb311751774464c96f6",
+    "maximum_tool_calls": 32,
+    "mcp_enabled_tools": [
+      "agent_edges_list",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "agent_node_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list",
+      "health_summary_get"
+    ],
+    "mcp_required_tools": [
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "snapshot_diff_get",
+      "agent_node_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list"
+    ],
+    "model": "gpt-5.6-terra",
+    "prompt_sha256": "de86e6b259b8ee72e6250d2c88c7a1d37f738335a01165d60af15ecb5fa5f995",
+    "reasoning_effort": "medium",
+    "repository_commit": "68aed98d66585c0abcd7ffbedccad347cb4d3fae",
+    "repository_tree": "e3eee24d660680c025a2fee4ae176007014c6979",
+    "safety_schema_sha256": "4e3d00f6c6c8883be5e7de6bf6d999a0c1cc00b928ed211d7586fc8e770e0016",
+    "sandbox": "read-only",
+    "spec_sha256": "17794567d5978b470f1aba44a778b2b6a568495a285de2c356f286a5c636f131",
+    "timeout_ms": 300000
+  },
+  "ordinal": 3,
+  "runtime": {
+    "cached_input_tokens": 1472768,
+    "effective_tokens": 89808,
+    "elapsed_ms": 190644,
+    "exit_code": 0,
+    "host_output_valid": true,
+    "input_tokens": 1557616,
+    "mcp_tools": [
+      "agent_node_get",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list",
+      "snapshot_diff_get"
+    ],
+    "mcp_tools_succeeded": [
+      "agent_node_get",
+      "agent_nodes_list",
+      "get_context",
+      "graph_cycles_list",
+      "graph_dependencies_list",
+      "graph_dependents_list",
+      "graph_impact_get",
+      "graph_path_get",
+      "health_audit_get",
+      "health_finding_get",
+      "health_findings_list",
+      "health_hotspots_list",
+      "snapshot_diff_get"
+    ],
+    "output_tokens": 4960,
+    "stderr_bytes": 2948,
+    "stderr_sha256": "5fe491cd1c04ecb7b0cc6398705d5411dba0dffda5525c94bc8a7cfaec8f082b",
+    "timed_out": false,
+    "tool_budget_exhausted": false,
+    "tool_calls": 25,
+    "tool_result_bytes": 154368,
+    "total_tokens": 1562576
+  },
+  "safety": {
+    "daemon_state_unchanged": true,
+    "journal_unchanged": true,
+    "no_lingering_depgraph_process": true,
+    "privileged_tools_observed": [],
+    "project_code_executed": false,
+    "source_unchanged": true,
+    "store_unchanged": true
+  },
+  "sample_id": "mcp-3",
+  "schema_version": "agent-dogfood-sample-v1",
+  "score": {
+    "accuracy_percent": 100,
+    "candidate_or_unresolved_as_exact": 0,
+    "candidate_or_unresolved_as_exact_ids": [],
+    "correct_claims": 16,
+    "correct_major_claims": 7,
+    "false_exact_claim_ids": [],
+    "false_exact_claims": 0,
+    "major_claims": 7,
+    "major_recall_percent": 100,
+    "missed_claim_ids": [],
+    "missed_major_claim_ids": [],
+    "total_claims": 16
+  },
+  "started_at": "2026-09-05T01:21:48.537Z"
+}
