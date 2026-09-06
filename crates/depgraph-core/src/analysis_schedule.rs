@@ -1,6 +1,9 @@
 //! Bind static discovery to an explicitly negotiated worker capability.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::Result;
 use serde_json::json;
@@ -8,10 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     analysis_checkpoint::UnitCheckpointKey,
-    analysis_execution::{AnalysisExecutionContext, AnalysisWorkItem},
+    analysis_execution::{AnalysisExecutionContext, AnalysisInputValidation, AnalysisWorkItem},
     analysis_plan::{AnalysisPlan, AnalysisUnitKind, plan_analysis_units},
     cache::{
-        ScanCachePreparation, fingerprint_adapters, fingerprint_toolchains, prepare_scan_cache,
+        ScanCachePreparation, fingerprint_adapters, fingerprint_scan_inputs,
+        fingerprint_toolchains, prepare_scan_cache,
     },
     scan::ScanCacheMode,
     worker::{
@@ -22,6 +26,68 @@ use crate::{
 pub(crate) struct AnalysisSchedule {
     pub plan: Option<AnalysisPlan>,
     pub work: Vec<AnalysisWorkItem>,
+    pub input_proof: Option<Arc<AnalysisInputProof>>,
+}
+
+/// A repository-wide content witness shared by all analysis units.  The
+/// initial digest may come from the bounded cache fingerprint, while
+/// revalidation always uses the streamed proof so cache-size limits cannot
+/// disable ordinary scans.  The first pre-reuse validation is memoized for
+/// the whole schedule; the postflight check deliberately recomputes it.
+pub(crate) struct AnalysisInputProof {
+    expected_content_digest: String,
+    preflight_content_digest: OnceLock<Option<String>>,
+}
+
+impl AnalysisInputProof {
+    fn new(expected_content_digest: String) -> Self {
+        Self {
+            expected_content_digest,
+            preflight_content_digest: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn expected_content_digest(&self) -> &str {
+        &self.expected_content_digest
+    }
+
+    /// Validate the repository content once before any checkpoint can be
+    /// reused. All units share the result to avoid hashing the repository once
+    /// per queued item.
+    pub(crate) fn matches_before_reuse(&self, root: &Path, store_path: Option<&Path>) -> bool {
+        self.preflight_content_digest
+            .get_or_init(|| fingerprint_scan_inputs(root, store_path).ok())
+            .as_deref()
+            == Some(self.expected_content_digest.as_str())
+    }
+
+    /// Recompute the witness at the publication boundary. This is separate
+    /// from the memoized pre-reuse check because files may change while units
+    /// are running.
+    pub(crate) fn matches_postflight(&self, root: &Path, store_path: Option<&Path>) -> bool {
+        fingerprint_scan_inputs(root, store_path)
+            .is_ok_and(|digest| digest == self.expected_content_digest)
+    }
+
+    /// Validate a newly produced checkpoint against a fresh repository
+    /// witness. This must not use the pre-reuse memo because a worker can
+    /// observe a different input set after that memo was populated.
+    pub(crate) fn matches_checkpoint_write(&self, root: &Path, store_path: Option<&Path>) -> bool {
+        self.matches_postflight(root, store_path)
+    }
+}
+
+const GO_SYNTAX_CHECKPOINT_CONTRACT_VERSION: &str = "depgraph-analysis-unit-syntax-checkpoint-v1";
+
+fn go_syntax_checkpoint_input_digest(content_digest: &str, unit_digest: &str) -> String {
+    depgraph_protocol::stable_id_from_value(
+        "analysis-unit-syntax-checkpoint",
+        &json!({
+            "contract_version": GO_SYNTAX_CHECKPOINT_CONTRACT_VERSION,
+            "repository_content": content_digest,
+            "unit_ownership": unit_digest,
+        }),
+    )
 }
 
 pub(crate) async fn prepare_analysis_schedule(
@@ -29,6 +95,7 @@ pub(crate) async fn prepare_analysis_schedule(
     workers: Vec<(AdapterKind, WorkerSpec)>,
     store_path: Option<&Path>,
     profile_plan_id: &str,
+    initial_content_digest: Option<String>,
 ) -> Result<AnalysisSchedule> {
     let plan = match plan_analysis_units(context.root, context.config, store_path) {
         Ok(plan) => Some(plan),
@@ -39,6 +106,7 @@ pub(crate) async fn prepare_analysis_schedule(
             None
         }
     };
+    let mut input_proof = None;
     let mut work = Vec::new();
     for (adapter, spec) in workers {
         let units = plan
@@ -50,7 +118,7 @@ pub(crate) async fn prepare_analysis_schedule(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let supports_units = adapter == AdapterKind::Go
+        let capability_supports_units = adapter == AdapterKind::Go
             && !units.is_empty()
             && plan.as_ref().is_some_and(go_module_scopes_cover_packages)
             && probe_worker_version_with_cancellation(&spec, context.root, context.cancellation)
@@ -60,6 +128,26 @@ pub(crate) async fn prepare_analysis_schedule(
                         .iter()
                         .any(|capability| capability == "analysis-unit-v1")
                 });
+        // A split Go schedule needs a repository-wide witness in addition to
+        // each unit's ownership fingerprint. If the witness cannot be built,
+        // retain the repository-wide worker fallback instead of publishing a
+        // split result whose auxiliary inputs were not proved stable.
+        let supports_units = capability_supports_units
+            && {
+                if input_proof.is_none() {
+                    input_proof = initial_content_digest
+                    .clone()
+                    .or_else(|| match fingerprint_scan_inputs(context.root, store_path) {
+                        Ok(digest) => Some(digest),
+                        Err(error) => {
+                            tracing::warn!(%error, "analysis input proof unavailable; using repository worker fallback");
+                            None
+                        }
+                    })
+                    .map(|digest| Arc::new(AnalysisInputProof::new(digest)));
+                }
+                input_proof.is_some()
+            };
         let cache = if context.cache_mode == ScanCacheMode::Enabled {
             match prepare_scan_cache(
                 context.root,
@@ -103,7 +191,12 @@ pub(crate) async fn prepare_analysis_schedule(
                 // Semantic reuse retains the existing external-dependency
                 // proof. Static planning alone cannot certify module caches.
                 let input_digest = if stage == "syntax" && adapter == AdapterKind::Go {
-                    Some(unit.input_fingerprint.clone())
+                    input_proof.as_ref().map(|proof| {
+                        go_syntax_checkpoint_input_digest(
+                            proof.expected_content_digest(),
+                            &unit.input_fingerprint,
+                        )
+                    })
                 } else {
                     cache
                         .as_ref()
@@ -135,7 +228,11 @@ pub(crate) async fn prepare_analysis_schedule(
             }
         }
     }
-    Ok(AnalysisSchedule { plan, work })
+    Ok(AnalysisSchedule {
+        plan,
+        work,
+        input_proof,
+    })
 }
 
 fn go_module_scopes_cover_packages(plan: &AnalysisPlan) -> bool {
@@ -172,6 +269,8 @@ pub(crate) fn validate_work_inputs(
     item: &AnalysisWorkItem,
     store_path: Option<&Path>,
     profile_plan_id: &str,
+    input_proof: Option<&AnalysisInputProof>,
+    validation: AnalysisInputValidation,
 ) -> bool {
     let Some(key) = item.checkpoint_key.as_ref() else {
         return false;
@@ -188,6 +287,20 @@ pub(crate) fn validate_work_inputs(
             .and_then(|request| request["stage"].as_str())
             == Some("syntax")
     {
+        let Some(input_proof) = input_proof else {
+            return false;
+        };
+        let input_matches = match validation {
+            AnalysisInputValidation::Reuse => {
+                input_proof.matches_before_reuse(context.root, store_path)
+            }
+            AnalysisInputValidation::CheckpointWrite => {
+                input_proof.matches_checkpoint_write(context.root, store_path)
+            }
+        };
+        if !input_matches {
+            return false;
+        }
         let Some(unit_id) = item
             .request
             .as_ref()
@@ -196,8 +309,12 @@ pub(crate) fn validate_work_inputs(
             return false;
         };
         return plan_analysis_units(context.root, context.config, store_path).is_ok_and(|plan| {
-            plan.unit(unit_id)
-                .is_some_and(|unit| unit.input_fingerprint == key.input_digest)
+            plan.unit(unit_id).is_some_and(|unit| {
+                go_syntax_checkpoint_input_digest(
+                    input_proof.expected_content_digest(),
+                    &unit.input_fingerprint,
+                ) == key.input_digest
+            })
         });
     }
     matches!(prepare_scan_cache(context.root, context.config, &[(item.spec.adapter, item.spec.clone())], store_path, profile_plan_id),
@@ -254,5 +371,53 @@ mod tests {
             None
         )?));
         Ok(())
+    }
+
+    #[test]
+    fn streamed_input_proof_covers_auxiliary_files_and_matches_cache_digest() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join("go.mod"),
+            "module example.test/app\n\ngo 1.26\n",
+        )?;
+        std::fs::write(root.path().join("main.go"), "package app\n")?;
+        std::fs::write(root.path().join("assembly.s"), ".text\n")?;
+        std::fs::write(root.path().join("embed.txt"), "embedded\n")?;
+
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let ScanCachePreparation::Ready(cache) = prepare_scan_cache(
+            root.path(),
+            &crate::Config::default(),
+            &[],
+            None,
+            &profile_plan_id,
+        ) else {
+            panic!("small fixture should remain eligible for the bounded cache");
+        };
+        let initial = fingerprint_scan_inputs(root.path(), None)?;
+        assert_eq!(cache.syntax.dimensions.get("file_content"), Some(&initial));
+
+        let proof = AnalysisInputProof::new(initial.clone());
+        assert!(proof.matches_before_reuse(root.path(), None));
+        std::fs::write(root.path().join("assembly.s"), ".text\n.byte 0\n")?;
+        assert!(!proof.matches_checkpoint_write(root.path(), None));
+        assert!(!AnalysisInputProof::new(initial).matches_before_reuse(root.path(), None));
+
+        let changed = fingerprint_scan_inputs(root.path(), None)?;
+        std::fs::write(root.path().join("embed.txt"), "embedded changed\n")?;
+        assert_ne!(changed, fingerprint_scan_inputs(root.path(), None)?);
+        Ok(())
+    }
+
+    #[test]
+    fn syntax_checkpoint_digest_binds_repository_content_and_unit_ownership() {
+        assert_ne!(
+            go_syntax_checkpoint_input_digest("content-a", "unit-a"),
+            go_syntax_checkpoint_input_digest("content-b", "unit-a")
+        );
+        assert_ne!(
+            go_syntax_checkpoint_input_digest("content-a", "unit-a"),
+            go_syntax_checkpoint_input_digest("content-a", "unit-b")
+        );
     }
 }

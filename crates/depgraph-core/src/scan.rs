@@ -668,6 +668,9 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     let setup_ms = elapsed_ms(setup_started);
     let worker_started = Instant::now();
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
+    let initial_content_digest = cache_plan
+        .as_ref()
+        .and_then(|plan| plan.syntax.dimensions.get("file_content").cloned());
     let checkpoint_store_path = store.database_path();
     let execution_context = AnalysisExecutionContext {
         root: &root,
@@ -681,8 +684,11 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         workers_to_run,
         checkpoint_store_path.as_deref(),
         &profile_plan.plan_id,
+        initial_content_digest,
     )
     .await?;
+    let analysis_plan = schedule.plan;
+    let analysis_input_proof = schedule.input_proof;
     let unit_count = schedule.work.len();
     let profiling = scan_profile_enabled();
     let mut performance_phases = Vec::new();
@@ -731,12 +737,14 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 }
             }
         },
-        |item| {
+        |item, validation| {
             validate_work_inputs(
                 &execution_context,
                 item,
                 checkpoint_store_path.as_deref(),
                 &profile_plan.plan_id,
+                analysis_input_proof.as_deref(),
+                validation,
             )
         },
     )
@@ -836,7 +844,14 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         return Ok(outcome);
     }
 
-    if let Some(expected) = schedule.plan.as_ref()
+    if let Some(proof) = analysis_input_proof.as_ref()
+        && !proof.matches_postflight(&root, checkpoint_store_path.as_deref())
+    {
+        let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
+    }
+    if let Some(expected) = analysis_plan.as_ref()
         && !plan_analysis_units(&root, config, checkpoint_store_path.as_deref())
             .is_ok_and(|observed| observed.input_digest == expected.input_digest)
     {

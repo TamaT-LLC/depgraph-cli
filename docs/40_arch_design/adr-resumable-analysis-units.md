@@ -124,6 +124,21 @@ fingerprint for every unit in the same adapter. This is deliberately
 conservative: an unknown repository-local edge cannot allow a stale result to
 be reused.
 
+Go syntax checkpoints add a repository-wide content witness to the static
+unit-ownership fingerprint. The witness covers every file selected by the
+repository inventory, including auxiliary files such as assembly sources and
+embedding inputs. When the bounded persistent-cache fingerprint is eligible,
+its `file_content` digest is reused; when cache limits reject that fingerprint,
+the executor streams the same inventory without those cache limits. Store
+databases and their WAL or SHM sidecars, `.depgraph` state, and the existing
+generated-state exclusions remain outside the witness. A shared witness is
+checked once before checkpoint reuse, then recomputed before each newly written
+checkpoint and again before publication so a file change during execution
+cannot be saved under the earlier key. If the witness cannot be obtained, the
+Go unit capability is not scheduled and the repository-worker fallback keeps
+the ordinary scan available. Legacy whole-adapter scans retain their existing
+cache and publication safeguards.
+
 AnalysisPlan::invalidation_from reports Added, Removed, SourceChanged,
 ManifestChanged, ConfigChanged, ProfileChanged, AnalyzerChanged,
 DependencyChanged, and UnknownDependency reasons. Direct changes seed the

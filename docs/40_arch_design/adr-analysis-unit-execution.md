@@ -63,12 +63,20 @@ checksum, limits, expected key, and the complete worker protocol again. Unknown,
 truncated, or mismatched entries are cache misses. Unfinished worker streams are
 never reused. `--no-cache` disables both reads and writes.
 
-Go syntax stages can reuse their static unit fingerprint. Semantic stages also
-require the existing semantic cache's dependency proof. In particular, a Go
-dependency snapshot that cannot be certified before execution still requires
-semantic reanalysis. Static discovery is not a proof of external dependency
-stability. Input validation runs before reuse and before saving a result; a
-changed plan or cache input prevents publication of a mixed completed snapshot.
+Go syntax stages bind their static unit-ownership fingerprint to a
+repository-wide content witness. The witness includes auxiliary inventory
+files such as assembly sources and embedding inputs, so a syntax checkpoint
+cannot be reused after an unowned file changes. A bounded cache fingerprint is
+used when available; a streamed inventory digest is used when cache-size
+limits make persistence ineligible. The streamed path keeps ordinary large
+repository scans available. Semantic stages also require the existing
+semantic cache's dependency proof. In particular, a Go dependency snapshot
+that cannot be certified before execution still requires semantic reanalysis.
+Static discovery is not a proof of external dependency stability. The shared
+witness is checked once before reuse, recomputed before each new checkpoint is
+saved, and checked again before publication. A changed plan or input prevents
+publication of a mixed completed snapshot; if a Go unit witness cannot be
+obtained, execution falls back to the repository-wide worker.
 
 The sidecars do not replace operation leases or the operation journal and are
 not completed graph snapshots. There is no Store schema migration. The existing

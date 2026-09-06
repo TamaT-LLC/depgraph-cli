@@ -34,6 +34,16 @@ pub(crate) struct AnalysisWorkItem {
     pub spec: WorkerSpec,
 }
 
+/// Identifies why the executor is asking whether a unit's inputs are valid.
+/// A checkpoint read can share one schedule-wide preflight witness, while a
+/// newly produced checkpoint must be guarded by a fresh witness because the
+/// repository may have changed while the worker was running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnalysisInputValidation {
+    Reuse,
+    CheckpointWrite,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AnalysisUnitProgress {
     pub unit_id: String,
@@ -64,7 +74,7 @@ pub(crate) async fn execute_analysis_units<F, V>(
 ) -> Result<AnalysisExecutionProgress>
 where
     F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
-    V: Fn(&AnalysisWorkItem) -> bool,
+    V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
 {
     let AnalysisExecutionContext {
         root,
@@ -132,7 +142,7 @@ where
                 break;
             };
             if let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
-                && validate_inputs(&item)
+                && validate_inputs(&item, AnalysisInputValidation::Reuse)
             {
                 let cached = checkpoints.read(key).ok().flatten().and_then(|events| {
                     let output =
@@ -273,7 +283,7 @@ where
         // reusable; prefixes from killed or malformed workers are never saved.
         if output.error.is_none()
             && !cancellation.is_cancelled()
-            && validate_inputs(&item)
+            && validate_inputs(&item, AnalysisInputValidation::CheckpointWrite)
             && let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
             && let Err(error) = checkpoints.write(key, &output.events)
         {
@@ -337,7 +347,8 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
         paths.contains(path)
             || path == manifest
             || (unit_root == "." && path == "go.work")
-            || (path.ends_with(".s") && (unit_root == "." || path.starts_with(&prefix)))
+            || ((path.ends_with(".s") || path.ends_with(".S"))
+                && (unit_root == "." || path.starts_with(&prefix)))
     };
     for event in &output.events {
         match event["event"].as_str() {
@@ -511,7 +522,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             },
             work(false),
             consume,
-            |_| true,
+            |_, _| true,
         )
         .await?;
         assert_eq!(
@@ -536,7 +547,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             },
             work(false),
             consume,
-            |_| true,
+            |_, _| true,
         )
         .await?;
         assert!(resumed.units.iter().all(|unit| unit.status == "completed"));
@@ -560,7 +571,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             },
             work(true),
             consume,
-            |_| true,
+            |_, _| true,
         )
         .await?;
         assert!(changed.units.iter().all(|unit| !unit.reused));

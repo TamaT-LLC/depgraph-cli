@@ -552,6 +552,135 @@ fn fingerprint_inventory(
     })
 }
 
+/// Fingerprints every file selected by the repository inventory without the
+/// cache-specific file-size and aggregate-byte limits.  This is used as an
+/// input-consistency proof for scans that are explicitly running without the
+/// persistent cache, and as a fallback when the bounded cache fingerprint is
+/// ineligible for a large repository.  The digest format for ordinary files
+/// intentionally matches the `file_content` dimension produced by
+/// `fingerprint_inventory` so a bounded proof can be reused when available.
+pub(crate) fn fingerprint_scan_inputs(
+    root: &Path,
+    store_path: Option<&Path>,
+) -> Result<String, CacheRejection> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
+    if !root.is_dir() {
+        return Err(CacheRejection::new("inventory-unavailable"));
+    }
+    let store_path = store_path.map(|path| {
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        fs::canonicalize(&candidate).unwrap_or(candidate)
+    });
+    let inventory = build_repository_file_inventory(&root)
+        .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
+    let mut files = Vec::with_capacity(inventory.paths.len());
+    for relative in inventory.paths {
+        let path = root.join(&relative);
+        if is_store_artifact(&path, store_path.as_deref()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| CacheRejection::at_path("inventory-unavailable", &relative))?;
+        let (content_path, length, symlink) = if metadata.file_type().is_symlink() {
+            let observation = observe_confined_symlink(&root, &path, &relative)?;
+            (
+                observation.canonical_target.clone(),
+                observation.length,
+                Some(observation),
+            )
+        } else if metadata.is_file() {
+            (path.clone(), metadata.len(), None)
+        } else {
+            return Err(CacheRejection::at_path(
+                "unsupported-filesystem-entry",
+                &relative,
+            ));
+        };
+        files.push(InventoryFile {
+            relative,
+            path: content_path,
+            length,
+            manifest: false,
+            generated: false,
+            symlink,
+        });
+    }
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"depgraph-cache-inventory-v1\0");
+    for file in &files {
+        if file.relative.rsplit('/').next() == Some(".depgraph.toml") {
+            continue;
+        }
+        stream_inventory_entry_digest(&mut hasher, &root, file)?;
+    }
+    Ok(finish_digest(hasher))
+}
+
+fn stream_inventory_entry_digest(
+    hasher: &mut Sha256,
+    root: &Path,
+    file: &InventoryFile,
+) -> Result<(), CacheRejection> {
+    if let Some(symlink) = &file.symlink {
+        hasher.update(b"symlink\0");
+        hasher.update((file.relative.len() as u64).to_be_bytes());
+        hasher.update(file.relative.as_bytes());
+        hasher.update((symlink.cache_identity.len() as u64).to_be_bytes());
+        hasher.update(symlink.cache_identity.as_bytes());
+        stream_file_content(hasher, &file.path, file.length, &file.relative)?;
+        let link_path = root.join(&file.relative);
+        let observed = observe_confined_symlink(root, &link_path, &file.relative)?;
+        if &observed != symlink {
+            return Err(CacheRejection::at_path(
+                "symlink-input-changed-during-fingerprint",
+                &file.relative,
+            ));
+        }
+    } else {
+        hasher.update((file.relative.len() as u64).to_be_bytes());
+        hasher.update(file.relative.as_bytes());
+        stream_file_content(hasher, &file.path, file.length, &file.relative)?;
+        let observed = fs::metadata(&file.path)
+            .map_err(|_| CacheRejection::at_path("inventory-read-failed", &file.relative))?;
+        if !observed.is_file() || observed.len() != file.length {
+            return Err(CacheRejection::at_path(
+                "input-changed-during-fingerprint",
+                &file.relative,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stream_file_content(
+    hasher: &mut Sha256,
+    path: &Path,
+    length: u64,
+    relative: &str,
+) -> Result<(), CacheRejection> {
+    hasher.update(length.to_be_bytes());
+    let file = fs::File::open(path)
+        .map_err(|_| CacheRejection::at_path("inventory-read-failed", relative))?;
+    let mut reader = file.take(length);
+    io::copy(&mut reader, hasher)
+        .map_err(|_| CacheRejection::at_path("inventory-read-failed", relative))?;
+    if reader.limit() != 0 {
+        return Err(CacheRejection::at_path(
+            "input-changed-during-fingerprint",
+            relative,
+        ));
+    }
+    Ok(())
+}
+
 fn observe_confined_symlink(
     root: &Path,
     link_path: &Path,

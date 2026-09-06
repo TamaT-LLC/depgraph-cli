@@ -725,7 +725,7 @@ func (s *scannerState) retainAnalysisScopeDiagnostics() {
 	}
 	owned := s.diagnostics[:0]
 	for _, diagnostic := range s.diagnostics {
-		if diagnostic.Path == "" || diagnostic.Path == "go.work" || s.ownsSourcePath(diagnostic.Path) || s.ownsManifestPath(diagnostic.Path) {
+		if diagnostic.Path == "" || diagnostic.Path == "go.work" || s.ownsAnalysisFilePath(diagnostic.Path) || s.ownsManifestPath(diagnostic.Path) {
 			owned = append(owned, diagnostic)
 		}
 	}
@@ -745,10 +745,12 @@ func (s *scannerState) retainSemanticStageGraph() {
 	if s.analysisUnit == nil || s.analysisStage != AnalysisUnitStageSemantic {
 		return
 	}
+	removedSiteIDs := map[string]bool{}
 	for id, site := range s.sites {
 		semantic := len(site.Evidence) > 0 && site.Evidence[0].Kind == "semantic"
 		if !semantic {
 			delete(s.sites, id)
+			removedSiteIDs[id] = true
 		}
 	}
 	for id, edge := range s.edges {
@@ -760,6 +762,7 @@ func (s *scannerState) retainSemanticStageGraph() {
 			delete(s.edges, id)
 		}
 	}
+	s.dropCallGraphLimitDiagnosticsForSites(removedSiteIDs)
 	s.retainSemanticFileCompletions()
 }
 
@@ -767,9 +770,11 @@ func (s *scannerState) retainAnalysisUnitSemanticScope() {
 	if s.analysisUnit == nil {
 		return
 	}
+	removedSiteIDs := map[string]bool{}
 	for id, site := range s.sites {
 		if len(site.Evidence) == 0 || !s.ownsAllSemanticEvidence(site.Evidence) {
 			delete(s.sites, id)
+			removedSiteIDs[id] = true
 		}
 	}
 	for id, edge := range s.edges {
@@ -777,7 +782,27 @@ func (s *scannerState) retainAnalysisUnitSemanticScope() {
 			delete(s.edges, id)
 		}
 	}
+	s.dropCallGraphLimitDiagnosticsForSites(removedSiteIDs)
 	s.retainAnalysisScopeDiagnostics()
+}
+
+// dropCallGraphLimitDiagnosticsForSites keeps the diagnostic ledger correlated
+// with the final site graph. Source boundary sites are intentionally removed
+// from semantic unit output, so their diagnostics must not survive without a
+// site_id that the consumer can resolve.
+func (s *scannerState) dropCallGraphLimitDiagnosticsForSites(siteIDs map[string]bool) {
+	if len(siteIDs) == 0 {
+		return
+	}
+	owned := s.diagnostics[:0]
+	for _, diagnostic := range s.diagnostics {
+		siteID, _ := diagnostic.Properties["site_id"].(string)
+		if diagnostic.Code == "go_callgraph_limit" && siteIDs[siteID] {
+			continue
+		}
+		owned = append(owned, diagnostic)
+	}
+	s.diagnostics = owned
 }
 
 func (s *scannerState) ownsAllSemanticEvidence(evidence []Evidence) bool {
@@ -840,16 +865,32 @@ func (s *scannerState) ownsAnalysisFilePath(relative string) bool {
 	if s.analysisUnit == nil {
 		return true
 	}
+	relative = cleanSlash(relative)
 	if s.ownsSourcePath(relative) {
 		return true
 	}
-	if !strings.HasSuffix(relative, ".s") {
+	if !isGoAssemblyPath(relative) {
 		return false
 	}
-	if s.analysisUnit.UnitRoot == "." {
-		return relative != "" && relative != "." && !strings.HasPrefix(relative, "../")
+	assemblyPath := filepath.Clean(filepath.Join(s.root, filepath.FromSlash(relative)))
+	if !isWithinRoot(s.root, assemblyPath) {
+		return false
 	}
-	return strings.HasPrefix(relative, s.analysisUnit.UnitRoot+"/")
+	nearestModuleDir := ""
+	for moduleDir := range s.moduleResolution.modulesByDir {
+		moduleDir = filepath.Clean(moduleDir)
+		if !isWithinRoot(moduleDir, assemblyPath) {
+			continue
+		}
+		if nearestModuleDir == "" || len(moduleDir) > len(nearestModuleDir) {
+			nearestModuleDir = moduleDir
+		}
+	}
+	return nearestModuleDir != "" && s.ownedModules[nearestModuleDir]
+}
+
+func isGoAssemblyPath(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".s")
 }
 
 func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]Node, error) {
@@ -1146,7 +1187,7 @@ func (s *scannerState) addAssemblyBoundaries(
 			continue
 		}
 		relative := relativePath(s.root, path)
-		if s.analysisUnit != nil && !s.ownsSourcePath(relative) {
+		if s.analysisUnit != nil && !s.ownsAnalysisFilePath(relative) {
 			continue
 		}
 		discovered++

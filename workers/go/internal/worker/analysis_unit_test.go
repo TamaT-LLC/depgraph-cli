@@ -365,3 +365,116 @@ type Wrapper struct { Value Value }
 		t.Fatal("semantic closure dropped the shared target package node")
 	}
 }
+
+func TestScanAnalysisUnitAssemblyOwnershipUsesNearestModule(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/app\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "app", "limits.go"), "package app\n\nfunc assemblyEntry()\n")
+	writeTestFile(t, filepath.Join(root, "app", "bridge.s"), "TEXT ·bridge(SB),$0-0\n\tRET\n")
+	writeTestFile(t, filepath.Join(root, "app", "upper.S"), "TEXT ·upper(SB),$0-0\n\tRET\n")
+	writeTestFile(t, filepath.Join(root, "app", "nested", "go.mod"), "module example.com/nested\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "app", "nested", "nested.s"), "TEXT ·nested(SB),$0-0\n\tRET\n")
+
+	request := AnalysisUnitRequest{
+		ContractVersion: AnalysisUnitContractVersion,
+		UnitID:          "analysis-unit:assembly-ownership",
+		Adapter:         AdapterName,
+		UnitRoot:        "app",
+		SourcePaths:     []string{"app/limits.go"},
+		Stage:           AnalysisUnitStageSyntax,
+	}
+	result, err := ScanWithAnalysisUnit(root, "", request)
+	if err != nil {
+		t.Fatalf("ScanWithAnalysisUnit() error = %v", err)
+	}
+
+	for _, path := range []string{"app/bridge.s", "app/upper.S"} {
+		foundFile := false
+		for _, file := range result.Files {
+			if file.Path != path {
+				continue
+			}
+			foundFile = true
+			if file.DiscoveredSites != 1 || file.EmittedSites != 1 || file.Skipped {
+				t.Fatalf("assembly file completion = %+v, want one emitted site", file)
+			}
+		}
+		if !foundFile {
+			t.Fatalf("owned assembly file %q was not completed: %+v", path, result.Files)
+		}
+		foundNode := false
+		for _, node := range result.Nodes {
+			if node.Kind == "file" && node.Locator == "file:"+path {
+				foundNode = true
+			}
+		}
+		if !foundNode {
+			t.Fatalf("owned assembly file node %q was not emitted", path)
+		}
+		implementation := false
+		for _, site := range result.Sites {
+			if site.Kind != "callgraph_boundary" || len(site.Evidence) == 0 || site.Evidence[0].Path != path {
+				continue
+			}
+			boundary, _ := site.Evidence[0].Properties["callgraph_boundary"].(string)
+			if boundary != "assembly_implementation" {
+				continue
+			}
+			implementation = true
+			if diagnostic := callGraphLimitDiagnosticForSite(result.Diagnostics, site.ID); diagnostic == nil || diagnostic.Path != path {
+				t.Fatalf("assembly boundary diagnostic for %q is missing or out of scope: site=%+v diagnostics=%+v", path, site, result.Diagnostics)
+			}
+		}
+		if !implementation {
+			t.Fatalf("assembly implementation site for %q was not emitted: %+v", path, result.Sites)
+		}
+	}
+	for _, file := range result.Files {
+		if strings.HasPrefix(file.Path, "app/nested/") {
+			t.Fatalf("nested module assembly escaped the app unit: %+v", file)
+		}
+	}
+	for _, node := range result.Nodes {
+		if node.Kind == "file" && strings.HasPrefix(node.Locator, "file:app/nested/") {
+			t.Fatalf("nested module assembly node escaped the app unit: %+v", node)
+		}
+	}
+}
+
+func TestScanAnalysisUnitSemanticStageDropsDiagnosticsForRemovedSourceSites(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/app\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "app", "limits.go"), "package app\n\nimport _ \"unsafe\"\n\nfunc assemblyEntry()\n")
+	writeTestFile(t, filepath.Join(root, "app", "bridge.s"), "TEXT ·bridge(SB),$0-0\n\tRET\n")
+	request := AnalysisUnitRequest{
+		ContractVersion: AnalysisUnitContractVersion,
+		UnitID:          "analysis-unit:semantic-boundaries",
+		Adapter:         AdapterName,
+		UnitRoot:        "app",
+		SourcePaths:     []string{"app/limits.go"},
+		Stage:           AnalysisUnitStageSemantic,
+	}
+	result, err := ScanWithAnalysisUnit(root, "", request)
+	if err != nil {
+		t.Fatalf("ScanWithAnalysisUnit() error = %v", err)
+	}
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code != "go_callgraph_limit" {
+			continue
+		}
+		t.Fatalf("semantic stage retained diagnostic for a removed source site: %+v", diagnostic)
+	}
+}
+
+func callGraphLimitDiagnosticForSite(diagnostics []Diagnostic, siteID string) *Diagnostic {
+	for index := range diagnostics {
+		diagnostic := &diagnostics[index]
+		if diagnostic.Code != "go_callgraph_limit" {
+			continue
+		}
+		if candidate, ok := diagnostic.Properties["site_id"].(string); ok && candidate == siteID {
+			return diagnostic
+		}
+	}
+	return nil
+}

@@ -421,6 +421,7 @@ fn verify_dependency_snapshot(
         first_export
             .get("graph")
             .context("first dependency snapshot export has no graph")?,
+        ".",
         "semantic",
         "first dependency snapshot export has no Go semantic profile",
     )?;
@@ -428,6 +429,7 @@ fn verify_dependency_snapshot(
         second_export
             .get("graph")
             .context("second dependency snapshot export has no graph")?,
+        ".",
         "semantic",
         "second dependency snapshot export has no Go semantic profile",
     )?;
@@ -461,6 +463,7 @@ fn verify_dependency_snapshot(
         changed_export
             .get("graph")
             .context("changed dependency snapshot export has no graph")?,
+        ".",
         "semantic",
         "changed dependency snapshot export has no Go semantic profile",
     )?;
@@ -499,7 +502,12 @@ fn verify_vta_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Result<
     let graph = first_export
         .get("graph")
         .context("VTA JSON export has no graph")?;
-    let profile = go_profile_for_stage(graph, "semantic", "VTA export has no Go semantic profile")?;
+    let profile = go_profile_for_stage(
+        graph,
+        ".",
+        "semantic",
+        "VTA export has no Go semantic profile",
+    )?;
     ensure!(
         profile["properties"]["go_call_graph_requested"] == "vta"
             && matches!(
@@ -850,6 +858,7 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
         ("unsafe", 1),
     ]);
     let mut counts = BTreeMap::<&str, u64>::new();
+    let mut counts_by_profile = BTreeMap::<&str, u64>::new();
     let mut unresolved_boundary_ids = Vec::<String>::new();
     for primary in evidence.iter().filter(|item| {
         item["owner_type"] == "site" && item["properties"]["callgraph_boundary"].as_str().is_some()
@@ -874,6 +883,9 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
             !reason.is_empty() && site["profile_id"].as_str().is_some(),
             "boundary site lost reason/profile identity: site={site} evidence={primary}"
         );
+        *counts_by_profile
+            .entry(required_str(site, "profile_id", "boundary site")?)
+            .or_default() += 1;
         let diagnostic = diagnostics
             .iter()
             .find(|diagnostic| {
@@ -910,21 +922,32 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
         counts == expected,
         "Go boundary fixture counts changed: {counts:?}"
     );
-    let profile = go_profile_with_observed_boundaries(
-        graph,
-        "boundary export has no Go profile with call-graph boundaries",
-    )?;
     let expected_total = expected.values().sum::<u64>();
+    let mut observed_total = 0;
+    for profile in graph_array(graph, "profiles")?
+        .iter()
+        .filter(|profile| profile["language"] == "go")
+    {
+        let profile_id = required_str(profile, "id", "boundary Go profile")?;
+        let count = counts_by_profile.remove(profile_id).unwrap_or_default();
+        observed_total += count;
+        ensure!(
+            profile["properties"]["go_callgraph_boundary_status"]
+                == if count == 0 { "none" } else { "observed" }
+                && profile["properties"]["go_callgraph_boundary_site_count"]
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(count)
+                && profile["properties"]["go_callgraph_boundary_completeness_policy"]
+                    == "semantic-complete-allowed-with-explicit-boundaries",
+            "Go profile boundary metadata disagrees with its {count} owned sites: {profile}"
+        );
+    }
     ensure!(
-        profile["properties"]["go_callgraph_boundary_status"] == "observed"
-            && profile["properties"]["go_callgraph_boundary_site_count"]
-                .as_str()
-                .and_then(|value| value.parse::<u64>().ok())
-                == Some(expected_total)
-            && profile["properties"]["go_callgraph_boundary_completeness_policy"]
-                == "semantic-complete-allowed-with-explicit-boundaries"
+        counts_by_profile.is_empty()
+            && observed_total == expected_total
             && string_array_contains(&graph["coverage"]["completeness"], "semantic-complete"),
-        "Go profile lost boundary/completeness metadata: {profile}"
+        "Go boundary graph lost profile ownership or aggregate completeness"
     );
 
     let unresolved = runner.query(store, &["unresolved", "--all", "--json"])?;
@@ -1251,6 +1274,7 @@ fn assert_parser_fallback_scan(
     }
     let go_profile = go_profile_for_stage(
         graph,
+        "app",
         "semantic",
         &format!("{scenario} parser-fallback export has no Go semantic profile"),
     )?;
@@ -1751,38 +1775,24 @@ fn graph_array<'a>(graph: &'a Value, field: &str) -> Result<&'a [Value]> {
         .with_context(|| format!("exported graph has no {field} array"))
 }
 
-fn go_profile_for_stage<'a>(graph: &'a Value, stage: &str, context: &str) -> Result<&'a Value> {
+fn go_profile_for_stage<'a>(
+    graph: &'a Value,
+    unit_root: &str,
+    stage: &str,
+    context: &str,
+) -> Result<&'a Value> {
     let profiles = graph_array(graph, "profiles")?;
     profiles
         .iter()
         .find(|profile| {
             profile["language"] == "go"
                 && profile["properties"]["analysis_stage"] == stage
-                && profile["properties"]["analysis_unit_root"] == "."
+                && profile["properties"]["analysis_unit_root"] == unit_root
         })
         .or_else(|| {
             // Legacy workers emit one Go profile without analysis_stage. Keep
             // this gate compatible with that stream while never falling back
             // from a requested semantic unit to a syntax profile.
-            profiles.iter().find(|profile| {
-                profile["language"] == "go" && profile["properties"].get("analysis_stage").is_none()
-            })
-        })
-        .with_context(|| context.to_owned())
-}
-
-fn go_profile_with_observed_boundaries<'a>(graph: &'a Value, context: &str) -> Result<&'a Value> {
-    let profiles = graph_array(graph, "profiles")?;
-    profiles
-        .iter()
-        .find(|profile| {
-            profile["language"] == "go"
-                && profile["properties"]["go_callgraph_boundary_status"] == "observed"
-        })
-        .or_else(|| {
-            // Legacy workers emit one Go profile without analysis_stage. Keep
-            // that stream compatible without selecting an unrelated split
-            // profile when the observed-boundary profile is missing.
             profiles.iter().find(|profile| {
                 profile["language"] == "go" && profile["properties"].get("analysis_stage").is_none()
             })
