@@ -1286,16 +1286,18 @@ test("condition canonicalization follows protocol UTF-8 ordering for Unicode val
 });
 
 test("extracts ESM, CJS, re-export, type-only, literal and computed imports", () => {
-  const source = `
-import type { A } from "./a"
-import value from "./value"
-import "./side-effect"
-export { other } from "./other"
-const common = require("./common")
-const lazy = import("./lazy")
-const name = "computed"
-const unknown = import(\`./\${name}\`)
-`;
+  const source = [
+    "",
+    'import type { A } from "./a"',
+    'import value from "./value"',
+    'import "./side-effect"',
+    'export { other } from "./other"',
+    'const common = require("./common")',
+    'const lazy = import("./lazy")',
+    'const name = "computed"',
+    'const unknown = import(`./${name}`)',
+    "",
+  ].join("\n");
   const result = extractDependencies("/repo/source.ts", "source.ts", source);
   assert.deepEqual(result.dependencies.map(({ kind, specifier, literal }) => ({ kind, specifier, literal })), [
     { kind: "type_import", specifier: "./a", literal: true },
