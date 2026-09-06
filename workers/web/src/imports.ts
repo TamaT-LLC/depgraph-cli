@@ -211,14 +211,77 @@ function nextCodePointOffset(source: string, offset: number): number {
   return Math.min(source.length, offset + (codePoint !== undefined && codePoint > 0xffff ? 2 : 1));
 }
 
-function looksLikeJsxElementStart(source: string, offset: number): boolean {
+const GENERIC_TSX_CALL_PREDECESSORS = new Set([
+  SyntaxKind.Identifier,
+  SyntaxKind.PrivateIdentifier,
+  SyntaxKind.CloseParenToken,
+  SyntaxKind.CloseBracketToken,
+  SyntaxKind.ThisKeyword,
+  SyntaxKind.SuperKeyword,
+  SyntaxKind.FunctionKeyword,
+]);
+
+const GENERIC_TSX_PROPERTY_ACCESS = new Set([SyntaxKind.DotToken, SyntaxKind.QuestionDotToken]);
+const JSX_CONTEXTUAL_EXPRESSION_PREFIXES = new Set([SyntaxKind.AwaitKeyword, SyntaxKind.OfKeyword]);
+
+function followsPropertyAccess(previous: Token | undefined): boolean {
+  return previous !== undefined && GENERIC_TSX_PROPERTY_ACCESS.has(previous.kind);
+}
+
+function isContextualGenericCallee(kind: SyntaxKind): boolean {
+  return kind >= SyntaxKind.FirstContextualKeyword
+    && kind <= SyntaxKind.LastContextualKeyword
+    && !JSX_CONTEXTUAL_EXPRESSION_PREFIXES.has(kind);
+}
+
+function isGenericCalleeToken(previous: Token | undefined, propertyName: boolean): boolean {
+  if (previous === undefined) return false;
+  return propertyName || GENERIC_TSX_CALL_PREDECESSORS.has(previous.kind) || isContextualGenericCallee(previous.kind);
+}
+
+const GENERIC_ARROW_PARAMETER_DELIMITERS = new Set([SyntaxKind.CommaToken, SyntaxKind.EqualsToken]);
+const JSX_EXTENDS_ATTRIBUTE_FOLLOWERS = new Set([
+  SyntaxKind.EqualsToken,
+  SyntaxKind.GreaterThanToken,
+  SyntaxKind.EndOfFile,
+]);
+
+function startsGenericArrowParameters(scanner: ReturnType<typeof createScanner>, first: SyntaxKind): boolean {
+  if (first !== SyntaxKind.Identifier) return false;
+  const next = scanner.scan();
+  if (GENERIC_ARROW_PARAMETER_DELIMITERS.has(next)) return true;
+  // `extends` alone or followed by `=` can be a JSX attribute. An actual
+  // type constraint disambiguates an arrow before its parameter list.
+  return next === SyntaxKind.ExtendsKeyword && !JSX_EXTENDS_ATTRIBUTE_FOLLOWERS.has(scanner.scan());
+}
+
+function looksLikeGenericTsxConstruct(source: string, offset: number, previous: Token | undefined, propertyName: boolean): boolean {
+  // A callee or declaration name remains the predecessor across whitespace
+  // and comments. JSX expressions instead follow tokens such as `=`,
+  // `return`, `(`, or `=>`, so parenthesized JSX text stays in JSX mode.
+  if (isGenericCalleeToken(previous, propertyName)) return true;
+  const scanner = createScanner(true, LanguageVariant.Standard, source, offset);
+  scanner.scan(); // `<`
+  let first = scanner.scan();
+  if (first === SyntaxKind.ConstKeyword) first = scanner.scan();
+  return startsGenericArrowParameters(scanner, first);
+}
+
+function looksLikeNamedJsxElementStart(source: string, offset: number, tagName: string): boolean {
+  const tagEnd = source.indexOf(">", offset + tagName.length + 1);
+  if (tagEnd < 0) return false;
+  if (/\/\s*$/u.test(source.slice(offset, tagEnd))) return true;
+  // Match the entire tag name: `<T>` must not consume a later `</Text>`.
+  const escapedTagName = tagName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`</${escapedTagName}\\s*>`, "u").test(source.slice(tagEnd + 1));
+}
+
+function looksLikeJsxElementStart(source: string, offset: number, previous?: Token, propertyName = false): boolean {
   const match = source.slice(offset).match(/^<([$_\p{ID_Start}][$_\p{ID_Continue}.:-]*|>)/u);
   if (!match?.[1]) return false;
   if (match[1] === ">") return source.indexOf("</>", offset + 2) >= 0;
-  const tagEnd = source.indexOf(">", offset + match[0].length);
-  if (tagEnd < 0) return false;
-  if (/\/\s*$/u.test(source.slice(offset, tagEnd))) return true;
-  return source.indexOf(`</${match[1]}`, tagEnd + 1) >= 0;
+  if (looksLikeGenericTsxConstruct(source, offset, previous, propertyName)) return false;
+  return looksLikeNamedJsxElementStart(source, offset, match[1]);
 }
 
 function looksLikeJsxClosingElement(source: string, offset: number): boolean {
@@ -235,6 +298,7 @@ function scanTokens(
   const scanner = createScanner(skipTrivia, languageVariant, source);
   const tokens: Token[] = [];
   let previousSignificantToken: Token | undefined;
+  let previousSignificantTokenIsPropertyName = false;
   let braceDepth = 0;
   const templateBases: number[] = [];
   let consumedOffset = 0;
@@ -292,6 +356,8 @@ function scanTokens(
       end,
       unterminated: scanner.isUnterminated(),
     };
+    const previousToken = previousSignificantToken;
+    const previousTokenIsPropertyName = previousSignificantTokenIsPropertyName;
     tokens.push(token);
     if (
       kind !== SyntaxKind.WhitespaceTrivia
@@ -299,6 +365,7 @@ function scanTokens(
       && kind !== SyntaxKind.SingleLineCommentTrivia
       && kind !== SyntaxKind.MultiLineCommentTrivia
     ) {
+      previousSignificantTokenIsPropertyName = followsPropertyAccess(previousSignificantToken);
       previousSignificantToken = token;
     }
     consumedOffset = end;
@@ -307,7 +374,7 @@ function scanTokens(
       if (
         modeAtScan === "code"
         && kind === SyntaxKind.LessThanToken
-        && looksLikeJsxElementStart(source, start)
+        && looksLikeJsxElementStart(source, start, previousToken, previousTokenIsPropertyName)
       ) {
         if (jsxExpressions.length > 0) jsxCodeReturnDepths.push(jsxDepth);
         jsxMode = "tag";
@@ -571,6 +638,10 @@ function typescriptParseDiagnostics(tokens: Token[], source: string, relativePat
       continue;
     }
     if (token.kind === SyntaxKind.ConstKeyword || token.kind === SyntaxKind.LetKeyword || token.kind === SyntaxKind.VarKeyword) {
+      // TypeScript 7's standalone scanner represents the `const` in `as
+      // const` as a ConstKeyword. It is the assertion type, not a variable
+      // declaration, so do not apply declaration validation to it.
+      if (token.kind === SyntaxKind.ConstKeyword && tokens[index - 1]?.kind === SyntaxKind.AsKeyword) continue;
       const declaration = tokens[index + 1];
       if (token.kind === SyntaxKind.ConstKeyword && declaration?.kind === SyntaxKind.EnumKeyword) continue;
       const identifierLike = declaration !== undefined && /^[$_\p{ID_Start}][$_\p{ID_Continue}]*$/u.test(declaration.text);

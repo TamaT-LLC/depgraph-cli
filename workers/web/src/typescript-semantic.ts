@@ -217,6 +217,8 @@ interface Collection {
   readonly heritage: HeritageCandidate[];
   readonly localExports: LocalExportReference[];
   readonly typeParameters: TypeParameterCandidate[];
+  readonly astNodesBySource: Map<string, number>;
+  readonly sourceLimitReasons: Map<string, "depth" | "nodes">;
   astNodes: number;
   limitIssue: TypeScriptSemanticIssue | null;
 }
@@ -658,54 +660,28 @@ function hasCanonicalMemberOwner(node: Node, owner: Candidate | null): owner is 
     && (owner.node as TypeAliasDeclaration).type === node.parent;
 }
 
-function collectSources(
-  sources: readonly TypeScriptSemanticSource[],
+function collectSourceNodes(
+  collection: Collection,
+  source: TypeScriptSemanticSource,
   issues: IssueCollector,
-): Collection {
-  const collection: Collection = {
-    candidates: [],
-    heritage: [],
-    localExports: [],
-    typeParameters: [],
-    astNodes: 0,
-    limitIssue: null,
-  };
-  if (sources.length > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES) {
-    collection.limitIssue = issue(
-      "typescript_semantic_source_limit_exceeded",
-      `TypeScript semantic definition extraction received ${sources.length} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
-      null,
-      true,
-    );
-    return collection;
-  }
-
+): void {
   const visit = (
     node: Node,
-    source: TypeScriptSemanticSource,
     owner: Candidate | null,
     lexicalPath: readonly string[],
     moduleScoped: boolean,
     astDepth: number,
   ): void => {
-    if (collection.limitIssue !== null) return;
+    if (collection.limitIssue !== null || collection.sourceLimitReasons.has(source.relativePath)) return;
     if (astDepth > MAX_AST_DEPTH) {
-      collection.limitIssue = issue(
-        "typescript_semantic_ast_depth_exceeded",
-        `TypeScript semantic definition extraction exceeded AST depth ${MAX_AST_DEPTH}`,
-        source.relativePath,
-        true,
-      );
+      collection.sourceLimitReasons.set(source.relativePath, "depth");
       return;
     }
     collection.astNodes += 1;
-    if (collection.astNodes > MAX_AST_NODES) {
-      collection.limitIssue = issue(
-        "typescript_semantic_ast_limit_exceeded",
-        `TypeScript semantic definition extraction exceeded ${MAX_AST_NODES} AST nodes`,
-        source.relativePath,
-        true,
-      );
+    const sourceAstNodes = (collection.astNodesBySource.get(source.relativePath) ?? 0) + 1;
+    collection.astNodesBySource.set(source.relativePath, sourceAstNodes);
+    if (sourceAstNodes > MAX_AST_NODES) {
+      collection.sourceLimitReasons.set(source.relativePath, "nodes");
       return;
     }
     collectLocalExportReferences(node, collection.localExports);
@@ -775,11 +751,59 @@ function collectSources(
     // definitions with the containing class as a fabricated direct owner.
     if (candidate !== null || node.kind !== SyntaxKind.MethodDeclaration) {
       node.forEachChild((child) => {
-        visit(child, source, childOwner, childLexicalPath, childModuleScoped, astDepth + 1);
+        visit(child, childOwner, childLexicalPath, childModuleScoped, astDepth + 1);
         return undefined;
       });
     }
   };
+
+  const candidateStart = collection.candidates.length;
+  const heritageStart = collection.heritage.length;
+  const localExportStart = collection.localExports.length;
+  const typeParameterStart = collection.typeParameters.length;
+  visit(source.sourceFile, null, [], true, 0);
+  const sourceLimit = collection.sourceLimitReasons.get(source.relativePath);
+  if (sourceLimit === undefined) return;
+
+  // A bounded source is discarded atomically. Definitions and relations from
+  // a partially traversed AST cannot be safely correlated, while other files
+  // can still use this compiler context and complete.
+  collection.candidates.length = candidateStart;
+  collection.heritage.length = heritageStart;
+  collection.localExports.length = localExportStart;
+  collection.typeParameters.length = typeParameterStart;
+  addIssue(issues, issue(
+    sourceLimit === "depth" ? "typescript_semantic_ast_depth_exceeded" : "typescript_semantic_ast_limit_exceeded",
+    sourceLimit === "depth"
+      ? `TypeScript semantic definition extraction exceeded AST depth ${MAX_AST_DEPTH}`
+      : `TypeScript semantic definition extraction exceeded ${MAX_AST_NODES} AST nodes`,
+    source.relativePath,
+  ));
+}
+
+function collectSources(
+  sources: readonly TypeScriptSemanticSource[],
+  issues: IssueCollector,
+): Collection {
+  const collection: Collection = {
+    candidates: [],
+    heritage: [],
+    localExports: [],
+    typeParameters: [],
+    astNodesBySource: new Map(),
+    sourceLimitReasons: new Map(),
+    astNodes: 0,
+    limitIssue: null,
+  };
+  if (sources.length > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES) {
+    collection.limitIssue = issue(
+      "typescript_semantic_source_limit_exceeded",
+      `TypeScript semantic definition extraction received ${sources.length} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
+      null,
+      true,
+    );
+    return collection;
+  }
 
   const seenPaths = new Set<string>();
   for (const source of [...sources].sort((left, right) => compareStrings(left.relativePath, right.relativePath))) {
@@ -818,8 +842,7 @@ function collectSources(
       ));
       continue;
     }
-    visit(source.sourceFile, source, null, [], true, 0);
-    if (collection.limitIssue !== null) break;
+    collectSourceNodes(collection, source, issues);
   }
   return collection;
 }

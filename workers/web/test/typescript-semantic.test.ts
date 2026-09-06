@@ -712,7 +712,7 @@ test("semantic AST path and bytes must match the confined inventory", async () =
   assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_source_identity_mismatch" && item.fatal));
 });
 
-test("semantic AST traversal rejects excessive depth before querying TypeChecker", async () => {
+test("semantic AST depth limits are reported for the bounded source", async () => {
   const compilerPath = path.resolve("/__depgraph_depth__", "src/deep.ts");
   let child: Node | undefined;
   for (let depth = 0; depth < 514; depth += 1) {
@@ -743,11 +743,100 @@ test("semantic AST traversal rejects excessive depth before querying TypeChecker
   }]);
   assert.deepEqual(delta.definitions, []);
   assert.deepEqual(delta.relations, []);
-  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_ast_depth_exceeded" && item.fatal));
+  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_ast_depth_exceeded" && !item.fatal));
   assert.equal(delta.typeCheckerQueries, 0);
 });
 
-test("fatal semantic issues survive a full nonfatal issue buffer and truncation", async () => {
+test("semantic AST limits discard one source and continue with the shared checker", async () => {
+  const sources = {
+    "src/deep.ts": "",
+    "src/valid.ts": "export class Valid {}\n",
+  };
+  const delta = await extractFixture(sources, "__depgraph_ts_semantic_per_source_limit__", {
+    transformSources: (inputs) => inputs.map((source) => {
+      if (source.relativePath !== "src/deep.ts") return source;
+      let child: Node | undefined;
+      for (let depth = 0; depth < 514; depth += 1) {
+        const next = child;
+        child = {
+          kind: SyntaxKind.EmptyStatement,
+          getStart: () => 0,
+          getEnd: () => 0,
+          forEachChild: (visitor: (node: Node) => unknown): unknown => next === undefined ? undefined : visitor(next),
+        } as Node;
+      }
+      return {
+        ...source,
+        sourceFile: {
+          kind: SyntaxKind.SourceFile,
+          path: source.compilerPath,
+          fileName: source.compilerPath,
+          text: source.expectedText,
+          getStart: () => 0,
+          getEnd: () => 0,
+          forEachChild: (visitor: (node: Node) => unknown): unknown => visitor(child!),
+        } as TypeScriptSemanticSource["sourceFile"],
+      };
+    }),
+  });
+  assert.ok(delta.definitions.some((definition) => definition.displayName === "Valid"));
+  assert.ok(delta.issues.some((item) => (
+    item.code === "typescript_semantic_ast_depth_exceeded"
+    && item.relativePath === "src/deep.ts"
+    && !item.fatal
+  )));
+  assert.equal(delta.issues.some((item) => item.fatal), false, JSON.stringify(delta.issues));
+});
+
+test("dependency AST limits discard one source and continue with the shared checker", async () => {
+  const sources = {
+    "src/deep.ts": "",
+    "src/valid.ts": "import \"./missing\";\nexport const value = 1;\n",
+  };
+  const fixture = await extractDependencyFixture(
+    sources,
+    "__depgraph_ts_dependency_per_source_limit__",
+    undefined,
+    (inputs) => inputs.map((source) => {
+      if (source.relativePath !== "src/deep.ts") return source;
+      let child: Node | undefined;
+      for (let depth = 0; depth < 514; depth += 1) {
+        const next = child;
+        child = {
+          kind: SyntaxKind.EmptyStatement,
+          getStart: () => 0,
+          getEnd: () => 0,
+          forEachChild: (visitor: (node: Node) => unknown): unknown => next === undefined ? undefined : visitor(next),
+        } as Node;
+      }
+      return {
+        ...source,
+        syntacticallyValid: false,
+        sourceFile: {
+          kind: SyntaxKind.SourceFile,
+          path: source.compilerPath,
+          fileName: source.compilerPath,
+          text: source.expectedText,
+          getStart: () => 0,
+          getEnd: () => 0,
+          forEachChild: (visitor: (node: Node) => unknown): unknown => visitor(child!),
+        } as TypeScriptSemanticSource["sourceFile"],
+      };
+    }),
+  );
+  assert.ok(fixture.dependencies.sites.some((site) => (
+    site.evidence.relativePath === "src/valid.ts"
+    && site.moduleSpecifier === "./missing"
+  )));
+  assert.equal(fixture.dependencies.sites.some((site) => site.evidence.relativePath === "src/deep.ts"), false);
+  assert.ok(fixture.dependencies.issues.some((item) => (
+    item.code === "typescript_semantic_dependency_ast_depth_exceeded"
+    && item.relativePath === "src/deep.ts"
+    && !item.fatal
+  )));
+});
+
+test("bounded semantic issues survive a full nonfatal issue buffer and truncation", async () => {
   const compilerPath = path.resolve("/__depgraph_issue_cap__", "src/capped.ts");
   const emptyNode = (kind: SyntaxKind): Node => ({
     kind,
@@ -788,9 +877,9 @@ test("fatal semantic issues survive a full nonfatal issue buffer and truncation"
   }]);
   assert.deepEqual(delta.definitions, []);
   assert.deepEqual(delta.relations, []);
-  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_ast_depth_exceeded" && item.fatal));
+  assert.equal(delta.issues.some((item) => item.code === "typescript_semantic_ast_depth_exceeded"), false);
   assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_issues_truncated"));
-  assert.equal(delta.issues.some((item) => item.fatal) ? "failed" : "ready", "failed");
+  assert.equal(delta.issues.some((item) => item.fatal) ? "failed" : "ready", "ready");
   assert.ok(delta.issues.length <= 1_000);
 });
 

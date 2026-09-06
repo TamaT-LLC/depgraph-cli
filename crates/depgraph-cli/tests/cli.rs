@@ -6926,6 +6926,190 @@ fn issue_423_health_cli_help_json_paging_and_baseline_transitions() {
     assert!(hotspot["hotspot_scores"]["total"].is_u64());
 }
 
+fn seed_issue_458_health_store(store_path: &Path, root: &Path) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    let scan_id = "health-store-root";
+    store.start_scan(scan_id, root, false).unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 1,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 1,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:web",
+        "language": "typescript",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+
+    let mut package = common("node_upsert", 3);
+    package["node"] = json!({
+        "id": "package:target",
+        "kind": "package_instance",
+        "locator": "npm:target@1.0.0",
+        "display_name": "target",
+        "properties": {
+            "name": "target",
+            "manifest_path": "package.json"
+        }
+    });
+    store.ingest_event(&package).unwrap();
+
+    let mut external = common("node_upsert", 4);
+    external["node"] = json!({
+        "id": "external:example-dep",
+        "kind": "external_system",
+        "locator": "npm:example-dep",
+        "display_name": "example-dep",
+        "properties": {}
+    });
+    store.ingest_event(&external).unwrap();
+
+    let mut site = common("dependency_site", 5);
+    site["site"] = json!({
+        "id": "site:target-example-dep",
+        "source": "package:target",
+        "kind": "package_dependency",
+        "specifier": "example-dep",
+        "resolution_status": "external",
+        "target_ids": ["external:example-dep"],
+        "profile_id": "fixture:web",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "reason": "package_not_installed"
+    });
+    store.ingest_event(&site).unwrap();
+
+    let mut edge = common("edge_upsert", 6);
+    edge["edge"] = json!({
+        "id": "edge:target-example-dep",
+        "source": "package:target",
+        "target": "external:example-dep",
+        "kind": "depends_on",
+        "site_id": "site:target-example-dep",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "fixture:web",
+        "condition": {"op": "all", "conditions": []},
+        "resolution_status": "external",
+        "precision": "exact",
+        "generated": false
+    });
+    store.ingest_event(&edge).unwrap();
+
+    let mut profile_completed = common("profile_completed", 7);
+    profile_completed["profile_id"] = json!("fixture:web");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 8);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
+#[test]
+fn issue_458_health_with_explicit_store_uses_snapshot_repository_root() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    let unrelated = temporary.path().join("unrelated");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(
+        target.join("package.json"),
+        r#"{"name":"target","private":true,"dependencies":{"example-dep":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        unrelated.join("package.json"),
+        r#"{"name":"unrelated","private":true,"dependencies":{"unrelated-lib":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let store_path = temporary.path().join("store.sqlite");
+    seed_issue_458_health_store(&store_path, &target);
+
+    for cwd in [&target, &unrelated] {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(cwd)
+            .args([
+                "--store",
+                store_path.to_str().unwrap(),
+                "--scan-id",
+                "health-store-root",
+                "health",
+                "list",
+                "--kind",
+                "manifest-mismatch",
+                "--all",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cwd={}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["command"], "health.list");
+        assert_eq!(document["scan_id"], "health-store-root");
+        assert_eq!(document["data"]["findings"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn issue_458_snapshot_queries_remain_available_after_the_repository_moves() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("repository");
+    fs::create_dir(&target).unwrap();
+    let store_path = temporary.path().join("store.sqlite");
+    seed_issue_458_health_store(&store_path, &target);
+    fs::rename(&target, temporary.path().join("moved-repository")).unwrap();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(temporary.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "deps",
+            "package:target",
+            "--json",
+        ])
+        .assert()
+        .success();
+}
+
 #[test]
 fn issue_440_hotspot_invalid_weight_uses_invalid_input_exit_code() {
     Command::cargo_bin("depgraph")
