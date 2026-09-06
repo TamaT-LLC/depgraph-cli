@@ -87,6 +87,49 @@ test("neutral path request inventory stays bounded across regular expressions", 
   );
 });
 
+test("repository-root scans discover nested pnpm workspaces and resolve local packages", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-nested-pnpm-workspace-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "frontend", "packages", "shared"), { recursive: true });
+  await mkdir(path.join(root, "frontend", "apps", "web"), { recursive: true });
+  const relatives = [
+    "go.mod",
+    "frontend/package.json",
+    "frontend/pnpm-workspace.yaml",
+    "frontend/packages/shared/package.json",
+    "frontend/packages/shared/index.ts",
+    "frontend/apps/web/package.json",
+    "frontend/apps/web/index.ts",
+  ];
+  const files = relatives.map((relative) => path.join(root, relative));
+  await Promise.all([
+    writeFile(files[0]!, "module example.com/root\n\ngo 1.24\n"),
+    writeFile(files[1]!, JSON.stringify({ name: "frontend", private: true, packageManager: "pnpm@10.33.0" })),
+    writeFile(files[2]!, "packages:\n  - \"packages/*\"\n  - \"apps/*\"\n"),
+    writeFile(files[3]!, JSON.stringify({ name: "@example/shared", version: "1.0.0", exports: "./index.ts" })),
+    writeFile(files[4]!, "export const answer = 42;\n"),
+    writeFile(files[5]!, JSON.stringify({ name: "web", private: true, dependencies: { "@example/shared": "workspace:*" } })),
+    writeFile(files[6]!, "import { answer } from \"@example/shared\";\nexport const result = answer;\n"),
+  ]);
+  const workspace = await discoverWorkspace(root, files);
+  assert.deepEqual(workspace.packages.map((record) => record.relativePath), [
+    "frontend",
+    "frontend/apps/web",
+    "frontend/packages/shared",
+  ]);
+  assert.deepEqual(workspace.ignoredManifestPaths, []);
+  const resolver = await ModuleResolver.create(workspace, files);
+  const owner = workspace.packages.find((record) => record.name === "web")!;
+  const resolution = await resolver.resolve(rawDependency("@example/shared"), files[6]!, owner);
+  assert.equal(resolution.status, "resolved");
+  assert.deepEqual(
+    resolution.targets.map((target) => target.kind === "file"
+      ? path.relative(root, target.absolutePath).replaceAll("\\", "/")
+      : null),
+    ["frontend/packages/shared/index.ts"],
+  );
+});
+
 test("TypeScript path mappings preserve declaration order without locale-dependent sorting", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-path-ordering-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -1375,6 +1418,28 @@ function returnedFromJsDoc() {}
   assert.equal(jsResult.parseErrors.length, 0);
 });
 
+test("const assertions are not parser diagnostics or named type dependencies", async () => {
+  const source = `
+export const scalar = "red" as const;
+export const array = ["red", "blue"] as const;
+export const object = { color: "red" } as const;
+export const template = \`red\` as const;
+export const checked = { color: "red" } as const satisfies Record<string, string>;
+`;
+  const analysis = await analyzeTypeScriptProject(new Map([["const-assertions.ts", source]]));
+  const result = extractDependencies(
+    "/repo/const-assertions.ts",
+    "const-assertions.ts",
+    source,
+    analysis.typeOnlyDependencyRanges.get("const-assertions.ts"),
+  );
+  assert.deepEqual(result.parseErrors, []);
+  assert.equal(
+    analysis.dependencyGraph.sites.some((site) => site.kind === "type_use" && site.specifier === "const"),
+    false,
+  );
+});
+
 test("TSX scanner ignores JSX text and attributes but keeps imports in JSX expressions", () => {
   const source = `
 export const View = () => (
@@ -1410,6 +1475,34 @@ import after from "./after";
     { kind: "import", specifier: "./after", literal: true },
   ]);
   assert.equal(result.parseErrors.length, 0);
+});
+
+test("TSX scanner distinguishes generic calls from JSX tags with prefix names", () => {
+  const source = `
+declare function read<T>(arg: object): T;
+declare const Text: any;
+declare const Table: any;
+declare const T: any;
+
+export function demo<T>() {
+  const value = read<T>({});
+  return <Text>{value}</Text>;
+}
+
+export function table<T>() {
+  const value = read<T>({});
+  return <Table>{value}</Table>;
+}
+
+export function sameName<T>() {
+  const value = read<T>({});
+  return <T>{value}</T>;
+}
+
+export const parenthesizedText = () => <T>(text)</T>;
+`;
+  const result = extractDependencies("/repo/generic-jsx.tsx", "generic-jsx.tsx", source);
+  assert.deepEqual(result.parseErrors, []);
 });
 
 test("nested TSX expressions return to code for later imports and JSX", () => {

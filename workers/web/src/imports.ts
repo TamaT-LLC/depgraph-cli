@@ -211,6 +211,19 @@ function nextCodePointOffset(source: string, offset: number): number {
   return Math.min(source.length, offset + (codePoint !== undefined && codePoint > 0xffff ? 2 : 1));
 }
 
+function jsxClosingTagSearchSource(source: string, offset: number, tagEnd: number): string {
+  const previous = source.slice(0, offset);
+  const following = source.slice(tagEnd + 1);
+  // A type argument list in a call or declaration has an identifier-like
+  // expression immediately before `<` and an opening parenthesis after `>`
+  // (`read<T>({})`, `function read<T>()`). JSX can legitimately begin with
+  // parenthesized text (`<T>(text)</T>`), so require both sides of this
+  // generic boundary before suppressing the closing-tag search.
+  if (!/[$_\p{ID_Continue}\)\]\.\?]$/u.test(previous)) return following;
+  if (!/^\s*\(/u.test(following)) return following;
+  return "";
+}
+
 function looksLikeJsxElementStart(source: string, offset: number): boolean {
   const match = source.slice(offset).match(/^<([$_\p{ID_Start}][$_\p{ID_Continue}.:-]*|>)/u);
   if (!match?.[1]) return false;
@@ -218,7 +231,16 @@ function looksLikeJsxElementStart(source: string, offset: number): boolean {
   const tagEnd = source.indexOf(">", offset + match[0].length);
   if (tagEnd < 0) return false;
   if (/\/\s*$/u.test(source.slice(offset, tagEnd))) return true;
-  return source.indexOf(`</${match[1]}`, tagEnd + 1) >= 0;
+  // A generic type argument such as `<T>` can precede a JSX component whose
+  // name starts with the same character (`<Text>...</Text>`). A prefix-only
+  // search would treat the latter closing tag as `</T>` and switch the scanner
+  // into JSX mode before it reaches the actual component. Require the complete
+  // closing tag name and its delimiter instead. A type argument list in a
+  // call or declaration is followed by an opening parenthesis
+  // (`read<T>({})`, `function read<T>()`), so exclude that boundary in the
+  // same bounded search, even when a same-name JSX closing tag appears later.
+  const escapedTagName = match[1].replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`</${escapedTagName}\\s*>`, "u").test(jsxClosingTagSearchSource(source, offset, tagEnd));
 }
 
 function looksLikeJsxClosingElement(source: string, offset: number): boolean {
@@ -571,6 +593,10 @@ function typescriptParseDiagnostics(tokens: Token[], source: string, relativePat
       continue;
     }
     if (token.kind === SyntaxKind.ConstKeyword || token.kind === SyntaxKind.LetKeyword || token.kind === SyntaxKind.VarKeyword) {
+      // TypeScript 7's standalone scanner represents the `const` in `as
+      // const` as a ConstKeyword. It is the assertion type, not a variable
+      // declaration, so do not apply declaration validation to it.
+      if (token.kind === SyntaxKind.ConstKeyword && tokens[index - 1]?.kind === SyntaxKind.AsKeyword) continue;
       const declaration = tokens[index + 1];
       if (token.kind === SyntaxKind.ConstKeyword && declaration?.kind === SyntaxKind.EnumKeyword) continue;
       const identifierLike = declaration !== undefined && /^[$_\p{ID_Start}][$_\p{ID_Continue}]*$/u.test(declaration.text);

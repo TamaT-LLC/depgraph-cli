@@ -330,6 +330,18 @@ function isWorkspacePath(relative: string, patterns: string[]): boolean {
   return included;
 }
 
+interface WorkspaceRule {
+  root: string;
+  patterns: string[];
+}
+
+function isWorkspacePackagePath(relative: string, rules: readonly WorkspaceRule[]): boolean {
+  return rules.some((rule) => {
+    const local = normalizeRelative(path.relative(rule.root, relative));
+    return local === "." || isWorkspacePath(local, rule.patterns);
+  });
+}
+
 function normalizeRemote(value: string): string {
   const trimmed = value.trim().replace(/\.git$/u, "");
   const scp = trimmed.match(/^(?:[^@]+@)?([^:]+):(.+)$/u);
@@ -617,7 +629,44 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
   const rootManifest = rootLoad.manifest;
   if (rootLoad.issue) issues.push(rootLoad.issue);
   const pnpmSource = await readUtf8(root, path.join(root, "pnpm-workspace.yaml"));
-  const patterns = workspacePatterns(rootManifest, pnpmSource);
+  const manifestCandidates = allFiles
+    .filter((file) => path.basename(file) === "package.json")
+    .map((file) => ({ file, relative: normalizeRelative(path.relative(root, path.dirname(file))) }));
+  const manifestLoads = new Map<string, Awaited<ReturnType<typeof loadManifest>>>();
+  manifestLoads.set(".", rootLoad);
+  for (const candidate of manifestCandidates) {
+    if (candidate.relative === ".") continue;
+    manifestLoads.set(candidate.relative, await loadManifest(root, candidate.file));
+  }
+  // A repository can contain a package manager workspace below the scan root.
+  // Keep each rule relative to the directory which declares it so nested
+  // package globs are not accidentally interpreted from the repository root.
+  const workspaceRootPaths = new Set<string>(["."]);
+  for (const file of allFiles) {
+    if (path.basename(file) !== "pnpm-workspace.yaml") continue;
+    workspaceRootPaths.add(normalizeRelative(path.relative(root, path.dirname(file))));
+  }
+  for (const candidate of manifestCandidates) {
+    const manifest = manifestLoads.get(candidate.relative)?.manifest;
+    const yamlPath = candidate.relative === "."
+      ? "pnpm-workspace.yaml"
+      : normalizeRelative(path.join(candidate.relative, "pnpm-workspace.yaml"));
+    if (manifest !== null && manifest !== undefined && (
+      Object.hasOwn(manifest, "workspaces")
+      || relativeFiles.has(yamlPath)
+    )) workspaceRootPaths.add(candidate.relative);
+  }
+  const workspaceRules: WorkspaceRule[] = [];
+  for (const workspaceRoot of [...workspaceRootPaths].sort(compareUtf8)) {
+    const manifest = manifestLoads.get(workspaceRoot)?.manifest ?? null;
+    const yamlPath = workspaceRoot === "."
+      ? "pnpm-workspace.yaml"
+      : normalizeRelative(path.join(workspaceRoot, "pnpm-workspace.yaml"));
+    const yaml = workspaceRoot === "." ? pnpmSource : relativeFiles.has(yamlPath)
+      ? await readUtf8(root, path.join(root, ...yamlPath.split("/")))
+      : null;
+    workspaceRules.push({ root: workspaceRoot, patterns: workspacePatterns(manifest, yaml) });
+  }
   const repository = await repositoryIdentity(root, rootManifest, allFiles);
   const { manager, lockfile, ambiguousLockfiles } = detectManager(rootManifest, relativeFiles);
   for (const ambiguous of ambiguousLockfiles) {
@@ -675,20 +724,14 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
       for (const [name, instances] of pnpLoad.instances) lockInstances.set(name, instances);
     }
   }
-  const manifestCandidates = allFiles
-    .filter((file) => path.basename(file) === "package.json")
-    .map((file) => ({ file, relative: normalizeRelative(path.relative(root, path.dirname(file))) }));
-  const manifests = manifestCandidates.filter(({ relative }) => isWorkspacePath(relative, patterns));
+  const manifests = manifestCandidates.filter(({ relative }) => isWorkspacePackagePath(relative, workspaceRules));
   const ignoredManifestPaths = manifestCandidates
-    .filter(({ relative }) => !isWorkspacePath(relative, patterns))
+    .filter(({ relative }) => !isWorkspacePackagePath(relative, workspaceRules))
     .map(({ file }) => normalizeRelative(path.relative(root, file)))
     .sort();
-  if (rootManifest && !manifests.some(({ relative }) => relative === ".")) {
-    manifests.unshift({ file: path.join(root, "package.json"), relative: "." });
-  }
   const packages: PackageRecord[] = [];
   for (const { file, relative } of manifests.sort((left, right) => compareUtf8(left.relative, right.relative))) {
-    const loaded = relative === "." ? { manifest: rootManifest } : await loadManifest(root, file);
+    const loaded = manifestLoads.get(relative) ?? await loadManifest(root, file);
     if (loaded.issue) issues.push(loaded.issue);
     const manifest = loaded.manifest;
     if (!manifest) continue;

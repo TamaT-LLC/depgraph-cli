@@ -121,6 +121,16 @@ import type {
 
 const MAX_CLOSED_CALL_FLOW_DEPTH = 64;
 
+class DependencyAstLimitError extends Error {
+  readonly reason: "depth" | "nodes";
+
+  constructor(reason: "depth" | "nodes", message: string) {
+    super(message);
+    this.name = "DependencyAstLimitError";
+    this.reason = reason;
+  }
+}
+
 interface DefinitionIndex {
   definitions: ReadonlyMap<string, TypeScriptRawDefinition>;
   byDeclaration: ReadonlyMap<string, readonly string[]>;
@@ -1276,9 +1286,13 @@ async function prepopulateBindingSymbols(
   };
   let visited = 0;
   const visit = async (node: Node, depth: number): Promise<void> => {
-    if (depth > MAX_AST_DEPTH) throw new DependencyContractError("dependency AST depth limit exceeded");
+    if (depth > MAX_AST_DEPTH) {
+      throw new DependencyAstLimitError("depth", `dependency AST depth ${MAX_AST_DEPTH} exceeded`);
+    }
     visited += 1;
-    if (visited > MAX_AST_NODES) throw new DependencyContractError("dependency AST node limit exceeded");
+    if (visited > MAX_AST_NODES) {
+      throw new DependencyAstLimitError("nodes", `dependency AST node limit ${MAX_AST_NODES} exceeded`);
+    }
     if (node.kind === SyntaxKind.ImportDeclaration) {
       const declaration = node as ImportDeclaration;
       const moduleSpecifier = stringLiteralText(declaration.moduleSpecifier);
@@ -3107,6 +3121,15 @@ async function collectTypeReference(
     "TypeChecker named type reference occurrence", true, publicProvenance)];
 }
 
+function isConstAssertionTypeReference(node: TypeReferenceNode): boolean {
+  // TypeScript 7 models the `const` in `value as const` as a TypeReference
+  // child of the AsExpression. It is a literal assertion marker, not a named
+  // type dependency. Keep real `as SomeType` references unchanged.
+  return node.parent?.kind === SyntaxKind.AsExpression
+    && node.typeName.kind === SyntaxKind.Identifier
+    && (node.typeName as Identifier).text === "const";
+}
+
 function collectInvalidOccurrences(node: Node, context: CollectionContext): TypeScriptRawDependencySite[] {
   const hasEvidenceSpan = (candidate: Node): boolean => (
     nodeEnd(candidate, context.source.sourceFile) > nodeStart(candidate, context.source.sourceFile)
@@ -3392,7 +3415,9 @@ function collectInvalidOccurrences(node: Node, context: CollectionContext): Type
     return result;
   }
   if (node.kind === SyntaxKind.TypeReference) {
-    const terminal = terminalIdentifier((node as TypeReferenceNode).typeName);
+    const typeReference = node as TypeReferenceNode;
+    if (isConstAssertionTypeReference(typeReference)) return [];
+    const terminal = terminalIdentifier(typeReference.typeName);
     return terminal === null || nodeEnd(terminal, context.source.sourceFile) <= nodeStart(terminal, context.source.sourceFile)
       ? []
       : [unresolved("type_use", "type_uses", "type_reference", terminal, terminal.text)];
@@ -3549,14 +3574,19 @@ export async function extractTypeScriptRawDependencyDelta(
     typeUses: new Map<string, TypeScriptTypeUseValidationSpan>(),
     calls: new Map<string, TypeScriptCallValidationSpan>(),
   }]));
-  let astNodes = 0;
   try {
     const index = definitionIndex(definitions);
     const sourcesByPath = sourcePathMap(sources);
-    const consumeAstNode = (depth: number): void => {
-      if (depth > MAX_AST_DEPTH) throw new DependencyContractError(`dependency AST depth ${MAX_AST_DEPTH} exceeded`);
-      astNodes += 1;
-      if (astNodes > MAX_AST_NODES) throw new DependencyContractError(`dependency AST node limit ${MAX_AST_NODES} exceeded`);
+    const astNodesBySource = new Map<string, number>();
+    const consumeAstNode = (depth: number, relativePath: string): void => {
+      if (depth > MAX_AST_DEPTH) {
+        throw new DependencyAstLimitError("depth", `dependency AST depth ${MAX_AST_DEPTH} exceeded`);
+      }
+      const astNodes = (astNodesBySource.get(relativePath) ?? 0) + 1;
+      astNodesBySource.set(relativePath, astNodes);
+      if (astNodes > MAX_AST_NODES) {
+        throw new DependencyAstLimitError("nodes", `dependency AST node limit ${MAX_AST_NODES} exceeded`);
+      }
     };
     const collectValidation = async (node: Node, context: CollectionContext): Promise<void> => {
       const validation = validationByPath.get(context.source.relativePath);
@@ -3715,7 +3745,10 @@ export async function extractTypeScriptRawDependencyDelta(
         }
 
         if (node.kind === SyntaxKind.TypeReference) {
-          await addTypeUse((node as TypeReferenceNode).typeName, "type_reference");
+          const typeReference = node as TypeReferenceNode;
+          if (!isConstAssertionTypeReference(typeReference)) {
+            await addTypeUse(typeReference.typeName, "type_reference");
+          }
         } else if (node.kind === SyntaxKind.TypeQuery) {
           await addTypeUse((node as TypeQueryNode).exprName, "type_reference");
         } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
@@ -3765,7 +3798,7 @@ export async function extractTypeScriptRawDependencyDelta(
       }
     };
     const visitDetachedJSDoc = async (node: Node, context: CollectionContext, depth: number): Promise<void> => {
-      consumeAstNode(depth);
+      consumeAstNode(depth, context.source.relativePath);
       await collectValidation(node, context);
       if (node.kind === SyntaxKind.JSDocImportTag) {
         if (context.syntacticallyValid) {
@@ -3783,7 +3816,7 @@ export async function extractTypeScriptRawDependencyDelta(
       for (const child of children.values()) await visitDetachedJSDoc(child, context, depth + 1);
     };
     const visit = async (node: Node, context: CollectionContext, depth: number): Promise<void> => {
-      consumeAstNode(depth);
+      consumeAstNode(depth, context.source.relativePath);
       await collectValidation(node, context);
       const semanticOwner = context.syntacticallyValid ? ownerAtNode(index, context.source, node) : null;
       const childContext = semanticOwner === null ? context : { ...context, owner: semanticOwner };
@@ -3834,7 +3867,10 @@ export async function extractTypeScriptRawDependencyDelta(
       } else if (node.kind === SyntaxKind.ImportType) {
         sites.push(...await collectImportType(node as ImportTypeNode, childContext, checker, counter, index, sourcesByPath));
       } else if (node.kind === SyntaxKind.TypeReference) {
-        sites.push(...await collectTypeReference((node as TypeReferenceNode).typeName, "type_reference", childContext, checker, counter, index, sourcesByPath));
+        const typeReference = node as TypeReferenceNode;
+        if (!isConstAssertionTypeReference(typeReference)) {
+          sites.push(...await collectTypeReference(typeReference.typeName, "type_reference", childContext, checker, counter, index, sourcesByPath));
+        }
       } else if (node.kind === SyntaxKind.TypeQuery) {
         sites.push(...await collectTypeReference((node as TypeQueryNode).exprName, "type_reference", childContext, checker, counter, index, sourcesByPath));
       } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
@@ -3866,23 +3902,52 @@ export async function extractTypeScriptRawDependencyDelta(
 
     for (const source of [...sources].sort((left, right) => compareStrings(left.relativePath, right.relativePath))) {
       const externalBindings = new BindingProvenanceMap();
-      if (source.syntacticallyValid) {
-        await prepopulateBindingSymbols(source.sourceFile, checker, counter, externalBindings);
+      const validation = validationByPath.get(source.relativePath);
+      if (validation === undefined) {
+        throw new DependencyContractError(`dependency validation source disappeared for ${source.relativePath}`);
       }
-      await visit(source.sourceFile, {
-        source,
-        owner: { kind: "file", relativePath: source.relativePath },
-        syntacticallyValid: source.syntacticallyValid,
-        externalBindings,
-        bindingProvenance: source.syntacticallyValid
-          ? sourceBindingProvenance(source.sourceFile)
-          : new Map<string, BindingProvenance>(),
-        freshReceiverProof: {
-          identifierIndex: null,
-          indexFailed: false,
-          useProofs: new Map<string, boolean>(),
-        },
-      }, 0);
+      const siteStart = sites.length;
+      const callStart = calls.length;
+      try {
+        if (source.syntacticallyValid) {
+          await prepopulateBindingSymbols(source.sourceFile, checker, counter, externalBindings);
+        }
+        await visit(source.sourceFile, {
+          source,
+          owner: { kind: "file", relativePath: source.relativePath },
+          syntacticallyValid: source.syntacticallyValid,
+          externalBindings,
+          bindingProvenance: source.syntacticallyValid
+            ? sourceBindingProvenance(source.sourceFile)
+            : new Map<string, BindingProvenance>(),
+          freshReceiverProof: {
+            identifierIndex: null,
+            indexFailed: false,
+            useProofs: new Map<string, boolean>(),
+          },
+        }, 0);
+      } catch (error) {
+        if (!(error instanceof DependencyAstLimitError)) throw error;
+        // A bounded source is discarded atomically. Its partially collected
+        // sites and validation spans cannot be correlated safely, while the
+        // remaining sources continue in the same compiler context.
+        sites.length = siteStart;
+        calls.length = callStart;
+        validation.visited.clear();
+        validation.importTypeModules.clear();
+        validation.moduleCalls.clear();
+        validation.nonLiteralModules.clear();
+        validation.typeUses.clear();
+        validation.calls.clear();
+        issues.push({
+          code: error.reason === "depth"
+            ? "typescript_semantic_dependency_ast_depth_exceeded"
+            : "typescript_semantic_dependency_ast_limit_exceeded",
+          message: error.message,
+          relativePath: source.relativePath,
+          fatal: false,
+        });
+      }
     }
     if (sites.length + calls.length > MAX_SITES) throw new DependencyContractError(`dependency site limit ${MAX_SITES} exceeded`);
     const occurrences = new Map<string, TypeScriptRawDependencySite>();

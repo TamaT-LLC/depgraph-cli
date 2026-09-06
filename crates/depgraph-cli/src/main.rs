@@ -2047,7 +2047,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     )
                 };
                 let (service, mut snapshot) =
-                    graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                    health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
                 let result = service.health_summary(
                     &mut snapshot,
                     &HealthSummaryRequest::try_new(kinds)?,
@@ -2094,7 +2094,7 @@ async fn run(cli: Cli) -> Result<u8> {
             ),
             Some(HealthNested::Show { finding_id, json }) => {
                 let (service, mut snapshot) =
-                    graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                    health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
                 let result = service.health_finding_get(
                     &mut snapshot,
                     &HealthFindingGetRequest::try_new(finding_id)?,
@@ -2140,7 +2140,7 @@ async fn run(cli: Cli) -> Result<u8> {
             output,
         } => {
             let (service, mut snapshot) =
-                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
             let scope = service.start_health_audit_scope(
                 &mut snapshot,
                 &HealthAuditRequest::try_new(changed, base_snapshot)?,
@@ -2202,7 +2202,7 @@ async fn run(cli: Cli) -> Result<u8> {
             )
             .map_err(|_| DepgraphServiceError::InvalidInput)?;
             let (service, mut snapshot) =
-                graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+                health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
             let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?;
             let result =
                 service.health_hotspots(&mut snapshot, &request, &CancellationToken::new())?;
@@ -2595,15 +2595,47 @@ fn graph_snapshot_request(
     explicit_store: Option<PathBuf>,
     requested_scan_id: Option<&str>,
 ) -> Result<(DepgraphService, SnapshotReadRequest)> {
-    let root = std::env::current_dir()?;
-    let store_path = store_path(explicit_store, &root)?;
-    let service = snapshot_read_service(&root, &store_path)?;
+    snapshot_request(explicit_store, requested_scan_id, false)
+}
+
+fn health_snapshot_request(
+    explicit_store: Option<PathBuf>,
+    requested_scan_id: Option<&str>,
+) -> Result<(DepgraphService, SnapshotReadRequest)> {
+    snapshot_request(explicit_store, requested_scan_id, true)
+}
+
+fn snapshot_request(
+    explicit_store: Option<PathBuf>,
+    requested_scan_id: Option<&str>,
+    bind_repository_root: bool,
+) -> Result<(DepgraphService, SnapshotReadRequest)> {
+    let invocation_root = canonical_directory(std::env::current_dir()?)?;
+    let store_path = store_path(explicit_store, &invocation_root)?;
+    // Resolve the snapshot before constructing the service used by the query.
+    // A caller may intentionally point --store at a repository other than the
+    // current working directory; health analyzers must read manifests, policy,
+    // and Git state from the repository recorded by that snapshot.
+    let bootstrap_service = snapshot_read_service(&invocation_root, &store_path)?;
     let cancellation = CancellationToken::new();
-    let request = match requested_scan_id {
-        Some(scan_id) => service.start_snapshot_request_for_scan(scan_id, &cancellation)?,
-        None => service
+    let mut request = match requested_scan_id {
+        Some(scan_id) => {
+            bootstrap_service.start_snapshot_request_for_scan(scan_id, &cancellation)?
+        }
+        None => bootstrap_service
             .start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?,
     };
+
+    if !bind_repository_root {
+        return Ok((bootstrap_service, request));
+    }
+    let scan_id = request.scan_id().to_owned();
+    let snapshot_scan = request
+        .store()
+        .scan(&scan_id)?
+        .with_context(|| format!("scan {scan_id} was not found in the selected store"))?;
+    let repository_root = canonical_directory(PathBuf::from(snapshot_scan.root))?;
+    let service = snapshot_read_service(&repository_root, &store_path)?;
     Ok((service, request))
 }
 
@@ -2626,7 +2658,7 @@ fn run_health_findings(
         .map_err(|_| DepgraphServiceError::InvalidInput)?;
     let confidences = health_render::parse_confidences(confidence)
         .map_err(|_| DepgraphServiceError::InvalidInput)?;
-    let (service, mut snapshot) = graph_snapshot_request(store, scan_id)?;
+    let (service, mut snapshot) = health_snapshot_request(store, scan_id)?;
     let request =
         HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?;
     let result = service.health_findings(&mut snapshot, &request, &CancellationToken::new())?;
