@@ -1,5 +1,6 @@
 import path from "node:path";
 import { stableId } from "./ids";
+import { objectValue, stringValue } from "./semantic-validation-utils";
 import { compareUtf8, type GraphEdge, type GraphNode, type JsonValue } from "./types";
 
 const DEFINITION_RELATIONS = new Set(["declares", "extends", "implements", "instantiates"]);
@@ -15,18 +16,8 @@ export interface TypeScriptDefinitionDelta {
 export interface TypeScriptDefinitionDeltaOptions {
   profileId: string;
   compilerVersion: string;
-}
-
-function objectValue(value: JsonValue | undefined, field: string): Record<string, JsonValue> {
-  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${field} must be an object`);
-  }
-  return value;
-}
-
-function stringValue(value: JsonValue | undefined, field: string): string {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`${field} must be a non-empty string`);
-  return value;
+  /** Optional logical identity used for IDs shared by source chunks. */
+  identityProfileId?: string;
 }
 
 function resolverValue(value: JsonValue | undefined, field: string): string {
@@ -172,7 +163,7 @@ function validateSemanticEdge(
   const expected = stableId("edge", {
     condition: edge.condition,
     kind: edge.kind,
-    profile_id: edge.profile_id,
+    profile_id: options.identityProfileId ?? edge.profile_id,
     source: edge.source,
     target: edge.target,
     path: primary.path,

@@ -65,6 +65,8 @@ pub enum ContractValueError {
     PolicyApiChangeId,
     #[error("SHA-256 digest is outside the closed contract")]
     Sha256Digest,
+    #[error("analysis input digest is outside the closed contract")]
+    AnalysisInputDigest,
     #[error("Agent graph export content is outside the closed contract")]
     AgentGraphExportContent,
 }
@@ -451,6 +453,16 @@ string_newtype!(
 );
 
 string_newtype!(
+    AnalysisInputDigest,
+    ContractValueError::AnalysisInputDigest,
+    valid_analysis_input_digest,
+    json_schema!({
+        "type": "string",
+        "pattern": r"^sha256:[0-9a-f]{64}$"
+    })
+);
+
+string_newtype!(
     AgentGraphExportContent,
     ContractValueError::AgentGraphExportContent,
     valid_agent_graph_export_content,
@@ -553,9 +565,9 @@ impl TryFrom<CoreSnapshotLocator> for SnapshotName {
     fn try_from(locator: CoreSnapshotLocator) -> Result<Self, Self::Error> {
         match locator {
             CoreSnapshotLocator::Name(name) => Self::parse(name),
-            CoreSnapshotLocator::Current | CoreSnapshotLocator::StableId(_) => {
-                Err(ContractValueError::SnapshotName)
-            }
+            CoreSnapshotLocator::Current
+            | CoreSnapshotLocator::StableId(_)
+            | CoreSnapshotLocator::Attempt(_) => Err(ContractValueError::SnapshotName),
         }
     }
 }
@@ -566,9 +578,9 @@ impl TryFrom<CoreSnapshotLocator> for SnapshotId {
     fn try_from(locator: CoreSnapshotLocator) -> Result<Self, Self::Error> {
         match locator {
             CoreSnapshotLocator::StableId(snapshot_id) => Self::parse(snapshot_id),
-            CoreSnapshotLocator::Current | CoreSnapshotLocator::Name(_) => {
-                Err(ContractValueError::SnapshotId)
-            }
+            CoreSnapshotLocator::Current
+            | CoreSnapshotLocator::Name(_)
+            | CoreSnapshotLocator::Attempt(_) => Err(ContractValueError::SnapshotId),
         }
     }
 }
@@ -763,6 +775,12 @@ fn valid_sha256_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_analysis_input_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(valid_sha256_digest)
 }
 
 fn valid_agent_graph_export_content(value: &str) -> bool {

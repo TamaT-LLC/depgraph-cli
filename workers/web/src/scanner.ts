@@ -52,10 +52,13 @@ import {
 import {
   ADAPTER_VERSION,
   aggregateConditions,
+  BASE_PROFILE_ID,
   canonicalizeCondition,
   compareUtf8,
+  LOGICAL_PROFILE_ID,
   PROFILE_CONFIG_ISSUE,
   PROFILE_ID,
+  setActiveProfileIds,
   WEB_CONDITION,
   WEB_UNIVERSAL_ENVIRONMENT,
   preferredWebEnvironment,
@@ -78,6 +81,12 @@ import {
   type PackageRecord,
   type Workspace,
 } from "./workspace";
+import {
+  analysisUnitLogicalProfileId,
+  analysisUnitProfileId,
+  type AnalysisUnitStage,
+  type AnalysisUnitRequest,
+} from "./analysis-unit";
 
 const PARSED_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".astro"]);
 const SOURCE_READ_CONCURRENCY = 64;
@@ -87,6 +96,12 @@ const MAX_SEMANTIC_TYPE_DESCRIPTOR_NODES = 2_048;
 const MAX_SEMANTIC_RESOLVER_CHARS = 4_096;
 const MAX_SEMANTIC_TYPE_DESCRIPTOR_CHARS = 2_048;
 const MAX_TYPESCRIPT_REFINEMENT_TARGETS_PER_SITE = 4_096;
+/**
+ * Bound the number of SourceFile objects requested from the native compiler
+ * for one source batch. The Program itself still has the complete context;
+ * this cap only protects the JS-side AST transfer/retention boundary.
+ */
+const MAX_TYPESCRIPT_AST_SOURCE_FILES = 4_096;
 
 type SourceSpan = {
   start_line: number;
@@ -465,7 +480,7 @@ class GraphBuilder {
       const id = stableId("edge", {
         condition: WEB_CONDITION,
         kind: relation.kind,
-        profile_id: PROFILE_ID,
+        profile_id: LOGICAL_PROFILE_ID,
         source: source.id,
         target: target.id,
         path: evidence.path,
@@ -556,7 +571,7 @@ class GraphBuilder {
         id: stableId("edge", {
           condition: WEB_CONDITION,
           kind: "declares",
-          profile_id: PROFILE_ID,
+          profile_id: LOGICAL_PROFILE_ID,
           source: file.id,
           target: id,
           path: relativePath,
@@ -582,6 +597,7 @@ class GraphBuilder {
     const merged = mergeTypeScriptDefinitionDelta(this.nodes, this.edges, delta, {
       profileId: PROFILE_ID,
       compilerVersion: TYPESCRIPT_COMPILER_VERSION,
+      identityProfileId: LOGICAL_PROFILE_ID,
     });
     const nextNodes = new Map(merged.nodes);
     const nextSites = new Map(this.sites);
@@ -590,7 +606,7 @@ class GraphBuilder {
     const unknownTarget = (): GraphNode => ({
       id: stableId("unknown", {
         repository: this.#workspace.repositoryIdentity,
-        profile: PROFILE_ID,
+        profile: LOGICAL_PROFILE_ID,
         language: "web",
         identity: "unresolved_dependency_target",
       }),
@@ -768,7 +784,7 @@ class GraphBuilder {
       const siteId = stableId("site", {
         source: source.id,
         kind: raw.kind,
-        profile_id: PROFILE_ID,
+        profile_id: LOGICAL_PROFILE_ID,
         condition: raw.condition,
         path: primary.path,
         span,
@@ -944,7 +960,7 @@ class GraphBuilder {
       const siteId = stableId("site", {
         source: source.id,
         kind: "call",
-        profile_id: PROFILE_ID,
+        profile_id: LOGICAL_PROFILE_ID,
         condition: raw.condition,
         path: primary.path,
         span,
@@ -1042,7 +1058,11 @@ class GraphBuilder {
       this.sites,
       this.edges,
       delta,
-      { profileId: PROFILE_ID, capability: WEB_FRAMEWORK_SEMANTIC_CAPABILITY },
+      {
+        profileId: PROFILE_ID,
+        identityProfileId: LOGICAL_PROFILE_ID,
+        capability: WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
+      },
     );
     const nextFiles = new Map([...this.files].map(([relativePath, coverage]) => [relativePath, { ...coverage }]));
     for (const site of delta.sites) {
@@ -1068,7 +1088,7 @@ class GraphBuilder {
       code: diagnostic.code,
       message: diagnostic.message,
       path: diagnostic.path,
-      profile: diagnostic.profile_id,
+      profile: diagnostic.profile_id === PROFILE_ID ? LOGICAL_PROFILE_ID : diagnostic.profile_id,
       evidence: (diagnostic.evidence ?? []).map((evidence) => ({
         kind: evidence.kind,
         extractor: evidence.extractor,
@@ -1095,7 +1115,7 @@ class GraphBuilder {
       workspace: owner.relativePath,
       package: owner.locator,
       path: relative,
-      profile: PROFILE_ID,
+      profile: BASE_PROFILE_ID,
       language: "web",
     });
     const node: GraphNode = {
@@ -1121,7 +1141,7 @@ class GraphBuilder {
     return this.addNode({
       id: stableId("unknown", {
         repository: this.#workspace.repositoryIdentity,
-        profile: PROFILE_ID,
+        profile: LOGICAL_PROFILE_ID,
         language: "web",
         identity: "unresolved_dependency_target",
       }),
@@ -1136,9 +1156,9 @@ class GraphBuilder {
     if (target.kind === "file") return this.fileNode(target.absolutePath);
     if (target.kind === "workspace_package") return this.nodes.get(target.package.id) ?? this.addPackageNode(target.package);
     const id = stableId("package", {
-      manager: this.#workspace.manager,
+      manager: target.locator.split(":", 1)[0] ?? this.#workspace.manager,
       locator: target.locator,
-      profile: PROFILE_ID,
+      profile: LOGICAL_PROFILE_ID,
       language: "web",
     });
     return this.addNode({
@@ -1149,7 +1169,7 @@ class GraphBuilder {
       properties: {
         name: target.name,
         version: target.version,
-        package_manager: this.#workspace.manager,
+        package_manager: target.locator.split(":", 1)[0] ?? this.#workspace.manager,
         locator: target.locator,
         workspace: false,
         external: true,
@@ -1163,7 +1183,7 @@ class GraphBuilder {
       kind: "package_instance",
       locator: `package://${record.locator}`,
       display_name: record.name,
-      properties: packageProperties(record, this.#workspace.manager),
+      properties: packageProperties(record, record.manager),
     });
   }
 
@@ -1177,7 +1197,7 @@ class GraphBuilder {
       router_instance: owner.id,
       pattern: entry.pattern,
       environment,
-      profile: PROFILE_ID,
+      profile: LOGICAL_PROFILE_ID,
     });
     return this.addNode({
       id,
@@ -1200,7 +1220,7 @@ class GraphBuilder {
       source: source.id,
       target: target.id,
       kind,
-      profile: PROFILE_ID,
+      profile: LOGICAL_PROFILE_ID,
       site: null,
     });
     this.addEdge({
@@ -1238,7 +1258,7 @@ class GraphBuilder {
       source: source.id,
       kind: raw.kind,
       specifier: raw.specifier,
-      profile: PROFILE_ID,
+      profile: LOGICAL_PROFILE_ID,
       path: raw.evidence.path,
       start_line: raw.evidence.start_line,
       start_column: raw.evidence.start_column,
@@ -1262,7 +1282,7 @@ class GraphBuilder {
         source: source.id,
         target: target.node.id,
         kind: raw.edgeKind,
-        profile: PROFILE_ID,
+        profile: LOGICAL_PROFILE_ID,
         site: siteId,
       });
       this.addEdge({
@@ -1749,7 +1769,7 @@ function metadataFiles(allFiles: string[], root: string): string[] {
     .filter((file) => {
       const name = path.basename(file);
       return name === "package.json"
-        || /^(?:pnpm-workspace\.yaml|pnpm-lock\.yaml|yarn\.lock|bun\.lock|bun\.lockb|package-lock\.json|npm-shrinkwrap\.json|\.pnp\.data\.json|\.pnp\.cjs)$/u.test(name)
+        || /^(?:pnpm-workspace\.(?:yaml|yml)|pnpm-lock\.yaml|yarn\.lock|bun\.lock|bun\.lockb|package-lock\.json|npm-shrinkwrap\.json|\.pnp\.data\.json|\.pnp\.cjs)$/u.test(name)
         || /^(?:tsconfig|jsconfig)(?:\.[^.]+)*\.json$/u.test(name)
         || /^(?:next|astro|vite|tanstack|router|webpack|rollup)\.config\.(?:js|jsx|ts|tsx|mjs|cjs)$/u.test(name);
     })
@@ -1764,25 +1784,842 @@ function configFiles(allFiles: string[], root: string): string[] {
     .sort();
 }
 
-async function localTypeScriptVersion(workspace: Workspace): Promise<Array<{ package: PackageRecord; version: string; source: string }>> {
-  const result: Array<{ package: PackageRecord; version: string; source: string }> = [];
-  for (const record of workspace.packages) {
-    const manifest = await readJson(workspace.root, path.join(record.absolutePath, "node_modules", "typescript", "package.json"));
-    if (typeof manifest?.version === "string") result.push({ package: record, version: manifest.version, source: "installed package manifest" });
-    const declaration = record.dependencies.get("typescript");
-    if (!declaration) continue;
-    const locked = workspace.lockInstances.get("typescript") ?? [];
-    if (locked.length > 0) {
-      for (const version of [...new Set(locked.map((instance) => instance.version))]) {
-        result.push({ package: record, version, source: workspace.lockfile ?? "lockfile" });
-      }
-    } else {
-      result.push({ package: record, version: declaration.range, source: `${record.manifestPath} ${declaration.section}` });
-    }
+function modelNodePath(node: GraphNode): string | null {
+  const sourcePath = node.properties.source_path;
+  if (typeof sourcePath === "string") return sourcePath;
+  const filePath = node.properties.path;
+  if (typeof filePath === "string") return filePath;
+  return null;
+}
+
+function coverageStatistics(
+  files: readonly FileCoverage[],
+  sites: readonly DependencySite[],
+): {
+  counts: { resolved: number; candidates: number; external: number; unresolved: number };
+  unsupportedSyntax: number;
+  skipped: number;
+} {
+  const counts = { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
+  for (const site of sites) counts[site.resolution_status] += 1;
+  return {
+    counts,
+    unsupportedSyntax: files.reduce((sum, file) => sum + file.unsupported_syntax, 0),
+    skipped: files.reduce((sum, file) => sum + file.skipped_sites, 0),
+  };
+}
+
+function baseCoverage(
+  files: readonly FileCoverage[],
+  sites: readonly DependencySite[],
+  statistics: ReturnType<typeof coverageStatistics>,
+  projectCodeExecuted: boolean,
+) {
+  return {
+    profiles: 1,
+    files_discovered: files.length,
+    files_analyzed: files.filter((file) => file.skipped_sites === 0).length,
+    files_skipped: files.filter((file) => file.skipped_sites > 0).length,
+    dependency_sites: sites.length,
+    ...statistics.counts,
+    unsupported_syntax: statistics.unsupportedSyntax,
+    project_code_executed: projectCodeExecuted,
+  };
+}
+
+/**
+ * Project a complete repository scan onto one unit/chunk. Compiler context is
+ * deliberately collected before this projection, so semantic targets from a
+ * sibling source remain available while ownership and coverage stay bounded
+ * to the requested batch.
+ */
+function hydrateAnalysisFileWitnesses(nodes: Iterable<GraphNode>, sources: ReadonlyMap<string, string>): void {
+  for (const node of nodes) {
+    if (node.kind !== "file") continue;
+    const sourcePath = node.properties.path as string;
+    const source = sources.get(sourcePath);
+    if (source === undefined) continue;
+    // Imported context files and their owning batch must attest the same
+    // bytes. Hashing an existing context source adds no AST or file coverage.
+    node.properties.content_hash = contentHash(source);
+    node.properties.analysis_hash = analysisContentHash(source, sourcePath);
   }
-  return result.filter((entry, index, entries) => entries.findIndex((candidate) => (
+}
+
+type AnalysisUnitSiteCounts = {
+  expected: number;
+  produced: number;
+  resolved: number;
+  candidates: number;
+  external: number;
+  unresolved: number;
+};
+
+type AnalysisUnitCoverageStatistics = ReturnType<typeof coverageStatistics>;
+
+interface AnalysisUnitProjectionRecords {
+  ownedPaths: ReadonlySet<string>;
+  nodes: GraphNode[];
+  sites: DependencySite[];
+  edges: GraphEdge[];
+}
+
+function analysisUnitSemanticEvidence(evidence: readonly Evidence[]): boolean {
+  return evidence.some((item) => item.kind === "semantic");
+}
+
+function analysisUnitEvidenceOwned(evidence: readonly Evidence[], ownedPaths: ReadonlySet<string>): boolean {
+  return evidence.some((item) => ownedPaths.has(item.path));
+}
+
+function analysisUnitStageSites(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  ownedPaths: ReadonlySet<string>,
+): DependencySite[] {
+  return model.sites.filter((site) => {
+    if (!analysisUnitEvidenceOwned(site.evidence, ownedPaths)) return false;
+    return request.stage === "semantic"
+      ? analysisUnitSemanticEvidence(site.evidence)
+      : !analysisUnitSemanticEvidence(site.evidence);
+  });
+}
+
+function analysisUnitStageEdges(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  ownedPaths: ReadonlySet<string>,
+  sites: readonly DependencySite[],
+): GraphEdge[] {
+  const retainedSiteIds = new Set(sites.map((site) => site.id));
+  return model.edges.filter((edge) => {
+    if (edge.kind === "contains") return analysisUnitEvidenceOwned(edge.evidence, ownedPaths);
+    if (edge.site_id !== null && retainedSiteIds.has(edge.site_id)) return true;
+    if (!analysisUnitEvidenceOwned(edge.evidence, ownedPaths)) return false;
+    return request.stage === "semantic" ? edge.phase === "semantic" : edge.phase !== "semantic";
+  });
+}
+
+function analysisUnitWorkspacePathIsOwned(workspacePath: unknown, ownedPaths: ReadonlySet<string>): boolean {
+  if (typeof workspacePath !== "string") return false;
+  if (workspacePath === ".") return true;
+  return [...ownedPaths].some((value) => value === workspacePath || value.startsWith(`${workspacePath}/`));
+}
+
+function analysisUnitFileNodeIsOwned(node: GraphNode, ownedPaths: ReadonlySet<string>): boolean {
+  const nodePath = modelNodePath(node);
+  return nodePath !== null && ownedPaths.has(nodePath);
+}
+
+type AnalysisUnitNodeOwnership = (node: GraphNode, ownedPaths: ReadonlySet<string>) => boolean;
+
+const ANALYSIS_UNIT_NODE_OWNERSHIP: Partial<Record<GraphNode["kind"], AnalysisUnitNodeOwnership>> = {
+  workspace: () => true,
+  package_instance: (node, ownedPaths) => analysisUnitWorkspacePathIsOwned(node.properties.workspace_path, ownedPaths),
+  file: analysisUnitFileNodeIsOwned,
+};
+
+function analysisUnitNodeIsOwned(node: GraphNode, ownedPaths: ReadonlySet<string>): boolean {
+  return ANALYSIS_UNIT_NODE_OWNERSHIP[node.kind]?.(node, ownedPaths) ?? false;
+}
+
+function analysisUnitOwnedNodeIds(model: ScanModel, ownedPaths: ReadonlySet<string>): Set<string> {
+  return new Set(model.nodes.filter((node) => analysisUnitNodeIsOwned(node, ownedPaths)).map((node) => node.id));
+}
+
+function addAnalysisUnitSiteEndpoints(retainedNodeIds: Set<string>, sites: readonly DependencySite[]): void {
+  for (const site of sites) {
+    retainedNodeIds.add(site.source);
+    for (const target of site.target_ids) retainedNodeIds.add(target);
+  }
+}
+
+function addAnalysisUnitEdgeEndpoints(retainedNodeIds: Set<string>, edges: readonly GraphEdge[]): void {
+  for (const edge of edges) {
+    retainedNodeIds.add(edge.source);
+    retainedNodeIds.add(edge.target);
+  }
+}
+
+function analysisUnitInitialNodeIds(
+  model: ScanModel,
+  ownedPaths: ReadonlySet<string>,
+  sites: readonly DependencySite[],
+  edges: readonly GraphEdge[],
+): Set<string> {
+  const retainedNodeIds = analysisUnitOwnedNodeIds(model, ownedPaths);
+  addAnalysisUnitSiteEndpoints(retainedNodeIds, sites);
+  addAnalysisUnitEdgeEndpoints(retainedNodeIds, edges);
+  return retainedNodeIds;
+}
+
+function analysisUnitContextSemanticNodeIds(
+  model: ScanModel,
+  retainedNodeIds: ReadonlySet<string>,
+  ownedPaths: ReadonlySet<string>,
+): Set<string> {
+  return new Set(
+    analysisUnitSemanticNodes(model, retainedNodeIds)
+      .filter((node) => {
+        const sourcePath = node.properties.source_path;
+        return typeof sourcePath === "string" && !ownedPaths.has(sourcePath);
+      })
+      .map((node) => node.id),
+  );
+}
+
+function analysisUnitSemanticNodes(model: ScanModel, retainedNodeIds: ReadonlySet<string>): GraphNode[] {
+  return model.nodes.filter((node) => retainedNodeIds.has(node.id) && (node.kind === "symbol" || node.kind === "type"));
+}
+
+function analysisUnitContextDefinitionEdges(model: ScanModel, contextSemanticNodeIds: ReadonlySet<string>): GraphEdge[] {
+  return model.edges.filter((edge) => (
+    edge.phase === "semantic"
+      && edge.kind === "declares"
+      && contextSemanticNodeIds.has(edge.target)
+  ));
+}
+
+function retainAnalysisUnitContextDefinitionWitnesses(
+  model: ScanModel,
+  retainedNodeIds: Set<string>,
+  ownedPaths: ReadonlySet<string>,
+): GraphEdge[] {
+  const contextSemanticNodeIds = analysisUnitContextSemanticNodeIds(model, retainedNodeIds, ownedPaths);
+  // The core validator requires every semantic definition to have its
+  // canonical `declares` owner relation. A context-only target therefore
+  // carries that relation with its context file, while dependency sites and
+  // contains edges still remain owned-scope-only.
+  const contextDefinitionEdges = analysisUnitContextDefinitionEdges(model, contextSemanticNodeIds);
+  for (const edge of contextDefinitionEdges) {
+    retainedNodeIds.add(edge.source);
+    retainedNodeIds.add(edge.target);
+  }
+  return contextDefinitionEdges;
+}
+
+function analysisUnitContextTargetPaths(
+  model: ScanModel,
+  retainedNodeIds: ReadonlySet<string>,
+  ownedPaths: ReadonlySet<string>,
+): Set<string> {
+  // A semantic symbol/type may resolve to a declaration in a context-only
+  // source file. Keep that file as a target witness so downstream protocol
+  // validation can verify its package and language ownership. It is not an
+  // owned file: no coverage or contains edge is projected for it below.
+  return new Set(
+    analysisUnitSemanticNodes(model, retainedNodeIds)
+      .map((node) => node.properties.source_path)
+      .filter((value): value is string => typeof value === "string" && !ownedPaths.has(value)),
+  );
+}
+
+function retainAnalysisUnitContextFileWitnesses(
+  model: ScanModel,
+  retainedNodeIds: Set<string>,
+  contextTargetPaths: ReadonlySet<string>,
+): void {
+  for (const node of model.nodes.filter((candidate) => candidate.kind === "file")) {
+    const filePath = node.properties.path;
+    if (typeof filePath === "string" && contextTargetPaths.has(filePath)) retainedNodeIds.add(node.id);
+  }
+}
+
+function retainAnalysisUnitPackageWitnesses(model: ScanModel, retainedNodeIds: Set<string>): void {
+  // Semantic definitions can be owned by a context-only workspace package.
+  // Keep that package instance as the target's ownership witness even when
+  // its manifest/source is outside this unit.
+  for (const node of model.nodes) {
+    if (!retainedNodeIds.has(node.id)) continue;
+    const packageId = node.properties.package_id;
+    if (typeof packageId === "string") retainedNodeIds.add(packageId);
+  }
+}
+
+function retainAnalysisUnitContextWitnesses(
+  model: ScanModel,
+  retainedNodeIds: Set<string>,
+  ownedPaths: ReadonlySet<string>,
+): GraphEdge[] {
+  const contextDefinitionEdges = retainAnalysisUnitContextDefinitionWitnesses(model, retainedNodeIds, ownedPaths);
+  const contextTargetPaths = analysisUnitContextTargetPaths(model, retainedNodeIds, ownedPaths);
+  retainAnalysisUnitContextFileWitnesses(model, retainedNodeIds, contextTargetPaths);
+  retainAnalysisUnitPackageWitnesses(model, retainedNodeIds);
+  return contextDefinitionEdges;
+}
+
+function projectAnalysisUnitRecords(model: ScanModel, request: AnalysisUnitRequest): AnalysisUnitProjectionRecords {
+  const ownedPaths = new Set([...request.source_paths, ...request.auxiliary_paths]);
+  const sites = analysisUnitStageSites(model, request, ownedPaths);
+  const stageEdges = analysisUnitStageEdges(model, request, ownedPaths, sites);
+  const retainedNodeIds = analysisUnitInitialNodeIds(model, ownedPaths, sites, stageEdges);
+  const contextDefinitionEdges = retainAnalysisUnitContextWitnesses(model, retainedNodeIds, ownedPaths);
+  const nodes = model.nodes.filter((node) => retainedNodeIds.has(node.id));
+  const edges = [...stageEdges, ...contextDefinitionEdges]
+    .filter((edge, index, all) => all.findIndex((candidate) => candidate.id === edge.id) === index)
+    .filter((edge) => retainedNodeIds.has(edge.source) && retainedNodeIds.has(edge.target));
+  return { ownedPaths, nodes, sites, edges };
+}
+
+const ANALYSIS_UNIT_SEMANTIC_DIAGNOSTIC_FLAGS = [
+  "typescript_definition_issue", "typescript_dependency_issue", "framework_semantic_issue",
+] as const;
+const ANALYSIS_UNIT_TYPESCRIPT_ISSUE_FLAGS = [
+  "typescript_definition_issue", "typescript_dependency_issue",
+] as const;
+
+function analysisUnitHasSemanticDiagnosticFlag(diagnostic: Diagnostic): boolean {
+  return ANALYSIS_UNIT_SEMANTIC_DIAGNOSTIC_FLAGS.some((key) => diagnostic.properties?.[key] === true);
+}
+
+function analysisUnitHasTypeScriptIssue(diagnostic: Diagnostic): boolean {
+  return ANALYSIS_UNIT_TYPESCRIPT_ISSUE_FLAGS.some((key) => diagnostic.properties?.[key] === true);
+}
+
+function analysisUnitDiagnosticForStage(diagnostic: Diagnostic, stage: AnalysisUnitStage): boolean {
+  const hasSemanticFlag = analysisUnitHasSemanticDiagnosticFlag(diagnostic);
+  if (stage === "syntax") return !hasSemanticFlag;
+  return hasSemanticFlag || diagnostic.code.includes("semantic");
+}
+
+function projectAnalysisUnitDiagnostics(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  ownedPaths: ReadonlySet<string>,
+): Diagnostic[] {
+  return model.diagnostics.filter((diagnostic) => (
+    diagnostic.path === null
+    || ownedPaths.has(diagnostic.path)
+    || diagnostic.evidence?.some((item) => ownedPaths.has(item.path)) === true
+  )).filter((diagnostic) => analysisUnitDiagnosticForStage(diagnostic, request.stage));
+}
+
+function analysisUnitSiteCounts(sites: readonly DependencySite[]): Map<string, AnalysisUnitSiteCounts> {
+  const siteCounts = new Map<string, AnalysisUnitSiteCounts>();
+  for (const site of sites.filter((candidate) => candidate.evidence[0] !== undefined)) {
+    const evidencePath = site.evidence[0]!.path;
+    const counts = siteCounts.get(evidencePath) ?? {
+      expected: 0,
+      produced: 0,
+      resolved: 0,
+      candidates: 0,
+      external: 0,
+      unresolved: 0,
+    };
+    counts.expected += 1;
+    counts.produced += 1;
+    counts[site.resolution_status] += 1;
+    siteCounts.set(evidencePath, counts);
+  }
+  return siteCounts;
+}
+
+function projectAnalysisUnitFiles(
+  model: ScanModel,
+  ownedPaths: ReadonlySet<string>,
+  sites: readonly DependencySite[],
+): { files: FileCoverage[]; coverageStats: AnalysisUnitCoverageStatistics } {
+  const siteCounts = analysisUnitSiteCounts(sites);
+  const files = model.files
+    .filter((file) => ownedPaths.has(file.path))
+    .map((file) => {
+      const counts = siteCounts.get(file.path) ?? {
+        expected: 0,
+        produced: 0,
+        resolved: 0,
+        candidates: 0,
+        external: 0,
+        unresolved: 0,
+      };
+      return {
+        ...file,
+        expected_sites: counts.expected + file.skipped_sites,
+        produced_sites: counts.produced,
+        resolved: counts.resolved,
+        candidates: counts.candidates,
+        external: counts.external,
+        unresolved: counts.unresolved,
+      };
+    })
+    .sort((left, right) => compareUtf8(left.path, right.path));
+  return { files, coverageStats: coverageStatistics(files, sites) };
+}
+
+function analysisUnitSemanticDiagnostics(diagnostics: readonly Diagnostic[]): Diagnostic[] {
+  return diagnostics.filter((diagnostic) => (
+    analysisUnitHasSemanticDiagnosticFlag(diagnostic) || diagnostic.code.includes("semantic")
+  ));
+}
+
+function analysisUnitNativeSemanticComplete(model: ScanModel): boolean {
+  return model.typeScriptProject.definitionGraphStatus === "ready"
+    && model.typeScriptProject.semanticIssues === 0
+    && model.typeScriptProject.semanticDiagnostics === 0
+    && model.typeScriptProject.emittedSemanticDiagnostics === 0;
+}
+
+function analysisUnitSemanticComplete(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  coverageStats: AnalysisUnitCoverageStatistics,
+  semanticDiagnostics: readonly Diagnostic[],
+): boolean {
+  const blockers = [
+    request.stage !== "semantic",
+    coverageStats.unsupportedSyntax > 0,
+    coverageStats.skipped > 0,
+    coverageStats.counts.unresolved > 0,
+    !analysisUnitNativeSemanticComplete(model),
+    semanticDiagnostics.length > 0,
+  ];
+  return !blockers.some(Boolean);
+}
+
+function projectAnalysisUnitTypeScriptSummary(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  nodes: readonly GraphNode[],
+  sites: readonly DependencySite[],
+  edges: readonly GraphEdge[],
+  diagnostics: readonly Diagnostic[],
+): ScanModel["typeScriptProject"] {
+  if (request.stage === "syntax") {
+    return {
+      ...model.typeScriptProject,
+      semanticNodes: 0,
+      semanticRelations: 0,
+      semanticSites: 0,
+      semanticCallSites: 0,
+      semanticIssues: 0,
+    };
+  }
+  return {
+    ...model.typeScriptProject,
+    semanticNodes: nodes.filter((node) => node.kind === "symbol" || node.kind === "type").length,
+    // Relation coverage includes definition and dependency edges. The
+    // emitted semantic stream exposes both, and the profile count must
+    // describe that same stream after unit projection.
+    semanticRelations: edges.filter((edge) => edge.phase === "semantic").length,
+    semanticSites: sites.filter((site) => analysisUnitSemanticEvidence(site.evidence)).length,
+    semanticCallSites: sites.filter((site) => site.kind === "call" && analysisUnitSemanticEvidence(site.evidence)).length,
+    // The wire counter attests emitted issue records. Context-only issues
+    // still prevent completion above, but are owned by another batch.
+    semanticIssues: diagnostics.filter(analysisUnitHasTypeScriptIssue).length,
+  };
+}
+
+function projectAnalysisUnitSemantics(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  nodes: readonly GraphNode[],
+  sites: readonly DependencySite[],
+  edges: readonly GraphEdge[],
+  diagnostics: readonly Diagnostic[],
+  coverageStats: AnalysisUnitCoverageStatistics,
+): {
+  syntaxComplete: boolean;
+  semanticComplete: boolean;
+  typeScriptProject: ScanModel["typeScriptProject"];
+} {
+  // Preserve parser failures in both stages. The semantic stage cannot be
+  // promoted merely because its TypeChecker pass returned a graph when the
+  // same owned source still has syntax that was not interpreted.
+  // Semantic requests run the same native syntax diagnostics and owned-file
+  // extraction before TypeChecker refinement, so a successful semantic slice
+  // also carries the syntax completion witness required by the core join.
+  const syntaxComplete = coverageStats.unsupportedSyntax === 0 && coverageStats.skipped === 0;
+  const semanticDiagnostics = analysisUnitSemanticDiagnostics(diagnostics);
+  const typeScriptProject = projectAnalysisUnitTypeScriptSummary(model, request, nodes, sites, edges, diagnostics);
+  return {
+    syntaxComplete,
+    semanticComplete: analysisUnitSemanticComplete(model, request, coverageStats, semanticDiagnostics),
+    typeScriptProject,
+  };
+}
+
+function appendAnalysisUnitCompletenessReason(
+  reasons: string[],
+  condition: boolean,
+  reason: string,
+): void {
+  if (condition) reasons.push(reason);
+}
+
+function analysisUnitCompletenessReasons(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  counts: AnalysisUnitCoverageStatistics["counts"],
+  unsupportedSyntax: number,
+  skipped: number,
+): string[] {
+  const reasons: string[] = [];
+  appendAnalysisUnitCompletenessReason(reasons, counts.unresolved > 0, "unresolved_dependency_sites");
+  appendAnalysisUnitCompletenessReason(reasons, unsupportedSyntax > 0, "unsupported_syntax");
+  appendAnalysisUnitCompletenessReason(reasons, skipped > 0, "skipped_sites");
+  appendAnalysisUnitCompletenessReason(
+    reasons,
+    request.stage === "semantic" && model.typeScriptProject.definitionGraphStatus === "failed",
+    "typescript_definition_graph_failure",
+  );
+  appendAnalysisUnitCompletenessReason(
+    reasons,
+    request.stage === "semantic" && model.typeScriptProject.semanticIssues > 0,
+    "typescript_definition_graph_incomplete",
+  );
+  appendAnalysisUnitCompletenessReason(
+    reasons,
+    request.stage === "semantic" && model.typeScriptProject.semanticDiagnostics > 0,
+    "typescript_semantic_diagnostics_present",
+  );
+  return reasons;
+}
+
+const ANALYSIS_UNIT_FRAMEWORK_SITE_KINDS = new Set([
+  "renders", "hydrates", "client_boundary", "server_boundary", "route_entry", "parent_route",
+  "loads", "before_load", "navigates_to", "masks_to", "rpc_call", "client_stub_for",
+  "handled_by", "uses_middleware",
+]);
+const ANALYSIS_UNIT_FRAMEWORK_NODE_KINDS = new Set(["component", "route", "server_function", "middleware"]);
+
+function emptyAnalysisUnitFrameworkSemantic(model: ScanModel): ScanModel["frameworkSemantic"] {
+  return {
+    status: "not-emitted",
+    nodes: 0,
+    sites: 0,
+    edges: 0,
+    emittedFrameworks: [],
+    pendingFrameworks: model.detectedFrameworks,
+    completionStatus: "not-detected",
+    completionIssueCount: 0,
+    completionLedger: [],
+  };
+}
+
+function projectAnalysisUnitFrameworkSemanticStage(
+  model: ScanModel,
+  ownedFrameworks: ReadonlySet<string>,
+  nodes: readonly GraphNode[],
+  sites: readonly DependencySite[],
+  edges: readonly GraphEdge[],
+): ScanModel["frameworkSemantic"] {
+  const frameworkSites = sites.filter((site) => ANALYSIS_UNIT_FRAMEWORK_SITE_KINDS.has(site.kind));
+  const frameworkEdges = edges.filter((edge) => edge.site_id !== null && ANALYSIS_UNIT_FRAMEWORK_SITE_KINDS.has(
+    sites.find((site) => site.id === edge.site_id)?.kind ?? "",
+  ));
+  const frameworkNodes = nodes.filter((node) => ANALYSIS_UNIT_FRAMEWORK_NODE_KINDS.has(node.kind));
+  const frameworkNames = [...new Set([
+    ...ownedFrameworks,
+    ...frameworkNodes
+      .map((node) => node.properties.framework)
+      .filter((value): value is string => typeof value === "string"),
+  ])].sort(compareUtf8);
+  const frameworkLedger = model.frameworkSemantic.completionLedger
+    .filter((entry) => frameworkNames.includes(entry.framework));
+  return {
+    ...model.frameworkSemantic,
+    status: frameworkNames.length > 0 ? "emitted" : "not-emitted",
+    nodes: frameworkNodes.length,
+    sites: frameworkSites.length,
+    edges: frameworkEdges.length,
+    emittedFrameworks: model.frameworkSemantic.emittedFrameworks.filter((framework) => frameworkNames.includes(framework)),
+    pendingFrameworks: frameworkNames.filter((framework) => !model.frameworkSemantic.emittedFrameworks.includes(framework)),
+    completionStatus: frameworkLedger.length === 0
+      ? "not-detected"
+      : frameworkLedger.every((entry) => entry.status === "complete") ? "complete" : "incomplete",
+    completionIssueCount: frameworkLedger.reduce((sum, entry) => sum + entry.reasons.length, 0),
+    completionLedger: frameworkLedger,
+  };
+}
+
+function projectAnalysisUnitFrameworkSemantic(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  ownedFrameworks: ReadonlySet<string>,
+  nodes: readonly GraphNode[],
+  sites: readonly DependencySite[],
+  edges: readonly GraphEdge[],
+): ScanModel["frameworkSemantic"] {
+  if (request.stage === "syntax") return emptyAnalysisUnitFrameworkSemantic(model);
+  return projectAnalysisUnitFrameworkSemanticStage(model, ownedFrameworks, nodes, sites, edges);
+}
+
+function projectAnalysisUnitModel(
+  model: ScanModel,
+  request: AnalysisUnitRequest,
+  ownedFrameworks: ReadonlySet<string>,
+): ScanModel {
+  const records = projectAnalysisUnitRecords(model, request);
+  const diagnostics = projectAnalysisUnitDiagnostics(model, request, records.ownedPaths);
+  const { files, coverageStats } = projectAnalysisUnitFiles(model, records.ownedPaths, records.sites);
+  const semantic = projectAnalysisUnitSemantics(
+    model,
+    request,
+    records.nodes,
+    records.sites,
+    records.edges,
+    diagnostics,
+    coverageStats,
+  );
+  const { counts, unsupportedSyntax, skipped } = coverageStats;
+  return {
+    ...model,
+    nodes: records.nodes,
+    sites: records.sites,
+    edges: records.edges,
+    diagnostics,
+    files,
+    coverage: {
+      ...baseCoverage(files, records.sites, coverageStats, false),
+      completeness: [
+        ...(semantic.syntaxComplete ? ["syntax-complete"] : []),
+        ...(semantic.semanticComplete ? ["semantic-complete"] : []),
+      ],
+      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped),
+    },
+    typeScriptProject: semantic.typeScriptProject,
+    frameworkSemantic: projectAnalysisUnitFrameworkSemantic(
+      model,
+      request,
+      ownedFrameworks,
+      records.nodes,
+      records.sites,
+      records.edges,
+    ),
+  };
+}
+
+type LocalTypeScriptVersion = { package: PackageRecord; version: string; source: string };
+
+async function installedLocalTypeScriptVersion(
+  workspace: Workspace,
+  record: PackageRecord,
+): Promise<LocalTypeScriptVersion[]> {
+  const manifest = await readJson(workspace.root, path.join(record.absolutePath, "node_modules", "typescript", "package.json"));
+  if (typeof manifest?.version !== "string") return [];
+  return [{ package: record, version: manifest.version, source: "installed package manifest" }];
+}
+
+function localTypeScriptLockInstances(workspace: Workspace, record: PackageRecord): readonly { version: string }[] {
+  const scope = workspace.scopes.find((candidate) => candidate.root === record.workspaceRoot);
+  // Once a package belongs to a discovered workspace scope, an absent
+  // TypeScript entry means that scope did not prove an installed version.
+  // Falling back to the repository-wide catalog would import a sibling
+  // workspace's version into this package's metadata.
+  return scope === undefined
+    ? workspace.lockInstances.get("typescript") ?? []
+    : scope.lockInstances.get("typescript") ?? [];
+}
+
+function declaredLocalTypeScriptVersions(
+  workspace: Workspace,
+  record: PackageRecord,
+): LocalTypeScriptVersion[] {
+  const declaration = record.dependencies.get("typescript");
+  if (!declaration) return [];
+  const locked = localTypeScriptLockInstances(workspace, record);
+  if (locked.length === 0) {
+    return [{ package: record, version: declaration.range, source: `${record.manifestPath} ${declaration.section}` }];
+  }
+  return [...new Set(locked.map((instance) => instance.version))]
+    .map((version) => ({ package: record, version, source: record.lockfile ?? "lockfile" }));
+}
+
+async function localTypeScriptVersionsForPackage(
+  workspace: Workspace,
+  record: PackageRecord,
+): Promise<LocalTypeScriptVersion[]> {
+  return [
+    ...await installedLocalTypeScriptVersion(workspace, record),
+    ...declaredLocalTypeScriptVersions(workspace, record),
+  ];
+}
+
+function deduplicateLocalTypeScriptVersions(entries: readonly LocalTypeScriptVersion[]): LocalTypeScriptVersion[] {
+  return entries.filter((entry, index) => entries.findIndex((candidate) => (
     candidate.package.id === entry.package.id && candidate.version === entry.version
   )) === index);
+}
+
+async function localTypeScriptVersion(workspace: Workspace): Promise<LocalTypeScriptVersion[]> {
+  const result: LocalTypeScriptVersion[] = [];
+  for (const record of workspace.packages) {
+    result.push(...await localTypeScriptVersionsForPackage(workspace, record));
+  }
+  return deduplicateLocalTypeScriptVersions(result);
+}
+
+interface TypeScriptAstSelection {
+  paths: Set<string>;
+  contextTargetFiles: number;
+  truncated: boolean;
+}
+
+interface TypeScriptAstSelectionState {
+  selected: Set<string>;
+  pending: string[];
+  queued: Set<string>;
+  truncated: boolean;
+}
+
+function compilerPathsByPackage(
+  root: string,
+  workspace: Workspace,
+  compilerSources: ReadonlyMap<string, string>,
+): Map<string, string[]> {
+  const pathsByPackage = new Map<string, string[]>();
+  for (const relativePath of [...compilerSources.keys()].sort(compareUtf8)) {
+    const packageId = owningPackage(workspace, path.resolve(root, ...relativePath.split("/"))).id;
+    const paths = pathsByPackage.get(packageId) ?? [];
+    paths.push(relativePath);
+    pathsByPackage.set(packageId, paths);
+  }
+  return pathsByPackage;
+}
+
+function enqueueTypeScriptAstPath(
+  relativePath: string,
+  compilerSources: ReadonlyMap<string, string>,
+  state: TypeScriptAstSelectionState,
+): void {
+  if (!compilerSources.has(relativePath) || state.selected.has(relativePath) || state.queued.has(relativePath)) return;
+  if (state.selected.size + state.pending.length >= MAX_TYPESCRIPT_AST_SOURCE_FILES) {
+    state.truncated = true;
+    return;
+  }
+  state.pending.push(relativePath);
+  state.queued.add(relativePath);
+}
+
+function typeScriptAstExtraction(
+  root: string,
+  relativePath: string,
+  compilerSources: ReadonlyMap<string, string>,
+  extractionCache: Map<string, ReturnType<typeof extractDependencies>>,
+): ReturnType<typeof extractDependencies> {
+  const existing = extractionCache.get(relativePath);
+  if (existing !== undefined) return existing;
+  const source = compilerSources.get(relativePath);
+  if (source === undefined) {
+    throw new Error("TypeScript AST selection source disappeared for " + relativePath);
+  }
+  const extraction = extractDependencies(
+    path.join(root, ...relativePath.split("/")),
+    relativePath,
+    source,
+  );
+  extractionCache.set(relativePath, extraction);
+  return extraction;
+}
+
+function enqueueTypeScriptResolutionTarget(
+  root: string,
+  pathsByPackage: ReadonlyMap<string, readonly string[]>,
+  compilerSources: ReadonlyMap<string, string>,
+  target: ResolvedTarget,
+  state: TypeScriptAstSelectionState,
+): void {
+  if (target.kind === "file") {
+    enqueueTypeScriptAstPath(
+      normalizeRelative(path.relative(root, target.absolutePath)),
+      compilerSources,
+      state,
+    );
+    return;
+  }
+  if (target.kind === "workspace_package") {
+    for (const candidate of pathsByPackage.get(target.package.id) ?? []) {
+      enqueueTypeScriptAstPath(candidate, compilerSources, state);
+    }
+  }
+}
+
+async function enqueueTypeScriptAstDependencies(
+  root: string,
+  workspace: Workspace,
+  compilerSources: ReadonlyMap<string, string>,
+  pathsByPackage: ReadonlyMap<string, readonly string[]>,
+  resolver: ModuleResolver,
+  extractionCache: Map<string, ReturnType<typeof extractDependencies>>,
+  relativePath: string,
+  state: TypeScriptAstSelectionState,
+): Promise<void> {
+  const absolutePath = path.join(root, ...relativePath.split("/"));
+  const owner = owningPackage(workspace, absolutePath);
+  const extraction = typeScriptAstExtraction(root, relativePath, compilerSources, extractionCache);
+  const resolutions = await Promise.all(extraction.dependencies.map((dependency) => (
+    resolver.resolve(dependency, absolutePath, owner)
+  )));
+  for (const resolution of resolutions) {
+    for (const target of resolution.targets) {
+      enqueueTypeScriptResolutionTarget(root, pathsByPackage, compilerSources, target, state);
+    }
+  }
+}
+
+/**
+ * Select owned ASTs plus the local declaration files needed to resolve their
+ * imports. The native Program still receives every context source, while the
+ * scanner only asks the async API for this bounded closure.
+ */
+async function selectTypeScriptAstPaths(
+  root: string,
+  workspace: Workspace,
+  compilerSources: ReadonlyMap<string, string>,
+  ownedPaths: ReadonlySet<string>,
+  resolver: ModuleResolver,
+  precompilerExtractions: ReadonlyMap<string, ReturnType<typeof extractDependencies>>,
+  progress: ProgressReporter,
+  includeDependencyClosure: boolean,
+): Promise<TypeScriptAstSelection> {
+ const pathsByPackage = compilerPathsByPackage(root, workspace, compilerSources);
+const requested = [...ownedPaths]
+  .filter((relativePath) => compilerSources.has(relativePath))
+  .sort(compareUtf8);
+ const state: TypeScriptAstSelectionState = {
+   selected: new Set<string>(),
+   pending: [],
+   queued: new Set<string>(),
+   truncated: false,
+ };
+ for (const relativePath of requested) enqueueTypeScriptAstPath(relativePath, compilerSources, state);
+ const extractionCache = new Map(precompilerExtractions);
+ if (includeDependencyClosure) {
+   // Ambient declarations are part of the compiler's global namespace even
+   // when no import edge points at them. Seed them after owned paths so the
+   // bounded AST selection admits the unit's output first; the native Program
+   // still keeps the complete context in its VFS.
+   for (const relativePath of [...compilerSources.keys()]
+     .filter((candidate) => candidate.toLowerCase().endsWith(".d.ts"))
+     .sort(compareUtf8)) {
+    enqueueTypeScriptAstPath(relativePath, compilerSources, state);
+   }
+ }
+ while (state.pending.length > 0) {
+   const relativePath = state.pending.shift()!;
+   if (state.selected.has(relativePath)) continue;
+   state.selected.add(relativePath);
+   if (!includeDependencyClosure) continue;
+   await enqueueTypeScriptAstDependencies(
+     root,
+     workspace,
+     compilerSources,
+     pathsByPackage,
+     resolver,
+     extractionCache,
+     relativePath,
+     state,
+   );
+   if (state.truncated && state.selected.size >= MAX_TYPESCRIPT_AST_SOURCE_FILES) break;
+ }
+ const contextTargetFiles = [...state.selected].filter((relativePath) => !ownedPaths.has(relativePath)).length;
+ progress.complete("typescript_ast_selection", {
+   context_source_files: compilerSources.size,
+   owned_source_files: requested.length,
+   ast_source_files: state.selected.size,
+   context_target_files: contextTargetFiles,
+   selection_truncated: state.truncated,
+ });
+ return { paths: state.selected, contextTargetFiles, truncated: state.truncated };
 }
 
 export async function scan(
@@ -1790,7 +2627,19 @@ export async function scan(
   allFiles: string[],
   inventoryIssues: FileInventoryIssue[] = [],
   progress: ProgressReporter = NOOP_PROGRESS,
+  analysisUnit: AnalysisUnitRequest | null = null,
 ): Promise<ScanModel> {
+  // Keep direct library callers in sync with the worker entrypoint. A unit
+  // scan owns its stream profile while structural and semantic definition
+  // nodes use the chunk-independent logical stage profile.
+  if (analysisUnit === null) {
+    setActiveProfileIds(BASE_PROFILE_ID);
+  } else {
+    setActiveProfileIds(
+      analysisUnitProfileId(analysisUnit, BASE_PROFILE_ID),
+      analysisUnitLogicalProfileId(analysisUnit, BASE_PROFILE_ID),
+    );
+  }
   progress.start("workspace_discovery", { inventory_files: allFiles.length });
   const workspace = await discoverWorkspace(root, allFiles);
   progress.complete("workspace_discovery", {
@@ -1885,11 +2734,20 @@ export async function scan(
       profile_id: PROFILE_ID,
     });
   }
+  for (const manifestPath of workspace.standaloneManifestPaths) {
+    graph.addDiagnostic({
+      severity: "info",
+      code: "web.package_manifest_standalone",
+      message: `${manifestPath} is excluded by the nearest workspace patterns and is analyzed in its own package scope`,
+      path: manifestPath,
+      profile_id: PROFILE_ID,
+    });
+  }
   for (const manifestPath of workspace.ignoredManifestPaths) {
     graph.addDiagnostic({
       severity: "info",
       code: "web.package_manifest_outside_workspace",
-      message: `${manifestPath} is outside the declared workspace patterns and was not treated as a package`,
+      message: `${manifestPath} could not be loaded as a package manifest`,
       path: manifestPath,
       profile_id: PROFILE_ID,
     });
@@ -1939,9 +2797,23 @@ export async function scan(
     routeEntriesByFile.set(absolute, entries);
   }
   const routeFiles = new Set(routeEntriesByFile.keys());
-  const sourceFiles = allFiles
-    .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)))
-    .sort();
+  const analysisContextPaths = analysisUnit === null ? null : new Set(analysisUnit.context_paths);
+  const analysisSourcePaths = analysisUnit === null ? null : new Set(analysisUnit.source_paths);
+  const analysisAuxiliaryPaths = analysisUnit === null ? null : new Set(analysisUnit.auxiliary_paths);
+  const discoveredSourceFiles = allFiles
+    .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)));
+  const requestedSourceFiles = analysisUnit === null
+    ? []
+    : allFiles.filter((file) => analysisSourcePaths?.has(normalizeRelative(path.relative(root, file))) === true);
+  const sourceFiles = [...new Set([...discoveredSourceFiles, ...requestedSourceFiles])].sort(compareUtf8);
+  // Route discovery still inspects the full repository so framework detection
+  // and drift diagnostics retain their repository-wide context. Collectors and
+  // route graph ownership, however, must emit only the source paths assigned
+  // to this unit; otherwise a chunk would either duplicate route sites or pass
+  // a route file whose AST is intentionally outside its source batch.
+  const outputRouteEntries = analysisUnit === null
+    ? routeDiscovery.entries
+    : routeDiscovery.entries.filter((entry) => analysisSourcePaths?.has(entry.relativeFile) === true);
   // Parse repository-owned JSON/JSONC without executing it, retain only
   // repository-relative TypeScript 7 `paths` mappings, and feed the normalized
   // allowlist into the worker-owned compiler config. Deprecated `baseUrl` is
@@ -1956,44 +2828,114 @@ export async function scan(
   const sourceCache = new Map<string, string | null>();
   const compilerSources = new Map<string, string>();
   const astroSources = new Map<string, string>();
-  const compilerFiles = sourceFiles.filter((file) => TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase()));
+  const compilerFiles = sourceFiles.filter((file) => {
+    if (!TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) return false;
+    if (analysisContextPaths === null) return true;
+    return analysisContextPaths.has(normalizeRelative(path.relative(root, file)));
+  });
+  const scanFiles = analysisUnit === null
+    ? sourceFiles
+    : sourceFiles.filter((file) => {
+      const relative = normalizeRelative(path.relative(root, file));
+      return analysisSourcePaths?.has(relative) === true || analysisAuxiliaryPaths?.has(relative) === true;
+    });
+  const availableCompilerPaths = new Set(sourceFiles
+    .filter((file) => TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase()))
+    .map((file) => normalizeRelative(path.relative(root, file))));
   // Each confined read performs a realpath check followed by the actual file
   // read. Bound the fan-out so large repositories do not serialize tens of
   // thousands of independent filesystem round trips or exhaust descriptors.
-  progress.start("source_read", { compiler_files: compilerFiles.length });
-  for (let offset = 0; offset < compilerFiles.length; offset += SOURCE_READ_CONCURRENCY) {
-    const batch = compilerFiles.slice(offset, offset + SOURCE_READ_CONCURRENCY);
-    const sources = await Promise.all(batch.map(async (file) => await readUtf8(root, file)));
-    for (let index = 0; index < batch.length; index += 1) {
-      const file = batch[index]!;
-      const source = sources[index] ?? null;
-      sourceCache.set(path.resolve(file), source);
-      if (source !== null) compilerSources.set(normalizeRelative(path.relative(root, file)), source);
-    }
-    progress.checkpoint("source_read", {
-      completed_files: Math.min(offset + batch.length, compilerFiles.length),
-      compiler_files: compilerFiles.length,
-    });
-  }
-  progress.complete("source_read", { compiler_files: compilerFiles.length });
   const precompilerExtractions = new Map<string, ReturnType<typeof extractDependencies>>();
   const typeScriptPathRequests: TypeScriptPathRequest[] = [];
-  progress.start("syntax_preextraction", { compiler_files: compilerSources.size });
-  let extractedFiles = 0;
-  const extractionProgressInterval = Math.max(1, Math.ceil(compilerSources.size / 256));
-  for (const [relative, source] of compilerSources) {
-    const absolute = path.join(root, ...relative.split("/"));
-    const extraction = extractDependencies(absolute, relative, source);
-    precompilerExtractions.set(relative, extraction);
-    for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
-      typeScriptPathRequests.push({ sourceFile: absolute, specifier });
+  progress.start("source_read", {
+    compiler_files: compilerFiles.length,
+    context_source_files: compilerFiles.length,
+  });
+  if (analysisUnit === null) {
+    for (let offset = 0; offset < compilerFiles.length; offset += SOURCE_READ_CONCURRENCY) {
+      const batch = compilerFiles.slice(offset, offset + SOURCE_READ_CONCURRENCY);
+      const sources = await readUtf8Batch(root, batch);
+      for (let index = 0; index < batch.length; index += 1) {
+        const file = batch[index]!;
+        const source = sources[index] ?? null;
+        sourceCache.set(path.resolve(file), source);
+        if (source !== null) compilerSources.set(normalizeRelative(path.relative(root, file)), source);
+      }
+      progress.checkpoint("source_read", {
+        completed_files: Math.min(offset + batch.length, compilerFiles.length),
+        compiler_files: compilerFiles.length,
+      });
     }
-    extractedFiles += 1;
-    if (extractedFiles % extractionProgressInterval === 0 || extractedFiles === compilerSources.size) {
+    progress.complete("source_read", { compiler_files: compilerFiles.length });
+  } else {
+    const pathToFile = new Map(sourceFiles.map((file) => [normalizeRelative(path.relative(root, file)), file]));
+    const pending = [...compilerFiles]
+      .map((file) => normalizeRelative(path.relative(root, file)))
+      .sort(compareUtf8);
+    const admitted = new Set(pending);
+    progress.start("syntax_preextraction", { compiler_files: compilerFiles.length, context_source_files: compilerFiles.length });
+    let extractedFiles = 0;
+    while (pending.length > 0) {
+      const batchPaths = pending.splice(0, SOURCE_READ_CONCURRENCY);
+      const batch = batchPaths.map((relative) => pathToFile.get(relative)!);
+      const sources = await readUtf8Batch(root, batch);
+      for (let index = 0; index < batch.length; index += 1) {
+        const file = batch[index]!;
+        const relative = batchPaths[index]!;
+        const source = sources[index] ?? null;
+        sourceCache.set(path.resolve(file), source);
+        if (source === null) continue;
+        compilerSources.set(relative, source);
+        const absolute = path.join(root, ...relative.split("/"));
+        const extraction = extractDependencies(absolute, relative, source);
+        if (analysisSourcePaths?.has(relative) === true) precompilerExtractions.set(relative, extraction);
+        for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
+          typeScriptPathRequests.push({ sourceFile: absolute, specifier });
+        }
+        for (const dependency of extraction.dependencies) {
+          const resolution = await resolver.resolve(dependency, absolute, owningPackage(workspace, file));
+          for (const target of resolution.targets) {
+            if (target.kind !== "file") continue;
+            const targetRelative = normalizeRelative(path.relative(root, target.absolutePath));
+            if (!availableCompilerPaths.has(targetRelative) || admitted.has(targetRelative)) continue;
+            admitted.add(targetRelative);
+            pending.push(targetRelative);
+          }
+        }
+        extractedFiles += 1;
+      }
+      pending.sort(compareUtf8);
+      progress.checkpoint("source_read", {
+        completed_files: extractedFiles,
+        compiler_files: admitted.size,
+        context_source_files: admitted.size,
+      });
       progress.checkpoint("syntax_preextraction", {
         completed_files: extractedFiles,
-        compiler_files: compilerSources.size,
+        compiler_files: admitted.size,
+        context_source_files: admitted.size,
       });
+    }
+    progress.complete("source_read", { compiler_files: compilerSources.size, context_source_files: compilerSources.size });
+  }
+  if (analysisUnit === null) {
+    progress.start("syntax_preextraction", { compiler_files: compilerSources.size });
+    let extractedFiles = 0;
+    const extractionProgressInterval = Math.max(1, Math.ceil(compilerSources.size / 256));
+    for (const [relative, source] of compilerSources) {
+      const absolute = path.join(root, ...relative.split("/"));
+      const extraction = extractDependencies(absolute, relative, source);
+      precompilerExtractions.set(relative, extraction);
+      for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
+        typeScriptPathRequests.push({ sourceFile: absolute, specifier });
+      }
+      extractedFiles += 1;
+      if (extractedFiles % extractionProgressInterval === 0 || extractedFiles === compilerSources.size) {
+        progress.checkpoint("syntax_preextraction", {
+          completed_files: extractedFiles,
+          compiler_files: compilerSources.size,
+        });
+      }
     }
   }
   progress.complete("syntax_preextraction", {
@@ -2004,11 +2946,75 @@ export async function scan(
     compiler_files: compilerSources.size,
     source_files: sourceFiles.length,
   });
+  let astSelection: TypeScriptAstSelection | null = null;
+  if (analysisUnit !== null) {
+    progress.start("typescript_ast_selection", {
+      context_source_files: compilerSources.size,
+      owned_source_files: analysisUnit.source_paths.length,
+      analysis_stage: analysisUnit.stage,
+    });
+    astSelection = await selectTypeScriptAstPaths(
+      root,
+      workspace,
+      compilerSources,
+      new Set(analysisUnit.source_paths),
+      resolver,
+      precompilerExtractions,
+      progress,
+      analysisUnit.stage === "semantic",
+    );
+    progress.start("typescript_context_rebuild", {
+      context_source_files: compilerSources.size,
+      owned_source_files: analysisUnit.source_paths.length,
+      ast_source_files: astSelection.paths.size,
+      context_target_files: astSelection.contextTargetFiles,
+      ast_selection_truncated: astSelection.truncated,
+      analysis_stage: analysisUnit.stage,
+    });
+  }
   const nativeTypeScript = await analyzeTypeScriptProject(
     compilerSources,
     resolver.typeScriptStaticConfig(typeScriptPathRequests),
     progress,
+    analysisUnit === null ? {} : {
+      sourcePaths: new Set(analysisUnit.source_paths),
+      astPaths: astSelection!.paths,
+      astSelectionTruncated: astSelection!.truncated,
+      stage: analysisUnit.stage,
+    },
   );
+  if (analysisUnit !== null) {
+    progress.complete("typescript_context_rebuild", {
+      context_source_files: compilerSources.size,
+      owned_source_files: analysisUnit.source_paths.length,
+      ast_source_files: nativeTypeScript.astRetainedSourceFiles,
+      ast_source_bytes: nativeTypeScript.astRetainedSourceBytes,
+      context_target_files: astSelection!.contextTargetFiles,
+      ast_selection_truncated: nativeTypeScript.astSelectionTruncated,
+      analysis_stage: analysisUnit.stage,
+    });
+  }
+  if (analysisUnit?.stage === "semantic" && nativeTypeScript.astSelectionTruncated) {
+    graph.addDiagnostic({
+      severity: "warning",
+      code: "web.typescript_ast_selection_truncated",
+      message: `TypeScript semantic AST context exceeded the bounded selection limit (${MAX_TYPESCRIPT_AST_SOURCE_FILES} source files); semantic completeness was withheld`,
+      path: null,
+      profile_id: PROFILE_ID,
+      properties: { typescript_definition_issue: true },
+    });
+  }
+  if (analysisUnit !== null) {
+    // Semantic definitions can point at a dependency-project declaration that
+    // is outside the unit's own source_paths. Create nodes for the complete
+    // compiler context without opening coverage or dependency sites; the
+    // projection below retains only context targets and the owned source
+    // batch. This preserves the compiler's full project identity space while
+    // keeping emitted ownership bounded.
+    for (const relative of compilerSources.keys()) {
+      graph.fileNode(path.resolve(root, ...relative.split("/")));
+    }
+  }
   for (const issue of resolver.issues) {
     recordSkippedInterpretation(graph, root, issue.path);
     graph.addDiagnostic({
@@ -2019,8 +3025,8 @@ export async function scan(
       profile_id: PROFILE_ID,
     });
   }
-  progress.start("syntax_dependency_resolution", { source_files: sourceFiles.length });
-  for (const file of sourceFiles) {
+  progress.start("syntax_dependency_resolution", { source_files: scanFiles.length });
+  for (const file of scanFiles) {
     const relative = normalizeRelative(path.relative(root, file));
     const generated = /^routeTree\.gen\./u.test(path.basename(file));
     const node = graph.fileNode(file, generated);
@@ -2124,7 +3130,7 @@ export async function scan(
       graph.countSite(relative, resolution.status);
     }
   }
-  progress.complete("syntax_dependency_resolution", { source_files: sourceFiles.length });
+  progress.complete("syntax_dependency_resolution", { source_files: scanFiles.length });
 
   progress.start("typescript_semantic_refinement", {
     dependency_sites: nativeTypeScript.dependencyGraph.sites.length,
@@ -2180,6 +3186,22 @@ export async function scan(
         nativeTypeScript.dependencyGraph,
         compilerSources,
       );
+      if (analysisUnit !== null) {
+        // The bounded compiler context can still produce a declaration target
+        // from a repository file that was reached through module resolution
+        // but was not included in context_paths by an older scheduler.  Add
+        // only that file node as a witness for semantic validation.  It has
+        // no coverage and receives no contains edge; ownership remains with
+        // the source batch that contains the file.
+        const repositoryPaths = new Set(allFiles.map((file) => normalizeRelative(path.relative(root, file))));
+        const ownedPaths = new Set(analysisUnit.source_paths);
+        for (const node of graph.nodes.values()) {
+          if (node.kind !== "symbol" && node.kind !== "type") continue;
+          const sourcePath = node.properties.source_path;
+          if (typeof sourcePath !== "string" || ownedPaths.has(sourcePath) || !repositoryPaths.has(sourcePath)) continue;
+          graph.fileNode(path.resolve(root, ...sourcePath.split("/")));
+        }
+      }
       nativeTypeScript.project.semanticNodes = counts.nodes;
       nativeTypeScript.project.semanticRelations = counts.relations;
       nativeTypeScript.project.semanticSites = counts.sites;
@@ -2243,7 +3265,7 @@ export async function scan(
     }
     emittedFrameworks.add(framework);
   };
-  const nextEntries = routeDiscovery.entries.filter((entry) => entry.framework === "next");
+  const nextEntries = outputRouteEntries.filter((entry) => entry.framework === "next");
   if (nextEntries.length > 0) {
     frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
@@ -2283,8 +3305,8 @@ export async function scan(
       });
     }
   }
-  const astroEntries = routeDiscovery.entries.filter((entry) => entry.framework === "astro");
-  if (astroEntries.length > 0) {
+  const astroEntries = outputRouteEntries.filter((entry) => entry.framework === "astro");
+  if (astroEntries.length > 0 && (analysisUnit === null || analysisUnit.stage === "semantic")) {
     frameworkAttempted = true;
     try {
       const result = await collectAstroSemanticDelta({
@@ -2318,7 +3340,7 @@ export async function scan(
       });
     }
   }
-  const tanstackRouterEntries = routeDiscovery.entries.filter((entry) => entry.framework === "tanstack-router");
+  const tanstackRouterEntries = outputRouteEntries.filter((entry) => entry.framework === "tanstack-router");
   if (tanstackRouterEntries.length > 0) {
     frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
@@ -2357,7 +3379,7 @@ export async function scan(
       });
     }
   }
-  const tanstackStartEntries = routeDiscovery.entries.filter((entry) => entry.framework === "tanstack-start");
+  const tanstackStartEntries = outputRouteEntries.filter((entry) => entry.framework === "tanstack-start");
   if (tanstackStartEntries.length > 0) {
     frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
@@ -2422,7 +3444,7 @@ export async function scan(
   progress.start("graph_finalize");
 
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
-  for (const entry of routeDiscovery.entries) {
+  for (const entry of outputRouteEntries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
     const coverage = graph.ensureCoverage(fileNode, entry.relativeFile);
     const owner = owningPackage(workspace, entry.absoluteFile);
@@ -2440,7 +3462,7 @@ export async function scan(
       kind: "route_entry",
       framework: entry.framework,
       pattern: entry.pattern,
-      profile: PROFILE_ID,
+      profile: LOGICAL_PROFILE_ID,
       path: entry.relativeFile,
       entry_kind: entry.entryKind,
     });
@@ -2458,7 +3480,7 @@ export async function scan(
       evidence: [routeRaw.evidence],
     });
     graph.addEdge({
-      id: stableId("edge", { repository: workspace.repositoryIdentity, source: fileNode.id, target: routeNode.id, kind: "route_entry", profile: PROFILE_ID, site: siteId }),
+      id: stableId("edge", { repository: workspace.repositoryIdentity, source: fileNode.id, target: routeNode.id, kind: "route_entry", profile: LOGICAL_PROFILE_ID, site: siteId }),
       source: fileNode.id,
       target: routeNode.id,
       kind: "route_entry",
@@ -2547,12 +3569,11 @@ export async function scan(
     });
   }
 
+  if (analysisUnit !== null) hydrateAnalysisFileWitnesses(graph.nodes.values(), compilerSources);
   const files = [...graph.files.values()].sort((left, right) => compareUtf8(left.path, right.path));
   const sites = [...graph.sites.values()].sort(compareById);
-  const counts = { resolved: 0, candidates: 0, external: 0, unresolved: 0 };
-  for (const site of sites) counts[site.resolution_status] += 1;
-  const unsupportedSyntax = files.reduce((sum, file) => sum + file.unsupported_syntax, 0);
-  const skipped = files.reduce((sum, file) => sum + file.skipped_sites, 0);
+  const coverageStats = coverageStatistics(files, sites);
+  const { counts, unsupportedSyntax, skipped } = coverageStats;
   const projectCodeExecuted = false;
   const reasons: string[] = [];
   if (counts.unresolved > 0) reasons.push("unresolved_dependency_sites");
@@ -2581,14 +3602,7 @@ export async function scan(
     diagnostics: [...graph.diagnostics.values()].sort(compareById),
     files,
     coverage: {
-      profiles: 1,
-      files_discovered: files.length,
-      files_analyzed: files.filter((file) => file.skipped_sites === 0).length,
-      files_skipped: files.filter((file) => file.skipped_sites > 0).length,
-      dependency_sites: sites.length,
-      ...counts,
-      unsupported_syntax: unsupportedSyntax,
-      project_code_executed: projectCodeExecuted,
+      ...baseCoverage(files, sites, coverageStats, projectCodeExecuted),
       completeness: [
         ...(syntaxComplete ? ["syntax-complete"] : []),
         ...(semanticComplete ? ["semantic-complete"] : []),
@@ -2602,9 +3616,23 @@ export async function scan(
     typeScriptProject: nativeTypeScript.project,
     frameworkSemantic,
   };
+  const ownedFrameworks = analysisUnit === null
+    ? new Set<string>()
+    : new Set(
+      outputRouteEntries
+        .filter((entry) => analysisUnit.source_paths.includes(entry.relativeFile))
+        .map((entry) => entry.framework),
+    );
+  const projectedModel = analysisUnit === null
+    ? model
+    : projectAnalysisUnitModel(model, analysisUnit, ownedFrameworks);
   progress.complete("graph_finalize", {
-    dependency_sites: model.coverage.dependency_sites,
-    files_analyzed: model.coverage.files_analyzed,
+    dependency_sites: projectedModel.coverage.dependency_sites,
+    files_analyzed: projectedModel.coverage.files_analyzed,
   });
-  return model;
+  return projectedModel;
+}
+
+async function readUtf8Batch(root: string, files: readonly string[]): Promise<Array<string | null>> {
+  return Promise.all(files.map(async (file) => await readUtf8(root, file)));
 }

@@ -261,12 +261,9 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 	packageErrorsTruncated := false
 	seenPackageErrors := map[string]bool{}
 
-	for moduleIndex, module := range orderedModules {
+	for _, module := range orderedModules {
 		if module.ManifestPath == "" {
 			continue
-		}
-		if progress != nil {
-			progress("go_typed_load", "progress", moduleIndex)
 		}
 		if preflight := modulePreflights[canonicalPathForConfinement(module.Dir)]; preflight.Reason != "" {
 			failedModules++
@@ -277,9 +274,6 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
-			if progress != nil {
-				progress("go_typed_load", "progress", moduleIndex+1)
-			}
 			continue
 		}
 		moduleWork := "off"
@@ -323,9 +317,6 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
-			if progress != nil {
-				progress("go_typed_load", "progress", moduleIndex+1)
-			}
 			continue
 		}
 		if loadErr != nil {
@@ -338,9 +329,6 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
-			if progress != nil {
-				progress("go_typed_load", "progress", moduleIndex+1)
-			}
 			continue
 		}
 		loadedModules++
@@ -464,6 +452,12 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 						Recoverable: true,
 					})
 				}
+				if progress != nil {
+					// packages.Load is atomic and cannot report work while it is
+					// running. This boundary counts each local package after its
+					// metadata and typed data have been inspected.
+					progress("go_typed_load", "progress", len(packageIDs))
+				}
 			}
 		}
 		if reasons := dependencySnapshot.observeModuleLoad(module, loaded); len(reasons) > 0 {
@@ -498,7 +492,7 @@ func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryM
 			inventory.TypedPackages = append(inventory.TypedPackages, moduleTypedPackages...)
 		}
 		if progress != nil {
-			progress("go_typed_load", "progress", moduleIndex+1)
+			progress("go_typed_load", "progress", len(packageIDs))
 		}
 	}
 	sort.SliceStable(inventory.TypedPackages, func(left, right int) bool {

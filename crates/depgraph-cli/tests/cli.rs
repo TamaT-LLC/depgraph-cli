@@ -1296,7 +1296,7 @@ fn partial_scan_export_output_rejects_parent_traversal_outside_the_repository() 
             "--store",
             store_path.to_str().unwrap(),
             "--scan-id",
-            "partial-export",
+            "attempt:partial-export",
             "export",
             "--format",
             "json",
@@ -3027,7 +3027,7 @@ fn empty_safe_scan_uses_external_store_and_reports_json() {
         .args(["--store", store.to_str().unwrap(), "doctor", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"store_schema_version\": 18"))
+        .stdout(predicate::str::contains("\"store_schema_version\": 19"))
         .stdout(predicate::str::contains("\"cache_contract_version\": 2"))
         .stdout(predicate::str::contains(
             "\"impact_query_cache_contract_version\": 1",
@@ -4698,8 +4698,9 @@ fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
     assert_eq!(
         first.status.code(),
         Some(0),
-        "{}",
-        String::from_utf8_lossy(&first.stdout)
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
     );
 
     let partial = temp.path().join("partial.sh");
@@ -4760,13 +4761,14 @@ fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
     assert!(latest.contains("file:normal"));
     assert!(!latest.contains("file:partial"));
 
+    let partial_selector = format!("attempt:{partial_scan}");
     let partial_export = Command::cargo_bin("depgraph")
         .unwrap()
         .args([
             "--store",
             store.to_str().unwrap(),
             "--scan-id",
-            partial_scan,
+            &partial_selector,
             "export",
             "--format",
             "json",
@@ -4779,6 +4781,74 @@ fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
             .unwrap()
             .contains("file:partial")
     );
+
+    // Incomplete staging graphs require the explicit attempt selector.
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "--scan-id",
+            partial_scan,
+            "export",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .failure();
+    for all in [false, true] {
+        let mut command = Command::cargo_bin("depgraph").unwrap();
+        command.args([
+            "--store",
+            store.to_str().unwrap(),
+            "--scan-id",
+            &partial_selector,
+            "deps",
+            "file:partial",
+            "--json",
+        ]);
+        if all {
+            command.arg("--all");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value["partial"]["contract_version"],
+            "depgraph-partial-result-v1"
+        );
+        assert_eq!(value["partial"]["analysis_complete"], false);
+        assert_eq!(value["partial"]["attempt_id"], partial_scan);
+        if !all {
+            assert_eq!(
+                value["serialized_output_bytes"].as_u64().unwrap() as usize,
+                String::from_utf8_lossy(&output.stdout).trim().len()
+            );
+        }
+    }
+    let health = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "--scan-id",
+            &partial_selector,
+            "health",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        health.status.success(),
+        "{}",
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let health: serde_json::Value = serde_json::from_slice(&health.stdout).unwrap();
+    assert_eq!(health["partial"]["analysis_complete"], false);
 
     let doctor = Command::cargo_bin("depgraph")
         .unwrap()
@@ -5466,20 +5536,25 @@ fn nonzero_worker_exit_is_exit_three_and_keeps_its_valid_prefix() {
             })
     );
 
+    let attempt_selector = format!("attempt:{}", failed["scan_id"].as_str().unwrap());
     let explicit = Command::cargo_bin("depgraph")
         .unwrap()
         .args([
             "--store",
             store.to_str().unwrap(),
             "--scan-id",
-            failed["scan_id"].as_str().unwrap(),
+            &attempt_selector,
             "export",
             "--format",
             "json",
         ])
         .output()
         .unwrap();
-    assert!(explicit.status.success());
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
     assert!(
         String::from_utf8(explicit.stdout)
             .unwrap()

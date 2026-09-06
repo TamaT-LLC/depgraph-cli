@@ -80,6 +80,12 @@ fn analyze_subject(
     collect_edge_blockers(&incoming_usage, &mut blockers, budget, is_cancelled)?;
     collect_site_blockers(index, &node.id, &mut blockers, budget, is_cancelled)?;
     collect_coverage_blockers(index, node, &mut blockers, budget, is_cancelled)?;
+    if index.analysis_coverage_incomplete {
+        blockers.push(FindingBlocker {
+            kind: BlockerKind::IncompleteCoverage,
+            detail: "one or more analysis units or dependency ranges were not analysed".to_owned(),
+        });
+    }
     let applicable = applicable_profiles(index, node, budget, is_cancelled)?;
     if applicable.is_empty() {
         let detail = node
@@ -269,6 +275,7 @@ struct SnapshotIndex<'a> {
     matrix_profile_ids_by_language: HashMap<String, Vec<&'a str>>,
     fixture_matrix_profile_ids: Vec<&'a str>,
     all_matrix_profile_ids: Vec<&'a str>,
+    analysis_coverage_incomplete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -669,6 +676,11 @@ impl<'a> SnapshotIndex<'a> {
                 coverage_omitted_paths.insert(record.path.as_str());
             }
         }
+        let analysis_coverage_incomplete = snapshot.scan.status != "completed"
+            || snapshot.coverage.reasons.iter().any(|reason| {
+                reason.starts_with("analysis-unit-")
+                    || reason == "analysis-input-changed-during-scan"
+            });
         Ok(Self {
             incoming,
             go_file_usage_profiles,
@@ -688,6 +700,7 @@ impl<'a> SnapshotIndex<'a> {
             matrix_profile_ids_by_language,
             fixture_matrix_profile_ids,
             all_matrix_profile_ids,
+            analysis_coverage_incomplete,
         })
     }
 }

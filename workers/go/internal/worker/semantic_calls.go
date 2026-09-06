@@ -503,7 +503,7 @@ func (e *goSemanticExtractor) addCall(
 	primary := evidence[0]
 	siteIdentity := map[string]any{
 		"condition": condition, "kind": "call", "path": primary.Path,
-		"profile_id": e.state.profile.ID, "source": sourceID,
+		"profile_id": e.state.identityProfileID(), "source": sourceID,
 		"span": goSemanticSpan(primary),
 	}
 	site := Site{
@@ -555,7 +555,7 @@ func (e *goSemanticExtractor) addCandidateCall(pending goSemanticPendingCall, ta
 	primary := evidence[0]
 	siteIdentity := map[string]any{
 		"condition": condition, "kind": "call", "path": primary.Path,
-		"profile_id": e.state.profile.ID, "source": pending.callerID,
+		"profile_id": e.state.identityProfileID(), "source": pending.callerID,
 		"span": goSemanticSpan(primary),
 	}
 	site := Site{
@@ -617,7 +617,7 @@ func (e *goSemanticExtractor) failCall(path, specifier, reason string, evidence 
 	primary := evidence[0]
 	identity := map[string]any{
 		"code": "go_call_unresolved", "path": path,
-		"profile_id": e.state.profile.ID, "reason": reason, "span": goSemanticSpan(primary),
+		"profile_id": e.state.identityProfileID(), "reason": reason, "span": goSemanticSpan(primary),
 	}
 	diagnostic := Diagnostic{
 		ID: stableIDFromValue("diagnostic", identity), Code: "go_call_unresolved",

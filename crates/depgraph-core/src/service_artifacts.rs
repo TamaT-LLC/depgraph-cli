@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     CancellationToken, Config, GraphQueryFilter,
-    export::filter_snapshot,
+    export::{export_filtered_with_partial_metadata, filter_snapshot, partial_export_metadata},
     policy::{
         PolicyAnnotation, PolicyAnnotationLevel, PolicyEntity, PolicyEvidenceSpan, PolicyPathStep,
         PolicyResultSummary, PolicySelectorKind, PolicySeverity, PublicApiChangeKind,
@@ -794,6 +794,7 @@ impl DepgraphService {
         let mut snapshot_request =
             self.start_snapshot_request_at_cancellable(request.snapshot(), cancellation)?;
         let snapshot_id = snapshot_request.snapshot_id().as_str().to_owned();
+        let partial = partial_export_metadata(&snapshot_request);
         let snapshot =
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
         let filtered = filter_snapshot(&snapshot, request.filter());
@@ -808,7 +809,8 @@ impl DepgraphService {
         canonicalize_export_graph(&mut selected);
         let maximum = self.config().limits().max_output_bytes();
         let mut writer = BoundedOutput::new(maximum, cancellation.clone());
-        let rendered = write_agent_safe_export(&selected, request.format(), &mut writer);
+        let rendered =
+            write_agent_safe_export(&selected, request.format(), partial.as_ref(), &mut writer);
         if rendered.is_err() {
             if cancellation.is_cancelled() {
                 return Err(DepgraphServiceError::Cancelled);
@@ -846,6 +848,7 @@ impl DepgraphService {
         let mut snapshot_request =
             self.start_snapshot_request_at_cancellable(request.snapshot(), cancellation)?;
         let snapshot_id = snapshot_request.snapshot_id().as_str().to_owned();
+        let partial = partial_export_metadata(&snapshot_request);
         let snapshot =
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
         let filtered = filter_snapshot(&snapshot, request.filter());
@@ -863,8 +866,13 @@ impl DepgraphService {
             GraphExportFormat::Mermaid => crate::ExportFormat::Mermaid,
             GraphExportFormat::Graphml => crate::ExportFormat::Graphml,
         };
-        let content = crate::export_filtered(&selected, format, &GraphQueryFilter::default())
-            .map_err(|_| DepgraphServiceError::Internal)?;
+        let content = export_filtered_with_partial_metadata(
+            &selected,
+            format,
+            &GraphQueryFilter::default(),
+            partial.as_ref(),
+        )
+        .map_err(|_| DepgraphServiceError::Internal)?;
         check_cancelled(cancellation)?;
         // Raw-compatible exports are the file-based remediation for an Agent-safe
         // inline export that exceeded the service response ceiling. Keep a separate
@@ -1339,6 +1347,11 @@ fn resolve_locator(
         SnapshotLocator::Current => store.current_snapshot_id()?,
         SnapshotLocator::Name(name) => store.snapshot_id_for_name(name)?,
         SnapshotLocator::StableId(id) => store.completed_snapshot(id)?.map(|record| record.id),
+        SnapshotLocator::Attempt(_) => {
+            return Err(anyhow::anyhow!(
+                "partial attempts cannot be exported as snapshots"
+            ));
+        }
     };
     let Some(id) = id else {
         return Ok(None);
@@ -1490,6 +1503,8 @@ struct AgentSafeJsonExport<'a> {
     schema_version: &'static str,
     nodes: Vec<AgentSafeJsonNode<'a>>,
     edges: Vec<AgentSafeJsonEdge<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1518,17 +1533,22 @@ struct AgentSafeJsonEdge<'a> {
 fn write_agent_safe_export<W: Write>(
     snapshot: &GraphSnapshot,
     format: GraphExportFormat,
+    partial: Option<&serde_json::Value>,
     writer: &mut W,
 ) -> anyhow::Result<()> {
     match format {
-        GraphExportFormat::Json => write_agent_safe_json(snapshot, writer),
-        GraphExportFormat::Dot => write_agent_safe_dot(snapshot, writer),
-        GraphExportFormat::Mermaid => write_agent_safe_mermaid(snapshot, writer),
-        GraphExportFormat::Graphml => write_agent_safe_graphml(snapshot, writer),
+        GraphExportFormat::Json => write_agent_safe_json(snapshot, partial, writer),
+        GraphExportFormat::Dot => write_agent_safe_dot(snapshot, partial, writer),
+        GraphExportFormat::Mermaid => write_agent_safe_mermaid(snapshot, partial, writer),
+        GraphExportFormat::Graphml => write_agent_safe_graphml(snapshot, partial, writer),
     }
 }
 
-fn write_agent_safe_json<W: Write>(snapshot: &GraphSnapshot, writer: &mut W) -> anyhow::Result<()> {
+fn write_agent_safe_json<W: Write>(
+    snapshot: &GraphSnapshot,
+    partial: Option<&serde_json::Value>,
+    writer: &mut W,
+) -> anyhow::Result<()> {
     let nodes = snapshot
         .nodes
         .iter()
@@ -1562,12 +1582,24 @@ fn write_agent_safe_json<W: Write>(snapshot: &GraphSnapshot, writer: &mut W) -> 
             schema_version: "depgraph-agent-graph-export-v1",
             nodes,
             edges,
+            partial,
         },
     )?;
     Ok(())
 }
 
-fn write_agent_safe_dot<W: Write>(snapshot: &GraphSnapshot, writer: &mut W) -> anyhow::Result<()> {
+fn write_agent_safe_dot<W: Write>(
+    snapshot: &GraphSnapshot,
+    partial: Option<&serde_json::Value>,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    if let Some(partial) = partial {
+        writeln!(
+            writer,
+            "// depgraph-partial: {}",
+            depgraph_protocol::canonical_json(partial)
+        )?;
+    }
     writer.write_all(b"digraph depgraph {\n  rankdir=LR;\n")?;
     for node in &snapshot.nodes {
         writeln!(
@@ -1602,8 +1634,16 @@ fn write_agent_safe_dot<W: Write>(snapshot: &GraphSnapshot, writer: &mut W) -> a
 
 fn write_agent_safe_mermaid<W: Write>(
     snapshot: &GraphSnapshot,
+    partial: Option<&serde_json::Value>,
     writer: &mut W,
 ) -> anyhow::Result<()> {
+    if let Some(partial) = partial {
+        writeln!(
+            writer,
+            "%% depgraph-partial: {}",
+            depgraph_protocol::canonical_json(partial)
+        )?;
+    }
     writer.write_all(b"flowchart LR\n")?;
     let indexes = snapshot
         .nodes
@@ -1642,6 +1682,7 @@ fn write_agent_safe_mermaid<W: Write>(
 
 fn write_agent_safe_graphml<W: Write>(
     snapshot: &GraphSnapshot,
+    partial: Option<&serde_json::Value>,
     writer: &mut W,
 ) -> anyhow::Result<()> {
     let indexes = snapshot
@@ -1652,8 +1693,22 @@ fn write_agent_safe_graphml<W: Write>(
         .collect::<BTreeMap<_, _>>();
     writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
     writer.write_all(
-        b"<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n  <key id=\"n_id\" for=\"node\" attr.name=\"depgraph.node.id\" attr.type=\"string\"/>\n  <key id=\"n_kind\" for=\"node\" attr.name=\"depgraph.node.kind\" attr.type=\"string\"/>\n  <key id=\"n_locator\" for=\"node\" attr.name=\"depgraph.node.locator\" attr.type=\"string\"/>\n  <key id=\"n_label\" for=\"node\" attr.name=\"depgraph.node.display_name\" attr.type=\"string\"/>\n  <key id=\"e_id\" for=\"edge\" attr.name=\"depgraph.edge.id\" attr.type=\"string\"/>\n  <key id=\"e_kind\" for=\"edge\" attr.name=\"depgraph.edge.kind\" attr.type=\"string\"/>\n  <key id=\"e_phase\" for=\"edge\" attr.name=\"depgraph.edge.phase\" attr.type=\"string\"/>\n  <key id=\"e_profile\" for=\"edge\" attr.name=\"depgraph.edge.profile_id\" attr.type=\"string\"/>\n  <graph id=\"depgraph\" edgedefault=\"directed\">\n",
+        b"<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n  <key id=\"n_id\" for=\"node\" attr.name=\"depgraph.node.id\" attr.type=\"string\"/>\n  <key id=\"n_kind\" for=\"node\" attr.name=\"depgraph.node.kind\" attr.type=\"string\"/>\n  <key id=\"n_locator\" for=\"node\" attr.name=\"depgraph.node.locator\" attr.type=\"string\"/>\n  <key id=\"n_label\" for=\"node\" attr.name=\"depgraph.node.display_name\" attr.type=\"string\"/>\n  <key id=\"e_id\" for=\"edge\" attr.name=\"depgraph.edge.id\" attr.type=\"string\"/>\n  <key id=\"e_kind\" for=\"edge\" attr.name=\"depgraph.edge.kind\" attr.type=\"string\"/>\n  <key id=\"e_phase\" for=\"edge\" attr.name=\"depgraph.edge.phase\" attr.type=\"string\"/>\n  <key id=\"e_profile\" for=\"edge\" attr.name=\"depgraph.edge.profile_id\" attr.type=\"string\"/>\n",
     )?;
+    if partial.is_some() {
+        writer.write_all(
+            b"  <key id=\"g_partial\" for=\"graph\" attr.name=\"depgraph.partial\" attr.type=\"string\"/>\n",
+        )?;
+    }
+    writer.write_all(b"  <graph id=\"depgraph\" edgedefault=\"directed\">\n")?;
+    if let Some(partial) = partial {
+        write_graphml_data(
+            writer,
+            "g_partial",
+            &depgraph_protocol::canonical_json(partial),
+            4,
+        )?;
+    }
     for (index, node) in snapshot.nodes.iter().enumerate() {
         writeln!(writer, "    <node id=\"n{index}\">")?;
         write_graphml_data(writer, "n_id", &node.id, 6)?;

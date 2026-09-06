@@ -1,7 +1,10 @@
 import { canonicalJson, stableId } from "./ids";
+import { objectValue, stringValue } from "./semantic-validation-utils";
 import {
   canonicalizeCondition,
   compareUtf8,
+  LOGICAL_PROFILE_ID,
+  PROFILE_ID,
   type Condition,
   type DependencySite,
   type Evidence,
@@ -19,6 +22,7 @@ export const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION = "0.1.0" as const;
 export const WEB_FRAMEWORK_COMPLETENESS_CAPABILITY = "framework-semantic-completeness-v1" as const;
 export const TYPESCRIPT_SEMANTIC_CAPABILITY = "typescript-definition-import-type-call-graph-v2" as const;
 export const WEB_SEMANTIC_RELEASE_CAPABILITIES = Object.freeze([
+  "analysis-source-batch-v1",
   "astro-component-render-hydration-v1",
   WEB_FRAMEWORK_COMPLETENESS_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
@@ -136,6 +140,14 @@ export interface FrameworkSemanticDelta {
 export interface FrameworkSemanticDeltaOptions {
   profileId: string;
   capability: string;
+  /** Structural framework nodes are shared by source chunks. */
+  nodeProfileId?: string;
+  /** Optional logical identity used for site IDs shared by source chunks. */
+  identityProfileId?: string;
+}
+
+function nodeProfileId(options: FrameworkSemanticDeltaOptions): string {
+  return options.nodeProfileId ?? options.profileId;
 }
 
 export interface FrameworkSemanticRelationStore {
@@ -163,11 +175,21 @@ export interface FrameworkSemanticRelationInput {
   readonly condition: Condition;
   readonly environment: string;
   readonly profileId: string;
+  /** Optional logical identity used for IDs shared by source chunks. */
+  readonly identityProfileId?: string;
   readonly resolutionStatus: ResolutionStatus;
   readonly precision: Precision | null;
   readonly reason: string | null;
   readonly evidence: readonly Evidence[];
   readonly generated: boolean;
+}
+
+function relationIdentityProfileId(input: FrameworkSemanticRelationInput): string {
+  if (input.identityProfileId !== undefined) return input.identityProfileId;
+  // Collector calls use the active stream profile. During a chunked scan the
+  // stable site identity must use the logical stage profile; standalone
+  // callers with their own profile retain that profile as the identity.
+  return input.profileId === PROFILE_ID ? LOGICAL_PROFILE_ID : input.profileId;
 }
 
 function defaultPrecision(status: ResolutionStatus): Precision {
@@ -192,7 +214,7 @@ export function emitFrameworkSemanticRelation(
     condition,
     kind: input.kind,
     path: input.relativePath,
-    profile_id: input.profileId,
+    profile_id: relationIdentityProfileId(input),
     source: input.source.id,
     span: input.span,
   });
@@ -240,21 +262,9 @@ export function emitFrameworkSemanticRelation(
   for (const edge of relationEdges) store.edges.set(edge.id, store.edges.get(edge.id) ?? edge);
 }
 
-function objectValue(value: JsonValue | undefined, field: string): Record<string, JsonValue> {
-  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${field} must be an object`);
-  }
-  return value;
-}
-
-function stringValue(value: JsonValue | undefined, field: string): string {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`${field} must be a non-empty string`);
-  return value;
-}
-
 function validateFrameworkNode(node: GraphNode, options: FrameworkSemanticDeltaOptions): void {
   if (!FRAMEWORK_NODE_KINDS.has(node.kind)) throw new Error(`framework delta contains non-framework node ${node.id}`);
-  if (stringValue(node.properties.profile_id, `${node.id}.properties.profile_id`) !== options.profileId) {
+  if (stringValue(node.properties.profile_id, `${node.id}.properties.profile_id`) !== nodeProfileId(options)) {
     throw new Error(`${node.id} belongs to a different profile`);
   }
   const framework = stringValue(node.properties.framework, `${node.id}.properties.framework`);
@@ -402,7 +412,7 @@ function validateSite(site: DependencySite, nodes: ReadonlyMap<string, GraphNode
   }
   const expectedId = stableId("site", {
     condition: canonicalizeCondition(site.condition), kind: site.kind, path: primary.path,
-    profile_id: site.profile_id, source: site.source,
+    profile_id: options.identityProfileId ?? site.profile_id, source: site.source,
     span: { start_line: primary.start_line, start_column: primary.start_column, end_line: primary.end_line, end_column: primary.end_column },
   });
   if (site.id !== expectedId) throw new Error(`${site.id} does not match site identity ${expectedId}`);
@@ -420,7 +430,7 @@ function validateEdge(edge: GraphEdge, site: DependencySite, nodes: ReadonlyMap<
   for (const endpointId of [edge.source, edge.target]) {
     const endpoint = nodes.get(endpointId)!;
     if (FRAMEWORK_NODE_KINDS.has(endpoint.kind)
-      && (endpoint.properties.profile_id !== options.profileId || endpoint.properties.framework !== edge.evidence[0]!.properties?.framework)) {
+      && (endpoint.properties.profile_id !== nodeProfileId(options) || endpoint.properties.framework !== edge.evidence[0]!.properties?.framework)) {
       throw new Error(`${edge.id} crosses framework or profile boundaries`);
     }
   }

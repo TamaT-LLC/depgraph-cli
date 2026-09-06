@@ -54,6 +54,13 @@ pub(crate) struct UnitCheckpointStore {
     max_bytes: usize,
 }
 
+/// A serialized stream that is invisible to checkpoint readers until its
+/// Store ingestion succeeds. Dropping it removes the private temporary file.
+pub(crate) struct StagedUnitCheckpoint {
+    file: tempfile::NamedTempFile,
+    target: PathBuf,
+}
+
 impl UnitCheckpointStore {
     pub fn open(store_path: &Path, max_bytes: usize) -> Result<Self> {
         let parent = store_path
@@ -111,8 +118,12 @@ impl UnitCheckpointStore {
         Ok(Some(checkpoint.events))
     }
 
-    /// Only a complete, supervisor-validated worker stream may be committed.
-    pub fn write(&self, key: &UnitCheckpointKey, events: &[Value]) -> Result<bool> {
+    /// Stage a supervisor-validated stream without making it reusable yet.
+    pub fn stage(
+        &self,
+        key: &UnitCheckpointKey,
+        events: &[Value],
+    ) -> Result<Option<StagedUnitCheckpoint>> {
         if !complete_stream(events) {
             bail!("cannot checkpoint an incomplete analysis unit");
         }
@@ -124,7 +135,7 @@ impl UnitCheckpointStore {
         };
         let bytes = serde_json::to_vec(&checkpoint)?;
         if bytes.len() > self.max_bytes {
-            return Ok(false);
+            return Ok(None);
         }
         // Tempfiles stay on the same filesystem; persist replaces one complete
         // generation atomically. A concurrent reader sees either generation.
@@ -132,8 +143,25 @@ impl UnitCheckpointStore {
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
         let target = self.directory.join(format!("{}.json", key.digest()?));
-        file.persist(target).map_err(|error| error.error)?;
+        Ok(Some(StagedUnitCheckpoint { file, target }))
+    }
+
+    /// Publish only after Store has accepted the complete unit atomically.
+    pub fn commit(&self, staged: StagedUnitCheckpoint) -> Result<()> {
+        staged
+            .file
+            .persist(staged.target)
+            .map_err(|error| error.error)?;
         self.prune()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn write(&self, key: &UnitCheckpointKey, events: &[Value]) -> Result<bool> {
+        let Some(staged) = self.stage(key, events)? else {
+            return Ok(false);
+        };
+        self.commit(staged)?;
         Ok(true)
     }
 
@@ -223,6 +251,20 @@ mod tests {
             json!({"event":"scan_started"}),
             json!({"event":"scan_completed"}),
         ]
+    }
+
+    #[test]
+    fn staged_output_is_not_reusable_until_accepted_and_committed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = UnitCheckpointStore::open(&temp.path().join("store"), 4096)?;
+        let staged = store.stage(&key(), &events())?.unwrap();
+        assert_eq!(store.read(&key())?, None);
+        drop(staged);
+        assert_eq!(store.read(&key())?, None);
+        assert_eq!(fs::read_dir(&store.directory)?.count(), 0);
+        store.commit(store.stage(&key(), &events())?.unwrap())?;
+        assert_eq!(store.read(&key())?, Some(events()));
+        Ok(())
     }
 
     #[test]

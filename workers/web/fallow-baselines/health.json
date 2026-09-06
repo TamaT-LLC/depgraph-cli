@@ -172,6 +172,9 @@
       }
     },
     "src/scanner.ts": {
+      "crap_moderate": {
+        "count": 13
+      },
       "complexity_critical": {
         "count": 4
       },
@@ -180,9 +183,6 @@
       },
       "crap_high": {
         "count": 7
-      },
-      "crap_moderate": {
-        "count": 9
       }
     },
     "src/semantic-delta.ts": {
@@ -373,7 +373,20 @@
         "count": 6
       },
       "crap_moderate": {
-        "count": 8
+        "count": 9
+      }
+    },
+    "src/analysis-unit.ts": {
+      "crap_high": {
+        "count": 3
+      },
+      "crap_moderate": {
+        "count": 3
+      }
+    },
+    "src/semantic-validation-utils.ts": {
+      "crap_moderate": {
+        "count": 1
       }
     }
   },
@@ -1487,6 +1500,9 @@
     "src/scanner.ts\u0000<arrow>": {
       "crap_high": {
         "count": 1
+      },
+      "crap_moderate": {
+        "count": 1
       }
     },
     "src/scanner.ts\u0000addEdge": {
@@ -1540,11 +1556,6 @@
       }
     },
     "src/scanner.ts\u0000lineEvidence": {
-      "crap_high": {
-        "count": 1
-      }
-    },
-    "src/scanner.ts\u0000localTypeScriptVersion": {
       "crap_high": {
         "count": 1
       }
@@ -3250,6 +3261,66 @@
         "count": 1
       },
       "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000isAncestorWorkspaceManifest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000isCanonicalRepositoryPath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000pathList": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000readAnalysisUnitRequest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000requiredString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000validateAnalysisUnitForRoot": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000enqueueTypeScriptAstPath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000enqueueTypeScriptResolutionTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000selectTypeScriptAstPaths": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000targetNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/semantic-validation-utils.ts\u0000objectValue": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/workspace.ts\u0000pnpmWorkspaceFileFor": {
+      "crap_moderate": {
         "count": 1
       }
     }

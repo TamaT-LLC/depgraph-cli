@@ -225,6 +225,7 @@ struct WorkerExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum WorkerFailureKind {
     Timeout,
+    MemoryLimit,
     Cancelled,
     MalformedProtocol,
     OutputLimit,
@@ -238,6 +239,7 @@ impl WorkerFailureKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
+            Self::MemoryLimit => "memory-limit",
             Self::Cancelled => "cancelled",
             Self::MalformedProtocol => "malformed-protocol",
             Self::OutputLimit => "output-limit",
@@ -252,6 +254,7 @@ impl WorkerFailureKind {
 fn select_worker_failure_kind(kinds: &[WorkerFailureKind]) -> Option<WorkerFailureKind> {
     const PRECEDENCE: &[WorkerFailureKind] = &[
         WorkerFailureKind::Timeout,
+        WorkerFailureKind::MemoryLimit,
         WorkerFailureKind::Cancelled,
         WorkerFailureKind::NonzeroExit,
         WorkerFailureKind::OutputLimit,
@@ -1775,6 +1778,7 @@ where
     enum WaitResult {
         Process(std::result::Result<std::io::Result<std::process::ExitStatus>, ()>),
         Cancelled(std::io::Result<()>),
+        Memory(std::io::Result<u64>),
     }
     let wait_result = tokio::select! {
         result = async {
@@ -1788,6 +1792,7 @@ where
             WaitResult::Process(result)
         }
         signal = cancellation.as_mut() => WaitResult::Cancelled(signal),
+        memory = process_guard.wait_for_memory_limit(config.max_worker_memory_bytes) => WaitResult::Memory(memory),
     };
     match wait_result {
         WaitResult::Process(Ok(Ok(status))) if !status.success() => {
@@ -1814,6 +1819,25 @@ where
             } else {
                 errors.push(format!("{} cancelled by user", spec.display));
                 failure_kinds.push(WorkerFailureKind::Cancelled);
+            }
+            terminate_worker(&mut child, &process_guard).await;
+        }
+        WaitResult::Memory(result) => {
+            match result {
+                Ok(bytes) => {
+                    errors.push(format!(
+                        "{} exceeded its worker memory budget: {bytes} bytes > {} bytes",
+                        spec.display, config.max_worker_memory_bytes
+                    ));
+                    failure_kinds.push(WorkerFailureKind::MemoryLimit);
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "failed to account for {} worker memory: {error}",
+                        spec.display
+                    ));
+                    failure_kinds.push(WorkerFailureKind::Other);
+                }
             }
             terminate_worker(&mut child, &process_guard).await;
         }
@@ -2096,6 +2120,53 @@ pub(crate) struct ProcessTreeGuard {
 }
 
 impl ProcessTreeGuard {
+    async fn wait_for_memory_limit(&self, limit: u64) -> std::io::Result<u64> {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let bytes = self.memory_usage_bytes()?;
+            if bytes > limit {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    fn memory_usage_bytes(&self) -> std::io::Result<u64> {
+        #[cfg(unix)]
+        {
+            crate::worker_memory::process_group_memory(self.process_group)
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::{
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject,
+            };
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            let result = unsafe {
+                QueryInformationJobObject(
+                    self.job as _,
+                    JobObjectExtendedLimitInformation,
+                    (&raw mut info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if result == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(info.PeakJobMemoryUsed as u64)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "worker memory accounting is unavailable",
+            ))
+        }
+    }
+
     pub(crate) fn attach(child: &tokio::process::Child) -> Result<Self> {
         #[cfg(unix)]
         {

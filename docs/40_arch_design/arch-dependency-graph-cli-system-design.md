@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-08-26
+updated: 2026-09-06
 ---
 
 > 2026-08-13: Issue #355として、GitHub上で公開済みなのは
@@ -55,8 +55,8 @@ updated: 2026-08-26
 | --- | --- |
 | Product / Rust / Go / Web adapter | `0.5.4` |
 | NDJSON protocol / graph schema | `1.0` |
-| SQLite store / scan cache / impact query cache | `18` / `2` / `1` |
-| Operation journal / MCP tool / operation DTO | `5` / `depgraph-mcp-tools-v1` / `depgraph-operation-v1` |
+| SQLite store / scan cache / impact query cache | `19` / `2` / `1` |
+| Operation journal / MCP tool / operation DTO | `6` / `depgraph-mcp-tools-v1` / `depgraph-operation-v2` |
 | Snapshot diff / policy / runtime trace / GraphML | `1.0` |
 | Incremental plan / daemon status | `incremental-plan-v1` / `daemon-status-v1` |
 | Code-health finding | `depgraph-health-finding-v1` |

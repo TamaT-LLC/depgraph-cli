@@ -1230,6 +1230,74 @@ fn semantic_symbol_and_type_nodes_use_their_canonical_identity_hash() {
 }
 
 #[test]
+fn web_source_batch_definition_relations_use_the_logical_profile_identity() {
+    let mut events = rust_semantic_values();
+    let wire_profile = events
+        .iter()
+        .find(|event| event["event"] == "profile_declared")
+        .expect("profile declaration")["profile"]["id"]
+        .as_str()
+        .expect("wire profile ID")
+        .to_owned();
+    let logical_profile = stable_id_from_value(
+        "profile",
+        &json!({
+            "base_profile": "web:base",
+            "contract_version": "depgraph-analysis-unit-v2",
+            "stage": "semantic",
+            "unit_id": "web:unit",
+        }),
+    );
+    let profile = events
+        .iter_mut()
+        .find(|event| event["event"] == "profile_declared")
+        .expect("profile declaration");
+    profile["profile"]["language"] = json!("web");
+    profile["profile"]["properties"]["analysis_unit_contract"] = json!("depgraph-analysis-unit-v2");
+    profile["profile"]["properties"]["analysis_base_profile_id"] = json!("web:base");
+    profile["profile"]["properties"]["analysis_unit_id"] = json!("web:unit");
+    profile["profile"]["properties"]["analysis_stage"] = json!("semantic");
+    profile["profile"]["properties"]["analysis_logical_profile_id"] = json!(logical_profile);
+    for event in events.iter_mut().filter(|event| {
+        matches!(
+            event["event"].as_str(),
+            Some("profile_completed" | "scan_completed")
+        )
+    }) {
+        event["coverage"]["completeness"] = json!(["syntax-complete"]);
+    }
+    for event in events
+        .iter_mut()
+        .filter(|event| event["event"] == "edge_upsert")
+    {
+        let edge = &mut event["edge"];
+        let evidence = &edge["evidence"][0];
+        edge["id"] = json!(stable_id_from_value(
+            "edge",
+            &json!({
+                "condition": edge["condition"],
+                "kind": edge["kind"],
+                "path": evidence["path"],
+                "profile_id": logical_profile,
+                "source": edge["source"],
+                "span": {
+                    "end_column": evidence["end_column"],
+                    "end_line": evidence["end_line"],
+                    "start_column": evidence["start_column"],
+                    "start_line": evidence["start_line"],
+                },
+                "target": edge["target"],
+            }),
+        ));
+        assert_eq!(edge["profile_id"], wire_profile);
+    }
+    resequence(&mut events);
+    let input = values_to_ndjson(events);
+    validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("Web source-batch relations must hash with their logical profile");
+}
+
+#[test]
 fn semantic_type_use_and_direct_call_are_resolved_exact_dependencies() {
     let validated = semantic_fixture();
 

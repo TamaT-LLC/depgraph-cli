@@ -314,7 +314,7 @@ func (e *goSemanticExtractor) addValueReference(
 	primary := evidence[0]
 	siteIdentity := map[string]any{
 		"condition": condition, "kind": "value_reference", "path": primary.Path,
-		"profile_id": e.state.profile.ID, "source": sourceID,
+		"profile_id": e.state.identityProfileID(), "source": sourceID,
 		"span": goSemanticSpan(primary),
 	}
 	site := Site{
@@ -352,7 +352,7 @@ func (e *goSemanticExtractor) failValueReference(path, specifier, reason string,
 	primary := evidence[0]
 	identity := map[string]any{
 		"code": "go_value_reference_unresolved", "path": path,
-		"profile_id": e.state.profile.ID, "reason": reason, "span": goSemanticSpan(primary),
+		"profile_id": e.state.identityProfileID(), "reason": reason, "span": goSemanticSpan(primary),
 	}
 	diagnostic := Diagnostic{
 		ID: stableIDFromValue("diagnostic", identity), Code: "go_value_reference_unresolved",

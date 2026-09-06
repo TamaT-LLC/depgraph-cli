@@ -10,10 +10,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
-    AgentLocator, AgentPolicyText, AgentToken, ContractBuildError, MAX_AGENT_CONDITION_BYTES, Page,
-    PolicyApiChangeId, PolicyConfigDigest, PolicyEvaluationCollectionDigest, PolicyEvaluationId,
-    PolicyViolationId, RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest,
-    SnapshotId, SnapshotName,
+    AgentLocator, AgentPolicyText, AgentToken, AnalysisInputDigest, ContractBuildError,
+    MAX_AGENT_CONDITION_BYTES, Page, PolicyApiChangeId, PolicyConfigDigest,
+    PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
+    RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = depgraph_core::service::MAX_GRAPH_EVIDENCE_ITEMS;
@@ -29,6 +29,11 @@ pub const MAX_AGENT_QUERY_VALUES: usize = depgraph_core::MAX_QUERY_PROJECTIONS;
 pub const MAX_AGENT_ARTIFACT_ITEMS: usize = depgraph_core::service::MAX_SHARED_ARTIFACT_ITEMS;
 pub const MAX_AGENT_CHANGED_FIELDS: usize = 256;
 pub const MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS: usize = 4;
+/// The analysis ledger is bounded at the public boundary even though the
+/// Store can retain more detailed rows.  A scan with more units remains
+/// queryable through the Store and is represented as a contract failure here
+/// instead of allocating an unbounded Agent response.
+pub const MAX_AGENT_ANALYSIS_UNITS: usize = 100_000;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -850,6 +855,748 @@ impl TryFrom<&depgraph_core::service::ScanServiceOutcome> for AgentScanOutcome {
             cache,
             AgentCoverage::try_from(&outcome.coverage)?,
         )
+    }
+}
+
+/// Stage names exposed by the resumable analysis execution contract.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAnalysisStage {
+    Repository,
+    Syntax,
+    Typed,
+    Semantic,
+}
+
+/// Lifecycle state for one planned analysis unit or source batch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAnalysisUnitStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Unanalysed,
+}
+
+/// Bounded progress for one worker unit.  Unit IDs are stable logical IDs;
+/// source-batch chunk IDs are kept in the Store ledger and are deliberately
+/// not duplicated in this progress projection.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAnalysisUnitProgress {
+    unit_id: AgentId,
+    adapter: AgentLabel,
+    status: AgentAnalysisUnitStatus,
+    reused: bool,
+    stage: AgentAnalysisStage,
+    duration_ms: u64,
+    protocol_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<AgentLabel>,
+}
+
+impl AgentAnalysisUnitProgress {
+    #[must_use]
+    pub const fn unit_id(&self) -> &AgentId {
+        &self.unit_id
+    }
+
+    #[must_use]
+    pub const fn adapter(&self) -> &AgentLabel {
+        &self.adapter
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentAnalysisUnitStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn reused(&self) -> bool {
+        self.reused
+    }
+
+    #[must_use]
+    pub const fn stage(&self) -> AgentAnalysisStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub const fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
+    #[must_use]
+    pub const fn protocol_events(&self) -> u64 {
+        self.protocol_events
+    }
+
+    #[must_use]
+    pub const fn failure_reason(&self) -> Option<&AgentLabel> {
+        self.failure_reason.as_ref()
+    }
+}
+
+impl TryFrom<&depgraph_core::analysis_execution::AnalysisUnitProgress>
+    for AgentAnalysisUnitProgress
+{
+    type Error = ContractBuildError;
+
+    fn try_from(
+        source: &depgraph_core::analysis_execution::AnalysisUnitProgress,
+    ) -> Result<Self, Self::Error> {
+        let status = match source.status.as_str() {
+            "queued" => AgentAnalysisUnitStatus::Queued,
+            "running" => AgentAnalysisUnitStatus::Running,
+            "completed" => AgentAnalysisUnitStatus::Completed,
+            "failed" => AgentAnalysisUnitStatus::Failed,
+            "cancelled" => AgentAnalysisUnitStatus::Cancelled,
+            "unanalysed" => AgentAnalysisUnitStatus::Unanalysed,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let stage = match source.stage.as_str() {
+            "repository" => AgentAnalysisStage::Repository,
+            "syntax" => AgentAnalysisStage::Syntax,
+            "typed" => AgentAnalysisStage::Typed,
+            "semantic" => AgentAnalysisStage::Semantic,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        Ok(Self {
+            unit_id: parse_agent_value(&source.unit_id)?,
+            adapter: parse_agent_value(&source.adapter)?,
+            status,
+            reused: source.reused,
+            stage,
+            duration_ms: source.duration_ms,
+            protocol_events: source.protocol_events,
+            failure_reason: parse_optional_agent_value(source.failure_reason.as_deref())?,
+        })
+    }
+}
+
+fn deserialize_analysis_units<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AgentAnalysisUnitProgress>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let units = Vec::<AgentAnalysisUnitProgress>::deserialize(deserializer)?;
+    if units.len() > MAX_AGENT_ANALYSIS_UNITS {
+        return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
+    }
+    Ok(units)
+}
+
+/// Snapshot of all unit progress observed by a scan or daemon attempt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAnalysisProgress {
+    #[schemars(length(max = 100000))]
+    #[serde(deserialize_with = "deserialize_analysis_units")]
+    units: Vec<AgentAnalysisUnitProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<AgentLabel>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentAnalysisProgressWire {
+    #[serde(deserialize_with = "deserialize_analysis_units")]
+    units: Vec<AgentAnalysisUnitProgress>,
+    #[serde(default)]
+    stop_reason: Option<AgentLabel>,
+}
+
+impl<'de> Deserialize<'de> for AgentAnalysisProgress {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentAnalysisProgressWire::deserialize(deserializer)?;
+        Self::new(wire.units, wire.stop_reason).map_err(D::Error::custom)
+    }
+}
+
+impl AgentAnalysisProgress {
+    pub fn new(
+        units: Vec<AgentAnalysisUnitProgress>,
+        stop_reason: Option<AgentLabel>,
+    ) -> Result<Self, ContractBuildError> {
+        if units.len() > MAX_AGENT_ANALYSIS_UNITS {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        let mut ids = BTreeSet::new();
+        if units.iter().any(|unit| !ids.insert(unit.unit_id.clone())) {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self { units, stop_reason })
+    }
+
+    #[must_use]
+    pub fn units(&self) -> &[AgentAnalysisUnitProgress] {
+        &self.units
+    }
+
+    #[must_use]
+    pub const fn stop_reason(&self) -> Option<&AgentLabel> {
+        self.stop_reason.as_ref()
+    }
+}
+
+impl TryFrom<&depgraph_core::analysis_execution::AnalysisExecutionProgress>
+    for AgentAnalysisProgress
+{
+    type Error = ContractBuildError;
+
+    fn try_from(
+        source: &depgraph_core::analysis_execution::AnalysisExecutionProgress,
+    ) -> Result<Self, Self::Error> {
+        let units = source
+            .units
+            .iter()
+            .map(AgentAnalysisUnitProgress::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(
+            units,
+            parse_optional_agent_value(source.stop_reason.as_deref())?,
+        )
+    }
+}
+
+const ANALYSIS_UNIT_CONTRACT_V1: &str = "depgraph-analysis-unit-v1";
+const ANALYSIS_UNIT_CONTRACT_V2: &str = "depgraph-analysis-unit-v2";
+const ANALYSIS_UNIT_CONTRACT_LEGACY: &str = "depgraph-analysis-unit-legacy";
+const ANALYSIS_UNIT_CONTRACT_MIXED: &str = "depgraph-analysis-unit-mixed";
+
+fn supported_analysis_contract(value: &str) -> bool {
+    matches!(
+        value,
+        ANALYSIS_UNIT_CONTRACT_V1
+            | ANALYSIS_UNIT_CONTRACT_V2
+            | ANALYSIS_UNIT_CONTRACT_LEGACY
+            | ANALYSIS_UNIT_CONTRACT_MIXED
+    )
+}
+
+/// Conservative repository-level projection of the durable analysis-unit
+/// ledger. Execution completion and semantic precision are separate facts:
+/// `complete` describes terminal execution of every unit, while
+/// `semantic_complete_units` counts the subset with a verified semantic
+/// result. The counts are checked before publication so an incomplete
+/// execution cannot be represented as complete by an Agent client.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAnalysisCoverage {
+    contract_version: AgentLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_digest: Option<AnalysisInputDigest>,
+    expected_units: u64,
+    completed_units: u64,
+    failed_units: u64,
+    unanalysed_units: u64,
+    cancelled_units: u64,
+    semantic_complete_units: u64,
+    complete: bool,
+    #[schemars(length(max = 1024))]
+    #[serde(deserialize_with = "deserialize_snapshot_metadata")]
+    reasons: Vec<AgentLabel>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentAnalysisCoverageWire {
+    contract_version: AgentLabel,
+    #[serde(default)]
+    plan_id: Option<AgentId>,
+    #[serde(default)]
+    input_digest: Option<AnalysisInputDigest>,
+    expected_units: u64,
+    completed_units: u64,
+    failed_units: u64,
+    unanalysed_units: u64,
+    cancelled_units: u64,
+    semantic_complete_units: u64,
+    complete: bool,
+    #[serde(deserialize_with = "deserialize_snapshot_metadata")]
+    reasons: Vec<AgentLabel>,
+}
+
+impl<'de> Deserialize<'de> for AgentAnalysisCoverage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentAnalysisCoverageWire::deserialize(deserializer)?;
+        Self::new(
+            wire.contract_version,
+            wire.plan_id,
+            wire.input_digest,
+            wire.expected_units,
+            wire.completed_units,
+            wire.failed_units,
+            wire.unanalysed_units,
+            wire.cancelled_units,
+            wire.semantic_complete_units,
+            wire.complete,
+            wire.reasons,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl AgentAnalysisCoverage {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        contract_version: AgentLabel,
+        plan_id: Option<AgentId>,
+        input_digest: Option<AnalysisInputDigest>,
+        expected_units: u64,
+        completed_units: u64,
+        failed_units: u64,
+        unanalysed_units: u64,
+        cancelled_units: u64,
+        semantic_complete_units: u64,
+        complete: bool,
+        reasons: Vec<AgentLabel>,
+    ) -> Result<Self, ContractBuildError> {
+        if !supported_analysis_contract(contract_version.as_str())
+            || completed_units
+                .checked_add(failed_units)
+                .and_then(|value| value.checked_add(unanalysed_units))
+                .and_then(|value| value.checked_add(cancelled_units))
+                != Some(expected_units)
+            || semantic_complete_units > completed_units
+            || (complete
+                && (completed_units != expected_units
+                    || failed_units != 0
+                    || unanalysed_units != 0
+                    || cancelled_units != 0))
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        if reasons.len() > MAX_AGENT_SNAPSHOT_METADATA_ITEMS
+            || reasons.windows(2).any(|window| window[0] >= window[1])
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            contract_version,
+            plan_id,
+            input_digest,
+            expected_units,
+            completed_units,
+            failed_units,
+            unanalysed_units,
+            cancelled_units,
+            semantic_complete_units,
+            complete,
+            reasons,
+        })
+    }
+
+    #[must_use]
+    pub const fn contract_version(&self) -> &AgentLabel {
+        &self.contract_version
+    }
+
+    #[must_use]
+    pub const fn plan_id(&self) -> Option<&AgentId> {
+        self.plan_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn input_digest(&self) -> Option<&AnalysisInputDigest> {
+        self.input_digest.as_ref()
+    }
+
+    #[must_use]
+    pub const fn expected_units(&self) -> u64 {
+        self.expected_units
+    }
+
+    #[must_use]
+    pub const fn completed_units(&self) -> u64 {
+        self.completed_units
+    }
+
+    #[must_use]
+    pub const fn failed_units(&self) -> u64 {
+        self.failed_units
+    }
+
+    #[must_use]
+    pub const fn unanalysed_units(&self) -> u64 {
+        self.unanalysed_units
+    }
+
+    #[must_use]
+    pub const fn cancelled_units(&self) -> u64 {
+        self.cancelled_units
+    }
+
+    #[must_use]
+    pub const fn semantic_complete_units(&self) -> u64 {
+        self.semantic_complete_units
+    }
+
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.complete
+    }
+
+    #[must_use]
+    pub fn reasons(&self) -> &[AgentLabel] {
+        &self.reasons
+    }
+}
+
+impl TryFrom<&depgraph_store::AnalysisCoverageSummary> for AgentAnalysisCoverage {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_store::AnalysisCoverageSummary) -> Result<Self, Self::Error> {
+        Self::new(
+            parse_agent_value(&source.contract_version)?,
+            parse_optional_agent_value(source.plan_id.as_deref())?,
+            parse_optional_agent_value(source.input_digest.as_deref())?,
+            source.expected_units,
+            source.completed_units,
+            source.failed_units,
+            source.unanalysed_units,
+            source.cancelled_units,
+            source.semantic_complete_units,
+            source.complete,
+            parse_agent_values(&source.reasons)?,
+        )
+    }
+}
+
+/// Additive scan outcome contract that can report terminal partial attempts.
+/// The original `AgentScanOutcome` remains the v1 completed-only contract.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScanStatusV2 {
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+    PolicyFailed,
+    SecurityFailed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+enum AgentScanOutcomeContractVersion {
+    #[serde(rename = "depgraph-agent-scan-outcome-v2")]
+    V2,
+}
+
+pub const AGENT_SCAN_OUTCOME_CONTRACT_VERSION: &str = "depgraph-agent-scan-outcome-v2";
+
+/// Versioned scan result used by operation/daemon surfaces that need to
+/// expose a terminal partial attempt while keeping the v1 tool envelope
+/// unchanged for existing clients.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScanOutcomeV2 {
+    contract_version: AgentScanOutcomeContractVersion,
+    scan_id: AgentId,
+    status: AgentScanStatusV2,
+    project_code_executed: bool,
+    cache: AgentScanCacheSummary,
+    coverage: AgentCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_snapshot_id: Option<SnapshotId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis: Option<AgentAnalysisProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis_coverage: Option<AgentAnalysisCoverage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentScanOutcomeV2Wire {
+    contract_version: AgentScanOutcomeContractVersion,
+    scan_id: AgentId,
+    status: AgentScanStatusV2,
+    project_code_executed: bool,
+    cache: AgentScanCacheSummary,
+    coverage: AgentCoverage,
+    #[serde(default)]
+    completed_snapshot_id: Option<SnapshotId>,
+    #[serde(default)]
+    analysis: Option<AgentAnalysisProgress>,
+    #[serde(default)]
+    analysis_coverage: Option<AgentAnalysisCoverage>,
+}
+
+impl<'de> Deserialize<'de> for AgentScanOutcomeV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentScanOutcomeV2Wire::deserialize(deserializer)?;
+        let AgentScanOutcomeContractVersion::V2 = wire.contract_version;
+        Self::new(
+            wire.scan_id,
+            wire.status,
+            wire.project_code_executed,
+            wire.cache,
+            wire.coverage,
+            wire.completed_snapshot_id,
+            wire.analysis,
+            wire.analysis_coverage,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl AgentScanOutcomeV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        scan_id: AgentId,
+        status: AgentScanStatusV2,
+        project_code_executed: bool,
+        cache: AgentScanCacheSummary,
+        coverage: AgentCoverage,
+        completed_snapshot_id: Option<SnapshotId>,
+        analysis: Option<AgentAnalysisProgress>,
+        analysis_coverage: Option<AgentAnalysisCoverage>,
+    ) -> Result<Self, ContractBuildError> {
+        if project_code_executed
+            || coverage.project_code_executed
+            || matches!(status, AgentScanStatusV2::Completed) != completed_snapshot_id.is_some()
+        {
+            return Err(ContractBuildError::AgentDtoValue);
+        }
+        Ok(Self {
+            contract_version: AgentScanOutcomeContractVersion::V2,
+            scan_id,
+            status,
+            project_code_executed,
+            cache,
+            coverage,
+            completed_snapshot_id,
+            analysis,
+            analysis_coverage,
+        })
+    }
+
+    #[must_use]
+    pub const fn contract_version(&self) -> &'static str {
+        AGENT_SCAN_OUTCOME_CONTRACT_VERSION
+    }
+
+    #[must_use]
+    pub const fn scan_id(&self) -> &AgentId {
+        &self.scan_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentScanStatusV2 {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn project_code_executed(&self) -> bool {
+        self.project_code_executed
+    }
+
+    #[must_use]
+    pub const fn cache(&self) -> AgentScanCacheSummary {
+        self.cache
+    }
+
+    #[must_use]
+    pub const fn coverage(&self) -> &AgentCoverage {
+        &self.coverage
+    }
+
+    #[must_use]
+    pub const fn completed_snapshot_id(&self) -> Option<&SnapshotId> {
+        self.completed_snapshot_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn analysis(&self) -> Option<&AgentAnalysisProgress> {
+        self.analysis.as_ref()
+    }
+
+    #[must_use]
+    pub const fn analysis_coverage(&self) -> Option<&AgentAnalysisCoverage> {
+        self.analysis_coverage.as_ref()
+    }
+}
+
+impl TryFrom<&depgraph_core::service::ScanServiceOutcome> for AgentScanOutcomeV2 {
+    type Error = ContractBuildError;
+
+    fn try_from(source: &depgraph_core::service::ScanServiceOutcome) -> Result<Self, Self::Error> {
+        let outcome = source.outcome();
+        let status = match outcome.status.as_str() {
+            "completed" => AgentScanStatusV2::Completed,
+            "partial" => AgentScanStatusV2::Partial,
+            "failed" => AgentScanStatusV2::Failed,
+            "cancelled" => AgentScanStatusV2::Cancelled,
+            "policy_failed" => AgentScanStatusV2::PolicyFailed,
+            "security_failed" => AgentScanStatusV2::SecurityFailed,
+            _ => return Err(ContractBuildError::AgentDtoValue),
+        };
+        let completed_snapshot_id = source
+            .completed_snapshot_id()
+            .map(|snapshot_id| SnapshotId::parse(snapshot_id.as_str()))
+            .transpose()
+            .map_err(|_| ContractBuildError::AgentDtoValue)?;
+        let analysis = outcome
+            .analysis
+            .as_ref()
+            .map(AgentAnalysisProgress::try_from)
+            .transpose()?;
+        let analysis_coverage = outcome
+            .analysis_coverage
+            .as_ref()
+            .map(AgentAnalysisCoverage::try_from)
+            .transpose()?;
+        let cache = AgentScanCacheSummary::new(
+            u64::try_from(
+                outcome
+                    .cache_events
+                    .iter()
+                    .filter(|event| event.outcome == "hit")
+                    .count(),
+            )
+            .map_err(|_| ContractBuildError::AgentDtoValue)?,
+            u64::try_from(
+                outcome
+                    .cache_events
+                    .iter()
+                    .filter(|event| event.outcome == "miss")
+                    .count(),
+            )
+            .map_err(|_| ContractBuildError::AgentDtoValue)?,
+        );
+        Self::new(
+            parse_agent_value(&outcome.scan_id)?,
+            status,
+            outcome.coverage.project_code_executed,
+            cache,
+            AgentCoverage::try_from(&outcome.coverage)?,
+            completed_snapshot_id,
+            analysis,
+            analysis_coverage,
+        )
+    }
+}
+
+#[cfg(test)]
+mod analysis_contract_tests {
+    use super::{
+        AgentAnalysisCoverage, AgentAnalysisProgress, AgentAnalysisStage, AgentAnalysisUnitStatus,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn analysis_coverage_rejects_count_mismatch() {
+        let value = json!({
+            "contract_version": "depgraph-analysis-unit-v2",
+            "expected_units": 2,
+            "completed_units": 1,
+            "failed_units": 0,
+            "unanalysed_units": 0,
+            "cancelled_units": 0,
+            "semantic_complete_units": 1,
+            "complete": true,
+            "reasons": []
+        });
+        assert!(serde_json::from_value::<AgentAnalysisCoverage>(value).is_err());
+    }
+
+    #[test]
+    fn analysis_coverage_separates_terminal_execution_from_semantic_precision() {
+        let mut value = json!({
+            "contract_version": "depgraph-analysis-unit-v2",
+            "expected_units": 1,
+            "completed_units": 1,
+            "failed_units": 0,
+            "unanalysed_units": 0,
+            "cancelled_units": 0,
+            "semantic_complete_units": 0,
+            "complete": true,
+            "reasons": []
+        });
+        let input_digest = format!("sha256:{}", "a".repeat(64));
+        value["input_digest"] = json!(input_digest);
+        let coverage = serde_json::from_value::<AgentAnalysisCoverage>(value)
+            .expect("terminal execution may complete without semantic precision");
+        assert!(coverage.complete());
+        assert_eq!(coverage.completed_units(), 1);
+        assert_eq!(coverage.semantic_complete_units(), 0);
+        assert_eq!(
+            coverage.input_digest().map(|digest| digest.as_str()),
+            Some(input_digest.as_str())
+        );
+
+        let mut legacy_digest = serde_json::to_value(&coverage).expect("coverage serializes");
+        legacy_digest["input_digest"] = json!("a".repeat(64));
+        assert!(serde_json::from_value::<AgentAnalysisCoverage>(legacy_digest).is_err());
+    }
+
+    #[test]
+    fn analysis_progress_rejects_duplicate_unit_ids() {
+        let value = json!({
+            "units": [
+                {"unit_id":"unit:one","adapter":"go","status":"completed","reused":false,"stage":"syntax","duration_ms":1,"protocol_events":2},
+                {"unit_id":"unit:one","adapter":"go","status":"completed","reused":false,"stage":"semantic","duration_ms":1,"protocol_events":2}
+            ]
+        });
+        assert!(serde_json::from_value::<AgentAnalysisProgress>(value).is_err());
+    }
+
+    #[test]
+    fn analysis_progress_conversion_preserves_stage_and_stop_reason() {
+        let source = depgraph_core::analysis_execution::AnalysisExecutionProgress {
+            units: vec![depgraph_core::analysis_execution::AnalysisUnitProgress {
+                unit_id: "unit:one".to_owned(),
+                adapter: "go".to_owned(),
+                status: "cancelled".to_owned(),
+                reused: false,
+                stage: "semantic".to_owned(),
+                duration_ms: 17,
+                protocol_events: 3,
+                failure_reason: None,
+            }],
+            stop_reason: Some("total-budget-exceeded".to_owned()),
+        };
+        let projected = AgentAnalysisProgress::try_from(&source).expect("closed progress");
+        assert_eq!(projected.units()[0].stage(), AgentAnalysisStage::Semantic);
+        assert_eq!(
+            projected.units()[0].status(),
+            AgentAnalysisUnitStatus::Cancelled
+        );
+        assert_eq!(
+            projected.stop_reason().map(|reason| reason.as_str()),
+            Some("total-budget-exceeded")
+        );
+    }
+
+    #[test]
+    fn analysis_progress_accepts_the_go_typed_stage() {
+        let value = json!({
+            "units": [{
+                "unit_id": "unit:one",
+                "adapter": "go",
+                "status": "completed",
+                "reused": false,
+                "stage": "typed",
+                "duration_ms": 2,
+                "protocol_events": 4
+            }]
+        });
+        let progress = serde_json::from_value::<AgentAnalysisProgress>(value)
+            .expect("typed analysis stage is part of the closed progress contract");
+        assert_eq!(progress.units()[0].stage(), AgentAnalysisStage::Typed);
     }
 }
 

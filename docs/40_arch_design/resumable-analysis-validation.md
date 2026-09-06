@@ -1,0 +1,130 @@
+# Resumable analysis integration validation
+
+`cargo xtask resumable-analysis-e2e` builds the CLI and the real Go and Web
+workers, then runs a generated public repository through the shared scheduler
+and Store. CI's existing Go job runs this command on Linux, preserving the
+eight-job identity required by the release evidence verifier. The fixture
+contains no source or configuration copied from a private repository.
+
+The Go application uses a local replacement module and has a separate,
+unrelated module. A nested pnpm workspace contains an application and a shared
+package, with a workspace import, path mapping, a type reference, a re-export,
+and a source cycle. Both Web projects call the TypeScript standard library so
+the public graph also exercises one shared external sentinel across units. The
+test installs no fixture dependencies and executes no fixture code. Its Go
+subprocesses use offline module resolution.
+
+The test compares a scan with 128 files per batch and one worker against a
+scan with one file per batch and two workers. It repeats the second scan in a
+new CLI process and checks checkpoint reuse. Comparison includes the public
+JSON export and the persisted profile, node, site, edge, evidence, diagnostic,
+file coverage, profile coverage, and aggregate coverage records. Only attempt
+and scheduling metadata are outside this graph comparison; graph IDs,
+conditions, source locations, and profile payloads remain intact.
+
+A failed TypeScript project-model chunk publishes bounded fallback metadata:
+an unknown package manager, an empty lockfile, and an empty feature list.
+Canonical profile joining records which metadata fields were observed. It
+treats unobserved fallback values as unknown, carries a known value from a
+successful sibling, and rejects disagreements between known values. A real
+zero count or empty configuration value remains known after a failed sibling
+joins it. Permutation tests verify this distinction across three or more
+chunks, so failed chunks cannot erase previously established context.
+
+The interruption case pauses the real Go worker before SSA, sends SIGINT to
+the CLI, and reads the terminal partial attempt with an explicit `attempt:`
+selector. Validated syntax and typed records must remain readable. A new CLI
+process resumes the same Store, reuses its completed checkpoints, and produces
+the same complete graph as the uninterrupted run.
+
+The Web interruption case pauses the real semantic worker after its syntax
+batch has completed, sends SIGINT, and reads the partial export and health
+findings from the attempt. The wrapper is outside the fixture and keeps the
+same path and bytes for the resumed process; an external sentinel makes only
+the first semantic request stop. The resumed CLI must reuse the Web syntax
+checkpoint, rerun the incomplete semantic stage, and reproduce the complete
+graph. Health findings for the partial attempt must keep `unused-file`
+confidence below `confirmed`.
+
+The Web input identity cases then change `frontend/apps/web/tsconfig.json`
+and verify that the Web application unit is rerun while unrelated workspace
+units remain reusable. The repository-wide Go unit is also rerun because its
+input scope includes ancestor configuration; the independent Go modules keep
+their checkpoints. A fresh scan under the changed configuration must have the
+same graph. After restoring the configuration, a byte-distinct Web worker
+wrapper that delegates to the real artifact must rerun Web units while Go
+units remain reusable, and the resulting graph must still match the baseline.
+
+Selective invalidation is checked against a fresh Store after every kind of
+dependency change. Editing the unrelated Go module must preserve the other
+Go checkpoints. Editing the replacement dependency must rerun that module and
+its importer. Editing the Web shared package must rerun its importing project
+while preserving valid Go results. `deps`, `dependents`, `why`, and `impact`
+must all follow the workspace dependency across project boundaries, with each
+returned edge, condition, profile, and provenance row compared to the
+persisted graph.
+
+Set `DEPGRAPH_RESUMABLE_REPORT` to a file path to retain the compact timing and
+reuse report. `DEPGRAPH_RESUMABLE_KEEP_FIXTURE=1` retains the temporary fixture
+for debugging. The optional `DEPGRAPH_RESUMABLE_GO_ONLY=1` isolates the Go
+boundary; CI runs both adapters and uploads the report as the
+`resumable-analysis-report` artifact.
+
+## Acceptance matrix
+
+The matrix maps the six issue contracts to checks run in this checkout on
+2026-09-06. The full `cargo xtask test` gate passed with Rust 1.93.1, Go 1.26.1,
+Node.js 24.18.0, and pnpm 10.33.0 on macOS arm64. It included 1,787 passing
+Rust tests in 50 suites, Node launcher/release tests, Go race/vet and real-worker
+E2E, Rust real-worker E2E, 269 passing Web tests, and the resumable integration
+fixture. One opt-in Web benchmark test is skipped in the regular suite; its
+separate measured run is documented in the linked benchmark report.
+`pnpm quality` also passed. CI repeats the relevant checks against the PR head
+and retains its integration report separately from these local measurements.
+
+| Issue | Acceptance boundary | Test or command | Evidence status |
+| --- | --- | --- | --- |
+| #459 | Nested workspace discovery, same-name package scopes, exclusions, and static-only operation | `cd workers/web && pnpm test`; `imports.test.ts` tests `repository-root scans discover nested pnpm workspaces and resolve local packages`, `independent nested workspaces keep same-name packages and lock scopes separate`, and `pnpm workspace declarations own their scope and keep exclusions absolute` | Passed in the full Web suite and mixed integration fixture |
+| #462 | Web project batches preserve compiler context, semantic targets, diagnostics, and canonical graph behavior | `cd workers/web && pnpm test`; `analysis-unit.test.ts` (`semantic source batches keep context targets while bounding dependency traversal`, `semantic source batches retain ambient declarations in the full compiler context`, `source batch size and order preserve one canonical graph`); `analysis-unit-issues.test.ts` (`batch semantic issue counts describe emitted diagnostics while context failures stay incomplete`); `DEPGRAPH_WEB_BENCHMARK=1 pnpm exec tsx --test test/analysis-unit-benchmark.test.ts` | Full Web suite, quality, and 1,024-file semantic benchmark passed; canonical joins also pass failed-chunk permutation and shared-external membership regressions |
+| #463 | Go syntax, typed, and semantic prefixes retain module context, local replacements, and stage eligibility | `cd workers/go && GOTOOLCHAIN=local GOFLAGS=-mod=readonly go test ./internal/worker -run 'Test(SyntheticAnalysisUnitCanonicalProjection|ScanAnalysisUnitTypedStage|AnalysisUnitTypedStage)' -count=1 -v`; `go test ./internal/worker -run '^$' -bench '^BenchmarkSyntheticAnalysisUnitLarge$' -benchtime=1x -count=1 -v` | Go race/vet, real-worker E2E, and mixed integration passed; the separately measured 1,024-file benchmark is recorded in Go validation |
+| #464 | Repository-first planning, unit scheduling, interruption/restart, invalidation, and public fixture evidence | `cargo xtask resumable-analysis-e2e` (calls `scripts/resumable-analysis-e2e.mjs`) | Passed: 13 baseline units, 22 split units, and all 22 reused after process restart; interruption and invalidation checks also passed |
+| #466 | Atomic checkpoint publication, failure/cancel retention, resource limits, and Store/journal compatibility | `cargo test -p depgraph-core incomplete_semantics_remain_readable_but_are_not_reused`; `cargo test -p depgraph-core typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa`; `cargo test -p depgraph-store analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger`; `cargo test -p depgraph-store analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors` | Passed in the pinned full Rust gate, including atomic ledger/checkpoint, input-proof snapshot identity, and metadata-only terminal summary regressions |
+| #467 | Cross-unit `deps`, `dependents`, `why`, and `impact`, exact stored provenance, partial selection, and conservative unused confidence | `cargo xtask resumable-analysis-e2e`; query assertions are in `scripts/resumable-analysis-query-assertions.mjs`; `cargo test -p depgraph-core incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles` | Passed: exact cross-workspace query provenance, canonical graph equality, and 8 partial unused-file findings with no confirmed confidence |
+
+The measured public fixture produced 13 profiles, 54 nodes, 111 edges, and
+162 evidence records. Its baseline scan took 11.019 seconds, the split scan
+13.442 seconds, and the fully reused scan 6.782 seconds. These elapsed times
+are observations from this development build, not product performance limits.
+
+The report records unit counts, reuse, graph payload counts, interruption and
+re-execution counters, and elapsed time.
+It does not measure per-stage RSS. The Web 1,024-file benchmark is opt-in, and
+its results remain fixture measurements rather than a CI threshold. The local measurements above
+remain separate from the CI result required before merge.
+
+## Additional boundaries
+
+The integration fixture complements these focused checks:
+
+- [Go validation](analysis-unit-go-validation.md) covers same-name module
+  instances, reversed batch order, a 1,024-file package, typed and SSA progress,
+  and repeated loading of shared compiler inputs.
+- [Web AST bounds](analysis-unit-web-ast-bounds.md) records the 1,024-file
+  project benchmark and the limits of native compiler context reuse.
+- Core executor tests cover inactivity, explicit total budgets, process-group
+  memory, protocol/output limits, cancellation, invalid checkpoints, and a
+  typed checkpoint surviving a failed semantic stage.
+- Store tests cover immutable expected-unit ledgers, atomic unit ingestion,
+  complete stage joins, snapshot seals, migrations, and conservative
+  completeness when a stage or dependency scope is missing.
+  Snapshot identities include the input and analysis proof while excluding
+  whether the proof came from a reused checkpoint. Metadata projection tests
+  deny graph-payload reads while recording incomplete coverage and returning
+  terminal status, diagnostics, and cache events.
+- MCP process tests exercise durable scan submission, client reconnection,
+  terminal v2 results, and completed snapshot naming. Operation journal tests
+  cover recovery and lease races. Daemon tests observe the same executor's
+  live unit progress.
+
+Worker unit tests and the existing Rust workspace, Go race/vet, Web quality,
+protocol/schema, and release compatibility gates remain part of validation.

@@ -733,7 +733,12 @@ pub fn validate_build_contract(protocol: &ValidatedProtocol) -> Result<(), Proto
 /// validated protocol stream.
 pub fn validate_semantic_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
     validate_site_edge_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
-    validate_semantic_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
+    validate_semantic_maps(
+        &protocol.profiles,
+        &protocol.nodes,
+        &protocol.edges,
+        &protocol.sites,
+    )?;
     validate_cross_language_maps(
         &protocol.profiles,
         &protocol.nodes,
@@ -834,7 +839,8 @@ pub fn validate_semantic_graph_maps(
     sites: &BTreeMap<String, DependencySite>,
 ) -> Result<(), ProtocolError> {
     validate_site_edge_maps(nodes, edges, sites)?;
-    validate_semantic_maps(nodes, edges, sites)
+    let profiles = BTreeMap::new();
+    validate_semantic_maps(&profiles, nodes, edges, sites)
 }
 
 fn validate_site_edge_maps(
@@ -1038,7 +1044,98 @@ fn validate_site_edge_maps(
     Ok(())
 }
 
+const SOURCE_BATCH_CONTRACT_VERSION: &str = "depgraph-analysis-unit-v2";
+
+/// Returns the profile namespace used by stable semantic graph identities.
+///
+/// Source-batch workers keep a wire profile per chunk so the protocol can
+/// attribute coverage and diagnostics to an execution. Graph identities must
+/// remain stable across chunks, however, so v2 declarations carry the
+/// chunk-independent logical profile ID. Validate the alias here, at the
+/// protocol boundary, before using it for any identity check.
+pub fn semantic_identity_profile_id(
+    profile_id: &str,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<String, ProtocolError> {
+    let Some(profile) = profiles.get(profile_id) else {
+        return Ok(profile_id.to_owned());
+    };
+    let Some(contract) = profile
+        .properties
+        .get("analysis_unit_contract")
+        .and_then(Value::as_str)
+    else {
+        return Ok(profile_id.to_owned());
+    };
+    if contract != SOURCE_BATCH_CONTRACT_VERSION {
+        return Ok(profile_id.to_owned());
+    }
+    let property = |key: &str| {
+        profile
+            .properties
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let base = property("analysis_base_profile_id").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "source-batch profile {profile_id} omitted analysis_base_profile_id"
+        ))
+    })?;
+    let unit = property("analysis_unit_id").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "source-batch profile {profile_id} omitted analysis_unit_id"
+        ))
+    })?;
+    let stage = property("analysis_stage").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "source-batch profile {profile_id} omitted analysis_stage"
+        ))
+    })?;
+    if !matches!(stage, "syntax" | "semantic") {
+        return invariant(format!(
+            "source-batch profile {profile_id} has unsupported analysis_stage {stage:?}"
+        ));
+    }
+    let logical = property("analysis_logical_profile_id").ok_or_else(|| {
+        ProtocolError::Invariant(format!(
+            "source-batch profile {profile_id} omitted analysis_logical_profile_id"
+        ))
+    })?;
+    let expected = match profile.language.as_str() {
+        "web" | "typescript" | "javascript" => stable_id_from_value(
+            "profile",
+            &json!({
+                "base_profile": base,
+                "contract_version": SOURCE_BATCH_CONTRACT_VERSION,
+                "stage": stage,
+                "unit_id": unit,
+            }),
+        ),
+        "go" => stable_id_from_value(
+            "profile",
+            &json!({
+                "kind": "profile",
+                "workspace": "go-analysis-unit-v2-logical",
+                "parts": [base, unit, stage],
+            }),
+        ),
+        language => {
+            return invariant(format!(
+                "source-batch profile {profile_id} has unsupported language {language:?}"
+            ));
+        }
+    };
+    if logical != expected {
+        return invariant(format!(
+            "source-batch profile {profile_id} logical profile does not match its unit and stage; expected {expected}"
+        ));
+    }
+    Ok(logical.to_owned())
+}
+
 fn validate_semantic_maps(
+    profiles: &BTreeMap<String, Profile>,
     nodes: &BTreeMap<String, GraphNode>,
     edges: &BTreeMap<String, GraphEdge>,
     sites: &BTreeMap<String, DependencySite>,
@@ -1088,7 +1185,8 @@ fn validate_semantic_maps(
             )?;
             continue;
         }
-        validate_semantic_edge(edge, linked_to_strict_site)?;
+        let logical_profile_id = semantic_identity_profile_id(&edge.profile_id, profiles)?;
+        validate_semantic_edge(edge, linked_to_strict_site, &logical_profile_id)?;
 
         if is_semantic_definition_relation(edge) {
             validate_definition_relation_endpoints(nodes, edge)?;
@@ -1119,7 +1217,8 @@ fn validate_semantic_maps(
 
     for site in sites.values() {
         let strict_dependency_site = strict_dependency_sites.contains(site.id.as_str());
-        validate_semantic_site(site, strict_dependency_site)?;
+        let logical_profile_id = semantic_identity_profile_id(&site.profile_id, profiles)?;
+        validate_semantic_site(site, strict_dependency_site, &logical_profile_id)?;
         if source_fallback_edge_kind_for_site(site).is_some() {
             validate_source_fallback_site(nodes, site)?;
             continue;
@@ -2286,9 +2385,10 @@ fn validate_identity_span(span: &Value, node_id: &str) -> Result<(), ProtocolErr
 fn validate_semantic_edge(
     edge: &GraphEdge,
     linked_to_strict_site: bool,
+    logical_profile_id: &str,
 ) -> Result<(), ProtocolError> {
     if is_semantic_definition_relation(edge) {
-        return validate_semantic_definition_relation(edge);
+        return validate_semantic_definition_relation(edge, logical_profile_id);
     }
     if !is_common_semantic_edge_kind(edge.kind.as_str())
         && !linked_to_strict_site
@@ -2359,7 +2459,10 @@ fn validate_semantic_edge(
     Ok(())
 }
 
-fn validate_semantic_definition_relation(edge: &GraphEdge) -> Result<(), ProtocolError> {
+fn validate_semantic_definition_relation(
+    edge: &GraphEdge,
+    logical_profile_id: &str,
+) -> Result<(), ProtocolError> {
     if edge.phase != Phase::Semantic {
         return invariant(format!(
             "semantic definition relation {} of kind {} must use phase=semantic",
@@ -2388,7 +2491,7 @@ fn validate_semantic_definition_relation(edge: &GraphEdge) -> Result<(), Protoco
             "condition": edge.condition.canonicalized(),
             "kind": edge.kind,
             "path": primary.path.as_deref().expect("complete semantic evidence path"),
-            "profile_id": edge.profile_id,
+            "profile_id": logical_profile_id,
             "source": edge.source,
             "span": {
                 "end_column": primary.end_column.expect("complete semantic evidence span"),
@@ -2411,6 +2514,7 @@ fn validate_semantic_definition_relation(edge: &GraphEdge) -> Result<(), Protoco
 fn validate_semantic_site(
     site: &DependencySite,
     strict_dependency_site: bool,
+    logical_profile_id: &str,
 ) -> Result<(), ProtocolError> {
     if semantic_edge_kind_for_site(site, strict_dependency_site).is_none() {
         return Ok(());
@@ -2505,7 +2609,7 @@ fn validate_semantic_site(
             "condition": site.condition.canonicalized(),
             "kind": site.kind,
             "path": path,
-            "profile_id": site.profile_id,
+            "profile_id": logical_profile_id,
             "source": site.source,
             "span": {
                 "end_column": primary.end_column.expect("complete span"),

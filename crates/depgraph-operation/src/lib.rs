@@ -46,9 +46,11 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 /// SQLite schema version owned by this crate.
-pub const JOURNAL_SCHEMA_VERSION: i64 = 5;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 6;
 /// Portable durable-operation record and recovery contract shipped to Agent hosts.
-pub const OPERATION_CONTRACT_VERSION: &str = "depgraph-operation-v1";
+pub const OPERATION_CONTRACT_VERSION: &str = "depgraph-operation-v2";
+const BOUNDED_SCAN_JOURNAL_SCHEMA_VERSION: i64 = 5;
+const UNBOUNDED_SCAN_DEADLINE_MS: i64 = depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64;
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION: i64 = 3;
@@ -537,7 +539,8 @@ fn canonical_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<Stri
     String::from_utf8(bytes).map_err(|_| JournalError::InvalidArgument)
 }
 
-/// Bounded operation progress. The journal rejects regressions and total changes.
+/// Bounded, monotonic operation progress. Scan discovery may replace its initial
+/// 0/1 estimate once, before any unit finishes; the discovered total stays fixed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationProgress {
     completed_units: u64,
@@ -798,6 +801,10 @@ impl SubmitRequest {
         idempotency_key: impl AsRef<[u8]>,
         execution_deadline_ms: i64,
     ) -> Result<Self, JournalError> {
+        if execution_deadline_ms == UNBOUNDED_SCAN_DEADLINE_MS && kind != OperationKind::ScanSubmit
+        {
+            return Err(JournalError::InvalidArgument);
+        }
         let root_seal = config.repository_root_seal();
         validate_live_root(&root_seal)?;
         let required = kind.capability_profile().required_capabilities();
@@ -1607,12 +1614,19 @@ impl OperationJournal {
                 validate_v4_schema(&transaction)?;
                 true
             }
+            BOUNDED_SCAN_JOURNAL_SCHEMA_VERSION => {
+                validate_v5_schema(&transaction)?;
+                true
+            }
             JOURNAL_SCHEMA_VERSION => {
                 validate_schema(&transaction)?;
                 true
             }
             _ => return Err(JournalError::UnsupportedSchemaVersion),
         };
+        if version < JOURNAL_SCHEMA_VERSION {
+            validate_legacy_deadlines(&transaction)?;
+        }
         validate_foreign_keys(&transaction)?;
         validate_no_operation_tombstone_overlap(&transaction)?;
         validate_operation_handoff_cardinality(&transaction)?;
@@ -1714,7 +1728,9 @@ impl OperationJournal {
         }
         let retain_until_ms = checked_add(request.execution_deadline_ms, TERMINAL_RETENTION_MS)?;
         let maximum_retain_until_ms = checked_add(now_ms, MAX_TASK_TTL_MS_I64)?;
-        if retain_until_ms > maximum_retain_until_ms {
+        if retain_until_ms > maximum_retain_until_ms
+            && request.execution_deadline_ms != UNBOUNDED_SCAN_DEADLINE_MS
+        {
             return Err(JournalError::InvalidArgument);
         }
 
@@ -2141,15 +2157,18 @@ impl OperationJournal {
         if cancelling != 1 {
             return Err(JournalError::IntegrityFailure);
         }
-        let retain_until_ms = record
-            .retain_until_ms
-            .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+        let (retention_anchor_ms, retain_until_ms) = terminal_retention(&record, now_ms)?;
         let updated = transaction.execute(
             "UPDATE operations
              SET status='cancelled', updated_at_ms=?1, terminal_at_ms=?1,
-                 retain_until_ms=?2
+                 retain_until_ms=?2, retention_anchor_ms=?4
              WHERE operation_id=?3 AND status='cancelling'",
-            params![now_ms, retain_until_ms, operation_id.as_str()],
+            params![
+                now_ms,
+                retain_until_ms,
+                operation_id.as_str(),
+                retention_anchor_ms
+            ],
         )?;
         if updated != 1 {
             return Err(JournalError::IntegrityFailure);
@@ -2333,19 +2352,25 @@ impl OperationJournal {
             return Err(JournalError::InvalidTransition);
         }
         validate_active_lease(&record, token_digest, now_ms)?;
-        if progress.total_units != record.progress.total_units
+        let initializes_scan_plan = record.kind == OperationKind::ScanSubmit
+            && record.progress.total_units == 1
+            && record.progress.completed_units == 0
+            && progress.completed_units == 0
+            && progress.total_units > 1;
+        if (progress.total_units != record.progress.total_units && !initializes_scan_plan)
             || progress.completed_units < record.progress.completed_units
         {
             return Err(JournalError::InvalidArgument);
         }
         transaction.execute(
             "UPDATE operations
-             SET progress_completed = ?1, updated_at_ms = ?2
+             SET progress_completed = ?1, updated_at_ms = ?2, progress_total = ?4
              WHERE operation_id = ?3",
             params![
                 u64_to_i64(progress.completed_units)?,
                 now_ms,
-                operation_id.as_str()
+                operation_id.as_str(),
+                u64_to_i64(progress.total_units)?,
             ],
         )?;
         let record = select_validated_by_id(&transaction, operation_id)?;
@@ -2563,7 +2588,11 @@ impl OperationJournal {
         let record =
             load_completion_intent_record(&transaction, repository_id, operation_id, now_ms)?;
         validate_completion_intent(&record, &intent, now_ms)?;
-        let retention_anchor_ms = record.retention_anchor_ms.max(now_ms);
+        let retention_anchor_ms = if record.execution_deadline_ms == UNBOUNDED_SCAN_DEADLINE_MS {
+            now_ms
+        } else {
+            record.retention_anchor_ms.max(now_ms)
+        };
         let retain_until_ms = checked_add(retention_anchor_ms, TERMINAL_RETENTION_MS)?;
         let updated = transaction.execute(
             "UPDATE operations
@@ -2920,9 +2949,7 @@ impl OperationJournal {
             return Err(JournalError::InvalidTransition);
         }
         validate_active_lease(&record, token_digest, now_ms)?;
-        let retain_until_ms = record
-            .retain_until_ms
-            .max(checked_add(now_ms, TERMINAL_RETENTION_MS)?);
+        let (retention_anchor_ms, retain_until_ms) = terminal_retention(&record, now_ms)?;
         let progress_completed = if status == OperationStatus::Completed {
             record.progress.total_units
         } else {
@@ -2934,7 +2961,7 @@ impl OperationJournal {
                  result_json = ?3, error_json = ?4,
                  lease_owner = NULL, lease_token_digest = NULL,
                  lease_expires_at_ms = NULL, updated_at_ms = ?5,
-                 terminal_at_ms = ?5, retain_until_ms = ?6
+                 terminal_at_ms = ?5, retain_until_ms = ?6, retention_anchor_ms = ?9
              WHERE operation_id = ?7 AND status = ?8",
             params![
                 status.as_str(),
@@ -2945,6 +2972,7 @@ impl OperationJournal {
                 retain_until_ms,
                 operation_id.as_str(),
                 record.status.as_str(),
+                retention_anchor_ms,
             ],
         )?;
         if updated != 1 {
@@ -3006,6 +3034,9 @@ impl OperationJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_live_root(&root_seal)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 0 && version < JOURNAL_SCHEMA_VERSION {
+            validate_legacy_deadlines(&transaction)?;
+        }
         if version == 0 {
             transaction.execute_batch(&schema_current_base()?)?;
             transaction.execute_batch(SCHEMA_V2_METADATA)?;
@@ -3051,6 +3082,13 @@ impl OperationJournal {
             migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
         } else if version == RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION {
             migrate_v4_to_v5(&transaction, &root_seal, &repository_id)?;
+        } else if version == BOUNDED_SCAN_JOURNAL_SCHEMA_VERSION {
+            validate_v5_schema(&transaction)?;
+            validate_repository_binding(&transaction, JournalDigest(root_seal.binding_digest()))?;
+            validate_connection_integrity(&transaction)?;
+            validate_foreign_keys(&transaction)?;
+            validate_journal_rows(&transaction, &repository_id, true, true)?;
+            transaction.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)?;
         } else if version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::UnsupportedSchemaVersion);
         } else {
@@ -3543,6 +3581,36 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
     validate_schema_surface(connection, true, true, true, &schema_current_base()?)
 }
 
+fn validate_legacy_deadlines(connection: &Connection) -> Result<(), JournalError> {
+    let unbounded: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE execution_deadline_ms=?1)",
+        params![UNBOUNDED_SCAN_DEADLINE_MS],
+        |row| row.get(0),
+    )?;
+    if unbounded {
+        return Err(JournalError::IntegrityFailure);
+    }
+    Ok(())
+}
+
+fn validate_v5_schema(connection: &Connection) -> Result<(), JournalError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != BOUNDED_SCAN_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    validate_legacy_deadlines(connection)?;
+    validate_schema_surface(connection, true, true, true, &schema_current_base()?)
+}
+
+fn terminal_retention(record: &OperationRecord, now_ms: i64) -> Result<(i64, i64), JournalError> {
+    let anchor = if record.execution_deadline_ms == UNBOUNDED_SCAN_DEADLINE_MS {
+        now_ms
+    } else {
+        record.retention_anchor_ms.max(now_ms)
+    };
+    Ok((anchor, checked_add(anchor, TERMINAL_RETENTION_MS)?))
+}
+
 fn validate_v4_schema(connection: &Connection) -> Result<(), JournalError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != RETENTION_ANCHOR_JOURNAL_SCHEMA_VERSION {
@@ -3766,6 +3834,7 @@ fn migrate_v4_to_v5(
     repository_id: &LogicalRepositoryId,
 ) -> Result<(), JournalError> {
     validate_v4_schema(connection)?;
+    validate_legacy_deadlines(connection)?;
     validate_repository_binding(connection, JournalDigest(root_seal.binding_digest()))?;
     validate_connection_integrity(connection)?;
     validate_foreign_keys(connection)?;
@@ -4997,6 +5066,10 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
     let input_digest = normalized_input.digest();
     let idempotency_key_digest = JournalDigest::from_database(raw.idempotency_key_digest)?;
     let status = OperationStatus::parse(&raw.status)?;
+    let unbounded = raw.execution_deadline_ms == UNBOUNDED_SCAN_DEADLINE_MS;
+    if unbounded && kind != OperationKind::ScanSubmit {
+        return Err(JournalError::IntegrityFailure);
+    }
     let progress = OperationProgress::new(
         i64_to_u64(raw.progress_completed)?,
         i64_to_u64(raw.progress_total)?,
@@ -5012,8 +5085,14 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
     if raw.updated_at_ms < raw.created_at_ms
         || raw.updated_at_ms > raw.execution_deadline_ms
         || raw.execution_deadline_ms <= raw.created_at_ms
-        || submitted_retain_until_ms > maximum_submitted_retain_until_ms
-        || raw.retention_anchor_ms < raw.execution_deadline_ms
+        || (!unbounded && submitted_retain_until_ms > maximum_submitted_retain_until_ms)
+        || (!unbounded && raw.retention_anchor_ms < raw.execution_deadline_ms)
+        || (unbounded
+            && !status.is_terminal()
+            && raw.retention_anchor_ms != raw.execution_deadline_ms)
+        || (unbounded
+            && status.is_terminal()
+            && raw.retention_anchor_ms == raw.execution_deadline_ms)
         || raw.retain_until_ms != anchored_retain_until_ms
     {
         return Err(JournalError::IntegrityFailure);
@@ -5083,7 +5162,7 @@ fn decode_operation(raw: RawOperation) -> Result<OperationRecord, JournalError> 
         return Err(JournalError::IntegrityFailure);
     }
     if raw.retention_anchor_ms != raw.execution_deadline_ms
-        && (status != OperationStatus::Completed || raw.terminal_at_ms.is_none())
+        && ((!unbounded && status != OperationStatus::Completed) || raw.terminal_at_ms.is_none())
     {
         // Only completion decisions can be recovered after their submitted
         // retention window. The separately durable anchor keeps that late

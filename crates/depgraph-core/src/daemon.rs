@@ -557,6 +557,10 @@ pub struct DaemonScanOutcome {
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
     pub invalidation_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<crate::analysis_execution::AnalysisExecutionProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_coverage: Option<depgraph_store::AnalysisCoverageSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_trace: Option<DaemonIncrementalTrace>,
 }
 
@@ -584,6 +588,10 @@ pub struct DaemonAttempt {
     pub invalidation_plan: Option<IncrementalInvalidationPlan>,
     pub invalidation_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<crate::analysis_execution::AnalysisExecutionProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_coverage: Option<depgraph_store::AnalysisCoverageSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_trace: Option<DaemonIncrementalTrace>,
     pub error: Option<String>,
 }
@@ -598,6 +606,8 @@ pub struct DaemonStatus {
     pub debounce_milliseconds: u64,
     pub pending_change_count: usize,
     pub active_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_analysis: Option<crate::analysis_execution::AnalysisExecutionProgress>,
     pub last_completed_attempt: Option<DaemonAttempt>,
     pub last_failed_attempt: Option<DaemonAttempt>,
     pub last_cancelled_attempt: Option<DaemonAttempt>,
@@ -819,11 +829,18 @@ impl DaemonScanRunner for RepositoryScanRunner {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    analysis: None,
+                    analysis_coverage: None,
                     incremental_trace: None,
                 });
             }
             let mut store = open_store(&store_path)?;
             let base_snapshot_id = store.current_snapshot_id()?;
+            let base_uses_analysis_units = base_snapshot_id
+                .as_deref()
+                .map(|id| store.completed_snapshot_uses_analysis_units(id))
+                .transpose()?
+                .unwrap_or(false);
             let current_profile_plan_id =
                 plan_repository_profiles(&root, &config, None)?.plan.plan_id;
             let base_profile_plan_id = base_snapshot_id
@@ -834,8 +851,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 .map(|profiles| profile_records_profile_plan_id(profiles))
                 .transpose()?
                 .flatten();
-            let mut force_full_scan =
-                base_profile_plan_id.as_deref() != Some(current_profile_plan_id.as_str());
+            let mut force_full_scan = base_uses_analysis_units
+                || base_profile_plan_id.as_deref() != Some(current_profile_plan_id.as_str());
             if let (Some(base_snapshot_id), Some(path)) = (
                 base_snapshot_id.as_deref().filter(|_| !force_full_scan),
                 semantic_noop_change_path(&request.changes),
@@ -920,6 +937,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                             base_snapshot_id: Some(base_snapshot_id.to_owned()),
                                             invalidation_plan: Some(plan),
                                             invalidation_error: None,
+                                            analysis: None,
+                                            analysis_coverage: None,
                                             incremental_trace: Some(DaemonIncrementalTrace {
                                                 schema_version:
                                                     DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
@@ -949,6 +968,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                             invalidation_error: Some(format!(
                                                 "semantic no-op delta failed: {error:#}"
                                             )),
+                                            analysis: None,
+                                            analysis_coverage: None,
                                             incremental_trace: None,
                                         });
                                     }
@@ -976,6 +997,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                 invalidation_error: Some(format!(
                                     "semantic no-op worker failed: {error:#}"
                                 )),
+                                analysis: None,
+                                analysis_coverage: None,
                                 incremental_trace: None,
                             });
                         }
@@ -983,7 +1006,9 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 }
             }
             let (invalidation_plan, invalidation_error) = if let Some(base_snapshot_id) =
-                base_snapshot_id.as_deref()
+                base_snapshot_id
+                    .as_deref()
+                    .filter(|_| !base_uses_analysis_units)
             {
                 let snapshot = store.load_completed_snapshot(base_snapshot_id)?;
                 match plan_incremental_invalidation(base_snapshot_id, &snapshot, &request.changes) {
@@ -1126,6 +1151,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                             base_snapshot_id: Some(base_snapshot_id.to_owned()),
                                             invalidation_plan: Some(plan.clone()),
                                             invalidation_error: Some(message),
+                                            analysis: None,
+                                            analysis_coverage: None,
                                             incremental_trace: None,
                                         });
                                     }
@@ -1149,6 +1176,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                 invalidation_error: Some(format!(
                                     "incremental worker failed: {error:#}"
                                 )),
+                                analysis: None,
+                                analysis_coverage: None,
                                 incremental_trace: None,
                             });
                         }
@@ -1183,6 +1212,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 base_snapshot_id,
                 invalidation_plan,
                 invalidation_error,
+                analysis: outcome.analysis,
+                analysis_coverage: outcome.analysis_coverage,
                 incremental_trace: None,
             })
         })
@@ -1338,6 +1369,8 @@ fn cancelled_daemon_outcome(
         base_snapshot_id: Some(base_snapshot_id.to_owned()),
         invalidation_plan,
         invalidation_error: None,
+        analysis: None,
+        analysis_coverage: None,
         incremental_trace: None,
     }
 }
@@ -1361,6 +1394,8 @@ fn daemon_outcome_from_scan(
         base_snapshot_id: Some(base_snapshot_id.to_owned()),
         invalidation_plan: Some(invalidation_plan),
         invalidation_error,
+        analysis: outcome.analysis,
+        analysis_coverage: outcome.analysis_coverage,
         incremental_trace: None,
     })
 }
@@ -1469,6 +1504,7 @@ fn start_daemon_with_runner_and_lock(
         stopped_at: None,
         debounce_milliseconds: config.debounce_milliseconds,
         pending_change_count: 0,
+        active_analysis: None,
         active_attempt_id: None,
         last_completed_attempt: None,
         last_failed_attempt: None,
@@ -1631,6 +1667,8 @@ struct ActiveAttempt {
     completion: oneshot::Receiver<Result<DaemonScanOutcome>>,
     task: JoinHandle<()>,
     shutdown_flush: bool,
+    observer: crate::analysis_execution::AnalysisProgressObserver,
+    observed_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1656,6 +1694,8 @@ async fn run_daemon_loop(
     let mut consecutive_failures = 0_u32;
     let mut watcher_open = true;
     let mut pending_watcher_event = None;
+    let mut progress_ticks = tokio::time::interval(Duration::from_millis(250));
+    progress_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if active.is_none()
@@ -1692,6 +1732,15 @@ async fn run_daemon_loop(
         let timer = sleep_until(timer_deadline);
         tokio::pin!(timer);
         tokio::select! {
+            _ = progress_ticks.tick(), if active.is_some() => {
+                let active = active.as_mut().expect("active attempt is guarded");
+                let revision = active.observer.revision();
+                if revision != active.observed_revision {
+                    active.observed_revision = revision;
+                    status.active_analysis = Some(active.observer.snapshot());
+                    publish_status(&status_sender, &status);
+                }
+            }
             _ = &mut stop_receiver, if !stopping => {
                 stopping = true;
                 deadline = None;
@@ -1795,6 +1844,7 @@ async fn run_daemon_loop(
                     }
                 }
                 status.active_attempt_id = None;
+                status.active_analysis = None;
                 status.pending_change_count = coalescer.len();
                 status.phase = if stopping {
                     DaemonPhase::Stopping
@@ -1818,6 +1868,7 @@ async fn run_daemon_loop(
     status.phase = DaemonPhase::Stopped;
     status.stopped_at = Some(timestamp());
     status.active_attempt_id = None;
+    status.active_analysis = None;
     status.pending_change_count = 0;
     publish_status(&status_sender, &status);
     status
@@ -1835,11 +1886,17 @@ fn spawn_attempt(
     };
     let cancellation = CancellationToken::new();
     let (sender, completion) = oneshot::channel();
+    let observer = crate::analysis_execution::AnalysisProgressObserver::default();
     let task = tokio::spawn({
         let request = request.clone();
         let cancellation = cancellation.clone();
+        let observer = observer.clone();
         async move {
-            let result = runner.run(request, cancellation).await;
+            let result = crate::analysis_execution::observe_analysis_progress(
+                observer,
+                runner.run(request, cancellation),
+            )
+            .await;
             let _ = sender.send(result);
         }
     });
@@ -1849,6 +1906,8 @@ fn spawn_attempt(
         completion,
         task,
         shutdown_flush,
+        observer,
+        observed_revision: 0,
     }
 }
 
@@ -1877,6 +1936,8 @@ fn record_attempt(
             completed_snapshot_id: outcome.completed_snapshot_id,
             invalidation_plan: outcome.invalidation_plan,
             invalidation_error: outcome.invalidation_error,
+            analysis: outcome.analysis,
+            analysis_coverage: outcome.analysis_coverage,
             incremental_trace: outcome.incremental_trace,
             error: None,
         },
@@ -1891,6 +1952,8 @@ fn record_attempt(
             completed_snapshot_id: None,
             invalidation_plan: None,
             invalidation_error: None,
+            analysis: None,
+            analysis_coverage: None,
             incremental_trace: None,
             error: Some(format!("{error:#}")),
         },
@@ -1942,6 +2005,8 @@ mod tests {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    analysis: None,
+                    analysis_coverage: None,
                     incremental_trace: None,
                 })
             })
@@ -1972,6 +2037,8 @@ mod tests {
                         base_snapshot_id: Some("stable-snapshot".to_owned()),
                         invalidation_plan: None,
                         invalidation_error: None,
+                        analysis: None,
+                        analysis_coverage: None,
                         incremental_trace: None,
                     });
                 }
@@ -1985,6 +2052,8 @@ mod tests {
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
                     invalidation_plan: None,
                     invalidation_error: None,
+                    analysis: None,
+                    analysis_coverage: None,
                     incremental_trace: None,
                 })
             })
@@ -2015,6 +2084,8 @@ mod tests {
                         base_snapshot_id: Some("stable-snapshot".to_owned()),
                         invalidation_plan: None,
                         invalidation_error: None,
+                        analysis: None,
+                        analysis_coverage: None,
                         incremental_trace: None,
                     });
                 }
@@ -2025,6 +2096,8 @@ mod tests {
                     base_snapshot_id: Some("stable-snapshot".to_owned()),
                     invalidation_plan: None,
                     invalidation_error: None,
+                    analysis: None,
+                    analysis_coverage: None,
                     incremental_trace: None,
                 })
             })
@@ -2054,6 +2127,8 @@ mod tests {
                     base_snapshot_id: None,
                     invalidation_plan: None,
                     invalidation_error: None,
+                    analysis: None,
+                    analysis_coverage: None,
                     incremental_trace: None,
                 })
             })
@@ -2181,12 +2256,29 @@ mod tests {
     const FIXTURE_PROFILE_ID: &str = "web:fixture";
 
     fn seed_incremental_store(root: &Path, store_path: &Path) -> Result<String> {
+        seed_incremental_store_with_analysis(root, store_path, false)
+    }
+
+    fn seed_incremental_store_with_analysis(
+        root: &Path,
+        store_path: &Path,
+        analysis: bool,
+    ) -> Result<String> {
         let mut store = open_store(store_path)?;
         let profile_plan_id = plan_repository_profiles(root, &Config::default(), None)?
             .plan
             .plan_id;
         let scan_id = "incremental-base";
         store.start_scan(scan_id, root, false)?;
+        if analysis {
+            store.initialize_analysis_unit_ledger(
+                scan_id,
+                "depgraph-analysis-unit-v2",
+                Some("plan"),
+                Some("input"),
+                &[],
+            )?;
+        }
         let common = |event: &str, seq: u64| {
             serde_json::json!({
                 "event": event,
@@ -2858,6 +2950,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analysis_unit_snapshot_uses_resumable_scheduler_without_legacy_delta() -> Result<()> {
+        struct RejectLegacyDelta;
+        impl IncrementalWorkerExecutor for RejectLegacyDelta {
+            fn run(
+                &self,
+                _root: PathBuf,
+                _config: Config,
+                _request: WorkerDeltaRequest,
+                _cancellation: CancellationToken,
+            ) -> IncrementalWorkerFuture {
+                Box::pin(async { panic!("analysis-unit snapshot reached a legacy delta worker") })
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base = seed_incremental_store_with_analysis(root.path(), &store_path, true)?;
+        let runner = RepositoryScanRunner::new(
+            root.path().to_path_buf(),
+            store_path.clone(),
+            Config::default(),
+            false,
+        )
+        .with_incremental_worker(Arc::new(RejectLegacyDelta));
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "analysis-replay".into(),
+                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.base_snapshot_id.as_deref(), Some(base.as_str()));
+        assert_ne!(
+            outcome.completed_snapshot_id.as_deref(),
+            Some(base.as_str())
+        );
+        assert!(outcome.invalidation_plan.is_none());
+        assert!(outcome.invalidation_error.is_none());
+        assert!(
+            outcome.analysis.is_some(),
+            "daemon did not use the shared analysis executor"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn legacy_worker_uses_the_atomic_full_scan_fallback() -> Result<()> {
         let root = tempfile::tempdir()?;
         let store_path = root.path().join("graph.db");
@@ -2887,6 +3028,139 @@ mod tests {
         );
         assert!(outcome.invalidation_error.is_none());
         assert!(outcome.completed_snapshot_id.is_some());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_publishes_active_executor_progress_and_retains_final_progress() -> Result<()> {
+        use crate::analysis_execution::{
+            AnalysisExecutionContext, AnalysisWorkItem, execute_analysis_units,
+        };
+        use crate::worker::{AdapterKind, WorkerSpec};
+
+        struct ProgressRunner {
+            root: PathBuf,
+            worker: PathBuf,
+        }
+        impl DaemonScanRunner for ProgressRunner {
+            fn run(
+                &self,
+                _request: DaemonScanRequest,
+                cancellation: CancellationToken,
+            ) -> DaemonScanFuture {
+                let root = self.root.clone();
+                let worker = self.worker.clone();
+                Box::pin(async move {
+                    let mut store = depgraph_store::Store::open_in_memory()?;
+                    let config = Config::default();
+                    let work = vec![AnalysisWorkItem {
+                        unit_id: "go:repository".into(),
+                        request: None,
+                        checkpoint_key: None,
+                        spec: WorkerSpec {
+                            adapter: AdapterKind::Go,
+                            program: "node".into(),
+                            leading_args: vec![worker.clone().into_os_string()],
+                            display: "progress fixture".into(),
+                            artifact_path: worker,
+                            runtime_requirement: None,
+                            expected_version: None,
+                            release_attested: false,
+                            attested_rust_sysroot: None,
+                        },
+                    }];
+                    let analysis = execute_analysis_units(
+                        &mut store,
+                        &AnalysisExecutionContext {
+                            root: &root,
+                            scan_id: "daemon-progress",
+                            config: &config,
+                            cache_mode: ScanCacheMode::Disabled,
+                            cancellation: &cancellation,
+                        },
+                        work,
+                        |_, _, output| Ok(output.error.is_none()),
+                        |_, _| false,
+                    )
+                    .await?;
+                    let complete = analysis.units.iter().all(|unit| unit.status == "completed");
+                    Ok(DaemonScanOutcome {
+                        scan_id: Some("daemon-progress".into()),
+                        status: if complete { "completed" } else { "failed" }.into(),
+                        completed_snapshot_id: complete.then(|| "fixture-snapshot".into()),
+                        base_snapshot_id: None,
+                        invalidation_plan: None,
+                        invalidation_error: None,
+                        analysis: Some(analysis),
+                        analysis_coverage: None,
+                        incremental_trace: None,
+                    })
+                })
+            }
+        }
+
+        let parent = tempfile::tempdir()?;
+        let root = parent.path().join("repository");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let ready = parent.path().join("ready");
+        let worker = parent.path().join("worker.mjs");
+        let script = r#"
+import fs from 'node:fs';
+const args=process.argv.slice(2), arg=key=>args[args.indexOf(key)+1];
+while (!fs.existsSync(READY)) await new Promise(resolve=>setTimeout(resolve,20));
+const common={protocol_version:'1.0',scan_id:arg('--scan-id'),adapter:'go',adapter_version:'fixture'};
+const coverage={profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness:['syntax-complete'],reasons:[]};
+for(const event of [
+ {event:'scan_started',seq:1,root:arg('--root'),project_code_executed:false,safe_mode:true},
+ {event:'profile_declared',seq:2,profile:{id:'go:fixture',language:'go',features:[],environment:{},properties:{}}},
+ {event:'profile_completed',seq:3,profile_id:'go:fixture',coverage},
+ {event:'scan_completed',seq:4,coverage}
+]) console.log(JSON.stringify({...common,...event}));
+"#.replace("READY", &serde_json::to_string(&ready)?);
+        std::fs::write(&worker, script)?;
+        let handle = start_daemon_with_runner(
+            root.clone(),
+            DaemonConfig {
+                debounce_milliseconds: 20,
+                ignored_paths: Vec::new(),
+            },
+            None,
+            InterruptedAttemptRecovery::default(),
+            Arc::new(ProgressRunner {
+                root: root.clone(),
+                worker,
+            }),
+        )?;
+        let mut status = handle.subscribe();
+        std::fs::write(root.join("watched.go"), "package fixture\n")?;
+        let running = wait_for_status(&mut status, |status| {
+            status
+                .active_analysis
+                .as_ref()
+                .is_some_and(|progress| progress.units.iter().any(|unit| unit.status == "running"))
+        })
+        .await?;
+        assert_eq!(
+            running.active_analysis.unwrap().units[0].unit_id,
+            "go:repository"
+        );
+        std::fs::write(&ready, "ready")?;
+        let finished = wait_for_status(&mut status, |status| {
+            status.last_completed_attempt.is_some()
+        })
+        .await?;
+        assert!(finished.active_analysis.is_none());
+        let progress = finished
+            .last_completed_attempt
+            .unwrap()
+            .analysis
+            .context("final analysis progress")?;
+        assert_eq!(progress.units.len(), 1);
+        assert_eq!(progress.units[0].status, "completed");
+        assert_eq!(progress.units[0].stage, "repository");
+        assert_eq!(progress.units[0].protocol_events, 4);
+        assert!(handle.stop().await?.active_analysis.is_none());
         Ok(())
     }
 

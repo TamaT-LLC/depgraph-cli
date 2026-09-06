@@ -225,7 +225,7 @@ fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
             .as_array()
             .expect("terminal output is a closed union")
             .len(),
-        5
+        6
     );
     let terminal_schema = terminal_output.to_string();
     assert!(!terminal_schema.contains("AgentOperation"));
@@ -326,6 +326,10 @@ fn issue_305_schema_closes_artifact_enums_scalars_and_collection_bounds() {
         r"^policy-config:sha256:[0-9a-f]{64}$"
     );
     assert_eq!(definitions["Sha256Digest"]["pattern"], r"^[0-9a-f]{64}$");
+    assert_eq!(
+        definitions["AnalysisInputDigest"]["pattern"],
+        r"^sha256:[0-9a-f]{64}$"
+    );
     for (definition, max_bytes) in [
         ("AgentArtifactId", 1_024_u64),
         ("AgentPolicyText", 4_096_u64),
@@ -882,7 +886,7 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 181, "review newly added object schemas explicitly");
+    assert_eq!(objects, 186, "review newly added object schemas explicitly");
 }
 
 #[test]

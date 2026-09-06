@@ -32,7 +32,26 @@ export const PROFILE_CONFIG_ISSUE = profileSelection.issue;
 const profileDigest = createHash("sha256")
   .update(JSON.stringify({ environments: WEB_ENVIRONMENTS, language: "web", mode: "production" }), "utf8")
   .digest("hex");
-export const PROFILE_ID = `profile:sha256:${profileDigest}`;
+export const BASE_PROFILE_ID = `profile:sha256:${profileDigest}`;
+
+// The worker is a single-process, single-scan executable. Keeping the active
+// profiles in this module lets the existing graph builders and framework
+// collectors share unit identities without threading a new option through
+// every extractor. PROFILE_ID is the stream/coverage profile for the current
+// chunk. LOGICAL_PROFILE_ID identifies stage-specific records across chunks.
+// Shared file identities use BASE_PROFILE_ID across projects and stages.
+export let PROFILE_ID = BASE_PROFILE_ID;
+export let LOGICAL_PROFILE_ID = BASE_PROFILE_ID;
+
+export function setActiveProfileIds(profileId: string, logicalProfileId = profileId): void {
+  PROFILE_ID = profileId;
+  LOGICAL_PROFILE_ID = logicalProfileId;
+}
+
+/** Legacy helper for callers that do not have a separate logical profile. */
+export function setActiveProfileId(profileId: string): void {
+  setActiveProfileIds(profileId);
+}
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };

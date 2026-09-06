@@ -633,6 +633,61 @@ impl DepgraphService {
             return Err(DepgraphServiceError::Cancelled);
         }
         let mut read_store = self.read_store_factory().open()?;
+        if snapshot_id.is_attempt() {
+            let cancellation_check = cancellation.clone();
+            let snapshot = read_store.store().interruptible_read(
+                move || cancellation_check.is_cancelled(),
+                |store| {
+                    let attempt_id = snapshot_id
+                        .attempt_id()
+                        .ok_or_else(|| anyhow::anyhow!("invalid partial attempt identity"))?;
+                    store.load_snapshot(attempt_id)
+                },
+            );
+            if cancellation.is_cancelled() {
+                return Err(DepgraphServiceError::Cancelled);
+            }
+            let snapshot = snapshot.map_err(DepgraphServiceError::store_operation)?;
+            let mut items = snapshot
+                .nodes
+                .into_iter()
+                .filter(|node| kinds.is_empty() || kinds.iter().any(|kind| kind == &node.kind))
+                .filter(|node| {
+                    let matches = |value: &str| match match_mode {
+                        NodeMatchMode::Exact => value == query,
+                        NodeMatchMode::Prefix => value.starts_with(query),
+                        NodeMatchMode::Contains => value.contains(query),
+                    };
+                    matches(&node.id)
+                        || matches(&node.kind)
+                        || matches(&node.locator)
+                        || matches(&node.display_name)
+                })
+                .map(|node| NodeSummaryRecord {
+                    id: node.id,
+                    kind: node.kind,
+                    locator: node.locator,
+                    display_name: node.display_name,
+                })
+                .collect::<Vec<_>>();
+            items.sort_by(|left, right| left.id.cmp(&right.id));
+            let total_items =
+                u64::try_from(items.len()).map_err(|_| DepgraphServiceError::ResourceExhausted)?;
+            let end = offset
+                .checked_add(limit)
+                .ok_or(DepgraphServiceError::ResourceExhausted)?
+                .min(items.len());
+            let items = if offset >= items.len() {
+                Vec::new()
+            } else {
+                items.drain(offset..end).collect()
+            };
+            return Ok(FindNodesPageResult {
+                snapshot_id: snapshot_id.clone(),
+                nodes: items.into_iter().map(Into::into).collect(),
+                total_items,
+            });
+        }
         let cancellation_check = cancellation.clone();
         let page = read_store.store().find_completed_snapshot_nodes_page(
             snapshot_id.as_str(),
@@ -883,7 +938,16 @@ impl DepgraphService {
         let cancellation_check = cancellation.clone();
         let snapshot = read_store.store().interruptible_read(
             move || cancellation_check.is_cancelled(),
-            |store| store.load_completed_snapshot(snapshot_id.as_str()),
+            |store| {
+                if snapshot_id.is_attempt() {
+                    let attempt_id = snapshot_id
+                        .attempt_id()
+                        .ok_or_else(|| anyhow::anyhow!("invalid partial attempt identity"))?;
+                    store.load_snapshot(attempt_id)
+                } else {
+                    store.load_completed_snapshot(snapshot_id.as_str())
+                }
+            },
         );
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);

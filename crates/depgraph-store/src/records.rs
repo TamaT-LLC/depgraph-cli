@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ProfileMatrixRecord;
+use crate::{CacheEventRecord, ProfileMatrixRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanRecord {
@@ -154,6 +154,21 @@ impl PendingCancelledScanOperations {
 pub struct ValidatedScanSummary {
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
+}
+
+/// Bounded metadata returned for a terminal scan attempt that was not
+/// promoted to a completed snapshot.
+///
+/// Terminal CLI outcomes expose only scan metadata.  Keeping this projection
+/// separate from [`GraphSnapshot`] prevents callers from accidentally
+/// materializing the attempt's nodes, sites, edges, evidence, or profile
+/// correlations merely to report a worker failure or cancellation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalScanMetadata {
+    pub status: String,
+    pub coverage: CoverageRecord,
+    pub diagnostics: Vec<DiagnosticRecord>,
+    pub cache_events: Vec<CacheEventRecord>,
 }
 
 #[derive(Debug)]
@@ -315,6 +330,55 @@ pub struct CoverageRecord {
     pub unsupported_syntax: u64,
     pub project_code_executed: bool,
     pub completeness: Vec<String>,
+    pub reasons: Vec<String>,
+}
+
+/// Durable execution evidence for one analysis unit stage/chunk.
+///
+/// A row is created before execution starts and is terminalized after the
+/// worker stream has been validated.  The store keeps the request scope and
+/// input identities alongside the status so a partial attempt cannot be
+/// mistaken for a complete graph after a process restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisUnitLedgerRecord {
+    pub scan_id: String,
+    pub contract_version: String,
+    pub unit_id: String,
+    pub adapter: String,
+    pub unit_root: String,
+    pub stage: String,
+    pub chunk_id: String,
+    pub chunk_index: Option<u64>,
+    pub chunk_count: Option<u64>,
+    pub status: String,
+    pub reused: bool,
+    pub source_paths: Vec<String>,
+    pub context_paths: Vec<String>,
+    pub auxiliary_paths: Vec<String>,
+    pub context_fingerprint: Option<String>,
+    pub input_fingerprint: Option<String>,
+    pub dependency_ids: Vec<String>,
+    pub unknown_dependencies: bool,
+    pub error: Option<String>,
+}
+
+/// Bounded scan-level projection of the unit ledger.
+///
+/// The complete ledger remains available through `Store::analysis_units`; the
+/// summary is deliberately count based so routine scan results cannot be
+/// inflated by a repository containing a very large number of units.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisCoverageSummary {
+    pub contract_version: String,
+    pub plan_id: Option<String>,
+    pub input_digest: Option<String>,
+    pub expected_units: u64,
+    pub completed_units: u64,
+    pub failed_units: u64,
+    pub unanalysed_units: u64,
+    pub cancelled_units: u64,
+    pub semantic_complete_units: u64,
+    pub complete: bool,
     pub reasons: Vec<String>,
 }
 

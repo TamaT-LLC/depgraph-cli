@@ -40,6 +40,18 @@ depgraph doctor
 保存先を固定する場合は、`depgraph --store /path/to/depgraph.sqlite scan /path/to/repository`のようにグローバルオプションを指定する。
 設定ファイルは必須ではなく、`depgraph init /path/to/repository`を実行した場合だけ`.depgraph.toml`を書き込む。
 
+Go・Web のスキャンは、先にディレクトリと workspace を調べ、解析単位と source batch ごとに処理する。
+同じ保存先で `scan` を再実行すると、入力と worker の互換性を検証して完了済みの処理を再利用する。
+既定では全体の時間制限はなく、個々の worker の無進捗時間、メモリ、出力量と同時実行数を制限する。
+`.depgraph.toml` の `[scan]` で `max_unit_source_files`（既定 128）、`max_concurrent_units`（2）、`max_worker_memory_bytes`（2 GiB）、`worker_timeout_seconds`（無進捗 300 秒）を指定できる。
+全体の時間予算が必要な場合は `total_budget_seconds` を指定する。
+分割・中断・再開・依存変更の検証方法は[統合検証](docs/40_arch_design/resumable-analysis-validation.md)に記載している。
+
+未完了の試行を調べる場合は、`scan --json` の `scan_id` を使い、`depgraph --scan-id "attempt:$SCAN_ID" deps path:src/app.ts --json` のように明示する。
+結果には未完了であることと解析範囲が含まれ、既存の完了 snapshot は置き換わらない。
+`deps`、`dependents`、`why`、`impact`、`cycles`、`unresolved`、health と graph export で利用できる。
+名前付き snapshot、diff、policy、bounded query、runtime validation は完了 snapshot を使用する。
+
 スキャン後は、ファイルやパッケージをセレクターで指定してグラフを調べる。
 次の例にある`src/app.ts`は、対象リポジトリ内の実際のパスへ置き換える。
 
@@ -210,9 +222,9 @@ target/debug/depgraph --version
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
 すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
-v0.5のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`5`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v1`を使用する。
+現行開発版のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`6`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v2`を使用する。
 公開済み`v0.5.4` artifactのStore schemaは`17`である。
-tag後の現行`main`はStore schema `18`を使用し、schema 18へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
+tag後の現行`main`はStore schema `19`を使用し、schema 19へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
 
 `v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。

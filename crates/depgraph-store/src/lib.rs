@@ -23,6 +23,7 @@ mod runtime;
 mod schema;
 mod snapshot;
 
+pub use analysis_coverage::aggregate_analysis_coverage;
 use build::{
     merge_build_delta, union_coverage, validate_build_union, validate_delta_attempt_metadata,
 };
@@ -71,7 +72,7 @@ use snapshot::{
     verify_completed_snapshot_seal_v1,
 };
 
-pub const STORE_SCHEMA_VERSION: i64 = 18;
+pub const STORE_SCHEMA_VERSION: i64 = 19;
 const LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 1;
 const COMPLETED_SNAPSHOT_SEAL_VERSION: i64 = 2;
 const MAX_PENDING_CANCELLED_SCAN_OPERATIONS: usize = 64;
@@ -1262,24 +1263,50 @@ ORDER BY id COLLATE BINARY
         let scan_id = required_str(first, "scan_id")?;
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
-        // Adapter logs may already have advanced mutation_count, so evidence
-        // itself is the authoritative signal that an owner can need replacing.
-        let replace_existing_evidence: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM evidence WHERE scan_id=?1 LIMIT 1)",
+        ingest_events_in_transaction(&tx, events, scan_id)?;
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
             [scan_id],
-            |row| row.get(0),
         )?;
-        let mut evidence_owners = HashSet::new();
-        for event in events {
-            if required_str(event, "scan_id")? != scan_id {
-                bail!("event batch contains multiple scan IDs");
-            }
-            ingest_event_in_transaction(
-                &tx,
-                event,
-                replace_existing_evidence,
-                &mut evidence_owners,
-            )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Ingest one worker stream and terminalize its analysis ledger row in the
+    /// same SQLite transaction.  A supervisor kill can therefore leave either
+    /// the whole unit prefix plus its terminal status, or neither; readers
+    /// never mistake an ingested graph prefix for a completed unit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_events_with_analysis_unit(
+        &mut self,
+        scan_id: &str,
+        events: &[&Value],
+        unit_id: &str,
+        unit_root: &str,
+        stage: &str,
+        chunk_id: &str,
+        status: &str,
+        reused: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        validate_analysis_unit_status(status)?;
+        if unit_id.is_empty() || unit_root.is_empty() || stage.is_empty() {
+            bail!("analysis unit ledger key must not be empty");
+        }
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        ingest_events_in_transaction(&tx, events, scan_id)?;
+        let updated = tx.execute(
+            "UPDATE analysis_unit_ledger
+                SET status=?1, reused=?2, error=?3
+              WHERE scan_id=?4 AND unit_id=?5 AND unit_root=?6
+                AND stage=?7 AND chunk_id=?8",
+            params![
+                status, reused, error, scan_id, unit_id, unit_root, stage, chunk_id
+            ],
+        )?;
+        if updated != 1 {
+            bail!("analysis unit ledger update addressed an unknown unit stage/chunk");
         }
         tx.execute(
             "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
@@ -1471,8 +1498,14 @@ ORDER BY id COLLATE BINARY
         let profile_rows = profile_statement.query_map([scan_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
+        let profiles = load_profiles(&self.connection, scan_id)?;
+        let analysis_records = if self.analysis_coverage(scan_id)?.is_some() {
+            Some(self.analysis_units(scan_id)?)
+        } else {
+            None
+        };
         let expected_completeness =
-            analysis_coverage::aggregate_completeness(&load_profiles(&self.connection, scan_id)?)?;
+            analysis_coverage::aggregate_completeness(&profiles, analysis_records.as_deref())?;
         let mut max_profile_files_discovered = 0_u64;
         let mut max_profile_files_analyzed = 0_u64;
         let mut max_profile_files_skipped = 0_u64;
@@ -1685,6 +1718,36 @@ ORDER BY id COLLATE BINARY
         Ok(ValidatedScanSummary {
             coverage,
             diagnostics: load_diagnostics(&self.connection, &validation.scan_id)?,
+        })
+    }
+
+    /// Load the metadata needed to report a terminal non-promoted scan.
+    ///
+    /// This projection intentionally avoids [`Store::load_snapshot`].  A
+    /// failed or cancelled attempt retains a graph for explicit partial
+    /// queries, but reporting its status only needs coverage and diagnostics.
+    /// The status guard keeps this API
+    /// from being used for a completed or still-staging scan, whose snapshot
+    /// and mutation semantics are different.
+    pub fn load_terminal_scan_metadata(&self, scan_id: &str) -> Result<TerminalScanMetadata> {
+        let status = self
+            .connection
+            .query_row("SELECT status FROM scans WHERE id=?1", [scan_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .with_context(|| format!("scan {scan_id} was not started"))?;
+        if !matches!(
+            status.as_str(),
+            "partial" | "failed" | "cancelled" | "policy_failed" | "security_failed"
+        ) {
+            bail!("terminal scan metadata requires a non-promoted terminal scan, found {status}");
+        }
+        Ok(TerminalScanMetadata {
+            status,
+            coverage: read::load_staging_coverage(&self.connection, scan_id)?,
+            diagnostics: load_diagnostics(&self.connection, scan_id)?,
+            cache_events: self.cache_events_for_scan(scan_id)?,
         })
     }
 
@@ -2446,6 +2509,43 @@ ORDER BY id COLLATE BINARY
         load_completed_snapshot_profiles_from_connection(&self.connection, snapshot_id)
     }
 
+    /// Load the original profile declaration for a staging scan.
+    ///
+    /// Profile coverage is stored separately, so this returns only the
+    /// declaration payload. Core uses it when several source-batch workers
+    /// converge on one logical profile and must merge the bounded observation
+    /// fields before accepting the next upsert.
+    pub fn load_scan_profile_declaration(
+        &self,
+        scan_id: &str,
+        profile_id: &str,
+    ) -> Result<Option<Value>> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT json FROM profiles WHERE scan_id=?1 AND id=?2",
+                params![scan_id, profile_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Load a single staging node for a strict canonical membership join.
+    pub fn load_scan_node_payload(&self, scan_id: &str, node_id: &str) -> Result<Option<Value>> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT raw_json FROM nodes WHERE scan_id=?1 AND id=?2",
+                params![scan_id, node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
     fn load_base_snapshot(&self, scan_id: &str) -> Result<GraphSnapshot> {
         load_base_snapshot_from_connection(&self.connection, scan_id)
     }
@@ -2465,6 +2565,294 @@ ORDER BY id COLLATE BINARY
         id.context("no matching scan is available")
     }
 
+    /// Create the immutable expected-unit set for a staging scan.
+    ///
+    /// Unit rows are written before workers start.  A later read can therefore
+    /// distinguish a worker that was never scheduled from one that completed
+    /// and can derive partial coverage after cancellation or process restart.
+    pub fn initialize_analysis_unit_ledger(
+        &mut self,
+        scan_id: &str,
+        contract_version: &str,
+        plan_id: Option<&str>,
+        input_digest: Option<&str>,
+        records: &[AnalysisUnitLedgerRecord],
+    ) -> Result<()> {
+        if contract_version.trim().is_empty() {
+            bail!("analysis unit contract version must not be empty");
+        }
+        if plan_id.is_some_and(|value| value.is_empty())
+            || input_digest.is_some_and(|value| value.is_empty())
+        {
+            bail!("analysis unit plan and input identities must not be empty");
+        }
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        let metadata = tx
+            .query_row(
+                "SELECT contract_version, plan_id, input_digest
+                   FROM analysis_scan_metadata WHERE scan_id=?1",
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((observed_contract, observed_plan, observed_input)) = metadata {
+            if observed_contract != contract_version
+                || observed_plan.as_deref() != plan_id
+                || observed_input.as_deref() != input_digest
+            {
+                bail!("analysis unit ledger metadata changed after initialization");
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO analysis_scan_metadata(
+                     scan_id, contract_version, plan_id, input_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    scan_id,
+                    contract_version,
+                    plan_id,
+                    input_digest,
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                ],
+            )?;
+        }
+        let existing_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM analysis_unit_ledger WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get(0),
+        )?;
+        if existing_count != 0 {
+            bail!("analysis unit ledger was already initialized");
+        }
+        let mut keys = BTreeSet::new();
+        for record in records {
+            validate_analysis_unit_ledger_record(record, scan_id)?;
+            let key = (
+                record.unit_id.as_str(),
+                record.unit_root.as_str(),
+                record.stage.as_str(),
+                record.chunk_id.as_str(),
+            );
+            if !keys.insert(key) {
+                bail!("analysis unit ledger contains duplicate unit stage/chunk");
+            }
+            tx.execute(
+                "INSERT INTO analysis_unit_ledger(
+                     scan_id, contract_version, unit_id, adapter, unit_root, stage,
+                     chunk_id, chunk_index, chunk_count, status, reused,
+                     source_paths_json, context_paths_json, auxiliary_paths_json,
+                     context_fingerprint, input_fingerprint, dependency_ids_json,
+                     unknown_dependencies, error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![
+                    scan_id,
+                    record.contract_version,
+                    record.unit_id,
+                    record.adapter,
+                    record.unit_root,
+                    record.stage,
+                    record.chunk_id,
+                    record.chunk_index.map(|value| value as i64),
+                    record.chunk_count.map(|value| value as i64),
+                    record.status,
+                    record.reused,
+                    serde_json::to_string(&record.source_paths)?,
+                    serde_json::to_string(&record.context_paths)?,
+                    serde_json::to_string(&record.auxiliary_paths)?,
+                    record.context_fingerprint,
+                    record.input_fingerprint,
+                    serde_json::to_string(&record.dependency_ids)?,
+                    record.unknown_dependencies,
+                    record.error,
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply terminal execution status to the expected unit rows.
+    pub fn finalize_analysis_unit_ledger(
+        &mut self,
+        scan_id: &str,
+        records: &[AnalysisUnitLedgerRecord],
+    ) -> Result<AnalysisCoverageSummary> {
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        for record in records {
+            validate_analysis_unit_ledger_record(record, scan_id)?;
+            let updated = tx.execute(
+                "UPDATE analysis_unit_ledger
+                    SET status=?1, reused=?2, error=?3
+                  WHERE scan_id=?4 AND unit_id=?5 AND unit_root=?6
+                    AND stage=?7 AND chunk_id=?8",
+                params![
+                    record.status,
+                    record.reused,
+                    record.error,
+                    scan_id,
+                    record.unit_id,
+                    record.unit_root,
+                    record.stage,
+                    record.chunk_id,
+                ],
+            )?;
+            if updated != 1 {
+                bail!("analysis unit ledger update addressed an unknown unit stage/chunk");
+            }
+        }
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
+        )?;
+        tx.commit()?;
+        self.analysis_coverage(scan_id)?
+            .context("analysis unit ledger has no metadata")
+    }
+
+    /// Read deterministic unit evidence for an analysis attempt.
+    pub fn analysis_units(&self, scan_id: &str) -> Result<Vec<AnalysisUnitLedgerRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT scan_id, contract_version, unit_id, adapter, unit_root, stage,
+                    chunk_id, chunk_index, chunk_count, status, reused,
+                    source_paths_json, context_paths_json, auxiliary_paths_json,
+                    context_fingerprint, input_fingerprint, dependency_ids_json,
+                    unknown_dependencies, error
+               FROM analysis_unit_ledger
+              WHERE scan_id=?1
+              ORDER BY unit_id COLLATE BINARY, unit_root COLLATE BINARY,
+                       stage COLLATE BINARY, chunk_index, chunk_id COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([scan_id], |row| {
+            let source_paths: String = row.get(11)?;
+            let context_paths: String = row.get(12)?;
+            let auxiliary_paths: String = row.get(13)?;
+            let dependency_ids: String = row.get(16)?;
+            Ok(AnalysisUnitLedgerRecord {
+                scan_id: row.get(0)?,
+                contract_version: row.get(1)?,
+                unit_id: row.get(2)?,
+                adapter: row.get(3)?,
+                unit_root: row.get(4)?,
+                stage: row.get(5)?,
+                chunk_id: row.get(6)?,
+                chunk_index: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                chunk_count: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                status: row.get(9)?,
+                reused: row.get(10)?,
+                source_paths: serde_json::from_str(&source_paths).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                context_paths: serde_json::from_str(&context_paths).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        12,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                auxiliary_paths: serde_json::from_str(&auxiliary_paths).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                context_fingerprint: row.get(14)?,
+                input_fingerprint: row.get(15)?,
+                dependency_ids: serde_json::from_str(&dependency_ids).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        16,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                unknown_dependencies: row.get(17)?,
+                error: row.get(18)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Return whether a worker identity was declared in the attempt ledger.
+    ///
+    /// Callers that do not initialize an analysis ledger still use the legacy
+    /// ingestion path.  The scheduler initializes every row before dispatch,
+    /// so this predicate lets the worker-output path select atomic ingestion
+    /// only when the corresponding unit is part of the current attempt.
+    pub fn analysis_unit_ledger_contains(
+        &self,
+        scan_id: &str,
+        unit_id: &str,
+        unit_root: &str,
+        stage: &str,
+        chunk_id: &str,
+    ) -> Result<bool> {
+        let present = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM analysis_unit_ledger
+                 WHERE scan_id=?1 AND unit_id=?2 AND unit_root=?3
+                   AND stage=?4 AND chunk_id=?5
+            )",
+            params![scan_id, unit_id, unit_root, stage, chunk_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(present != 0)
+    }
+
+    /// Return the immutable scan-level analysis completeness projection.
+    pub fn analysis_coverage(&self, scan_id: &str) -> Result<Option<AnalysisCoverageSummary>> {
+        let metadata = self
+            .connection
+            .query_row(
+                "SELECT contract_version, plan_id, input_digest
+                   FROM analysis_scan_metadata WHERE scan_id=?1",
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((contract, plan_id, input_digest)) = metadata else {
+            return Ok(None);
+        };
+        let records = self.analysis_units(scan_id)?;
+        let mut summary = analysis_coverage::aggregate_analysis_coverage(
+            &contract,
+            plan_id.as_deref(),
+            input_digest.as_deref(),
+            &records,
+        );
+        // Unit execution and semantic precision are separate facts. A worker
+        // can terminalize successfully while reporting only syntax coverage,
+        // so derive the latter from the persisted profile completion rows and
+        // the durable unit ledger instead of counting terminal rows alone.
+        let profiles = load_profiles(&self.connection, scan_id)?;
+        summary.semantic_complete_units =
+            analysis_coverage::semantic_complete_units(&profiles, Some(&records));
+        Ok(Some(summary))
+    }
+
     pub fn has_final_coverage(&self, scan_id: &str) -> Result<bool> {
         Ok(self
             .connection
@@ -2476,13 +2864,13 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn mark_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
-        let mut coverage = self.load_snapshot(scan_id)?.coverage;
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        let mut coverage = read::load_staging_coverage(&tx, scan_id)?;
         coverage.completeness.clear();
         coverage.reasons.push(reason.to_owned());
         coverage.reasons.sort();
         coverage.reasons.dedup();
-        let tx = self.connection.transaction()?;
-        ensure_scan_staging(&tx, scan_id)?;
         tx.execute(
             "INSERT INTO coverage(scan_id, json) VALUES (?1, ?2)
              ON CONFLICT(scan_id) DO UPDATE SET json=excluded.json",
@@ -2495,6 +2883,78 @@ ORDER BY id COLLATE BINARY
         tx.commit()?;
         Ok(())
     }
+}
+
+fn validate_analysis_unit_ledger_record(
+    record: &AnalysisUnitLedgerRecord,
+    scan_id: &str,
+) -> Result<()> {
+    if record.scan_id != scan_id {
+        bail!("analysis unit ledger record belongs to another scan");
+    }
+    for (name, value, max) in [
+        ("contract version", record.contract_version.as_str(), 4096),
+        ("unit ID", record.unit_id.as_str(), 4096),
+        ("adapter", record.adapter.as_str(), 128),
+        ("unit root", record.unit_root.as_str(), 4096),
+        ("stage", record.stage.as_str(), 128),
+    ] {
+        if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+            bail!("analysis unit ledger {name} is invalid");
+        }
+    }
+    if record.chunk_id.len() > 4096 || record.chunk_id.chars().any(char::is_control) {
+        bail!("analysis unit ledger chunk ID is invalid");
+    }
+    if !matches!(
+        record.status.as_str(),
+        "queued" | "running" | "completed" | "failed" | "cancelled" | "unanalysed" | "unknown"
+    ) {
+        bail!("analysis unit ledger status is invalid");
+    }
+    if record.stage == "typed"
+        && (record.contract_version != "depgraph-analysis-unit-v2" || record.adapter != "go")
+    {
+        bail!("typed analysis unit ledger rows require Go analysis-unit v2");
+    }
+    match (record.chunk_index, record.chunk_count) {
+        (None, None) => {}
+        (Some(index), Some(count)) if count > 0 && index < count => {}
+        _ => bail!("analysis unit ledger chunk metadata is invalid"),
+    }
+    for path in record
+        .source_paths
+        .iter()
+        .chain(record.context_paths.iter())
+        .chain(record.auxiliary_paths.iter())
+    {
+        if path.len() > 4096 || path.chars().any(char::is_control) {
+            bail!("analysis unit ledger path is invalid");
+        }
+    }
+    if record
+        .dependency_ids
+        .iter()
+        .any(|dependency| dependency.len() > 4096 || dependency.chars().any(char::is_control))
+    {
+        bail!("analysis unit ledger dependency ID is invalid");
+    }
+    if record
+        .context_fingerprint
+        .as_ref()
+        .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+        || record
+            .input_fingerprint
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+        || record
+            .error
+            .as_ref()
+            .is_some_and(|value| value.len() > 16 * 1024 || value.chars().any(char::is_control))
+    {
+        bail!("analysis unit ledger metadata is invalid");
+    }
+    Ok(())
 }
 
 fn load_scan_operation_recovery_binding_from(
@@ -2716,6 +3176,39 @@ fn ingest_event_in_transaction(
         other => bail!("unknown protocol event {other}"),
     }
     Ok(())
+}
+
+fn ingest_events_in_transaction(
+    tx: &Transaction<'_>,
+    events: &[&Value],
+    scan_id: &str,
+) -> Result<()> {
+    // Adapter logs may already have advanced mutation_count, so evidence
+    // itself is the authoritative signal that an owner can need replacing.
+    let replace_existing_evidence: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM evidence WHERE scan_id=?1 LIMIT 1)",
+        [scan_id],
+        |row| row.get(0),
+    )?;
+    let mut evidence_owners = HashSet::new();
+    for event in events {
+        if required_str(event, "scan_id")? != scan_id {
+            bail!("event batch contains multiple scan IDs");
+        }
+        ingest_event_in_transaction(tx, event, replace_existing_evidence, &mut evidence_owners)?;
+    }
+    Ok(())
+}
+
+fn validate_analysis_unit_status(status: &str) -> Result<()> {
+    if matches!(
+        status,
+        "queued" | "running" | "completed" | "failed" | "cancelled" | "unanalysed" | "unknown"
+    ) {
+        Ok(())
+    } else {
+        bail!("analysis unit ledger status is invalid: {status}")
+    }
 }
 
 fn ensure_scan_staging(tx: &Transaction<'_>, scan_id: &str) -> Result<()> {
@@ -3654,7 +4147,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("fresh-v18.db");
         let store = Store::open(&path)?;
-        assert_eq!(store.schema_version()?, 18);
+        assert_eq!(store.schema_version()?, 19);
         for column in [
             "health_policy_config_digest",
             "health_analyzer_version",
@@ -4593,6 +5086,63 @@ mod tests {
     }
 
     #[test]
+    fn analysis_proof_separates_equal_graphs_but_ignores_reuse_observation() -> Result<()> {
+        let fixture =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
+        let mut store = Store::open_in_memory()?;
+        for (scan_id, plan_id, input_digest, context_fingerprint, reused) in [
+            ("analysis-cold", "plan-a", "input-a", "context-a", false),
+            ("analysis-warm", "plan-a", "input-a", "context-a", true),
+            (
+                "analysis-different",
+                "plan-b",
+                "input-b",
+                "context-b",
+                false,
+            ),
+        ] {
+            stage_protocol_fixture_with_scan_id(
+                &mut store,
+                fixture,
+                scan_id,
+                Some("fixture-revision"),
+            )?;
+            let row = analysis_identity_row(scan_id, context_fingerprint, reused);
+            store.initialize_analysis_unit_ledger(
+                scan_id,
+                "depgraph-analysis-unit-v2",
+                Some(plan_id),
+                Some(input_digest),
+                &[row],
+            )?;
+        }
+
+        store.finish_scan("analysis-cold", "completed", None, true)?;
+        store.finish_scan("analysis-warm", "completed", None, false)?;
+        store.finish_scan("analysis-different", "completed", None, false)?;
+
+        let cold = store
+            .snapshot_id_for_source("scan", "analysis-cold")?
+            .context("cold analysis snapshot")?;
+        let warm = store
+            .snapshot_id_for_source("scan", "analysis-warm")?
+            .context("warm analysis snapshot")?;
+        let different = store
+            .snapshot_id_for_source("scan", "analysis-different")?
+            .context("different analysis snapshot")?;
+        assert_eq!(cold, warm, "reused is an execution observation");
+        assert_ne!(cold, different, "analysis context is part of the proof");
+        let snapshot_count: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM completed_snapshots", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(snapshot_count, 2);
+        Ok(())
+    }
+
+    #[test]
     fn prospective_scan_identity_matches_later_promotion() -> Result<()> {
         let fixture =
             include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
@@ -4698,6 +5248,16 @@ mod tests {
         store.ingest_event(&completed)?;
 
         store.validate_scan("scan-1")?;
+        let declaration = store
+            .load_scan_profile_declaration("scan-1", "z-profile")?
+            .context("stored profile declaration")?;
+        assert_eq!(declaration["id"], "z-profile");
+        assert!(declaration.get("coverage").is_none());
+        assert!(
+            store
+                .load_scan_profile_declaration("scan-1", "missing-profile")?
+                .is_none()
+        );
         store.finish_scan("scan-1", "completed", None, true)?;
         let snapshot = store.load_snapshot("scan-1")?;
         assert_eq!(
@@ -4848,6 +5408,145 @@ mod tests {
                 "8954b66d43225e62c92e8bbcc8500191b5cceb1e"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_coverage_updates_do_not_reconstruct_graph_payloads() -> Result<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        for has_final_coverage in [false, true] {
+            let mut store = Store::open_in_memory()?;
+            let scan_id = stage_protocol_fixture(&mut store, RUST_SEMANTIC_GOLDEN, None)?;
+            if !has_final_coverage {
+                store.connection.execute("DELETE FROM coverage", [])?;
+            }
+            // Cover a worker prefix that recorded execution before it emitted
+            // its final coverage, and preserve any existing coverage reasons.
+            store.connection.execute(
+                "UPDATE scans SET project_code_executed=1 WHERE id=?1",
+                [&scan_id],
+            )?;
+            let mut expected = store.load_snapshot(&scan_id)?.coverage;
+            expected.completeness.clear();
+            expected
+                .reasons
+                .push("worker-failure:fixture:memory-limit".to_owned());
+            expected.reasons.sort();
+            expected.reasons.dedup();
+
+            store
+                .connection
+                .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                    AuthAction::Read {
+                        table_name,
+                        column_name,
+                    } if matches!(table_name, "nodes" | "edges" | "evidence" | "diagnostics")
+                        || column_name == "raw_json"
+                        || (table_name == "profiles" && column_name == "json") =>
+                    {
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                }));
+            assert!(store.load_snapshot(&scan_id).is_err());
+            for _ in 0..2 {
+                store.mark_coverage_incomplete(&scan_id, "worker-failure:fixture:memory-limit")?;
+            }
+            let raw: String = store.connection.query_row(
+                "SELECT json FROM coverage WHERE scan_id=?1",
+                [&scan_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(serde_json::from_str::<CoverageRecord>(&raw)?, expected);
+            store
+                .connection
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+            assert_eq!(store.load_snapshot(&scan_id)?.coverage, expected);
+            store.finish_scan(&scan_id, "partial", Some("fixture failure"), false)?;
+            assert!(
+                store
+                    .mark_coverage_incomplete(&scan_id, "late mutation")
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scan_metadata_does_not_reconstruct_graph_payloads() -> Result<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        for status in ["partial", "cancelled"] {
+            for has_final_coverage in [false, true] {
+                let mut store = Store::open_in_memory()?;
+                let scan_id = stage_protocol_fixture(&mut store, RUST_SEMANTIC_GOLDEN, None)?;
+                store.record_cache_event(
+                    Some(&scan_id),
+                    None,
+                    CacheLayer::Syntax,
+                    Some("fixture-cache-key"),
+                    "reject",
+                    "fixture-reason",
+                )?;
+                if !has_final_coverage {
+                    store.connection.execute("DELETE FROM coverage", [])?;
+                }
+                let expected = store.load_snapshot(&scan_id)?;
+                let expected_cache_events = store.cache_events_for_scan(&scan_id)?;
+                store.finish_scan(&scan_id, status, Some("fixture terminal"), false)?;
+
+                // The terminal projection may count normalized site/profile
+                // rows and retain diagnostic raw_json, but it must not parse
+                // any graph payload or profile declaration/correlation.
+                store
+                    .connection
+                    .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                        AuthAction::Read {
+                            table_name,
+                            column_name,
+                        } if matches!(table_name, "nodes" | "edges" | "evidence")
+                            || (table_name == "profiles" && column_name == "json")
+                            || (table_name == "sites"
+                                && matches!(
+                                    column_name,
+                                    "condition_json" | "target_ids_json" | "raw_json"
+                                )) =>
+                        {
+                            Authorization::Deny
+                        }
+                        _ => Authorization::Allow,
+                    }));
+                let metadata = store.load_terminal_scan_metadata(&scan_id)?;
+                assert_eq!(metadata.status, status);
+                assert_eq!(metadata.coverage, expected.coverage);
+                assert_eq!(metadata.diagnostics, expected.diagnostics);
+                assert_eq!(metadata.cache_events, expected_cache_events);
+                store
+                    .connection
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scan_metadata_rejects_staging_and_completed_scans() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("staging-terminal-metadata", Path::new("/fixture"), false)?;
+        let error = store
+            .load_terminal_scan_metadata("staging-terminal-metadata")
+            .expect_err("staging scans must not use the terminal projection")
+            .to_string();
+        assert!(error.contains("non-promoted terminal"));
+
+        let scan_id = stage_protocol_fixture(&mut store, RUST_SEMANTIC_GOLDEN, None)?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+        let error = store
+            .load_terminal_scan_metadata(&scan_id)
+            .expect_err("completed scans must use their immutable snapshot")
+            .to_string();
+        assert!(error.contains("non-promoted terminal"));
         Ok(())
     }
 
@@ -6672,6 +7371,55 @@ mod tests {
         Ok(scan_id)
     }
 
+    fn stage_protocol_fixture_with_scan_id(
+        store: &mut Store,
+        fixture: &str,
+        scan_id: &str,
+        source_revision: Option<&str>,
+    ) -> Result<()> {
+        store.start_scan_with_revision(scan_id, Path::new("/fixture"), false, source_revision)?;
+        let mut events = fixture
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for event in &mut events {
+            event["scan_id"] = json!(scan_id);
+        }
+        events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+        for event in events {
+            store.ingest_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn analysis_identity_row(
+        scan_id: &str,
+        context_fingerprint: &str,
+        reused: bool,
+    ) -> AnalysisUnitLedgerRecord {
+        AnalysisUnitLedgerRecord {
+            scan_id: scan_id.to_owned(),
+            contract_version: "depgraph-analysis-unit-v2".to_owned(),
+            unit_id: "unit".to_owned(),
+            adapter: "web".to_owned(),
+            unit_root: "/fixture".to_owned(),
+            stage: "syntax".to_owned(),
+            chunk_id: String::new(),
+            chunk_index: None,
+            chunk_count: None,
+            status: "completed".to_owned(),
+            reused,
+            source_paths: vec!["src/index.ts".to_owned()],
+            context_paths: vec!["src/index.ts".to_owned()],
+            auxiliary_paths: Vec::new(),
+            context_fingerprint: Some(context_fingerprint.to_owned()),
+            input_fingerprint: Some("input-fingerprint".to_owned()),
+            dependency_ids: Vec::new(),
+            unknown_dependencies: false,
+            error: None,
+        }
+    }
+
     fn downgrade_completed_store_to_v17(path: &Path) -> Result<String> {
         let snapshot_id = {
             let mut store = Store::open(path)?;
@@ -6835,5 +7583,214 @@ mod tests {
             .map(|event| serde_json::to_string(&event).unwrap())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn analysis_unit_ledger_tracks_partial_then_complete_stage_join() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("analysis-scan", Path::new("."), false)?;
+        let row = |stage: &str| AnalysisUnitLedgerRecord {
+            scan_id: "analysis-scan".into(),
+            contract_version: "depgraph-analysis-unit-v1".into(),
+            unit_id: "unit".into(),
+            adapter: "go".into(),
+            unit_root: "app".into(),
+            stage: stage.into(),
+            chunk_id: String::new(),
+            chunk_index: None,
+            chunk_count: None,
+            status: "queued".into(),
+            reused: false,
+            source_paths: vec!["app/main.go".into()],
+            context_paths: vec!["app/main.go".into()],
+            auxiliary_paths: Vec::new(),
+            context_fingerprint: Some("context".into()),
+            input_fingerprint: Some("input".into()),
+            dependency_ids: Vec::new(),
+            unknown_dependencies: false,
+            error: None,
+        };
+        let rows = vec![row("syntax"), row("semantic")];
+        store.initialize_analysis_unit_ledger(
+            "analysis-scan",
+            "depgraph-analysis-unit-v1",
+            Some("plan"),
+            Some("input"),
+            &rows,
+        )?;
+        let queued = store.analysis_coverage("analysis-scan")?.unwrap();
+        assert!(!queued.complete);
+        assert_eq!(queued.unanalysed_units, 1);
+
+        let mut completed = rows;
+        for row in &mut completed {
+            row.status = "completed".into();
+            row.reused = true;
+        }
+        let summary = store.finalize_analysis_unit_ledger("analysis-scan", &completed)?;
+        assert!(summary.complete);
+        assert_eq!(summary.completed_units, 1);
+        assert_eq!(store.analysis_units("analysis-scan")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_coverage_separates_terminal_execution_from_semantic_precision() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("semantic-scan", Path::new("/tmp/project"), false)?;
+        let row = |stage: &str, chunk_id: &str| AnalysisUnitLedgerRecord {
+            scan_id: "semantic-scan".into(),
+            contract_version: "depgraph-analysis-unit-v2".into(),
+            unit_id: "unit".into(),
+            adapter: "go".into(),
+            unit_root: "app".into(),
+            stage: stage.into(),
+            chunk_id: chunk_id.into(),
+            chunk_index: Some(0),
+            chunk_count: Some(1),
+            status: "queued".into(),
+            reused: false,
+            source_paths: vec!["app/main.go".into()],
+            context_paths: vec!["app/main.go".into()],
+            auxiliary_paths: Vec::new(),
+            context_fingerprint: Some("context".into()),
+            input_fingerprint: Some("input".into()),
+            dependency_ids: Vec::new(),
+            unknown_dependencies: false,
+            error: None,
+        };
+        let rows = vec![row("syntax", "syntax"), row("semantic", "semantic")];
+        store.initialize_analysis_unit_ledger(
+            "semantic-scan",
+            "depgraph-analysis-unit-v2",
+            Some("plan"),
+            Some("input"),
+            &rows,
+        )?;
+
+        let profile = |id: &str, stage: &str, seq: u64| {
+            let declared = json!({
+                "event":"profile_declared", "protocol_version":"1.0",
+                "scan_id":"semantic-scan", "adapter":"go", "adapter_version":"0.1.0",
+                "seq":seq, "profile":{
+                    "id":id, "language":"go", "features":[], "environment":{},
+                    "properties":{
+                        "analysis_unit_contract":"depgraph-analysis-unit-v2",
+                        "analysis_base_profile_id":"go:base",
+                        "analysis_unit_id":"unit", "analysis_unit_root":"app",
+                        "analysis_stage":stage
+                    }
+                }
+            });
+            declared
+        };
+        for (id, stage, seq) in [
+            ("logical-syntax", "syntax", 1),
+            ("logical-semantic", "semantic", 2),
+        ] {
+            store.ingest_event(&profile(id, stage, seq))?;
+        }
+        let completion = |id: &str, completeness: &[&str], seq: u64| {
+            json!({
+                "event":"profile_completed", "protocol_version":"1.0",
+                "scan_id":"semantic-scan", "adapter":"go", "adapter_version":"0.1.0",
+                "seq":seq, "profile_id":id, "coverage":{
+                    "profiles":1, "files_discovered":1, "files_analyzed":1, "files_skipped":0,
+                    "dependency_sites":0, "resolved":0, "candidates":0, "external":0,
+                    "unresolved":0, "unsupported_syntax":0, "project_code_executed":false,
+                    "completeness":completeness, "reasons":[]
+                }
+            })
+        };
+        store.ingest_event(&completion("logical-syntax", &["syntax-complete"], 3))?;
+        // The semantic worker completed its process but explicitly did not
+        // establish semantic precision for this unit.
+        store.ingest_event(&completion("logical-semantic", &["syntax-complete"], 4))?;
+
+        let mut completed = rows;
+        for row in &mut completed {
+            row.status = "completed".into();
+        }
+        let summary = store.finalize_analysis_unit_ledger("semantic-scan", &completed)?;
+        assert!(summary.complete);
+        assert_eq!(summary.completed_units, 1);
+        assert_eq!(summary.semantic_complete_units, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_unit_ingest_and_terminal_status_commit_or_rollback_together() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("atomic-analysis", Path::new("."), false)?;
+        let row = AnalysisUnitLedgerRecord {
+            scan_id: "atomic-analysis".into(),
+            contract_version: "depgraph-analysis-unit-v1".into(),
+            unit_id: "unit".into(),
+            adapter: "go".into(),
+            unit_root: ".".into(),
+            stage: "syntax".into(),
+            chunk_id: String::new(),
+            chunk_index: None,
+            chunk_count: None,
+            status: "queued".into(),
+            reused: false,
+            source_paths: Vec::new(),
+            context_paths: Vec::new(),
+            auxiliary_paths: Vec::new(),
+            context_fingerprint: None,
+            input_fingerprint: None,
+            dependency_ids: Vec::new(),
+            unknown_dependencies: false,
+            error: None,
+        };
+        store.initialize_analysis_unit_ledger(
+            "atomic-analysis",
+            "depgraph-analysis-unit-v1",
+            None,
+            None,
+            &[row],
+        )?;
+        let invalid = serde_json::json!({
+            "event": "not-a-protocol-event",
+            "scan_id": "atomic-analysis"
+        });
+        assert!(
+            store
+                .ingest_events_with_analysis_unit(
+                    "atomic-analysis",
+                    &[&invalid],
+                    "unit",
+                    ".",
+                    "syntax",
+                    "",
+                    "completed",
+                    false,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(store.analysis_units("atomic-analysis")?[0].status, "queued");
+
+        let started = serde_json::json!({
+            "event": "scan_started",
+            "scan_id": "atomic-analysis",
+            "project_code_executed": false
+        });
+        store.ingest_events_with_analysis_unit(
+            "atomic-analysis",
+            &[&started],
+            "unit",
+            ".",
+            "syntax",
+            "",
+            "completed",
+            false,
+            None,
+        )?;
+        assert_eq!(
+            store.analysis_units("atomic-analysis")?[0].status,
+            "completed"
+        );
+        Ok(())
     }
 }

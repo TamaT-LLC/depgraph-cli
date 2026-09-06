@@ -59,7 +59,9 @@ pub use crate::service_repository::{
     RepositoryOutputPrecondition, RepositoryOverwritePolicy, RepositoryPathError,
     RepositoryPathSelector, RepositoryRelativePath,
 };
-pub use crate::service_snapshot::{ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest};
+pub use crate::service_snapshot::{
+    PartialSnapshotMetadata, ResolvedSnapshotId, SnapshotLocator, SnapshotReadRequest,
+};
 pub use crate::service_store_write::{
     DeferredRuntimeImportCompletion, DeferredRuntimeImportRecovery,
     DeferredRuntimeImportServiceOutcome, DeferredScanCompletion, DeferredScanRecovery,

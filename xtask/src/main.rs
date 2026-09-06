@@ -106,6 +106,9 @@ const MCP_OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTR
 const MCP_TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
 const MCP_TOOL_SCHEMA_BYTES: &[u8] =
     include_bytes!("../../schemas/depgraph-mcp-tools-v1.schema.json");
+const SCAN_OUTCOME_V2_SCHEMA_PATH: &str = "schemas/depgraph-agent-scan-outcome-v2.schema.json";
+const SCAN_OUTCOME_V2_SCHEMA_BYTES: &[u8] =
+    include_bytes!("../../schemas/depgraph-agent-scan-outcome-v2.schema.json");
 const MCP_APACHE_NOTICE: &str = "Apache-2.0 notice: rmcp 3.1.0 and rmcp-macros 3.1.2 are licensed under Apache-2.0; the complete Apache License 2.0 text is packaged as LICENSE-APACHE.";
 const PROJECT_LICENSES: &[(&str, &[u8])] = &[
     ("LICENSE-APACHE", include_bytes!("../../LICENSE-APACHE")),
@@ -290,6 +293,7 @@ enum Task {
     },
     Test,
     GoSemanticE2e,
+    ResumableAnalysisE2e,
     RustSemanticE2e,
     Package,
     CompilerPack {
@@ -917,6 +921,7 @@ fn main() -> Result<()> {
         Task::GoSemanticE2e => {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
+        Task::ResumableAnalysisE2e => resumable_analysis_e2e(),
         Task::RustSemanticE2e => {
             rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
@@ -1114,7 +1119,21 @@ fn test() -> Result<()> {
     run(Command::new(pnpm_program())
         .arg("test")
         .current_dir("workers/web"))?;
+    resumable_analysis_e2e()?;
     Ok(())
+}
+
+fn resumable_analysis_e2e() -> Result<()> {
+    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    build_non_rust_workers()?;
+    let target_dir = cargo_target_dir();
+    let cli = workspace_root()
+        .join(target_dir)
+        .join("debug")
+        .join(executable_name("depgraph"));
+    run(Command::new("node")
+        .arg("scripts/resumable-analysis-e2e.mjs")
+        .env("DEPGRAPH_BIN", cli))
 }
 
 fn package() -> Result<()> {
@@ -1221,6 +1240,10 @@ fn package() -> Result<()> {
         &staging.join(MCP_TOOL_SCHEMA_PATH),
     )?;
     let mcp_tool_schema_path = staging.join(MCP_TOOL_SCHEMA_PATH);
+    copy_lf_normalized_text(
+        Path::new(SCAN_OUTCOME_V2_SCHEMA_PATH),
+        &staging.join(SCAN_OUTCOME_V2_SCHEMA_PATH),
+    )?;
     let query_fixture_path = staging.join(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH);
     copy_lf_normalized_text(
         Path::new(depgraph_core::BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH),
@@ -4069,6 +4092,9 @@ fn verify_checksum_sidecar(archive: &Path, checksum: &Path) -> Result<String> {
     Ok(digest)
 }
 
+// This verifies the contract compiled from the selected release source.
+// Historical archives use the verifier from their immutable release tag;
+// a matching product version alone does not make post-tag schemas compatible.
 fn verify_published_release_tree(
     extracted: &Path,
     expected_target: &str,
@@ -4205,6 +4231,16 @@ fn verify_published_release_tree(
         "MCP tool schema",
     )?;
     verify_mcp_tool_schema_bytes(&mcp_tool_schema, "published release")?;
+    // The manifest and operation contract have already matched this verifier.
+    // Only this current contract requires the standalone v2 result schema.
+    let scan_outcome_schema = verified_release_path(
+        extracted,
+        SCAN_OUTCOME_V2_SCHEMA_PATH,
+        "scan outcome v2 schema",
+    )?;
+    if fs::read(scan_outcome_schema)? != SCAN_OUTCOME_V2_SCHEMA_BYTES {
+        bail!("published release scan outcome v2 schema differs from the compiled contract");
+    }
     if smoke.mcp.tool_schema_sha256 != manifest.mcp_tool_schema.sha256 {
         bail!("published MCP smoke schema digest differs from the extracted release manifest");
     }

@@ -4570,9 +4570,40 @@ fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_clo
         assert!(Instant::now() < deadline, "durable scan did not complete");
         std::thread::sleep(Duration::from_millis(25));
     };
+    let scan_config = operation_service_config(
+        &root,
+        &store_path,
+        [DepgraphCapability::Read, DepgraphCapability::StoreWrite],
+    );
+    let (journal_status, stored, journal_error): (String, Option<String>, Option<String>) =
+        Connection::open(operation_journal_path(&scan_config))
+            .unwrap()
+            .query_row(
+                "SELECT status, result_json, error_json FROM operations WHERE operation_id=?1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
     assert_eq!(
-        terminal["result"]["result"]["structuredContent"]["result"]["status"],
-        "completed"
+        journal_status, "completed",
+        "journal error: {journal_error:?}; terminal: {terminal}"
+    );
+    let stored = stored.expect("completed operation must retain its result");
+    let decoded = serde_json::from_str::<
+        depgraph_mcp_tools::SuccessEnvelope<depgraph_mcp_tools::AgentScanOutcomeV2>,
+    >(&stored);
+    assert!(
+        decoded.is_ok(),
+        "invalid persisted v2 scan result: {:?}: {stored}",
+        decoded.err()
+    );
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["result"]["status"], "completed",
+        "terminal scan result: {terminal}"
+    );
+    assert_eq!(
+        terminal["result"]["result"]["structuredContent"]["result"]["contract_version"],
+        "depgraph-agent-scan-outcome-v2"
     );
     assert_eq!(
         terminal["result"]["result"]["structuredContent"]["result"]["project_code_executed"],

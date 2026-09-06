@@ -3,6 +3,13 @@ import path from "node:path";
 import { inventoryFiles, inventoryFilesFromManifest, readUtf8 } from "./fs";
 import { stableId } from "./ids";
 import {
+  analysisUnitLogicalProfileId,
+  analysisUnitProfileId,
+  readAnalysisUnitRequest,
+  validateAnalysisUnitForRoot,
+  type AnalysisUnitRequest,
+} from "./analysis-unit";
+import {
   deltaEventsFor,
   IncrementalFallbackError,
   parseWorkerDeltaRequest,
@@ -23,6 +30,8 @@ import {
 import {
   ADAPTER,
   ADAPTER_VERSION,
+  BASE_PROFILE_ID,
+  setActiveProfileIds,
   PROFILE_ID,
   WEB_ENVIRONMENTS,
   PROTOCOL_VERSION,
@@ -36,6 +45,7 @@ interface Options {
   scanId: string;
   deltaRequest: string | null;
   inventoryFile: string | null;
+  analysisUnitFile: string | null;
 }
 
 interface VersionOptions {
@@ -99,6 +109,7 @@ function parseArgs(args: string[]): Options | VersionOptions {
   let scanId: string | null = null;
   let deltaRequest: string | null = null;
   let inventoryFile: string | null = null;
+  let analysisUnitFile: string | null = null;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--root") {
@@ -121,9 +132,14 @@ function parseArgs(args: string[]): Options | VersionOptions {
       if (!value) throw new UsageError("--inventory-file requires a path");
       inventoryFile = path.resolve(value);
       index += 1;
+    } else if (argument === "--analysis-unit") {
+      const value = args[index + 1];
+      if (!value) throw new UsageError("--analysis-unit requires a path");
+      analysisUnitFile = path.resolve(value);
+      index += 1;
     } else if (argument === "--help" || argument === "-h") {
       throw new UsageError(
-        "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--delta-request <path>]",
+        "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--analysis-unit <path>] [--delta-request <path>]",
       );
     } else {
       throw new UsageError(`unknown argument: ${argument ?? ""}`);
@@ -131,13 +147,36 @@ function parseArgs(args: string[]): Options | VersionOptions {
   }
   if (!root || !scanId) {
     throw new UsageError(
-      "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--delta-request <path>]",
+      "usage: depgraph-web-worker --root <path> --scan-id <id> [--inventory-file <path>] [--analysis-unit <path>] [--delta-request <path>]",
     );
   }
-  return { root: path.resolve(root), scanId, deltaRequest, inventoryFile };
+  return { root: path.resolve(root), scanId, deltaRequest, inventoryFile, analysisUnitFile };
 }
 
-function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEvent[] {
+function analysisProfileProperties(request: AnalysisUnitRequest | null): Record<string, string> {
+  if (request === null) return {};
+  return {
+    analysis_base_profile_id: BASE_PROFILE_ID,
+    analysis_logical_profile_id: analysisUnitLogicalProfileId(request, BASE_PROFILE_ID),
+    analysis_unit_contract: request.contract_version,
+    analysis_unit_id: request.unit_id,
+    analysis_unit_root: request.unit_root,
+    analysis_stage: request.stage,
+    analysis_chunk_id: request.chunk_id,
+    analysis_chunk_index: String(request.chunk_index),
+    analysis_chunk_count: String(request.chunk_count),
+    analysis_context_fingerprint: request.context_fingerprint,
+    analysis_source_path_count: String(request.source_paths.length),
+    analysis_context_path_count: String(request.context_paths.length),
+  };
+}
+
+function eventsFor(
+  model: ScanModel,
+  root: string,
+  scanId: string,
+  analysisUnit: AnalysisUnitRequest | null = null,
+): ProtocolEvent[] {
   let seq = 0;
   const common = (event: string): CommonEvent => ({
     event,
@@ -170,6 +209,7 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
         lockfile: model.lockfile ?? "",
         ...frameworkSemanticProfileProperties(model.frameworkSemantic),
         ...typeScriptProfileProperties(model.typeScriptProject),
+        ...analysisProfileProperties(analysisUnit),
         project_code_executed: "false",
       },
     },
@@ -194,7 +234,12 @@ function eventsFor(model: ScanModel, root: string, scanId: string): ProtocolEven
   return events;
 }
 
-function failureEventsFor(root: string, scanId: string, failure: TypeScriptProjectError): ProtocolEvent[] {
+function failureEventsFor(
+  root: string,
+  scanId: string,
+  failure: TypeScriptProjectError,
+  analysisUnit: AnalysisUnitRequest | null = null,
+): ProtocolEvent[] {
   let seq = 0;
   const common = (event: string): CommonEvent => ({
     event,
@@ -242,6 +287,7 @@ function failureEventsFor(root: string, scanId: string, failure: TypeScriptProje
           lockfile: "",
           ...WEB_FRAMEWORK_SEMANTIC_PROFILE_PROPERTIES,
           ...typeScriptProfileProperties(null, failure),
+          ...analysisProfileProperties(analysisUnit),
           project_code_executed: "false",
         },
       },
@@ -317,9 +363,20 @@ async function main(): Promise<void> {
     return;
   }
   let root: string | null = null;
+  let analysisUnit: AnalysisUnitRequest | null = null;
   try {
     root = await realpath(options.root);
     if (!(await stat(root)).isDirectory()) throw new Error(`root is not a directory: ${root}`);
+    if (options.analysisUnitFile !== null) {
+      analysisUnit = await readAnalysisUnitRequest(options.analysisUnitFile);
+      if (options.deltaRequest !== null) throw new UsageError("--analysis-unit cannot be combined with --delta-request");
+      setActiveProfileIds(
+        analysisUnitProfileId(analysisUnit, BASE_PROFILE_ID),
+        analysisUnitLogicalProfileId(analysisUnit, BASE_PROFILE_ID),
+      );
+    } else {
+      setActiveProfileIds(BASE_PROFILE_ID);
+    }
     const deltaRequest = options.deltaRequest === null
       ? null
       : parseWorkerDeltaRequest(
@@ -349,9 +406,10 @@ async function main(): Promise<void> {
       inventory_files: inventory.files.length,
       inventory_issues: inventory.issues.length,
     });
-    const model = await scan(root, inventory.files, inventory.issues, progress);
+    if (analysisUnit !== null) await validateAnalysisUnitForRoot(root, inventory.files, analysisUnit);
+    const model = await scan(root, inventory.files, inventory.issues, progress, analysisUnit);
     await writeEvents(deltaRequest === null
-      ? eventsFor(model, root, options.scanId)
+      ? eventsFor(model, root, options.scanId, analysisUnit)
       : deltaEventsFor(model, deltaRequest));
     process.stderr.write(
       `depgraph-web-worker: ${model.coverage.files_analyzed} files, ${model.coverage.dependency_sites} sites, ${deltaRequest === null ? "full" : "delta"} mode, project code executed=false\n`,
@@ -361,7 +419,7 @@ async function main(): Promise<void> {
       process.stderr.write(`depgraph-web-worker: incremental fallback required: ${error.message}\n`);
       process.exitCode = 75;
     } else if (error instanceof TypeScriptProjectError && root !== null) {
-      await writeEvents(failureEventsFor(root, options.scanId, error)).catch(() => undefined);
+      await writeEvents(failureEventsFor(root, options.scanId, error, analysisUnit)).catch(() => undefined);
       process.stderr.write(`depgraph-web-worker: ${error.message}\n`);
     } else {
       process.stderr.write(`depgraph-web-worker: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);

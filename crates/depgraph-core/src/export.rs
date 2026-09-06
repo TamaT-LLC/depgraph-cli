@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, io};
 
 use anyhow::Result;
 use depgraph_store::{GraphSnapshot, refresh_profile_matrix_view};
+use serde_json::Value;
 
 use crate::query::{GraphQueryFilter, render_condition};
 
@@ -36,6 +37,54 @@ pub fn export_filtered(
     }
     let filtered = filter_snapshot(snapshot, filter);
     export(&filtered, format)
+}
+
+/// Render an export with the bounded metadata of a terminal partial analysis
+/// attempt. Completed exports continue through [`export`] unchanged. The
+/// metadata is kept as JSON so callers can expose only the attempt selector
+/// and aggregate ledger, without leaking store paths or unbounded unit rows.
+pub fn export_filtered_with_partial_metadata(
+    snapshot: &GraphSnapshot,
+    format: ExportFormat,
+    filter: &GraphQueryFilter,
+    partial: Option<&Value>,
+) -> Result<String> {
+    let filtered;
+    let snapshot = if filter.is_empty() {
+        snapshot
+    } else {
+        filtered = filter_snapshot(snapshot, filter);
+        &filtered
+    };
+    let mut output = Vec::new();
+    match format {
+        ExportFormat::Json => write_json_with_partial_metadata(snapshot, &mut output, partial)?,
+        ExportFormat::Dot => write_dot_with_partial_metadata(snapshot, &mut output, partial)?,
+        ExportFormat::Mermaid => {
+            write_mermaid_with_partial_metadata(snapshot, &mut output, partial)?
+        }
+        ExportFormat::Graphml => {
+            write_graphml_with_partial_metadata(snapshot, &mut output, partial)?
+        }
+    }
+    Ok(String::from_utf8(output)?)
+}
+
+/// Build the public, bounded projection used by partial exports and query
+/// pages.  The unit ledger itself remains available through the Store API;
+/// artifacts carry its aggregate so a consumer can distinguish an analyzed
+/// prefix from a complete graph without receiving an unbounded payload.
+pub fn partial_export_metadata(snapshot: &crate::service::SnapshotReadRequest) -> Option<Value> {
+    let partial = snapshot.partial_metadata()?;
+    let coverage = partial.analysis_coverage();
+    Some(serde_json::json!({
+        "contract_version": "depgraph-partial-result-v1",
+        "attempt_id": partial.attempt_id(),
+        "status": partial.status(),
+        "analysis_complete": false,
+        "analysis_coverage": coverage,
+        "ledger": coverage,
+    }))
 }
 
 pub fn export_filtered_to_writer<W: io::Write>(
@@ -136,12 +185,19 @@ pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> G
         .diagnostics
         .retain(|diagnostic| filter.matches_diagnostic(diagnostic));
     filtered.coverage.profiles = filtered.profiles.len() as u64;
-    if snapshot
-        .profiles
-        .iter()
-        .any(|profile| profile.properties["analysis_unit_contract"] == "depgraph-analysis-unit-v1")
-        && (filtered.profiles.len() != snapshot.profiles.len()
-            || filtered.edges.len() != snapshot.edges.len())
+    if snapshot.profiles.iter().any(|profile| {
+        profile
+            .properties
+            .get("analysis_unit_contract")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|contract| {
+                matches!(
+                    contract,
+                    "depgraph-analysis-unit-v1" | "depgraph-analysis-unit-v2"
+                )
+            })
+    }) && (filtered.profiles.len() != snapshot.profiles.len()
+        || filtered.edges.len() != snapshot.edges.len())
     {
         // A whole-unit stage join is not evidence of completeness for a
         // projection containing only one stage. Keep the selected profiles'
@@ -188,6 +244,14 @@ fn export_json(snapshot: &GraphSnapshot) -> Result<String> {
 }
 
 fn write_json<W: io::Write>(snapshot: &GraphSnapshot, writer: &mut W) -> Result<()> {
+    write_json_with_partial_metadata(snapshot, writer, None)
+}
+
+fn write_json_with_partial_metadata<W: io::Write>(
+    snapshot: &GraphSnapshot,
+    writer: &mut W,
+    partial: Option<&Value>,
+) -> Result<()> {
     let mut sites = serde_json::to_value(&snapshot.sites)?;
     for site in sites.as_array_mut().into_iter().flatten() {
         if let Some(object) = site.as_object_mut()
@@ -213,24 +277,27 @@ fn write_json<W: io::Write>(snapshot: &GraphSnapshot, writer: &mut W) -> Result<
     // Attempt identity, timestamps, absolute checkout roots, and worker logs
     // deliberately stay in `doctor`/the evidence store. This content envelope
     // is reproducible across scans of the same repository state.
-    serde_json::to_writer_pretty(
-        writer,
-        &serde_json::json!({
-            "schema_version":"1.0",
-            "command":"export",
-            "graph":{
-                "profiles":snapshot.profiles,
-                "nodes":snapshot.nodes,
-                "sites":sites,
-                "edges":edges,
-                "evidence":snapshot.evidence,
-                "diagnostics":snapshot.diagnostics,
-                "file_coverage":snapshot.file_coverage,
-                "coverage":snapshot.coverage,
-                "profile_matrix":snapshot.profile_matrix,
-            }
-        }),
-    )?;
+    let mut value = serde_json::json!({
+        "schema_version":"1.0",
+        "command":"export",
+        "graph":{
+            "profiles":snapshot.profiles,
+            "nodes":snapshot.nodes,
+            "sites":sites,
+            "edges":edges,
+            "evidence":snapshot.evidence,
+            "diagnostics":snapshot.diagnostics,
+            "file_coverage":snapshot.file_coverage,
+            "coverage":snapshot.coverage,
+            "profile_matrix":snapshot.profile_matrix,
+        }
+    });
+    if let Some(partial) = partial
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("partial".to_owned(), partial.clone());
+    }
+    serde_json::to_writer_pretty(writer, &value)?;
     Ok(())
 }
 
@@ -241,6 +308,21 @@ fn export_dot(snapshot: &GraphSnapshot) -> String {
 }
 
 fn write_dot<W: io::Write>(snapshot: &GraphSnapshot, output: &mut W) -> Result<()> {
+    write_dot_with_partial_metadata(snapshot, output, None)
+}
+
+fn write_dot_with_partial_metadata<W: io::Write>(
+    snapshot: &GraphSnapshot,
+    output: &mut W,
+    partial: Option<&Value>,
+) -> Result<()> {
+    if let Some(partial) = partial {
+        writeln!(
+            output,
+            "// depgraph-partial: {}",
+            depgraph_protocol::canonical_json(partial)
+        )?;
+    }
     output.write_all(b"digraph depgraph {\n  rankdir=LR;\n")?;
     let observation_status = edge_observation_status(snapshot);
     for node in &snapshot.nodes {
@@ -286,6 +368,21 @@ fn export_mermaid(snapshot: &GraphSnapshot) -> String {
 }
 
 fn write_mermaid<W: io::Write>(snapshot: &GraphSnapshot, output: &mut W) -> Result<()> {
+    write_mermaid_with_partial_metadata(snapshot, output, None)
+}
+
+fn write_mermaid_with_partial_metadata<W: io::Write>(
+    snapshot: &GraphSnapshot,
+    output: &mut W,
+    partial: Option<&Value>,
+) -> Result<()> {
+    if let Some(partial) = partial {
+        writeln!(
+            output,
+            "%% depgraph-partial: {}",
+            depgraph_protocol::canonical_json(partial)
+        )?;
+    }
     output.write_all(b"flowchart LR\n")?;
     let observation_status = edge_observation_status(snapshot);
     for (index, node) in snapshot.nodes.iter().enumerate() {
@@ -324,6 +421,35 @@ fn write_mermaid<W: io::Write>(snapshot: &GraphSnapshot, output: &mut W) -> Resu
             )?;
         }
     }
+    Ok(())
+}
+
+fn write_graphml_with_partial_metadata(
+    snapshot: &GraphSnapshot,
+    output: &mut Vec<u8>,
+    partial: Option<&Value>,
+) -> Result<()> {
+    if partial.is_none() {
+        return crate::graphml::write_graphml(snapshot, output);
+    }
+    let mut graphml = Vec::new();
+    crate::graphml::write_graphml(snapshot, &mut graphml)?;
+    let metadata = depgraph_protocol::canonical_json(partial.expect("checked above"));
+    // XML declarations must remain the first bytes. Escaping only the second
+    // hyphen of a repeated pair keeps arbitrary error text from forming the
+    // forbidden `--` sequence while preserving the JSON value if the comment
+    // is extracted.
+    let comment = format!(
+        "<!-- depgraph-partial: {} -->\n",
+        metadata.replace("--", "-\\u002d")
+    );
+    let declaration_end = graphml
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    output.extend_from_slice(&graphml[..declaration_end]);
+    output.extend_from_slice(comment.as_bytes());
+    output.extend_from_slice(&graphml[declaration_end..]);
     Ok(())
 }
 
@@ -410,6 +536,54 @@ mod tests {
         let filtered = filter_snapshot(&snapshot, &filter);
         assert_eq!(filtered.coverage.completeness, ["syntax-complete"]);
         assert_eq!(snapshot.coverage.completeness.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_export_metadata_is_present_in_every_format() -> Result<()> {
+        let mut store = depgraph_store::Store::open_in_memory()?;
+        store.start_scan(
+            "partial-export",
+            std::path::Path::new("/tmp/project"),
+            false,
+        )?;
+        let snapshot = store.load_snapshot("partial-export")?;
+        let metadata = json!({
+            "contract_version": "depgraph-partial-result-v1",
+            "attempt_id": "partial-export",
+            "status": "failed",
+            "analysis_complete": false,
+            "analysis_coverage": {
+                "expected_units": 2,
+                "completed_units": 1,
+                "failed_units": 1,
+                "complete": false
+            },
+            "ledger": {"expected_units": 2, "completed_units": 1}
+        });
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Dot,
+            ExportFormat::Mermaid,
+            ExportFormat::Graphml,
+        ] {
+            let output = export_filtered_with_partial_metadata(
+                &snapshot,
+                format,
+                &GraphQueryFilter::default(),
+                Some(&metadata),
+            )?;
+            assert!(output.contains("partial-export"), "{format:?}");
+            assert!(output.contains("analysis_complete"), "{format:?}");
+        }
+        let json_output = export_filtered_with_partial_metadata(
+            &snapshot,
+            ExportFormat::Json,
+            &GraphQueryFilter::default(),
+            Some(&metadata),
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&json_output)?;
+        assert_eq!(value["partial"]["analysis_complete"], false);
         Ok(())
     }
 

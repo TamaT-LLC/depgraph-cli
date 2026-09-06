@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/TamaT-LLC/depgraph-cli/workers/go/internal/worker"
 )
@@ -30,7 +31,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *version {
-		fmt.Fprintf(stdout, "depgraph-go-worker %s (protocol %s; capabilities %s)\n", worker.AdapterVersion, worker.ProtocolVersion, worker.AnalysisUnitCapability)
+		fmt.Fprintf(stdout, "depgraph-go-worker %s (protocol %s; capabilities %s)\n", worker.AdapterVersion, worker.ProtocolVersion, strings.Join(worker.AnalysisUnitCapabilities, ","))
 		return 0
 	}
 	if flags.NArg() != 0 || *root == "" || *scanID == "" {

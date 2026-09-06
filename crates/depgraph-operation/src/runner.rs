@@ -20,7 +20,8 @@ use depgraph_mcp_tools::{
     AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
     AgentDaemonControlPhase, AgentError, AgentErrorCode, AgentExportOutcome,
     AgentGraphExportFormat, AgentRemediation, AgentRuntimeOutcome, AgentRuntimeStatus,
-    AgentScanOutcome, ErrorEnvelope, LogicalRepositoryId, OperationId, SnapshotId, SuccessEnvelope,
+    AgentScanOutcome, AgentScanOutcomeV2, ErrorEnvelope, LogicalRepositoryId, OperationId,
+    SnapshotId, SuccessEnvelope,
 };
 
 use crate::{
@@ -482,6 +483,16 @@ pub struct ExecutionControl<'a> {
 }
 
 impl ExecutionControl<'_> {
+    fn report_scan_progress(&mut self, completed: u64, total: u64) -> Result<(), RunnerError> {
+        self.journal.update_progress(
+            self.repository_id,
+            self.operation_id,
+            self.lease_token,
+            crate::OperationProgress::new(completed, total)?,
+            (self.now)()?,
+        )?;
+        Ok(())
+    }
     #[must_use]
     pub const fn cancellation_token(&self) -> &CancellationToken {
         self.cancellation
@@ -1766,13 +1777,18 @@ impl ScanOperationDispatcher {
             },
         );
         let service = DepgraphService::new(self.config.clone());
-        let execution = service.scan_deferred_cancellable_for_operation(
-            &request,
-            work.operation_id().as_str(),
-            cancellation.clone(),
+        let observer = depgraph_core::analysis_execution::AnalysisProgressObserver::default();
+        let execution = depgraph_core::analysis_execution::observe_analysis_progress(
+            observer.clone(),
+            service.scan_deferred_cancellable_for_operation(
+                &request,
+                work.operation_id().as_str(),
+                cancellation.clone(),
+            ),
         );
         tokio::pin!(execution);
         let mut forced_cancel = false;
+        let mut reported_progress = None;
         let result = runtime.block_on(async {
             let mut checkpoints = tokio::time::interval(Duration::from_millis(25));
             checkpoints.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1780,6 +1796,16 @@ impl ScanOperationDispatcher {
                 tokio::select! {
                     result = &mut execution => break result,
                     _ = checkpoints.tick() => {
+                        let (finished, total) = observer.counts();
+                        if total > 0 && reported_progress != Some(finished) {
+                            let reported = if reported_progress.is_none() {
+                                control.report_scan_progress(0, total + 1)
+                            } else { Ok(()) };
+                            if reported.is_err() || control.report_scan_progress(finished, total + 1).is_err() {
+                                forced_cancel = true;
+                                cancellation.cancel();
+                            } else { reported_progress = Some(finished); }
+                        }
                         match control.checkpoint() {
                             Ok(ExecutionCheckpoint::Continue) => {}
                             Ok(
@@ -1825,7 +1851,12 @@ impl ScanOperationDispatcher {
             {
                 DispatchOutcome::Cancelled
             }
-            Ok(DeferredScanServiceOutcome::Finished(_)) => self.failed(AgentErrorCode::Internal),
+            Ok(DeferredScanServiceOutcome::Finished(result)) => {
+                match self.completed_output(&result) {
+                    Ok(result) => DispatchOutcome::Completed(result),
+                    Err(error) => DispatchOutcome::Failed(error),
+                }
+            }
             Err(DepgraphServiceError::Cancelled) => DispatchOutcome::Cancelled,
             Err(DepgraphServiceError::Conflict | DepgraphServiceError::StoreWriterConflict) => {
                 self.failed(AgentErrorCode::Conflict)
@@ -2187,24 +2218,18 @@ impl ScanOperationDispatcher {
         &self,
         result: &depgraph_core::service::ScanServiceOutcome,
     ) -> Result<CanonicalJson, CanonicalJson> {
+        let outcome = AgentScanOutcomeV2::try_from(result)
+            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
         let snapshot_id = result
             .completed_snapshot_id()
-            .ok_or_else(|| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
-        let outcome = AgentScanOutcome::try_from(result)
-            .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
-        let snapshot_id = snapshot_id
-            .as_str()
-            .parse::<SnapshotId>()
+            .map(|snapshot_id| snapshot_id.as_str().parse::<SnapshotId>())
+            .transpose()
             .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
         let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
             .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))?;
         CanonicalJson::new(
-            serde_json::to_value(SuccessEnvelope::new(
-                repository_id,
-                Some(snapshot_id),
-                outcome,
-            ))
-            .expect("closed scan output serializes"),
+            serde_json::to_value(SuccessEnvelope::new(repository_id, snapshot_id, outcome))
+                .expect("closed scan output serializes"),
         )
         .map_err(|_| self.canonical_error(AgentErrorCode::IntegrityFailure))
     }
@@ -2513,22 +2538,45 @@ impl OperationDispatcher for ScanOperationDispatcher {
         }
         let input = serde_json::from_str::<ScanInput>(intent.normalized_input().as_str())
             .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
-        let envelope = serde_json::from_value::<SuccessEnvelope<AgentScanOutcome>>(
-            intent.result().value().clone(),
-        )
-        .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+        // Durable v1 completion intents remain recoverable after the journal
+        // migration. New scans use v2 so terminal partial outcomes are explicit.
+        let value = intent.result().value().clone();
+        let (envelope_repository_id, scan_id, snapshot_id) =
+            if value["result"].get("contract_version").is_some() {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentScanOutcomeV2>>(value)
+                    .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+                let snapshot_id = envelope
+                    .snapshot_id()
+                    .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?;
+                if envelope.result().completed_snapshot_id() != Some(snapshot_id) {
+                    return Err(RunnerError::Journal(JournalError::IntegrityFailure));
+                }
+                (
+                    envelope.repository_id().clone(),
+                    envelope.result().scan_id().clone(),
+                    snapshot_id.clone(),
+                )
+            } else {
+                let envelope = serde_json::from_value::<SuccessEnvelope<AgentScanOutcome>>(value)
+                    .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
+                let snapshot_id = envelope
+                    .snapshot_id()
+                    .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?;
+                (
+                    envelope.repository_id().clone(),
+                    envelope.result().scan_id().clone(),
+                    snapshot_id.clone(),
+                )
+            };
         let repository_id = LogicalRepositoryId::parse(self.config.logical_repository_id())
             .map_err(|_| RunnerError::Journal(JournalError::IntegrityFailure))?;
-        if envelope.repository_id() != &repository_id {
+        if envelope_repository_id != repository_id {
             return Err(RunnerError::Journal(JournalError::IntegrityFailure));
         }
-        let snapshot_id = envelope
-            .snapshot_id()
-            .ok_or(RunnerError::Journal(JournalError::IntegrityFailure))?;
         let result_digest = JournalDigest::sha256(intent.result().as_str().as_bytes());
         let recovery = DeferredScanRecovery {
             operation_id: intent.operation_id().as_str(),
-            scan_id: envelope.result().scan_id().as_str(),
+            scan_id: scan_id.as_str(),
             snapshot_id: snapshot_id.as_str(),
             strict: input.strict,
             cache_enabled: !input.no_cache,

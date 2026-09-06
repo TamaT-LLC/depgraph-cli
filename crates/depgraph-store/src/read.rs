@@ -874,6 +874,72 @@ pub(crate) fn load_adapter_logs(
         .map_err(Into::into)
 }
 
+/// Refresh staging coverage from normalized counters without reconstructing
+/// the graph, evidence, diagnostics, or profile correlations. Failure
+/// bookkeeping must stay bounded by metadata even for a large partial scan.
+pub(crate) fn load_staging_coverage(
+    connection: &Connection,
+    scan_id: &str,
+) -> Result<CoverageRecord> {
+    let (executed, stored) = connection
+        .query_row(
+            "SELECT scans.project_code_executed, coverage.json
+               FROM scans LEFT JOIN coverage ON coverage.scan_id=scans.id
+              WHERE scans.id=?1",
+            [scan_id],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("scan {scan_id} was not found"))?;
+    let mut coverage = stored
+        .map(|raw| serde_json::from_str::<CoverageRecord>(&raw))
+        .transpose()?
+        .unwrap_or_else(|| CoverageRecord {
+            reasons: vec!["final worker coverage unavailable".to_owned()],
+            ..CoverageRecord::default()
+        });
+    (
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+    ) = connection.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(resolution_status='resolved'), 0),
+                COALESCE(SUM(resolution_status='candidates'), 0),
+                COALESCE(SUM(resolution_status='external'), 0),
+                COALESCE(SUM(resolution_status='unresolved'), 0)
+           FROM sites WHERE scan_id=?1",
+        [scan_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    (
+        coverage.profiles,
+        coverage.files_discovered,
+        coverage.files_skipped,
+    ) = connection.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM profiles WHERE scan_id=?1),
+            (SELECT COUNT(*) FROM file_coverage WHERE scan_id=?1),
+            (SELECT COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0)
+               FROM file_coverage WHERE scan_id=?1)",
+        [scan_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    coverage.files_analyzed = coverage.files_discovered - coverage.files_skipped;
+    coverage.project_code_executed |= executed;
+    Ok(coverage)
+}
+
 pub(crate) fn observed_coverage(
     connection: &Connection,
     scan_id: &str,

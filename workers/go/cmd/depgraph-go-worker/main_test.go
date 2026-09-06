@@ -53,7 +53,7 @@ func TestRunVersionAdvertisesAnalysisUnitCapability(t *testing.T) {
 	if code := run([]string{"--version"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("run() code = %d, stderr=%s", code, stderr.String())
 	}
-	if got, want := stdout.String(), "depgraph-go-worker 0.5.4 (protocol 1.0; capabilities analysis-unit-v1)\n"; got != want {
+	if got, want := stdout.String(), "depgraph-go-worker 0.5.4 (protocol 1.0; capabilities analysis-source-batch-v1,analysis-unit-typed-v1)\n"; got != want {
 		t.Fatalf("version handshake = %q, want %q", got, want)
 	}
 	if stderr.Len() != 0 {
@@ -71,12 +71,16 @@ func TestRunAnalysisUnitEmitsBoundedStageProgress(t *testing.T) {
 	}
 	requestPath := filepath.Join(root, "request.json")
 	request := worker.AnalysisUnitRequest{
-		ContractVersion: worker.AnalysisUnitContractVersion,
-		UnitID:          "analysis-unit:progress",
-		Adapter:         worker.AdapterName,
-		UnitRoot:        ".",
-		SourcePaths:     []string{"main.go"},
-		Stage:           worker.AnalysisUnitStageSemantic,
+		ContractVersion:    worker.AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:progress",
+		Adapter:            worker.AdapterName,
+		UnitRoot:           ".",
+		SourcePaths:        []string{"main.go"},
+		Stage:              worker.AnalysisUnitStageSemantic,
+		ContextPaths:       []string{"main.go"},
+		ChunkID:            "semantic",
+		ChunkCount:         1,
+		ContextFingerprint: "progress-context",
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil {

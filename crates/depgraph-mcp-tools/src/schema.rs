@@ -14,7 +14,7 @@ use crate::{
     AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
     AgentRepositoryInitOutcome, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2, AgentSite, AgentSnapshot,
     AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
     OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
     SuccessEnvelope, TaskAccepted,
@@ -22,6 +22,8 @@ use crate::{
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
     "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-mcp-tools-v1.schema.json";
+pub const AGENT_SCAN_OUTCOME_V2_SCHEMA_ID: &str =
+    "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-agent-scan-outcome-v2.schema.json";
 
 struct McpToolsV1Schema;
 
@@ -144,6 +146,28 @@ pub fn mcp_tools_v1_schema() -> Schema {
         .for_deserialize()
         .into_generator()
         .into_root_schema_for::<McpToolsV1Schema>()
+}
+
+/// Standalone schema for the additive scan outcome projection.  It is kept
+/// outside the v1 catalog so regenerating the legacy catalog cannot silently
+/// change the closed completed-only tool contract.
+#[must_use]
+pub fn agent_scan_outcome_v2_schema() -> Schema {
+    let mut schema = SchemaSettings::draft2020_12()
+        .for_deserialize()
+        .into_generator()
+        .into_root_schema_for::<AgentScanOutcomeV2>();
+    if let Some(object) = schema.as_object_mut() {
+        object.insert(
+            "$id".to_owned(),
+            serde_json::Value::String(AGENT_SCAN_OUTCOME_V2_SCHEMA_ID.to_owned()),
+        );
+        object.insert(
+            "title".to_owned(),
+            serde_json::Value::String("depgraph agent scan outcome v2".to_owned()),
+        );
+    }
+    schema
 }
 
 pub fn canonical_json_bytes<T>(value: &T) -> Result<Vec<u8>, CanonicalJsonError>

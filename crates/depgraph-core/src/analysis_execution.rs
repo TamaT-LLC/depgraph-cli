@@ -4,7 +4,8 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::Write,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use serde_json::Value;
 use tokio::task::JoinSet;
 
 use crate::{
-    analysis_checkpoint::{UnitCheckpointKey, UnitCheckpointStore},
+    analysis_checkpoint::{StagedUnitCheckpoint, UnitCheckpointKey, UnitCheckpointStore},
     cancellation::CancellationToken,
     config::Config,
     scan::ScanCacheMode,
@@ -25,8 +26,6 @@ use crate::{
 
 /// There is no deadline for the aggregate queue. Worker deadlines, output
 /// budgets and process-tree cancellation apply separately to each work item.
-const MAX_CONCURRENT_UNITS: usize = 2;
-
 pub(crate) struct AnalysisWorkItem {
     pub unit_id: String,
     pub request: Option<Value>,
@@ -50,11 +49,129 @@ pub struct AnalysisUnitProgress {
     pub adapter: String,
     pub status: String,
     pub reused: bool,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub protocol_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AnalysisExecutionProgress {
     pub units: Vec<AnalysisUnitProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+/// Observation is scoped to one scan future, so concurrent scans cannot share
+/// progress. It does not grant cancellation or Store mutation authority.
+#[derive(Clone, Debug, Default)]
+pub struct AnalysisProgressObserver(
+    Arc<Mutex<AnalysisExecutionProgress>>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
+
+impl AnalysisProgressObserver {
+    pub fn revision(&self) -> u64 {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn snapshot(&self) -> AnalysisExecutionProgress {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn counts(&self) -> (u64, u64) {
+        let progress = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            progress
+                .units
+                .iter()
+                .filter(|unit| matches!(unit.status.as_str(), "completed" | "failed" | "cancelled"))
+                .count() as u64,
+            progress.units.len() as u64,
+        )
+    }
+}
+
+tokio::task_local! { static ANALYSIS_PROGRESS: AnalysisProgressObserver; }
+
+pub async fn observe_analysis_progress<F: std::future::Future>(
+    observer: AnalysisProgressObserver,
+    future: F,
+) -> F::Output {
+    ANALYSIS_PROGRESS.scope(observer, future).await
+}
+
+fn publish_progress(progress: &AnalysisExecutionProgress) {
+    let _ = ANALYSIS_PROGRESS.try_with(|observer| {
+        *observer
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = progress.clone();
+        observer
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    });
+}
+
+fn publish_unit_progress(progress: &AnalysisExecutionProgress, index: usize) {
+    let _ = ANALYSIS_PROGRESS.try_with(|observer| {
+        let mut observed = observer
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(unit) = observed.units.get_mut(index) {
+            *unit = progress.units[index].clone();
+        }
+        observer
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    });
+}
+
+/// A caller's optional total budget also runs while static discovery performs
+/// synchronous IO. Dropping the guard wakes and joins its thread immediately.
+pub(crate) struct ScanBudgetGuard {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScanBudgetGuard {
+    pub(crate) fn start(seconds: Option<u64>, cancellation: &CancellationToken) -> Option<Self> {
+        let seconds = seconds?;
+        let cancellation = cancellation.clone();
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if matches!(
+                receiver.recv_timeout(Duration::from_secs(seconds)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                cancellation.cancel_for_budget();
+            }
+        });
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ScanBudgetGuard {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub(crate) struct AnalysisExecutionContext<'a> {
@@ -96,6 +213,7 @@ where
     } else {
         None
     };
+    let prerequisites = stage_prerequisites(&work)?;
     let mut progress = AnalysisExecutionProgress {
         units: work
             .iter()
@@ -104,20 +222,50 @@ where
                 adapter: item.spec.adapter.name().into(),
                 status: "queued".into(),
                 reused: false,
+                stage: item
+                    .request
+                    .as_ref()
+                    .and_then(|request| request["stage"].as_str())
+                    .unwrap_or("repository")
+                    .to_owned(),
+                duration_ms: 0,
+                protocol_events: 0,
+                failure_reason: None,
             })
             .collect(),
+        stop_reason: None,
     };
+    publish_progress(&progress);
     let repository_inventory = crate::repository_inventory::write_repository_inventory_file(root)?;
     let inventory_bytes = Arc::new(std::fs::read(repository_inventory.path())?);
     drop(repository_inventory);
     let mut pending = work.into_iter().enumerate().collect::<VecDeque<_>>();
     let mut running = JoinSet::new();
     let mut running_units = BTreeMap::new();
-    let mut ready = BTreeMap::<usize, (String, WorkerOutput, bool)>::new();
+    let mut ready =
+        BTreeMap::<usize, (String, WorkerOutput, bool, Option<StagedUnitCheckpoint>)>::new();
     let mut next_ingest = 0;
+    let mut started = BTreeMap::<usize, Instant>::new();
     loop {
-        while let Some((unit_id, output, reused)) = ready.remove(&next_ingest) {
+        while let Some((unit_id, output, reused, staged)) = ready.remove(&next_ingest) {
+            progress.units[next_ingest].protocol_events = output.events.len() as u64;
+            progress.units[next_ingest].failure_reason =
+                output.failure_kind.map(|kind| kind.as_str().to_owned());
+            progress.units[next_ingest].duration_ms = started
+                .remove(&next_ingest)
+                .map(|time| time.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
             let complete = consume(store, &unit_id, output)?;
+            if complete
+                && !cancellation.is_cancelled()
+                && let (Some(checkpoints), Some(staged)) = (&checkpoints, staged)
+                && let Err(error) = checkpoints.commit(staged)
+            {
+                tracing::warn!(unit_id, %error, "analysis unit checkpoint could not be committed");
+            }
+            if !complete && progress.units[next_ingest].failure_reason.is_none() {
+                progress.units[next_ingest].failure_reason = Some("ingestion-failed".to_owned());
+            }
             progress.units[next_ingest].status = if cancellation.is_cancelled() {
                 "cancelled"
             } else if complete {
@@ -127,16 +275,18 @@ where
             }
             .into();
             progress.units[next_ingest].reused = reused && complete;
+            publish_unit_progress(&progress, next_ingest);
             tracing::info!(unit_id, complete, reused, "analysis unit finished");
             next_ingest += 1;
         }
         // A bounded reorder window makes Store ingestion independent of worker
         // timing without retaining outputs for the whole repository in memory.
-        while running.len() < MAX_CONCURRENT_UNITS
+        while running.len() < config.scan.max_concurrent_units
             && !cancellation.is_cancelled()
-            && pending
-                .front()
-                .is_some_and(|(index, _)| *index < next_ingest + MAX_CONCURRENT_UNITS)
+            && pending.front().is_some_and(|(index, _)| {
+                *index < next_ingest + config.scan.max_concurrent_units
+                    && prerequisites[*index].is_none_or(|previous| previous < next_ingest)
+            })
         {
             let Some((index, item)) = pending.pop_front() else {
                 break;
@@ -149,14 +299,17 @@ where
                         replay_analysis_checkpoint(events, &item.spec, root, scan_id, &config.scan)
                             .ok()?;
                     validate_unit_output(&item, &output).ok()?;
-                    Some(output)
+                    semantic_checkpoint_complete(item.request.as_ref(), &output.events)
+                        .then_some(output)
                 });
                 if let Some(output) = cached {
-                    ready.insert(index, (item.unit_id, output, true));
+                    ready.insert(index, (item.unit_id, output, true, None));
                     continue;
                 }
             }
             progress.units[index].status = "running".into();
+            started.insert(index, Instant::now());
+            publish_unit_progress(&progress, index);
             tracing::info!(unit_id = item.unit_id, "analysis unit started");
             let root = root.to_path_buf();
             let scan_id = scan_id.to_owned();
@@ -275,26 +428,139 @@ where
                     }),
                     security_violation: false,
                 };
-                ready.insert(index, (unit_id, output, false));
+                ready.insert(index, (unit_id, output, false, None));
                 continue;
             }
         };
-        // The supervisor has validated the full stream before it becomes
-        // reusable; prefixes from killed or malformed workers are never saved.
-        if output.error.is_none()
+        // Serialize without publishing. A protocol-valid stream can still be
+        // rejected by the Store's cross-unit integrity and coverage checks.
+        let staged = if output.error.is_none()
+            && semantic_checkpoint_complete(item.request.as_ref(), &output.events)
             && !cancellation.is_cancelled()
             && validate_inputs(&item, AnalysisInputValidation::CheckpointWrite)
             && let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
-            && let Err(error) = checkpoints.write(key, &output.events)
         {
-            tracing::warn!(unit_id = item.unit_id, %error, "analysis unit checkpoint could not be saved");
-        }
-        ready.insert(index, (item.unit_id, output, false));
+            match checkpoints.stage(key, &output.events) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    tracing::warn!(unit_id = item.unit_id, %error, "analysis unit checkpoint could not be staged");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        ready.insert(index, (item.unit_id, output, false, staged));
     }
     for (index, _) in pending {
         progress.units[index].status = "cancelled".into();
     }
+    if cancellation.is_cancelled() {
+        progress.stop_reason = Some(
+            if cancellation.is_budget_exhausted() {
+                "total-budget-exceeded"
+            } else {
+                "cancelled"
+            }
+            .into(),
+        );
+    }
+    publish_progress(&progress);
     Ok(progress)
+}
+
+/// A later stage may run alongside other units, but only after all preceding
+/// chunks of its own unit have been consumed. In particular, SSA must not
+/// start before the typed checkpoint has reached its durable boundary.
+fn stage_prerequisites(work: &[AnalysisWorkItem]) -> Result<Vec<Option<usize>>> {
+    let mut last = BTreeMap::new();
+    for (index, item) in work.iter().enumerate() {
+        if let Some(request) = &item.request
+            && let (Some(unit), Some(stage)) =
+                (request["unit_id"].as_str(), request["stage"].as_str())
+        {
+            last.insert((unit, stage), index);
+        }
+    }
+    work.iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let Some(request) = &item.request else {
+                return Ok(None);
+            };
+            let unit = request["unit_id"].as_str().unwrap_or_default();
+            let prior: &[&str] = match request["stage"].as_str() {
+                Some("typed") => &["syntax"],
+                Some("semantic") => &["syntax", "typed"],
+                _ => &[],
+            };
+            let previous = prior
+                .iter()
+                .filter_map(|stage| last.get(&(unit, *stage)))
+                .max()
+                .copied();
+            anyhow::ensure!(
+                previous.is_none_or(|previous| previous < index),
+                "analysis schedule has an out-of-order stage prerequisite"
+            );
+            Ok(previous)
+        })
+        .collect()
+}
+
+/// A successful protocol stream can still contain a typed graph after SSA or
+/// semantic extraction failed. Keep that useful graph, but rerun its semantic
+/// unit next time rather than treating the incomplete analysis as a checkpoint.
+fn semantic_checkpoint_complete(request: Option<&Value>, events: &[Value]) -> bool {
+    let stage = request.and_then(|request| request["stage"].as_str());
+    if stage == Some("typed") {
+        let declared = events
+            .iter()
+            .filter(|event| event["event"] == "profile_declared")
+            .map(|event| (&event["profile"]["id"], &event["profile"]["properties"]))
+            .collect::<Vec<_>>();
+        let complete = |event: &Value| {
+            event["coverage"]["completeness"]
+                .as_array()
+                .is_some_and(|levels| {
+                    levels.iter().any(|level| level == "syntax-complete")
+                        && !levels.iter().any(|level| level == "semantic-complete")
+                })
+        };
+        let profiles = events
+            .iter()
+            .filter(|event| event["event"] == "profile_completed")
+            .collect::<Vec<_>>();
+        return !profiles.is_empty()
+            && profiles.iter().all(|event| {
+                complete(event)
+                    && declared.iter().any(|(id, properties)| {
+                        **id == event["profile_id"]
+                            && properties["go_typed_stage_complete"] == "true"
+                            && properties["analysis_stage"] == "typed"
+                    })
+            })
+            && events
+                .iter()
+                .any(|event| event["event"] == "scan_completed" && complete(event));
+    }
+    if stage != Some("semantic") {
+        return true;
+    }
+    let complete = |event: &Value| {
+        event["coverage"]["completeness"]
+            .as_array()
+            .is_some_and(|levels| levels.iter().any(|level| level == "semantic-complete"))
+    };
+    let profiles = events
+        .iter()
+        .filter(|event| event["event"] == "profile_completed")
+        .collect::<Vec<_>>();
+    !profiles.is_empty()
+        && profiles.into_iter().all(complete)
+        && events
+            .iter()
+            .any(|event| event["event"] == "scan_completed" && complete(event))
 }
 
 fn inventory_unchanged(path: &Path, expected: &[u8]) -> bool {
@@ -338,6 +604,13 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
         .filter_map(Value::as_str)
         .collect::<std::collections::BTreeSet<_>>();
     let prefix = format!("{unit_root}/");
+    let batched = contract == crate::analysis_schedule::SOURCE_BATCH_CONTRACT;
+    let auxiliary = request["auxiliary_paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
     let manifest = if unit_root == "." {
         "go.mod".to_owned()
     } else {
@@ -345,10 +618,12 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
     };
     let owns = |path: &str| {
         paths.contains(path)
-            || path == manifest
-            || (unit_root == "." && path == "go.work")
-            || ((path.ends_with(".s") || path.ends_with(".S"))
-                && (unit_root == "." || path.starts_with(&prefix)))
+            || auxiliary.contains(path)
+            || (!batched
+                && (path == manifest
+                    || (unit_root == "." && path == "go.work")
+                    || ((path.ends_with(".s") || path.ends_with(".S"))
+                        && (unit_root == "." || path.starts_with(&prefix)))))
     };
     for event in &output.events {
         match event["event"].as_str() {
@@ -366,6 +641,35 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
                         );
                     }
                 }
+                if batched {
+                    for (property, field) in [
+                        ("analysis_chunk_id", "chunk_id"),
+                        ("analysis_context_fingerprint", "context_fingerprint"),
+                    ] {
+                        if properties[property].as_str() != request[field].as_str()
+                            || properties[property].as_str().is_none()
+                        {
+                            anyhow::bail!(
+                                "worker profile is not bound to the requested source batch ({property})"
+                            );
+                        }
+                    }
+                    for (property, field) in [
+                        ("analysis_chunk_index", "chunk_index"),
+                        ("analysis_chunk_count", "chunk_count"),
+                    ] {
+                        if properties[property]
+                            .as_str()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            != request[field].as_u64()
+                            || request[field].as_u64().is_none()
+                        {
+                            anyhow::bail!(
+                                "worker profile has mismatched source batch cardinality ({property})"
+                            );
+                        }
+                    }
+                }
             }
             Some("file_completed") => {
                 if !event["path"].as_str().is_some_and(owns) {
@@ -373,11 +677,12 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
                 }
             }
             Some("dependency_site") => {
-                if let Some(path) = event["site"]["evidence"]
+                if event["site"]["evidence"]
                     .as_array()
-                    .and_then(|evidence| evidence.first())
-                    .and_then(|evidence| evidence["path"].as_str())
-                    && !owns(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|evidence| evidence["path"].as_str())
+                    .any(|path| !owns(path))
                 {
                     anyhow::bail!("worker dependency source escapes the requested analysis unit");
                 }
@@ -393,6 +698,112 @@ mod tests {
     use super::*;
     use crate::worker::AdapterKind;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn progress_observers_are_isolated_between_concurrent_scan_futures() {
+        let first = AnalysisProgressObserver::default();
+        let second = AnalysisProgressObserver::default();
+        let run = |id: &'static str| async move {
+            let mut progress = AnalysisExecutionProgress {
+                units: vec![AnalysisUnitProgress {
+                    unit_id: id.to_owned(),
+                    adapter: "web".to_owned(),
+                    status: "running".to_owned(),
+                    reused: false,
+                    stage: "syntax".to_owned(),
+                    duration_ms: 0,
+                    protocol_events: 0,
+                    failure_reason: None,
+                }],
+                stop_reason: None,
+            };
+            publish_progress(&progress);
+            tokio::task::yield_now().await;
+            progress.units[0].status = "completed".to_owned();
+            publish_unit_progress(&progress, 0);
+        };
+        tokio::join!(
+            observe_analysis_progress(first.clone(), run("first")),
+            observe_analysis_progress(second.clone(), run("second"))
+        );
+        assert_eq!(first.snapshot().units[0].unit_id, "first");
+        assert_eq!(second.snapshot().units[0].unit_id, "second");
+        assert_eq!(first.counts(), (1, 1));
+        assert_eq!(second.counts(), (1, 1));
+        assert_eq!(first.revision(), 2);
+        publish_progress(&AnalysisExecutionProgress::default());
+        assert_eq!(first.counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_cancels_and_dropped_or_absent_budgets_do_not() {
+        let cancellation = CancellationToken::new();
+        let guard = ScanBudgetGuard::start(Some(1), &cancellation);
+        tokio::time::timeout(Duration::from_secs(3), cancellation.cancelled())
+            .await
+            .unwrap();
+        assert!(cancellation.is_budget_exhausted());
+        drop(guard);
+        let active = CancellationToken::new();
+        assert!(ScanBudgetGuard::start(None, &active).is_none());
+        let start = Instant::now();
+        drop(ScanBudgetGuard::start(Some(300), &active));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!active.is_cancelled());
+    }
+
+    #[test]
+    fn incomplete_semantics_remain_readable_but_are_not_reused() {
+        let request = json!({"stage":"semantic"});
+        let mut events = vec![
+            json!({"event":"node_upsert","node":{"id":"typed-target"}}),
+            json!({"event":"profile_completed","coverage":{"completeness":["syntax-complete"]}}),
+            json!({"event":"scan_completed","coverage":{"completeness":["syntax-complete"]}}),
+        ];
+        let original = events.clone();
+        assert!(!semantic_checkpoint_complete(Some(&request), &events));
+        assert_eq!(
+            events, original,
+            "eligibility must not discard the typed graph"
+        );
+        for event in &mut events[1..] {
+            event["coverage"]["completeness"] = json!(["semantic-complete"]);
+        }
+        assert!(semantic_checkpoint_complete(Some(&request), &events));
+        events.push(json!({"event":"profile_completed","coverage":{"completeness":[]}}));
+        assert!(!semantic_checkpoint_complete(Some(&request), &events));
+        assert!(semantic_checkpoint_complete(
+            Some(&json!({"stage":"syntax"})),
+            &original
+        ));
+    }
+
+    #[test]
+    fn typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa() {
+        let request = json!({"stage":"typed"});
+        let events = vec![
+            json!({"event":"profile_declared","profile":{"id":"typed-profile","properties":{
+                "analysis_stage":"typed","go_typed_stage_complete":"true"}}}),
+            json!({"event":"node_upsert","node":{"id":"typed-target"}}),
+            json!({"event":"profile_completed","profile_id":"typed-profile","coverage":{"completeness":["syntax-complete"]}}),
+            json!({"event":"scan_completed","coverage":{"completeness":["syntax-complete"]}}),
+        ];
+        assert!(semantic_checkpoint_complete(Some(&request), &events));
+        let mut incomplete = events.clone();
+        incomplete[0]["profile"]["properties"]["go_typed_stage_complete"] = json!("false");
+        assert!(!semantic_checkpoint_complete(Some(&request), &incomplete));
+        let mut wrong_profile = events.clone();
+        wrong_profile[2]["profile_id"] = json!("other-profile");
+        assert!(!semantic_checkpoint_complete(
+            Some(&request),
+            &wrong_profile
+        ));
+        let mut overclaimed = events.clone();
+        overclaimed[3]["coverage"]["completeness"] =
+            json!(["syntax-complete", "semantic-complete"]);
+        assert!(!semantic_checkpoint_complete(Some(&request), &overclaimed));
+        assert!(!semantic_checkpoint_complete(Some(&request), &events[..3]));
+    }
 
     #[test]
     fn unit_output_cannot_claim_another_units_profile_or_source_coverage() -> Result<()> {
@@ -441,6 +852,119 @@ mod tests {
         assert!(inventory_unchanged(&inventory, b"original"));
         std::fs::write(&inventory, b"modified")?;
         assert!(!inventory_unchanged(&inventory, b"original"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_results_are_durable_before_ssa_and_survive_failed_semantics() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let worker = temp.path().join("worker.mjs");
+        let typed_saved = temp.path().join("typed-saved");
+        let retry = temp.path().join("retry");
+        let executions = temp.path().join("executions");
+        let script = r#"
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const arg = key => args[args.indexOf(key) + 1];
+const request = JSON.parse(fs.readFileSync(arg('--analysis-unit'), 'utf8'));
+fs.appendFileSync(EXECUTIONS, request.stage + '\n');
+if (request.stage === 'typed') await new Promise(resolve => setTimeout(resolve, 150));
+if (request.stage === 'semantic') {
+  if (!fs.existsSync(TYPED_SAVED)) { console.error('SSA started before typed ingestion'); process.exit(2); }
+  if (!fs.existsSync(RETRY)) process.exit(1);
+}
+const common = { protocol_version:'1.0',scan_id:arg('--scan-id'),adapter:'go',adapter_version:'0.1.0' };
+const coverage = { profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness:['syntax-complete'],reasons:[] };
+const properties = { analysis_unit_contract:request.contract_version,analysis_unit_id:request.unit_id,analysis_unit_root:request.unit_root,analysis_stage:request.stage,analysis_chunk_id:request.chunk_id,analysis_chunk_index:'0',analysis_chunk_count:'1',analysis_context_fingerprint:'context',go_typed_stage_complete:request.stage === 'typed' ? 'true' : 'false' };
+const profile = { id:'go:'+request.stage,language:'go',features:[],environment:{},properties };
+const events = [
+ {event:'scan_started',seq:1,root:arg('--root'),project_code_executed:false,safe_mode:true},
+ {event:'profile_declared',seq:2,profile},
+ {event:'profile_completed',seq:3,profile_id:profile.id,coverage},
+ {event:'scan_completed',seq:4,coverage}
+];
+for (const event of events) console.log(JSON.stringify({...common,...event}));
+"#;
+        let script = script
+            .replace("EXECUTIONS", &serde_json::to_string(&executions)?)
+            .replace("TYPED_SAVED", &serde_json::to_string(&typed_saved)?)
+            .replace("RETRY", &serde_json::to_string(&retry)?);
+        std::fs::write(&worker, script)?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: "node".into(),
+            leading_args: vec![worker.clone().into_os_string()],
+            display: "typed checkpoint fixture".into(),
+            artifact_path: worker,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let work = || {
+            ["syntax", "typed", "semantic"].into_iter().map(|stage| {
+            let id = format!("unit:{stage}");
+            AnalysisWorkItem {
+                unit_id: id.clone(),
+                request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":[],"context_paths":[],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":"context"})),
+                spec: spec.clone(),
+                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:"input".into(),execution_digest:"worker".into(),root_digest:"root".into() }),
+            }
+        }).collect()
+        };
+        let consume = |_: &mut Store, id: &str, output: WorkerOutput| {
+            if id == "unit:typed" && output.error.is_none() {
+                std::fs::write(&typed_saved, "saved")?;
+            }
+            Ok(output.error.is_none())
+        };
+        let store_path = temp.path().join("store.sqlite");
+        let config = Config::default();
+        let cancellation = CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "typed-failure",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+        let mut store = Store::open(&store_path)?;
+        let first =
+            execute_analysis_units(&mut store, &context, work(), consume, |_, _| true).await?;
+        assert_eq!(
+            first
+                .units
+                .iter()
+                .map(|unit| unit.status.as_str())
+                .collect::<Vec<_>>(),
+            ["completed", "completed", "failed"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&executions)?,
+            "syntax\ntyped\nsemantic\n"
+        );
+        drop(store);
+        std::fs::write(&retry, "retry")?;
+        std::fs::remove_file(&typed_saved)?;
+        let mut store = Store::open(&store_path)?;
+        let resumed =
+            execute_analysis_units(&mut store, &context, work(), consume, |_, _| true).await?;
+        assert!(resumed.units.iter().all(|unit| unit.status == "completed"));
+        assert_eq!(
+            resumed
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&executions)?,
+            "syntax\ntyped\nsemantic\nsemantic\n"
+        );
         Ok(())
     }
 
@@ -580,6 +1104,43 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             *consumed.borrow(),
             ["first", "second", "first", "second", "first", "second"]
         );
+        // A complete protocol stream may still fail cross-unit Store checks.
+        // It must be executed again, while a neighboring accepted unit reuses.
+        let rejected_work = || {
+            let mut items: Vec<AnalysisWorkItem> = work(true);
+            for item in &mut items {
+                item.checkpoint_key.as_mut().unwrap().input_digest = "ingestion-rejected".into();
+            }
+            items
+        };
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "ingestion-rejected",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+        let rejected = execute_analysis_units(
+            &mut store,
+            &context,
+            rejected_work(),
+            |_, id, output| Ok(id != "first" && output.error.is_none()),
+            |_, _| true,
+        )
+        .await?;
+        assert_eq!(rejected.units[0].status, "failed");
+        let retried =
+            execute_analysis_units(&mut store, &context, rejected_work(), consume, |_, _| true)
+                .await?;
+        assert_eq!(
+            retried
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(std::fs::read_to_string(&executions)?.lines().count(), 8);
         Ok(())
     }
 }

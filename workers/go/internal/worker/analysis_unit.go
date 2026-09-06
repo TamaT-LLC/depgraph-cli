@@ -12,9 +12,15 @@ import (
 )
 
 // AnalysisUnitContractVersion is the request contract negotiated by the core
-// scheduler.  The request selects work inside the repository; it never
-// changes the repository root supplied to the worker.
-const AnalysisUnitContractVersion = "depgraph-analysis-unit-v1"
+// scheduler. The request selects work inside the repository; it never changes
+// the repository root supplied to the worker.
+const AnalysisUnitContractVersion = "depgraph-analysis-unit-v2"
+
+// LegacyAnalysisUnitContractVersion remains readable for callers which used
+// the original single-unit protocol. New workers advertise v2 only; accepting
+// v1 here keeps direct library users from failing while they migrate their
+// request producer.
+const LegacyAnalysisUnitContractVersion = "depgraph-analysis-unit-v1"
 
 const maxAnalysisUnitRequestBytes = 4 << 20
 const maxAnalysisUnitPathLength = 4_096
@@ -23,6 +29,7 @@ type AnalysisUnitStage string
 
 const (
 	AnalysisUnitStageSyntax   AnalysisUnitStage = "syntax"
+	AnalysisUnitStageTyped    AnalysisUnitStage = "typed"
 	AnalysisUnitStageSemantic AnalysisUnitStage = "semantic"
 )
 
@@ -35,12 +42,18 @@ type AnalysisProgressFunc func(phase, status string, items int)
 // core owns planning and checkpoint fingerprints; the worker only receives
 // the immutable repository-relative scope and the requested phase.
 type AnalysisUnitRequest struct {
-	ContractVersion string            `json:"contract_version"`
-	UnitID          string            `json:"unit_id"`
-	Adapter         string            `json:"adapter"`
-	UnitRoot        string            `json:"unit_root"`
-	SourcePaths     []string          `json:"source_paths"`
-	Stage           AnalysisUnitStage `json:"stage"`
+	ContractVersion    string            `json:"contract_version"`
+	UnitID             string            `json:"unit_id"`
+	Adapter            string            `json:"adapter"`
+	UnitRoot           string            `json:"unit_root"`
+	SourcePaths        []string          `json:"source_paths"`
+	Stage              AnalysisUnitStage `json:"stage"`
+	ContextPaths       []string          `json:"context_paths"`
+	ChunkID            string            `json:"chunk_id"`
+	ChunkIndex         int               `json:"chunk_index"`
+	ChunkCount         int               `json:"chunk_count"`
+	AuxiliaryPaths     []string          `json:"auxiliary_paths"`
+	ContextFingerprint string            `json:"context_fingerprint"`
 }
 
 // ReadAnalysisUnitRequest reads and strictly validates a request file before
@@ -74,7 +87,7 @@ func ReadAnalysisUnitRequest(file string) (AnalysisUnitRequest, error) {
 }
 
 func (request AnalysisUnitRequest) Validate() error {
-	if request.ContractVersion != AnalysisUnitContractVersion {
+	if request.ContractVersion != AnalysisUnitContractVersion && request.ContractVersion != LegacyAnalysisUnitContractVersion {
 		return fmt.Errorf("analysis unit request contract version is unsupported")
 	}
 	if request.Adapter != AdapterName {
@@ -86,21 +99,16 @@ func (request AnalysisUnitRequest) Validate() error {
 	if err := validateRepositoryRelativeRequestPath("unit_root", request.UnitRoot, true); err != nil {
 		return err
 	}
-	if request.Stage != AnalysisUnitStageSyntax && request.Stage != AnalysisUnitStageSemantic {
-		return fmt.Errorf("analysis unit request stage must be syntax or semantic")
+	if request.Stage != AnalysisUnitStageSyntax && request.Stage != AnalysisUnitStageTyped && request.Stage != AnalysisUnitStageSemantic {
+		return fmt.Errorf("analysis unit request stage must be syntax, typed, or semantic")
 	}
-	if !sort.StringsAreSorted(request.SourcePaths) {
-		return fmt.Errorf("analysis unit request source_paths must be sorted")
+	if request.ContractVersion == LegacyAnalysisUnitContractVersion && request.Stage == AnalysisUnitStageTyped {
+		return fmt.Errorf("typed analysis unit stage requires %s", AnalysisUnitContractVersion)
 	}
-	seen := make(map[string]struct{}, len(request.SourcePaths))
+	if err := validateRequestPathList("source_paths", request.SourcePaths, true); err != nil {
+		return err
+	}
 	for _, sourcePath := range request.SourcePaths {
-		if err := validateRepositoryRelativeRequestPath("source_paths", sourcePath, false); err != nil {
-			return err
-		}
-		if _, duplicate := seen[sourcePath]; duplicate {
-			return fmt.Errorf("analysis unit request source_paths contains a duplicate path")
-		}
-		seen[sourcePath] = struct{}{}
 		if !request.ownsPath(sourcePath) {
 			return fmt.Errorf("analysis unit request source path %q escapes unit_root %q", sourcePath, request.UnitRoot)
 		}
@@ -108,7 +116,129 @@ func (request AnalysisUnitRequest) Validate() error {
 			return fmt.Errorf("analysis unit request source path %q is not a Go source", sourcePath)
 		}
 	}
+	if request.ContractVersion == LegacyAnalysisUnitContractVersion {
+		return nil
+	}
+	if err := validateRequestPathList("context_paths", request.ContextPaths, true); err != nil {
+		return err
+	}
+	context := request.contextPathSet()
+	for _, contextPath := range request.ContextPaths {
+		if !strings.HasSuffix(contextPath, ".go") {
+			return fmt.Errorf("analysis unit request context path %q is not a Go source", contextPath)
+		}
+	}
+	for _, sourcePath := range request.SourcePaths {
+		if _, ok := context[sourcePath]; !ok {
+			return fmt.Errorf("analysis unit request source path %q is not included in context_paths", sourcePath)
+		}
+	}
+	if !boundedRequestString(request.ChunkID) {
+		return fmt.Errorf("analysis unit request chunk_id is empty or exceeds its limit")
+	}
+	if request.ChunkCount <= 0 || request.ChunkIndex < 0 || request.ChunkIndex >= request.ChunkCount {
+		return fmt.Errorf("analysis unit request chunk_index/count is invalid")
+	}
+	if request.Stage == AnalysisUnitStageTyped && (request.ChunkIndex != 0 || request.ChunkCount != 1) {
+		return fmt.Errorf("typed analysis unit request must use exactly one chunk")
+	}
+	if request.Stage == AnalysisUnitStageTyped && !sameRequestPaths(request.SourcePaths, request.ContextPaths) {
+		return fmt.Errorf("typed analysis unit request source_paths must cover the complete context_paths set")
+	}
+	if err := validateRequestPathList("auxiliary_paths", request.AuxiliaryPaths, true); err != nil {
+		return err
+	}
+	for _, auxiliaryPath := range request.AuxiliaryPaths {
+		if !request.ownsPath(auxiliaryPath) && auxiliaryPath != "go.work" {
+			return fmt.Errorf("analysis unit request auxiliary path %q escapes unit_root %q", auxiliaryPath, request.UnitRoot)
+		}
+		if !isAnalysisAuxiliaryPath(auxiliaryPath) {
+			return fmt.Errorf("analysis unit request auxiliary path %q is unsupported", auxiliaryPath)
+		}
+	}
+	if request.Stage != AnalysisUnitStageSyntax && len(request.AuxiliaryPaths) > 0 {
+		return fmt.Errorf("analysis unit request auxiliary_paths are only valid for syntax stage")
+	}
+	if !boundedRequestString(request.ContextFingerprint) {
+		return fmt.Errorf("analysis unit request context_fingerprint is empty or exceeds its limit")
+	}
 	return nil
+}
+
+func sameRequestPaths(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateRequestPathList(field string, values []string, allowEmpty bool) error {
+	if !allowEmpty && len(values) == 0 {
+		return fmt.Errorf("analysis unit request %s must not be empty", field)
+	}
+	if !sort.StringsAreSorted(values) {
+		return fmt.Errorf("analysis unit request %s must be sorted", field)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if err := validateRepositoryRelativeRequestPath(field, value, false); err != nil {
+			return err
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return fmt.Errorf("analysis unit request %s contains a duplicate path", field)
+		}
+		seen[value] = struct{}{}
+	}
+	return nil
+}
+
+func isAnalysisAuxiliaryPath(relative string) bool {
+	if relative == "go.work" || path.Base(relative) == "go.mod" {
+		return true
+	}
+	extension := strings.ToLower(path.Ext(relative))
+	return extension == ".s"
+}
+
+func (request AnalysisUnitRequest) contextPathSet() map[string]struct{} {
+	paths := request.ContextPaths
+	if request.ContractVersion == LegacyAnalysisUnitContractVersion && len(paths) == 0 {
+		paths = request.SourcePaths
+	}
+	set := make(map[string]struct{}, len(paths))
+	for _, contextPath := range paths {
+		set[contextPath] = struct{}{}
+	}
+	return set
+}
+
+func (request AnalysisUnitRequest) auxiliaryPathSet() map[string]struct{} {
+	set := make(map[string]struct{}, len(request.AuxiliaryPaths))
+	for _, path := range request.AuxiliaryPaths {
+		set[path] = struct{}{}
+	}
+	return set
+}
+
+func (request AnalysisUnitRequest) normalized() AnalysisUnitRequest {
+	if request.ContractVersion != LegacyAnalysisUnitContractVersion {
+		return request
+	}
+	if len(request.ContextPaths) == 0 {
+		request.ContextPaths = append([]string(nil), request.SourcePaths...)
+	}
+	if request.ChunkID == "" {
+		request.ChunkID = "legacy"
+	}
+	if request.ChunkCount == 0 {
+		request.ChunkCount = 1
+	}
+	return request
 }
 
 // ValidateForRoot applies checks that need the canonical repository root.  A
@@ -133,6 +263,18 @@ func (request AnalysisUnitRequest) ValidateForRoot(root string) error {
 		absolute := canonicalPathForConfinement(pathJoin(root, sourcePath))
 		if absolute == "" || !isWithinRoot(unitPath, absolute) {
 			return fmt.Errorf("analysis unit source path %q escapes repository root", sourcePath)
+		}
+	}
+	for contextPath := range request.contextPathSet() {
+		absolute := canonicalPathForConfinement(pathJoin(root, contextPath))
+		if absolute == "" || !isWithinRoot(root, absolute) {
+			return fmt.Errorf("analysis unit context path %q escapes repository root", contextPath)
+		}
+	}
+	for auxiliaryPath := range request.auxiliaryPathSet() {
+		absolute := canonicalPathForConfinement(pathJoin(root, auxiliaryPath))
+		if absolute == "" || !isWithinRoot(root, absolute) {
+			return fmt.Errorf("analysis unit auxiliary path %q escapes repository root", auxiliaryPath)
 		}
 	}
 	return nil

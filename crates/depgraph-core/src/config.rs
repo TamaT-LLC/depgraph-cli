@@ -25,6 +25,12 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ScanConfig {
     pub worker_timeout_seconds: u64,
+    /// Resident memory budget for each isolated worker process tree.
+    pub max_worker_memory_bytes: u64,
+    pub max_concurrent_units: usize,
+    pub max_unit_source_files: usize,
+    /// An explicit caller budget; progressing scans have no aggregate deadline by default.
+    pub total_budget_seconds: Option<u64>,
     pub max_protocol_line_bytes: usize,
     pub max_protocol_bytes: usize,
     pub max_stderr_bytes: usize,
@@ -83,6 +89,10 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             worker_timeout_seconds: 300,
+            max_worker_memory_bytes: 2 * 1024 * 1024 * 1024,
+            max_concurrent_units: 2,
+            max_unit_source_files: 128,
+            total_budget_seconds: None,
             max_protocol_line_bytes: 1024 * 1024,
             max_protocol_bytes: 256 * 1024 * 1024,
             max_stderr_bytes: 10 * 1024 * 1024,
@@ -147,6 +157,22 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.scan.worker_timeout_seconds == 0 {
             bail!("scan.worker_timeout_seconds must be at least 1");
+        }
+        if self.scan.max_worker_memory_bytes == 0 {
+            bail!("scan.max_worker_memory_bytes must be at least 1");
+        }
+        if !(1..=64).contains(&self.scan.max_concurrent_units) {
+            bail!("scan.max_concurrent_units must be between 1 and 64");
+        }
+        if !(1..=4096).contains(&self.scan.max_unit_source_files) {
+            bail!("scan.max_unit_source_files must be between 1 and 4096");
+        }
+        if self
+            .scan
+            .total_budget_seconds
+            .is_some_and(|seconds| !(1..=30_931_200).contains(&seconds))
+        {
+            bail!("scan.total_budget_seconds must be between 1 and 30931200 when specified");
         }
         if self.scan.max_protocol_line_bytes == 0 {
             bail!("scan.max_protocol_line_bytes must be at least 1");
@@ -302,6 +328,13 @@ mod tests {
             "schema_version = 1\nunknown_option = true\n",
             "schema_version = 1\n[scan]\nworker_timout_seconds = 5\n",
             "schema_version = 1\n[scan]\nworker_timeout_seconds = 0\n",
+            "schema_version = 1\n[scan]\nmax_worker_memory_bytes = 0\n",
+            "schema_version = 1\n[scan]\nmax_concurrent_units = 0\n",
+            "schema_version = 1\n[scan]\nmax_concurrent_units = 65\n",
+            "schema_version = 1\n[scan]\nmax_unit_source_files = 0\n",
+            "schema_version = 1\n[scan]\nmax_unit_source_files = 4097\n",
+            "schema_version = 1\n[scan]\ntotal_budget_seconds = 0\n",
+            "schema_version = 1\n[scan]\ntotal_budget_seconds = 30931201\n",
             "schema_version = 1\n[scan]\nmax_protocol_line_bytes = 0\n",
             "schema_version = 1\n[scan]\nmax_protocol_bytes = 0\n",
             "schema_version = 1\n[scan]\nmax_stderr_bytes = 0\n",

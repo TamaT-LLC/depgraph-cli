@@ -7,9 +7,9 @@ use std::{
 use anyhow::{Context, Result};
 use depgraph_protocol::canonical_json;
 use depgraph_store::{
-    CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord,
-    ScanHealthProvenance, ScanOperationStagingIdentity, Store, ValidatedScan,
-    ValidatedScanCacheHit,
+    AnalysisCoverageSummary, AnalysisUnitLedgerRecord, CacheEventRecord, CacheLayer,
+    CompletedScanSnapshot, CoverageRecord, DiagnosticRecord, ScanHealthProvenance,
+    ScanOperationStagingIdentity, Store, ValidatedScan, ValidatedScanCacheHit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,9 +20,10 @@ use uuid::Uuid;
 
 use crate::{
     analysis_execution::{
-        AnalysisExecutionContext, AnalysisExecutionProgress, execute_analysis_units,
+        AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisWorkItem,
+        execute_analysis_units,
     },
-    analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, plan_analysis_units},
+    analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
     analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
     cache::{
         CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
@@ -43,7 +44,8 @@ use crate::{
     service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
-        is_security_error, locate_worker, resolve_safe_executable,
+        is_security_error, locate_worker, probe_worker_version_with_cancellation,
+        resolve_safe_executable, worker_capabilities,
     },
 };
 
@@ -61,6 +63,8 @@ pub struct ScanOutcome {
     pub performance: Option<ScanPerformance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<AnalysisExecutionProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_coverage: Option<AnalysisCoverageSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +211,25 @@ impl ScanFailure {
     }
 }
 
+fn analysis_unit_error_detail(detail: &str) -> String {
+    // Ledger metadata is a bounded single-line explanation. Raw stderr is
+    // retained separately and must not make terminalization reject the row.
+    let detail = detail.split("; stderr:").next().unwrap_or(detail);
+    let mut result = String::new();
+    for character in detail.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if result.len() + character.len_utf8() > 16 * 1024 {
+            break;
+        }
+        result.push(character);
+    }
+    result
+}
+
 #[derive(Debug)]
 struct WorkerPreflight {
     workers_to_run: Vec<(AdapterKind, WorkerSpec)>,
@@ -344,6 +367,10 @@ async fn prepare_scan_with_cache_mode_and_cancellation(
     cancellation: CancellationToken,
     mode: ScanPreparationMode<'_>,
 ) -> Result<PreparedScan> {
+    let _budget = crate::analysis_execution::ScanBudgetGuard::start(
+        config.scan.total_budget_seconds,
+        &cancellation,
+    );
     let total_started = Instant::now();
     let mut pending_promotion = None;
     let mut promotion = ScanPromotionContext {
@@ -493,6 +520,27 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         mut failures,
     } = preflight_workers(adapters, locate_worker);
     let mut cache_plan = None;
+    // V2 must replay its unit checkpoints so this attempt has a verified unit
+    // ledger and observable reuse. Preserve the whole-snapshot shortcut for
+    // older workers; a failed capability probe cannot authorize that shortcut.
+    let mut whole_snapshot_cache_allowed = true;
+    if cache_mode == ScanCacheMode::Enabled {
+        for (adapter, spec) in &workers_to_run {
+            if !matches!(adapter, AdapterKind::Go | AdapterKind::Web) {
+                continue;
+            }
+            match probe_worker_version_with_cancellation(spec, &root, &cancellation).await {
+                Ok(version)
+                    if !worker_capabilities(&version)
+                        .iter()
+                        .any(|capability| capability == "analysis-source-batch-v1") => {}
+                _ => {
+                    whole_snapshot_cache_allowed = false;
+                    break;
+                }
+            }
+        }
+    }
     if cache_mode == ScanCacheMode::Disabled {
         record_cache_rejection(store, &scan_id, "disabled-by-request")?;
     } else if !failures.is_empty() {
@@ -510,7 +558,16 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             }
             ScanCachePreparation::Ready(plan) => {
                 if let Some(semantic_key) = &plan.semantic {
-                    if let Some(hit) =
+                    if !whole_snapshot_cache_allowed {
+                        store.record_cache_event(
+                            Some(&scan_id),
+                            None,
+                            CacheLayer::Semantic,
+                            Some(&semantic_key.key),
+                            "reject",
+                            "analysis-unit-cache-requires-unit-replay",
+                        )?;
+                    } else if let Some(hit) =
                         store.lookup_scan_cache(&plan.syntax, semantic_key, &scan_id)?
                     {
                         if cancellation.is_cancelled() {
@@ -602,6 +659,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                                         policy: None,
                                         performance: None,
                                         analysis: None,
+                                        analysis_coverage: None,
                                     };
                                     match promote_validated_scan_cache_hit_if_active(
                                         store,
@@ -689,7 +747,18 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     .await?;
     let analysis_plan = schedule.plan;
     let analysis_input_proof = schedule.input_proof;
+    let ledger_records = analysis_ledger_records(&scan_id, &schedule.work, analysis_plan.as_ref());
     let unit_count = schedule.work.len();
+    let analysis_contract = analysis_contract_version(&ledger_records);
+    store.initialize_analysis_unit_ledger(
+        &scan_id,
+        analysis_contract,
+        analysis_plan.as_ref().map(|plan| plan.plan_id.as_str()),
+        analysis_plan
+            .as_ref()
+            .map(|plan| plan.input_digest.as_str()),
+        &ledger_records,
+    )?;
     let profiling = scan_profile_enabled();
     let mut performance_phases = Vec::new();
     let mut protocol_event_count = 0_u64;
@@ -698,11 +767,12 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     let mut file_coverage_ledgers = BTreeMap::new();
     let mut analysis_unit_file_paths = BTreeMap::new();
     let mut pending_analysis_unit_completions = BTreeMap::new();
+    let mut analysis_unit_failures = BTreeMap::new();
     let analysis = execute_analysis_units(
         store,
         &execution_context,
         schedule.work,
-        |store, _unit_id, output| {
+        |store, unit_id, output| {
             let ingest_started = Instant::now();
             if profiling {
                 protocol_event_count += output.events.len() as u64;
@@ -727,6 +797,10 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             match result {
                 Ok(()) => Ok(true),
                 Err(error) => {
+                    analysis_unit_failures.insert(
+                        unit_id.to_owned(),
+                        analysis_unit_error_detail(&format!("{error:#}")),
+                    );
                     failures.push(ScanFailure::with_classification(
                         adapter,
                         format!("{error:#}"),
@@ -766,10 +840,46 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         ));
     }
     ingest_ms += elapsed_ms(ingest_started);
+    let mut terminal_ledger = ledger_records;
+    for (record, progress) in terminal_ledger.iter_mut().zip(analysis.units.iter()) {
+        record.status = match progress.status.as_str() {
+            "completed" => "completed",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            _ => "unanalysed",
+        }
+        .to_owned();
+        record.reused = progress.reused;
+        // Keep the concrete ingestion/worker error after terminalization.
+        // The progress category alone (for example, `ingestion-failed`) does
+        // not explain why a checkpoint could not be accepted on retry.
+        record.error = analysis_unit_failures
+            .get(&progress.unit_id)
+            .cloned()
+            .or_else(|| progress.failure_reason.clone());
+    }
+    let analysis_coverage = store.finalize_analysis_unit_ledger(&scan_id, &terminal_ledger)?;
+    if !analysis_coverage.complete {
+        let reason = analysis_coverage
+            .reasons
+            .first()
+            .map(String::as_str)
+            .unwrap_or("analysis-unit-incomplete");
+        if failures.is_empty() {
+            failures.push(ScanFailure::with_classification(
+                AdapterKind::Go,
+                format!("analysis unit coverage is incomplete: {reason}"),
+                WorkerFailureKind::Other,
+                false,
+            ));
+        }
+        store.mark_coverage_incomplete(&scan_id, reason)?;
+    }
     let worker_ms = elapsed_ms(worker_started);
     if cancellation.is_cancelled() {
         let mut outcome = cancel_scan(store, &scan_id)?;
         outcome.analysis = Some(analysis);
+        outcome.analysis_coverage = Some(analysis_coverage);
         return Ok(outcome);
     }
     if profiling {
@@ -824,8 +934,12 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             .map(|failure| format!("{}: {}", failure.adapter.name(), failure.detail))
             .collect::<Vec<_>>()
             .join("; ");
-        for failure in &failures {
-            store.mark_coverage_incomplete(&scan_id, &failure.stable_identity())?;
+        let failure_reasons = failures
+            .iter()
+            .map(ScanFailure::stable_identity)
+            .collect::<BTreeSet<_>>();
+        for reason in failure_reasons {
+            store.mark_coverage_incomplete(&scan_id, &reason)?;
         }
         let security_violation = failures.iter().any(|failure| failure.security_violation);
         let mut outcome = finish_non_promoted_scan(
@@ -841,6 +955,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             &cancellation,
         )?;
         outcome.analysis = Some(analysis);
+        outcome.analysis_coverage = Some(analysis_coverage);
         return Ok(outcome);
     }
 
@@ -849,6 +964,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     {
         let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
         outcome.analysis = Some(analysis);
+        outcome.analysis_coverage = Some(analysis_coverage);
         return Ok(outcome);
     }
     if let Some(expected) = analysis_plan.as_ref()
@@ -857,6 +973,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     {
         let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
         outcome.analysis = Some(analysis);
+        outcome.analysis_coverage = Some(analysis_coverage);
         return Ok(outcome);
     }
     let observed_profile_plan = match plan_repository_profiles(&root, config, None) {
@@ -886,6 +1003,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 &cancellation,
             )?;
             outcome.analysis = Some(analysis);
+            outcome.analysis_coverage = Some(analysis_coverage);
             return Ok(outcome);
         }
     };
@@ -908,6 +1026,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 record_cache_rejection(store, &scan_id, "input-or-toolchain-changed-during-scan")?;
                 let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
                 outcome.analysis = Some(analysis);
+                outcome.analysis_coverage = Some(analysis_coverage);
                 return Ok(outcome);
             }
         }
@@ -916,6 +1035,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     if cancellation.is_cancelled() {
         let mut outcome = cancel_scan(store, &scan_id)?;
         outcome.analysis = Some(analysis);
+        outcome.analysis_coverage = Some(analysis_coverage);
         return Ok(outcome);
     }
 
@@ -930,6 +1050,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         promotion,
     )?;
     outcome.analysis = Some(analysis);
+    outcome.analysis_coverage = Some(analysis_coverage);
     if profiling {
         performance_phases.push(ScanPhasePerformance {
             phase: "store_validation_promotion".into(),
@@ -1291,6 +1412,7 @@ fn complete_scan_with_mode(
         policy,
         performance: None,
         analysis: None,
+        analysis_coverage: None,
     };
 
     if promotion.mode == ScanPromotionMode::Deferred {
@@ -1534,23 +1656,51 @@ fn merge_file_coverage_events(
 
 type AnalysisUnitFilePaths = BTreeMap<(AdapterKind, String), BTreeSet<String>>;
 type PendingAnalysisUnitCompletions = BTreeMap<(AdapterKind, String, String), Vec<Value>>;
+type FileCoverageStageDelta = (
+    BTreeMap<(String, String), FileCoverageLedger>,
+    AnalysisUnitFilePaths,
+);
 
+#[cfg(test)]
 fn merge_file_coverage_events_with_unit_paths(
     events: &mut [Value],
     adapter: AdapterKind,
     ledgers: &mut BTreeMap<(String, String), FileCoverageLedger>,
-    mut unit_file_paths: Option<&mut AnalysisUnitFilePaths>,
+    unit_file_paths: Option<&mut AnalysisUnitFilePaths>,
 ) -> Result<()> {
+    let (ledger_delta, unit_file_path_delta) =
+        stage_file_coverage_events(events, adapter, ledgers)?;
+    ledgers.extend(ledger_delta);
+    if let Some(unit_file_paths) = unit_file_paths {
+        for (key, paths) in unit_file_path_delta {
+            unit_file_paths.entry(key).or_default().extend(paths);
+        }
+    }
+    Ok(())
+}
+
+/// Merge file coverage into a per-output delta.  The caller commits the
+/// returned maps only after the corresponding Store transaction succeeds.
+/// Keeping this delta bounded by the current worker stream avoids cloning the
+/// repository-wide coverage maps while preventing failed ingestion from
+/// leaking coverage into later units.
+fn stage_file_coverage_events(
+    events: &mut [Value],
+    adapter: AdapterKind,
+    ledgers: &BTreeMap<(String, String), FileCoverageLedger>,
+) -> Result<FileCoverageStageDelta> {
     let Some(stage) = analysis_unit_stage(events) else {
         // Legacy whole-adapter workers are allowed to account for manifest and
         // package records that do not map one-to-one to source file rows. Keep
         // their established coverage semantics untouched.
-        return Ok(());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     };
     let adapter_name = adapter.name().to_owned();
     let unit_identity = analysis_unit_identity(events);
     let mut new_files = 0_u64;
     let mut seen_in_stream = BTreeSet::new();
+    let mut ledger_delta = BTreeMap::new();
+    let mut unit_file_path_delta = AnalysisUnitFilePaths::new();
     for event in events.iter_mut() {
         if event.get("event").and_then(Value::as_str) != Some("file_completed") {
             continue;
@@ -1559,10 +1709,8 @@ fn merge_file_coverage_events_with_unit_paths(
         let key = (adapter_name.clone(), path);
         let first_in_scan = !ledgers.contains_key(&key);
         let first_in_stream = seen_in_stream.insert(key.clone());
-        if let Some((unit_id, _)) = &unit_identity
-            && let Some(unit_file_paths) = unit_file_paths.as_deref_mut()
-        {
-            unit_file_paths
+        if let Some((unit_id, _)) = &unit_identity {
+            unit_file_path_delta
                 .entry((adapter, unit_id.clone()))
                 .or_default()
                 .insert(key.1.clone());
@@ -1572,13 +1720,14 @@ fn merge_file_coverage_events_with_unit_paths(
                 .checked_add(1)
                 .context("file coverage file count overflowed")?;
         }
-        let merged = ledgers
+        let merged = ledger_delta
             .get(&key)
+            .or_else(|| ledgers.get(&key))
             .map(|previous| previous.merge(&current))
             .transpose()?
             .unwrap_or(current);
         merged.write_to_event(event)?;
-        ledgers.insert(key, merged);
+        ledger_delta.insert(key, merged);
     }
 
     // Store's coverage event is additive across worker streams, while its
@@ -1588,7 +1737,12 @@ fn merge_file_coverage_events_with_unit_paths(
     let (new_skipped, new_analyzed) = if stage == "semantic" {
         let skipped = seen_in_stream
             .iter()
-            .filter(|key| ledgers.get(*key).is_some_and(|ledger| ledger.skipped))
+            .filter(|key| {
+                ledger_delta
+                    .get(*key)
+                    .or_else(|| ledgers.get(*key))
+                    .is_some_and(|ledger| ledger.skipped)
+            })
             .count() as u64;
         let analyzed = (seen_in_stream.len() as u64).saturating_sub(skipped);
         (skipped, analyzed)
@@ -1610,7 +1764,7 @@ fn merge_file_coverage_events_with_unit_paths(
         coverage.insert("files_skipped".into(), json!(new_skipped));
         coverage.insert("files_analyzed".into(), json!(new_analyzed));
     }
-    Ok(())
+    Ok((ledger_delta, unit_file_path_delta))
 }
 
 fn analysis_unit_stage(events: &[Value]) -> Option<String> {
@@ -1620,10 +1774,11 @@ fn analysis_unit_stage(events: &[Value]) -> Option<String> {
         }
         let profile = event.get("profile")?.as_object()?;
         let properties = profile.get("properties")?.as_object()?;
-        (properties
-            .get("analysis_unit_contract")
-            .and_then(Value::as_str)
-            == Some(ANALYSIS_UNIT_WORKER_CONTRACT_VERSION))
+        is_analysis_unit_contract(
+            properties
+                .get("analysis_unit_contract")
+                .and_then(Value::as_str),
+        )
         .then(|| {
             properties
                 .get("analysis_stage")?
@@ -1641,11 +1796,11 @@ fn analysis_unit_identity(events: &[Value]) -> Option<(String, String)> {
         }
         let profile = event.get("profile")?.as_object()?;
         let properties = profile.get("properties")?.as_object()?;
-        if properties
-            .get("analysis_unit_contract")
-            .and_then(Value::as_str)
-            != Some(ANALYSIS_UNIT_WORKER_CONTRACT_VERSION)
-        {
+        if !is_analysis_unit_contract(
+            properties
+                .get("analysis_unit_contract")
+                .and_then(Value::as_str),
+        ) {
             return None;
         }
         let unit_id = properties
@@ -1657,6 +1812,42 @@ fn analysis_unit_identity(events: &[Value]) -> Option<(String, String)> {
             .and_then(Value::as_str)?
             .to_owned();
         Some((unit_id, stage))
+    })
+}
+
+fn analysis_unit_ledger_identity(events: &[Value]) -> Option<(String, String, String, String)> {
+    events.iter().find_map(|event| {
+        if event.get("event").and_then(Value::as_str) != Some("profile_declared") {
+            return None;
+        }
+        let properties = event.get("profile")?.get("properties")?.as_object()?;
+        if !is_analysis_unit_contract(
+            properties
+                .get("analysis_unit_contract")
+                .and_then(Value::as_str),
+        ) {
+            return None;
+        }
+        Some((
+            properties.get("analysis_unit_id")?.as_str()?.to_owned(),
+            properties
+                .get("analysis_unit_root")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_owned(),
+            properties.get("analysis_stage")?.as_str()?.to_owned(),
+            properties
+                .get("analysis_chunk_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        ))
+    })
+}
+
+fn is_analysis_unit_contract(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value == ANALYSIS_UNIT_WORKER_CONTRACT_VERSION || value == "depgraph-analysis-unit-v2"
     })
 }
 
@@ -1675,6 +1866,7 @@ fn ingest_worker_output(
         &output.stderr,
         output.stderr_truncated,
     )?;
+    let ledger_identity = analysis_unit_ledger_identity(&output.events);
     let worker_error = output.error.clone();
     const ORDER: &[&str] = &[
         "scan_started",
@@ -1721,15 +1913,56 @@ fn ingest_worker_output(
                 .is_none_or(|site_id| available_sites.contains(site_id))
         });
     }
-    if let Some(file_coverage_ledgers) = file_coverage_ledgers {
-        merge_file_coverage_events_with_unit_paths(
-            &mut ordered,
-            output.adapter,
-            file_coverage_ledgers,
-            unit_file_paths,
-        )?;
+    let mut file_coverage_delta: BTreeMap<(String, String), FileCoverageLedger> = BTreeMap::new();
+    let mut unit_file_path_delta = AnalysisUnitFilePaths::new();
+    if let Some(existing) = file_coverage_ledgers.as_deref() {
+        (file_coverage_delta, unit_file_path_delta) =
+            stage_file_coverage_events(&mut ordered, output.adapter, existing)?;
     }
-    if let Some(pending_analysis_unit_completions) = pending_analysis_unit_completions
+    crate::analysis_canonical::normalize_source_batch_profiles(&mut ordered)?;
+    let merge_web_memberships = output.adapter == AdapterKind::Web
+        && ordered.iter().any(|event| {
+            event["event"] == "profile_declared"
+                && event["profile"]["properties"]["analysis_unit_contract"]
+                    == "depgraph-analysis-unit-v2"
+        });
+    let mut merged_profiles = BTreeSet::new();
+    let mut merged_nodes = BTreeSet::new();
+    for event in &mut ordered {
+        if merge_web_memberships
+            && event["event"] == "node_upsert"
+            && event["node"]["properties"]["profile_ids"].is_array()
+            && matches!(
+                event["node"]["kind"].as_str(),
+                Some("file" | "symbol" | "type" | "external_system")
+            )
+        {
+            let id = event["node"]["id"]
+                .as_str()
+                .context("semantic node has no ID")?
+                .to_owned();
+            if let Some(previous) = store.load_scan_node_payload(scan_id, &id)? {
+                crate::analysis_canonical::merge_shared_web_node(&previous, &mut event["node"])?;
+                merged_nodes.insert(id);
+            }
+        }
+        if event["event"] != "profile_declared"
+            || event["profile"]["properties"]["analysis_unit_contract"]
+                != "depgraph-analysis-unit-v2"
+        {
+            continue;
+        }
+        let id = event["profile"]["id"]
+            .as_str()
+            .context("source-batch profile is missing its logical ID")?
+            .to_owned();
+        if let Some(previous) = store.load_scan_profile_declaration(scan_id, &id)? {
+            crate::analysis_canonical::merge_logical_profile(&previous, &mut event["profile"])?;
+            merged_profiles.insert(id);
+        }
+    }
+    let mut pending_delta = PendingAnalysisUnitCompletions::new();
+    if pending_analysis_unit_completions.is_some()
         && let Some((unit_id, stage)) = analysis_unit_identity(&ordered)
     {
         let key = (output.adapter, unit_id, stage);
@@ -1739,17 +1972,15 @@ fn ingest_worker_output(
                 event.get("event").and_then(Value::as_str),
                 Some("profile_completed") | Some("scan_completed")
             ) {
-                pending_analysis_unit_completions
-                    .entry(key.clone())
-                    .or_default()
-                    .push(event);
+                pending_delta.entry(key.clone()).or_default().push(event);
             } else {
                 retained.push(event);
             }
         }
         ordered = retained;
     }
-    if let Some(global_upserts) = global_upserts {
+    let mut global_upsert_delta = BTreeMap::new();
+    if let Some(existing) = global_upserts.as_deref() {
         for event in &ordered {
             if let Some((kind, object)) = upsert_object(event) {
                 let id = object
@@ -1758,18 +1989,68 @@ fn ingest_worker_output(
                     .context("upsert object is missing id")?;
                 let key = (kind.to_owned(), id.to_owned());
                 let serialized: [u8; 32] = Sha256::digest(canonical_json(object).as_bytes()).into();
-                if let Some(previous) = global_upserts.get(&key) {
-                    if previous != &serialized {
-                        anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
-                    }
-                } else {
-                    global_upserts.insert(key, serialized);
+                if let Some(previous) = existing.get(&key).or_else(|| global_upsert_delta.get(&key))
+                    && previous != &serialized
+                    && !((kind == "profile" && merged_profiles.contains(id))
+                        || (kind == "node" && merged_nodes.contains(id)))
+                {
+                    anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
                 }
+                global_upsert_delta.insert(key, serialized);
             }
         }
     }
     let ordered_refs = ordered.iter().collect::<Vec<_>>();
-    store.ingest_events(&ordered_refs)?;
+    if let Some((unit_id, unit_root, stage, chunk_id)) = ledger_identity {
+        if store.analysis_unit_ledger_contains(scan_id, &unit_id, &unit_root, &stage, &chunk_id)? {
+            store.ingest_events_with_analysis_unit(
+                scan_id,
+                &ordered_refs,
+                &unit_id,
+                &unit_root,
+                &stage,
+                &chunk_id,
+                if worker_error.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                },
+                false,
+                worker_error.as_deref(),
+            )?;
+        } else {
+            // Keep the legacy ingestion contract for callers that pass a
+            // worker-prefixed stream without initializing a unit ledger.
+            // Scheduled attempts always initialize the row above, so this
+            // fallback cannot make an unplanned unit complete an attempt.
+            store.ingest_events(&ordered_refs)?;
+        }
+    } else {
+        store.ingest_events(&ordered_refs)?;
+    }
+
+    // The Store transaction is the commit point for the in-memory indexes as
+    // well.  A failed event batch must not leave a global upsert, file
+    // coverage entry, or deferred completion visible to a later unit.
+    if let Some(global_upserts) = global_upserts {
+        global_upserts.extend(global_upsert_delta);
+    }
+    if let Some(file_coverage_ledgers) = file_coverage_ledgers {
+        file_coverage_ledgers.extend(file_coverage_delta);
+    }
+    if let Some(unit_file_paths) = unit_file_paths {
+        for (key, paths) in unit_file_path_delta {
+            unit_file_paths.entry(key).or_default().extend(paths);
+        }
+    }
+    if let Some(pending_analysis_unit_completions) = pending_analysis_unit_completions {
+        for (key, events) in pending_delta {
+            pending_analysis_unit_completions
+                .entry(key)
+                .or_default()
+                .extend(events);
+        }
+    }
     if let Some(error) = worker_error {
         anyhow::bail!("{} worker failed: {error}", output.adapter.name());
     }
@@ -1787,6 +2068,10 @@ fn finalize_analysis_unit_completions(
         return Ok(());
     }
 
+    for events in pending.values_mut() {
+        crate::analysis_canonical::coalesce_stage_completions(events)?;
+    }
+
     let stage_keys = pending.keys().cloned().collect::<Vec<_>>();
     let mut semantic_joins = BTreeSet::new();
     for (adapter, unit_id, stage) in &stage_keys {
@@ -1800,10 +2085,21 @@ fn finalize_analysis_unit_completions(
         let Some(syntax_events) = pending.get(&(*adapter, unit_id.clone(), stage.clone())) else {
             continue;
         };
+        let typed_key = (*adapter, unit_id.clone(), "typed".to_owned());
+        let typed_complete = match pending.get(&typed_key) {
+            Some(events) => {
+                *adapter == AdapterKind::Go
+                    && has_completion_pair(events)
+                    && reports_completeness(events, "syntax-complete")
+                    && typed_profiles_complete(store, events)?
+            }
+            None => true,
+        };
         if has_completion_pair(syntax_events)
             && has_completion_pair(semantic_events)
             && reports_completeness(syntax_events, "syntax-complete")
             && reports_completeness(semantic_events, "semantic-complete")
+            && typed_complete
         {
             semantic_joins.insert((*adapter, unit_id.clone()));
         }
@@ -1874,14 +2170,39 @@ fn has_completion_pair(events: &[Value]) -> bool {
     profile_completed && scan_completed
 }
 
+fn typed_profiles_complete(store: &Store, events: &[Value]) -> Result<bool> {
+    for event in events
+        .iter()
+        .filter(|event| event["event"] == "profile_completed")
+    {
+        let scan_id = event["scan_id"]
+            .as_str()
+            .context("typed completion has no scan ID")?;
+        let profile_id = event["profile_id"]
+            .as_str()
+            .context("typed completion has no profile ID")?;
+        let Some(profile) = store.load_scan_profile_declaration(scan_id, profile_id)? else {
+            return Ok(false);
+        };
+        if profile["language"] != "go"
+            || profile["properties"]["analysis_stage"] != "typed"
+            || profile["properties"]["go_typed_stage_complete"] != "true"
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn reports_completeness(events: &[Value], level: &str) -> bool {
-    events.iter().any(|event| {
-        event
-            .get("coverage")
-            .and_then(|coverage| coverage.get("completeness"))
-            .and_then(Value::as_array)
-            .is_some_and(|levels| levels.iter().any(|value| value.as_str() == Some(level)))
-    })
+    !events.is_empty()
+        && events.iter().all(|event| {
+            event
+                .get("coverage")
+                .and_then(|coverage| coverage.get("completeness"))
+                .and_then(Value::as_array)
+                .is_some_and(|levels| levels.iter().any(|value| value.as_str() == Some(level)))
+        })
 }
 
 fn unit_file_counts(
@@ -2056,24 +2377,145 @@ fn ingest_empty_coverage(store: &mut Store, scan_id: &str) -> Result<()> {
 }
 
 fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanOutcome> {
-    let snapshot = store.load_snapshot(scan_id)?;
+    // This helper is used only after cancellation or a non-promoted terminal
+    // result. Its summary only needs retained metadata; explicit partial
+    // queries can load the graph separately without making summary reporting
+    // reconstruct every node, site, edge, evidence, and profile correlation.
+    let metadata = store.load_terminal_scan_metadata(scan_id)?;
     Ok(ScanOutcome {
         scan_id: scan_id.to_owned(),
-        status: snapshot.scan.status,
+        status: metadata.status,
         exit_code,
-        coverage: snapshot.coverage,
-        diagnostics: snapshot.diagnostics,
-        cache_events: store.cache_events_for_scan(scan_id)?,
+        coverage: metadata.coverage,
+        diagnostics: metadata.diagnostics,
+        cache_events: metadata.cache_events,
         policy: None,
         performance: None,
         analysis: None,
+        analysis_coverage: None,
     })
+}
+
+fn analysis_ledger_records(
+    scan_id: &str,
+    work: &[AnalysisWorkItem],
+    plan: Option<&AnalysisPlan>,
+) -> Vec<AnalysisUnitLedgerRecord> {
+    work.iter()
+        .map(|item| {
+            let request = item.request.as_ref();
+            let logical_unit_id = request
+                .and_then(|request| request["unit_id"].as_str())
+                .unwrap_or(item.unit_id.as_str());
+            let unit = plan.and_then(|plan| plan.unit(logical_unit_id));
+            let source_paths = request_paths(request, "source_paths");
+            let mut context_paths = request_paths(request, "context_paths");
+            if context_paths.is_empty() {
+                context_paths = source_paths.clone();
+            }
+            let auxiliary_paths = request_paths(request, "auxiliary_paths");
+            let contract_version = request
+                .and_then(|request| request["contract_version"].as_str())
+                .unwrap_or("depgraph-analysis-unit-legacy")
+                .to_owned();
+            let stage = request
+                .and_then(|request| request["stage"].as_str())
+                .unwrap_or("repository")
+                .to_owned();
+            let unit_root = request
+                .and_then(|request| request["unit_root"].as_str())
+                .or_else(|| unit.map(|unit| unit.unit_root.as_str()))
+                .unwrap_or(".")
+                .to_owned();
+            let chunk_id = request
+                .and_then(|request| request["chunk_id"].as_str())
+                .unwrap_or("")
+                .to_owned();
+            let chunk_index = request.and_then(|request| request["chunk_index"].as_u64());
+            let chunk_count = request.and_then(|request| request["chunk_count"].as_u64());
+            let context_fingerprint = request
+                .and_then(|request| request["context_fingerprint"].as_str())
+                .map(ToOwned::to_owned);
+            let input_fingerprint = request
+                .and_then(|request| request["input_fingerprint"].as_str())
+                .map(ToOwned::to_owned)
+                .or_else(|| unit.map(|unit| unit.input_fingerprint.clone()));
+            let dependency_ids = unit
+                .map(|unit| unit.dependency_ids.clone())
+                .unwrap_or_default();
+            let unknown_dependencies = request
+                .and_then(|request| request["unknown_dependencies"].as_bool())
+                .unwrap_or_else(|| unit.is_some_and(|unit| unit.unknown_dependencies));
+            AnalysisUnitLedgerRecord {
+                scan_id: scan_id.to_owned(),
+                contract_version,
+                unit_id: logical_unit_id.to_owned(),
+                adapter: item.spec.adapter.name().to_owned(),
+                unit_root,
+                stage,
+                chunk_id,
+                chunk_index,
+                chunk_count,
+                status: "queued".to_owned(),
+                reused: false,
+                source_paths,
+                context_paths,
+                auxiliary_paths,
+                context_fingerprint,
+                input_fingerprint,
+                dependency_ids,
+                unknown_dependencies,
+                error: None,
+            }
+        })
+        .collect()
+}
+
+fn request_paths(request: Option<&Value>, key: &str) -> Vec<String> {
+    let mut paths = request
+        .and_then(|request| request[key].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn analysis_contract_version(records: &[AnalysisUnitLedgerRecord]) -> &str {
+    let mut contracts = records
+        .iter()
+        .map(|record| record.contract_version.as_str())
+        .collect::<BTreeSet<_>>();
+    if contracts.len() == 1 {
+        contracts
+            .pop_first()
+            .unwrap_or("depgraph-analysis-unit-legacy")
+    } else if contracts.is_empty() {
+        "depgraph-analysis-unit-legacy"
+    } else {
+        "depgraph-analysis-unit-mixed"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use depgraph_store::{CACHE_CONTRACT_VERSION, CacheKey};
+
+    #[test]
+    fn analysis_unit_failure_metadata_is_bounded_and_excludes_worker_stderr() {
+        assert_eq!(
+            analysis_unit_error_detail("worker failed\nexit code 1\t; stderr: raw\nworker output"),
+            "worker failed exit code 1 "
+        );
+        let bounded = analysis_unit_error_detail(&"\u{754c}".repeat(16 * 1024));
+        assert!(bounded.len() <= 16 * 1024);
+        assert_eq!(bounded.len(), 16 * 1024 - 1);
+        assert!(bounded.chars().all(|character| !character.is_control()));
+    }
 
     #[test]
     fn worker_timeout_diagnostic_reports_only_the_last_safe_progress_phase() {
@@ -2289,6 +2731,10 @@ mod tests {
             syntax: invalid_key,
             semantic: None,
             semantic_reject_reason: None,
+            go_dependency_witness: crate::go_dependency_witness::compute_go_dependency_witness(
+                root.path(),
+                &[],
+            ),
             symlink_proofs: Vec::new(),
         };
 
@@ -3024,6 +3470,110 @@ mod tests {
         let snapshot = store.load_snapshot("partial-scan")?;
         assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));
         assert!(snapshot.edges.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_analysis_unit_store_transaction_does_not_leak_in_memory_deltas() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("atomic-scan", root.path(), false)?;
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":"atomic-scan",
+                "adapter":"go","adapter_version":"0.1.0","seq":seq
+            })
+        };
+        let mut profile = common("profile_declared", 1);
+        profile["profile"] = json!({
+            "id":"go:atomic",
+            "language":"go",
+            "features":[],
+            "environment":{},
+            "properties":{
+                "analysis_unit_contract": ANALYSIS_UNIT_WORKER_CONTRACT_VERSION,
+                "analysis_unit_id":"atomic-unit",
+                "analysis_stage":"syntax"
+            }
+        });
+        let mut node = common("node_upsert", 2);
+        node["node"] = json!({
+            "id":"file:atomic",
+            "kind":"file",
+            "locator":"file://atomic.go",
+            "properties":{}
+        });
+        let mut invalid_edge = common("edge_upsert", 3);
+        invalid_edge["edge"] = json!({
+            "id":"edge:atomic-orphan",
+            "site_id":"site:missing",
+            "source":"file:atomic",
+            "target":"file:missing",
+            "kind":"imports",
+            "phase":"source",
+            "environment":"host",
+            "profile_id":"go:atomic",
+            "resolution_status":"resolved",
+            "precision":"exact",
+            "condition":{"op":"all","conditions":[]},
+            "generated":false,
+            "evidence":[]
+        });
+        let mut file = common("file_completed", 4);
+        file["path"] = json!("atomic.go");
+        file["discovered_sites"] = json!(1);
+        file["emitted_sites"] = json!(1);
+        file["skipped_sites"] = json!(0);
+        file["skipped"] = json!(false);
+        let mut profile_completed = common("profile_completed", 5);
+        profile_completed["profile_id"] = json!("go:atomic");
+        profile_completed["coverage"] = json!({
+            "profiles":1,"files_discovered":1,"files_analyzed":1,"files_skipped":0,
+            "dependency_sites":0,"resolved":0,"candidates":0,"external":0,
+            "unresolved":0,"unsupported_syntax":0,"project_code_executed":false,
+            "completeness":["syntax-complete"],"reasons":[]
+        });
+        let mut scan_completed = common("scan_completed", 6);
+        scan_completed["coverage"] = profile_completed["coverage"].clone();
+
+        let output = WorkerOutput {
+            adapter: AdapterKind::Go,
+            events: vec![
+                profile,
+                node,
+                invalid_edge,
+                file,
+                profile_completed,
+                scan_completed,
+            ],
+            stderr: String::new(),
+            stderr_truncated: false,
+            error: None,
+            failure_kind: None,
+            security_violation: false,
+        };
+        let mut global_upserts = BTreeMap::new();
+        let mut file_ledgers = BTreeMap::new();
+        let mut unit_file_paths = AnalysisUnitFilePaths::new();
+        let mut pending = PendingAnalysisUnitCompletions::new();
+        assert!(
+            ingest_worker_output(
+                &mut store,
+                "atomic-scan",
+                output,
+                Some(&mut global_upserts),
+                Some(&mut file_ledgers),
+                Some(&mut unit_file_paths),
+                Some(&mut pending),
+            )
+            .is_err()
+        );
+        assert!(global_upserts.is_empty());
+        assert!(file_ledgers.is_empty());
+        assert!(unit_file_paths.is_empty());
+        assert!(pending.is_empty());
+        assert!(store.load_snapshot("atomic-scan")?.nodes.is_empty());
+        assert!(store.load_snapshot("atomic-scan")?.file_coverage.is_empty());
         Ok(())
     }
 

@@ -1610,18 +1610,20 @@ fn task_metadata(
     let retention = operation.retention();
     let created_at = task_timestamp(timestamps.created_at_ms())?;
     let updated_at = task_timestamp(timestamps.updated_at_ms())?;
-    let ttl_ms = retention
-        .retain_until_ms()
-        .checked_sub(timestamps.created_at_ms())
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| McpError::internal_error("invalid operation retention", None))?;
     let mut task = Task::new(
         operation.operation_id().as_str(),
         status,
         created_at,
         updated_at,
-    )
-    .with_ttl_ms(ttl_ms);
+    );
+    if retention.retain_until_ms() != depgraph_mcp_tools::UNBOUNDED_SCAN_RETAIN_UNTIL_MS as i64 {
+        let ttl_ms = retention
+            .retain_until_ms()
+            .checked_sub(timestamps.created_at_ms())
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| McpError::internal_error("invalid operation retention", None))?;
+        task = task.with_ttl_ms(ttl_ms);
+    }
     if polling {
         task = task.with_poll_interval_ms(u64::from(TASK_POLL_INTERVAL_MS));
     }
@@ -2355,6 +2357,30 @@ fn submit_durable_operation_with_compiler_pack(
     )
 }
 
+fn operation_execution_deadline(
+    config: &DepgraphServiceConfig,
+    kind: OperationKind,
+    now_ms: i64,
+) -> Result<i64, ToolExecutionFailure> {
+    let deadline_ms = if kind == OperationKind::ScanSubmit {
+        let scan_config = depgraph_core::Config::load(config.canonical_root())
+            .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+        match scan_config.scan.total_budget_seconds {
+            Some(seconds) => i64::try_from(seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000))
+                .and_then(|budget| now_ms.checked_add(budget))
+                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?,
+            None => depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64,
+        }
+    } else {
+        now_ms
+            .checked_add(SCAN_EXECUTION_DEADLINE_MS)
+            .ok_or_else(|| ToolExecutionFailure::Agent(internal_agent_error()))?
+    };
+    Ok(deadline_ms)
+}
+
 fn submit_durable_operation_with_optional_compiler_pack(
     config: &DepgraphServiceConfig,
     kind: OperationKind,
@@ -2364,9 +2390,7 @@ fn submit_durable_operation_with_optional_compiler_pack(
     cancellation: &CancellationToken,
 ) -> Result<OperationHandle, ToolExecutionFailure> {
     let now_ms = system_now_ms()?;
-    let deadline_ms = now_ms
-        .checked_add(SCAN_EXECUTION_DEADLINE_MS)
-        .ok_or_else(|| ToolExecutionFailure::Agent(internal_agent_error()))?;
+    let deadline_ms = operation_execution_deadline(config, kind, now_ms)?;
     let request = SubmitRequest::new(
         config,
         kind,
@@ -5757,6 +5781,63 @@ mod tests {
             .unwrap();
             assert!(!encoded.contains("TOP_SECRET"));
         }
+    }
+
+    #[test]
+    fn scan_operation_has_no_implicit_deadline_and_respects_explicit_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let now = 1_800_000_000_000;
+        assert_eq!(
+            operation_execution_deadline(&config, OperationKind::ScanSubmit, now).unwrap(),
+            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64
+        );
+        assert_eq!(
+            operation_execution_deadline(&config, OperationKind::DaemonStop, now).unwrap(),
+            now + SCAN_EXECUTION_DEADLINE_MS
+        );
+        std::fs::write(
+            config.canonical_root().join(".depgraph.toml"),
+            "schema_version = 1\n[scan]\ntotal_budget_seconds = 7200\n",
+        )
+        .unwrap();
+        assert_eq!(
+            operation_execution_deadline(&config, OperationKind::ScanSubmit, now).unwrap(),
+            now + 7_200_000
+        );
+    }
+
+    #[test]
+    fn unbounded_task_uses_null_ttl_until_terminal_retention_begins() {
+        let root = tempfile::tempdir().unwrap();
+        let config = operation_test_config(root.path());
+        let now = 1_800_000_000_000;
+        let request = SubmitRequest::new(
+            &config,
+            OperationKind::ScanSubmit,
+            &serde_json::json!({"no_cache":false,"strict":false}),
+            b"unbounded-task",
+            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64,
+        )
+        .unwrap();
+        let mut manager = OperationManager::open(&config).unwrap();
+        let handle = manager.submit(&request, now).unwrap();
+        let operation = manager.get(handle.operation_id(), now + 7_200_000).unwrap();
+        let task =
+            serde_json::to_value(task_metadata(&operation, TaskStatus::Working, true).unwrap())
+                .unwrap();
+        assert_eq!(task.get("ttlMs"), Some(&serde_json::Value::Null));
+        manager
+            .cancel_before_launch(handle.operation_id(), now + 7_200_000)
+            .unwrap();
+        let operation = manager.get(handle.operation_id(), now + 7_200_001).unwrap();
+        let task =
+            serde_json::to_value(task_metadata(&operation, TaskStatus::Cancelled, false).unwrap())
+                .unwrap();
+        assert_eq!(
+            task["ttlMs"],
+            serde_json::json!(7_200_000 + depgraph_operation::TERMINAL_RETENTION_MS)
+        );
     }
 
     #[test]

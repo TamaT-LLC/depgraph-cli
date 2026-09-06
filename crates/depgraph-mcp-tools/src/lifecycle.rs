@@ -9,6 +9,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
+use crate::dto::{AgentAnalysisCoverage, AgentAnalysisProgress};
 use crate::{
     AgentId, AgentLabel, AgentToken, ContractBuildError, RepositoryRelativePath, SnapshotId,
 };
@@ -227,6 +228,10 @@ pub struct AgentDaemonAttempt {
     completed_snapshot_id: Option<SnapshotId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     invalidation_summary: Option<AgentDaemonInvalidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis: Option<AgentAnalysisProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis_coverage: Option<AgentAnalysisCoverage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     incremental_trace: Option<AgentDaemonTrace>,
 }
@@ -251,6 +256,16 @@ impl TryFrom<DaemonAttempt> for AgentDaemonAttempt {
                 .collect::<Result<_, _>>()?,
             base_snapshot_id: attempt.base_snapshot_id.map(parse_value).transpose()?,
             completed_snapshot_id: attempt.completed_snapshot_id.map(parse_value).transpose()?,
+            analysis: attempt
+                .analysis
+                .as_ref()
+                .map(AgentAnalysisProgress::try_from)
+                .transpose()?,
+            analysis_coverage: attempt
+                .analysis_coverage
+                .as_ref()
+                .map(AgentAnalysisCoverage::try_from)
+                .transpose()?,
             invalidation_summary: attempt
                 .invalidation_plan
                 .map(AgentDaemonInvalidationSummary::try_from)
@@ -286,6 +301,8 @@ pub struct AgentDaemonStatus {
     pending_change_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_attempt_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_analysis: Option<AgentAnalysisProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_completed_attempt: Option<AgentDaemonAttempt>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -400,6 +417,11 @@ impl TryFrom<DaemonStatus> for AgentDaemonStatus {
             pending_change_count: u64::try_from(status.pending_change_count)
                 .map_err(|_| ContractBuildError::AgentDtoValue)?,
             active_attempt_id: status.active_attempt_id.map(parse_value).transpose()?,
+            active_analysis: status
+                .active_analysis
+                .as_ref()
+                .map(AgentAnalysisProgress::try_from)
+                .transpose()?,
             last_completed_attempt: status
                 .last_completed_attempt
                 .map(AgentDaemonAttempt::try_from)

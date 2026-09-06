@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::{
     AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
     AgentDaemonControlPhase, AgentExportOutcome, AgentRuntimeOutcome, AgentScanOutcome,
-    ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId, SuccessEnvelope, TaskId,
+    AgentScanOutcomeV2, ContractBuildError, ContractVersion, LogicalRepositoryId, OperationId,
+    SuccessEnvelope, TaskId,
 };
 
 /// Closed terminal output contracts registered for durable submit tools.
@@ -50,6 +51,18 @@ impl PortableTerminalOutputContract {
     ) -> Result<PortableTerminalOutput, PortableTerminalOutputError> {
         match self {
             Self::ScanSubmit => {
+                if value["result"]["contract_version"] == crate::AGENT_SCAN_OUTCOME_CONTRACT_VERSION
+                {
+                    let envelope =
+                        serde_json::from_value::<SuccessEnvelope<AgentScanOutcomeV2>>(value)
+                            .map_err(|_| PortableTerminalOutputError)?;
+                    if envelope.snapshot_id() != envelope.result().completed_snapshot_id() {
+                        return Err(PortableTerminalOutputError);
+                    }
+                    return Ok(PortableTerminalOutput(
+                        PortableTerminalOutputEnvelope::ScanV2(Box::new(envelope)),
+                    ));
+                }
                 let envelope = serde_json::from_value::<SuccessEnvelope<AgentScanOutcome>>(value)
                     .map_err(|_| PortableTerminalOutputError)?;
                 if envelope.snapshot_id().is_none() {
@@ -129,6 +142,7 @@ pub struct PortableTerminalOutput(PortableTerminalOutputEnvelope);
 #[serde(untagged)]
 enum PortableTerminalOutputEnvelope {
     Scan(Box<SuccessEnvelope<AgentScanOutcome>>),
+    ScanV2(Box<SuccessEnvelope<AgentScanOutcomeV2>>),
     RuntimeImport(Box<SuccessEnvelope<AgentRuntimeOutcome>>),
     ExportFile(Box<SuccessEnvelope<AgentExportOutcome>>),
     DaemonControl(Box<SuccessEnvelope<AgentDaemonControlOutcome>>),
@@ -154,6 +168,7 @@ impl PortableTerminalOutput {
     pub const fn repository_id(&self) -> &LogicalRepositoryId {
         match &self.0 {
             PortableTerminalOutputEnvelope::Scan(envelope) => envelope.repository_id(),
+            PortableTerminalOutputEnvelope::ScanV2(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::RuntimeImport(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::ExportFile(envelope) => envelope.repository_id(),
             PortableTerminalOutputEnvelope::DaemonControl(envelope) => envelope.repository_id(),
@@ -173,11 +188,19 @@ pub struct PortableTerminalOutputError;
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_contract_version: Option<OperationStateContract>,
     operation_id: OperationId,
     status: AgentOperationStatus,
     progress: AgentOperationProgress,
     timestamps: AgentOperationTimestamps,
     retention: AgentOperationRetention,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+enum OperationStateContract {
+    #[serde(rename = "depgraph-operation-v2")]
+    V2,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -246,18 +269,18 @@ impl AgentOperationTimestamps {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOperationRetention {
-    execution_deadline_ms: u64,
-    retain_until_ms: u64,
+    execution_deadline_ms: Option<u64>,
+    retain_until_ms: Option<u64>,
 }
 
 impl AgentOperationRetention {
     #[must_use]
-    pub const fn execution_deadline_ms(self) -> u64 {
+    pub const fn execution_deadline_ms(self) -> Option<u64> {
         self.execution_deadline_ms
     }
 
     #[must_use]
-    pub const fn retain_until_ms(self) -> u64 {
+    pub const fn retain_until_ms(self) -> Option<u64> {
         self.retain_until_ms
     }
 }
@@ -275,6 +298,7 @@ impl AgentOperation {
         execution_deadline_ms: u64,
         retain_until_ms: u64,
     ) -> Result<Self, ContractBuildError> {
+        let unbounded = execution_deadline_ms == UNBOUNDED_SCAN_DEADLINE_MS;
         let terminal_timing_is_valid = match terminal_at_ms {
             Some(terminal_at_ms) => {
                 status.is_terminal()
@@ -289,13 +313,20 @@ impl AgentOperation {
             || created_at_ms > updated_at_ms
             || updated_at_ms > execution_deadline_ms
             || execution_deadline_ms <= created_at_ms
-            || retain_until_ms < execution_deadline_ms
+            || (!unbounded && retain_until_ms < execution_deadline_ms)
+            || (unbounded
+                && !status.is_terminal()
+                && retain_until_ms != UNBOUNDED_SCAN_RETAIN_UNTIL_MS)
+            || (unbounded
+                && status.is_terminal()
+                && retain_until_ms == UNBOUNDED_SCAN_RETAIN_UNTIL_MS)
             || retain_until_ms < terminal_at_ms.unwrap_or(0)
             || !terminal_timing_is_valid
         {
             return Err(ContractBuildError::AgentDtoValue);
         }
         Ok(Self {
+            operation_contract_version: unbounded.then_some(OperationStateContract::V2),
             operation_id,
             status,
             progress: AgentOperationProgress {
@@ -308,8 +339,12 @@ impl AgentOperation {
                 terminal_at_ms,
             },
             retention: AgentOperationRetention {
-                execution_deadline_ms,
-                retain_until_ms,
+                execution_deadline_ms: (!unbounded).then_some(execution_deadline_ms),
+                retain_until_ms: if unbounded && !status.is_terminal() {
+                    None
+                } else {
+                    Some(retain_until_ms)
+                },
             },
         })
     }
@@ -343,6 +378,7 @@ impl AgentOperation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentOperationWire {
+    operation_contract_version: Option<OperationStateContract>,
     operation_id: OperationId,
     status: AgentOperationStatus,
     progress: AgentOperationProgress,
@@ -356,6 +392,14 @@ impl<'de> Deserialize<'de> for AgentOperation {
         D: Deserializer<'de>,
     {
         let wire = AgentOperationWire::deserialize(deserializer)?;
+        if (wire.retention.execution_deadline_ms.is_none()
+            != (wire.operation_contract_version == Some(OperationStateContract::V2)))
+            || (wire.retention.retain_until_ms.is_none()
+                && wire.operation_contract_version != Some(OperationStateContract::V2))
+            || wire.retention.execution_deadline_ms == Some(UNBOUNDED_SCAN_DEADLINE_MS)
+        {
+            return Err(D::Error::custom(ContractBuildError::AgentDtoValue));
+        }
         Self::new(
             wire.operation_id,
             wire.status,
@@ -364,14 +408,22 @@ impl<'de> Deserialize<'de> for AgentOperation {
             wire.timestamps.created_at_ms,
             wire.timestamps.updated_at_ms,
             wire.timestamps.terminal_at_ms,
-            wire.retention.execution_deadline_ms,
-            wire.retention.retain_until_ms,
+            wire.retention
+                .execution_deadline_ms
+                .unwrap_or(UNBOUNDED_SCAN_DEADLINE_MS),
+            wire.retention
+                .retain_until_ms
+                .unwrap_or(UNBOUNDED_SCAN_RETAIN_UNTIL_MS),
         )
         .map_err(D::Error::custom)
     }
 }
 
 pub const TASK_POLL_INTERVAL_MS: u32 = 1_000;
+/// Internal durable representation of an absent scan deadline. Public operation
+/// responses use null; terminal retention starts when the operation settles.
+pub const UNBOUNDED_SCAN_DEADLINE_MS: u64 = i64::MAX as u64 - 7 * 24 * 60 * 60 * 1_000;
+pub const UNBOUNDED_SCAN_RETAIN_UNTIL_MS: u64 = i64::MAX as u64;
 pub const MIN_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_TASK_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 

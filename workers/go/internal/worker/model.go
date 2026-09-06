@@ -10,11 +10,21 @@ import (
 )
 
 const (
-	ProtocolVersion        = "1.0"
-	AdapterName            = "go"
-	AdapterVersion         = "0.5.4"
-	AnalysisUnitCapability = "analysis-unit-v1"
+	ProtocolVersion             = "1.0"
+	AdapterName                 = "go"
+	AdapterVersion              = "0.5.4"
+	AnalysisUnitCapability      = "analysis-source-batch-v1"
+	AnalysisUnitTypedCapability = "analysis-unit-typed-v1"
 )
+
+// AnalysisUnitCapabilities is kept in the order required by the worker
+// handshake. The source-batch capability remains available to older cores,
+// while the typed capability opts a v2 scheduler into the typed checkpoint
+// boundary.
+var AnalysisUnitCapabilities = []string{
+	AnalysisUnitCapability,
+	AnalysisUnitTypedCapability,
+}
 
 type Condition struct {
 	Op         string      `json:"op"`

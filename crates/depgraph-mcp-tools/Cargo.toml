@@ -10,6 +10,7 @@ description = "Closed, versioned Agent DTO contracts for depgraph MCP tools"
 chacha20poly1305.workspace = true
 depgraph-core = { path = "../depgraph-core" }
 depgraph-protocol = { path = "../depgraph-protocol" }
+depgraph-store = { path = "../depgraph-store" }
 hex.workspace = true
 rmcp = { version = "=3.1.0", default-features = false }
 schemars.workspace = true

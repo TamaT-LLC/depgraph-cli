@@ -25,8 +25,139 @@ use crate::{
     LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION, ProfileMatrixRecord, ProfileRecord, ScanRecord,
     incremental, load_adapter_logs, load_diagnostics, load_edges, load_evidence,
     load_file_coverage, load_nodes, load_profiles, load_sites, merge_build_delta,
-    observed_coverage, profile_matrix::refresh_profile_matrix, runtime, table_has_column,
+    observed_coverage, profile_matrix::refresh_profile_matrix, runtime, table_exists,
+    table_has_column,
 };
+
+struct AnalysisLedgerIdentityRow {
+    contract_version: String,
+    unit_id: String,
+    adapter: String,
+    unit_root: String,
+    stage: String,
+    chunk_id: String,
+    chunk_index: Option<i64>,
+    chunk_count: Option<i64>,
+    status: String,
+    source_paths_json: String,
+    context_paths_json: String,
+    auxiliary_paths_json: String,
+    context_fingerprint: Option<String>,
+    input_fingerprint: Option<String>,
+    dependency_ids_json: String,
+    unknown_dependencies: bool,
+    error: Option<String>,
+}
+
+impl AnalysisLedgerIdentityRow {
+    fn into_value(self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "contract_version": self.contract_version,
+            "unit_id": self.unit_id,
+            "adapter": self.adapter,
+            "unit_root": self.unit_root,
+            "stage": self.stage,
+            "chunk_id": self.chunk_id,
+            "chunk_index": self.chunk_index,
+            "chunk_count": self.chunk_count,
+            // `reused` is intentionally excluded: it records how a valid
+            // proof was obtained, rather than changing the proof itself.
+            "status": self.status,
+            "source_paths": serde_json::from_str::<serde_json::Value>(&self.source_paths_json)
+                .with_context(|| "analysis unit source paths are not valid JSON")?,
+            "context_paths": serde_json::from_str::<serde_json::Value>(&self.context_paths_json)
+                .with_context(|| "analysis unit context paths are not valid JSON")?,
+            "auxiliary_paths": serde_json::from_str::<serde_json::Value>(&self.auxiliary_paths_json)
+                .with_context(|| "analysis unit auxiliary paths are not valid JSON")?,
+            "context_fingerprint": self.context_fingerprint,
+            "input_fingerprint": self.input_fingerprint,
+            "dependency_ids": serde_json::from_str::<serde_json::Value>(&self.dependency_ids_json)
+                .with_context(|| "analysis unit dependency IDs are not valid JSON")?,
+            "unknown_dependencies": self.unknown_dependencies,
+            "error": self.error,
+        }))
+    }
+}
+
+/// Return the stable identity of the analysis proof attached to a scan.
+///
+/// The scan ID and creation time are run-local metadata, and `reused` is an
+/// execution observation.  They are deliberately omitted so a warm scan with
+/// the same plan and effective ledger proof retains the graph snapshot ID.
+/// Plan/input identities and all ledger fields that affect scope or
+/// completeness remain part of the digest, so equal graph payloads cannot
+/// alias when their analysis proof differs.
+fn analysis_proof_digest(connection: &Connection, scan_id: &str) -> Result<Option<String>> {
+    if !table_exists(connection, "analysis_scan_metadata")? {
+        return Ok(None);
+    }
+    if !table_exists(connection, "analysis_unit_ledger")? {
+        bail!("analysis unit metadata exists without its ledger table");
+    }
+    let metadata = connection
+        .query_row(
+            "SELECT contract_version, plan_id, input_digest
+               FROM analysis_scan_metadata WHERE scan_id=?1",
+            [scan_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((contract_version, plan_id, input_digest)) = metadata else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT contract_version, unit_id, adapter, unit_root, stage, chunk_id,
+                chunk_index, chunk_count, status,
+                source_paths_json, context_paths_json, auxiliary_paths_json,
+                context_fingerprint, input_fingerprint, dependency_ids_json,
+                unknown_dependencies, error
+           FROM analysis_unit_ledger
+          WHERE scan_id=?1
+          ORDER BY unit_id COLLATE BINARY, unit_root COLLATE BINARY,
+                   stage COLLATE BINARY, chunk_index, chunk_id COLLATE BINARY",
+    )?;
+    let rows = statement
+        .query_map([scan_id], |row| {
+            Ok(AnalysisLedgerIdentityRow {
+                contract_version: row.get(0)?,
+                unit_id: row.get(1)?,
+                adapter: row.get(2)?,
+                unit_root: row.get(3)?,
+                stage: row.get(4)?,
+                chunk_id: row.get(5)?,
+                chunk_index: row.get(6)?,
+                chunk_count: row.get(7)?,
+                status: row.get(8)?,
+                source_paths_json: row.get(9)?,
+                context_paths_json: row.get(10)?,
+                auxiliary_paths_json: row.get(11)?,
+                context_fingerprint: row.get(12)?,
+                input_fingerprint: row.get(13)?,
+                dependency_ids_json: row.get(14)?,
+                unknown_dependencies: row.get(15)?,
+                error: row.get(16)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let ledger = rows
+        .into_iter()
+        .map(AnalysisLedgerIdentityRow::into_value)
+        .collect::<Result<Vec<_>>>()?;
+    let proof = json!({
+        "schema": "analysis-proof-v1",
+        "contract_version": contract_version,
+        "plan_id": plan_id,
+        "input_digest": input_digest,
+        "ledger": ledger,
+    });
+    Ok(Some(stable_id_from_value("analysis-proof", &proof)))
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct SnapshotSource<'a> {
@@ -358,6 +489,67 @@ SELECT attempt.id, attempt.base_scan_id, attempt.base_snapshot_id,
         ),
     ] {
         hasher.write_query(connection, snapshot_id, domain, suffix)?;
+    }
+
+    // Analysis-unit evidence was added after the original v2 seal.  Include
+    // the domains only when a snapshot closure actually has ledger rows so
+    // legacy seals remain byte-for-byte verifiable after migration.  A new
+    // completed scan records its unit status before promotion, making the
+    // partial/completeness proof part of the immutable snapshot seal.
+    if table_exists(connection, "analysis_scan_metadata")?
+        && connection.query_row(
+            &format!(
+                "{SNAPSHOT_SEAL_CLOSURE_CTE}
+SELECT EXISTS(
+                    SELECT 1 FROM analysis_scan_metadata AS metadata
+                     WHERE metadata.scan_id IN (
+                         SELECT snapshot.scan_id
+                           FROM completed_snapshots AS snapshot
+                           JOIN snapshot_closure AS closure ON closure.id=snapshot.id
+                     )
+                )",
+            ),
+            [snapshot_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        hasher.write_query(
+            connection,
+            snapshot_id,
+            "analysis_scan_metadata",
+            "
+SELECT metadata.scan_id, metadata.contract_version, metadata.plan_id,
+       metadata.input_digest, metadata.created_at
+  FROM analysis_scan_metadata AS metadata
+ WHERE metadata.scan_id IN (
+       SELECT snapshot.scan_id
+         FROM completed_snapshots AS snapshot
+         JOIN snapshot_closure AS closure ON closure.id=snapshot.id
+ )
+ ORDER BY metadata.scan_id COLLATE BINARY",
+        )?;
+        hasher.write_query(
+            connection,
+            snapshot_id,
+            "analysis_unit_ledger",
+            "
+SELECT ledger.scan_id, ledger.contract_version, ledger.unit_id,
+       ledger.adapter, ledger.unit_root, ledger.stage, ledger.chunk_id,
+       ledger.chunk_index, ledger.chunk_count, ledger.status, ledger.reused,
+       ledger.source_paths_json, ledger.context_paths_json,
+       ledger.auxiliary_paths_json, ledger.context_fingerprint,
+       ledger.input_fingerprint, ledger.dependency_ids_json,
+       ledger.unknown_dependencies, ledger.error
+  FROM analysis_unit_ledger AS ledger
+ WHERE ledger.scan_id IN (
+       SELECT snapshot.scan_id
+         FROM completed_snapshots AS snapshot
+         JOIN snapshot_closure AS closure ON closure.id=snapshot.id
+ )
+ ORDER BY ledger.scan_id COLLATE BINARY, ledger.unit_id COLLATE BINARY,
+          ledger.unit_root COLLATE BINARY, ledger.stage COLLATE BINARY,
+          ledger.chunk_index, ledger.chunk_id COLLATE BINARY",
+        )?;
     }
 
     for (domain, suffix) in [
@@ -1032,8 +1224,19 @@ pub(crate) fn completed_snapshot_identity(
         .collect::<Vec<_>>();
     profile_ids.sort();
     profile_ids.dedup();
+    let analysis_digest = analysis_proof_digest(connection, scan_id)?;
     let mut identity = json!({
-        "schema": "completed-snapshot-v1",
+        "schema": if runtime_session_ids.is_empty() {
+            if analysis_digest.is_some() {
+                "completed-snapshot-v3-analysis"
+            } else {
+                "completed-snapshot-v1"
+            }
+        } else if analysis_digest.is_some() {
+            "completed-snapshot-v4-analysis-runtime"
+        } else {
+            "completed-snapshot-v2"
+        },
         "parent_snapshot_id": parent_snapshot_id,
         "source_revision": source_revision,
         "profile_ids": profile_ids,
@@ -1048,8 +1251,10 @@ pub(crate) fn completed_snapshot_identity(
             "coverage": snapshot.coverage,
         },
     });
+    if let Some(analysis_digest) = analysis_digest {
+        identity["analysis_proof_digest"] = json!(analysis_digest);
+    }
     if !runtime_session_ids.is_empty() {
-        identity["schema"] = json!("completed-snapshot-v2");
         identity["runtime_session_ids"] = json!(runtime_session_ids);
     }
     Ok((stable_id_from_value("snapshot", &identity), profile_ids))
