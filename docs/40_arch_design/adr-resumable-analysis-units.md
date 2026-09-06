@@ -105,6 +105,21 @@ canonical unit identity includes its repository-relative root. If duplicate
 module or project names make a source reference ambiguous, the reference is
 unknown and the affected adapter is conservatively invalidated.
 
+Go replacement planning follows the worker's active-workspace boundary. Only
+the repository-root `go.work` is active for a root scan; a module listed by its
+`use` entries receives that workspace's replacement directives, while a
+module outside the workspace uses its own `go.mod` replacements with
+`GOWORK=off`. A versioned workspace replacement takes precedence over a
+wildcard replacement, and conflicting directives at the same precedence are
+unknown. Local replacement paths are resolved relative to the manifest that
+declares them and must resolve to a discovered, root-confined `go.mod`; a
+module-path replacement remains external. The active `go.work` is included in
+each governed module's manifest fingerprint, so edits to workspace membership
+or replacement rules invalidate those members and their dependency closure.
+Portable planning treats absolute `use` and local replacement paths as
+unknown, even when they might name an in-root path; the worker's later
+confinement check remains authoritative for those directives.
+
 ## Fingerprints and invalidation
 
 The plan keeps separate fingerprints for source content, manifest content,

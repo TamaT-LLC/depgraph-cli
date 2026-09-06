@@ -560,6 +560,8 @@ fn discover_analysis_plan_with_exclusions(
     if units.len() > MAX_PLAN_UNITS {
         bail!("analysis plan exceeds its closed unit limit");
     }
+    attach_active_go_workspace_manifests(&mut units, &parsed);
+    let active_go_workspace_member_ids = active_go_workspace_member_ids(&units, &parsed);
 
     let manifest_to_package_id = units
         .iter()
@@ -576,9 +578,11 @@ fn discover_analysis_plan_with_exclusions(
         .flat_map(|unit| {
             unit.manifest_paths
                 .iter()
+                .filter(|path| path.ends_with("go.mod"))
                 .map(|path| (path.clone(), unit.id.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let go_replacements_by_module = go_replacements_by_module(&parsed, &manifest_to_go_module_id);
     let web_name_to_project_ids = web_name_index(&units);
     let package_root_index = package_root_index(&units);
 
@@ -589,6 +593,13 @@ fn discover_analysis_plan_with_exclusions(
     for manifest in &parsed {
         let Some(owner_id) = find_manifest_owner(manifest, &units) else {
             continue;
+        };
+        let go_resolution = GoResolutionContext {
+            replacements: go_replacements_by_module
+                .get(&owner_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            active_workspace_member_ids: active_go_workspace_member_ids.as_ref(),
         };
         for raw in &manifest.dependencies {
             references
@@ -601,6 +612,7 @@ fn discover_analysis_plan_with_exclusions(
                     &manifest_to_package_id,
                     &manifest_to_go_module_id,
                     &web_name_to_project_ids,
+                    &go_resolution,
                 ));
         }
         for member in &manifest.workspace_members {
@@ -626,7 +638,17 @@ fn discover_analysis_plan_with_exclusions(
         &mut units,
         &package_root_index,
         &mut references,
+        &go_replacements_by_module,
+        active_go_workspace_member_ids.as_ref(),
     )?;
+    if parsed.iter().any(|manifest| {
+        manifest.adapter == AnalysisAdapter::Go
+            && manifest.workspace
+            && manifest.path == "go.work"
+            && go_workspace_has_nonportable_paths(manifest)
+    }) {
+        add_unknown_go_workspace_dependencies(&units, &mut references);
+    }
 
     let source_paths = files
         .iter()
@@ -887,10 +909,41 @@ fn classify_file(path: &str) -> FileKind {
 #[derive(Clone, Debug)]
 struct RawDependency {
     specifier: String,
+    version: Option<String>,
     kind: AnalysisDependencyKind,
     local_path: Option<String>,
     evidence_path: String,
     external_hint: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GoReplacement {
+    old_module: String,
+    old_version: Option<String>,
+    new_module: Option<String>,
+    new_version: Option<String>,
+    local_path: Option<String>,
+    evidence_path: String,
+}
+
+type GoReplacementSortKey<'a> = (
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+);
+
+struct GoResolutionContext<'a> {
+    replacements: &'a [GoReplacement],
+    active_workspace_member_ids: Option<&'a BTreeSet<String>>,
+}
+
+struct GoImportResolutionContext<'a> {
+    replacements: &'a [GoReplacement],
+    active_workspace_member_ids: Option<&'a BTreeSet<String>>,
+    source_unit_id: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -899,6 +952,7 @@ struct ParsedManifest {
     adapter: AnalysisAdapter,
     locator: String,
     dependencies: Vec<RawDependency>,
+    go_replacements: Vec<GoReplacement>,
     workspace_members: Vec<String>,
     workspace: bool,
 }
@@ -1130,6 +1184,101 @@ fn build_drafts(files: &BTreeMap<String, FileKind>, parsed: &[ParsedManifest]) -
     drafts.into_values().collect()
 }
 
+/// Attach the active root workspace manifest to each module it governs.
+///
+/// `go` reads the active `go.work` while compiling a member, so that file is
+/// part of the member's manifest input even when the module's own `go.mod`
+/// is unchanged.  Keeping the path on the executable unit also makes a
+/// workspace edit invalidate direct members through `manifest_fingerprint`;
+/// dependency closure then carries that change to their dependents.  Nested
+/// `go.work` files intentionally remain context-only records.
+fn attach_active_go_workspace_manifests(units: &mut [AnalysisUnit], parsed: &[ParsedManifest]) {
+    let Some(workspace) = parsed.iter().find(|manifest| {
+        manifest.adapter == AnalysisAdapter::Go && manifest.workspace && manifest.path == "go.work"
+    }) else {
+        return;
+    };
+    let workspace_paths_are_uncertain = go_workspace_has_nonportable_paths(workspace);
+    for unit in units.iter_mut().filter(|unit| {
+        unit.adapter == AnalysisAdapter::Go && unit.kind == AnalysisUnitKind::GoModule
+    }) {
+        let Some(module_manifest) = unit
+            .manifest_paths
+            .iter()
+            .find(|path| path.ends_with("go.mod"))
+        else {
+            continue;
+        };
+        if (workspace_paths_are_uncertain
+            || go_workspace_contains_module(workspace, module_manifest))
+            && !unit.manifest_paths.contains(&workspace.path)
+        {
+            unit.manifest_paths.push(workspace.path.clone());
+        }
+    }
+}
+
+fn active_go_workspace_member_ids(
+    units: &[AnalysisUnit],
+    parsed: &[ParsedManifest],
+) -> Option<BTreeSet<String>> {
+    let workspace = parsed.iter().find(|manifest| {
+        manifest.adapter == AnalysisAdapter::Go && manifest.workspace && manifest.path == "go.work"
+    })?;
+    Some(
+        units
+            .iter()
+            .filter(|unit| {
+                unit.adapter == AnalysisAdapter::Go && unit.kind == AnalysisUnitKind::GoModule
+            })
+            .filter_map(|unit| {
+                let module_manifest = unit
+                    .manifest_paths
+                    .iter()
+                    .find(|path| path.ends_with("go.mod"))?;
+                go_workspace_contains_module(workspace, module_manifest).then(|| unit.id.clone())
+            })
+            .collect(),
+    )
+}
+
+fn go_workspace_has_nonportable_paths(workspace: &ParsedManifest) -> bool {
+    workspace
+        .workspace_members
+        .iter()
+        .any(|member| is_nonportable_go_path(member))
+        || workspace.go_replacements.iter().any(|replacement| {
+            replacement
+                .local_path
+                .as_deref()
+                .is_some_and(is_nonportable_go_path)
+        })
+}
+
+fn is_nonportable_go_path(path: &str) -> bool {
+    path.starts_with('/') || path.contains('\\') || path.as_bytes().get(1) == Some(&b':')
+}
+
+fn add_unknown_go_workspace_dependencies(
+    units: &[AnalysisUnit],
+    references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
+) {
+    for unit in units.iter().filter(|unit| {
+        unit.adapter == AnalysisAdapter::Go && unit.kind == AnalysisUnitKind::GoModule
+    }) {
+        references
+            .entry(unit.id.clone())
+            .or_default()
+            .push(AnalysisDependencyReference {
+                target_unit_id: None,
+                specifier: "go.work:nonportable-path".to_owned(),
+                kind: AnalysisDependencyKind::Context,
+                resolution: AnalysisDependencyResolution::Unknown,
+                evidence_path: Some("go.work".to_owned()),
+            });
+    }
+}
+
 fn workspace_has_direct_web_sources(
     files: &BTreeMap<String, FileKind>,
     parsed: &[ParsedManifest],
@@ -1201,6 +1350,7 @@ fn parse_cargo_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
                 let external_hint = local_path.is_none();
                 dependencies.push(RawDependency {
                     specifier: name.clone(),
+                    version: None,
                     kind: local_path
                         .as_ref()
                         .map(|_| AnalysisDependencyKind::LocalPath)
@@ -1229,6 +1379,7 @@ fn parse_cargo_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         adapter: AnalysisAdapter::Rust,
         locator: package_name,
         dependencies,
+        go_replacements: Vec::new(),
         workspace_members,
         workspace,
     })
@@ -1237,6 +1388,7 @@ fn parse_cargo_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
 fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
     let mut locator = String::new();
     let mut dependencies = Vec::new();
+    let mut go_replacements = Vec::new();
     let mut block = None::<&str>;
     for raw_line in text.lines() {
         let line = raw_line
@@ -1264,13 +1416,14 @@ fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
                 "require" if !fields.is_empty() => {
                     dependencies.push(RawDependency {
                         specifier: fields[0].to_owned(),
+                        version: fields.get(1).map(|value| (*value).to_owned()),
                         kind: AnalysisDependencyKind::ManifestDependency,
                         local_path: None,
                         evidence_path: path.to_owned(),
                         external_hint: true,
                     });
                 }
-                "replace" => add_go_replace_dependency(path, &fields, &mut dependencies),
+                "replace" => add_go_replacement(path, &fields, &mut go_replacements),
                 _ => {}
             }
             continue;
@@ -1279,12 +1432,13 @@ fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
             Some("module") if fields.len() >= 2 => locator = fields[1].to_owned(),
             Some("require") if fields.len() >= 2 => dependencies.push(RawDependency {
                 specifier: fields[1].to_owned(),
+                version: fields.get(2).map(|value| (*value).to_owned()),
                 kind: AnalysisDependencyKind::ManifestDependency,
                 local_path: None,
                 evidence_path: path.to_owned(),
                 external_hint: true,
             }),
-            Some("replace") => add_go_replace_dependency(path, &fields[1..], &mut dependencies),
+            Some("replace") => add_go_replacement(path, &fields[1..], &mut go_replacements),
             _ => {}
         }
     }
@@ -1293,12 +1447,13 @@ fn parse_go_mod_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         adapter: AnalysisAdapter::Go,
         locator,
         dependencies,
+        go_replacements,
         workspace_members: Vec::new(),
         workspace: false,
     })
 }
 
-fn add_go_replace_dependency(path: &str, fields: &[&str], dependencies: &mut Vec<RawDependency>) {
+fn add_go_replacement(path: &str, fields: &[&str], replacements: &mut Vec<GoReplacement>) {
     let Some(separator) = fields.iter().position(|field| *field == "=>") else {
         return;
     };
@@ -1308,50 +1463,78 @@ fn add_go_replace_dependency(path: &str, fields: &[&str], dependencies: &mut Vec
     let Some(replacement) = fields.get(separator + 1).copied() else {
         return;
     };
-    if old.is_empty() || replacement.is_empty() {
+    let replacement_fields = fields.len().saturating_sub(separator + 1);
+    if old.is_empty()
+        || replacement.is_empty()
+        || !(1..=2).contains(&separator)
+        || !(1..=2).contains(&replacement_fields)
+    {
         return;
     }
-    let local = is_local_specifier(replacement);
-    dependencies.push(RawDependency {
-        specifier: old.to_owned(),
-        kind: if local {
-            AnalysisDependencyKind::LocalPath
-        } else {
-            AnalysisDependencyKind::ManifestDependency
-        },
-        local_path: local.then(|| replacement.to_owned()),
+    let old_version = (separator == 2).then(|| fields[1].to_owned());
+    let replacement_version = (replacement_fields == 2).then(|| fields[separator + 2].to_owned());
+    let (new_module, local_path) = if is_local_specifier(replacement) {
+        if replacement_fields != 1 {
+            return;
+        }
+        (None, Some(replacement.to_owned()))
+    } else {
+        (Some(replacement.to_owned()), None)
+    };
+    replacements.push(GoReplacement {
+        old_module: old.to_owned(),
+        old_version,
+        new_module,
+        new_version: replacement_version,
+        local_path,
         evidence_path: path.to_owned(),
-        external_hint: !local,
     });
 }
 
 fn parse_go_work_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
     let mut members = Vec::new();
-    let mut in_use = false;
+    let mut go_replacements = Vec::new();
+    let mut block = None::<&str>;
     for raw_line in text.lines() {
         let line = raw_line
             .split_once("//")
             .map_or(raw_line, |(line, _)| line)
             .trim();
-        if line == "use (" {
-            in_use = true;
+        if line == "use (" || line == "replace (" {
+            block = Some(if line.starts_with("use") {
+                "use"
+            } else {
+                "replace"
+            });
             continue;
         }
-        if in_use && line == ")" {
-            in_use = false;
+        if line == ")" {
+            block = None;
             continue;
         }
-        if in_use {
-            if let Some(value) = line.split_whitespace().next()
-                && !value.is_empty()
-            {
-                members.push(value.to_owned());
+        if let Some(kind) = block {
+            match kind {
+                "use" => {
+                    if let Some(value) = line.split_whitespace().next()
+                        && !value.is_empty()
+                    {
+                        members.push(value.to_owned());
+                    }
+                }
+                "replace" => {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    add_go_replacement(path, &fields, &mut go_replacements);
+                }
+                _ => {}
             }
         } else if let Some(value) = line.strip_prefix("use ") {
             let value = value.trim();
             if !value.is_empty() {
                 members.push(value.to_owned());
             }
+        } else if let Some(value) = line.strip_prefix("replace ") {
+            let fields = value.split_whitespace().collect::<Vec<_>>();
+            add_go_replacement(path, &fields, &mut go_replacements);
         }
     }
     Ok(ParsedManifest {
@@ -1359,6 +1542,7 @@ fn parse_go_work_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         adapter: AnalysisAdapter::Go,
         locator: path.to_owned(),
         dependencies: Vec::new(),
+        go_replacements,
         workspace_members: members,
         workspace: true,
     })
@@ -1410,6 +1594,7 @@ fn parse_web_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
                     .map(str::to_owned);
                 dependencies.push(RawDependency {
                     specifier: name.clone(),
+                    version: None,
                     kind: local_path
                         .as_ref()
                         .map(|_| AnalysisDependencyKind::LocalPath)
@@ -1428,6 +1613,7 @@ fn parse_web_manifest(path: &str, text: &str) -> Result<ParsedManifest> {
         adapter: AnalysisAdapter::Web,
         locator,
         dependencies,
+        go_replacements: Vec::new(),
         workspace_members,
         workspace,
     })
@@ -1439,6 +1625,9 @@ fn find_manifest_owner(manifest: &ParsedManifest, units: &[AnalysisUnit]) -> Opt
         .filter(|unit| unit.adapter == manifest.adapter)
         .filter(|unit| unit.manifest_paths.contains(&manifest.path))
         .filter(|unit| {
+            if manifest.adapter == AnalysisAdapter::Go && manifest.path == "go.work" {
+                return unit.kind == AnalysisUnitKind::GoWorkspace;
+            }
             matches!(
                 unit.kind,
                 AnalysisUnitKind::RustPackage
@@ -1470,6 +1659,106 @@ fn find_workspace_owner(manifest: &ParsedManifest, units: &[AnalysisUnit]) -> Op
         .map(|unit| unit.id.clone())
 }
 
+/// Return the replacements that are effective for each Go module. A module
+/// listed by the active repository-root go.work uses that workspace's
+/// replacements; its own go.mod replacements are only a fallback when no
+/// matching workspace directive governs the module. Conflicting directives at
+/// the same version precedence remain in the returned set and resolve as
+/// unknown rather than being selected by iteration order.
+fn go_replacements_by_module(
+    parsed: &[ParsedManifest],
+    manifest_to_go_module_id: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<GoReplacement>> {
+    let workspaces = parsed
+        .iter()
+        .filter(|manifest| {
+            manifest.adapter == AnalysisAdapter::Go
+                && manifest.workspace
+                // The worker activates only the repository-root go.work.
+                // Nested files remain context records and must not silently
+                // alter module resolution for a root scan.
+                && manifest.path == "go.work"
+        })
+        .collect::<Vec<_>>();
+    let mut replacements_by_module = BTreeMap::new();
+    for manifest in parsed.iter().filter(|manifest| {
+        manifest.adapter == AnalysisAdapter::Go && manifest.path.ends_with("go.mod")
+    }) {
+        let Some(module_id) = manifest_to_go_module_id.get(&manifest.path) else {
+            continue;
+        };
+        let matching_workspaces = workspaces
+            .iter()
+            .filter(|workspace| go_workspace_contains_module(workspace, &manifest.path))
+            .collect::<Vec<_>>();
+        let workspace_replacements = matching_workspaces
+            .into_iter()
+            .flat_map(|workspace| workspace.go_replacements.iter())
+            .collect::<Vec<_>>();
+        let mut replacements = Vec::new();
+        for dependency in &manifest.dependencies {
+            if workspace_replacements
+                .iter()
+                .any(|replacement| go_replacement_matches(replacement, dependency))
+            {
+                replacements.extend(
+                    workspace_replacements
+                        .iter()
+                        .filter(|replacement| go_replacement_matches(replacement, dependency))
+                        .map(|replacement| (*replacement).clone()),
+                );
+            } else {
+                replacements.extend(
+                    manifest
+                        .go_replacements
+                        .iter()
+                        .filter(|replacement| go_replacement_matches(replacement, dependency))
+                        .cloned(),
+                );
+            }
+        }
+        replacements.sort_by(|left, right| {
+            go_replacement_sort_key(left).cmp(&go_replacement_sort_key(right))
+        });
+        replacements.dedup();
+        replacements_by_module.insert(module_id.clone(), replacements);
+    }
+    replacements_by_module
+}
+
+fn go_replacement_matches(replacement: &GoReplacement, dependency: &RawDependency) -> bool {
+    replacement.old_module == dependency.specifier
+        && (replacement.old_version.is_none() || replacement.old_version == dependency.version)
+}
+
+fn go_replacement_sort_key(replacement: &GoReplacement) -> GoReplacementSortKey<'_> {
+    (
+        &replacement.old_module,
+        replacement.old_version.as_deref(),
+        replacement.new_module.as_deref(),
+        replacement.new_version.as_deref(),
+        replacement.local_path.as_deref(),
+        &replacement.evidence_path,
+    )
+}
+
+fn go_workspace_contains_module(workspace: &ParsedManifest, module_manifest: &str) -> bool {
+    let module_dir = module_manifest
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or(REPOSITORY_ROOT);
+    let workspace_dir = workspace
+        .path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or(REPOSITORY_ROOT);
+    workspace
+        .workspace_members
+        .iter()
+        .filter_map(|member| join_relative(workspace_dir, member))
+        .any(|member| member == module_dir)
+}
+
 fn manifest_owner_rank(kind: AnalysisUnitKind) -> u8 {
     match kind {
         AnalysisUnitKind::RustPackage
@@ -1489,6 +1778,7 @@ fn resolve_manifest_dependency(
     manifest_to_package_id: &BTreeMap<String, String>,
     manifest_to_go_module_id: &BTreeMap<String, String>,
     web_name_to_project_ids: &BTreeMap<String, Vec<String>>,
+    go_resolution: &GoResolutionContext<'_>,
 ) -> AnalysisDependencyReference {
     let mut target = None;
     let mut resolution = if raw.external_hint {
@@ -1496,6 +1786,37 @@ fn resolve_manifest_dependency(
     } else {
         AnalysisDependencyResolution::Unknown
     };
+    let mut kind = raw.kind;
+    if manifest.adapter == AnalysisAdapter::Go {
+        match select_go_replacement(go_resolution.replacements, raw) {
+            Some(Err(())) => {
+                return AnalysisDependencyReference {
+                    target_unit_id: None,
+                    specifier: raw.specifier.clone(),
+                    kind: raw.kind,
+                    resolution: AnalysisDependencyResolution::Unknown,
+                    evidence_path: Some(raw.evidence_path.clone()),
+                };
+            }
+            Some(Ok(replacement)) => {
+                let (target, resolution) =
+                    resolve_go_replacement_target(replacement, manifest_to_go_module_id);
+                kind = replacement
+                    .local_path
+                    .as_ref()
+                    .map(|_| AnalysisDependencyKind::LocalPath)
+                    .unwrap_or(raw.kind);
+                return AnalysisDependencyReference {
+                    target_unit_id: target,
+                    specifier: raw.specifier.clone(),
+                    kind,
+                    resolution,
+                    evidence_path: Some(replacement.evidence_path.clone()),
+                };
+            }
+            None => {}
+        }
+    }
     if let Some(local_path) = raw.local_path.as_deref()
         && let Some(manifest_path) =
             relative_manifest_path(manifest.adapter, &manifest.path, local_path)
@@ -1532,12 +1853,24 @@ fn resolve_manifest_dependency(
             resolution = AnalysisDependencyResolution::Unknown;
         }
     } else if manifest.adapter == AnalysisAdapter::Go {
+        let source_id = manifest_to_go_module_id.get(&manifest.path);
         let matches = units
             .iter()
             .filter(|unit| {
                 unit.adapter == AnalysisAdapter::Go
                     && unit.kind == AnalysisUnitKind::GoModule
                     && unit.locator == raw.specifier
+            })
+            .filter(|target| {
+                go_resolution
+                    .active_workspace_member_ids
+                    .is_none_or(|member_ids| {
+                        source_id.is_some_and(|source_id| {
+                            source_id == &target.id
+                                || (member_ids.contains(source_id)
+                                    && member_ids.contains(&target.id))
+                        })
+                    })
             })
             .collect::<Vec<_>>();
         if matches.len() == 1 {
@@ -1550,10 +1883,72 @@ fn resolve_manifest_dependency(
     AnalysisDependencyReference {
         target_unit_id: target,
         specifier: raw.specifier.clone(),
-        kind: raw.kind,
+        kind,
         resolution,
         evidence_path: Some(raw.evidence_path.clone()),
     }
+}
+
+/// Go gives a versioned replacement precedence over a wildcard replacement.
+/// At either precedence level, duplicate directives are ambiguous and must
+/// remain unknown rather than being resolved by source order.
+fn select_go_replacement<'a>(
+    replacements: &'a [GoReplacement],
+    dependency: &RawDependency,
+) -> Option<Result<&'a GoReplacement, ()>> {
+    let exact = replacements
+        .iter()
+        .filter(|replacement| {
+            replacement.old_module == dependency.specifier
+                && replacement.old_version.is_some()
+                && replacement.old_version == dependency.version
+        })
+        .collect::<Vec<_>>();
+    if exact.len() > 1 {
+        return Some(Err(()));
+    }
+    if let Some(replacement) = exact.first() {
+        return Some(Ok(replacement));
+    }
+    let wildcard = replacements
+        .iter()
+        .filter(|replacement| {
+            replacement.old_module == dependency.specifier && replacement.old_version.is_none()
+        })
+        .collect::<Vec<_>>();
+    if wildcard.len() > 1 {
+        Some(Err(()))
+    } else {
+        wildcard.first().copied().map(Ok)
+    }
+}
+
+fn resolve_go_replacement_target(
+    replacement: &GoReplacement,
+    manifest_to_go_module_id: &BTreeMap<String, String>,
+) -> (Option<String>, AnalysisDependencyResolution) {
+    if let Some(local_path) = replacement.local_path.as_deref() {
+        if is_nonportable_go_path(local_path) {
+            return (None, AnalysisDependencyResolution::Unknown);
+        }
+        let Some(manifest_path) =
+            relative_manifest_path(AnalysisAdapter::Go, &replacement.evidence_path, local_path)
+        else {
+            return (None, AnalysisDependencyResolution::Unknown);
+        };
+        let Some(target) = manifest_to_go_module_id.get(&manifest_path).cloned() else {
+            return (None, AnalysisDependencyResolution::Unknown);
+        };
+        return (Some(target), AnalysisDependencyResolution::Resolved);
+    }
+    if replacement.new_module.is_some() {
+        // A module-path replacement remains a remote module from the core
+        // planner's point of view. The worker only treats local replacement
+        // paths as repository-local targets; a matching module name in this
+        // checkout must not be mistaken for the selected remote version.
+        return (None, AnalysisDependencyResolution::External);
+    }
+    (None, AnalysisDependencyResolution::Unknown)
 }
 
 fn resolve_workspace_member(
@@ -1667,6 +2062,8 @@ fn add_static_source_imports(
     units: &mut [AnalysisUnit],
     package_root_index: &BTreeMap<(AnalysisAdapter, String), String>,
     references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
+    go_replacements_by_module: &BTreeMap<String, Vec<GoReplacement>>,
+    active_go_workspace_member_ids: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     for (path, kind) in files {
         if !kind.is_source() {
@@ -1687,9 +2084,24 @@ fn add_static_source_imports(
             continue;
         };
         let owner_id = owner.id.clone();
+        let go_resolution = GoImportResolutionContext {
+            replacements: (adapter == AnalysisAdapter::Go)
+                .then(|| go_replacements_by_module.get(&owner_id))
+                .flatten()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            active_workspace_member_ids: active_go_workspace_member_ids,
+            source_unit_id: &owner_id,
+        };
         for specifier in imports {
-            let (target, resolution) =
-                resolve_source_import(adapter, path, &specifier, units, package_root_index);
+            let (target, resolution) = resolve_source_import(
+                adapter,
+                path,
+                &specifier,
+                units,
+                package_root_index,
+                &go_resolution,
+            );
             references
                 .entry(owner_id.clone())
                 .or_default()
@@ -1815,11 +2227,38 @@ fn resolve_source_import(
     specifier: &str,
     units: &[AnalysisUnit],
     package_root_index: &BTreeMap<(AnalysisAdapter, String), String>,
+    go_resolution: &GoImportResolutionContext<'_>,
 ) -> (Option<String>, AnalysisDependencyResolution) {
     if adapter == AnalysisAdapter::Go {
+        match select_go_replacement_for_import(go_resolution.replacements, specifier) {
+            Some(Err(())) => return (None, AnalysisDependencyResolution::Unknown),
+            Some(Ok(replacement)) => {
+                let suffix = specifier
+                    .strip_prefix(&replacement.old_module)
+                    .unwrap_or_default()
+                    .trim_start_matches('/');
+                let (target, resolution) = resolve_go_replacement_target_for_import(
+                    replacement,
+                    units,
+                    package_root_index,
+                    suffix,
+                );
+                return (target, resolution);
+            }
+            None => {}
+        }
         let modules = units
             .iter()
             .filter(|unit| unit.adapter == adapter && unit.kind == AnalysisUnitKind::GoModule)
+            .filter(|target| {
+                go_resolution
+                    .active_workspace_member_ids
+                    .is_none_or(|member_ids| {
+                        target.id == go_resolution.source_unit_id
+                            || (member_ids.contains(go_resolution.source_unit_id)
+                                && member_ids.contains(&target.id))
+                    })
+            })
             .filter(|unit| {
                 specifier == unit.locator || specifier.starts_with(&(unit.locator.clone() + "/"))
             })
@@ -1877,6 +2316,94 @@ fn resolve_source_import(
         return (None, AnalysisDependencyResolution::Unknown);
     }
     (None, AnalysisDependencyResolution::External)
+}
+
+fn select_go_replacement_for_import<'a>(
+    replacements: &'a [GoReplacement],
+    specifier: &str,
+) -> Option<Result<&'a GoReplacement, ()>> {
+    let longest = replacements
+        .iter()
+        .filter(|replacement| {
+            specifier == replacement.old_module
+                || specifier.starts_with(&(replacement.old_module.clone() + "/"))
+        })
+        .map(|replacement| replacement.old_module.len())
+        .max()?;
+    let candidates = replacements
+        .iter()
+        .filter(|replacement| {
+            replacement.old_module.len() == longest
+                && (specifier == replacement.old_module
+                    || specifier.starts_with(&(replacement.old_module.clone() + "/")))
+        })
+        .collect::<Vec<_>>();
+    let versioned = candidates
+        .iter()
+        .filter(|replacement| replacement.old_version.is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    if versioned.len() > 1 {
+        return Some(Err(()));
+    }
+    if let Some(replacement) = versioned.first() {
+        return Some(Ok(replacement));
+    }
+    if candidates.len() > 1 {
+        Some(Err(()))
+    } else {
+        candidates.first().copied().map(Ok)
+    }
+}
+
+fn resolve_go_replacement_target_for_import(
+    replacement: &GoReplacement,
+    units: &[AnalysisUnit],
+    package_root_index: &BTreeMap<(AnalysisAdapter, String), String>,
+    suffix: &str,
+) -> (Option<String>, AnalysisDependencyResolution) {
+    let target_module = if let Some(local_path) = replacement.local_path.as_deref() {
+        if is_nonportable_go_path(local_path) {
+            return (None, AnalysisDependencyResolution::Unknown);
+        }
+        let Some(manifest_path) =
+            relative_manifest_path(AnalysisAdapter::Go, &replacement.evidence_path, local_path)
+        else {
+            return (None, AnalysisDependencyResolution::Unknown);
+        };
+        units
+            .iter()
+            .filter(|unit| {
+                unit.adapter == AnalysisAdapter::Go
+                    && unit.kind == AnalysisUnitKind::GoModule
+                    && unit
+                        .manifest_paths
+                        .iter()
+                        .any(|path| path == &manifest_path)
+            })
+            .collect::<Vec<_>>()
+    } else if replacement.new_module.is_some() {
+        return (None, AnalysisDependencyResolution::External);
+    } else {
+        return (None, AnalysisDependencyResolution::Unknown);
+    };
+    if target_module.len() != 1 {
+        return (None, AnalysisDependencyResolution::Unknown);
+    }
+    let module = target_module[0];
+    let package_root = if suffix.is_empty() {
+        module.unit_root.clone()
+    } else {
+        let Some(root) = join_relative(&module.unit_root, suffix) else {
+            return (None, AnalysisDependencyResolution::Unknown);
+        };
+        root
+    };
+    package_root_index
+        .get(&(AnalysisAdapter::Go, package_root))
+        .cloned()
+        .map(|id| (Some(id), AnalysisDependencyResolution::Resolved))
+        .unwrap_or((None, AnalysisDependencyResolution::Unknown))
 }
 
 fn finalize_units(
@@ -2792,6 +3319,8 @@ fn is_local_specifier(value: &str) -> bool {
         || value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with('/')
+        || value.contains('\\')
+        || value.as_bytes().get(1) == Some(&b':')
 }
 
 fn is_within(path: &str, root: &str) -> bool {
@@ -3008,6 +3537,284 @@ mod tests {
                 )
         );
         assert!(plan.dependency_groups.iter().any(|group| group.cyclic));
+        Ok(())
+    }
+
+    #[test]
+    fn go_work_replacements_override_member_replacements_and_preserve_cycles() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for directory in ["app", "workspace-target", "local", "independent"] {
+            fs::create_dir_all(root.path().join(directory))?;
+        }
+        fs::write(
+            root.path().join("go.work"),
+            "go 1.26\n\nuse (\n ./app\n ./workspace-target\n)\n\nreplace (\n example.com/old v1.0.0 => ./workspace-target\n)\nreplace example.com/old => ./local\nreplace example.com/wild => ./workspace-target\n",
+        )?;
+        fs::write(
+            root.path().join("app/go.mod"),
+            "module example.com/app\n\ngo 1.26\n\nrequire (\n example.com/old v1.0.0\n example.com/wild v1.0.0\n)\n\nreplace (\n example.com/old => ../local\n example.com/wild => ../local\n)\n",
+        )?;
+        fs::write(
+            root.path().join("workspace-target/go.mod"),
+            "module example.com/workspace-target\n\ngo 1.26\n\nrequire example.com/app v1.0.0\n",
+        )?;
+        fs::write(
+            root.path().join("local/go.mod"),
+            "module example.com/local\n\ngo 1.26\n",
+        )?;
+        fs::write(
+            root.path().join("independent/go.mod"),
+            "module example.com/independent\n\ngo 1.26\n\nrequire (\n example.com/old v1.0.0\n example.com/app v1.0.0\n)\n\nreplace example.com/old => ../local\n",
+        )?;
+        fs::write(
+            root.path().join("app/app.go"),
+            "package app\n\nimport (\n _ \"example.com/old\"\n _ \"example.com/wild\"\n)\n",
+        )?;
+        fs::write(
+            root.path().join("workspace-target/target.go"),
+            "package target\n",
+        )?;
+        fs::write(root.path().join("local/local.go"), "package local\n")?;
+        fs::create_dir_all(root.path().join("independent/subpkg"))?;
+        fs::write(
+            root.path().join("independent/independent.go"),
+            "package independent\nimport _ \"example.com/independent/subpkg\"\n",
+        )?;
+        fs::write(
+            root.path().join("independent/subpkg/helper.go"),
+            "package subpkg\n",
+        )?;
+
+        let before = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let app = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/app")
+            .expect("app module");
+        let workspace_target = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/workspace-target")
+            .expect("workspace replacement target");
+        let local = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/local")
+            .expect("module-local replacement target");
+        let independent = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/independent")
+            .expect("independent module");
+        let replacement_refs = app
+            .dependency_references
+            .iter()
+            .filter(|reference| reference.kind == AnalysisDependencyKind::LocalPath)
+            .collect::<Vec<_>>();
+        assert!(replacement_refs.iter().any(|reference| {
+            reference.target_unit_id.as_deref() == Some(workspace_target.id.as_str())
+                && reference.evidence_path.as_deref() == Some("go.work")
+        }));
+        assert!(
+            !replacement_refs.iter().any(|reference| {
+                reference.target_unit_id.as_deref() == Some(local.id.as_str())
+            })
+        );
+        assert!(independent.dependency_references.iter().any(|reference| {
+            reference.target_unit_id.as_deref() == Some(local.id.as_str())
+                && reference.evidence_path.as_deref() == Some("independent/go.mod")
+        }));
+        assert!(independent.dependency_references.iter().any(|reference| {
+            reference.specifier == "example.com/app"
+                && reference.resolution == AnalysisDependencyResolution::External
+        }));
+        assert!(independent.dependency_references.iter().any(|reference| {
+            reference.specifier == "example.com/independent/subpkg"
+                && reference.resolution == AnalysisDependencyResolution::Resolved
+        }));
+        assert!(before.dependency_groups.iter().any(|group| {
+            group.cyclic
+                && group.unit_ids.contains(&app.id)
+                && group.unit_ids.contains(&workspace_target.id)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_go_workspace_paths_are_kept_conservative() -> Result<()> {
+        for path in ["/repo/app", "C:/repo/app", r"C:\repo\app"] {
+            let workspace = parse_go_work_manifest("go.work", &format!("use {path}\n"))?;
+            assert!(go_workspace_has_nonportable_paths(&workspace), "{path}");
+        }
+        let root = tempfile::tempdir()?;
+        for directory in ["app", "replacement"] {
+            fs::create_dir_all(root.path().join(directory))?;
+        }
+        let app_path = root.path().join("app");
+        let replacement_path = root.path().join("replacement");
+        let app_path = app_path.to_string_lossy().replace('\\', "/");
+        let replacement_path = replacement_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            root.path().join("go.work"),
+            format!(
+                "go 1.26\nuse (\n {app_path}\n {replacement_path}\n)\nreplace example.com/old => {replacement_path}\n"
+            ),
+        )?;
+        fs::write(
+            root.path().join("app/go.mod"),
+            "module example.com/app\n\ngo 1.26\nrequire example.com/old v1.0.0\n",
+        )?;
+        fs::write(
+            root.path().join("replacement/go.mod"),
+            "module example.com/replacement\n\ngo 1.26\n",
+        )?;
+        fs::write(root.path().join("app/app.go"), "package app\n")?;
+        fs::write(
+            root.path().join("replacement/replacement.go"),
+            "package replacement\n",
+        )?;
+
+        let plan = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let app = plan
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/app")
+            .expect("app module");
+        assert!(app.unknown_dependencies);
+        assert!(app.dependency_references.iter().any(|reference| {
+            reference.specifier == "go.work:nonportable-path"
+                && reference.resolution == AnalysisDependencyResolution::Unknown
+                && reference.evidence_path.as_deref() == Some("go.work")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn go_work_edit_invalidates_members_and_their_dependents() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for directory in ["app", "selected", "replacement-two"] {
+            fs::create_dir_all(root.path().join(directory))?;
+        }
+        fs::write(
+            root.path().join("go.work"),
+            "go 1.26\nuse (\n ./app\n ./selected\n)\nreplace example.com/old => ./selected\n",
+        )?;
+        fs::write(
+            root.path().join("app/go.mod"),
+            "module example.com/app\n\ngo 1.26\nrequire example.com/old v1.0.0\n",
+        )?;
+        fs::write(
+            root.path().join("selected/go.mod"),
+            "module example.com/selected\n\ngo 1.26\nrequire example.com/app v1.0.0\n",
+        )?;
+        fs::write(
+            root.path().join("replacement-two/go.mod"),
+            "module example.com/replacement-two\n\ngo 1.26\nrequire example.com/app v1.0.0\n",
+        )?;
+        fs::write(root.path().join("app/app.go"), "package app\n")?;
+        fs::write(
+            root.path().join("selected/selected.go"),
+            "package selected\n",
+        )?;
+        fs::write(
+            root.path().join("replacement-two/replacement.go"),
+            "package replacementtwo\n",
+        )?;
+
+        let before = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let app_id = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/app")
+            .expect("app module")
+            .id
+            .clone();
+        let before_app = before.unit(&app_id).expect("app module before edit");
+        assert!(
+            before_app
+                .manifest_paths
+                .iter()
+                .any(|path| path == "go.work")
+        );
+        let before_app_manifest_fingerprint = before_app.manifest_fingerprint.clone();
+        let target_id = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/selected")
+            .expect("target module")
+            .id
+            .clone();
+        let before_target_dependency_fingerprint = before
+            .unit(&target_id)
+            .expect("target module before edit")
+            .dependency_fingerprint
+            .clone();
+        let target_two_id = before
+            .units
+            .iter()
+            .find(|unit| unit.locator == "example.com/replacement-two")
+            .expect("second target module")
+            .id
+            .clone();
+        fs::write(
+            root.path().join("go.work"),
+            "go 1.26\nuse (\n ./app\n ./replacement-two\n)\nreplace example.com/old => ./replacement-two\n",
+        )?;
+        let after = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let after_app = after.unit(&app_id).expect("app module after edit");
+        assert!(
+            after_app
+                .manifest_paths
+                .iter()
+                .any(|path| path == "go.work")
+        );
+        assert_ne!(
+            after_app.manifest_fingerprint,
+            before_app_manifest_fingerprint
+        );
+        assert_ne!(
+            after
+                .unit(&target_id)
+                .expect("target module after edit")
+                .dependency_fingerprint,
+            before_target_dependency_fingerprint
+        );
+        let invalidation = after.invalidation_from(&before)?;
+        let app_entry = invalidation
+            .entries
+            .iter()
+            .find(|entry| entry.unit_id == app_id)
+            .expect("changed app entry");
+        assert!(
+            app_entry
+                .reasons
+                .contains(&AnalysisInvalidationReason::ManifestChanged)
+        );
+        assert!(
+            app_entry
+                .reasons
+                .contains(&AnalysisInvalidationReason::DependencyChanged)
+        );
+        let target_entry = invalidation
+            .entries
+            .iter()
+            .find(|entry| entry.unit_id == target_id)
+            .expect("dependent target entry");
+        assert!(
+            target_entry
+                .reasons
+                .contains(&AnalysisInvalidationReason::DependencyChanged)
+        );
+        let target_two_entry = invalidation
+            .entries
+            .iter()
+            .find(|entry| entry.unit_id == target_two_id)
+            .expect("dependent target entry");
+        assert!(
+            target_two_entry
+                .reasons
+                .contains(&AnalysisInvalidationReason::DependencyChanged)
+        );
         Ok(())
     }
 
