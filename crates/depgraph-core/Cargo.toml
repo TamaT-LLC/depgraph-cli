@@ -55,3 +55,4 @@ caseless.workspace = true
 [dev-dependencies]
 jsonschema = { version = "0.47", default-features = false }
 rusqlite.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

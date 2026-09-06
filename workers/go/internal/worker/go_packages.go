@@ -95,9 +95,25 @@ func loadGoPackagesInventory(root string, modules []Module, work WorkFile, tags 
 	return loadGoPackagesInventoryWith(root, modules, work, tags, packages.Load, goPackagesLoadTimeout)
 }
 
+func loadGoPackagesInventoryForModules(root string, modules, inventoryModules []Module, work WorkFile, tags []string) goPackagesInventory {
+	return loadGoPackagesInventoryWithModules(root, modules, inventoryModules, work, tags, packages.Load, goPackagesLoadTimeout)
+}
+
+func loadGoPackagesInventoryForModulesProgress(root string, modules, inventoryModules []Module, work WorkFile, tags []string, progress AnalysisProgressFunc) goPackagesInventory {
+	return loadGoPackagesInventoryWithModulesProgress(root, modules, inventoryModules, work, tags, packages.Load, goPackagesLoadTimeout, progress)
+}
+
 func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, tags []string, loader goPackagesLoadFunc, timeout time.Duration) (inventory goPackagesInventory) {
+	return loadGoPackagesInventoryWithModules(root, modules, modules, work, tags, loader, timeout)
+}
+
+func loadGoPackagesInventoryWithModules(root string, modules, inventoryModules []Module, work WorkFile, tags []string, loader goPackagesLoadFunc, timeout time.Duration) (inventory goPackagesInventory) {
+	return loadGoPackagesInventoryWithModulesProgress(root, modules, inventoryModules, work, tags, loader, timeout, nil)
+}
+
+func loadGoPackagesInventoryWithModulesProgress(root string, modules, inventoryModules []Module, work WorkFile, tags []string, loader goPackagesLoadFunc, timeout time.Duration, progress AnalysisProgressFunc) (inventory goPackagesInventory) {
 	inventory = goPackagesInventory{Status: "fallback", Fallback: true}
-	dependencySnapshot := newGoDependencySnapshotBuilder(root, modules, work)
+	dependencySnapshot := newGoDependencySnapshotBuilder(root, inventoryModules, work)
 	defer func() {
 		inventory.DependencySnapshot = dependencySnapshot.finalize(inventory.Status)
 	}()
@@ -120,8 +136,8 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 		}
 		return orderedModules[left].Dir < orderedModules[right].Dir
 	})
-	knownModuleDirs := make(map[string]bool, len(orderedModules))
-	for _, module := range orderedModules {
+	knownModuleDirs := make(map[string]bool, len(inventoryModules))
+	for _, module := range inventoryModules {
 		knownModuleDirs[canonicalPathForConfinement(module.Dir)] = true
 	}
 
@@ -164,8 +180,8 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 		workPath = ""
 		sourceWorkPath = lexicalWorkspacePath(root, work.Path)
 	}
-	modulePreflights := make(map[string]goModulePreflight, len(orderedModules))
-	for _, module := range orderedModules {
+	modulePreflights := make(map[string]goModulePreflight, len(inventoryModules))
+	for _, module := range inventoryModules {
 		if module.ManifestPath == "" {
 			continue
 		}
@@ -177,12 +193,12 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 			modulePreflights[canonicalPathForConfinement(module.Dir)] = goModulePreflight{Code: "go_packages_source_confinement", Reason: reason}
 		}
 	}
-	propagateUnsafeLocalReplacements(root, orderedModules, modulePreflights)
+	propagateUnsafeLocalReplacements(root, inventoryModules, modulePreflights)
 	if !workSafe && sourceWorkPath != "" {
-		disableWorkspaceTypedLoading(root, orderedModules, work, sourceWorkPath, modulePreflights, workReason)
+		disableWorkspaceTypedLoading(root, inventoryModules, work, sourceWorkPath, modulePreflights, workReason)
 	} else if sourceWorkPath != "" {
 		workspaceFailure := ""
-		for _, module := range orderedModules {
+		for _, module := range inventoryModules {
 			if !moduleIsWorkspaceMember(root, module, work, sourceWorkPath) {
 				continue
 			}
@@ -192,7 +208,7 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 			}
 		}
 		if workspaceFailure == "" {
-			if reason := workspaceModulesUnsafeForGoPackages(root, orderedModules, work, sourceWorkPath, knownModuleDirs); reason != "" {
+			if reason := workspaceModulesUnsafeForGoPackages(root, inventoryModules, work, sourceWorkPath, knownModuleDirs); reason != "" {
 				workspaceFailure = "go.work could not be isolated safely: " + reason
 			}
 		}
@@ -209,7 +225,7 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				"warning",
 				workspaceFailure+"; go/packages was not invoked for workspace members and the parser retained workspace syntax",
 			))
-			disableWorkspaceTypedLoading(root, orderedModules, work, sourceWorkPath, modulePreflights, workspaceFailure)
+			disableWorkspaceTypedLoading(root, inventoryModules, work, sourceWorkPath, modulePreflights, workspaceFailure)
 			workPath = ""
 		}
 	}
@@ -225,7 +241,7 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				"warning",
 				workspaceFailure+"; go/packages was not invoked for workspace members and the parser retained workspace syntax",
 			))
-			disableWorkspaceTypedLoading(root, orderedModules, work, sourceWorkPath, modulePreflights, workspaceFailure)
+			disableWorkspaceTypedLoading(root, inventoryModules, work, sourceWorkPath, modulePreflights, workspaceFailure)
 			workPath = ""
 			removeIsolatedWork = nil
 		} else {
@@ -245,9 +261,12 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 	packageErrorsTruncated := false
 	seenPackageErrors := map[string]bool{}
 
-	for _, module := range orderedModules {
+	for moduleIndex, module := range orderedModules {
 		if module.ManifestPath == "" {
 			continue
+		}
+		if progress != nil {
+			progress("go_typed_load", "progress", moduleIndex)
 		}
 		if preflight := modulePreflights[canonicalPathForConfinement(module.Dir)]; preflight.Reason != "" {
 			failedModules++
@@ -258,6 +277,9 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
+			if progress != nil {
+				progress("go_typed_load", "progress", moduleIndex+1)
+			}
 			continue
 		}
 		moduleWork := "off"
@@ -301,6 +323,9 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
+			if progress != nil {
+				progress("go_typed_load", "progress", moduleIndex+1)
+			}
 			continue
 		}
 		if loadErr != nil {
@@ -313,6 +338,9 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				Path:        relativePath(root, module.ManifestPath),
 				Recoverable: true,
 			})
+			if progress != nil {
+				progress("go_typed_load", "progress", moduleIndex+1)
+			}
 			continue
 		}
 		loadedModules++
@@ -468,6 +496,9 @@ func loadGoPackagesInventoryWith(root string, modules []Module, work WorkFile, t
 				moduleTypedPackages[index].SSAInput = ssaInput
 			}
 			inventory.TypedPackages = append(inventory.TypedPackages, moduleTypedPackages...)
+		}
+		if progress != nil {
+			progress("go_typed_load", "progress", moduleIndex+1)
 		}
 	}
 	sort.SliceStable(inventory.TypedPackages, func(left, right int) bool {

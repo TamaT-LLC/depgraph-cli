@@ -228,12 +228,81 @@ fn verify_duplicate_module_root_scan(
         "duplicate module instances or package IDs were merged: instances={module_instances:?} packages={packages:?}"
     );
 
+    let profiles = graph_array(graph, "profiles")?;
+    let go_profiles = profiles
+        .iter()
+        .filter(|profile| profile["language"] == "go")
+        .collect::<Vec<_>>();
+    ensure!(
+        !go_profiles.is_empty(),
+        "duplicate-module graph has no Go profile"
+    );
+    let split_profiles = go_profiles.iter().any(|profile| {
+        profile["properties"].get("analysis_unit_root").is_some()
+            || profile["properties"].get("analysis_stage").is_some()
+    });
+    let mut profiles_by_module = BTreeMap::<&str, BTreeMap<&str, &str>>::new();
+    let mut legacy_profile_ids = Vec::new();
+    for profile in &go_profiles {
+        let profile_id = required_str(profile, "id", "duplicate-module Go profile")?;
+        let properties = profile
+            .get("properties")
+            .context("duplicate-module Go profile has no properties")?;
+        if split_profiles {
+            let unit_root = properties
+                .get("analysis_unit_root")
+                .and_then(Value::as_str)
+                .with_context(|| {
+                    format!("split duplicate-module profile {profile_id} has no analysis_unit_root")
+                })?;
+            let stage = properties
+                .get("analysis_stage")
+                .and_then(Value::as_str)
+                .with_context(|| {
+                    format!("split duplicate-module profile {profile_id} has no analysis_stage")
+                })?;
+            ensure!(
+                matches!(unit_root, "one" | "two") && matches!(stage, "syntax" | "semantic"),
+                "duplicate-module profile has invalid unit scope: id={profile_id} root={unit_root} stage={stage}"
+            );
+            let stage_profiles = profiles_by_module.entry(unit_root).or_default();
+            ensure!(
+                stage_profiles.insert(stage, profile_id).is_none(),
+                "duplicate-module graph emitted duplicate {unit_root}/{stage} Go profiles"
+            );
+        } else {
+            ensure!(
+                properties.get("analysis_unit_root").is_none()
+                    && properties.get("analysis_stage").is_none(),
+                "duplicate-module graph mixed legacy and analysis-unit Go profiles"
+            );
+            legacy_profile_ids.push(profile_id);
+        }
+    }
+    if split_profiles {
+        ensure!(
+            profiles_by_module.len() == 2
+                && profiles_by_module.values().all(|stages| {
+                    stages.len() == 2
+                        && stages.contains_key("syntax")
+                        && stages.contains_key("semantic")
+                }),
+            "duplicate-module graph must have exactly one syntax and semantic profile per module: {profiles_by_module:?}"
+        );
+    } else {
+        ensure!(
+            legacy_profile_ids.len() == 1,
+            "legacy duplicate-module graph must retain exactly one Go profile, got {}",
+            legacy_profile_ids.len()
+        );
+    }
+
     let has_contains_edge = |source: &str, target: &str| {
         edges.iter().any(|edge| {
             edge["kind"] == "contains" && edge["source"] == source && edge["target"] == target
         })
     };
-    let mut build_units = BTreeMap::new();
+    let mut unit_owners = BTreeMap::<&str, &str>::new();
     for relative_dir in ["one", "two"] {
         let module_id = module_instances[relative_dir];
         let package_id = packages[relative_dir];
@@ -251,10 +320,47 @@ fn verify_duplicate_module_root_scan(
                     .is_some_and(|node| node["kind"] == "build_unit")
             })
             .collect::<Vec<_>>();
+        let mut units_by_profile = BTreeMap::<&str, Vec<&str>>::new();
+        for target in units {
+            let unit = nodes_by_id
+                .get(target)
+                .with_context(|| format!("module {relative_dir} build unit {target} is missing"))?;
+            let unit_profile_id = unit["properties"]["profile_id"].as_str().with_context(|| {
+                format!("module {relative_dir} build unit {target} has no profile_id")
+            })?;
+            let edge_profile_ids = edges
+                .iter()
+                .filter(|edge| {
+                    edge["kind"] == "contains"
+                        && edge["source"] == package_id
+                        && edge["target"] == *target
+                })
+                .filter_map(|edge| edge["profile_id"].as_str())
+                .collect::<Vec<_>>();
+            ensure!(
+                edge_profile_ids
+                    .iter()
+                    .all(|profile_id| *profile_id == unit_profile_id),
+                "module {relative_dir} build unit {target} has inconsistent profile IDs: node={unit_profile_id} edges={edge_profile_ids:?}"
+            );
+            units_by_profile
+                .entry(unit_profile_id)
+                .or_default()
+                .push(target);
+        }
+        let expected_profile_ids = if split_profiles {
+            profiles_by_module
+                .get(relative_dir)
+                .with_context(|| format!("module {relative_dir} has no split Go profiles"))?
+                .values()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            legacy_profile_ids.clone()
+        };
         ensure!(
-            units.len() == 1,
-            "module {relative_dir} emitted {} build units instead of one",
-            units.len()
+            units_by_profile.len() == expected_profile_ids.len(),
+            "module {relative_dir} emitted build units for unexpected profiles: expected={expected_profile_ids:?} actual={units_by_profile:?}"
         );
         let file_locator = format!("file:{relative_dir}/shared.go");
         let file_id = nodes
@@ -262,17 +368,26 @@ fn verify_duplicate_module_root_scan(
             .find(|node| node["kind"] == "file" && node["locator"] == file_locator)
             .with_context(|| format!("module {relative_dir} has no file node"))
             .and_then(|node| required_str(node, "id", "duplicate module file"))?;
-        ensure!(
-            has_contains_edge(units[0], file_id),
-            "build unit for {relative_dir} does not contain its file"
-        );
-        build_units.insert(relative_dir, units[0]);
+        for profile_id in expected_profile_ids {
+            let profile_units = units_by_profile.get(profile_id).with_context(|| {
+                format!("module {relative_dir} emitted no build unit for profile {profile_id}")
+            })?;
+            ensure!(
+                profile_units.len() == 1,
+                "module {relative_dir} emitted {} build units for profile {profile_id}, expected one",
+                profile_units.len()
+            );
+            let unit_id = profile_units[0];
+            ensure!(
+                has_contains_edge(unit_id, file_id),
+                "build unit {unit_id} for {relative_dir} profile {profile_id} does not contain its owned file {file_id}"
+            );
+            ensure!(
+                unit_owners.insert(unit_id, relative_dir).is_none(),
+                "build unit {unit_id} is shared by duplicate module instances"
+            );
+        }
     }
-    ensure!(
-        build_units["one"] != build_units["two"],
-        "duplicate module instances shared build unit {}",
-        build_units["one"]
-    );
 
     let projection = serde_json::to_string(&projection)?;
     for forbidden in [fixture, temp, runner.module_cache, runner.go_path] {
@@ -302,24 +417,20 @@ fn verify_dependency_snapshot(
     );
     let first_export = runner.export_json(&first_store)?;
     let second_export = runner.export_json(&second_store)?;
-    let first_profile = graph_array(
+    let first_profile = go_profile_for_stage(
         first_export
             .get("graph")
             .context("first dependency snapshot export has no graph")?,
-        "profiles",
-    )?
-    .iter()
-    .find(|profile| profile["language"] == "go")
-    .context("first dependency snapshot export has no Go profile")?;
-    let second_profile = graph_array(
+        "semantic",
+        "first dependency snapshot export has no Go semantic profile",
+    )?;
+    let second_profile = go_profile_for_stage(
         second_export
             .get("graph")
             .context("second dependency snapshot export has no graph")?,
-        "profiles",
-    )?
-    .iter()
-    .find(|profile| profile["language"] == "go")
-    .context("second dependency snapshot export has no Go profile")?;
+        "semantic",
+        "second dependency snapshot export has no Go semantic profile",
+    )?;
     ensure!(
         first_profile["properties"]["go_dependency_snapshot_status"] == "complete"
             && first_profile["properties"]["go_dependency_snapshot_schema"]
@@ -346,15 +457,13 @@ fn verify_dependency_snapshot(
         "changed dependency snapshot scan did not complete: {changed_scan}"
     );
     let changed_export = runner.export_json(&changed_store)?;
-    let changed_profile = graph_array(
+    let changed_profile = go_profile_for_stage(
         changed_export
             .get("graph")
             .context("changed dependency snapshot export has no graph")?,
-        "profiles",
-    )?
-    .iter()
-    .find(|profile| profile["language"] == "go")
-    .context("changed dependency snapshot export has no Go profile")?;
+        "semantic",
+        "changed dependency snapshot export has no Go semantic profile",
+    )?;
     ensure!(
         first_profile["id"] != changed_profile["id"]
             && first_profile["properties"]["go_dependency_snapshot_fingerprint"]
@@ -390,10 +499,7 @@ fn verify_vta_graph(runner: &Runner<'_>, temp: &Path, fixture: &Path) -> Result<
     let graph = first_export
         .get("graph")
         .context("VTA JSON export has no graph")?;
-    let profile = graph_array(graph, "profiles")?
-        .iter()
-        .find(|profile| profile["language"] == "go")
-        .context("VTA export has no Go profile")?;
+    let profile = go_profile_for_stage(graph, "semantic", "VTA export has no Go semantic profile")?;
     ensure!(
         profile["properties"]["go_call_graph_requested"] == "vta"
             && matches!(
@@ -804,10 +910,10 @@ fn verify_call_graph_boundaries(runner: &Runner<'_>, store: &Path, graph: &Value
         counts == expected,
         "Go boundary fixture counts changed: {counts:?}"
     );
-    let profile = graph_array(graph, "profiles")?
-        .iter()
-        .find(|profile| profile["language"] == "go")
-        .context("boundary export has no Go profile")?;
+    let profile = go_profile_with_observed_boundaries(
+        graph,
+        "boundary export has no Go profile with call-graph boundaries",
+    )?;
     let expected_total = expected.values().sum::<u64>();
     ensure!(
         profile["properties"]["go_callgraph_boundary_status"] == "observed"
@@ -1143,10 +1249,11 @@ fn assert_parser_fallback_scan(
             "{scenario} full parser fallback unexpectedly retained semantic nodes or edges: {graph}"
         );
     }
-    let go_profile = graph_array(graph, "profiles")?
-        .iter()
-        .find(|profile| profile["language"] == "go")
-        .with_context(|| format!("{scenario} parser-fallback export has no Go profile"))?;
+    let go_profile = go_profile_for_stage(
+        graph,
+        "semantic",
+        &format!("{scenario} parser-fallback export has no Go semantic profile"),
+    )?;
     ensure!(
         go_profile["properties"]["go_packages_status"] == expected_status
             && go_profile["coverage"]["project_code_executed"] == false,
@@ -1642,6 +1749,45 @@ fn graph_array<'a>(graph: &'a Value, field: &str) -> Result<&'a [Value]> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .with_context(|| format!("exported graph has no {field} array"))
+}
+
+fn go_profile_for_stage<'a>(graph: &'a Value, stage: &str, context: &str) -> Result<&'a Value> {
+    let profiles = graph_array(graph, "profiles")?;
+    profiles
+        .iter()
+        .find(|profile| {
+            profile["language"] == "go"
+                && profile["properties"]["analysis_stage"] == stage
+                && profile["properties"]["analysis_unit_root"] == "."
+        })
+        .or_else(|| {
+            // Legacy workers emit one Go profile without analysis_stage. Keep
+            // this gate compatible with that stream while never falling back
+            // from a requested semantic unit to a syntax profile.
+            profiles.iter().find(|profile| {
+                profile["language"] == "go" && profile["properties"].get("analysis_stage").is_none()
+            })
+        })
+        .with_context(|| context.to_owned())
+}
+
+fn go_profile_with_observed_boundaries<'a>(graph: &'a Value, context: &str) -> Result<&'a Value> {
+    let profiles = graph_array(graph, "profiles")?;
+    profiles
+        .iter()
+        .find(|profile| {
+            profile["language"] == "go"
+                && profile["properties"]["go_callgraph_boundary_status"] == "observed"
+        })
+        .or_else(|| {
+            // Legacy workers emit one Go profile without analysis_stage. Keep
+            // that stream compatible without selecting an unrelated split
+            // profile when the observed-boundary profile is missing.
+            profiles.iter().find(|profile| {
+                profile["language"] == "go" && profile["properties"].get("analysis_stage").is_none()
+            })
+        })
+        .with_context(|| context.to_owned())
 }
 
 fn required_str<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str> {

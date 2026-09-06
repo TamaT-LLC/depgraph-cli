@@ -198,6 +198,12 @@ type scannerState struct {
 	root               string
 	workspaceIdentity  string
 	profile            Profile
+	progress           AnalysisProgressFunc
+	analysisUnit       *AnalysisUnitRequest
+	ownedModules       map[string]bool
+	contextModules     map[string]bool
+	ownedSourcePaths   map[string]bool
+	analysisStage      AnalysisUnitStage
 	goPackages         goPackagesInventory
 	moduleResolution   localModuleResolution
 	inventory          *repositoryInventory
@@ -216,8 +222,19 @@ func (s *scannerState) scopedID(kind string, parts ...string) string {
 	return profileScopedID(kind, s.workspaceIdentity, s.profile.ID, parts...)
 }
 
+// targetID identifies repository definitions and structural targets. Unit
+// scans use one repository-relative identity for these nodes so syntax and
+// semantic stages, and a dependent unit's closure, can upsert the same
+// payload. Whole-repository scans retain the historical profile-scoped IDs.
+func (s *scannerState) targetID(kind string, parts ...string) string {
+	if s.analysisUnit != nil {
+		return stableID(kind, s.workspaceIdentity, parts...)
+	}
+	return s.scopedID(kind, parts...)
+}
+
 func Scan(root string) (Result, error) {
-	return scan(root, nil)
+	return scanWithProgress(root, nil, nil, nil)
 }
 
 func ScanWithInventory(root, inventoryFile string) (Result, error) {
@@ -225,10 +242,39 @@ func ScanWithInventory(root, inventoryFile string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return scan(root, inventory)
+	return scanWithProgress(root, inventory, nil, nil)
 }
 
-func scan(root string, inventory *repositoryInventory) (Result, error) {
+// ScanWithAnalysisUnit scans one repository-relative Go module unit.  The
+// module and workspace inventory still comes from the complete repository so
+// duplicate module paths and local replacements retain their global identity.
+func ScanWithAnalysisUnit(root string, inventoryFile string, request AnalysisUnitRequest) (Result, error) {
+	return ScanWithAnalysisUnitProgress(root, inventoryFile, request, nil)
+}
+
+// ScanWithAnalysisUnitProgress is ScanWithAnalysisUnit with an optional
+// progress callback for the core scheduler's bounded idle deadline. Progress
+// is emitted only at parser, typed-load, and SSA work boundaries.
+func ScanWithAnalysisUnitProgress(root string, inventoryFile string, request AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
+	if err := request.Validate(); err != nil {
+		return Result{}, err
+	}
+	var inventory *repositoryInventory
+	var err error
+	if inventoryFile != "" {
+		inventory, err = readRepositoryInventory(inventoryFile)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	return scanWithProgress(root, inventory, &request, progress)
+}
+
+func scan(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest) (Result, error) {
+	return scanWithProgress(root, inventory, analysisUnit, nil)
+}
+
+func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Result{}, fmt.Errorf("normalize root: %w", err)
@@ -338,7 +384,64 @@ func scan(root string, inventory *repositoryInventory) (Result, error) {
 		goPackagesWork.Path = untrustedWorkPath
 		goPackagesWork.ParseIssues++
 	}
-	goPackages := loadGoPackagesInventory(absRoot, modules, goPackagesWork, configuredTags)
+	ownedModules := map[string]bool{}
+	contextModules := map[string]bool{}
+	ownedSourcePaths := map[string]bool{}
+	selectedModules := modules
+	if analysisUnit != nil {
+		if err := analysisUnit.ValidateForRoot(absRoot); err != nil {
+			return Result{}, err
+		}
+		for _, module := range modules {
+			if module.RelativeDir == analysisUnit.UnitRoot {
+				ownedModules[module.Dir] = true
+			}
+		}
+		if len(ownedModules) == 0 {
+			return Result{}, fmt.Errorf("analysis unit root %q does not identify a discovered Go module", analysisUnit.UnitRoot)
+		}
+		for _, sourcePath := range analysisUnit.SourcePaths {
+			ownedSourcePaths[sourcePath] = true
+			module := moduleForPath(modules, filepath.Join(absRoot, filepath.FromSlash(sourcePath)))
+			if module == nil || !ownedModules[module.Dir] {
+				return Result{}, fmt.Errorf("analysis unit source path %q belongs to a different module", sourcePath)
+			}
+		}
+		contextModules = analysisContextModules(modules, ownedModules, buildLocalModuleResolution(absRoot, modules, work))
+		selectedModules = make([]Module, 0, len(contextModules))
+		for _, module := range modules {
+			if contextModules[module.Dir] {
+				selectedModules = append(selectedModules, module)
+			}
+		}
+	}
+	var goPackages goPackagesInventory
+	if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSyntax {
+		goPackages = goPackagesInventory{
+			Status:   "syntax-only",
+			Fallback: true,
+			Diagnostics: []Diagnostic{{
+				Code: "go_packages_stage_skipped", Severity: "info", Recoverable: true,
+				Message: "typed Go loading was deferred to the semantic analysis stage",
+			}},
+		}
+	} else {
+		loadModules := modules
+		if analysisUnit != nil {
+			loadModules = selectedModules
+		}
+		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic && progress != nil {
+			progress("go_typed_load", "progress", 0)
+		}
+		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic {
+			goPackages = loadGoPackagesInventoryForModulesProgress(absRoot, loadModules, modules, goPackagesWork, configuredTags, progress)
+		} else {
+			goPackages = loadGoPackagesInventoryForModules(absRoot, loadModules, modules, goPackagesWork, configuredTags)
+		}
+		if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic && progress != nil {
+			progress("go_typed_load", "completed", goPackages.ModuleCount)
+		}
+	}
 	initialDiagnostics = append(initialDiagnostics, goPackages.Diagnostics...)
 	// The constrained typed-package pass always disables cgo. GOOS/GOARCH and this
 	// effective cgo state are profile axes even when no custom build tags were
@@ -353,9 +456,19 @@ func scan(root string, inventory *repositoryInventory) (Result, error) {
 		goPackages.DependencySnapshot.Status,
 		goPackages.DependencySnapshot.Fingerprint,
 	)
+	if analysisUnit != nil {
+		profileID = analysisUnitProfileID(profileID, *analysisUnit)
+	}
 	profileProperties := map[string]string{
 		"variants": "normal,internal_test,external_test", "safe_scan": "true", "configured_tags": strings.Join(configuredTags, ","),
 		"go_call_graph_requested": configuredProfile.CallGraph,
+	}
+	if analysisUnit != nil {
+		profileProperties["analysis_unit_contract"] = AnalysisUnitContractVersion
+		profileProperties["analysis_unit_id"] = analysisUnit.UnitID
+		profileProperties["analysis_unit_root"] = analysisUnit.UnitRoot
+		profileProperties["analysis_stage"] = string(analysisUnit.Stage)
+		profileProperties["analysis_source_path_count"] = strconv.Itoa(len(analysisUnit.SourcePaths))
 	}
 	for key, value := range inventoryProperties(goPackages) {
 		profileProperties[key] = value
@@ -368,11 +481,15 @@ func scan(root string, inventory *repositoryInventory) (Result, error) {
 	}
 	state := &scannerState{
 		root: absRoot, workspaceIdentity: workspaceIdentity, profile: profile, goPackages: goPackages,
+		progress:     progress,
+		analysisUnit: analysisUnit, ownedModules: ownedModules, contextModules: contextModules,
+		ownedSourcePaths: ownedSourcePaths, analysisStage: analysisUnitStage(analysisUnit),
 		moduleResolution: buildLocalModuleResolution(absRoot, modules, work),
 		inventory:        inventory,
 		nodes:            map[string]Node{}, edges: map[string]Edge{}, sites: map[string]Site{}, diagnostics: initialDiagnostics,
 		files: skippedMetadata,
 	}
+	state.retainAnalysisScopeDiagnostics()
 	state.workspaceNodeID = stableID("workspace", workspaceIdentity, "root")
 	if err := addNode(state.nodes, Node{
 		ID: state.workspaceNodeID, Kind: "workspace", Locator: "go-workspace:" + workspaceIdentity,
@@ -381,37 +498,125 @@ func scan(root string, inventory *repositoryInventory) (Result, error) {
 		return Result{}, err
 	}
 
-	moduleNodes, err := state.addModules(modules, work)
+	emittedModules := modules
+	if analysisUnit != nil {
+		emittedModules = selectedModules
+	}
+	moduleNodes, err := state.addModules(emittedModules, work)
 	if err != nil {
 		return Result{}, err
 	}
-	sources, err := state.discoverAndParseFiles(modules)
+	allSources, err := state.discoverAndParseFiles(modules)
 	if err != nil {
 		return Result{}, err
 	}
-	discoveredFiles := len(sources) + len(state.files) + len(manifestPaths)
-	if work.Path != "" {
+	sources := allSources
+	if analysisUnit != nil {
+		sources = state.ownedSources(allSources)
+		state.retainOwnedFileCompletions()
+	}
+	discoveredFiles := len(sources) + len(state.files) + len(ownedManifestPaths(manifestPaths, selectedModules))
+	if work.Path != "" && (analysisUnit == nil || analysisUnit.UnitRoot == ".") {
 		discoveredFiles++
 	}
-	groups, err := state.addPackagesAndFiles(sources, moduleNodes)
+	groups, err := state.addPackagesAndFiles(sources, moduleNodes, allSources)
 	if err != nil {
 		return Result{}, err
 	}
-	assemblyFiles, err := state.addAssemblyBoundaries(modules, moduleNodes, groups)
+	assemblyFiles, err := state.addAssemblyBoundaries(emittedModules, moduleNodes, groups)
 	if err != nil {
 		return Result{}, err
 	}
 	discoveredFiles += assemblyFiles
-	state.addModuleRequirements(modules, work, moduleNodes)
-	state.addManifestCompletions(modules, work)
+	state.addModuleRequirements(ownedModuleList(modules, ownedModules), work, moduleNodes)
+	state.addManifestCompletions(ownedModuleList(modules, ownedModules), work)
 	for _, source := range sources {
 		state.extractFileDependencies(source, groups)
 	}
 	state.semanticIncomplete = true
-	state.extractGoSemanticGraph(sources)
+	if analysisUnit == nil || analysisUnit.Stage == AnalysisUnitStageSemantic {
+		state.extractGoSemanticGraph(sources)
+	}
+	if analysisUnit != nil && analysisUnit.Stage == AnalysisUnitStageSemantic {
+		state.retainSemanticStageGraph()
+	}
+	if analysisUnit != nil {
+		// The unit stream emits one file_completed record for each owned source,
+		// manifest, assembly file, or explicitly skipped metadata item. Context
+		// modules are loaded for resolution but do not contribute to this unit's
+		// coverage, so derive the discovery count from the final owned ledger.
+		discoveredFiles = len(state.files)
+	}
 
 	result := state.result(discoveredFiles)
 	return result, nil
+}
+
+func analysisUnitStage(request *AnalysisUnitRequest) AnalysisUnitStage {
+	if request == nil {
+		return ""
+	}
+	return request.Stage
+}
+
+func analysisUnitProfileID(base string, request AnalysisUnitRequest) string {
+	return stableID("profile", "go-analysis-unit-v1", base, request.UnitID, string(request.Stage))
+}
+
+func ownedManifestPaths(paths []string, modules []Module) []string {
+	if len(modules) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(modules))
+	for _, module := range modules {
+		if module.ManifestPath != "" {
+			allowed[cleanSlash(module.ManifestPath)] = true
+		}
+	}
+	owned := make([]string, 0, len(paths))
+	for _, manifest := range paths {
+		if allowed[cleanSlash(manifest)] {
+			owned = append(owned, manifest)
+		}
+	}
+	return owned
+}
+
+func ownedModuleList(modules []Module, owned map[string]bool) []Module {
+	if len(owned) == 0 {
+		return modules
+	}
+	result := make([]Module, 0, len(owned))
+	for _, module := range modules {
+		if owned[module.Dir] {
+			result = append(result, module)
+		}
+	}
+	return result
+}
+
+func analysisContextModules(modules []Module, owned map[string]bool, resolution localModuleResolution) map[string]bool {
+	selected := make(map[string]bool, len(owned))
+	queue := make([]Module, 0, len(owned))
+	for _, module := range modules {
+		if owned[module.Dir] {
+			selected[module.Dir] = true
+			queue = append(queue, module)
+		}
+	}
+	for len(queue) > 0 {
+		module := queue[0]
+		queue = queue[1:]
+		for _, requirement := range module.Requirements {
+			for _, candidate := range resolution.requirementTargets(module, requirement) {
+				if !selected[candidate.Dir] {
+					selected[candidate.Dir] = true
+					queue = append(queue, candidate)
+				}
+			}
+		}
+	}
+	return selected
 }
 
 func (s *scannerState) addManifestCompletions(modules []Module, work WorkFile) {
@@ -440,7 +645,7 @@ func (s *scannerState) addManifestCompletions(modules []Module, work WorkFile) {
 		}
 		s.files = append(s.files, completion)
 	}
-	if work.Path != "" {
+	if work.Path != "" && (s.analysisUnit == nil || s.analysisUnit.UnitRoot == ".") {
 		rel := relativePath(s.root, work.Path)
 		completion := FileCompletion{Path: rel}
 		if s.hasReadDiagnostic("go_work_read", rel) {
@@ -468,17 +673,199 @@ func (s *scannerState) hasReadDiagnostic(code, path string) bool {
 	return false
 }
 
+func (s *scannerState) ownsSourcePath(relative string) bool {
+	if s.analysisUnit == nil {
+		return true
+	}
+	return s.ownedSourcePaths[cleanSlash(relative)]
+}
+
+func (s *scannerState) reportProgress(phase, status string, items int) {
+	if s.progress != nil && s.analysisUnit != nil {
+		s.progress(phase, status, items)
+	}
+}
+
+func (s *scannerState) moduleIsVisible(module *Module) bool {
+	if module == nil || s.analysisUnit == nil {
+		return module != nil
+	}
+	return s.ownedModules[module.Dir] || s.contextModules[module.Dir]
+}
+
+func (s *scannerState) ownedSources(sources []*sourceFile) []*sourceFile {
+	if s.analysisUnit == nil {
+		return sources
+	}
+	owned := make([]*sourceFile, 0, len(sources))
+	for _, source := range sources {
+		if s.ownsSourcePath(source.RelPath) {
+			owned = append(owned, source)
+		}
+	}
+	return owned
+}
+
+func (s *scannerState) retainOwnedFileCompletions() {
+	if s.analysisUnit == nil {
+		return
+	}
+	owned := s.files[:0]
+	for _, completion := range s.files {
+		if s.ownsSourcePath(completion.Path) {
+			owned = append(owned, completion)
+		}
+	}
+	s.files = owned
+}
+
+func (s *scannerState) retainAnalysisScopeDiagnostics() {
+	if s.analysisUnit == nil {
+		return
+	}
+	owned := s.diagnostics[:0]
+	for _, diagnostic := range s.diagnostics {
+		if diagnostic.Path == "" || diagnostic.Path == "go.work" || s.ownsSourcePath(diagnostic.Path) || s.ownsManifestPath(diagnostic.Path) {
+			owned = append(owned, diagnostic)
+		}
+	}
+	s.diagnostics = owned
+}
+
+func (s *scannerState) ownsManifestPath(relative string) bool {
+	for moduleDir := range s.ownedModules {
+		if relativePath(s.root, filepath.Join(moduleDir, "go.mod")) == cleanSlash(relative) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *scannerState) retainSemanticStageGraph() {
+	if s.analysisUnit == nil || s.analysisStage != AnalysisUnitStageSemantic {
+		return
+	}
+	for id, site := range s.sites {
+		semantic := len(site.Evidence) > 0 && site.Evidence[0].Kind == "semantic"
+		if !semantic {
+			delete(s.sites, id)
+		}
+	}
+	for id, edge := range s.edges {
+		// Structural ownership edges are emitted by every unit so a semantic
+		// profile's build units remain connected to their files. Dependency
+		// edges are deliberately retained only from the semantic stage; the
+		// syntax stage owns source imports and other source-level sites.
+		if edge.Phase != "semantic" && edge.Kind != "contains" {
+			delete(s.edges, id)
+		}
+	}
+	s.retainSemanticFileCompletions()
+}
+
+func (s *scannerState) retainAnalysisUnitSemanticScope() {
+	if s.analysisUnit == nil {
+		return
+	}
+	for id, site := range s.sites {
+		if len(site.Evidence) == 0 || !s.ownsAllSemanticEvidence(site.Evidence) {
+			delete(s.sites, id)
+		}
+	}
+	for id, edge := range s.edges {
+		if edge.Phase == "semantic" && (len(edge.Evidence) == 0 || !s.ownsAllSemanticEvidence(edge.Evidence)) {
+			delete(s.edges, id)
+		}
+	}
+	s.retainAnalysisScopeDiagnostics()
+}
+
+func (s *scannerState) ownsAllSemanticEvidence(evidence []Evidence) bool {
+	for _, item := range evidence {
+		if item.Kind != "semantic" || !s.ownsSourcePath(item.Path) {
+			return false
+		}
+	}
+	return true
+}
+
+// retainSemanticFileCompletions rebuilds the file ledger after the source
+// projection has been removed. A worker invocation has one unkeyed
+// file_completed record per path, so retaining syntax counts here would make
+// the semantic stream claim sites that it no longer emits. Keep the same
+// source paths (plus owned assembly files and manifests) with counts derived
+// from the retained semantic sites instead.
+func (s *scannerState) retainSemanticFileCompletions() {
+	semanticSitesByPath := map[string]int{}
+	for _, site := range s.sites {
+		if len(site.Evidence) == 0 || site.Evidence[0].Kind != "semantic" {
+			continue
+		}
+		path := cleanSlash(site.Evidence[0].Path)
+		if path != "" {
+			semanticSitesByPath[path]++
+		}
+	}
+	completions := make([]FileCompletion, 0, len(s.files)+len(s.ownedSourcePaths))
+	seen := map[string]bool{}
+	for _, completion := range s.files {
+		path := cleanSlash(completion.Path)
+		if !s.ownsAnalysisFilePath(path) && !s.ownsManifestPath(path) &&
+			!(path == "go.work" && s.analysisUnit.UnitRoot == ".") {
+			continue
+		}
+		if !completion.Skipped {
+			count := semanticSitesByPath[path]
+			completion.DiscoveredSites = count
+			completion.EmittedSites = count
+			completion.SkippedSites = 0
+			completion.Reason = ""
+		}
+		completions = append(completions, completion)
+		seen[path] = true
+	}
+	for path := range s.ownedSourcePaths {
+		if seen[path] {
+			continue
+		}
+		count := semanticSitesByPath[path]
+		completions = append(completions, FileCompletion{
+			Path: path, DiscoveredSites: count, EmittedSites: count,
+		})
+	}
+	s.files = completions
+}
+
+func (s *scannerState) ownsAnalysisFilePath(relative string) bool {
+	if s.analysisUnit == nil {
+		return true
+	}
+	if s.ownsSourcePath(relative) {
+		return true
+	}
+	if !strings.HasSuffix(relative, ".s") {
+		return false
+	}
+	if s.analysisUnit.UnitRoot == "." {
+		return relative != "" && relative != "." && !strings.HasPrefix(relative, "../")
+	}
+	return strings.HasPrefix(relative, s.analysisUnit.UnitRoot+"/")
+}
+
 func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]Node, error) {
 	moduleNodes := make(map[string]Node, len(modules))
 	for i := range modules {
 		module := &modules[i]
+		if !s.moduleIsVisible(module) {
+			continue
+		}
 		workspaceMember := work.Path == "" || s.moduleResolution.workspaceMembers[module.Dir]
 		locator := "gomod:" + module.Path
 		if module.RelativeDir != "." {
 			locator += "#" + module.RelativeDir
 		}
 		node := Node{
-			ID: s.scopedID("package_instance", module.Path, module.RelativeDir), Kind: "package_instance",
+			ID: s.targetID("package_instance", module.Path, module.RelativeDir), Kind: "package_instance",
 			Locator: locator, DisplayName: module.Path,
 			Properties: map[string]any{
 				"ecosystem": "go", "module_path": module.Path, "relative_dir": module.RelativeDir,
@@ -503,6 +890,10 @@ func (s *scannerState) addModules(modules []Module, work WorkFile) (map[string]N
 
 func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, error) {
 	var paths []string
+	parsedItems := 0
+	if s.analysisUnit != nil {
+		s.reportProgress("go_syntax", "progress", 0)
+	}
 	entries, err := repositoryFileEntries(s.root, s.inventory)
 	if err != nil {
 		return nil, fmt.Errorf("discover Go files: %w", err)
@@ -513,6 +904,9 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 		if entry.Type()&os.ModeSymlink != 0 {
 			if strings.HasSuffix(entry.Name(), ".go") && !strings.HasPrefix(entry.Name(), ".") && !strings.HasPrefix(entry.Name(), "_") {
 				originalPath := relativePath(s.root, path)
+				if !s.ownsSourcePath(originalPath) {
+					continue
+				}
 				ledgerPath := originalPath
 				code := "go_source_symlink_skipped"
 				reason := fmt.Sprintf("Go source symlink %s was not followed in safe mode", originalPath)
@@ -530,6 +924,8 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 				s.files = append(s.files, FileCompletion{
 					Path: ledgerPath, DiscoveredSites: 1, SkippedSites: 1, Skipped: true, Reason: reason,
 				})
+				parsedItems++
+				s.reportProgress("go_syntax", "progress", parsedItems)
 			}
 			continue
 		}
@@ -542,7 +938,11 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 	for _, path := range paths {
 		sourceBytes, readErr := readRegularFileWithinRoot(s.root, path)
 		rel := relativePath(s.root, path)
+		owned := s.ownsSourcePath(rel)
 		if readErr != nil {
+			if !owned {
+				continue
+			}
 			ledgerPath := rel
 			code := "go_file_read"
 			if errors.Is(readErr, errPathConfinement) {
@@ -555,6 +955,8 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 				Path: ledgerPath, DiscoveredSites: 1, SkippedSites: 1, Skipped: true,
 				Reason: reason,
 			})
+			parsedItems++
+			s.reportProgress("go_syntax", "progress", parsedItems)
 			continue
 		}
 		module := moduleForPath(modules, path)
@@ -565,8 +967,10 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 		parsed, parseErr := parser.ParseFile(fset, path, sourceBytes, parser.ParseComments|parser.AllErrors)
 		condition, conditionText, conditionErr := parseBuildCondition(sourceBytes)
 		if conditionErr != nil {
-			s.unsupported++
-			s.diagnostics = append(s.diagnostics, Diagnostic{Code: "go_build_constraint", Severity: "warning", Message: conditionErr.Error(), Path: rel, Recoverable: true})
+			if owned {
+				s.unsupported++
+				s.diagnostics = append(s.diagnostics, Diagnostic{Code: "go_build_constraint", Severity: "warning", Message: conditionErr.Error(), Path: rel, Recoverable: true})
+			}
 		}
 		packageName := "unknown"
 		if parsed != nil && parsed.Name != nil {
@@ -586,20 +990,33 @@ func (s *scannerState) discoverAndParseFiles(modules []Module) ([]*sourceFile, e
 			Condition: condition, ConditionText: conditionText, AST: parsed, FileSet: fset, Source: sourceBytes, ParseErr: parseErr,
 		}
 		source.ImportPath = packageImportPath(s.root, *module, source.Dir)
-		source.FileNodeID = s.scopedID("file", module.Path, source.RelPath)
+		source.FileNodeID = s.targetID("file", module.Path, source.RelPath)
 		if parseErr != nil {
-			s.unsupported++
-			evidence := sourceEvidence(rel, 1, 1, 1, 1, "parse error")
-			s.diagnostics = append(s.diagnostics, Diagnostic{Code: "go_parse_error", Severity: "warning", Message: parseErr.Error(), Path: rel, Evidence: evidence, Recoverable: true})
+			if owned {
+				s.unsupported++
+				evidence := sourceEvidence(rel, 1, 1, 1, 1, "parse error")
+				s.diagnostics = append(s.diagnostics, Diagnostic{Code: "go_parse_error", Severity: "warning", Message: parseErr.Error(), Path: rel, Evidence: evidence, Recoverable: true})
+			}
 		}
 		sources = append(sources, source)
+		if owned {
+			parsedItems++
+			s.reportProgress("go_syntax", "progress", parsedItems)
+		}
+	}
+	if s.analysisUnit != nil {
+		s.reportProgress("go_syntax", "completed", parsedItems)
 	}
 	return sources, nil
 }
 
-func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes map[string]Node) (map[string][]*packageGroup, error) {
+func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes map[string]Node, contextSources []*sourceFile) (map[string][]*packageGroup, error) {
 	groupsByDir := map[string]*packageGroup{}
-	for _, source := range sources {
+	allSources := contextSources
+	if allSources == nil {
+		allSources = sources
+	}
+	for _, source := range allSources {
 		group := groupsByDir[source.Dir]
 		if group == nil {
 			group = &packageGroup{Dir: source.Dir, ImportPath: source.ImportPath, Module: source.Module, Variants: map[string]Node{}}
@@ -619,6 +1036,16 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 	sort.Strings(dirs)
 	for _, dir := range dirs {
 		group := groupsByDir[dir]
+		if !s.moduleIsVisible(group.Module) {
+			continue
+		}
+		ownedGroup := false
+		for _, source := range group.Files {
+			if s.ownsSourcePath(source.RelPath) {
+				ownedGroup = true
+				break
+			}
+		}
 		if group.BaseName == "" && len(group.Files) > 0 {
 			group.BaseName = strings.TrimSuffix(group.Files[0].PackageName, "_test")
 		}
@@ -628,7 +1055,7 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 		// exact worker artifact digest and therefore reject graphs from older workers.
 		moduleInstanceScope := group.Module.RelativeDir
 		packageNode := Node{
-			ID: s.scopedID("module", group.Module.Path, moduleInstanceScope, group.ImportPath), Kind: "module",
+			ID: s.targetID("module", group.Module.Path, moduleInstanceScope, group.ImportPath), Kind: "module",
 			Locator: "go-package:" + group.ImportPath, DisplayName: group.ImportPath,
 			Properties: map[string]any{
 				"language": "go", "module_path": group.Module.Path, "package_path": group.ImportPath, "package_name": group.BaseName,
@@ -642,10 +1069,18 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 			return nil, err
 		}
 		group.PackageNode = packageNode
-		groupsByImport[group.ImportPath] = append(groupsByImport[group.ImportPath], group)
 		moduleNode := moduleNodes[group.Module.Dir]
 		packageEvidence := sourceEvidence(group.Files[0].RelPath, 1, 1, 1, 1, "package declaration")
 		s.addStructuralEdge(moduleNode.ID, packageNode.ID, "contains", AlwaysCondition(), packageEvidence)
+
+		if !ownedGroup {
+			// Context package declarations are retained so a source unit can
+			// resolve a local replacement/workspace import.  Their source graph
+			// belongs to another unit and is emitted by that unit.
+			groupsByImport[group.ImportPath] = append(groupsByImport[group.ImportPath], group)
+			continue
+		}
+		groupsByImport[group.ImportPath] = append(groupsByImport[group.ImportPath], group)
 
 		variants := variantsForGroup(group)
 		for _, variant := range variants {
@@ -710,8 +1145,11 @@ func (s *scannerState) addAssemblyBoundaries(
 			strings.HasPrefix(entry.Name(), ".") || strings.HasPrefix(entry.Name(), "_") {
 			continue
 		}
-		discovered++
 		relative := relativePath(s.root, path)
+		if s.analysisUnit != nil && !s.ownsSourcePath(relative) {
+			continue
+		}
+		discovered++
 		if entry.Type()&os.ModeSymlink != 0 {
 			reason := "Go assembly symlink was not followed in safe mode"
 			s.diagnostics = append(s.diagnostics, Diagnostic{
@@ -754,7 +1192,7 @@ func (s *scannerState) addAssemblyBoundaries(
 			condition = combineConditions(condition, filenameCondition)
 			conditionText = joinConditionText(conditionText, filenameText)
 		}
-		fileNodeID := s.scopedID("file", module.Path, relative)
+		fileNodeID := s.targetID("file", module.Path, relative)
 		fileNode := Node{
 			ID: fileNodeID, Kind: "file", Locator: "file:" + relative, DisplayName: relative,
 			Properties: map[string]any{
@@ -901,7 +1339,7 @@ func (s *scannerState) addModuleRequirements(modules []Module, work WorkFile, mo
 			if len(targetIDs) == 0 {
 				locator := "gomod:" + targetModulePath + "@" + targetVersion
 				targetProperties["target_kind"] = "package_instance"
-				targetID := s.scopedID("external_system", requirement.Path, requirement.Version, replacement.NewPath, replacement.NewVersion)
+				targetID := s.targetID("external_system", requirement.Path, requirement.Version, replacement.NewPath, replacement.NewVersion)
 				targetNode := Node{ID: targetID, Kind: "external_system", Locator: locator, DisplayName: targetDisplay, Properties: targetProperties}
 				if err := addNode(s.nodes, targetNode); err != nil {
 					s.diagnostics = append(s.diagnostics, Diagnostic{Code: "identity_conflict", Severity: "error", Message: err.Error(), Recoverable: false})
@@ -1035,7 +1473,7 @@ func (s *scannerState) addExternalSite(source *sourceFile, kind, specifier, edge
 }
 
 func (s *scannerState) addExternalSiteWithCondition(source *sourceFile, kind, specifier, edgeKind, nodeKind, locator, display string, condition Condition, evidence []Evidence, properties map[string]any) string {
-	targetID := s.scopedID("external_system", locator)
+	targetID := s.targetID("external_system", locator)
 	properties["external"] = true
 	properties["target_kind"] = nodeKind
 	if err := addNode(s.nodes, Node{ID: targetID, Kind: "external_system", Locator: locator, DisplayName: display, Properties: properties}); err != nil {
@@ -1167,7 +1605,7 @@ func (s *scannerState) ensureUnknownNode() string {
 	if s.unknownNodeID != "" {
 		return s.unknownNodeID
 	}
-	s.unknownNodeID = s.scopedID("unknown_target", "go")
+	s.unknownNodeID = s.targetID("unknown_target", "go")
 	_ = addNode(s.nodes, Node{
 		ID: s.unknownNodeID, Kind: "unknown_target", Locator: "unknown:go", DisplayName: "Unknown Go target",
 		Properties: map[string]any{"language": "go"},
@@ -1309,7 +1747,7 @@ func (s *scannerState) extractEmbedDirectives(source *sourceFile) {
 			targets := make([]string, 0, len(matches))
 			for _, match := range matches {
 				rel := relativePath(s.root, match)
-				targetID := s.scopedID("file", source.Module.Path, rel)
+				targetID := s.targetID("file", source.Module.Path, rel)
 				info, _ := os.Stat(match)
 				properties := map[string]any{"language": "asset", "embedded": true, "module_path": source.Module.Path}
 				if info != nil {

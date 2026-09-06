@@ -664,7 +664,7 @@ fn validate_symlink_proof(root: &Path, proof: &SymlinkProof) -> Result<(), Cache
     Ok(())
 }
 
-fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Result<String, ()> {
+pub(crate) fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Result<String, ()> {
     let mut hasher = Sha256::new();
     hasher.update(b"depgraph-cache-adapters-v1\0");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -695,7 +695,7 @@ fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Result<String,
     Ok(finish_digest(hasher))
 }
 
-fn fingerprint_toolchains(
+pub(crate) fn fingerprint_toolchains(
     root: &Path,
     workers: &[(AdapterKind, WorkerSpec)],
 ) -> Result<String, ()> {

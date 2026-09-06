@@ -321,6 +321,7 @@ depgraph init .
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
+depgraph scan /path/to/repository --plan --json
 
 # Inspect profile selection without starting workers or changing the Store.
 depgraph profiles plan /path/to/repository

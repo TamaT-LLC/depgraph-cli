@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	ProtocolVersion = "1.0"
-	AdapterName     = "go"
-	AdapterVersion  = "0.5.4"
+	ProtocolVersion        = "1.0"
+	AdapterName            = "go"
+	AdapterVersion         = "0.5.4"
+	AnalysisUnitCapability = "analysis-unit-v1"
 )
 
 type Condition struct {
