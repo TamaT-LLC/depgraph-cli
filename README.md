@@ -280,6 +280,7 @@ depgraph init .
 depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
+depgraph scan /path/to/repository --plan --json
 
 # ワーカーの起動やストアの変更をせず、プロファイル選択を確認する。
 depgraph profiles plan /path/to/repository

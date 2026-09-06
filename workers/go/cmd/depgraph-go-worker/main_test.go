@@ -48,6 +48,103 @@ func TestRunUsageError(t *testing.T) {
 	}
 }
 
+func TestRunVersionAdvertisesAnalysisUnitCapability(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--version"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run() code = %d, stderr=%s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "depgraph-go-worker 0.5.4 (protocol 1.0; capabilities analysis-unit-v1)\n"; got != want {
+		t.Fatalf("version handshake = %q, want %q", got, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("version handshake polluted stderr: %q", stderr.String())
+	}
+}
+
+func TestRunAnalysisUnitEmitsBoundedStageProgress(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/progress\n\ngo 1.26.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package progress\n\nfunc Target() {}\nfunc Caller() { Target() }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(root, "request.json")
+	request := worker.AnalysisUnitRequest{
+		ContractVersion: worker.AnalysisUnitContractVersion,
+		UnitID:          "analysis-unit:progress",
+		Adapter:         worker.AdapterName,
+		UnitRoot:        ".",
+		SourcePaths:     []string{"main.go"},
+		Stage:           worker.AnalysisUnitStageSemantic,
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(requestPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--root", root, "--scan-id", "progress", "--analysis-unit", requestPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run() code = %d, stderr=%s", code, stderr.String())
+	}
+	logs := stderr.String()
+	for _, want := range []string{
+		"depgraph-progress phase=go_syntax status=progress items=0",
+		"depgraph-progress phase=go_syntax status=progress items=1",
+		"depgraph-progress phase=go_syntax status=completed items=1",
+		"depgraph-progress phase=go_typed_load status=progress items=0",
+		"depgraph-progress phase=go_typed_load status=completed items=",
+		"depgraph-progress phase=go_ssa status=progress items=0",
+		"depgraph-progress phase=go_ssa status=completed items=",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("stderr omitted progress boundary %q: %s", want, logs)
+		}
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("analysis-unit run emitted no protocol output")
+	}
+}
+
+func TestRunRejectsAnalysisUnitRootEscapeWithFailureStream(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/invalid\n\ngo 1.26.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(root, "request.json")
+	request := `{"contract_version":"depgraph-analysis-unit-v1","unit_id":"analysis-unit:invalid","adapter":"go","unit_root":"../outside","source_paths":[],"stage":"syntax"}`
+	if err := os.WriteFile(requestPath, []byte(request), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--root", root, "--scan-id", "invalid", "--analysis-unit", requestPath}, &stdout, &stderr); code != 3 {
+		t.Fatalf("run() code = %d, want 3; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "canonical repository-relative") {
+		t.Fatalf("root escape was not reported on stderr: %s", stderr.String())
+	}
+	var events []map[string]any
+	scanner := bufio.NewScanner(&stdout)
+	for scanner.Scan() {
+		var event map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			t.Fatalf("failure output contained non-protocol content: %q (%v)", scanner.Text(), err)
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0]["event"] != "scan_started" || events[1]["event"] != "diagnostic" || events[2]["event"] != "scan_completed" {
+		t.Fatalf("invalid request failure stream = %+v", events)
+	}
+}
+
 func TestRunMovesToNeutralDirectoryBeforeToolLookup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell marker fixture is Unix-only")

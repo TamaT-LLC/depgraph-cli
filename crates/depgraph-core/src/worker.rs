@@ -1454,29 +1454,34 @@ pub async fn execute_worker(
     }
 }
 
-pub(crate) async fn execute_worker_with_cancellation(
-    spec: WorkerSpec,
-    root: PathBuf,
-    scan_id: String,
-    config: ScanConfig,
-    profiles: ProfileConfig,
-    cancellation: CancellationToken,
-) -> WorkerOutput {
+pub(crate) struct WorkerUnitInput {
+    pub root: PathBuf,
+    pub scan_id: String,
+    pub config: ScanConfig,
+    pub profiles: ProfileConfig,
+    pub cancellation: CancellationToken,
+    pub inventory: PathBuf,
+}
+
+pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput) -> WorkerOutput {
     let adapter = spec.adapter;
-    match execute_worker_inner_with_cancellation(
+    let result = execute_worker_inner_with_request(
         &spec,
-        &root,
-        &scan_id,
-        &config,
-        &profiles,
-        None,
+        &input.root,
+        &input.scan_id,
+        &input.config,
+        &input.profiles,
+        WorkerRequestFiles {
+            delta_request: None,
+            inventory: Some(&input.inventory),
+        },
         async move {
-            cancellation.cancelled().await;
+            input.cancellation.cancelled().await;
             Ok(())
         },
     )
-    .await
-    {
+    .await;
+    match result {
         Ok(execution) => WorkerOutput {
             adapter,
             events: execution.events,
@@ -1588,6 +1593,39 @@ async fn execute_worker_inner_with_cancellation<F>(
 where
     F: Future<Output = std::io::Result<()>>,
 {
+    execute_worker_inner_with_request(
+        spec,
+        root,
+        scan_id,
+        config,
+        profiles,
+        WorkerRequestFiles {
+            delta_request,
+            inventory: None,
+        },
+        cancellation,
+    )
+    .await
+}
+
+struct WorkerRequestFiles<'a> {
+    delta_request: Option<&'a WorkerDeltaRequest>,
+    inventory: Option<&'a Path>,
+}
+
+async fn execute_worker_inner_with_request<F>(
+    spec: &WorkerSpec,
+    root: &Path,
+    scan_id: &str,
+    config: &ScanConfig,
+    profiles: &ProfileConfig,
+    input: WorkerRequestFiles<'_>,
+    cancellation: F,
+) -> Result<WorkerExecution>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let delta_request = input.delta_request;
     let program = resolve_worker_program(spec, root)?;
     tokio::pin!(cancellation);
     if let Some(requirement) = &spec.runtime_requirement {
@@ -1607,10 +1645,17 @@ where
     }
 
     let neutral_cwd = neutral_working_directory(root)?;
-    let repository_inventory_file = write_repository_inventory_file(root)?;
+    let generated_inventory = if input.inventory.is_none() {
+        Some(write_repository_inventory_file(root)?)
+    } else {
+        None
+    };
+    let repository_inventory_path = input
+        .inventory
+        .or_else(|| generated_inventory.as_ref().map(|file| file.path()))
+        .context("worker repository inventory is unavailable")?;
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let inventory_parent = repository_inventory_file
-        .path()
+    let inventory_parent = repository_inventory_path
         .parent()
         .context("repository inventory file has no parent")?
         .canonicalize()
@@ -1650,7 +1695,7 @@ where
         .arg("--scan-id")
         .arg(scan_id)
         .arg("--inventory-file")
-        .arg(repository_inventory_file.path())
+        .arg(repository_inventory_path)
         .current_dir(&neutral_cwd.path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1713,21 +1758,33 @@ where
         .take()
         .context("worker stderr pipe is unavailable")?;
     let stdout_task = tokio::spawn(read_capped(stdout, config.max_protocol_bytes));
-    let stderr_task = tokio::spawn(read_capped(stderr, config.max_stderr_bytes));
+    let (progress_sender, progress_receiver) = tokio::sync::watch::channel(0_u64);
+    let observe_progress = input.inventory.is_some();
+    let stderr_task = if observe_progress {
+        tokio::spawn(crate::worker_progress::read_progress_stderr(
+            stderr,
+            config.max_stderr_bytes,
+            progress_sender,
+        ))
+    } else {
+        tokio::spawn(read_capped(stderr, config.max_stderr_bytes))
+    };
 
     let mut errors = Vec::new();
     let mut failure_kinds = Vec::new();
     enum WaitResult {
-        Process(
-            std::result::Result<
-                std::io::Result<std::process::ExitStatus>,
-                tokio::time::error::Elapsed,
-            >,
-        ),
+        Process(std::result::Result<std::io::Result<std::process::ExitStatus>, ()>),
         Cancelled(std::io::Result<()>),
     }
     let wait_result = tokio::select! {
-        result = timeout(Duration::from_secs(config.worker_timeout_seconds), child.wait()) => {
+        result = async {
+            let budget = Duration::from_secs(config.worker_timeout_seconds);
+            if observe_progress {
+                crate::worker_progress::wait_with_progress(child.wait(), budget, progress_receiver).await
+            } else {
+                timeout(budget, child.wait()).await.map_err(|_| ())
+            }
+        } => {
             WaitResult::Process(result)
         }
         signal = cancellation.as_mut() => WaitResult::Cancelled(signal),
@@ -2354,6 +2411,47 @@ pub fn parse_and_validate_events(
         bail!(error);
     }
     Ok(parsed.events)
+}
+
+/// Rebind a disposable checkpoint to this attempt, then repeat the same
+/// adapter-version, safe-mode, path and semantic validation as a live worker.
+pub(crate) fn replay_analysis_checkpoint(
+    mut events: Vec<Value>,
+    spec: &WorkerSpec,
+    root: &Path,
+    scan_id: &str,
+    config: &ScanConfig,
+) -> Result<WorkerOutput> {
+    let mut bytes = Vec::new();
+    for event in &mut events {
+        event["scan_id"] = Value::String(scan_id.to_owned());
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.push(b'\n');
+        if bytes.len() > config.max_protocol_bytes {
+            bail!("analysis checkpoint exceeds the worker output budget");
+        }
+    }
+    let parsed = parse_events_preserving_prefix(
+        &bytes,
+        scan_id,
+        spec.adapter.name(),
+        root,
+        config.max_protocol_line_bytes,
+        spec.expected_version.as_deref(),
+        Some(spec.release_attested),
+    );
+    if let Some(error) = parsed.error {
+        bail!("analysis checkpoint validation failed: {error}");
+    }
+    Ok(WorkerOutput {
+        adapter: spec.adapter,
+        events: parsed.events,
+        stderr: String::new(),
+        stderr_truncated: false,
+        error: None,
+        failure_kind: None,
+        security_violation: false,
+    })
 }
 
 #[derive(Debug)]

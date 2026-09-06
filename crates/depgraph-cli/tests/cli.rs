@@ -2897,6 +2897,83 @@ fn impact_queries_recompute_canonically_without_reading_or_writing_the_cache() {
 }
 
 #[test]
+fn scan_plan_discovers_nested_units_without_starting_workers_or_writing_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("backend")).unwrap();
+    fs::create_dir_all(root.path().join("frontend/packages/ui")).unwrap();
+    fs::write(
+        root.path().join("backend/go.mod"),
+        "module example.test/backend\n\ngo 1.23\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("backend/main.go"),
+        "package main\nfunc main() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("frontend/package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("frontend/packages/ui/package.json"),
+        r#"{"name":"@fixture/ui"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("frontend/packages/ui/index.ts"),
+        "export const version = 1;\n",
+    )
+    .unwrap();
+    let store = cache.path().join("graph.sqlite");
+    let run = || {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .env(
+                "DEPGRAPH_GO_WORKER",
+                cache.path().join("worker-must-not-run"),
+            )
+            .env(
+                "DEPGRAPH_WEB_WORKER",
+                cache.path().join("worker-must-not-run"),
+            )
+            .args([
+                "--store",
+                store.to_str().unwrap(),
+                "scan",
+                root.path().to_str().unwrap(),
+                "--plan",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let first = run();
+    let second = run();
+    assert_eq!(first, second);
+    let plan: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(plan["contract_version"], "depgraph-analysis-plan-v1");
+    let units = plan["units"].as_array().unwrap();
+    assert!(
+        units
+            .iter()
+            .any(|unit| unit["unit_root"] == "backend" && unit["adapter"] == "go")
+    );
+    assert!(
+        units
+            .iter()
+            .any(|unit| unit["unit_root"] == "frontend/packages/ui" && unit["adapter"] == "web")
+    );
+    assert!(!store.exists());
+    assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn empty_safe_scan_uses_external_store_and_reports_json() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -3973,6 +4050,68 @@ fn complete_worker(node_id: &str) -> String {
         ),
     ]
     .join("\n")
+}
+
+#[cfg(unix)]
+#[test]
+fn changing_source_during_unit_execution_never_promotes_a_mixed_snapshot() {
+    for no_cache in [false, true] {
+        let root = fixture_root();
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("main.go"), "package fixture\n").unwrap();
+        let worker = cache.path().join("worker");
+        let version = "if [ \"${1-}\" = '--version' ]; then printf 'depgraph-go-worker 0.1.0 (protocol 1.0)\\n'; exit 0; fi\n";
+        write_worker(
+            &worker,
+            &format!("{version}{}", complete_worker("file:fixture")),
+        );
+        let store_path = cache.path().join("store.sqlite");
+        let baseline = scan_with_worker(root.path(), &store_path, &worker, false);
+        assert!(
+            baseline.status.success(),
+            "{}",
+            String::from_utf8_lossy(&baseline.stderr)
+        );
+        let baseline_snapshot = depgraph_store::Store::open(&store_path)
+            .unwrap()
+            .current_snapshot_id()
+            .unwrap();
+        let changed_worker = complete_worker("file:fixture").replacen(
+            PARSE_ARGS,
+            &format!("{PARSE_ARGS}\nprintf '// changed during scan\\n' >> \"$root/main.go\"\n"),
+            1,
+        );
+        write_worker(&worker, &format!("{version}{changed_worker}"));
+        let mut command = Command::cargo_bin("depgraph").unwrap();
+        command.env("DEPGRAPH_GO_WORKER", &worker).args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--json",
+        ]);
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let changed = command.output().unwrap();
+        assert_eq!(
+            changed.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&changed.stderr)
+        );
+        let changed: serde_json::Value = serde_json::from_slice(&changed.stdout).unwrap();
+        assert_eq!(changed["status"], "partial");
+        assert!(
+            changed["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "analysis-input-changed")
+        );
+        let store = depgraph_store::Store::open(&store_path).unwrap();
+        assert_eq!(store.current_snapshot_id().unwrap(), baseline_snapshot);
+    }
 }
 
 #[cfg(unix)]

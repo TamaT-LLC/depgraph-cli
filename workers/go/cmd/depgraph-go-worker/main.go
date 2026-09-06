@@ -20,6 +20,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	root := flags.String("root", "", "repository root to scan")
 	scanID := flags.String("scan-id", "", "scan identifier supplied by depgraph core")
 	inventoryFile := flags.String("inventory-file", "", "repository inventory supplied by depgraph core")
+	analysisUnitFile := flags.String("analysis-unit", "", "analysis unit request supplied by depgraph core")
 	version := flags.Bool("version", false, "print worker version")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "usage: depgraph-go-worker --root <path> --scan-id <id>")
@@ -29,7 +30,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *version {
-		fmt.Fprintf(stdout, "depgraph-go-worker %s (protocol %s)\n", worker.AdapterVersion, worker.ProtocolVersion)
+		fmt.Fprintf(stdout, "depgraph-go-worker %s (protocol %s; capabilities %s)\n", worker.AdapterVersion, worker.ProtocolVersion, worker.AnalysisUnitCapability)
 		return 0
 	}
 	if flags.NArg() != 0 || *root == "" || *scanID == "" {
@@ -40,6 +41,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "depgraph-go-worker: normalize root: %v\n", err)
 		return 3
+	}
+	inventoryPath := *inventoryFile
+	if inventoryPath != "" {
+		inventoryPath, err = filepath.Abs(inventoryPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "depgraph-go-worker: normalize inventory: %v\n", err)
+			return 3
+		}
+	}
+	var analysisUnit *worker.AnalysisUnitRequest
+	if *analysisUnitFile != "" {
+		request, requestErr := worker.ReadAnalysisUnitRequest(*analysisUnitFile)
+		if requestErr != nil {
+			fmt.Fprintf(stderr, "depgraph-go-worker: %v\n", requestErr)
+			if emitErr := worker.EmitFailure(stdout, *scanID, absRoot, requestErr); emitErr != nil {
+				fmt.Fprintf(stderr, "depgraph-go-worker: emit failure: %v\n", emitErr)
+			}
+			return 3
+		}
+		analysisUnit = &request
 	}
 	neutralDirectory, err := os.MkdirTemp("", "depgraph-go-worker-")
 	if err != nil {
@@ -62,12 +83,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 
-	fmt.Fprintf(stderr, "depgraph-go-worker: safe static scan of %s\n", absRoot)
+	if analysisUnit == nil {
+		fmt.Fprintf(stderr, "depgraph-go-worker: safe static scan of %s\n", absRoot)
+	} else {
+		fmt.Fprintf(stderr, "depgraph-go-worker: analysis unit %s stage=%s root=%s starting\n", analysisUnit.UnitID, analysisUnit.Stage, analysisUnit.UnitRoot)
+	}
 	var result worker.Result
-	if *inventoryFile == "" {
+	if analysisUnit != nil {
+		result, err = worker.ScanWithAnalysisUnitProgress(absRoot, inventoryPath, *analysisUnit, func(phase, status string, items int) {
+			fmt.Fprintf(stderr, "depgraph-progress phase=%s status=%s items=%d\n", phase, status, items)
+		})
+	} else if inventoryPath == "" {
 		result, err = worker.Scan(absRoot)
 	} else {
-		result, err = worker.ScanWithInventory(absRoot, *inventoryFile)
+		result, err = worker.ScanWithInventory(absRoot, inventoryPath)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "depgraph-go-worker: %v\n", err)
@@ -80,6 +109,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "depgraph-go-worker: %v\n", err)
 		return 3
 	}
-	fmt.Fprintf(stderr, "depgraph-go-worker: analyzed %d files and emitted %d dependency sites\n", result.Coverage.FilesAnalyzed, result.Coverage.DependencySites)
+	if analysisUnit == nil {
+		fmt.Fprintf(stderr, "depgraph-go-worker: analyzed %d files and emitted %d dependency sites\n", result.Coverage.FilesAnalyzed, result.Coverage.DependencySites)
+	} else {
+		fmt.Fprintf(stderr, "depgraph-go-worker: analysis unit %s stage=%s progress=completed items=%d files=%d sites=%d\n", analysisUnit.UnitID, analysisUnit.Stage, result.Coverage.FilesAnalyzed, result.Coverage.FilesAnalyzed, result.Coverage.DependencySites)
+	}
 	return 0
 }

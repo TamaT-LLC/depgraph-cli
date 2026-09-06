@@ -1,0 +1,400 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-analysis-plan-v1.schema.json",
+  "title": "depgraph static analysis plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "repository_root",
+    "repository_identity",
+    "inventory_digest",
+    "fingerprints",
+    "input_fingerprint",
+    "plan_id",
+    "input_digest",
+    "units",
+    "dependency_groups",
+    "limitations"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "depgraph-analysis-plan-v1"
+    },
+    "repository_root": {
+      "const": "."
+    },
+    "repository_identity": {
+      "$ref": "#/$defs/repositoryId"
+    },
+    "inventory_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "fingerprints": {
+      "$ref": "#/$defs/inputFingerprints"
+    },
+    "input_fingerprint": {
+      "$ref": "#/$defs/digest"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/planId"
+    },
+    "input_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "units": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/unit"
+      }
+    },
+    "dependency_groups": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/dependencyGroup"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "static_discovery_only",
+          "package_managers_not_executed",
+          "project_code_not_executed",
+          "dynamic_dependencies_may_be_unknown",
+          "rust_uses_whole_adapter_fallback",
+          "profiles_replicated_per_unit_until_worker_negotiation"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "repositoryId": {
+      "type": "string",
+      "pattern": "^analysis-repository:sha256:[0-9a-f]{64}$"
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^analysis-plan:sha256:[0-9a-f]{64}$"
+    },
+    "unitId": {
+      "type": "string",
+      "pattern": "^analysis-unit:sha256:[0-9a-f]{64}$"
+    },
+    "scopeId": {
+      "type": "string",
+      "pattern": "^analysis-profile-scope:sha256:[0-9a-f]{64}$"
+    },
+    "groupId": {
+      "type": "string",
+      "pattern": "^analysis-dependency-group:sha256:[0-9a-f]{64}$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "repositoryPath": {
+      "anyOf": [
+        {
+          "const": "."
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\\\\\u0000-\\u001f\\u007f]+(?:/[^/\\\\\\u0000-\\u001f\\u007f]+)*$",
+          "not": {
+            "pattern": "(^|/)\\.\\.?(/|$)"
+          }
+        }
+      ]
+    },
+    "adapter": {
+      "enum": ["rust", "go", "web"]
+    },
+    "role": {
+      "enum": ["executable", "context"]
+    },
+    "unitKind": {
+      "enum": [
+        "repository_adapter",
+        "rust_workspace",
+        "rust_package",
+        "go_workspace",
+        "go_module",
+        "go_package",
+        "web_workspace",
+        "web_project"
+      ]
+    },
+    "dependencyKind": {
+      "enum": [
+        "workspace_member",
+        "local_path",
+        "manifest_dependency",
+        "source_import",
+        "context"
+      ]
+    },
+    "dependencyResolution": {
+      "enum": ["resolved", "external", "unknown"]
+    },
+    "dependencyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_unit_id",
+        "specifier",
+        "kind",
+        "resolution",
+        "evidence_path"
+      ],
+      "properties": {
+        "target_unit_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/unitId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "specifier": {
+          "$ref": "#/$defs/text"
+        },
+        "kind": {
+          "$ref": "#/$defs/dependencyKind"
+        },
+        "resolution": {
+          "$ref": "#/$defs/dependencyResolution"
+        },
+        "evidence_path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/repositoryPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "profileScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition_ids", "scoped_ids", "fingerprint"],
+      "properties": {
+        "definition_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "scoped_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/scopeId"
+          }
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "inputFingerprints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_fingerprint",
+        "manifest_fingerprint",
+        "config_fingerprint",
+        "profile_fingerprint",
+        "analyzer_fingerprint"
+      ],
+      "properties": {
+        "source_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "manifest_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "config_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "profile_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "analyzer_fingerprint": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "adapter",
+        "role",
+        "kind",
+        "locator",
+        "unit_root",
+        "manifest_paths",
+        "source_paths",
+        "config_paths",
+        "profile_scope",
+        "source_fingerprint",
+        "manifest_fingerprint",
+        "config_fingerprint",
+        "profile_fingerprint",
+        "analyzer_fingerprint",
+        "dependency_fingerprint",
+        "input_fingerprint",
+        "dependency_ids",
+        "dependent_ids",
+        "dependency_references",
+        "unknown_dependencies"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/unitId"
+        },
+        "adapter": {
+          "$ref": "#/$defs/adapter"
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "kind": {
+          "$ref": "#/$defs/unitKind"
+        },
+        "locator": {
+          "$ref": "#/$defs/text"
+        },
+        "unit_root": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "manifest_paths": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "source_paths": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "config_paths": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "profile_scope": {
+          "$ref": "#/$defs/profileScope"
+        },
+        "source_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "manifest_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "config_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "profile_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "analyzer_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "dependency_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "input_fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "dependency_ids": {
+          "type": "array",
+          "maxItems": 500000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/unitId"
+          }
+        },
+        "dependent_ids": {
+          "type": "array",
+          "maxItems": 500000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/unitId"
+          }
+        },
+        "dependency_references": {
+          "type": "array",
+          "maxItems": 500000,
+          "items": {
+            "$ref": "#/$defs/dependencyReference"
+          }
+        },
+        "unknown_dependencies": {
+          "type": "boolean"
+        }
+      }
+    },
+    "dependencyGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "unit_ids", "outgoing_group_ids", "cyclic"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/groupId"
+        },
+        "unit_ids": {
+          "type": "array",
+          "maxItems": 100000,
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/unitId"
+          }
+        },
+        "outgoing_group_ids": {
+          "type": "array",
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/groupId"
+          }
+        },
+        "cyclic": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

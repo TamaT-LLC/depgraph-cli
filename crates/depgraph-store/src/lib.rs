@@ -10,6 +10,7 @@ use serde::{Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod analysis_coverage;
 mod build;
 mod cache;
 mod diff;
@@ -1470,7 +1471,8 @@ ORDER BY id COLLATE BINARY
         let profile_rows = profile_statement.query_map([scan_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut expected_completeness: Option<BTreeSet<String>> = None;
+        let expected_completeness =
+            analysis_coverage::aggregate_completeness(&load_profiles(&self.connection, scan_id)?)?;
         let mut max_profile_files_discovered = 0_u64;
         let mut max_profile_files_analyzed = 0_u64;
         let mut max_profile_files_skipped = 0_u64;
@@ -1499,11 +1501,6 @@ ORDER BY id COLLATE BINARY
                 .collect::<BTreeSet<_>>();
             if profile_completeness.len() != profile.completeness.len() {
                 bail!("profile {profile_id} coverage contains duplicate completeness levels");
-            }
-            if let Some(intersection) = &mut expected_completeness {
-                intersection.retain(|level| profile_completeness.contains(level));
-            } else {
-                expected_completeness = Some(profile_completeness);
             }
             max_profile_files_discovered =
                 max_profile_files_discovered.max(profile.files_discovered);

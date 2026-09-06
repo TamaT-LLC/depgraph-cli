@@ -4,6 +4,13 @@ This directory contains versioned, machine-readable contracts shipped with depgr
 Consumers should select a schema by its declared contract version and fail closed on
 unknown versions or properties.
 
+`depgraph-analysis-plan-v1.schema.json` is the closed static discovery contract
+for portable analysis plans. It describes executable and context units,
+repository-relative input scopes, dependency witnesses and cycles, and the
+fingerprints used for conservative invalidation. The core planner remains the
+semantic authority for cross-field identity, path, and graph checks; workers
+must verify effective inputs before reusing a semantic checkpoint.
+
 `agent-dogfood-report-v1.schema.json` is the closed JSON Schema 2020-12
 contract for the packaged MCP real-Agent comparison. It binds the public
 release and compiler-pack digests, fixed repository commits and snapshots,

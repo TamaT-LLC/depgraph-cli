@@ -136,6 +136,26 @@ pub fn filter_snapshot(snapshot: &GraphSnapshot, filter: &GraphQueryFilter) -> G
         .diagnostics
         .retain(|diagnostic| filter.matches_diagnostic(diagnostic));
     filtered.coverage.profiles = filtered.profiles.len() as u64;
+    if snapshot
+        .profiles
+        .iter()
+        .any(|profile| profile.properties["analysis_unit_contract"] == "depgraph-analysis-unit-v1")
+        && (filtered.profiles.len() != snapshot.profiles.len()
+            || filtered.edges.len() != snapshot.edges.len())
+    {
+        // A whole-unit stage join is not evidence of completeness for a
+        // projection containing only one stage. Keep the selected profiles'
+        // own coverage as the upper bound for a filtered export.
+        filtered.coverage.completeness.retain(|level| {
+            !filtered.profiles.is_empty()
+                && filtered.profiles.iter().all(|profile| {
+                    profile
+                        .coverage
+                        .as_ref()
+                        .is_some_and(|coverage| coverage.completeness.contains(level))
+                })
+        });
+    }
     filtered.coverage.dependency_sites = filtered.sites.len() as u64;
     filtered.coverage.resolved = filtered
         .sites
@@ -348,6 +368,50 @@ mod tests {
         CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ProfileCorrelationRecord, ScanRecord,
     };
     use serde_json::json;
+
+    #[test]
+    fn analysis_unit_profile_filter_does_not_inherit_the_whole_scan_join() -> Result<()> {
+        let mut store = depgraph_store::Store::open_in_memory()?;
+        store.start_scan("filter-stages", std::path::Path::new("/tmp/project"), false)?;
+        let mut snapshot = store.load_snapshot("filter-stages")?;
+        snapshot.coverage.completeness = vec!["syntax-complete".into(), "semantic-complete".into()];
+        for stage in ["syntax", "semantic"] {
+            let coverage = CoverageRecord {
+                profiles: 1,
+                completeness: if stage == "syntax" {
+                    vec!["syntax-complete".into()]
+                } else {
+                    vec!["syntax-complete".into(), "semantic-complete".into()]
+                },
+                ..CoverageRecord::default()
+            };
+            snapshot.profiles.push(serde_json::from_value(json!({
+                "id":stage,"language":"go","features":[],"environment":{},
+                "properties":{"analysis_unit_contract":"depgraph-analysis-unit-v1",
+                    "analysis_unit_id":"unit","analysis_unit_root":".","analysis_stage":stage},
+                "coverage":coverage
+            }))?);
+            snapshot.edges.push(EdgeRecord {
+                id: format!("edge:{stage}"),
+                site_id: None,
+                source: "a".into(),
+                target: "b".into(),
+                kind: "contains".into(),
+                phase: "source".into(),
+                environment: "test".into(),
+                profile_id: stage.into(),
+                resolution_status: "resolved".into(),
+                precision: "exact".into(),
+                condition: json!({"op":"all","conditions":[]}),
+                generated: false,
+            });
+        }
+        let filter = GraphQueryFilter::new(vec![], vec!["syntax".into()], vec![], vec![])?;
+        let filtered = filter_snapshot(&snapshot, &filter);
+        assert_eq!(filtered.coverage.completeness, ["syntax-complete"]);
+        assert_eq!(snapshot.coverage.completeness.len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn empty_exports_are_stable() -> Result<()> {

@@ -147,6 +147,9 @@ enum Commands {
         /// Bypass cache lookup and storage for this scan.
         #[arg(long)]
         no_cache: bool,
+        /// Discover analysis units and dependencies without launching workers or writing a Store.
+        #[arg(long, conflicts_with_all = ["strict", "no_cache"])]
+        plan: bool,
     },
     /// Preview the bounded default or explicit profile set without launching workers.
     Profiles {
@@ -1171,9 +1174,38 @@ async fn run(cli: Cli) -> Result<u8> {
             strict,
             json,
             no_cache,
+            plan,
         } => {
             let root = canonical_directory(path)?;
             let store_path = store_path(cli.store, &root)?;
+            if plan {
+                let config = depgraph_core::Config::load(&root)?;
+                let plan = depgraph_core::analysis_plan::plan_analysis_units(
+                    &root,
+                    &config,
+                    Some(&store_path),
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    println!("analysis plan: {}", plan.digest()?);
+                    for unit in plan.executable_units() {
+                        println!(
+                            "{} {}: {} files, {} dependencies{}",
+                            unit.adapter.as_str(),
+                            unit.unit_root,
+                            unit.source_paths.len(),
+                            unit.dependency_ids.len(),
+                            if unit.unknown_dependencies {
+                                " (dependency scope incomplete)"
+                            } else {
+                                ""
+                            },
+                        );
+                    }
+                }
+                return Ok(0);
+            }
             let service = store_write_service(&root, &store_path)?;
             let result = service
                 .scan(&ScanRequest::new(

@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use depgraph_protocol::canonical_json;
 use depgraph_store::{
     CacheEventRecord, CacheLayer, CompletedScanSnapshot, CoverageRecord, DiagnosticRecord,
     ScanHealthProvenance, ScanOperationStagingIdentity, Store, ValidatedScan,
@@ -13,10 +14,16 @@ use depgraph_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use tokio::task::{Id, JoinError, JoinSet};
 use uuid::Uuid;
 
 use crate::{
+    analysis_execution::{
+        AnalysisExecutionContext, AnalysisExecutionProgress, execute_analysis_units,
+    },
+    analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, plan_analysis_units},
+    analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
     cache::{
         CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
         validate_scan_cache_hit_inputs,
@@ -36,8 +43,7 @@ use crate::{
     service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
     worker::{
         AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
-        execute_worker_with_cancellation, is_security_error, locate_worker,
-        resolve_safe_executable,
+        is_security_error, locate_worker, resolve_safe_executable,
     },
 };
 
@@ -53,6 +59,8 @@ pub struct ScanOutcome {
     pub policy: Option<PolicyResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub performance: Option<ScanPerformance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisExecutionProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +163,7 @@ struct ScanFailure {
 }
 
 impl ScanFailure {
+    #[cfg(test)]
     fn with_kind(adapter: AdapterKind, detail: String, kind: WorkerFailureKind) -> Self {
         Self::with_classification(adapter, detail, kind, false)
     }
@@ -592,6 +601,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                                         cache_events: Vec::new(),
                                         policy: None,
                                         performance: None,
+                                        analysis: None,
                                     };
                                     match promote_validated_scan_cache_hit_if_active(
                                         store,
@@ -657,120 +667,131 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
 
     let setup_ms = elapsed_ms(setup_started);
     let worker_started = Instant::now();
-    let mut join_set = JoinSet::new();
-    let mut task_adapters = BTreeMap::new();
     let cache_workers = cache_plan.as_ref().map(|_| workers_to_run.clone());
-    for (adapter, spec) in workers_to_run {
-        if cancellation.is_cancelled() {
-            while join_set.join_next().await.is_some() {}
-            return cancel_scan(store, &scan_id);
-        }
-        let root = root.clone();
-        let scan_id = scan_id.clone();
-        let scan_config = config.scan.clone();
-        let profiles = config.profiles.clone();
-        let cancellation = cancellation.clone();
-        let task = join_set.spawn(async move {
-            execute_worker_with_cancellation(
-                spec,
-                root,
-                scan_id,
-                scan_config,
-                profiles,
-                cancellation,
-            )
-            .await
-        });
-        task_adapters.insert(task.id(), adapter);
-    }
-
-    let mut outputs = Vec::new();
-    while let Some(result) = join_set.join_next_with_id().await {
-        match result {
-            Ok((task_id, output)) => {
-                task_adapters.remove(&task_id);
-                outputs.push(output);
-            }
-            Err(error) => {
-                let adapter = task_adapter(&mut task_adapters, error.id());
-                let kind = classify_worker_task_failure(&error);
-                failures.push(ScanFailure::with_kind(
-                    adapter,
-                    format!("worker task failed: {error}"),
-                    kind,
-                ));
-            }
-        }
-    }
-    outputs.sort_by_key(|output| output.adapter);
-    let worker_ms = elapsed_ms(worker_started);
-
-    if cancellation.is_cancelled() {
-        return cancel_scan(store, &scan_id);
-    }
-
+    let initial_content_digest = cache_plan
+        .as_ref()
+        .and_then(|plan| plan.syntax.dimensions.get("file_content").cloned());
+    let checkpoint_store_path = store.database_path();
+    let execution_context = AnalysisExecutionContext {
+        root: &root,
+        scan_id: &scan_id,
+        config,
+        cache_mode,
+        cancellation: &cancellation,
+    };
+    let schedule = prepare_analysis_schedule(
+        &execution_context,
+        workers_to_run,
+        checkpoint_store_path.as_deref(),
+        &profile_plan.plan_id,
+        initial_content_digest,
+    )
+    .await?;
+    let analysis_plan = schedule.plan;
+    let analysis_input_proof = schedule.input_proof;
+    let unit_count = schedule.work.len();
     let profiling = scan_profile_enabled();
-    let mut performance_phases = if profiling {
-        let mut phases = vec![
-            ScanPhasePerformance {
-                phase: "core_scan_setup".into(),
-                duration_ms: setup_ms,
-                items: outputs.len() as u64,
-                bytes: 0,
-            },
-            ScanPhasePerformance {
-                phase: "core_worker_execution".into(),
-                duration_ms: worker_ms,
-                items: outputs.len() as u64,
-                bytes: 0,
-            },
-        ];
-        phases.extend(outputs.iter().flat_map(worker_phase_performance));
-        phases
-    } else {
-        Vec::new()
-    };
-    let protocol_event_count = if profiling {
-        outputs
-            .iter()
-            .map(|output| output.events.len() as u64)
-            .sum()
-    } else {
-        0
-    };
-    let protocol_bytes = if profiling {
-        performance_phases
-            .iter()
-            .filter(|phase| phase.phase.ends_with("_protocol_write"))
-            .fold(0_u64, |total, phase| total.saturating_add(phase.bytes))
-    } else {
-        0
-    };
-    let ingest_started = Instant::now();
-    let mut global_upserts = (outputs.len() > 1).then(BTreeMap::<(String, String), Vec<u8>>::new);
-    for output in bind_worker_outputs_to_profile_plan(outputs, &profile_plan, &mut failures) {
-        let adapter = output.adapter;
-        let failure_kind = output.failure_kind;
-        let security_violation = output.security_violation;
-        if let Err(error) = ingest_worker_output(store, &scan_id, output, global_upserts.as_mut()) {
-            let detail = format!("{error:#}");
-            failures.push(match failure_kind {
-                Some(kind) => {
-                    ScanFailure::with_classification(adapter, detail, kind, security_violation)
+    let mut performance_phases = Vec::new();
+    let mut protocol_event_count = 0_u64;
+    let mut ingest_ms = 0_u64;
+    let mut global_upserts = BTreeMap::new();
+    let mut file_coverage_ledgers = BTreeMap::new();
+    let mut analysis_unit_file_paths = BTreeMap::new();
+    let mut pending_analysis_unit_completions = BTreeMap::new();
+    let analysis = execute_analysis_units(
+        store,
+        &execution_context,
+        schedule.work,
+        |store, _unit_id, output| {
+            let ingest_started = Instant::now();
+            if profiling {
+                protocol_event_count += output.events.len() as u64;
+                performance_phases.extend(worker_phase_performance(&output));
+            }
+            let adapter = output.adapter;
+            let failure_kind = output.failure_kind;
+            let security_violation = output.security_violation;
+            let result =
+                bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
+                    ingest_worker_output(
+                        store,
+                        &scan_id,
+                        output,
+                        Some(&mut global_upserts),
+                        Some(&mut file_coverage_ledgers),
+                        Some(&mut analysis_unit_file_paths),
+                        Some(&mut pending_analysis_unit_completions),
+                    )
+                });
+            ingest_ms += elapsed_ms(ingest_started);
+            match result {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    failures.push(ScanFailure::with_classification(
+                        adapter,
+                        format!("{error:#}"),
+                        failure_kind.unwrap_or(WorkerFailureKind::Other),
+                        security_violation,
+                    ));
+                    Ok(false)
                 }
-                None => ScanFailure::with_classification(
-                    adapter,
-                    detail,
-                    WorkerFailureKind::Other,
-                    security_violation,
-                ),
-            });
-        }
+            }
+        },
+        |item, validation| {
+            validate_work_inputs(
+                &execution_context,
+                item,
+                checkpoint_store_path.as_deref(),
+                &profile_plan.plan_id,
+                analysis_input_proof.as_deref(),
+                validation,
+            )
+        },
+    )
+    .await?;
+    let ingest_started = Instant::now();
+    let allow_semantic_join = failures.is_empty() && !cancellation.is_cancelled();
+    if let Err(error) = finalize_analysis_unit_completions(
+        store,
+        &mut pending_analysis_unit_completions,
+        &analysis_unit_file_paths,
+        &file_coverage_ledgers,
+        allow_semantic_join,
+    ) {
+        failures.push(ScanFailure::with_classification(
+            AdapterKind::Go,
+            format!("analysis-unit coverage finalization failed: {error:#}"),
+            WorkerFailureKind::Other,
+            false,
+        ));
+    }
+    ingest_ms += elapsed_ms(ingest_started);
+    let worker_ms = elapsed_ms(worker_started);
+    if cancellation.is_cancelled() {
+        let mut outcome = cancel_scan(store, &scan_id)?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
     }
     if profiling {
         performance_phases.push(ScanPhasePerformance {
+            phase: "core_scan_setup".into(),
+            duration_ms: setup_ms,
+            items: unit_count as u64,
+            bytes: 0,
+        });
+        performance_phases.push(ScanPhasePerformance {
+            phase: "core_worker_execution".into(),
+            duration_ms: worker_ms.saturating_sub(ingest_ms),
+            items: unit_count as u64,
+            bytes: 0,
+        });
+        let protocol_bytes = performance_phases
+            .iter()
+            .filter(|phase| phase.phase.ends_with("_protocol_write"))
+            .fold(0_u64, |total, phase| total.saturating_add(phase.bytes));
+        performance_phases.push(ScanPhasePerformance {
             phase: "core_protocol_ingest".into(),
-            duration_ms: elapsed_ms(ingest_started),
+            duration_ms: ingest_ms,
             items: protocol_event_count,
             bytes: protocol_bytes,
         });
@@ -807,7 +828,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             store.mark_coverage_incomplete(&scan_id, &failure.stable_identity())?;
         }
         let security_violation = failures.iter().any(|failure| failure.security_violation);
-        return finish_non_promoted_scan(
+        let mut outcome = finish_non_promoted_scan(
             store,
             &scan_id,
             if security_violation {
@@ -818,9 +839,26 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             Some(&summary),
             if security_violation { 4 } else { 3 },
             &cancellation,
-        );
+        )?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
     }
 
+    if let Some(proof) = analysis_input_proof.as_ref()
+        && !proof.matches_postflight(&root, checkpoint_store_path.as_deref())
+    {
+        let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
+    }
+    if let Some(expected) = analysis_plan.as_ref()
+        && !plan_analysis_units(&root, config, checkpoint_store_path.as_deref())
+            .is_ok_and(|observed| observed.input_digest == expected.input_digest)
+    {
+        let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
+    }
     let observed_profile_plan = match plan_repository_profiles(&root, config, None) {
         Ok(preview) if preview.plan.plan_id == profile_plan.plan_id => preview.plan,
         _ => {
@@ -839,14 +877,16 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             )?;
             store
                 .mark_coverage_incomplete(&scan_id, "profile-planning-input-changed-during-scan")?;
-            return finish_non_promoted_scan(
+            let mut outcome = finish_non_promoted_scan(
                 store,
                 &scan_id,
                 "partial",
                 Some("profile planning input changed during scan"),
                 3,
                 &cancellation,
-            );
+            )?;
+            outcome.analysis = Some(analysis);
+            return Ok(outcome);
         }
     };
     if let (Some(expected), Some(workers)) = (cache_plan.take(), cache_workers.as_deref()) {
@@ -866,12 +906,17 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             }
             _ => {
                 record_cache_rejection(store, &scan_id, "input-or-toolchain-changed-during-scan")?;
+                let mut outcome = finish_changed_input_scan(store, &scan_id, &cancellation)?;
+                outcome.analysis = Some(analysis);
+                return Ok(outcome);
             }
         }
     }
 
     if cancellation.is_cancelled() {
-        return cancel_scan(store, &scan_id);
+        let mut outcome = cancel_scan(store, &scan_id)?;
+        outcome.analysis = Some(analysis);
+        return Ok(outcome);
     }
 
     let promotion_started = Instant::now();
@@ -884,6 +929,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         &cancellation,
         promotion,
     )?;
+    outcome.analysis = Some(analysis);
     if profiling {
         performance_phases.push(ScanPhasePerformance {
             phase: "store_validation_promotion".into(),
@@ -900,6 +946,30 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         });
     }
     Ok(outcome)
+}
+
+fn finish_changed_input_scan(
+    store: &mut Store,
+    scan_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<ScanOutcome> {
+    add_core_diagnostic(
+        store,
+        scan_id,
+        "error",
+        "analysis-input-changed",
+        "analysis input changed while units were running; retry to produce a consistent snapshot",
+        "analysis-input-changed-during-scan",
+    )?;
+    store.mark_coverage_incomplete(scan_id, "analysis-input-changed-during-scan")?;
+    finish_non_promoted_scan(
+        store,
+        scan_id,
+        "partial",
+        Some("analysis input changed during scan"),
+        3,
+        cancellation,
+    )
 }
 
 fn scan_profile_enabled() -> bool {
@@ -942,6 +1012,7 @@ fn worker_phase_performance(output: &WorkerOutput) -> Vec<ScanPhasePerformance> 
         .collect()
 }
 
+#[cfg(test)]
 fn bind_worker_outputs_to_profile_plan(
     outputs: Vec<WorkerOutput>,
     plan: &DefaultProfileSelectionPlan,
@@ -1219,6 +1290,7 @@ fn complete_scan_with_mode(
         cache_events: store.cache_events_for_scan(scan_id)?,
         policy,
         performance: None,
+        analysis: None,
     };
 
     if promotion.mode == ScanPromotionMode::Deferred {
@@ -1334,12 +1406,14 @@ pub(crate) fn git_source_revision(root: &Path) -> Option<String> {
     Some(revision.to_ascii_lowercase())
 }
 
+#[cfg(test)]
 fn task_adapter(task_adapters: &mut BTreeMap<Id, AdapterKind>, task_id: Id) -> AdapterKind {
     task_adapters
         .remove(&task_id)
         .expect("every spawned worker task must have a registered adapter")
 }
 
+#[cfg(test)]
 fn classify_worker_task_failure(error: &JoinError) -> WorkerFailureKind {
     if error.is_panic() {
         WorkerFailureKind::TaskPanic
@@ -1364,11 +1438,236 @@ fn violates_strict_policy(coverage: &CoverageRecord, config: &Config) -> bool {
         || has_rust_hir_backend_failure(coverage)
 }
 
+#[derive(Clone, Debug)]
+struct FileCoverageLedger {
+    discovered_sites: u64,
+    emitted_sites: u64,
+    skipped_sites: u64,
+    skipped: bool,
+    reason: Option<String>,
+}
+
+impl FileCoverageLedger {
+    fn from_event(event: &Value) -> Result<(String, Self)> {
+        let path = event
+            .get("path")
+            .and_then(Value::as_str)
+            .context("file coverage event is missing path")?
+            .to_owned();
+        let ledger = Self {
+            discovered_sites: event
+                .get("discovered_sites")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            emitted_sites: event
+                .get("emitted_sites")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            skipped_sites: event
+                .get("skipped_sites")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            skipped: event
+                .get("skipped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            reason: event
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        };
+        Ok((path, ledger))
+    }
+
+    fn merge(&self, other: &Self) -> Result<Self> {
+        let reason = match (&self.reason, &other.reason) {
+            (Some(left), Some(right)) => Some(left.min(right).to_owned()),
+            (Some(reason), None) | (None, Some(reason)) => Some(reason.clone()),
+            (None, None) => None,
+        };
+        Ok(Self {
+            discovered_sites: self
+                .discovered_sites
+                .checked_add(other.discovered_sites)
+                .context("file coverage discovered-site ledger overflowed")?,
+            emitted_sites: self
+                .emitted_sites
+                .checked_add(other.emitted_sites)
+                .context("file coverage emitted-site ledger overflowed")?,
+            skipped_sites: self
+                .skipped_sites
+                .checked_add(other.skipped_sites)
+                .context("file coverage skipped-site ledger overflowed")?,
+            skipped: self.skipped || other.skipped,
+            reason,
+        })
+    }
+
+    fn write_to_event(&self, event: &mut Value) -> Result<()> {
+        let object = event
+            .as_object_mut()
+            .context("file coverage event is not an object")?;
+        object.insert("discovered_sites".into(), json!(self.discovered_sites));
+        object.insert("emitted_sites".into(), json!(self.emitted_sites));
+        object.insert("skipped_sites".into(), json!(self.skipped_sites));
+        object.insert("skipped".into(), json!(self.skipped));
+        match &self.reason {
+            Some(reason) => {
+                object.insert("reason".into(), Value::String(reason.clone()));
+            }
+            None => {
+                object.remove("reason");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn merge_file_coverage_events(
+    events: &mut [Value],
+    adapter: AdapterKind,
+    ledgers: &mut BTreeMap<(String, String), FileCoverageLedger>,
+) -> Result<()> {
+    merge_file_coverage_events_with_unit_paths(events, adapter, ledgers, None)
+}
+
+type AnalysisUnitFilePaths = BTreeMap<(AdapterKind, String), BTreeSet<String>>;
+type PendingAnalysisUnitCompletions = BTreeMap<(AdapterKind, String, String), Vec<Value>>;
+
+fn merge_file_coverage_events_with_unit_paths(
+    events: &mut [Value],
+    adapter: AdapterKind,
+    ledgers: &mut BTreeMap<(String, String), FileCoverageLedger>,
+    mut unit_file_paths: Option<&mut AnalysisUnitFilePaths>,
+) -> Result<()> {
+    let Some(stage) = analysis_unit_stage(events) else {
+        // Legacy whole-adapter workers are allowed to account for manifest and
+        // package records that do not map one-to-one to source file rows. Keep
+        // their established coverage semantics untouched.
+        return Ok(());
+    };
+    let adapter_name = adapter.name().to_owned();
+    let unit_identity = analysis_unit_identity(events);
+    let mut new_files = 0_u64;
+    let mut seen_in_stream = BTreeSet::new();
+    for event in events.iter_mut() {
+        if event.get("event").and_then(Value::as_str) != Some("file_completed") {
+            continue;
+        }
+        let (path, current) = FileCoverageLedger::from_event(event)?;
+        let key = (adapter_name.clone(), path);
+        let first_in_scan = !ledgers.contains_key(&key);
+        let first_in_stream = seen_in_stream.insert(key.clone());
+        if let Some((unit_id, _)) = &unit_identity
+            && let Some(unit_file_paths) = unit_file_paths.as_deref_mut()
+        {
+            unit_file_paths
+                .entry((adapter, unit_id.clone()))
+                .or_default()
+                .insert(key.1.clone());
+        }
+        if first_in_scan && first_in_stream {
+            new_files = new_files
+                .checked_add(1)
+                .context("file coverage file count overflowed")?;
+        }
+        let merged = ledgers
+            .get(&key)
+            .map(|previous| previous.merge(&current))
+            .transpose()?
+            .unwrap_or(current);
+        merged.write_to_event(event)?;
+        ledgers.insert(key, merged);
+    }
+
+    // Store's coverage event is additive across worker streams, while its
+    // per-file table is keyed by (scan_id, adapter, path). Count a path only
+    // when it first appears in this scan so syntax/semantic stages do not make
+    // the aggregate file count depend on which stage arrived last.
+    let (new_skipped, new_analyzed) = if stage == "semantic" {
+        let skipped = seen_in_stream
+            .iter()
+            .filter(|key| ledgers.get(*key).is_some_and(|ledger| ledger.skipped))
+            .count() as u64;
+        let analyzed = (seen_in_stream.len() as u64).saturating_sub(skipped);
+        (skipped, analyzed)
+    } else {
+        // The syntax stage establishes the unique file set. The semantic stage
+        // contributes the final analyzed/skipped status after it has had a
+        // chance to replace the syntax projection.
+        (0, 0)
+    };
+    for event in events.iter_mut() {
+        if event.get("event").and_then(Value::as_str) != Some("scan_completed") {
+            continue;
+        }
+        let coverage = event
+            .get_mut("coverage")
+            .and_then(Value::as_object_mut)
+            .context("scan completion event is missing coverage")?;
+        coverage.insert("files_discovered".into(), json!(new_files));
+        coverage.insert("files_skipped".into(), json!(new_skipped));
+        coverage.insert("files_analyzed".into(), json!(new_analyzed));
+    }
+    Ok(())
+}
+
+fn analysis_unit_stage(events: &[Value]) -> Option<String> {
+    events.iter().find_map(|event| {
+        if event.get("event").and_then(Value::as_str) != Some("profile_declared") {
+            return None;
+        }
+        let profile = event.get("profile")?.as_object()?;
+        let properties = profile.get("properties")?.as_object()?;
+        (properties
+            .get("analysis_unit_contract")
+            .and_then(Value::as_str)
+            == Some(ANALYSIS_UNIT_WORKER_CONTRACT_VERSION))
+        .then(|| {
+            properties
+                .get("analysis_stage")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
+        .flatten()
+    })
+}
+
+fn analysis_unit_identity(events: &[Value]) -> Option<(String, String)> {
+    events.iter().find_map(|event| {
+        if event.get("event").and_then(Value::as_str) != Some("profile_declared") {
+            return None;
+        }
+        let profile = event.get("profile")?.as_object()?;
+        let properties = profile.get("properties")?.as_object()?;
+        if properties
+            .get("analysis_unit_contract")
+            .and_then(Value::as_str)
+            != Some(ANALYSIS_UNIT_WORKER_CONTRACT_VERSION)
+        {
+            return None;
+        }
+        let unit_id = properties
+            .get("analysis_unit_id")
+            .and_then(Value::as_str)?
+            .to_owned();
+        let stage = properties
+            .get("analysis_stage")
+            .and_then(Value::as_str)?
+            .to_owned();
+        Some((unit_id, stage))
+    })
+}
+
 fn ingest_worker_output(
     store: &mut Store,
     scan_id: &str,
     output: WorkerOutput,
-    global_upserts: Option<&mut BTreeMap<(String, String), Vec<u8>>>,
+    global_upserts: Option<&mut BTreeMap<(String, String), [u8; 32]>>,
+    file_coverage_ledgers: Option<&mut BTreeMap<(String, String), FileCoverageLedger>>,
+    unit_file_paths: Option<&mut AnalysisUnitFilePaths>,
+    pending_analysis_unit_completions: Option<&mut PendingAnalysisUnitCompletions>,
 ) -> Result<()> {
     store.save_adapter_log(
         scan_id,
@@ -1394,7 +1693,8 @@ fn ingest_worker_output(
             output
                 .events
                 .iter()
-                .filter(|event| event.get("event").and_then(Value::as_str) == Some(*event_type)),
+                .filter(|event| event.get("event").and_then(Value::as_str) == Some(*event_type))
+                .cloned(),
         );
     }
     if worker_error.is_some() {
@@ -1421,6 +1721,34 @@ fn ingest_worker_output(
                 .is_none_or(|site_id| available_sites.contains(site_id))
         });
     }
+    if let Some(file_coverage_ledgers) = file_coverage_ledgers {
+        merge_file_coverage_events_with_unit_paths(
+            &mut ordered,
+            output.adapter,
+            file_coverage_ledgers,
+            unit_file_paths,
+        )?;
+    }
+    if let Some(pending_analysis_unit_completions) = pending_analysis_unit_completions
+        && let Some((unit_id, stage)) = analysis_unit_identity(&ordered)
+    {
+        let key = (output.adapter, unit_id, stage);
+        let mut retained = Vec::with_capacity(ordered.len());
+        for event in ordered {
+            if matches!(
+                event.get("event").and_then(Value::as_str),
+                Some("profile_completed") | Some("scan_completed")
+            ) {
+                pending_analysis_unit_completions
+                    .entry(key.clone())
+                    .or_default()
+                    .push(event);
+            } else {
+                retained.push(event);
+            }
+        }
+        ordered = retained;
+    }
     if let Some(global_upserts) = global_upserts {
         for event in &ordered {
             if let Some((kind, object)) = upsert_object(event) {
@@ -1429,7 +1757,7 @@ fn ingest_worker_output(
                     .and_then(Value::as_str)
                     .context("upsert object is missing id")?;
                 let key = (kind.to_owned(), id.to_owned());
-                let serialized = serde_json::to_vec(object)?;
+                let serialized: [u8; 32] = Sha256::digest(canonical_json(object).as_bytes()).into();
                 if let Some(previous) = global_upserts.get(&key) {
                     if previous != &serialized {
                         anyhow::bail!("conflicting cross-worker {kind} upsert for {id}");
@@ -1440,10 +1768,186 @@ fn ingest_worker_output(
             }
         }
     }
-    store.ingest_events(&ordered)?;
+    let ordered_refs = ordered.iter().collect::<Vec<_>>();
+    store.ingest_events(&ordered_refs)?;
     if let Some(error) = worker_error {
         anyhow::bail!("{} worker failed: {error}", output.adapter.name());
     }
+    Ok(())
+}
+
+fn finalize_analysis_unit_completions(
+    store: &mut Store,
+    pending: &mut PendingAnalysisUnitCompletions,
+    unit_file_paths: &AnalysisUnitFilePaths,
+    ledgers: &BTreeMap<(String, String), FileCoverageLedger>,
+    allow_semantic_join: bool,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let stage_keys = pending.keys().cloned().collect::<Vec<_>>();
+    let mut semantic_joins = BTreeSet::new();
+    for (adapter, unit_id, stage) in &stage_keys {
+        if stage != "syntax" || !allow_semantic_join {
+            continue;
+        }
+        let semantic_key = (*adapter, unit_id.clone(), "semantic".to_owned());
+        let Some(semantic_events) = pending.get(&semantic_key) else {
+            continue;
+        };
+        let Some(syntax_events) = pending.get(&(*adapter, unit_id.clone(), stage.clone())) else {
+            continue;
+        };
+        if has_completion_pair(syntax_events)
+            && has_completion_pair(semantic_events)
+            && reports_completeness(syntax_events, "syntax-complete")
+            && reports_completeness(semantic_events, "semantic-complete")
+        {
+            semantic_joins.insert((*adapter, unit_id.clone()));
+        }
+    }
+
+    for (adapter, unit_id, stage) in &stage_keys {
+        let owner = if pending.contains_key(&(*adapter, unit_id.clone(), "syntax".to_owned())) {
+            "syntax"
+        } else {
+            "semantic"
+        };
+        let is_owner = stage == owner;
+        let Some(events) = pending.get_mut(&(*adapter, unit_id.clone(), stage.clone())) else {
+            continue;
+        };
+        let counts = unit_file_counts(*adapter, unit_id, unit_file_paths, ledgers);
+        let joined = semantic_joins.contains(&(*adapter, unit_id.clone()));
+        for event in events {
+            match event.get("event").and_then(Value::as_str) {
+                Some("profile_completed") => {
+                    set_coverage_file_counts(event, counts)?;
+                    // A profile completion describes one stage's facts. Keep
+                    // syntax profiles syntax-only even when their scan-level
+                    // projection participates in a successful stage join.
+                    set_semantic_completeness(event, stage == "semantic" && joined)?;
+                }
+                Some("scan_completed") => {
+                    set_coverage_file_counts(event, if is_owner { counts } else { (0, 0, 0) })?;
+                    set_semantic_completeness(event, joined)?;
+                    if stage == "syntax" && joined {
+                        remove_coverage_reason(event, "go-packages-parser-fallback")?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Profile completion rows are independent upserts, while scan completion
+    // rows are merged by the Store. Ingest profiles first so the final scan
+    // completeness is the intersection of the joined stage projections.
+    let mut ordered = Vec::new();
+    for events in pending.values() {
+        ordered.extend(events.iter().filter(|event| {
+            event.get("event").and_then(Value::as_str) == Some("profile_completed")
+        }));
+    }
+    for events in pending.values() {
+        ordered.extend(
+            events.iter().filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("scan_completed")
+            }),
+        );
+    }
+    let refs = ordered.into_iter().collect::<Vec<_>>();
+    store.ingest_events(&refs)?;
+    pending.clear();
+    Ok(())
+}
+
+fn has_completion_pair(events: &[Value]) -> bool {
+    let profile_completed = events
+        .iter()
+        .any(|event| event.get("event").and_then(Value::as_str) == Some("profile_completed"));
+    let scan_completed = events
+        .iter()
+        .any(|event| event.get("event").and_then(Value::as_str) == Some("scan_completed"));
+    profile_completed && scan_completed
+}
+
+fn reports_completeness(events: &[Value], level: &str) -> bool {
+    events.iter().any(|event| {
+        event
+            .get("coverage")
+            .and_then(|coverage| coverage.get("completeness"))
+            .and_then(Value::as_array)
+            .is_some_and(|levels| levels.iter().any(|value| value.as_str() == Some(level)))
+    })
+}
+
+fn unit_file_counts(
+    adapter: AdapterKind,
+    unit_id: &str,
+    unit_file_paths: &AnalysisUnitFilePaths,
+    ledgers: &BTreeMap<(String, String), FileCoverageLedger>,
+) -> (u64, u64, u64) {
+    let paths = unit_file_paths
+        .get(&(adapter, unit_id.to_owned()))
+        .into_iter()
+        .flat_map(|paths| paths.iter());
+    let mut discovered = 0_u64;
+    let mut skipped = 0_u64;
+    for path in paths {
+        discovered = discovered.saturating_add(1);
+        if ledgers
+            .get(&(adapter.name().to_owned(), path.clone()))
+            .is_some_and(|ledger| ledger.skipped)
+        {
+            skipped = skipped.saturating_add(1);
+        }
+    }
+    let analyzed = discovered.saturating_sub(skipped);
+    (discovered, analyzed, skipped)
+}
+
+fn set_coverage_file_counts(event: &mut Value, counts: (u64, u64, u64)) -> Result<()> {
+    let coverage = event
+        .get_mut("coverage")
+        .and_then(Value::as_object_mut)
+        .context("analysis-unit completion event is missing coverage")?;
+    coverage.insert("files_discovered".into(), json!(counts.0));
+    coverage.insert("files_analyzed".into(), json!(counts.1));
+    coverage.insert("files_skipped".into(), json!(counts.2));
+    Ok(())
+}
+
+fn set_semantic_completeness(event: &mut Value, include: bool) -> Result<()> {
+    let coverage = event
+        .get_mut("coverage")
+        .and_then(Value::as_object_mut)
+        .context("analysis-unit completion event is missing coverage")?;
+    let completeness = coverage
+        .entry("completeness")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("analysis-unit completion completeness is not an array")?;
+    completeness.retain(|level| level.as_str() != Some("semantic-complete"));
+    if include {
+        completeness.push(Value::String("semantic-complete".to_owned()));
+    }
+    completeness.sort_by_key(Value::to_string);
+    completeness.dedup();
+    Ok(())
+}
+
+fn remove_coverage_reason(event: &mut Value, reason: &str) -> Result<()> {
+    let coverage = event
+        .get_mut("coverage")
+        .and_then(Value::as_object_mut)
+        .context("analysis-unit completion event is missing coverage")?;
+    let Some(reasons) = coverage.get_mut("reasons").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    reasons.retain(|value| value.as_str() != Some(reason));
     Ok(())
 }
 
@@ -1562,6 +2066,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         cache_events: store.cache_events_for_scan(scan_id)?,
         policy: None,
         performance: None,
+        analysis: None,
     })
 }
 
@@ -2509,13 +3014,316 @@ mod tests {
                 &mut store,
                 "partial-scan",
                 output,
-                Some(&mut BTreeMap::new())
+                Some(&mut BTreeMap::new()),
+                None,
+                None,
+                None,
             )
             .is_err()
         );
         let snapshot = store.load_snapshot("partial-scan")?;
         assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));
         assert!(snapshot.edges.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_unit_file_ledgers_merge_by_path_and_keep_legacy_coverage() -> Result<()> {
+        let unit_events = |stage: &str, discovered: u64, emitted: u64, skipped: u64| {
+            vec![
+                json!({
+                    "event": "profile_declared",
+                    "profile": {"properties": {
+                        "analysis_unit_contract": ANALYSIS_UNIT_WORKER_CONTRACT_VERSION,
+                        "analysis_stage": stage,
+                    }}
+                }),
+                json!({
+                    "event": "file_completed",
+                    "path": "main.go",
+                    "discovered_sites": discovered,
+                    "emitted_sites": emitted,
+                    "skipped_sites": skipped,
+                    "skipped": skipped > 0,
+                }),
+                json!({
+                    "event": "scan_completed",
+                    "coverage": {
+                        "files_discovered": 1,
+                        "files_analyzed": if skipped == 0 { 1 } else { 0 },
+                        "files_skipped": if skipped > 0 { 1 } else { 0 },
+                    }
+                }),
+            ]
+        };
+
+        let mut ledgers = BTreeMap::new();
+        let mut syntax = unit_events("syntax", 2, 2, 0);
+        merge_file_coverage_events(&mut syntax, AdapterKind::Go, &mut ledgers)?;
+        assert_eq!(syntax[2]["coverage"]["files_discovered"], 1);
+        assert_eq!(syntax[2]["coverage"]["files_analyzed"], 0);
+
+        let mut semantic = unit_events("semantic", 3, 3, 0);
+        merge_file_coverage_events(&mut semantic, AdapterKind::Go, &mut ledgers)?;
+        assert_eq!(semantic[2]["coverage"]["files_discovered"], 0);
+        assert_eq!(semantic[2]["coverage"]["files_analyzed"], 1);
+        assert_eq!(semantic[1]["discovered_sites"], 5);
+        assert_eq!(semantic[1]["emitted_sites"], 5);
+
+        let mut legacy = vec![
+            json!({
+                "event": "profile_declared",
+                "profile": {"properties": {}}
+            }),
+            json!({
+                "event": "file_completed",
+                "path": "main.go",
+                "discovered_sites": 2,
+                "emitted_sites": 1,
+                "skipped_sites": 1,
+                "skipped": true,
+                "reason": "legacy",
+            }),
+            json!({
+                "event": "scan_completed",
+                "coverage": {"files_discovered": 4, "files_analyzed": 2, "files_skipped": 2}
+            }),
+        ];
+        let before = legacy.clone();
+        merge_file_coverage_events(&mut legacy, AdapterKind::Go, &mut ledgers)?;
+        assert_eq!(legacy, before);
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_unit_stage_join_adds_semantic_completeness_only_after_both_stages() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let common = |event: &str, scan_id: &str, seq: u64| {
+            json!({
+                "event": event,
+                "protocol_version": "1.0",
+                "scan_id": scan_id,
+                "adapter": "go",
+                "adapter_version": "0.5.4",
+                "seq": seq,
+            })
+        };
+        let completion = |scan_id: &str, profile_id: &str, event: &str, completeness: Value| {
+            let mut value = common(
+                event,
+                scan_id,
+                if event == "profile_completed" { 1 } else { 2 },
+            );
+            if event == "profile_completed" {
+                value["profile_id"] = json!(profile_id);
+            }
+            let reasons = if profile_id == "profile:syntax" {
+                json!(["go-packages-parser-fallback"])
+            } else {
+                json!([])
+            };
+            value["coverage"] = json!({
+                "profiles": 1,
+                "files_discovered": 9,
+                "files_analyzed": 9,
+                "files_skipped": 0,
+                "dependency_sites": 0,
+                "resolved": 0,
+                "candidates": 0,
+                "external": 0,
+                "unresolved": 0,
+                "unsupported_syntax": 0,
+                "project_code_executed": false,
+                "completeness": completeness,
+                "reasons": reasons,
+            });
+            value
+        };
+
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("joined", root.path(), false)?;
+        let profile_declared = |scan_id: &str, id: &str, stage: &str, seq: u64| {
+            let mut value = common("profile_declared", scan_id, seq);
+            value["profile"] = json!({
+                "id": id,
+                "language": "go",
+                "features": [],
+                "environment": {},
+                "properties": {
+                    "analysis_unit_contract": ANALYSIS_UNIT_WORKER_CONTRACT_VERSION,
+                    "analysis_unit_id": "unit",
+                    "analysis_stage": stage,
+                },
+            });
+            value
+        };
+        let joined_syntax_profile = profile_declared("joined", "profile:syntax", "syntax", 1);
+        let joined_semantic_profile = profile_declared("joined", "profile:semantic", "semantic", 2);
+        store.ingest_events(&[&joined_syntax_profile, &joined_semantic_profile])?;
+        let mut file = common("file_completed", "joined", 3);
+        file["path"] = json!("main.go");
+        file["discovered_sites"] = json!(0);
+        file["emitted_sites"] = json!(0);
+        file["skipped_sites"] = json!(0);
+        file["skipped"] = json!(false);
+        store.ingest_event(&file)?;
+        let mut pending = PendingAnalysisUnitCompletions::new();
+        pending.insert(
+            (AdapterKind::Go, "unit".to_owned(), "syntax".to_owned()),
+            vec![
+                completion(
+                    "joined",
+                    "profile:syntax",
+                    "profile_completed",
+                    json!(["syntax-complete"]),
+                ),
+                completion(
+                    "joined",
+                    "profile:syntax",
+                    "scan_completed",
+                    json!(["syntax-complete"]),
+                ),
+            ],
+        );
+        pending.insert(
+            (AdapterKind::Go, "unit".to_owned(), "semantic".to_owned()),
+            vec![
+                completion(
+                    "joined",
+                    "profile:semantic",
+                    "profile_completed",
+                    json!(["syntax-complete", "semantic-complete"]),
+                ),
+                completion(
+                    "joined",
+                    "profile:semantic",
+                    "scan_completed",
+                    json!(["syntax-complete", "semantic-complete"]),
+                ),
+            ],
+        );
+        let mut unit_file_paths = AnalysisUnitFilePaths::new();
+        unit_file_paths
+            .entry((AdapterKind::Go, "unit".to_owned()))
+            .or_default()
+            .insert("main.go".to_owned());
+        let mut ledgers = BTreeMap::new();
+        ledgers.insert(
+            ("go".to_owned(), "main.go".to_owned()),
+            FileCoverageLedger {
+                discovered_sites: 0,
+                emitted_sites: 0,
+                skipped_sites: 0,
+                skipped: false,
+                reason: None,
+            },
+        );
+        assert_eq!(
+            unit_file_counts(AdapterKind::Go, "unit", &unit_file_paths, &ledgers),
+            (1, 1, 0)
+        );
+        finalize_analysis_unit_completions(
+            &mut store,
+            &mut pending,
+            &unit_file_paths,
+            &ledgers,
+            true,
+        )?;
+        let snapshot = store.load_snapshot("joined")?;
+        assert_eq!(snapshot.coverage.files_discovered, 1);
+        assert_eq!(snapshot.coverage.files_analyzed, 1);
+        assert!(
+            snapshot
+                .coverage
+                .completeness
+                .iter()
+                .any(|level| level == "semantic-complete")
+        );
+        let syntax_profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "profile:syntax")
+            .and_then(|profile| profile.coverage.as_ref())
+            .context("joined syntax profile coverage was not stored")?;
+        assert!(
+            !syntax_profile
+                .completeness
+                .iter()
+                .any(|level| level == "semantic-complete")
+        );
+        assert!(
+            syntax_profile
+                .reasons
+                .iter()
+                .any(|reason| reason == "go-packages-parser-fallback")
+        );
+        assert!(
+            !snapshot
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "go-packages-parser-fallback")
+        );
+
+        let mut failed_store = Store::open_in_memory()?;
+        failed_store.start_scan("failed", root.path(), false)?;
+        let mut failed_file = common("file_completed", "failed", 3);
+        failed_file["path"] = json!("main.go");
+        failed_file["discovered_sites"] = json!(0);
+        failed_file["emitted_sites"] = json!(0);
+        failed_file["skipped_sites"] = json!(0);
+        failed_file["skipped"] = json!(false);
+        failed_store.ingest_event(&failed_file)?;
+        let mut failed_pending = PendingAnalysisUnitCompletions::new();
+        failed_pending.insert(
+            (AdapterKind::Go, "unit".to_owned(), "syntax".to_owned()),
+            vec![
+                completion(
+                    "failed",
+                    "profile:syntax",
+                    "profile_completed",
+                    json!(["syntax-complete"]),
+                ),
+                completion(
+                    "failed",
+                    "profile:syntax",
+                    "scan_completed",
+                    json!(["syntax-complete"]),
+                ),
+            ],
+        );
+        failed_pending.insert(
+            (AdapterKind::Go, "unit".to_owned(), "semantic".to_owned()),
+            vec![
+                completion(
+                    "failed",
+                    "profile:semantic",
+                    "profile_completed",
+                    json!(["syntax-complete", "semantic-complete"]),
+                ),
+                completion(
+                    "failed",
+                    "profile:semantic",
+                    "scan_completed",
+                    json!(["syntax-complete", "semantic-complete"]),
+                ),
+            ],
+        );
+        finalize_analysis_unit_completions(
+            &mut failed_store,
+            &mut failed_pending,
+            &unit_file_paths,
+            &ledgers,
+            false,
+        )?;
+        let failed_snapshot = failed_store.load_snapshot("failed")?;
+        assert!(
+            !failed_snapshot
+                .coverage
+                .completeness
+                .iter()
+                .any(|level| level == "semantic-complete")
+        );
         Ok(())
     }
 

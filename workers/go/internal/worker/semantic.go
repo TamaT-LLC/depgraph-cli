@@ -134,8 +134,20 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	for _, context := range extractor.contexts {
 		context.emitCalls()
 	}
+	if s.analysisUnit != nil && s.analysisStage == AnalysisUnitStageSemantic {
+		s.reportProgress("go_ssa", "progress", 0)
+	}
 	extractor.emitSSACalls()
+	if s.analysisUnit != nil && s.analysisStage == AnalysisUnitStageSemantic {
+		s.reportProgress("go_ssa", "completed", len(extractor.contexts))
+	}
 	extractor.emitImplements()
+	// Typed loading includes the dependency closure so imported declarations can
+	// be resolved, but a unit stream owns only its requested source paths. Drop
+	// semantic relations whose evidence belongs to a closure module before the
+	// semantic ledger accounts for them; the closure's definition nodes remain
+	// available as cross-unit targets.
+	s.retainAnalysisUnitSemanticScope()
 
 	extractor.accountSemanticSites()
 	if s.goPackages.Status == "loaded" && extractor.complete {

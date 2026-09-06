@@ -1,3 +1,7 @@
+mod analysis_checkpoint;
+pub mod analysis_execution;
+pub mod analysis_plan;
+mod analysis_schedule;
 pub mod bounded_query;
 pub mod bounded_query_execute;
 pub mod bounded_query_plan;
@@ -58,6 +62,7 @@ mod service_repository;
 mod service_snapshot;
 mod service_store_write;
 pub mod worker;
+mod worker_progress;
 mod worker_web_semantic;
 
 use std::{
