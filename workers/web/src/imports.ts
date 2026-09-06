@@ -221,6 +221,24 @@ const GENERIC_TSX_CALL_PREDECESSORS = new Set([
   SyntaxKind.FunctionKeyword,
 ]);
 
+const GENERIC_TSX_PROPERTY_ACCESS = new Set([SyntaxKind.DotToken, SyntaxKind.QuestionDotToken]);
+const JSX_CONTEXTUAL_EXPRESSION_PREFIXES = new Set([SyntaxKind.AwaitKeyword, SyntaxKind.OfKeyword]);
+
+function followsPropertyAccess(previous: Token | undefined): boolean {
+  return previous !== undefined && GENERIC_TSX_PROPERTY_ACCESS.has(previous.kind);
+}
+
+function isContextualGenericCallee(kind: SyntaxKind): boolean {
+  return kind >= SyntaxKind.FirstContextualKeyword
+    && kind <= SyntaxKind.LastContextualKeyword
+    && !JSX_CONTEXTUAL_EXPRESSION_PREFIXES.has(kind);
+}
+
+function isGenericCalleeToken(previous: Token | undefined, propertyName: boolean): boolean {
+  if (previous === undefined) return false;
+  return propertyName || GENERIC_TSX_CALL_PREDECESSORS.has(previous.kind) || isContextualGenericCallee(previous.kind);
+}
+
 const GENERIC_ARROW_PARAMETER_DELIMITERS = new Set([SyntaxKind.CommaToken, SyntaxKind.EqualsToken]);
 const JSX_EXTENDS_ATTRIBUTE_FOLLOWERS = new Set([
   SyntaxKind.EqualsToken,
@@ -237,11 +255,11 @@ function startsGenericArrowParameters(scanner: ReturnType<typeof createScanner>,
   return next === SyntaxKind.ExtendsKeyword && !JSX_EXTENDS_ATTRIBUTE_FOLLOWERS.has(scanner.scan());
 }
 
-function looksLikeGenericTsxConstruct(source: string, offset: number, previous: Token | undefined): boolean {
+function looksLikeGenericTsxConstruct(source: string, offset: number, previous: Token | undefined, propertyName: boolean): boolean {
   // A callee or declaration name remains the predecessor across whitespace
   // and comments. JSX expressions instead follow tokens such as `=`,
   // `return`, `(`, or `=>`, so parenthesized JSX text stays in JSX mode.
-  if (previous !== undefined && GENERIC_TSX_CALL_PREDECESSORS.has(previous.kind)) return true;
+  if (isGenericCalleeToken(previous, propertyName)) return true;
   const scanner = createScanner(true, LanguageVariant.Standard, source, offset);
   scanner.scan(); // `<`
   let first = scanner.scan();
@@ -258,11 +276,11 @@ function looksLikeNamedJsxElementStart(source: string, offset: number, tagName: 
   return new RegExp(`</${escapedTagName}\\s*>`, "u").test(source.slice(tagEnd + 1));
 }
 
-function looksLikeJsxElementStart(source: string, offset: number, previous?: Token): boolean {
+function looksLikeJsxElementStart(source: string, offset: number, previous?: Token, propertyName = false): boolean {
   const match = source.slice(offset).match(/^<([$_\p{ID_Start}][$_\p{ID_Continue}.:-]*|>)/u);
   if (!match?.[1]) return false;
   if (match[1] === ">") return source.indexOf("</>", offset + 2) >= 0;
-  if (looksLikeGenericTsxConstruct(source, offset, previous)) return false;
+  if (looksLikeGenericTsxConstruct(source, offset, previous, propertyName)) return false;
   return looksLikeNamedJsxElementStart(source, offset, match[1]);
 }
 
@@ -280,6 +298,7 @@ function scanTokens(
   const scanner = createScanner(skipTrivia, languageVariant, source);
   const tokens: Token[] = [];
   let previousSignificantToken: Token | undefined;
+  let previousSignificantTokenIsPropertyName = false;
   let braceDepth = 0;
   const templateBases: number[] = [];
   let consumedOffset = 0;
@@ -338,6 +357,7 @@ function scanTokens(
       unterminated: scanner.isUnterminated(),
     };
     const previousToken = previousSignificantToken;
+    const previousTokenIsPropertyName = previousSignificantTokenIsPropertyName;
     tokens.push(token);
     if (
       kind !== SyntaxKind.WhitespaceTrivia
@@ -345,6 +365,7 @@ function scanTokens(
       && kind !== SyntaxKind.SingleLineCommentTrivia
       && kind !== SyntaxKind.MultiLineCommentTrivia
     ) {
+      previousSignificantTokenIsPropertyName = followsPropertyAccess(previousSignificantToken);
       previousSignificantToken = token;
     }
     consumedOffset = end;
@@ -353,7 +374,7 @@ function scanTokens(
       if (
         modeAtScan === "code"
         && kind === SyntaxKind.LessThanToken
-        && looksLikeJsxElementStart(source, start, previousToken)
+        && looksLikeJsxElementStart(source, start, previousToken, previousTokenIsPropertyName)
       ) {
         if (jsxExpressions.length > 0) jsxCodeReturnDepths.push(jsxDepth);
         jsxMode = "tag";

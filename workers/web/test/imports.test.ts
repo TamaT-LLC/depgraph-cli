@@ -1522,6 +1522,16 @@ test("TSX generic boundaries preserve dependencies before a later same-name JSX 
     "const map = <const T,>(value: T) => value;",
     "const specialized = read<T>;",
     "class Container<T> {}",
+    "api.get <T>({});",
+    "api.default<T>({});",
+    "api.return /* comment */ <T>({});",
+    "api?.return<T>({});",
+    "const type = read; type<T>({});",
+    "const get = read; get<T>({});",
+    "const async = read; async<T>({});",
+    "const control = await <T>(import('./ignored-text'))</T>;",
+    "for (const control of <T>(import('./ignored-text'))</T>) {}",
+
     "function render() { return <T>(import('./ignored-text'))</T>; }",
     "const control = <T extends>(import('./ignored-text'))</T>;",
     "const control = <T extends={true}>(import('./ignored-text'))</T>;",
@@ -1541,6 +1551,7 @@ declare const T: any;
 declare const $: any;
 type T = unknown;
 declare function read<U>(value: unknown): U;
+declare const api: { get: typeof read; default: typeof read; return: typeof read };
 ${construct}
 import beforeStatic from "./before-static";
 const beforeRequire = require("./before-require");
