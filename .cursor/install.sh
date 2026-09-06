@@ -3,7 +3,7 @@
 #
 # The full local gate (`cargo xtask test`) drives four toolchains that must
 # match the versions pinned by the repository and CI:
-#   - Rust    : rust-toolchain.toml (rustup installs it automatically)
+#   - Rust     : rust-toolchain.toml (rustup installs it automatically)
 #   - Go       : workers/go/go.mod (GOTOOLCHAIN=local, so the exact version must exist)
 #   - Node.js  : workers/web/package.json engines (>=24)
 #   - pnpm     : workers/web/package.json packageManager (Corepack activates it)
@@ -16,6 +16,12 @@ set -euo pipefail
 GO_VERSION="1.26.1"
 NODE_VERSION="24.18.0"
 
+# Official upstream SHA-256 checksums for the exact release archives below.
+# Downloads are verified against these before any root-owned extraction so a
+# corrupted or tampered artifact can never be unpacked or executed.
+GO_SHA256="031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a"
+NODE_SHA256="55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRIORITY_BIN="/usr/local/cargo/bin"
 
@@ -27,6 +33,16 @@ as_root() {
     "$@"
   else
     sudo "$@"
+  fi
+}
+
+verify_sha256() {
+  # Abort unless $1 hashes to the expected $2.
+  local file="$1" expected="$2" actual
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  if [ "$actual" != "$expected" ]; then
+    echo "integrity check failed for $file: expected $expected, got $actual" >&2
+    return 1
   fi
 }
 
@@ -46,6 +62,7 @@ ensure_go() {
     local tmp
     tmp="$(mktemp -d)"
     curl -fsSL -o "$tmp/go.tar.gz" "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+    verify_sha256 "$tmp/go.tar.gz" "$GO_SHA256"
     as_root rm -rf /usr/local/go
     as_root tar -C /usr/local -xzf "$tmp/go.tar.gz"
     as_root ln -sf /usr/local/go/bin/go /usr/local/bin/go
@@ -54,6 +71,9 @@ ensure_go() {
   fi
   link_priority go
   link_priority gofmt
+  # Drop any cached older `go`/`gofmt` location the shell resolved earlier so
+  # later commands use the freshly linked priority binary.
+  hash -r
 }
 
 ensure_node() {
@@ -64,20 +84,25 @@ ensure_node() {
     local tmp
     tmp="$(mktemp -d)"
     curl -fsSL -o "$tmp/node.tar.xz" "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"
+    verify_sha256 "$tmp/node.tar.xz" "$NODE_SHA256"
     as_root rm -rf /usr/local/nodejs
     as_root mkdir -p /usr/local/nodejs
     as_root tar -C /usr/local/nodejs --strip-components=1 -xf "$tmp/node.tar.xz"
     as_root ln -sf /usr/local/nodejs/bin/node /usr/local/bin/node
     as_root ln -sf /usr/local/nodejs/bin/npm /usr/local/bin/npm
     as_root ln -sf /usr/local/nodejs/bin/npx /usr/local/bin/npx
-    as_root /usr/local/nodejs/bin/corepack enable --install-directory /usr/local/bin
     rm -rf "$tmp"
   fi
+  # Always (re)generate the Corepack shims regardless of whether Node was
+  # already present: a correct Node runtime can still ship a missing or broken
+  # Corepack/pnpm shim, and the pnpm gate below depends on them.
+  as_root /usr/local/nodejs/bin/corepack enable --install-directory /usr/local/bin
   link_priority node
   link_priority npm
   link_priority npx
   link_priority corepack
   link_priority pnpm
+  hash -r
 }
 
 ensure_bubblewrap() {
@@ -102,9 +127,16 @@ ensure_go
 ensure_node
 ensure_bubblewrap
 
-# Corepack activates the pnpm version pinned in workers/web/package.json.
+# Corepack activates and pins the pnpm version from workers/web/package.json.
+# Failures must propagate: a wrong or missing pnpm breaks the frozen install.
 log "Activating pnpm via Corepack"
-(cd "$REPO_ROOT/workers/web" && corepack install) 2>/dev/null || true
+(cd "$REPO_ROOT/workers/web" && corepack install)
+ACTUAL_PNPM="$(cd "$REPO_ROOT/workers/web" && pnpm --version)"
+EXPECTED_PNPM="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"pnpm@\([^"]*\)".*/\1/p' "$REPO_ROOT/workers/web/package.json")"
+if [ -n "$EXPECTED_PNPM" ] && [ "$ACTUAL_PNPM" != "$EXPECTED_PNPM" ]; then
+  echo "pnpm version mismatch: expected $EXPECTED_PNPM, got $ACTUAL_PNPM" >&2
+  exit 1
+fi
 
 # Make the repo-pinned Rust the global default. rust-toolchain.toml already
 # overrides the channel inside the repo, but the supervised build feature stages
@@ -113,7 +145,10 @@ log "Activating pnpm via Corepack"
 RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
 if [ -n "$RUST_CHANNEL" ] && command -v rustup >/dev/null 2>&1; then
   log "Setting Rust ${RUST_CHANNEL} as the rustup default"
-  rustup toolchain install "$RUST_CHANNEL" --profile minimal --component clippy,rustfmt >/dev/null 2>&1 || true
+  # clippy and rustfmt are required by rust-toolchain.toml and cargo xtask test,
+  # so a failed install must abort rather than surface later as a missing
+  # component.
+  rustup toolchain install "$RUST_CHANNEL" --profile minimal --component clippy,rustfmt
   rustup default "$RUST_CHANNEL"
 fi
 
