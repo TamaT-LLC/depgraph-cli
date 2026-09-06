@@ -92,6 +92,17 @@ ensure_node
 log "Activating pnpm via Corepack"
 corepack prepare --activate 2>/dev/null || true
 
+# Make the repo-pinned Rust the global default. rust-toolchain.toml already
+# overrides the channel inside the repo, but the supervised build feature stages
+# fixtures into temporary directories outside the repo, where only the rustup
+# default applies. CI sets `rustup default 1.93.1` for the same reason.
+RUST_CHANNEL="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
+if [ -n "$RUST_CHANNEL" ] && command -v rustup >/dev/null 2>&1; then
+  log "Setting Rust ${RUST_CHANNEL} as the rustup default"
+  rustup toolchain install "$RUST_CHANNEL" --profile minimal --component clippy,rustfmt >/dev/null 2>&1 || true
+  rustup default "$RUST_CHANNEL"
+fi
+
 # Warm the Rust toolchain (rust-toolchain.toml pins the channel + components).
 log "Fetching Rust dependencies (locked)"
 (cd "$REPO_ROOT" && cargo fetch --locked)
