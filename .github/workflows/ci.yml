@@ -115,6 +115,35 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      # syscall.Openat is Linux-only; Darwin shares the openat(O_NOFOLLOW) walk
+      # via golang.org/x/sys/unix. Compile that GOOS here so a stub that
+      # returns reference-file-nofollow-unavailable cannot land unnoticed.
+      - name: Cross-compile the reference fingerprint walk for Darwin and Windows
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-darwin-arm64.test" ./internal/worker
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-windows-amd64.test" ./internal/worker
+
+  go-macos:
+    runs-on: macos-15
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    defaults:
+      run:
+        working-directory: workers/go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.1
+          cache-dependency-path: workers/go/go.sum
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      # Issue #479: Darwin must hash confined in-repo sources so package
+      # semantic checkpoints bind go_reference_fingerprint. The Linux go job
+      # still owns the full ./... race suite.
+      - run: go test -race ./internal/worker -run 'TestGoLoader|TestAnalysisSplit|TestOpenReferenceFile|TestComputeGoReferenceFingerprint|TestGoReferenceFileDigest|TestSupportedUnix' -count=1
 
   web:
     runs-on: ubuntu-24.04
