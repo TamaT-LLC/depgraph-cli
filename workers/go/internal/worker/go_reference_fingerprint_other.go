@@ -1,12 +1,13 @@
-//go:build !unix && !windows
+//go:build !unix
 
 package worker
 
 import "os"
 
-// openReferenceFile refuses to hash on platforms that cannot open the final
-// path component without following a symlink. Lstat-then-Open would race with
-// a swap of that component, so those targets fail closed instead.
+// openReferenceFile refuses to hash unless the final path component can be
+// opened without following a symlink or reparse point. CreateFile with
+// FILE_FLAG_OPEN_REPARSE_POINT still follows intermediate reparse points, so
+// Windows is fail-closed here along with every other non-Unix target.
 func openReferenceFile(string) (*os.File, error) {
 	return nil, errReferenceOpenNoFollowUnavailable
 }

@@ -97,3 +97,31 @@ func TestComputeGoReferenceFingerprintBindsFileContentWhenNoFollowAvailable(t *t
 		t.Fatalf("fingerprint = %+v", fp)
 	}
 }
+
+func TestComputeGoReferenceFingerprintOmitsDigestWhenAFileIsUnreadable(t *testing.T) {
+	root := canonicalTestRoot(t, t.TempDir())
+	depFile := filepath.Join(root, "dep.go")
+	writeTestFile(t, depFile, "package dep\n")
+	if err := os.Chmod(depFile, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(depFile, 0o644) })
+	module := Module{Dir: root, RelativeDir: ".", Path: "example.com/app"}
+	dep := &packages.Package{
+		ID: "example.com/app/dep", PkgPath: "example.com/app/dep", Name: "dep",
+		Module:  &packages.Module{Path: "example.com/app", Dir: root},
+		GoFiles: []string{depFile}, CompiledGoFiles: []string{depFile},
+	}
+	target := &packages.Package{
+		ID: "example.com/app", PkgPath: "example.com/app", Name: "app",
+		Module:  &packages.Module{Path: "example.com/app", Dir: root},
+		Imports: map[string]*packages.Package{"example.com/app/dep": dep},
+	}
+	fp := computeGoReferenceFingerprint(root, []Module{module}, []*packages.Package{target}, nil)
+	if fp.Fingerprint != "" {
+		t.Fatalf("incomplete fingerprint = %q reasons=%v", fp.Fingerprint, fp.Reasons)
+	}
+	if !slices.Contains(fp.Reasons, "reference-file-unreadable") && !slices.Contains(fp.Reasons, "reference-file-nofollow-unavailable") {
+		t.Fatalf("reasons = %v", fp.Reasons)
+	}
+}

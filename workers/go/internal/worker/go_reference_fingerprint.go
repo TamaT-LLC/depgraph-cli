@@ -59,7 +59,7 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 	}
 	visited := map[string]bool{}
 	reasons := map[string]bool{}
-	noFollowUnavailable := false
+	incomplete := false
 	var entries []goReferenceFingerprintPackage
 	queue := append([]*packages.Package(nil), targets...)
 	for len(queue) > 0 {
@@ -90,11 +90,12 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 					digest, err = hashReferenceFile(confined)
 					if errors.Is(err, errReferenceOpenNoFollowUnavailable) {
 						reasons["reference-file-nofollow-unavailable"] = true
-						noFollowUnavailable = true
+						incomplete = true
 						continue
 					}
 					if err != nil {
 						reasons["reference-file-unreadable"] = true
+						incomplete = true
 						continue
 					}
 					digests[confined] = digest
@@ -137,7 +138,7 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 	for _, entry := range entries {
 		fileCount += len(entry.Files)
 	}
-	if noFollowUnavailable {
+	if incomplete {
 		return goReferenceFingerprint{PackageCount: len(entries), Reasons: reasonList}
 	}
 	payload := map[string]any{"schema": goReferenceFingerprintSchema, "packages": entries, "reasons": reasonList}
