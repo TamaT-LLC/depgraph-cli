@@ -2974,6 +2974,128 @@ fn scan_plan_discovers_nested_units_without_starting_workers_or_writing_a_store(
 }
 
 #[test]
+fn scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("backend")).unwrap();
+    fs::create_dir_all(root.path().join("frontend/packages/ui")).unwrap();
+    fs::write(
+        root.path().join("backend/go.mod"),
+        "module example.test/backend\n\ngo 1.23\n",
+    )
+    .unwrap();
+    for index in 0..3 {
+        fs::write(
+            root.path().join(format!("backend/file{index}.go")),
+            format!("package backend\nconst Value{index} = {index}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.path().join("frontend/package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("frontend/packages/ui/package.json"),
+        r#"{"name":"@fixture/ui"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("frontend/packages/ui/index.ts"),
+        "export const version = 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join(".depgraph.toml"),
+        "schema_version = 1\n[scan]\nmax_unit_source_files = 2\n",
+    )
+    .unwrap();
+    let store = cache.path().join("graph.sqlite");
+    let run = |json: bool| {
+        let mut args = vec![
+            "--store",
+            store.to_str().unwrap(),
+            "scan",
+            root.path().to_str().unwrap(),
+            "--split-plan",
+        ];
+        if json {
+            args.push("--json");
+        }
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .env(
+                "DEPGRAPH_GO_WORKER",
+                cache.path().join("worker-must-not-run"),
+            )
+            .env(
+                "DEPGRAPH_WEB_WORKER",
+                cache.path().join("worker-must-not-run"),
+            )
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let first = run(true);
+    let second = run(true);
+    assert_eq!(first, second, "the split plan is deterministic");
+    let split: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(split["contract_version"], "depgraph-analysis-split-plan-v1");
+    let units = split["execution_units"].as_array().unwrap();
+    let backend_syntax = units
+        .iter()
+        .filter(|unit| unit["ownership"]["unit_root"] == "backend" && unit["stage"] == "syntax")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backend_syntax.len(),
+        2,
+        "three Go files with a two-file budget split the syntax stage into two input batches"
+    );
+    assert!(backend_syntax.iter().all(|unit| {
+        unit["split_kind"] == "input_batch"
+            && unit["loader"]["input_split"] == true
+            && unit["split_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("source_file_budget"))
+    }));
+    let backend_semantic = units
+        .iter()
+        .filter(|unit| unit["ownership"]["unit_root"] == "backend" && unit["stage"] == "semantic")
+        .collect::<Vec<_>>();
+    assert_eq!(backend_semantic.len(), 1);
+    assert_eq!(backend_semantic[0]["loader"]["kind"], "module");
+    assert_eq!(backend_semantic[0]["loader"]["input_split"], false);
+    assert!(units.iter().any(
+        |unit| unit["ownership"]["unit_root"] == "frontend/packages/ui" && unit["adapter"] == "web"
+    ));
+    assert!(split["parallelism"]["waves"].as_array().unwrap().len() >= 2);
+    for unit in units {
+        for path in unit["loader"]["paths"].as_array().unwrap() {
+            assert!(
+                !path.as_str().unwrap().starts_with('/'),
+                "loader paths stay repository-relative"
+            );
+        }
+    }
+
+    let text = String::from_utf8(run(false)).unwrap();
+    assert!(text.starts_with("analysis split plan: "));
+    assert!(text.contains("budget: 2 concurrent units, 2 files"));
+    assert!(text.contains("go backend syntax [1/2] input_batch: owns 2 files"));
+    assert!(text.contains("go backend semantic [1/1] whole:"));
+    assert!(text.contains("loader module reads 3 files"));
+    assert!(text.contains("reasons source_file_budget"));
+    assert!(text.contains("limitation: estimates_are_heuristic"));
+    assert!(!store.exists());
+    assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn empty_safe_scan_uses_external_store_and_reports_json() {
     let root = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
