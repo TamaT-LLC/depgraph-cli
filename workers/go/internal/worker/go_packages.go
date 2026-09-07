@@ -52,6 +52,18 @@ type goSSAInput struct {
 	ModulePath        string
 	ModuleRelativeDir string
 	Roots             []*packages.Package
+	// ProgramScope is declared by the loader that produced Roots. The zero
+	// value means whole-program (every dependency carries bodies); the
+	// package-scope hybrid loader declares package-with-declaration-deps so
+	// the SSA stage never attempts RTA/VTA over export-data dependencies.
+	ProgramScope goSSAProgramScope
+}
+
+func (input *goSSAInput) programScope() goSSAProgramScope {
+	if input == nil || input.ProgramScope == "" {
+		return goSSAProgramScopeWholeProgram
+	}
+	return input.ProgramScope
 }
 
 type goTypedFile struct {
@@ -89,6 +101,12 @@ type goPackagesInventory struct {
 	Fallback           bool
 	Diagnostics        []Diagnostic
 	DependencySnapshot goDependencySnapshot
+	// ReferencePackages are in-repo dependencies loaded without syntax by the
+	// package-scope loader. They are nil for module-whole-program loads, whose
+	// dependencies are ordinary typed packages.
+	ReferencePackages []goReferencePackage
+	// Loader carries the hybrid loader's evidence; nil for the historical path.
+	Loader *goLoaderReport
 }
 
 func loadGoPackagesInventory(root string, modules []Module, work WorkFile, tags []string) goPackagesInventory {
@@ -1437,6 +1455,9 @@ func inventoryProperties(inventory goPackagesInventory) map[string]string {
 	}
 	if len(inventory.DependencySnapshot.Reasons) > 0 {
 		properties["go_dependency_snapshot_reasons"] = strings.Join(inventory.DependencySnapshot.Reasons, ",")
+	}
+	for key, value := range goLoaderProperties(inventory.Loader) {
+		properties[key] = value
 	}
 	return properties
 }
