@@ -110,6 +110,7 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
                 .as_str()
                 .context("profile ID is missing")?;
             let features_present = event["profile"].get("features").is_some();
+            let go_profile = event["profile"]["language"] == "go";
             event["profile"]["id"] = json!(aliases[wire]);
             let properties = event["profile"]["properties"]
                 .as_object_mut()
@@ -128,6 +129,9 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
             // worker/checkpoint stream; canonical profiles carry configuration
             // and semantic status, while graph/coverage provide logical counts.
             properties.retain(|key, _| !execution_counter(key));
+            if go_profile {
+                properties.retain(|key, _| !go_execution_observation(key));
+            }
             if let Some(ledger) = properties.get_mut("web_framework_completeness_ledger") {
                 *ledger = json!(serde_json::to_string(
                     &parse_framework_ledger(ledger)?
@@ -227,6 +231,107 @@ pub(crate) fn merge_shared_web_node(previous: &Value, incoming: &mut Value) -> R
     incoming["properties"]["profile_id"] = json!(profiles.first());
     incoming["properties"]["profile_ids"] = json!(profiles);
     Ok(())
+}
+
+/// Per-execution observations of the Go package loader.  A logical Go unit
+/// may be typed and analysed as several package-bounded execution units whose
+/// loader metrics, reference fingerprints, and split identity differ by
+/// construction.  They remain on the raw worker/checkpoint stream and in the
+/// scan's execution ledger; the canonical profile carries the loader policy
+/// and the joined status only.
+fn go_execution_observation(key: &str) -> bool {
+    matches!(
+        key,
+        "analysis_execution_unit_id"
+            | "analysis_split_kind"
+            | "analysis_loader_input_split"
+            | "analysis_context_path_count"
+            | "go_loader_target_packages"
+            | "go_loader_target_files"
+            | "go_loader_target_bytes"
+            | "go_loader_body_files"
+            | "go_loader_declaration_only_files"
+            | "go_loader_loaded_packages"
+            | "go_loader_syntax_packages"
+            | "go_loader_parsed_files"
+            | "go_loader_syntax_equals_targets"
+            | "go_loader_reference_packages_export"
+            | "go_loader_reference_packages_source"
+            | "go_loader_reference_packages_in_repo"
+            | "go_loader_reference_packages_external"
+            | "go_loader_reference_packages_standard"
+            | "go_loader_child_processes"
+            | "go_loader_child_max_rss_bytes"
+            | "go_loader_peak_rss_bytes"
+            | "go_loader_listing_ms"
+            | "go_loader_export_compile_ms"
+            | "go_loader_type_check_ms"
+            | "go_loader_build_cache"
+            | "go_loader_build_cache_reused"
+            | "go_loader_build_cache_rejected"
+            | "go_loader_witness"
+            | "go_loader_scope_invalid"
+            | "go_reference_fingerprint"
+            | "go_reference_fingerprint_packages"
+            | "go_reference_fingerprint_files"
+            | "go_reference_fingerprint_reasons"
+            | "go_packages_packages"
+            | "go_packages_typed_packages"
+            | "go_packages_typed_files"
+            | "go_packages_active_files"
+            | "go_packages_compiled_files"
+            | "go_packages_embed_files"
+            | "go_packages_modules"
+            | "go_packages_test_variants"
+    )
+}
+
+/// Go observations joined across the execution units of one logical stage:
+/// the loader scope is `widened` when any unit had to widen it, and the typed
+/// stage is complete only when every unit completed it.
+const GO_OBSERVATIONS: [&str; 2] = ["analysis_loader_scope", "go_typed_stage_complete"];
+
+fn string_property<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn join_go_observations(left: &Value, right: &Value) -> Vec<(&'static str, Value)> {
+    let mut joined = Vec::new();
+    match (
+        string_property(left, GO_OBSERVATIONS[0]),
+        string_property(right, GO_OBSERVATIONS[0]),
+    ) {
+        (None, None) => {}
+        (Some(left), Some(right)) => {
+            let value = if left == "widened" || right == "widened" {
+                "widened"
+            } else {
+                left
+            };
+            joined.push((GO_OBSERVATIONS[0], json!(value)));
+        }
+        (Some(value), None) | (None, Some(value)) => {
+            joined.push((GO_OBSERVATIONS[0], json!(value)));
+        }
+    }
+    match (
+        string_property(left, GO_OBSERVATIONS[1]),
+        string_property(right, GO_OBSERVATIONS[1]),
+    ) {
+        (None, None) => {}
+        (Some(left), Some(right)) => {
+            let value = if left == "true" && right == "true" {
+                "true"
+            } else {
+                "false"
+            };
+            joined.push((GO_OBSERVATIONS[1], json!(value)));
+        }
+        (Some(value), None) | (None, Some(value)) => {
+            joined.push((GO_OBSERVATIONS[1], json!(value)));
+        }
+    }
+    joined
 }
 
 fn execution_counter(key: &str) -> bool {
@@ -439,6 +544,9 @@ pub(crate) fn merge_logical_profile(previous: &Value, incoming: &mut Value) -> R
         for key in TYPESCRIPT_PROJECT_OBSERVATIONS {
             properties.remove(key);
         }
+        for key in GO_OBSERVATIONS {
+            properties.remove(key);
+        }
         properties.remove(TYPESCRIPT_PROJECT_METADATA_AVAILABLE);
     }
     for key in ["features", "package_manager", "lockfile"] {
@@ -458,6 +566,18 @@ pub(crate) fn merge_logical_profile(previous: &Value, incoming: &mut Value) -> R
     }
     for key in ["features", "package_manager", "lockfile"] {
         adopt_known_profile_metadata(previous, incoming, key)?;
+    }
+    if previous["language"] == "go" {
+        // Go profiles carry no framework or TypeScript observations; once the
+        // axes agree, only the Go observations remain to be joined.
+        let joined = join_go_observations(&previous["properties"], &incoming["properties"]);
+        let properties = incoming["properties"]
+            .as_object_mut()
+            .context("profile properties are missing")?;
+        for (key, value) in joined {
+            properties.insert(key.into(), value);
+        }
+        return Ok(());
     }
     let left = &previous["properties"];
     let right = &incoming["properties"];
@@ -1267,6 +1387,69 @@ mod tests {
             "package-lock.json",
         );
         assert!(merge_logical_profile(&failed_after_empty, &mut changed).is_err());
+        Ok(())
+    }
+
+    /// Package-bounded Go execution units of one logical stage differ in
+    /// their loader metrics and split identity by construction.  Those are
+    /// stripped as per-execution observations, the loader scope and typed
+    /// completion are joined conservatively, and a real configuration change
+    /// between units is still rejected.
+    #[test]
+    fn go_package_execution_units_join_into_one_logical_profile() -> Result<()> {
+        let logical = stable_id_from_value(
+            "profile",
+            &json!({"kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":["go:base","unit","typed"]}),
+        );
+        let declared = |chunk: &str, scope: &str, complete: &str, targets: &str| {
+            json!({"event":"profile_declared","profile":{"id":format!("wire-{chunk}"),"language":"go","properties":{
+                "analysis_unit_contract":V2,"analysis_base_profile_id":"go:base","analysis_unit_id":"unit","analysis_stage":"typed",
+                "analysis_logical_profile_id":logical,"analysis_chunk_count":"2","analysis_chunk_index":"0","analysis_chunk_id":chunk,
+                "analysis_source_path_count":"1","analysis_context_path_count":"2",
+                "analysis_execution_unit_id":format!("analysis-execution-unit:{chunk}"),"analysis_split_kind":"output_batch",
+                "analysis_loader_kind":"package","analysis_loader_input_split":"true","analysis_loader_scope":scope,
+                "analysis_loader_mode":"package","go_loader_program_scope":"package-with-declaration-deps",
+                "go_loader_target_packages":targets,"go_loader_peak_rss_bytes":"1024","go_loader_type_check_ms":"3",
+                "go_reference_fingerprint":format!("sha256:{chunk}"),"go_typed_stage_complete":complete,
+            }}})
+        };
+        let mut first = vec![declared("a", "applied", "true", "1")];
+        let mut second = vec![declared("b", "widened", "true", "2")];
+        normalize_source_batch_profiles(&mut first)?;
+        normalize_source_batch_profiles(&mut second)?;
+        let first = first.remove(0)["profile"].clone();
+        let mut second = second.remove(0)["profile"].clone();
+        for key in [
+            "analysis_execution_unit_id",
+            "analysis_split_kind",
+            "go_loader_target_packages",
+            "go_loader_peak_rss_bytes",
+            "go_reference_fingerprint",
+        ] {
+            assert!(
+                first["properties"].get(key).is_none(),
+                "{key} survived normalization"
+            );
+        }
+        assert_eq!(first["properties"]["analysis_loader_mode"], "package");
+        assert_eq!(
+            first["properties"]["go_loader_program_scope"],
+            "package-with-declaration-deps"
+        );
+        merge_logical_profile(&first, &mut second)?;
+        assert_eq!(second["properties"]["analysis_loader_scope"], "widened");
+        assert_eq!(second["properties"]["go_typed_stage_complete"], "true");
+        let mut reverse = first.clone();
+        let mut widened = vec![declared("b", "widened", "false", "2")];
+        normalize_source_batch_profiles(&mut widened)?;
+        merge_logical_profile(&widened.remove(0)["profile"], &mut reverse)?;
+        assert_eq!(reverse["properties"]["analysis_loader_scope"], "widened");
+        assert_eq!(reverse["properties"]["go_typed_stage_complete"], "false");
+
+        let mut changed = vec![declared("c", "applied", "true", "1")];
+        changed[0]["profile"]["properties"]["analysis_loader_mode"] = json!("module");
+        normalize_source_batch_profiles(&mut changed)?;
+        assert!(merge_logical_profile(&first, &mut changed.remove(0)["profile"]).is_err());
         Ok(())
     }
 

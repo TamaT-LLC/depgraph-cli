@@ -79,6 +79,9 @@ const RUST_SYSROOT_ROOT_ENV: &str = "DEPGRAPH_RUST_SYSROOT_ROOT";
 const RUST_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const RUST_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
 const TYPESCRIPT_RELEASE_GATE_ENV: &str = "DEPGRAPH_TYPESCRIPT_RELEASE_GATE";
+/// Scan-scoped Go build cache the package loader shares across the
+/// package-scoped units of one scan (read by `depgraph-go-worker`).
+pub(crate) const GO_BUILD_CACHE_ENV: &str = "DEPGRAPH_GO_BUILD_CACHE";
 const TYPESCRIPT_RELEASE_GATE_PROPERTY: &str = "typescript_release_gate";
 const TYPESCRIPT_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const TYPESCRIPT_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
@@ -1464,6 +1467,9 @@ pub(crate) struct WorkerUnitInput {
     pub profiles: ProfileConfig,
     pub cancellation: CancellationToken,
     pub inventory: PathBuf,
+    /// Scan-scoped Go build cache shared by the package-scoped units of one
+    /// scan.  The Go worker admits it only when it lies outside the scan root.
+    pub build_cache: Option<PathBuf>,
 }
 
 pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput) -> WorkerOutput {
@@ -1477,6 +1483,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
         WorkerRequestFiles {
             delta_request: None,
             inventory: Some(&input.inventory),
+            build_cache: input.build_cache.as_deref(),
         },
         async move {
             input.cancellation.cancelled().await;
@@ -1605,6 +1612,7 @@ where
         WorkerRequestFiles {
             delta_request,
             inventory: None,
+            build_cache: None,
         },
         cancellation,
     )
@@ -1614,6 +1622,7 @@ where
 struct WorkerRequestFiles<'a> {
     delta_request: Option<&'a WorkerDeltaRequest>,
     inventory: Option<&'a Path>,
+    build_cache: Option<&'a Path>,
 }
 
 async fn execute_worker_inner_with_request<F>(
@@ -1731,6 +1740,11 @@ where
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
     {
         command.env("DEPGRAPH_SCAN_PROFILE", "1");
+    }
+    if spec.adapter == AdapterKind::Go
+        && let Some(build_cache) = input.build_cache
+    {
+        command.env(GO_BUILD_CACHE_ENV, build_cache);
     }
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
         let sysroot = spec.attested_rust_sysroot.as_ref().context(

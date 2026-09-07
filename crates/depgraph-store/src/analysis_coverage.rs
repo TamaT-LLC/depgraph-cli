@@ -226,15 +226,22 @@ fn join_v2(
         reasons.insert("analysis-unit-context-scope-mismatch".to_owned());
         return false;
     }
-    // Go's typed stage loads the complete module in one request. Its source
-    // scope is the owned module; go/packages reconstructs dependency types.
-    // The shared fingerprint still binds its external dependency inputs.
-    if (expect_typed && typed_rows.len() != 1)
-        || typed_rows.iter().any(|row| {
+    // Go's typed stage receives the owned module as its context and
+    // go/packages reconstructs dependency types; the shared fingerprint still
+    // binds its external dependency inputs.  A module-loader worker types the
+    // whole module in one request; a package-loader worker types it as
+    // package-bounded rows.  Either way the typed rows must partition exactly
+    // the owned sources: every row sees the same module context, no owned
+    // source is typed twice, and none is left untyped.
+    if expect_typed
+        && (typed_rows.iter().any(|row| {
             union_paths(std::slice::from_ref(row), |item| &item.context_paths) != owned_sources
-                || union_paths(std::slice::from_ref(row), |item| &item.source_paths)
-                    != owned_sources
-        })
+        }) || union_paths(&typed_rows, |row| &row.source_paths) != owned_sources
+            || typed_rows
+                .iter()
+                .map(|row| row.source_paths.len())
+                .sum::<usize>()
+                != owned_sources.len())
     {
         reasons.insert("analysis-unit-context-scope-mismatch".to_owned());
         return false;
@@ -813,6 +820,59 @@ mod tests {
             .context_paths
             .push("shared/dependency.go".into());
         assert!(!complete(&typed_wrong_scope));
+    }
+
+    /// A package-loader worker types the owned module as package-bounded
+    /// rows.  They join when they partition the owned sources exactly and
+    /// each sees the whole module as its context; an overlap, a gap, or a
+    /// row typed against a narrower context does not join.
+    #[test]
+    fn v2_typed_rows_may_partition_the_owned_sources() {
+        let syntax = unit_row("syntax", "syntax", 0, 1, &["app/a.go", "app/b.go"]);
+        let typed_a = unit_row("typed", "typed-a", 0, 2, &["app/a.go"]);
+        let typed_b = unit_row("typed", "typed-b", 1, 2, &["app/b.go"]);
+        let semantic_a = unit_row("semantic", "bodies-a", 0, 2, &["app/a.go"]);
+        let semantic_b = unit_row("semantic", "bodies-b", 1, 2, &["app/b.go"]);
+        let rows = vec![syntax, typed_a, typed_b, semantic_a, semantic_b];
+        let summary = |rows: &[AnalysisUnitLedgerRecord]| {
+            aggregate_analysis_coverage(
+                "depgraph-analysis-unit-v2",
+                Some("plan"),
+                Some("input"),
+                rows,
+            )
+        };
+        let joined = summary(&rows);
+        assert!(joined.complete, "{:?}", joined.reasons);
+        assert_eq!(joined.semantic_complete_units, 1);
+
+        let mut overlap = rows.clone();
+        overlap[1].source_paths.push("app/b.go".into());
+        let overlap = summary(&overlap);
+        assert!(!overlap.complete);
+        assert!(
+            overlap
+                .reasons
+                .contains(&"analysis-unit-context-scope-mismatch".into())
+        );
+
+        let mut gap = rows.clone();
+        gap[2].source_paths.clear();
+        assert!(!summary(&gap).complete);
+
+        let mut narrow_context = rows.clone();
+        narrow_context[1].context_paths = vec!["app/a.go".into()];
+        assert!(!summary(&narrow_context).complete);
+
+        let mut missing_row = rows;
+        missing_row.remove(2);
+        let missing_row = summary(&missing_row);
+        assert!(!missing_row.complete);
+        assert!(
+            missing_row
+                .reasons
+                .contains(&"analysis-unit-chunk-count-mismatch".into())
+        );
     }
 
     #[test]
