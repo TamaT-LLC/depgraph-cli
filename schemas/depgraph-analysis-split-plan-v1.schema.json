@@ -1,0 +1,854 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TamaT-LLC/depgraph-cli/schemas/depgraph-analysis-split-plan-v1.schema.json",
+  "title": "depgraph pre-split analysis plan v1",
+  "description": "Execution scope, loader scope, work estimates, split reasons, and the parallelism decision derived from a depgraph-analysis-plan-v1 discovery plan, the configured budgets, and the adapter's splittable boundaries before any worker starts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "plan_id",
+    "plan_input_digest",
+    "budget",
+    "budget_fingerprint",
+    "boundaries",
+    "refinements",
+    "unsplittable_refinements",
+    "split_plan_id",
+    "execution_units",
+    "parallelism",
+    "limitations"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "depgraph-analysis-split-plan-v1"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/planId"
+    },
+    "plan_input_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
+    "budget_fingerprint": {
+      "$ref": "#/$defs/budgetId"
+    },
+    "boundaries": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/adapterBoundary"
+      }
+    },
+    "refinements": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/refinement"
+      }
+    },
+    "unsplittable_refinements": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "$ref": "#/$defs/unsplittableRefinement"
+      }
+    },
+    "split_plan_id": {
+      "$ref": "#/$defs/splitPlanId"
+    },
+    "execution_units": {
+      "type": "array",
+      "maxItems": 1000000,
+      "items": {
+        "$ref": "#/$defs/executionUnit"
+      }
+    },
+    "parallelism": {
+      "$ref": "#/$defs/parallelism"
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "estimates_are_heuristic",
+          "source_sizes_incomplete",
+          "whole_context_loader_retained",
+          "refinement_unsplittable"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "adapter": {
+      "enum": [
+        "rust",
+        "go",
+        "web"
+      ]
+    },
+    "adapterBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter",
+        "id",
+        "stages"
+      ],
+      "properties": {
+        "adapter": {
+          "$ref": "#/$defs/adapter"
+        },
+        "id": {
+          "$ref": "#/$defs/text"
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/stageBoundary"
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_concurrent_units",
+        "max_unit_source_files",
+        "max_unit_source_bytes",
+        "max_context_source_bytes",
+        "worker_timeout_seconds",
+        "max_worker_memory_bytes",
+        "max_protocol_bytes",
+        "max_stderr_bytes",
+        "total_budget_seconds"
+      ],
+      "properties": {
+        "max_concurrent_units": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "max_unit_source_files": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_unit_source_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_context_source_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_worker_memory_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_protocol_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_stderr_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "total_budget_seconds": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "budgetId": {
+      "type": "string",
+      "pattern": "^analysis-split-budget:sha256:[0-9a-f]{64}$"
+    },
+    "contextGroupId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^analysis-context-group:sha256:[0-9a-f]{64}$"
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "owned_file_count",
+        "owned_source_bytes",
+        "loader_file_count",
+        "loader_source_bytes",
+        "reference_file_count",
+        "reference_source_bytes",
+        "dependency_closure_units",
+        "weight",
+        "over_budget"
+      ],
+      "properties": {
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "owned_file_count": {
+          "$ref": "#/$defs/count"
+        },
+        "owned_source_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "loader_file_count": {
+          "$ref": "#/$defs/count"
+        },
+        "loader_source_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "reference_file_count": {
+          "$ref": "#/$defs/count"
+        },
+        "reference_source_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "dependency_closure_units": {
+          "$ref": "#/$defs/count"
+        },
+        "weight": {
+          "$ref": "#/$defs/count"
+        },
+        "over_budget": {
+          "type": "boolean"
+        }
+      }
+    },
+    "executionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "worker_timeout_seconds",
+        "max_worker_memory_bytes",
+        "max_protocol_bytes",
+        "max_stderr_bytes",
+        "max_source_files",
+        "max_source_bytes",
+        "max_context_source_bytes"
+      ],
+      "properties": {
+        "worker_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_worker_memory_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_protocol_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_stderr_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_source_files": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_source_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_context_source_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "executionUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "unit_id",
+        "adapter",
+        "stage",
+        "batch_index",
+        "batch_count",
+        "split_kind",
+        "split_reasons",
+        "ownership",
+        "loader",
+        "estimate",
+        "budget",
+        "prerequisite_ids"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/executionUnitId"
+        },
+        "unit_id": {
+          "$ref": "#/$defs/unitId"
+        },
+        "adapter": {
+          "$ref": "#/$defs/adapter"
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "batch_index": {
+          "$ref": "#/$defs/count"
+        },
+        "batch_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "split_kind": {
+          "$ref": "#/$defs/splitKind"
+        },
+        "split_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/splitReason"
+          }
+        },
+        "ownership": {
+          "$ref": "#/$defs/ownership"
+        },
+        "loader": {
+          "$ref": "#/$defs/loader"
+        },
+        "estimate": {
+          "$ref": "#/$defs/estimate"
+        },
+        "budget": {
+          "$ref": "#/$defs/executionBudget"
+        },
+        "prerequisite_ids": {
+          "$ref": "#/$defs/executionUnitIdList"
+        }
+      }
+    },
+    "executionUnitId": {
+      "type": "string",
+      "pattern": "^analysis-execution-unit:sha256:[0-9a-f]{64}$"
+    },
+    "executionUnitIdList": {
+      "type": "array",
+      "maxItems": 1000000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/executionUnitId"
+      }
+    },
+    "granularity": {
+      "enum": [
+        "file",
+        "package"
+      ]
+    },
+    "loader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "paths",
+        "package_roots",
+        "reference_depth",
+        "reference_paths",
+        "reference_unit_ids",
+        "input_split"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/loaderKind"
+        },
+        "paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "package_roots": {
+          "$ref": "#/$defs/pathList"
+        },
+        "reference_depth": {
+          "$ref": "#/$defs/referenceDepth"
+        },
+        "reference_paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "reference_unit_ids": {
+          "$ref": "#/$defs/unitIdList"
+        },
+        "input_split": {
+          "type": "boolean"
+        }
+      }
+    },
+    "loaderBinding": {
+      "description": "Loader target a worker receives inside the `split` object of a depgraph-analysis-unit-v2 request. `paths` must cover the request's `source_paths`; `reference_paths` is disjoint from `paths`; `input_split` is true exactly when reference-only inputs exist.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "paths",
+        "package_roots",
+        "reference_depth",
+        "reference_paths",
+        "input_split"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/loaderKind"
+        },
+        "paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "package_roots": {
+          "$ref": "#/$defs/pathList"
+        },
+        "reference_depth": {
+          "$ref": "#/$defs/referenceDepth"
+        },
+        "reference_paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "input_split": {
+          "type": "boolean"
+        }
+      }
+    },
+    "loaderKind": {
+      "enum": [
+        "files",
+        "package",
+        "module",
+        "project",
+        "repository"
+      ]
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "unit_root",
+        "context_group_id",
+        "context_group_unit_ids",
+        "cyclic_group",
+        "source_paths",
+        "package_roots"
+      ],
+      "properties": {
+        "unit_id": {
+          "$ref": "#/$defs/unitId"
+        },
+        "unit_root": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "context_group_id": {
+          "$ref": "#/$defs/contextGroupId"
+        },
+        "context_group_unit_ids": {
+          "$ref": "#/$defs/unitIdList"
+        },
+        "cyclic_group": {
+          "type": "boolean"
+        },
+        "source_paths": {
+          "$ref": "#/$defs/pathList"
+        },
+        "package_roots": {
+          "$ref": "#/$defs/pathList"
+        }
+      }
+    },
+    "parallelism": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_concurrent_units",
+        "effective_concurrency",
+        "admitted_memory_bytes",
+        "waves"
+      ],
+      "properties": {
+        "max_concurrent_units": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "effective_concurrency": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "admitted_memory_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "waves": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "$ref": "#/$defs/wave"
+          }
+        }
+      }
+    },
+    "pathList": {
+      "description": "Sorted, unique repository-relative paths. Bounded by the repository inventory limit of 1,000,000 files, which the planner enforces on every loader, reference, and package-root list.",
+      "type": "array",
+      "maxItems": 1000000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/repositoryPath"
+      }
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^analysis-plan:sha256:[0-9a-f]{64}$"
+    },
+    "referenceDepth": {
+      "enum": [
+        "paths_only",
+        "declarations",
+        "bodies"
+      ]
+    },
+    "refinement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_unit_id",
+        "trigger"
+      ],
+      "properties": {
+        "execution_unit_id": {
+          "$ref": "#/$defs/executionUnitId"
+        },
+        "trigger": {
+          "$ref": "#/$defs/resplitTrigger"
+        }
+      }
+    },
+    "repositoryPath": {
+      "anyOf": [
+        {
+          "const": "."
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\\\\\u0000-\\u001f\\u007f]+(?:/[^/\\\\\\u0000-\\u001f\\u007f]+)*$",
+          "not": {
+            "pattern": "(^|/)\\.\\.?(/|$)"
+          }
+        }
+      ]
+    },
+    "resplitOutcome": {
+      "enum": [
+        "split",
+        "unsplittable"
+      ]
+    },
+    "resplitPlan": {
+      "description": "Result of re-planning one execution unit whose estimate was exceeded. The discovery plan_id and every logical unit input fingerprint are unchanged; only split_plan_id and the execution units derived from the refined unit change. An unsplittable outcome keeps every execution unit and retains every saved result, while the returned plan still records the attempted refinement in its history (refinements, unsplittable_refinements, the refinement_unsplittable limitation, and therefore split_plan_id).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "plan_id",
+        "previous_split_plan_id",
+        "split_plan_id",
+        "refinement",
+        "outcome",
+        "unsplittable_reason",
+        "superseded_execution_unit_ids",
+        "replacement_execution_unit_ids",
+        "retained_execution_unit_ids",
+        "saved_results",
+        "plan"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "depgraph-analysis-split-plan-v1"
+        },
+        "plan_id": {
+          "$ref": "#/$defs/planId"
+        },
+        "previous_split_plan_id": {
+          "$ref": "#/$defs/splitPlanId"
+        },
+        "split_plan_id": {
+          "$ref": "#/$defs/splitPlanId"
+        },
+        "refinement": {
+          "$ref": "#/$defs/refinement"
+        },
+        "outcome": {
+          "$ref": "#/$defs/resplitOutcome"
+        },
+        "unsplittable_reason": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/unsplittableReason"
+            }
+          ]
+        },
+        "superseded_execution_unit_ids": {
+          "$ref": "#/$defs/executionUnitIdList"
+        },
+        "replacement_execution_unit_ids": {
+          "$ref": "#/$defs/executionUnitIdList"
+        },
+        "retained_execution_unit_ids": {
+          "$ref": "#/$defs/executionUnitIdList"
+        },
+        "saved_results": {
+          "type": "array",
+          "maxItems": 2000000,
+          "items": {
+            "$ref": "#/$defs/savedResult"
+          }
+        },
+        "plan": {
+          "$ref": "#"
+        }
+      }
+    },
+    "resplitTrigger": {
+      "enum": [
+        "worker_timeout",
+        "worker_memory",
+        "output_limit",
+        "estimate_exceeded"
+      ]
+    },
+    "savedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_unit_id",
+        "disposition"
+      ],
+      "properties": {
+        "execution_unit_id": {
+          "$ref": "#/$defs/executionUnitId"
+        },
+        "disposition": {
+          "$ref": "#/$defs/savedResultDisposition"
+        }
+      }
+    },
+    "savedResultDisposition": {
+      "description": "retained: identity, inputs, and checkpoint key are unchanged and saved results stay valid; superseded: the execution unit no longer exists and its saved results are discarded; replacement: a new execution unit without saved results.",
+      "enum": [
+        "retained",
+        "superseded",
+        "replacement"
+      ]
+    },
+    "splitBinding": {
+      "description": "The `split` object attached to a depgraph-analysis-unit-v2 worker request once the worker advertised analysis-loader-scope-v1. Estimates and budgets stay in the core; the worker echoes the identity and reports whether it applied or widened the loader scope.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "split_plan_id",
+        "execution_unit_id",
+        "split_kind",
+        "loader"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "depgraph-analysis-split-plan-v1"
+        },
+        "split_plan_id": {
+          "$ref": "#/$defs/splitPlanId"
+        },
+        "execution_unit_id": {
+          "$ref": "#/$defs/executionUnitId"
+        },
+        "split_kind": {
+          "$ref": "#/$defs/splitKind"
+        },
+        "loader": {
+          "$ref": "#/$defs/loaderBinding"
+        }
+      }
+    },
+    "splitKind": {
+      "enum": [
+        "whole",
+        "output_batch",
+        "input_batch",
+        "staged_bodies"
+      ]
+    },
+    "splitPlanId": {
+      "type": "string",
+      "pattern": "^analysis-split-plan:sha256:[0-9a-f]{64}$"
+    },
+    "splitReason": {
+      "enum": [
+        "unit_fits_budget",
+        "source_file_budget",
+        "source_byte_budget",
+        "context_byte_budget",
+        "adapter_boundary_unsplittable",
+        "cycle_group_retained",
+        "staged_after_declarations",
+        "refined"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "syntax",
+        "typed",
+        "semantic"
+      ]
+    },
+    "stageBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "loader_kind",
+        "reference_depth",
+        "granularity",
+        "output_splittable",
+        "input_splittable",
+        "staged_bodies"
+      ],
+      "properties": {
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "loader_kind": {
+          "$ref": "#/$defs/loaderKind"
+        },
+        "reference_depth": {
+          "$ref": "#/$defs/referenceDepth"
+        },
+        "granularity": {
+          "$ref": "#/$defs/granularity"
+        },
+        "output_splittable": {
+          "type": "boolean"
+        },
+        "input_splittable": {
+          "type": "boolean"
+        },
+        "staged_bodies": {
+          "type": "boolean"
+        }
+      }
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "unitId": {
+      "type": "string",
+      "pattern": "^analysis-unit:sha256:[0-9a-f]{64}$"
+    },
+    "unitIdList": {
+      "type": "array",
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/unitId"
+      }
+    },
+    "unsplittableReason": {
+      "description": "Why a refinement left its target unchanged: the target owns a single granule of its stage, the adapter stage is neither input nor output splittable, or the target is not an execution unit of the plan built from the current input (a stale ID or a history carried across boundaries).",
+      "enum": [
+        "single_granule",
+        "adapter_boundary",
+        "unknown_execution_unit"
+      ]
+    },
+    "unsplittableRefinement": {
+      "description": "A refinement of the plan's history that could not be applied. Every refinement is either applied or listed here, so the plan explains its own refinement list.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_unit_id",
+        "trigger",
+        "reason"
+      ],
+      "properties": {
+        "execution_unit_id": {
+          "$ref": "#/$defs/executionUnitId"
+        },
+        "trigger": {
+          "$ref": "#/$defs/resplitTrigger"
+        },
+        "reason": {
+          "$ref": "#/$defs/unsplittableReason"
+        }
+      }
+    },
+    "wave": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "execution_unit_ids",
+        "estimated_weight"
+      ],
+      "properties": {
+        "index": {
+          "$ref": "#/$defs/count"
+        },
+        "execution_unit_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/executionUnitId"
+          }
+        },
+        "estimated_weight": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    }
+  }
+}

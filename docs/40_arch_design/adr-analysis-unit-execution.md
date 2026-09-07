@@ -30,8 +30,9 @@ Requests bind a logical unit, stage, chunk ID/index/count, context fingerprint, 
 | `context_paths` | All source files owned by the logical module or project |
 | `source_paths` | Source files whose records this request may emit |
 | `auxiliary_paths` | Metadata or assembly records emitted by this request only |
+| `split` (optional) | Loader target and execution-unit identity from the [pre-split plan](adr-presplit-analysis-planning.md); sent only to workers advertising `analysis-loader-scope-v1` |
 
-The scheduler emits syntax work before semantic work.
+The scheduler derives every batch from the pre-split plan before any worker starts and emits syntax work before semantic work.
 Go workers also advertising `analysis-unit-typed-v1` receive a separate `typed` stage between them.
 Each later stage waits until all preceding chunks of its own unit have been saved and ingested; other units can proceed concurrently.
 Web stages use source batches; TypeScript retains the project context while AST transfer and dependency extraction select the current batch.
@@ -71,6 +72,9 @@ worker_timeout_seconds = 300
 max_worker_memory_bytes = 2147483648
 max_concurrent_units = 2
 max_unit_source_files = 128
+# Pre-split byte budgets (see adr-presplit-analysis-planning.md).
+max_unit_source_bytes = 8388608
+max_context_source_bytes = 67108864
 # Omission means no aggregate deadline.
 # total_budget_seconds = 7200
 ```

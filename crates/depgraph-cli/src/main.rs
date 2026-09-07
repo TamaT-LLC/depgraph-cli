@@ -152,6 +152,11 @@ enum Commands {
         /// Discover analysis units and dependencies without launching workers or writing a Store.
         #[arg(long, conflicts_with_all = ["strict", "no_cache"])]
         plan: bool,
+        /// Explain how the shipped worker boundaries would execute the discovered units
+        /// (ownership vs loader scope, estimates, split reasons, parallelism) without
+        /// launching workers or writing a Store.
+        #[arg(long, conflicts_with_all = ["strict", "no_cache", "plan"])]
+        split_plan: bool,
     },
     /// Preview the bounded default or explicit profile set without launching workers.
     Profiles {
@@ -1177,16 +1182,27 @@ async fn run(cli: Cli) -> Result<u8> {
             json,
             no_cache,
             plan,
+            split_plan,
         } => {
             let root = canonical_directory(path)?;
             let store_path = store_path(cli.store, &root)?;
-            if plan {
+            if plan || split_plan {
                 let config = depgraph_core::Config::load(&root)?;
                 let plan = depgraph_core::analysis_plan::plan_analysis_units(
                     &root,
                     &config,
                     Some(&store_path),
                 )?;
+                if split_plan {
+                    let split =
+                        depgraph_core::analysis_split::plan_default_split(&root, &config, &plan)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&split)?);
+                    } else {
+                        print_split_plan(&split);
+                    }
+                    return Ok(0);
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
@@ -2436,6 +2452,72 @@ fn requires_build_attempt(
     !matches!(outcome, BuildOutcomeKind::Completed)
         || has_compiler_mir_ledger
         || (!has_compiler_invocation_ledger && !has_cargo_unit_graph)
+}
+
+/// Explain every execution unit of a split plan: what it owns, what its
+/// loader reads, what it only references, how much work that is, and why it
+/// was (or was not) split.
+fn print_split_plan(split: &depgraph_core::analysis_split::AnalysisSplitPlan) {
+    println!(
+        "analysis split plan: {} (discovery plan {})",
+        split.split_plan_id, split.plan_id
+    );
+    println!(
+        "budget: {} concurrent units, {} files / {} bytes per unit, {} context bytes, {}s worker timeout",
+        split.budget.max_concurrent_units,
+        split.budget.max_unit_source_files,
+        split.budget.max_unit_source_bytes,
+        split.budget.max_context_source_bytes,
+        split.budget.worker_timeout_seconds,
+    );
+    println!(
+        "parallelism: {} effective of {} allowed, {} waves, {} bytes admitted worker memory",
+        split.parallelism.effective_concurrency,
+        split.parallelism.max_concurrent_units,
+        split.parallelism.waves.len(),
+        split.parallelism.admitted_memory_bytes,
+    );
+    for unit in &split.execution_units {
+        let reasons = unit
+            .split_reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{} {} {} [{}/{}] {}: owns {} files ({} bytes); loader {} reads {} files ({} bytes){}; references {} files ({} bytes) at {} across {} units; weight {}{}; reasons {}",
+            unit.adapter.as_str(),
+            unit.ownership.unit_root,
+            unit.stage.as_str(),
+            unit.batch_index + 1,
+            unit.batch_count,
+            unit.split_kind.as_str(),
+            unit.estimate.owned_file_count,
+            unit.estimate.owned_source_bytes,
+            unit.loader.kind.as_str(),
+            unit.estimate.loader_file_count,
+            unit.estimate.loader_source_bytes,
+            if unit.loader.input_split {
+                " (input split)"
+            } else {
+                ""
+            },
+            unit.estimate.reference_file_count,
+            unit.estimate.reference_source_bytes,
+            unit.loader.reference_depth.as_str(),
+            unit.estimate.dependency_closure_units,
+            unit.estimate.weight,
+            if unit.estimate.over_budget {
+                " (over budget)"
+            } else {
+                ""
+            },
+            reasons,
+        );
+    }
+    for limitation in &split.limitations {
+        println!("limitation: {}", limitation.as_str());
+    }
 }
 
 fn canonical_directory(path: PathBuf) -> Result<PathBuf> {

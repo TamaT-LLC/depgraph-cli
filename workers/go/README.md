@@ -73,6 +73,20 @@ An incomplete load or extraction emits the same stream with the property set
 to `"false"` and never claims `semantic-complete`. Legacy v1 requests retain
 the existing syntax/semantic behavior.
 
+A request may carry the optional `split` object of the
+`depgraph-analysis-split-plan-v1` contract (see
+`docs/40_arch_design/adr-presplit-analysis-planning.md`). The worker validates
+it strictly: `loader.paths` must cover `source_paths`, `reference_paths` must be
+disjoint from loaded paths, and `input_split` must agree with the presence of
+reference-only inputs. It echoes `analysis_split_plan_id`,
+`analysis_execution_unit_id`, `analysis_split_kind`, `analysis_loader_kind`,
+`analysis_loader_input_split`, and `analysis_loader_scope` (`applied` when the
+worker loaded exactly the requested loader scope, `widened` when it loaded the
+complete module for a narrower `package` request). The worker does not yet
+advertise `analysis-loader-scope-v1`, so the core does not send `split` to it;
+a bounded `packages.Load` scope will advertise that capability together with
+`analysis-go-package-loader-v1`.
+
 Progress is reported at parsed-file, completed-package, and completed-SSA-input
 boundaries. A single `go/packages` load and a single SSA program build are
 atomic operations in the Go APIs, so no heartbeat is fabricated while either
