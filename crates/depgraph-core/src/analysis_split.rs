@@ -1547,25 +1547,31 @@ fn apply_refinements(
     unsplittable: &mut Vec<AnalysisUnsplittableRefinement>,
     matched: &mut BTreeSet<usize>,
 ) {
+    // An execution unit ID depends on the batch's ownership and loader scope
+    // only, never on its position or the batch count, so the IDs are computed
+    // once and only the two halves of a refined batch are recomputed.
+    let id_of = |batch: &Batch| {
+        build_execution_unit(
+            unit,
+            boundary,
+            &input.budget,
+            context,
+            group,
+            Batch {
+                granules: batch.granules.clone(),
+                reasons: batch.reasons.clone(),
+            },
+            0,
+            1,
+        )
+        .id
+    };
+    let mut ids = batches.iter().map(id_of).collect::<Vec<_>>();
     for (refinement_index, refinement) in input.refinements.iter().enumerate() {
-        let count = batches.len() as u64;
-        let position = batches.iter().enumerate().position(|(index, batch)| {
-            build_execution_unit(
-                unit,
-                boundary,
-                &input.budget,
-                context,
-                group,
-                Batch {
-                    granules: batch.granules.clone(),
-                    reasons: batch.reasons.clone(),
-                },
-                index as u64,
-                count,
-            )
-            .id == refinement.execution_unit_id
-        });
-        let Some(position) = position else {
+        let Some(position) = ids
+            .iter()
+            .position(|id| *id == refinement.execution_unit_id)
+        else {
             continue;
         };
         matched.insert(refinement_index);
@@ -1604,21 +1610,20 @@ fn apply_refinements(
         let mut reasons = batch.reasons.clone();
         reasons.insert(AnalysisSplitReason::Refined);
         let removed = batches.remove(position);
+        ids.remove(position);
         let (head, tail) = removed.granules.split_at(split_at);
-        batches.insert(
-            position,
-            Batch {
-                granules: tail.to_vec(),
-                reasons: reasons.clone(),
-            },
-        );
-        batches.insert(
-            position,
-            Batch {
-                granules: head.to_vec(),
-                reasons,
-            },
-        );
+        let tail = Batch {
+            granules: tail.to_vec(),
+            reasons: reasons.clone(),
+        };
+        let head = Batch {
+            granules: head.to_vec(),
+            reasons,
+        };
+        ids.insert(position, id_of(&tail));
+        batches.insert(position, tail);
+        ids.insert(position, id_of(&head));
+        batches.insert(position, head);
     }
 }
 
