@@ -182,9 +182,11 @@ list` children.
 - Same-path modules stay distinct by directory; local `replace` resolves to
   the in-repo directory; test variants keep `ForTest`. Type objects never
   cross loads.
-- `analysis_loader_mode` and `go_call_graph_program_scope` are not profile
-  axes. Package chunks of one module join with a whole-module unit of the
-  same module.
+- `analysis_loader_mode` and `go_call_graph_program_scope` are not coverage
+  profile axes. Package chunks of one module share a logical profile with a
+  whole-module unit of the same module. Canonical profile merge still
+  requires those keys to match; a re-split replaces the promoted unit rather
+  than folding mixed loader modes.
 
 ### Public evidence gate
 

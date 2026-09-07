@@ -1457,7 +1457,8 @@ mod tests {
                 "analysis_split_contract":"depgraph-analysis-split-plan-v1","analysis_split_plan_id":format!("analysis-split-plan:{chunk}"),
                 "analysis_execution_unit_id":format!("analysis-execution-unit:{chunk}"),"analysis_split_kind":"output_batch",
                 "analysis_loader_kind":"package","analysis_loader_input_split":"true","analysis_loader_scope":scope,
-                "analysis_loader_mode":"package","go_loader_program_scope":"package-with-declaration-deps",
+                "analysis_loader_mode":"package","go_call_graph_program_scope":"package-with-declaration-deps",
+                "go_loader_program_scope":"package-with-declaration-deps",
                 "go_loader_target_packages":targets,"go_loader_peak_rss_bytes":"1024","go_loader_type_check_ms":"3",
                 "go_reference_fingerprint":format!("sha256:{chunk}"),"go_typed_stage_complete":complete,
             }}})
@@ -1483,6 +1484,10 @@ mod tests {
             );
         }
         assert_eq!(first["properties"]["analysis_loader_mode"], "package");
+        assert_eq!(
+            first["properties"]["go_call_graph_program_scope"],
+            "package-with-declaration-deps"
+        );
         assert_eq!(
             first["properties"]["go_loader_program_scope"],
             "package-with-declaration-deps"

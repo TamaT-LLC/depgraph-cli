@@ -511,7 +511,7 @@ function assertSameCanonicalGraph(actual, expected, label) {
   return [...policy].sort();
 }
 function goUnits(outcome) {
-  return outcome.output.analysis.units.filter((unit) => unit.adapter === "go");
+  return (outcome.output.analysis?.units ?? []).filter((unit) => unit.adapter === "go");
 }
 // The control has no split binding, so the worker reports no loader scope
 // and no loader metrics: the pre-#463 module path, byte for byte.
@@ -544,7 +544,8 @@ function assertPackageBoundedUnits(units, label) {
     assert.ok(row.child_max_rss_mib > 0, `${label}: child max RSS missing`);
     assert.ok(typeof unit.loader.go_reference_fingerprint === "string" && unit.loader.go_reference_fingerprint.includes("sha256:"), `${label}: reference fingerprint missing`);
     if (!unit.reused) {
-      assert.ok(row.core_peak_mib > 0 && row.core_peak_mib * MIB <= REDUCED_WORKER_MEMORY_BYTES, `${label}: core-observed peak ${row.core_peak_mib} MiB is not under the limit`);
+      const peakBytes = number(unit, "analysis_worker_peak_memory_bytes");
+      assert.ok(peakBytes > 0 && peakBytes <= REDUCED_WORKER_MEMORY_BYTES, `${label}: core-observed peak ${mib(peakBytes)} MiB is not under the limit`);
     }
   }
 }

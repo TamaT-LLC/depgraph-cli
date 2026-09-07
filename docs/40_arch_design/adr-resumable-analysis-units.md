@@ -184,11 +184,15 @@ chunk of a module therefore shares the same snapshot. The first scan after
 this snapshot-source change invalidates typed and semantic checkpoints once;
 syntax checkpoints are kept.
 
-`go_call_graph_program_scope` and `analysis_loader_mode` are not profile
-axes: a whole-module unit and package-bounded chunks of the same module
-join. Precision differs (`package-with-declaration-deps` vs whole-program);
-identities do not. Absence of `go_call_graph_program_scope` means
-whole-program, which keeps historical streams byte-identical.
+`go_call_graph_program_scope` and `analysis_loader_mode` are not coverage
+`profile_axes`: a whole-module unit and package-bounded chunks of the same
+module still share one logical profile identity. `merge_logical_profile`
+treats both keys as configuration identity, so units that disagree cannot
+be folded into one canonical profile. In this planner a module is either
+promoted as a whole or executed as package batches (a memory/time re-split
+supersedes the promoted unit), so those keys agree in practice. Absence of
+`go_call_graph_program_scope` means whole-program, which keeps historical
+streams byte-identical.
 
 AnalysisPlan::invalidation_from reports Added, Removed, SourceChanged,
 ManifestChanged, ConfigChanged, ProfileChanged, AnalyzerChanged,

@@ -1089,3 +1089,20 @@ func TestGoLoaderDependencySnapshotIsSharedByEveryChunkOfAModule(t *testing.T) {
 		t.Fatalf("external source change was not observed uniformly: before=%s use=%s shape=%s", whole.DependencySnapshot.Fingerprint, changedUse.DependencySnapshot.Fingerprint, changedShape.DependencySnapshot.Fingerprint)
 	}
 }
+
+func TestIsUnusedImportMessageMatchesGoTypesForms(t *testing.T) {
+	cases := []struct {
+		message string
+		want    bool
+	}{
+		{`"fmt" imported and not used`, true},
+		{`"fmt" imported as f and not used`, true},
+		{`undefined: Foo`, false},
+		{`imported and not used`, false},
+	}
+	for _, test := range cases {
+		if got := isUnusedImportMessage(test.message); got != test.want {
+			t.Fatalf("isUnusedImportMessage(%q) = %v, want %v", test.message, got, test.want)
+		}
+	}
+}

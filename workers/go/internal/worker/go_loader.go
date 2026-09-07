@@ -851,6 +851,9 @@ func receiverIsGeneric(receiver *ast.FieldList) bool {
 }
 
 func isUnusedImportMessage(message string) bool {
+	// go/types reports unused imports as `"path" imported and not used` and
+	// unused aliases as `"path" imported as name and not used`. Both forms
+	// start with a quoted path and end with "and not used".
 	return strings.HasPrefix(message, "\"") && strings.HasSuffix(message, "and not used") && strings.Contains(message, "imported")
 }
 
