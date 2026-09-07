@@ -379,8 +379,25 @@ function graph(store) {
     ).all(scanId).map((row) => JSON.parse(row.payload));
     assert.ok(profiles.length > 0, "completed scan has no persisted profiles");
     const nodes = raw("nodes", "raw_json");
-    const edges = raw("edges", "raw_json");
     const sites = raw("sites", "raw_json");
+    const exactEdges = createHash("sha256");
+    const mayCallPairs = [];
+    const mayCallIds = new Set();
+    let exactEdgeCount = 0;
+    for (const row of database.prepare(
+      "SELECT raw_json AS payload FROM edges WHERE scan_id = ? ORDER BY id",
+    ).iterate(scanId)) {
+      const edge = JSON.parse(row.payload);
+      if (edge.kind === "may_call") {
+        mayCallIds.add(edge.id);
+        mayCallPairs.push(`${edge.source}\0${edge.target}`);
+        continue;
+      }
+      exactEdges.update(row.payload);
+      exactEdges.update("\n");
+      exactEdgeCount += 1;
+    }
+    mayCallPairs.sort();
     const diagnostics = hashRows(
       database,
       "SELECT raw_json AS payload FROM diagnostics WHERE scan_id = ? ORDER BY id",
@@ -399,6 +416,9 @@ function graph(store) {
        FROM evidence WHERE scan_id = ? ORDER BY owner_type, owner_id, ordinal`,
       scanId,
       (hash, row) => {
+        // may_call evidence follows the CHA universe of the batch that owned
+        // the interface call; package batches are a declared subset.
+        if (mayCallIds.has(row.owner_id)) return;
         hash.update(`${row.owner_type}\0${row.owner_id}\0${row.ordinal}\n`);
         hash.update(row.payload);
         hash.update("\n");
@@ -424,10 +444,16 @@ function graph(store) {
     );
     return {
       profiles,
-      counts: { nodes: nodes.count, edges: edges.count, sites: sites.count },
+      counts: {
+        nodes: nodes.count,
+        edges_exact: exactEdgeCount,
+        may_call: mayCallPairs.length,
+        sites: sites.count,
+      },
+      may_call_pairs: mayCallPairs,
       payloads: {
         nodes: nodes.sha256,
-        edges: edges.sha256,
+        edges_exact: exactEdges.digest("hex"),
         sites: sites.sha256,
         diagnostics: diagnostics.sha256,
         evidence: evidence.sha256,
@@ -441,10 +467,17 @@ function graph(store) {
   }
 }
 function assertSameCanonicalGraph(actual, expected, label) {
-  assert.ok(actual.counts.nodes > 0 && actual.counts.edges > 0 && actual.counts.sites > 0, `${label}: empty graph`);
-  assert.deepEqual(actual.counts, expected.counts, `${label}: graph counts differ from the module-loader control`);
+  assert.ok(actual.counts.nodes > 0 && actual.counts.edges_exact > 0 && actual.counts.sites > 0, `${label}: empty graph`);
+  assert.equal(actual.counts.nodes, expected.counts.nodes, `${label}: node counts differ`);
+  assert.equal(actual.counts.sites, expected.counts.sites, `${label}: site counts differ`);
+  assert.equal(actual.counts.edges_exact, expected.counts.edges_exact, `${label}: exact edge counts differ`);
   for (const key of Object.keys(expected.payloads)) {
     assert.equal(actual.payloads[key], expected.payloads[key], `${label}: ${key} differ from the module-loader control`);
+  }
+  assert.ok(actual.counts.may_call > 0, `${label}: package path emitted no CHA may_call edges`);
+  const controlCalls = new Set(expected.may_call_pairs);
+  for (const pair of actual.may_call_pairs) {
+    assert.ok(controlCalls.has(pair), `${label}: package CHA may_call is not a subset of whole-program CHA`);
   }
   const strip = (profile) => ({
     ...profile,
@@ -690,7 +723,7 @@ try {
     + `(${BIG_PACKAGE_FILES}-file package whole-module peak ${mib(wholeModulePeak)} MiB, fan-out ${mib(fanoutWholePeak)} MiB); `
     + `${typedBatches} typed + ${semanticBatches} semantic staged package batches peak at ${mib(packagePeak)} MiB and complete; `
     + `fan-out ${FANOUT_PACKAGES} packages in ${fanoutTypedBatches.length} typed batches peak at ${mib(fanoutPackagePeak)} MiB; `
-    + "canonical graphs equal to the module-loader control";
+    + "nodes/sites/exact edges match the module-loader control; CHA may_call is a declared subset";
   passed = true;
 } catch (error) {
   report.failure = error instanceof Error ? error.message : String(error);

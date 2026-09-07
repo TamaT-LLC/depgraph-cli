@@ -195,8 +195,12 @@ shipped default. A control worker advertising only the module-loader
 capabilities fails its typed and semantic units at that limit; the shipped
 package-bounded path completes, reports `go_loader_syntax_packages ==
 go_loader_target_packages`, never type-checks a body twice within a stage,
-and reproduces the control's canonical graph. Resume replays every staged
-batch. CI uploads the per-unit table as `go-loader-scope-report`.
+and reproduces the control's nodes, sites, exact edges, evidence, and
+coverage. CHA `may_call` edges of a package batch are a declared subset of
+whole-program CHA: an interface call is resolved only against implementers
+in that batch's SSA program (`package-with-declaration-deps`). Resume
+replays every staged batch. CI uploads the per-unit table as
+`go-loader-scope-report`.
 
 The original private repository item is not in CI. A maintainer can compare
 a fresh scan and a resumed scan of that tree with:
