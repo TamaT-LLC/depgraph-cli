@@ -236,13 +236,16 @@ pub(crate) fn merge_shared_web_node(previous: &Value, incoming: &mut Value) -> R
 /// Per-execution observations of the Go package loader.  A logical Go unit
 /// may be typed and analysed as several package-bounded execution units whose
 /// loader metrics, reference fingerprints, and split identity differ by
-/// construction.  They remain on the raw worker/checkpoint stream and in the
-/// scan's execution ledger; the canonical profile carries the loader policy
-/// and the joined status only.
+/// construction, and the split plan they were derived from changes with the
+/// budget while the canonical graph must not.  They remain on the raw
+/// worker/checkpoint stream and in the scan's execution ledger; the canonical
+/// profile carries the loader policy and the joined status only.
 fn go_execution_observation(key: &str) -> bool {
     matches!(
         key,
-        "analysis_execution_unit_id"
+        "analysis_split_contract"
+            | "analysis_split_plan_id"
+            | "analysis_execution_unit_id"
             | "analysis_split_kind"
             | "analysis_loader_input_split"
             | "analysis_context_path_count"
@@ -1406,6 +1409,7 @@ mod tests {
                 "analysis_unit_contract":V2,"analysis_base_profile_id":"go:base","analysis_unit_id":"unit","analysis_stage":"typed",
                 "analysis_logical_profile_id":logical,"analysis_chunk_count":"2","analysis_chunk_index":"0","analysis_chunk_id":chunk,
                 "analysis_source_path_count":"1","analysis_context_path_count":"2",
+                "analysis_split_contract":"depgraph-analysis-split-plan-v1","analysis_split_plan_id":format!("analysis-split-plan:{chunk}"),
                 "analysis_execution_unit_id":format!("analysis-execution-unit:{chunk}"),"analysis_split_kind":"output_batch",
                 "analysis_loader_kind":"package","analysis_loader_input_split":"true","analysis_loader_scope":scope,
                 "analysis_loader_mode":"package","go_loader_program_scope":"package-with-declaration-deps",
@@ -1420,6 +1424,8 @@ mod tests {
         let first = first.remove(0)["profile"].clone();
         let mut second = second.remove(0)["profile"].clone();
         for key in [
+            "analysis_split_contract",
+            "analysis_split_plan_id",
             "analysis_execution_unit_id",
             "analysis_split_kind",
             "go_loader_target_packages",

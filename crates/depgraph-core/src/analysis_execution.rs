@@ -71,7 +71,8 @@ pub struct AnalysisUnitProgress {
 }
 
 /// Worker profile properties copied into the execution ledger of one unit.
-const LOADER_OBSERVATION_KEYS: [&str; 22] = [
+const LOADER_OBSERVATION_KEYS: [&str; 23] = [
+    "analysis_split_plan_id",
     "analysis_execution_unit_id",
     "analysis_split_kind",
     "analysis_loader_kind",
