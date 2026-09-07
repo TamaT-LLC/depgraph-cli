@@ -171,7 +171,8 @@ pub enum AnalysisSplitKind {
     OutputBatch,
     /// The loader input itself is bounded to the batch and its references.
     InputBatch,
-    /// Bodies of one package are analysed in batches after a declaration stage.
+    /// Bodies of one package are analysed in batches: each batch reads the
+    /// declarations of the whole package and the bodies of its own files.
     StagedBodies,
 }
 
@@ -298,7 +299,8 @@ pub struct AnalysisStageBoundary {
     /// The worker can bound its loader to the batch and its references.
     pub input_splittable: bool,
     /// Batches of this stage read bodies of their own files and declarations
-    /// of everything else, relying on the preceding stage's results.
+    /// of everything else, including the other files of their own packages,
+    /// relying on the preceding stage's results.
     pub staged_bodies: bool,
 }
 
@@ -363,8 +365,15 @@ impl AnalysisAdapterBoundary {
         }
     }
 
-    /// Target Go boundary for issue #463: typed loading is bounded to packages
-    /// with declaration references, and a large package's bodies are staged.
+    /// Target Go boundary for issue #463: typed and semantic loading are
+    /// bounded to packages with declaration references, and a large package's
+    /// bodies are staged in both stages.  The typed stage stages bodies as
+    /// well because its stream carries the body-derived value references,
+    /// calls, and type uses of the files it owns: a typed unit that stripped
+    /// every body would emit a different canonical graph than the module
+    /// loader, and the canonical graph must not depend on the split plan.
+    /// Each typed or semantic unit therefore holds the declarations of its
+    /// packages and their references plus the bodies of its own batch only.
     /// The bounded scope only reaches the worker through the `split` binding,
     /// so this boundary always requires the loader-scope capability.
     pub fn go_package_loader() -> Self {
@@ -386,10 +395,10 @@ impl AnalysisAdapterBoundary {
                     stage: AnalysisStage::Typed,
                     loader_kind: AnalysisLoaderKind::Package,
                     reference_depth: AnalysisReferenceDepth::Declarations,
-                    granularity: AnalysisSplitGranularity::Package,
+                    granularity: AnalysisSplitGranularity::File,
                     output_splittable: true,
                     input_splittable: true,
-                    staged_bodies: false,
+                    staged_bodies: true,
                 },
                 AnalysisStageBoundary {
                     stage: AnalysisStage::Semantic,

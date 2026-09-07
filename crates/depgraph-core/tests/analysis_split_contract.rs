@@ -610,8 +610,11 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
             .contains(&AnalysisSplitReason::SourceByteBudget)
     }));
 
-    // A package-capable Go worker receives a declaration stage for the whole
-    // package and body batches that reference those declarations.
+    // A package-capable Go worker receives the large package as staged body
+    // batches in both the typed and the semantic stage: every batch reads
+    // the package's declarations and the bodies of its own files only, so
+    // the types and all bodies of the package are never held together, and
+    // each stage still emits the body-derived references of every file once.
     let (staged_split, _) = split(
         &checkout,
         &plan,
@@ -621,30 +624,12 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
             AnalysisAdapterBoundary::web_project_loader(),
         ],
     )?;
-    let typed = only(
+    let typed = units(
         &staged_split,
         &plan,
         "services/big",
         "go",
         AnalysisStage::Typed,
-    );
-    assert_eq!(typed.loader.kind, AnalysisLoaderKind::Package);
-    assert_eq!(
-        typed.loader.reference_depth,
-        AnalysisReferenceDepth::Declarations
-    );
-    assert_eq!(
-        typed.ownership.package_roots,
-        vec!["services/big".to_owned()]
-    );
-    assert!(
-        typed.estimate.over_budget,
-        "one package cannot be type-checked in pieces"
-    );
-    assert!(
-        typed
-            .split_reasons
-            .contains(&AnalysisSplitReason::SourceByteBudget)
     );
     let bodies = units(
         &staged_split,
@@ -653,43 +638,82 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         "go",
         AnalysisStage::Semantic,
     );
+    assert_eq!(typed.len(), 2);
     assert_eq!(bodies.len(), 2);
-    for batch in &bodies {
-        assert_eq!(batch.split_kind, AnalysisSplitKind::StagedBodies);
-        assert!(
-            batch
-                .split_reasons
-                .contains(&AnalysisSplitReason::StagedAfterDeclarations)
-        );
-        assert_eq!(batch.loader.kind, AnalysisLoaderKind::Package);
-        assert_eq!(batch.loader.paths, batch.ownership.source_paths);
-        assert_eq!(
-            batch.loader.reference_depth,
-            AnalysisReferenceDepth::Declarations
-        );
-        assert!(batch.loader.input_split);
-        assert_eq!(batch.prerequisite_ids, vec![typed.id.clone()]);
-        assert!(!batch.estimate.over_budget);
-        assert_eq!(batch.estimate.owned_source_bytes, 4 * 2_097_152);
-        let overlap = batch
-            .loader
-            .paths
-            .iter()
-            .filter(|path| batch.loader.reference_paths.contains(path))
-            .count();
-        assert_eq!(overlap, 0, "bodies and declaration references are disjoint");
-    }
-    let mut owned = bodies
+    let typed_ids = typed
         .iter()
-        .flat_map(|batch| batch.ownership.source_paths.iter().cloned())
+        .map(|batch| batch.id.clone())
         .collect::<Vec<_>>();
-    owned.sort();
-    assert_eq!(
-        owned,
-        plan.unit(&unit_id(&plan, "services/big", "go"))
-            .unwrap()
-            .source_paths
-    );
+    for (stage, batches) in [
+        (AnalysisStage::Typed, &typed),
+        (AnalysisStage::Semantic, &bodies),
+    ] {
+        for batch in batches {
+            assert_eq!(batch.stage, stage);
+            assert_eq!(batch.split_kind, AnalysisSplitKind::StagedBodies);
+            assert!(
+                batch
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::StagedAfterDeclarations)
+            );
+            assert!(
+                batch
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::SourceByteBudget)
+            );
+            assert_eq!(batch.loader.kind, AnalysisLoaderKind::Package);
+            assert_eq!(batch.loader.paths, batch.ownership.source_paths);
+            assert_eq!(
+                batch.ownership.package_roots,
+                vec!["services/big".to_owned()]
+            );
+            assert_eq!(
+                batch.loader.reference_depth,
+                AnalysisReferenceDepth::Declarations
+            );
+            assert!(batch.loader.input_split);
+            assert!(!batch.estimate.over_budget);
+            assert_eq!(batch.estimate.owned_source_bytes, 4 * 2_097_152);
+            let overlap = batch
+                .loader
+                .paths
+                .iter()
+                .filter(|path| batch.loader.reference_paths.contains(path))
+                .count();
+            assert_eq!(overlap, 0, "bodies and declaration references are disjoint");
+        }
+        let mut owned = batches
+            .iter()
+            .flat_map(|batch| batch.ownership.source_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        owned.sort();
+        assert_eq!(
+            owned,
+            plan.unit(&unit_id(&plan, "services/big", "go"))
+                .unwrap()
+                .source_paths,
+            "{stage:?} batches partition the package's files"
+        );
+    }
+    // Every body batch runs after the typed batches of its package, so the
+    // declarations of the whole package are checked before any body batch
+    // starts; the typed batches themselves follow the syntax stage.
+    for batch in &bodies {
+        assert_eq!(batch.prerequisite_ids, typed_ids);
+    }
+    let syntax_ids = units(
+        &staged_split,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Syntax,
+    )
+    .iter()
+    .map(|batch| batch.id.clone())
+    .collect::<Vec<_>>();
+    for batch in &typed {
+        assert_eq!(batch.prerequisite_ids, syntax_ids);
+    }
     // The multi-package api module fits the byte budgets, so its typed and
     // semantic stages are promoted to the whole-module loader and keep the
     // whole-program precision of that loader; the plan says so.

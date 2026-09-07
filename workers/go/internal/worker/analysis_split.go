@@ -169,23 +169,16 @@ func (request AnalysisUnitRequest) packageScoped() bool {
 	return request.Split != nil && request.Stage != AnalysisUnitStageSyntax && request.Split.Loader.Kind == "package"
 }
 
-// stagedBodies reports whether this semantic chunk owns the bodies of a subset
-// of the files its loader reads: the other files of the same packages
+// stagedBodies reports whether this typed or semantic chunk owns the bodies of
+// a subset of the files its loader reads: the other files of the same packages
 // contribute declarations only, as the `declarations` reference depth allows.
+// Both stages stage bodies the same way because both streams carry the
+// body-derived value references, calls, and type uses of the owned files; a
+// typed chunk that stripped every body would emit a different graph than the
+// module loader. A large package's types and all of its bodies are therefore
+// never held together, and no body is type-checked twice within one stage.
 func (request AnalysisUnitRequest) stagedBodies() bool {
-	return request.packageScoped() && request.Stage == AnalysisUnitStageSemantic && request.Split.SplitKind == "staged_bodies"
-}
-
-// declarationStage reports whether this typed request is the declaration
-// stage of a package-scoped plan. Such a request type-checks the declarations
-// of its target packages with every function body stripped: the typed
-// checkpoint then holds the package's types, signatures, and implements
-// relations, while the body-derived value references and calls are emitted by
-// the semantic units that own the files. Types and bodies of a large package
-// are never held together, and no body is type-checked by two units of the
-// same scan.
-func (request AnalysisUnitRequest) declarationStage() bool {
-	return request.packageScoped() && request.Stage == AnalysisUnitStageTyped
+	return request.packageScoped() && request.Split.SplitKind == "staged_bodies"
 }
 
 // scanOptions maps the negotiated split binding onto the loader selection. A
@@ -204,10 +197,7 @@ func (request AnalysisUnitRequest) scanOptions(buildCacheDir string) scanOptions
 	for _, root := range request.Split.Loader.PackageRoots {
 		options.loaderTargets = append(options.loaderTargets, goLoaderTargetSpec{Dir: root})
 	}
-	switch {
-	case request.declarationStage():
-		options.bodyPaths = map[string]bool{}
-	case request.stagedBodies():
+	if request.stagedBodies() {
 		options.bodyPaths = make(map[string]bool, len(request.SourcePaths))
 		for _, sourcePath := range request.SourcePaths {
 			options.bodyPaths[sourcePath] = true

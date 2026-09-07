@@ -60,11 +60,22 @@ func TestPackageLoaderBindingRelaxesTypedChunking(t *testing.T) {
 	if options.loaderMode != goLoaderModePackage || len(options.loaderTargets) != 1 || options.loaderTargets[0].Dir != "use" {
 		t.Fatalf("scanOptions = %+v", options)
 	}
-	// The package-bound typed stage is the declaration stage: every body of
-	// the target package is stripped, so the typed checkpoint never holds
-	// types and bodies together and the semantic units own every body.
-	if options.bodyPaths == nil || len(options.bodyPaths) != 0 {
-		t.Fatalf("typed declaration stage bodyPaths = %v, want an empty set", options.bodyPaths)
+	// An output batch of a small package keeps every body of the target
+	// package; only a staged-bodies chunk restricts the bodies to the files it
+	// owns, and it does so in the typed stage exactly as in the semantic one,
+	// because both streams carry the body-derived references of those files.
+	if options.bodyPaths != nil {
+		t.Fatalf("typed output batch staged bodies: %v, want every body", options.bodyPaths)
+	}
+	typedStaged := request
+	typedStaged.SourcePaths = []string{"use/use.go"}
+	typedStaged.Split = splitTestPackageBinding("package", "staged_bodies",
+		[]string{"use/use.go"}, []string{"use"}, []string{"cmd/app/main.go", "shape/shape.go", "use/use_external_test.go"})
+	if err := typedStaged.Validate(); err != nil {
+		t.Fatalf("package-bound staged typed chunk was rejected: %v", err)
+	}
+	if options := typedStaged.scanOptions(""); !options.bodyPaths["use/use.go"] || len(options.bodyPaths) != 1 {
+		t.Fatalf("typed staged-bodies chunk bodyPaths = %v, want the owned file only", options.bodyPaths)
 	}
 	semanticWhole := request
 	semanticWhole.Stage = AnalysisUnitStageSemantic
