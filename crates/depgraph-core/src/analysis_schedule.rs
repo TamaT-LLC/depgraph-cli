@@ -40,7 +40,13 @@ pub(crate) struct AnalysisSchedule {
     /// `None` when no worker negotiated source batches.
     pub split_plan: Option<AnalysisSplitPlan>,
     pub work: Vec<AnalysisWorkItem>,
+    /// The split-plan execution unit each work item runs, by work index.
+    /// Items of adapters without a split plan have no execution unit.
+    pub execution_unit_ids: Vec<Option<String>>,
     pub input_proof: Option<Arc<AnalysisInputProof>>,
+    /// What a re-split needs to derive replacement work items for the same
+    /// discovery plan; `None` when no worker negotiated source batches.
+    pub resplit: Option<AnalysisResplitContext>,
 }
 
 /// Work for one adapter, kept in worker order until the shared split plan
@@ -57,6 +63,131 @@ struct SourceBatchSchedule<'a> {
     capabilities: Vec<String>,
     batch_contexts: Vec<SourceBatchContext>,
     execution_digest: Option<String>,
+}
+
+/// The scheduling inputs a re-split reproduces: the split input that rebuilt
+/// the current plan and, per source-batch adapter, the worker, unit contexts,
+/// and execution digest the original work items were derived from.
+pub(crate) struct AnalysisResplitContext {
+    pub split_input: AnalysisSplitInput,
+    adapters: Vec<ResplitAdapter>,
+}
+
+struct ResplitAdapter {
+    adapter: AdapterKind,
+    spec: WorkerSpec,
+    unit_ids: Vec<String>,
+    batch_contexts: Vec<SourceBatchContext>,
+    execution_digest: Option<String>,
+}
+
+impl AnalysisResplitContext {
+    /// Work items for the execution units in `only`, in the order the refined
+    /// split plan and the worker stages define, built exactly like the
+    /// original schedule so their chunk identity and checkpoint keys agree.
+    pub(crate) fn work_items(
+        &self,
+        context: &AnalysisExecutionContext<'_>,
+        plan: &AnalysisPlan,
+        split_plan: &AnalysisSplitPlan,
+        only: &BTreeSet<String>,
+    ) -> Vec<(String, AnalysisWorkItem)> {
+        let mut work = Vec::new();
+        for adapter in &self.adapters {
+            let units = adapter
+                .unit_ids
+                .iter()
+                .filter_map(|id| plan.unit(id))
+                .collect::<Vec<_>>();
+            if units.len() != adapter.unit_ids.len() {
+                continue;
+            }
+            work.extend(
+                source_batch_work_items(
+                    context,
+                    split_plan,
+                    adapter.adapter,
+                    &adapter.spec,
+                    &units,
+                    &adapter.batch_contexts,
+                    adapter.execution_digest.as_deref(),
+                )
+                .into_iter()
+                .filter(|(execution_unit_id, _)| only.contains(execution_unit_id)),
+            );
+        }
+        work
+    }
+}
+
+/// Every work item of one source-batch adapter under `split_plan`, with the
+/// split-plan execution unit it runs.
+fn source_batch_work_items(
+    context: &AnalysisExecutionContext<'_>,
+    split_plan: &AnalysisSplitPlan,
+    adapter: AdapterKind,
+    spec: &WorkerSpec,
+    units: &[&AnalysisUnit],
+    batch_contexts: &[SourceBatchContext],
+    execution_digest: Option<&str>,
+) -> Vec<(String, AnalysisWorkItem)> {
+    let boundary = split_plan
+        .boundaries
+        .iter()
+        .find(|boundary| boundary.adapter == analysis_adapter(adapter))
+        .expect("source batches require an adapter boundary");
+    // The boundary selected from the worker's capabilities already records
+    // whether it negotiated loader scope; the binding and the byte-bounded
+    // partition follow the same decision.
+    let loader_scope = boundary.loader_scope;
+    let mut work = Vec::new();
+    for stage in boundary.stages() {
+        for (unit, batch_context) in units.iter().zip(batch_contexts) {
+            let requests = source_batch_requests_for_stage(
+                split_plan,
+                unit,
+                stage,
+                batch_context,
+                loader_scope,
+            );
+            for (execution_unit_id, request) in requests {
+                let unit_id = format!(
+                    "{}:{}:{}",
+                    unit.id,
+                    stage.as_str(),
+                    request["chunk_id"].as_str().unwrap_or_default()
+                );
+                let input_digest =
+                    if stage == AnalysisStage::Syntax || batch_context.semantic_reusable {
+                        request["context_fingerprint"].as_str().map(str::to_owned)
+                    } else {
+                        None
+                    };
+                let checkpoint_key = if context.cache_mode == ScanCacheMode::Enabled {
+                    input_digest
+                        .zip(execution_digest)
+                        .map(|(input, execution)| UnitCheckpointKey {
+                            unit_id: unit_id.clone(),
+                            input_digest: input,
+                            execution_digest: execution.to_owned(),
+                            root_digest: root_digest(context.root),
+                        })
+                } else {
+                    None
+                };
+                work.push((
+                    execution_unit_id,
+                    AnalysisWorkItem {
+                        unit_id,
+                        request: Some(request),
+                        checkpoint_key,
+                        spec: spec.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    work
 }
 
 /// A repository-wide content witness shared by all analysis units.  The
@@ -307,7 +438,7 @@ pub(crate) async fn prepare_analysis_schedule(
     // source-batch adapter at once, before any worker starts. The decision is
     // a pure function of the discovery plan, budgets, boundaries, sizes, and
     // the worker context closure; it never reads file contents.
-    let split_plan = {
+    let (split_plan, split_input) = {
         let mut boundaries = Vec::new();
         let mut contexts = BTreeMap::new();
         for entry in &scheduled {
@@ -340,16 +471,21 @@ pub(crate) async fn prepare_analysis_schedule(
                 )
                 .with_sizes(sizes)
                 .with_contexts(contexts);
-                Some(plan_analysis_split(plan, &input)?)
+                (Some(plan_analysis_split(plan, &input)?), Some(input))
             }
-            _ => None,
+            _ => (None, None),
         }
     };
 
     let mut work = Vec::new();
+    let mut execution_unit_ids = Vec::new();
+    let mut resplit_adapters = Vec::new();
     for entry in scheduled {
         match entry {
-            ScheduledAdapter::Ready(items) => work.extend(items),
+            ScheduledAdapter::Ready(items) => {
+                execution_unit_ids.extend(items.iter().map(|_| None));
+                work.extend(items);
+            }
             ScheduledAdapter::SourceBatches(schedule) => {
                 let SourceBatchSchedule {
                     adapter,
@@ -362,67 +498,39 @@ pub(crate) async fn prepare_analysis_schedule(
                 let split_plan = split_plan
                     .as_ref()
                     .expect("source batches require a split plan");
-                let boundary = split_plan
-                    .boundaries
-                    .iter()
-                    .find(|boundary| boundary.adapter == analysis_adapter(adapter))
-                    .expect("source batches require an adapter boundary");
-                // The boundary selected from the worker's capabilities already
-                // records whether it negotiated loader scope; the binding and
-                // the byte-bounded partition follow the same decision.
-                let loader_scope = boundary.loader_scope;
-                for stage in boundary.stages() {
-                    for (unit, batch_context) in units.iter().zip(&batch_contexts) {
-                        let requests = source_batch_requests_for_stage(
-                            split_plan,
-                            unit,
-                            stage,
-                            batch_context,
-                            loader_scope,
-                        );
-                        for request in requests {
-                            let unit_id = format!(
-                                "{}:{}:{}",
-                                unit.id,
-                                stage.as_str(),
-                                request["chunk_id"].as_str().unwrap_or_default()
-                            );
-                            let input_digest = if stage == AnalysisStage::Syntax
-                                || batch_context.semantic_reusable
-                            {
-                                request["context_fingerprint"].as_str().map(str::to_owned)
-                            } else {
-                                None
-                            };
-                            let checkpoint_key = if context.cache_mode == ScanCacheMode::Enabled {
-                                input_digest.zip(execution_digest.as_ref()).map(
-                                    |(input, execution)| UnitCheckpointKey {
-                                        unit_id: unit_id.clone(),
-                                        input_digest: input,
-                                        execution_digest: execution.clone(),
-                                        root_digest: root_digest(context.root),
-                                    },
-                                )
-                            } else {
-                                None
-                            };
-                            work.push(AnalysisWorkItem {
-                                unit_id,
-                                request: Some(request),
-                                checkpoint_key,
-                                spec: spec.clone(),
-                            });
-                        }
-                    }
+                for (execution_unit_id, item) in source_batch_work_items(
+                    context,
+                    split_plan,
+                    adapter,
+                    &spec,
+                    &units,
+                    &batch_contexts,
+                    execution_digest.as_deref(),
+                ) {
+                    execution_unit_ids.push(Some(execution_unit_id));
+                    work.push(item);
                 }
+                resplit_adapters.push(ResplitAdapter {
+                    adapter,
+                    spec,
+                    unit_ids: units.iter().map(|unit| unit.id.clone()).collect(),
+                    batch_contexts,
+                    execution_digest,
+                });
             }
         }
     }
+    let resplit = split_input.map(|split_input| AnalysisResplitContext {
+        split_input,
+        adapters: resplit_adapters,
+    });
     Ok(AnalysisSchedule {
         plan,
         split_plan,
         work,
+        execution_unit_ids,
         input_proof,
+        resplit,
     })
 }
 
@@ -434,6 +542,7 @@ fn analysis_adapter(adapter: AdapterKind) -> AnalysisAdapter {
     }
 }
 
+#[derive(Clone)]
 struct SourceBatchContext {
     context_fingerprint: String,
     semantic_reusable: bool,
@@ -473,6 +582,22 @@ fn split_plan_for_boundaries(
     store_path: Option<&Path>,
     boundaries: Vec<AnalysisAdapterBoundary>,
 ) -> Result<(AnalysisSplitPlan, BTreeMap<String, SourceBatchContext>)> {
+    split_plan_and_input_for_boundaries(root, config, plan, store_path, boundaries)
+        .map(|(split_plan, contexts, _)| (split_plan, contexts))
+}
+
+#[cfg(test)]
+fn split_plan_and_input_for_boundaries(
+    root: &Path,
+    config: &crate::Config,
+    plan: &AnalysisPlan,
+    store_path: Option<&Path>,
+    boundaries: Vec<AnalysisAdapterBoundary>,
+) -> Result<(
+    AnalysisSplitPlan,
+    BTreeMap<String, SourceBatchContext>,
+    AnalysisSplitInput,
+)> {
     let inventory = build_repository_file_inventory(root)?;
     let mut contexts = BTreeMap::new();
     let mut batch_contexts = BTreeMap::new();
@@ -495,7 +620,7 @@ fn split_plan_for_boundaries(
     let input = AnalysisSplitInput::new(AnalysisSplitBudget::from_config(config), boundaries)
         .with_sizes(measure_source_sizes(root, plan)?)
         .with_contexts(contexts);
-    Ok((plan_analysis_split(plan, &input)?, batch_contexts))
+    Ok((plan_analysis_split(plan, &input)?, batch_contexts, input))
 }
 
 #[cfg(test)]
@@ -513,13 +638,12 @@ fn source_batch_requests(
         "typed" => AnalysisStage::Typed,
         _ => AnalysisStage::Semantic,
     };
-    Ok(source_batch_requests_for_stage(
-        &split_plan,
-        unit,
-        stage,
-        &contexts[&unit.id],
-        false,
-    ))
+    Ok(
+        source_batch_requests_for_stage(&split_plan, unit, stage, &contexts[&unit.id], false)
+            .into_iter()
+            .map(|(_, request)| request)
+            .collect(),
+    )
 }
 
 fn prepare_source_batch_context(
@@ -597,7 +721,7 @@ fn source_batch_requests_for_stage(
     stage: AnalysisStage,
     context: &SourceBatchContext,
     loader_scope_negotiated: bool,
-) -> Vec<serde_json::Value> {
+) -> Vec<(String, serde_json::Value)> {
     let stage_name = stage.as_str();
     split_plan
         .execution_units_for(&unit.id, stage)
@@ -633,7 +757,7 @@ fn source_batch_requests_for_stage(
             {
                 object.insert("split".to_owned(), binding);
             }
-            request
+            (execution_unit.id.clone(), request)
         })
         .collect()
 }
@@ -1326,7 +1450,10 @@ mod tests {
                 stage,
                 context,
                 legacy_boundary.loader_scope,
-            );
+            )
+            .into_iter()
+            .map(|(_, request)| request)
+            .collect::<Vec<_>>();
             let previous = previous_requests(stage);
             assert_eq!(
                 legacy.len(),
@@ -1363,6 +1490,17 @@ mod tests {
                 context,
                 negotiated_boundary.loader_scope,
             );
+            for (execution_unit_id, request) in &negotiated {
+                assert_eq!(
+                    request["split"]["execution_unit_id"].as_str(),
+                    Some(execution_unit_id.as_str()),
+                    "the scheduler knows which execution unit each request runs"
+                );
+            }
+            let negotiated = negotiated
+                .into_iter()
+                .map(|(_, request)| request)
+                .collect::<Vec<_>>();
             for request in &negotiated {
                 let mut stripped = request.clone();
                 let split = stripped
@@ -1677,6 +1815,243 @@ mod tests {
                 Some(&changed_execution),
             ));
         }
+        Ok(())
+    }
+
+    /// A package-loader worker's small module is promoted to one whole-module
+    /// typed unit.  When that unit exceeds the worker memory limit the
+    /// re-split demotes it to package-bounded typed units, and the scheduler
+    /// derives replacement work items for exactly those units: package
+    /// loaders bound to the new plan, fresh chunk identities, checkpoint keys
+    /// with the module context, and untouched siblings in the other stages.
+    #[test]
+    fn resplit_derives_package_bounded_replacements_for_a_promoted_unit() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        std::fs::write(&root.join("go.mod"), "module example.test/app\n\ngo 1.26\n")?;
+        for name in ["core", "api", "cli"] {
+            std::fs::create_dir(root.join(name))?;
+            let import = if name == "core" {
+                String::new()
+            } else {
+                "import _ \"example.test/app/core\"\n".to_owned()
+            };
+            std::fs::write(
+                root.join(format!("{name}/{name}.go")),
+                format!("package {name}\n\n{import}const Value = 1\n"),
+            )?;
+        }
+        let config = crate::Config::default();
+        let plan = plan_analysis_units(&root, &config, None)?;
+        let app = plan
+            .executable_units()
+            .into_iter()
+            .find(|unit| unit.adapter == AnalysisAdapter::Go)
+            .expect("one Go module");
+        let boundary = AnalysisAdapterBoundary::for_capabilities(
+            AnalysisAdapter::Go,
+            &[
+                "analysis-unit-v1".to_owned(),
+                "analysis-source-batch-v1".to_owned(),
+                "analysis-unit-typed-v1".to_owned(),
+                ANALYSIS_LOADER_SCOPE_CAPABILITY.to_owned(),
+                crate::analysis_split::ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY.to_owned(),
+            ],
+        )
+        .expect("package-loader boundary");
+        assert!(boundary.loader_scope);
+        let (current, batch_contexts, split_input) =
+            split_plan_and_input_for_boundaries(&root, &config, &plan, None, vec![boundary])?;
+        let typed = current.execution_units_for(&app.id, AnalysisStage::Typed);
+        let semantic = current.execution_units_for(&app.id, AnalysisStage::Semantic);
+        assert_eq!(
+            typed.len(),
+            1,
+            "a small module is promoted to one typed unit"
+        );
+        assert_eq!(semantic.len(), 1, "and to one semantic unit");
+        assert_eq!(
+            typed[0].loader.kind,
+            crate::analysis_split::AnalysisLoaderKind::Module
+        );
+        let promoted_id = typed[0].id.clone();
+        let promoted_semantic_id = semantic[0].id.clone();
+
+        let cancellation = crate::cancellation::CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "resplit",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+        let artifact = fixture.path().join("go-worker");
+        std::fs::write(&artifact, "synthetic go worker\n")?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: artifact.clone().into_os_string(),
+            leading_args: Vec::new(),
+            display: "synthetic go worker".into(),
+            artifact_path: artifact,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let resplit = AnalysisResplitContext {
+            split_input,
+            adapters: vec![ResplitAdapter {
+                adapter: AdapterKind::Go,
+                spec: spec.clone(),
+                unit_ids: vec![app.id.clone()],
+                batch_contexts: vec![batch_contexts[&app.id].clone()],
+                execution_digest: Some("execution".into()),
+            }],
+        };
+        let original = source_batch_work_items(
+            &context,
+            &current,
+            AdapterKind::Go,
+            &spec,
+            &[app],
+            &resplit.adapters[0].batch_contexts,
+            Some("execution"),
+        );
+        assert_eq!(
+            original.len(),
+            current.execution_units.len(),
+            "one work item per execution unit"
+        );
+        assert!(
+            original.iter().all(
+                |(id, item)| item.request.as_ref().unwrap()["split"]["execution_unit_id"] == *id
+            )
+        );
+
+        let outcome = crate::analysis_split::resplit_execution_unit(
+            &plan,
+            &current,
+            &resplit.split_input,
+            &promoted_id,
+            crate::analysis_split::AnalysisResplitTrigger::WorkerMemory,
+        )?;
+        assert_eq!(
+            outcome.outcome,
+            crate::analysis_split::AnalysisResplitOutcome::Split
+        );
+        // One refinement demotes both promoted stages: the semantic stage is
+        // not tried whole after the typed stage exceeded the worker's memory.
+        assert_eq!(
+            outcome
+                .superseded_execution_unit_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([promoted_id.clone(), promoted_semantic_id.clone()])
+        );
+        let replacement_stage = |stage: AnalysisStage| {
+            outcome
+                .plan
+                .execution_units_for(&app.id, stage)
+                .into_iter()
+                .filter(|unit| outcome.replacement_execution_unit_ids.contains(&unit.id))
+                .collect::<Vec<_>>()
+        };
+        let typed_replacements = replacement_stage(AnalysisStage::Typed);
+        let semantic_replacements = replacement_stage(AnalysisStage::Semantic);
+        assert_eq!(
+            typed_replacements.len() + semantic_replacements.len(),
+            outcome.replacement_execution_unit_ids.len()
+        );
+        assert!(!typed_replacements.is_empty() && !semantic_replacements.is_empty());
+        assert!(
+            typed_replacements
+                .iter()
+                .chain(&semantic_replacements)
+                .all(|unit| unit.loader.kind == crate::analysis_split::AnalysisLoaderKind::Package),
+            "replacements are package-bounded"
+        );
+        assert!(
+            outcome.retained_execution_unit_ids.iter().all(|id| current
+                .execution_unit(id)
+                .unwrap()
+                .stage
+                == AnalysisStage::Syntax),
+            "only the syntax batches are retained"
+        );
+        for id in &outcome.retained_execution_unit_ids {
+            let (before, after) = (
+                current.execution_unit(id).unwrap(),
+                outcome.plan.execution_unit(id).unwrap(),
+            );
+            assert_eq!(
+                (before.batch_index, before.batch_count),
+                (after.batch_index, after.batch_count),
+                "siblings keep their chunk numbering"
+            );
+        }
+
+        let replacements = resplit.work_items(
+            &context,
+            &plan,
+            &outcome.plan,
+            &outcome
+                .replacement_execution_unit_ids
+                .iter()
+                .cloned()
+                .collect(),
+        );
+        assert_eq!(
+            replacements.len(),
+            outcome.replacement_execution_unit_ids.len()
+        );
+        // Chunk identity follows the owned paths alone, so a replacement that
+        // owns the same paths as the promoted unit keeps its chunk ID and
+        // ledger key; the execution unit ID and the loader binding differ.
+        let superseded_work_ids = original
+            .iter()
+            .filter(|(id, _)| *id == promoted_id || *id == promoted_semantic_id)
+            .map(|(_, item)| item.unit_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(superseded_work_ids.len(), 2);
+        let mut typed_index = 0;
+        for (id, item) in &replacements {
+            let request = item.request.as_ref().unwrap();
+            assert!(outcome.replacement_execution_unit_ids.contains(id));
+            assert_ne!(*id, promoted_id);
+            assert_ne!(*id, promoted_semantic_id);
+            assert_eq!(request["split"]["split_plan_id"], outcome.split_plan_id);
+            assert_eq!(request["split"]["execution_unit_id"], json!(id));
+            assert_eq!(request["split"]["loader"]["kind"], "package");
+            let stage = request["stage"].as_str().unwrap();
+            if stage == "typed" {
+                assert_eq!(request["chunk_index"], json!(typed_index));
+                assert_eq!(request["chunk_count"], json!(typed_replacements.len()));
+                assert_eq!(
+                    request["context_paths"],
+                    json!(app.source_paths),
+                    "typed context stays the owned module"
+                );
+                typed_index += 1;
+            } else {
+                assert_eq!(stage, "semantic");
+            }
+            assert_eq!(
+                item.unit_id,
+                format!(
+                    "{}:{stage}:{}",
+                    app.id,
+                    request["chunk_id"].as_str().unwrap()
+                )
+            );
+            let key = item.checkpoint_key.as_ref().expect("checkpoint key");
+            assert_eq!(key.execution_digest, "execution");
+            assert_eq!(
+                key.input_digest,
+                request["context_fingerprint"].as_str().unwrap()
+            );
+        }
+        assert_eq!(typed_index, typed_replacements.len());
         Ok(())
     }
 }

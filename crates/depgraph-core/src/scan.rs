@@ -25,6 +25,7 @@ use crate::{
     },
     analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
     analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
+    analysis_split::{AnalysisResplitOutcome, AnalysisResplitTrigger, resplit_execution_unit},
     cache::{
         CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
         validate_scan_cache_hit_inputs,
@@ -746,7 +747,10 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     )
     .await?;
     let analysis_plan = schedule.plan;
-    if let Some(split_plan) = &schedule.split_plan {
+    let mut split_plan = schedule.split_plan;
+    let resplit_context = schedule.resplit;
+    let mut execution_unit_ids = schedule.execution_unit_ids;
+    if let Some(split_plan) = &split_plan {
         tracing::debug!(
             split_plan_id = %split_plan.split_plan_id,
             execution_units = split_plan.execution_units.len(),
@@ -756,7 +760,8 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         );
     }
     let analysis_input_proof = schedule.input_proof;
-    let ledger_records = analysis_ledger_records(&scan_id, &schedule.work, analysis_plan.as_ref());
+    let mut ledger_records =
+        analysis_ledger_records(&scan_id, &schedule.work, analysis_plan.as_ref());
     let unit_count = schedule.work.len();
     let analysis_contract = analysis_contract_version(&ledger_records);
     store.initialize_analysis_unit_ledger(
@@ -776,62 +781,238 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     let mut file_coverage_ledgers = BTreeMap::new();
     let mut analysis_unit_file_paths = BTreeMap::new();
     let mut pending_analysis_unit_completions = BTreeMap::new();
-    let mut analysis_unit_failures = BTreeMap::new();
-    let analysis = execute_analysis_units(
-        store,
-        &execution_context,
-        schedule.work,
-        |store, unit_id, output| {
-            let ingest_started = Instant::now();
-            if profiling {
-                protocol_event_count += output.events.len() as u64;
-                performance_phases.extend(worker_phase_performance(&output));
-            }
-            let adapter = output.adapter;
-            let failure_kind = output.failure_kind;
-            let security_violation = output.security_violation;
-            let result =
-                bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
-                    ingest_worker_output(
-                        store,
-                        &scan_id,
-                        output,
-                        Some(&mut global_upserts),
-                        Some(&mut file_coverage_ledgers),
-                        Some(&mut analysis_unit_file_paths),
-                        Some(&mut pending_analysis_unit_completions),
-                    )
-                });
-            ingest_ms += elapsed_ms(ingest_started);
-            match result {
-                Ok(()) => Ok(true),
-                Err(error) => {
-                    analysis_unit_failures.insert(
-                        unit_id.to_owned(),
-                        analysis_unit_error_detail(&format!("{error:#}")),
-                    );
-                    failures.push(ScanFailure::with_classification(
+    // Failures are keyed by work unit so a re-split can withdraw the failure
+    // of a superseded unit before its replacements run (a replacement that
+    // owns the same paths shares the unit ID); they join `failures` once
+    // execution has ended.
+    let analysis_unit_failures = std::sync::Mutex::new(BTreeMap::<String, String>::new());
+    let unit_failures = std::sync::Mutex::new(BTreeMap::<String, ScanFailure>::new());
+    let mut consume = |store: &mut Store, unit_id: &str, output: WorkerOutput| -> Result<bool> {
+        let ingest_started = Instant::now();
+        if profiling {
+            protocol_event_count += output.events.len() as u64;
+            performance_phases.extend(worker_phase_performance(&output));
+        }
+        let adapter = output.adapter;
+        let failure_kind = output.failure_kind;
+        let security_violation = output.security_violation;
+        let result = bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
+            ingest_worker_output(
+                store,
+                &scan_id,
+                output,
+                Some(&mut global_upserts),
+                Some(&mut file_coverage_ledgers),
+                Some(&mut analysis_unit_file_paths),
+                Some(&mut pending_analysis_unit_completions),
+            )
+        });
+        ingest_ms += elapsed_ms(ingest_started);
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                lock_failures(&analysis_unit_failures).insert(
+                    unit_id.to_owned(),
+                    analysis_unit_error_detail(&format!("{error:#}")),
+                );
+                lock_failures(&unit_failures).insert(
+                    unit_id.to_owned(),
+                    ScanFailure::with_classification(
                         adapter,
                         format!("{error:#}"),
                         failure_kind.unwrap_or(WorkerFailureKind::Other),
                         security_violation,
-                    ));
-                    Ok(false)
-                }
+                    ),
+                );
+                Ok(false)
             }
-        },
-        |item, validation| {
-            validate_work_inputs(
-                &execution_context,
-                item,
-                checkpoint_store_path.as_deref(),
-                &profile_plan.plan_id,
-                analysis_input_proof.as_deref(),
-                validation,
-            )
-        },
+        }
+    };
+    let validate = |item: &AnalysisWorkItem, validation| {
+        validate_work_inputs(
+            &execution_context,
+            item,
+            checkpoint_store_path.as_deref(),
+            &profile_plan.plan_id,
+            analysis_input_proof.as_deref(),
+            validation,
+        )
+    };
+    let mut analysis = execute_analysis_units(
+        store,
+        &execution_context,
+        schedule.work,
+        &mut consume,
+        &validate,
     )
     .await?;
+    // A unit whose worker exceeded its memory or time limit is re-planned at
+    // the next finer boundary of the same discovery plan; its replacements
+    // run in the same attempt and its failure is withdrawn.  The superseded
+    // attempt stays visible in the progress ledger as a failed unit.
+    let mut superseded_indices = BTreeSet::new();
+    if let (Some(plan), Some(current), Some(resplit)) = (
+        analysis_plan.as_ref(),
+        split_plan.as_mut(),
+        resplit_context.as_ref(),
+    ) {
+        let mut attempted = BTreeSet::new();
+        while !cancellation.is_cancelled() {
+            let Some((execution_unit_id, trigger)) =
+                analysis
+                    .units
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, progress)| {
+                        if superseded_indices.contains(&index) || progress.status != "failed" {
+                            return None;
+                        }
+                        let trigger = match progress.failure_reason.as_deref()? {
+                            "memory-limit" => AnalysisResplitTrigger::WorkerMemory,
+                            "timeout" => AnalysisResplitTrigger::WorkerTimeout,
+                            _ => return None,
+                        };
+                        let id = execution_unit_ids.get(index)?.clone()?;
+                        (!attempted.contains(&id)).then_some((id, trigger))
+                    })
+            else {
+                break;
+            };
+            attempted.insert(execution_unit_id.clone());
+            let resplit_plan = resplit_execution_unit(
+                plan,
+                current,
+                &resplit.split_input,
+                &execution_unit_id,
+                trigger,
+            )?;
+            let superseded = execution_unit_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| {
+                    id.as_ref()
+                        .is_some_and(|id| resplit_plan.superseded_execution_unit_ids.contains(id))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            // Only a failed attempt is withdrawn: an ingested result is never
+            // removed, and retained siblings must keep their chunk numbering
+            // because their profiles already carry it.
+            let withdrawable = superseded.len() == resplit_plan.superseded_execution_unit_ids.len()
+                && superseded
+                    .iter()
+                    .all(|index| analysis.units[*index].status == "failed")
+                && resplit_plan.retained_execution_unit_ids.iter().all(|id| {
+                    current
+                        .execution_unit(id)
+                        .zip(resplit_plan.plan.execution_unit(id))
+                        .is_some_and(|(before, after)| {
+                            before.batch_index == after.batch_index
+                                && before.batch_count == after.batch_count
+                        })
+                });
+            let applied = resplit_plan.outcome == AnalysisResplitOutcome::Split && withdrawable;
+            let disposition = match (resplit_plan.outcome, withdrawable) {
+                (AnalysisResplitOutcome::Split, true) => "applied",
+                (AnalysisResplitOutcome::Split, false) => "deferred",
+                (AnalysisResplitOutcome::Unsplittable, _) => "unsplittable",
+            };
+            let message = format!(
+                "analysis re-split {disposition}: execution unit {execution_unit_id} ({}) {} -> {}{}; superseded {}, replacements {}",
+                trigger.as_str(),
+                resplit_plan.previous_split_plan_id,
+                resplit_plan.split_plan_id,
+                resplit_plan
+                    .unsplittable_reason
+                    .map(|reason| format!(" ({})", reason.as_str()))
+                    .unwrap_or_default(),
+                resplit_plan.superseded_execution_unit_ids.len(),
+                resplit_plan.replacement_execution_unit_ids.len(),
+            );
+            tracing::info!(%message);
+            add_core_diagnostic(
+                store,
+                &scan_id,
+                "info",
+                "analysis-resplit",
+                &message,
+                &format!("{}:{}", resplit_plan.split_plan_id, execution_unit_id),
+            )?;
+            if !applied {
+                continue;
+            }
+            let replacement_ids = resplit_plan
+                .replacement_execution_unit_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let (replacement_execution_ids, replacement_work): (Vec<_>, Vec<_>) = resplit
+                .work_items(
+                    &execution_context,
+                    plan,
+                    &resplit_plan.plan,
+                    &replacement_ids,
+                )
+                .into_iter()
+                .unzip();
+            let replacement_records =
+                analysis_ledger_records(&scan_id, &replacement_work, Some(plan));
+            let superseded_records = superseded
+                .iter()
+                .map(|index| ledger_records[*index].clone())
+                .collect::<Vec<_>>();
+            store.resplit_analysis_unit_ledger(
+                &scan_id,
+                &superseded_records,
+                &replacement_records,
+            )?;
+            for index in superseded {
+                superseded_indices.insert(index);
+                let unit_id = &analysis.units[index].unit_id;
+                lock_failures(&unit_failures).remove(unit_id);
+                lock_failures(&analysis_unit_failures).remove(unit_id);
+                let loader = &mut analysis.units[index].loader;
+                loader.insert("analysis_resplit".to_owned(), "superseded".to_owned());
+                loader.insert(
+                    "analysis_resplit_split_plan_id".to_owned(),
+                    resplit_plan.split_plan_id.clone(),
+                );
+            }
+            *current = resplit_plan.plan;
+            let replacement_progress = execute_analysis_units(
+                store,
+                &execution_context,
+                replacement_work,
+                &mut consume,
+                &validate,
+            )
+            .await?;
+            ledger_records.extend(replacement_records);
+            execution_unit_ids.extend(replacement_execution_ids.into_iter().map(Some));
+            for mut unit in replacement_progress.units {
+                unit.loader
+                    .insert("analysis_resplit".to_owned(), "replacement".to_owned());
+                unit.loader.insert(
+                    "analysis_resplit_split_plan_id".to_owned(),
+                    current.split_plan_id.clone(),
+                );
+                analysis.units.push(unit);
+            }
+            if replacement_progress.stop_reason.is_some() {
+                analysis.stop_reason = replacement_progress.stop_reason;
+            }
+        }
+    }
+    drop(consume);
+    failures.extend(
+        unit_failures
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .into_values(),
+    );
+    let analysis_unit_failures = analysis_unit_failures
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ingest_started = Instant::now();
     let allow_semantic_join = failures.is_empty() && !cancellation.is_cancelled();
     if let Err(error) = finalize_analysis_unit_completions(
@@ -849,8 +1030,16 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         ));
     }
     ingest_ms += elapsed_ms(ingest_started);
-    let mut terminal_ledger = ledger_records;
-    for (record, progress) in terminal_ledger.iter_mut().zip(analysis.units.iter()) {
+    // Superseded rows left the Store ledger with their re-split; only the
+    // units still part of the attempt are terminalized.
+    let mut terminal_ledger = ledger_records
+        .into_iter()
+        .zip(analysis.units.iter())
+        .enumerate()
+        .filter(|(index, _)| !superseded_indices.contains(index))
+        .map(|(_, pair)| pair)
+        .collect::<Vec<_>>();
+    for (record, progress) in &mut terminal_ledger {
         record.status = match progress.status.as_str() {
             "completed" => "completed",
             "failed" => "failed",
@@ -867,6 +1056,10 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             .cloned()
             .or_else(|| progress.failure_reason.clone());
     }
+    let terminal_ledger = terminal_ledger
+        .into_iter()
+        .map(|(record, _)| record)
+        .collect::<Vec<_>>();
     let analysis_coverage = store.finalize_analysis_unit_ledger(&scan_id, &terminal_ledger)?;
     if !analysis_coverage.complete {
         let reason = analysis_coverage
@@ -2403,6 +2596,14 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         analysis: None,
         analysis_coverage: None,
     })
+}
+
+/// The per-unit failure maps are shared between the ingestion closure and the
+/// re-split pass of one scan future; the lock is never held across an await.
+fn lock_failures<T>(failures: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn analysis_ledger_records(

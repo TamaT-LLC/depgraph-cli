@@ -2643,37 +2643,90 @@ ORDER BY id COLLATE BINARY
             if !keys.insert(key) {
                 bail!("analysis unit ledger contains duplicate unit stage/chunk");
             }
+            insert_analysis_unit_ledger_record(&tx, scan_id, record)?;
+        }
+        tx.execute(
+            "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
+            [scan_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the ledger rows of execution units a re-split superseded with
+    /// the rows of their replacements, before any replacement runs.
+    ///
+    /// A superseded row must exist and must not have completed: the scheduler
+    /// only re-splits units whose worker failed, so no ingested result is ever
+    /// removed from the attempt.  Replacement rows must be new to the attempt.
+    /// Retained rows are untouched; the plan and input identities of the
+    /// attempt do not change because a re-split keeps the discovery plan.
+    pub fn resplit_analysis_unit_ledger(
+        &mut self,
+        scan_id: &str,
+        superseded: &[AnalysisUnitLedgerRecord],
+        replacements: &[AnalysisUnitLedgerRecord],
+    ) -> Result<()> {
+        let tx = self.connection.transaction()?;
+        ensure_scan_staging(&tx, scan_id)?;
+        for record in superseded {
+            validate_analysis_unit_ledger_record(record, scan_id)?;
+            let status: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM analysis_unit_ledger
+                      WHERE scan_id=?1 AND unit_id=?2 AND unit_root=?3
+                        AND stage=?4 AND chunk_id=?5",
+                    params![
+                        scan_id,
+                        record.unit_id,
+                        record.unit_root,
+                        record.stage,
+                        record.chunk_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match status.as_deref() {
+                None => bail!("analysis unit re-split superseded an unknown unit stage/chunk"),
+                Some("completed") => {
+                    bail!("analysis unit re-split cannot supersede a completed unit stage/chunk")
+                }
+                Some(_) => {}
+            }
             tx.execute(
-                "INSERT INTO analysis_unit_ledger(
-                     scan_id, contract_version, unit_id, adapter, unit_root, stage,
-                     chunk_id, chunk_index, chunk_count, status, reused,
-                     source_paths_json, context_paths_json, auxiliary_paths_json,
-                     context_fingerprint, input_fingerprint, dependency_ids_json,
-                     unknown_dependencies, error
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                           ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "DELETE FROM analysis_unit_ledger
+                  WHERE scan_id=?1 AND unit_id=?2 AND unit_root=?3
+                    AND stage=?4 AND chunk_id=?5",
                 params![
                     scan_id,
-                    record.contract_version,
                     record.unit_id,
-                    record.adapter,
                     record.unit_root,
                     record.stage,
-                    record.chunk_id,
-                    record.chunk_index.map(|value| value as i64),
-                    record.chunk_count.map(|value| value as i64),
-                    record.status,
-                    record.reused,
-                    serde_json::to_string(&record.source_paths)?,
-                    serde_json::to_string(&record.context_paths)?,
-                    serde_json::to_string(&record.auxiliary_paths)?,
-                    record.context_fingerprint,
-                    record.input_fingerprint,
-                    serde_json::to_string(&record.dependency_ids)?,
-                    record.unknown_dependencies,
-                    record.error,
+                    record.chunk_id
                 ],
             )?;
+        }
+        for record in replacements {
+            validate_analysis_unit_ledger_record(record, scan_id)?;
+            let present: i64 = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM analysis_unit_ledger
+                     WHERE scan_id=?1 AND unit_id=?2 AND unit_root=?3
+                       AND stage=?4 AND chunk_id=?5
+                )",
+                params![
+                    scan_id,
+                    record.unit_id,
+                    record.unit_root,
+                    record.stage,
+                    record.chunk_id
+                ],
+                |row| row.get(0),
+            )?;
+            if present != 0 {
+                bail!("analysis unit re-split replacement duplicates a unit stage/chunk");
+            }
+            insert_analysis_unit_ledger_record(&tx, scan_id, record)?;
         }
         tx.execute(
             "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
@@ -2883,6 +2936,45 @@ ORDER BY id COLLATE BINARY
         tx.commit()?;
         Ok(())
     }
+}
+
+fn insert_analysis_unit_ledger_record(
+    tx: &Transaction<'_>,
+    scan_id: &str,
+    record: &AnalysisUnitLedgerRecord,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO analysis_unit_ledger(
+             scan_id, contract_version, unit_id, adapter, unit_root, stage,
+             chunk_id, chunk_index, chunk_count, status, reused,
+             source_paths_json, context_paths_json, auxiliary_paths_json,
+             context_fingerprint, input_fingerprint, dependency_ids_json,
+             unknown_dependencies, error
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                   ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            scan_id,
+            record.contract_version,
+            record.unit_id,
+            record.adapter,
+            record.unit_root,
+            record.stage,
+            record.chunk_id,
+            record.chunk_index.map(|value| value as i64),
+            record.chunk_count.map(|value| value as i64),
+            record.status,
+            record.reused,
+            serde_json::to_string(&record.source_paths)?,
+            serde_json::to_string(&record.context_paths)?,
+            serde_json::to_string(&record.auxiliary_paths)?,
+            record.context_fingerprint,
+            record.input_fingerprint,
+            serde_json::to_string(&record.dependency_ids)?,
+            record.unknown_dependencies,
+            record.error,
+        ],
+    )?;
+    Ok(())
 }
 
 fn validate_analysis_unit_ledger_record(
@@ -7631,6 +7723,92 @@ mod tests {
         assert!(summary.complete);
         assert_eq!(summary.completed_units, 1);
         assert_eq!(store.analysis_units("analysis-scan")?.len(), 2);
+        Ok(())
+    }
+
+    /// A re-split swaps the rows of a failed, un-ingested execution unit for
+    /// its replacements inside the attempt; it never removes a completed row,
+    /// never addresses an unknown row, and never duplicates a chunk.
+    #[test]
+    fn analysis_unit_ledger_resplit_replaces_only_unfinished_rows() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("resplit-scan", Path::new("."), false)?;
+        let row = |stage: &str, chunk_id: &str, index: u64, count: u64, paths: &[&str]| {
+            AnalysisUnitLedgerRecord {
+                scan_id: "resplit-scan".into(),
+                contract_version: "depgraph-analysis-unit-v2".into(),
+                unit_id: "unit".into(),
+                adapter: "go".into(),
+                unit_root: "app".into(),
+                stage: stage.into(),
+                chunk_id: chunk_id.into(),
+                chunk_index: Some(index),
+                chunk_count: Some(count),
+                status: "queued".into(),
+                reused: false,
+                source_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                context_paths: vec!["app/a.go".into(), "app/b.go".into()],
+                auxiliary_paths: Vec::new(),
+                context_fingerprint: Some("context".into()),
+                input_fingerprint: Some("input".into()),
+                dependency_ids: Vec::new(),
+                unknown_dependencies: false,
+                error: None,
+            }
+        };
+        let syntax = row("syntax", "syntax", 0, 1, &["app/a.go", "app/b.go"]);
+        let whole = row("typed", "typed-whole", 0, 1, &["app/a.go", "app/b.go"]);
+        let semantic = row("semantic", "semantic", 0, 1, &["app/a.go", "app/b.go"]);
+        store.initialize_analysis_unit_ledger(
+            "resplit-scan",
+            "depgraph-analysis-unit-v2",
+            Some("plan"),
+            Some("input"),
+            &[syntax.clone(), whole.clone(), semantic.clone()],
+        )?;
+        let typed_a = row("typed", "typed-a", 0, 2, &["app/a.go"]);
+        let typed_b = row("typed", "typed-b", 1, 2, &["app/b.go"]);
+
+        let mut unknown = whole.clone();
+        unknown.chunk_id = "typed-missing".into();
+        assert!(
+            store
+                .resplit_analysis_unit_ledger("resplit-scan", &[unknown], &[typed_a.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .resplit_analysis_unit_ledger("resplit-scan", &[whole.clone()], &[syntax.clone()])
+                .is_err(),
+            "a replacement must not duplicate an existing chunk"
+        );
+        assert_eq!(store.analysis_units("resplit-scan")?.len(), 3);
+
+        store.resplit_analysis_unit_ledger(
+            "resplit-scan",
+            &[whole.clone()],
+            &[typed_a.clone(), typed_b.clone()],
+        )?;
+        let rows = store.analysis_units("resplit-scan")?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            ["semantic", "syntax", "typed-a", "typed-b"]
+        );
+
+        let mut terminal = vec![syntax, typed_a, typed_b, semantic];
+        for row in &mut terminal {
+            row.status = "completed".into();
+        }
+        let summary = store.finalize_analysis_unit_ledger("resplit-scan", &terminal)?;
+        assert!(summary.complete, "{:?}", summary.reasons);
+        assert!(
+            store
+                .resplit_analysis_unit_ledger("resplit-scan", &[terminal[1].clone()], &[whole])
+                .is_err(),
+            "a completed row is never superseded"
+        );
         Ok(())
     }
 

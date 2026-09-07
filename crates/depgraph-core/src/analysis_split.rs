@@ -229,6 +229,17 @@ pub enum AnalysisResplitTrigger {
     EstimateExceeded,
 }
 
+impl AnalysisResplitTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerTimeout => "worker_timeout",
+            Self::WorkerMemory => "worker_memory",
+            Self::OutputLimit => "output_limit",
+            Self::EstimateExceeded => "estimate_exceeded",
+        }
+    }
+}
+
 /// Why a refinement left its target unchanged.  Every refinement in a plan's
 /// history is either applied or reported here, so a plan always explains its
 /// own refinement list.
@@ -243,6 +254,16 @@ pub enum AnalysisUnsplittableReason {
     /// typically a refinement carried over from a plan whose boundaries or
     /// budget differed, or a target already replaced by an earlier refinement.
     UnknownExecutionUnit,
+}
+
+impl AnalysisUnsplittableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleGranule => "single_granule",
+            Self::AdapterBoundary => "adapter_boundary",
+            Self::UnknownExecutionUnit => "unknown_execution_unit",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
