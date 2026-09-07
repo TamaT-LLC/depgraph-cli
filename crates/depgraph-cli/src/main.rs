@@ -400,7 +400,7 @@ enum Commands {
         kind: Vec<String>,
         /// Return the findings of completed health ranges when some ranges
         /// could not be analyzed; every finding then carries an
-        /// incomplete_coverage blocker and `partial` is true.
+        /// incomplete_coverage blocker and JSON `partial_ranges` is true.
         #[arg(long)]
         allow_partial: bool,
     },
@@ -422,7 +422,8 @@ enum Commands {
         #[arg(long, value_name = "CONFIDENCE")]
         min_confidence: Option<String>,
         /// Return completed health ranges when some ranges could not be
-        /// analyzed (every finding is then demoted to indeterminate).
+        /// analyzed (every finding is then demoted to indeterminate and JSON
+        /// `partial_ranges` is true).
         #[arg(long)]
         allow_partial: bool,
         #[arg(long)]
@@ -641,7 +642,8 @@ enum HealthNested {
         #[arg(long, value_name = "CONFIDENCE")]
         min_confidence: Option<String>,
         /// Return completed health ranges when some ranges could not be
-        /// analyzed (every finding is then demoted to indeterminate).
+        /// analyzed (every finding is then demoted to indeterminate and JSON
+        /// `partial_ranges` is true).
         #[arg(long)]
         allow_partial: bool,
         #[arg(long)]
