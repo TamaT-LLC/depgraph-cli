@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use depgraph_core::{
     BlockerKind, CancellationToken, Confidence, FindingKind, HealthFinding,
     health::{
@@ -278,6 +278,77 @@ fn health_range_plan_respects_max_ranges_and_planner_rows() -> Result<()> {
         .health_range_plan(&identity, &limits(SMALL_RANGE_BUDGET), &mut || true)
         .unwrap_err();
     assert_eq!(health_work_error(&error), Some(HealthWorkError::Cancelled));
+    Ok(())
+}
+
+/// The site-target projection is part of the planner's bounded work: it is
+/// charged row by row against `planner_rows`, and a projection that cannot
+/// fit is dropped instead of being left behind for later requests.
+#[test]
+fn planner_projection_is_charged_to_the_planner_budget_and_dropped_on_exhaustion() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let fixture = generate(temporary.path(), &HealthRangeFixtureShape::small())?;
+    let reference_store = open(&fixture)?;
+    let plan = plan_for(&reference_store, &fixture, SMALL_RANGE_BUDGET)?;
+    let site_targets = plan.stats.site_targets;
+    // The aggregate rows before the projection are one per node kind plus a
+    // handful of counts; the projection must be the larger part so that a
+    // budget of exactly `site_targets` rows is exhausted inside it.
+    let aggregate_rows_upper_bound = plan.stats.nodes_by_kind.len() as u64 + 8;
+    assert!(site_targets > aggregate_rows_upper_bound, "{plan:?}");
+    let range = plan.ranges.first().context("at least one range")?;
+    let mut reference_budget = CountingHealthWorkBudget::new(u64::MAX);
+    let reference_load = reference_store.load_health_range(&plan, range, &mut reference_budget)?;
+    assert_eq!(reference_load.work_used, reference_budget.used());
+
+    // A fresh connection has no projection; planning under `site_targets`
+    // rows passes the aggregates and must fail while projecting.
+    let store = open(&fixture)?;
+    let identity = identity(&store, &fixture)?;
+    let error = store
+        .health_range_plan(
+            &identity,
+            &HealthRangeLimits {
+                planner_rows: site_targets,
+                ..limits(SMALL_RANGE_BUDGET)
+            },
+            &mut || false,
+        )
+        .unwrap_err();
+    assert_eq!(
+        health_work_error(&error),
+        Some(HealthWorkError::ResourceExhausted)
+    );
+
+    // Nothing was left behind: the range loader has to rebuild the projection
+    // on this connection and is charged exactly its rows for doing so; the
+    // second load reuses it and costs the same as on the reference connection.
+    let mut rebuilt_budget = CountingHealthWorkBudget::new(u64::MAX);
+    let rebuilt = store.load_health_range(&plan, range, &mut rebuilt_budget)?;
+    assert_eq!(rebuilt.work_used, reference_load.work_used + site_targets);
+    assert_eq!(rebuilt.subjects, reference_load.subjects);
+    assert_eq!(rebuilt.inbound_edges, reference_load.inbound_edges);
+    assert_eq!(rebuilt.inbound_sites, reference_load.inbound_sites);
+    let mut reused_budget = CountingHealthWorkBudget::new(u64::MAX);
+    let reused = store.load_health_range(&plan, range, &mut reused_budget)?;
+    assert_eq!(reused.work_used, reference_load.work_used);
+
+    // A reused projection is still accounted for by the planner, so a plan on
+    // this connection reports the same work and digest as the reference plan.
+    let replanned = plan_for(&store, &fixture, SMALL_RANGE_BUDGET)?;
+    assert_eq!(replanned.planner_work_used, plan.planner_work_used);
+    assert_eq!(replanned.plan_digest, plan.plan_digest);
+
+    // A loader budget smaller than the projection fails closed before any
+    // range row is read.
+    let cold = open(&fixture)?;
+    let mut tiny = CountingHealthWorkBudget::new(site_targets - 1);
+    let error = cold.load_health_range(&plan, range, &mut tiny).unwrap_err();
+    assert_eq!(
+        health_work_error(&error),
+        Some(HealthWorkError::ResourceExhausted)
+    );
+    assert_eq!(tiny.used(), site_targets - 1);
     Ok(())
 }
 

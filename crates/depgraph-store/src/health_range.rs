@@ -604,10 +604,24 @@ impl CountCursor<'_> {
 
 const SITE_TARGETS_TABLE: &str = "temp.health_site_targets";
 
+/// Sites projected per batch. Each batch charges its target rows to the
+/// budget before inserting them, so the projection never grows past the
+/// budget and cancellation is observed between batches.
+const SITE_TARGET_PROJECTION_BATCH: i64 = 2_048;
+
 /// Build (or reuse) the temporary `site_id -> target_id` projection for one
 /// scan. Sites store their targets as a JSON array without an index, so the
 /// projection turns per-range site fetches into index range scans.
-fn ensure_site_target_projection(connection: &Connection, scan_id: &str) -> Result<u64> {
+///
+/// Every projected row is one step of `budget`; a budget failure drops the
+/// partial projection before the error is returned. A projection that already
+/// exists for `scan_id` is reused without charging; callers that must account
+/// for its rows (the planner) do so from the reported row count.
+fn ensure_site_target_projection(
+    connection: &Connection,
+    scan_id: &str,
+    budget: &mut dyn HealthWorkBudget,
+) -> Result<SiteTargetProjection> {
     let existing = connection
         .query_row(
             "SELECT name FROM sqlite_temp_master WHERE type='table' AND name='health_site_targets_scan'",
@@ -626,7 +640,7 @@ fn ensure_site_target_projection(connection: &Connection, scan_id: &str) -> Resu
         if let Some((current_scan, rows)) = current
             && current_scan == scan_id
         {
-            return Ok(rows);
+            return Ok(SiteTargetProjection { rows, reused: true });
         }
     }
     connection.execute_batch(&format!(
@@ -635,23 +649,104 @@ fn ensure_site_target_projection(connection: &Connection, scan_id: &str) -> Resu
          CREATE TEMP TABLE health_site_targets (target_id TEXT NOT NULL, site_id TEXT NOT NULL);
          CREATE TEMP TABLE health_site_targets_scan (scan_id TEXT NOT NULL, row_count INTEGER NOT NULL);"
     ))?;
-    let inserted = connection.execute(
-        &format!(
-            "INSERT INTO {SITE_TARGETS_TABLE}(target_id, site_id)
-             SELECT CAST(target.value AS TEXT), site.id
-               FROM sites AS site, json_each(site.target_ids_json) AS target
-              WHERE site.scan_id=?1"
-        ),
-        [scan_id],
-    )?;
+    let inserted = match project_site_targets(connection, scan_id, budget) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            // Never leave a half-built projection behind; a later request
+            // would otherwise trust its row count.
+            let _ = release_site_target_projection(connection);
+            return Err(error);
+        }
+    };
     connection.execute_batch(
         "CREATE INDEX temp.health_site_targets_target ON health_site_targets(target_id, site_id);",
     )?;
     connection.execute(
         "INSERT INTO temp.health_site_targets_scan(scan_id, row_count) VALUES (?1, ?2)",
-        params![scan_id, inserted as u64],
+        params![scan_id, inserted],
     )?;
-    Ok(inserted as u64)
+    Ok(SiteTargetProjection {
+        rows: inserted,
+        reused: false,
+    })
+}
+
+struct SiteTargetProjection {
+    rows: u64,
+    /// The table already existed for this scan, so no row was charged.
+    reused: bool,
+}
+
+/// Fill the projection in primary-key order, one bounded batch of sites at a
+/// time. The batch's target count is charged before its rows are inserted so
+/// an exhausted budget stops the projection without materializing the batch.
+fn project_site_targets(
+    connection: &Connection,
+    scan_id: &str,
+    budget: &mut dyn HealthWorkBudget,
+) -> Result<u64> {
+    let mut batch_statement = connection.prepare(
+        "SELECT id, json_array_length(target_ids_json) FROM sites
+          WHERE scan_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
+    )?;
+    let mut insert_statement = connection.prepare(&format!(
+        "INSERT INTO {SITE_TARGETS_TABLE}(target_id, site_id)
+         SELECT CAST(target.value AS TEXT), site.id
+           FROM sites AS site, json_each(site.target_ids_json) AS target
+          WHERE site.scan_id=?1 AND site.id>?2 AND site.id<=?3"
+    ))?;
+    let mut inserted = 0_u64;
+    let mut cursor = String::new();
+    loop {
+        let mut last: Option<String> = None;
+        let mut targets = 0_u64;
+        let mut sites = 0_i64;
+        let mut rows = batch_statement.query(params![
+            scan_id,
+            cursor.as_str(),
+            SITE_TARGET_PROJECTION_BATCH
+        ])?;
+        while let Some(row) = rows.next()? {
+            last = Some(row.get::<_, String>(0)?);
+            targets += row.get::<_, Option<u64>>(1)?.unwrap_or(0);
+            sites += 1;
+        }
+        drop(rows);
+        let Some(last) = last else {
+            break;
+        };
+        for _ in 0..targets {
+            charge(budget)?;
+        }
+        inserted +=
+            insert_statement.execute(params![scan_id, cursor.as_str(), last.as_str()])? as u64;
+        cursor = last;
+        if sites < SITE_TARGET_PROJECTION_BATCH {
+            break;
+        }
+    }
+    Ok(inserted)
+}
+
+/// Planner-side budget: counts projected rows toward `planner_rows` and polls
+/// cancellation at the same 4,096-row cadence as the rest of the planner.
+struct PlannerRowBudget<'a> {
+    rows_read: &'a mut u64,
+    limit: u64,
+    cancelled: &'a mut dyn FnMut() -> bool,
+}
+
+impl HealthWorkBudget for PlannerRowBudget<'_> {
+    fn step(&mut self) -> std::result::Result<(), HealthWorkError> {
+        *self.rows_read += 1;
+        if *self.rows_read > self.limit {
+            return Err(HealthWorkError::ResourceExhausted);
+        }
+        if self.rows_read.is_multiple_of(4096) && (self.cancelled)() {
+            return Err(HealthWorkError::Cancelled);
+        }
+        Ok(())
+    }
 }
 
 fn release_site_target_projection(connection: &Connection) -> Result<()> {
@@ -869,6 +964,22 @@ fn placeholders(count: usize) -> String {
     out
 }
 
+/// Planner bound: `rows_read` aggregate/index rows may not exceed
+/// `planner_rows`, and cancellation is honoured at every checkpoint.
+fn planner_check(
+    cancelled: &mut dyn FnMut() -> bool,
+    rows_read: u64,
+    planner_rows: u64,
+) -> Result<()> {
+    if cancelled() {
+        return Err(HealthWorkError::Cancelled.into());
+    }
+    if rows_read > planner_rows {
+        return Err(HealthWorkError::ResourceExhausted.into());
+    }
+    Ok(())
+}
+
 impl Store {
     /// Resolve which scan tables and overlay layers a health request reads,
     /// without loading any graph row.
@@ -957,15 +1068,7 @@ impl Store {
         let connection = &self.connection;
         let scan_id = identity.base_scan_id.as_str();
         let mut rows_read = 0_u64;
-        let mut check = |rows_read: u64| -> Result<()> {
-            if cancelled() {
-                return Err(HealthWorkError::Cancelled.into());
-            }
-            if rows_read > limits.planner_rows {
-                return Err(HealthWorkError::ResourceExhausted.into());
-            }
-            Ok(())
-        };
+        let planner_rows = limits.planner_rows;
 
         let mut stats = HealthTargetStats::default();
         let mut kinds = connection.prepare(
@@ -981,7 +1084,7 @@ impl Store {
             }
             stats.nodes_by_kind.insert(kind, count);
         }
-        check(rows_read)?;
+        planner_check(cancelled, rows_read, planner_rows)?;
         (
             stats.edges,
             stats.sites,
@@ -1035,13 +1138,27 @@ impl Store {
             |row| row.get(0),
         )?;
         rows_read += 4;
-        check(rows_read)?;
+        planner_check(cancelled, rows_read, planner_rows)?;
 
         // Site targets are a JSON array without an index; project them once so
-        // both the planner and the range loader can seek by target id.
-        stats.site_targets = ensure_site_target_projection(connection, scan_id)?;
-        rows_read += stats.site_targets;
-        check(rows_read)?;
+        // both the planner and the range loader can seek by target id. The
+        // projection charges the planner budget row by row, so an input with
+        // more targets than the budget fails before the table is built.
+        let projection = {
+            let mut projection_budget = PlannerRowBudget {
+                rows_read: &mut rows_read,
+                limit: planner_rows,
+                cancelled,
+            };
+            ensure_site_target_projection(connection, scan_id, &mut projection_budget)?
+        };
+        stats.site_targets = projection.rows;
+        if projection.reused {
+            // Account for the reused rows so a repeated plan on the same
+            // connection reports the same work and digest as the first one.
+            rows_read += projection.rows;
+        }
+        planner_check(cancelled, rows_read, planner_rows)?;
 
         let go_profile_cost = HEALTH_RANGE_ESTIMATE_PER_GO_PROFILE * stats.go_profiles;
         let cut_at = (limits.per_range_work / HEALTH_RANGE_ESTIMATE_SAFETY_DIVISOR).max(1);
@@ -1082,7 +1199,7 @@ impl Store {
             let is_go_file = row.get::<_, i64>(1)? == 1;
             rows_read += 1;
             if rows_read.is_multiple_of(4096) {
-                check(rows_read)?;
+                planner_check(cancelled, rows_read, planner_rows)?;
             }
             let inbound_edges = edges.count_for(&id, &mut rows_read)?;
             let inbound_sites = sites.count_for(&id, &mut rows_read)?;
@@ -1120,7 +1237,7 @@ impl Store {
                 return Err(HealthWorkError::ResourceExhausted.into());
             }
         }
-        check(rows_read)?;
+        planner_check(cancelled, rows_read, planner_rows)?;
 
         let mut plan = HealthRangePlan {
             contract_version: HEALTH_RANGE_PLAN_CONTRACT_VERSION.to_owned(),
@@ -1338,8 +1455,10 @@ impl Store {
     ) -> Result<HealthRangeInput> {
         let connection = &self.connection;
         let scan_id = plan.identity.base_scan_id.as_str();
-        ensure_site_target_projection(connection, scan_id)?;
         let mut work = WorkCounter::new(budget);
+        // Normally reused from planning on this connection; rebuilding it on a
+        // fresh connection is charged to this range like any other row load.
+        ensure_site_target_projection(connection, scan_id, &mut work)?;
         let lo = range.first_subject_id.as_str();
         let hi = range.last_subject_id.as_str();
         let mut subjects = Vec::new();

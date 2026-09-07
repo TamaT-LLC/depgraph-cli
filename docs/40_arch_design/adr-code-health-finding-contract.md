@@ -239,8 +239,12 @@ into ranges whose estimated load, index, and analysis work fits the unchanged
 per-phase budget of 1,000,000 steps (`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`).
 The planner itself is bounded by `MAX_HEALTH_PLANNER_ROWS` (4,000,000 rows) and
 `MAX_HEALTH_RANGES` (256); exceeding either is `RESOURCE_EXHAUSTED`, never a
-partial plan. The plan digest binds identity, limits, statistics, and range
-boundaries.
+partial plan. The temporary site-target projection the planner and the range
+loader seek through counts toward the same row bound: it is filled in batches
+of sites whose target rows are charged before they are inserted, cancellation
+is polled between batches, and a projection that does not fit is dropped rather
+than left on the connection. The plan digest binds identity, limits,
+statistics, and range boundaries.
 
 Execution charges four independent budgets of the same size: the snapshot-wide
 context (profiles, profile matrix, coverage, coverage-omitted paths, Go
