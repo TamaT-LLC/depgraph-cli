@@ -253,6 +253,11 @@ struct EventSink<'a> {
 
 impl EventSink<'_> {
     fn push(&mut self, mut event: Value) {
+        // Once ingest has failed the run is over; buffering the rest of the
+        // stream would only grow `pending` until the error is reported.
+        if self.error.is_some() {
+            return;
+        }
         self.seq += 1;
         event["seq"] = json!(self.seq);
         event["scan_id"] = json!(self.scan_id);
