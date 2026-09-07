@@ -231,7 +231,6 @@ func goLoaderProperties(report *goLoaderReport) map[string]string {
 		"go_loader_build_cache_reused":               strconv.FormatBool(metrics.BuildCacheReused),
 		"go_loader_witness":                          metrics.Witness,
 		"go_reference_fingerprint_schema":            goReferenceFingerprintSchema,
-		"go_reference_fingerprint":                   report.ReferenceFingerprint.Fingerprint,
 		"go_reference_fingerprint_packages":          strconv.Itoa(report.ReferenceFingerprint.PackageCount),
 		"go_reference_fingerprint_files":             strconv.Itoa(report.ReferenceFingerprint.FileCount),
 		"go_packages_query":                          "targets-syntax-types-info,dependencies-export-data",
@@ -253,6 +252,9 @@ func goLoaderProperties(report *goLoaderReport) map[string]string {
 	}
 	if metrics.SelfPeakRSSBytes > 0 {
 		properties["go_loader_peak_rss_bytes"] = strconv.FormatInt(metrics.SelfPeakRSSBytes, 10)
+	}
+	if report.ReferenceFingerprint.Fingerprint != "" {
+		properties["go_reference_fingerprint"] = report.ReferenceFingerprint.Fingerprint
 	}
 	if len(report.ReferenceFingerprint.Reasons) > 0 {
 		properties["go_reference_fingerprint_reasons"] = strings.Join(report.ReferenceFingerprint.Reasons, ",")

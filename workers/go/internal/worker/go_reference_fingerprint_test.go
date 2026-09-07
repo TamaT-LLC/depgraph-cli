@@ -4,8 +4,30 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
+
+func referenceFingerprintWithInRepoDep(t *testing.T) goReferenceFingerprint {
+	t.Helper()
+	root := canonicalTestRoot(t, t.TempDir())
+	depFile := filepath.Join(root, "dep.go")
+	writeTestFile(t, depFile, "package dep\n")
+	module := Module{Dir: root, RelativeDir: ".", Path: "example.com/app"}
+	dep := &packages.Package{
+		ID: "example.com/app/dep", PkgPath: "example.com/app/dep", Name: "dep",
+		Module:  &packages.Module{Path: "example.com/app", Dir: root},
+		GoFiles: []string{depFile}, CompiledGoFiles: []string{depFile},
+	}
+	target := &packages.Package{
+		ID: "example.com/app", PkgPath: "example.com/app", Name: "app",
+		Module:  &packages.Module{Path: "example.com/app", Dir: root},
+		Imports: map[string]*packages.Package{"example.com/app/dep": dep},
+	}
+	return computeGoReferenceFingerprint(root, []Module{module}, []*packages.Package{target}, nil)
+}
 
 func TestOpenReferenceFileOpensRegularFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "real.go")
@@ -60,5 +82,18 @@ func TestGoReferenceFileDigestHashesOpenedHandle(t *testing.T) {
 	}
 	if digest == "" {
 		t.Fatal("empty digest")
+	}
+}
+
+func TestComputeGoReferenceFingerprintBindsFileContentWhenNoFollowAvailable(t *testing.T) {
+	fp := referenceFingerprintWithInRepoDep(t)
+	if fp.Fingerprint == "" {
+		if slices.Contains(fp.Reasons, "reference-file-nofollow-unavailable") {
+			t.Skip("no-follow open is unavailable on this platform")
+		}
+		t.Fatalf("fingerprint missing: %+v", fp)
+	}
+	if fp.PackageCount != 1 || fp.FileCount != 1 {
+		t.Fatalf("fingerprint = %+v", fp)
 	}
 }

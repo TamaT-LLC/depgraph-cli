@@ -14,6 +14,8 @@ import (
 // open a confined path without following a swapped final-component symlink.
 var errReferenceOpenNoFollowUnavailable = errors.New("reference-file no-follow open is unavailable on this platform")
 
+var errReferenceFileNotRegular = errors.New("reference file is not a regular file")
+
 const goReferenceFingerprintSchema = "go-reference-fingerprint-v1"
 
 // goReferenceFingerprint digests the source of every in-repo package in the
@@ -57,6 +59,7 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 	}
 	visited := map[string]bool{}
 	reasons := map[string]bool{}
+	noFollowUnavailable := false
 	var entries []goReferenceFingerprintPackage
 	queue := append([]*packages.Package(nil), targets...)
 	for len(queue) > 0 {
@@ -83,12 +86,22 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 				}
 				digest, ok := digests[confined]
 				if !ok {
-					digest, ok = goReferenceFileDigest(confined)
-					if !ok {
+					var err error
+					digest, err = hashReferenceFile(confined)
+					if errors.Is(err, errReferenceOpenNoFollowUnavailable) {
+						reasons["reference-file-nofollow-unavailable"] = true
+						noFollowUnavailable = true
+						continue
+					}
+					if err != nil {
 						reasons["reference-file-unreadable"] = true
 						continue
 					}
 					digests[confined] = digest
+					ok = true
+				}
+				if !ok {
+					continue
 				}
 				entry.Files = append(entry.Files, goReferenceFingerprintFile{Path: relativePath(root, confined), Digest: digest})
 			}
@@ -124,6 +137,9 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 	for _, entry := range entries {
 		fileCount += len(entry.Files)
 	}
+	if noFollowUnavailable {
+		return goReferenceFingerprint{PackageCount: len(entries), Reasons: reasonList}
+	}
 	payload := map[string]any{"schema": goReferenceFingerprintSchema, "packages": entries, "reasons": reasonList}
 	return goReferenceFingerprint{
 		Fingerprint:  stableIDFromValue("go_reference_fingerprint", payload),
@@ -132,20 +148,31 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 }
 
 func goReferenceFileDigest(path string) (string, bool) {
+	digest, err := hashReferenceFile(path)
+	return digest, err == nil
+}
+
+func hashReferenceFile(path string) (string, error) {
 	file, err := openReferenceFile(path)
 	if err != nil {
-		return "", false
+		return "", err
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		_ = file.Close()
-		return "", false
+		if err != nil {
+			return "", err
+		}
+		return "", errReferenceFileNotRegular
 	}
 	hasher := sha256.New()
 	_, copyErr := io.Copy(hasher, file)
 	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil {
-		return "", false
+	if copyErr != nil {
+		return "", copyErr
 	}
-	return "sha256:" + hex.EncodeToString(hasher.Sum(nil)), true
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return "sha256:" + hex.EncodeToString(hasher.Sum(nil)), nil
 }
