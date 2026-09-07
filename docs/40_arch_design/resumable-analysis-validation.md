@@ -126,9 +126,12 @@ plain input but plans bounded store ranges, analyzes each range under the
 unchanged per-range budget, and reuses per-range checkpoints. The same Go CI
 job runs it after the resumable fixture and uploads the report as the
 `health-range-report` artifact, keeping the eight-job identity. The xtask
-writes the report (`gate.passed`, `gate.failure`, the runner report, the CLI
-envelope) before it raises a failed comparison, and the upload step runs
-whenever the gate ran, so a divergence leaves its evidence in the artifact.
+writes the report before it raises the verdict on every path — fixture
+generation failure, a runner that exited without its own report, a CLI
+failure, or a failed comparison — with `gate.passed`, `gate.failure`, the
+`generate` and `runner_step` exit codes and read errors, the runner report
+when it exists, and the CLI envelope; the upload step runs whenever the gate
+step ran, so a failure leaves its evidence in the artifact.
 
 The fixture is public and synthetic. `crates/depgraph-core/tests/support/health_range_fixture.rs`
 generates a Go-shaped worker protocol stream (`go` adapter, `depgraph-protocol`

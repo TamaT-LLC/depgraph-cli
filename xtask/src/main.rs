@@ -6,7 +6,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1169,81 +1169,19 @@ fn health_range_e2e() -> Result<()> {
         "health_range_e2e",
         "--",
     ];
-    // Generation runs in its own process so the measured peak RSS of the
-    // ranged path does not include building the fixture.
-    let generate_report = work_dir.join("generate-report.json");
-    run(Command::new("cargo")
-        .args(runner)
-        .args(["--shape", "over-limit", "--generate-only", "--work-dir"])
-        .arg(&fixture_dir)
-        .arg("--report")
-        .arg(&generate_report)
-        .stdout(std::process::Stdio::null()))?;
-    // The runner writes its report before it exits non-zero on a divergence,
-    // so its status is folded into the verdict below instead of aborting here;
-    // the combined report then carries the evidence of the failure.
-    let runner_report = work_dir.join("runner-report.json");
-    let mut runner_command = Command::new("cargo");
-    runner_command
-        .args(runner)
-        .arg("--store")
-        .arg(&store)
-        .arg("--root")
-        .arg(&repo)
-        .arg("--report")
-        .arg(&runner_report)
-        .stdout(std::process::Stdio::null());
-    let runner_status = runner_command
-        .status()
-        .with_context(|| format!("failed to start {runner_command:?}"))?;
-    let read_json = |path: &Path| -> Result<Value> {
-        Ok(serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("missing {}", path.display()))?,
-        )?)
-    };
-    let generated = read_json(&generate_report)?;
-    let mut runner = read_json(&runner_report)
-        .with_context(|| format!("{runner_command:?} exited with {runner_status}"))?;
-    runner["input"] = generated["input"].clone();
-
-    // The CLI on the generated store must report the same ranged execution.
-    let cli = target_dir.join("debug").join(executable_name("depgraph"));
-    let output = Command::new(&cli)
-        .current_dir(&repo)
-        .arg("--store")
-        .arg(&store)
-        .args(["health", "--json"])
-        .output()
-        .with_context(|| format!("failed to start {}", cli.display()))?;
-    let envelope = serde_json::from_slice::<Value>(&output.stdout).ok();
-
-    // The report is written before the verdict is raised so a failed
-    // comparison still leaves its evidence behind (CI uploads it either way).
-    let verdict = if runner_status.success() {
-        verify_health_range_evidence(&runner, &output, envelope.as_ref())
-    } else {
-        Err(anyhow!(
-            "health range e2e: the runner exited with {runner_status} (see runner.comparison)"
-        ))
-    };
-    let report = json!({
-        "contract": "depgraph-health-range-e2e-v1",
-        "gate": {
-            "passed": verdict.is_ok(),
-            "failure": verdict.as_ref().err().map(|error| format!("{error:#}")),
-        },
-        "runner": runner,
-        "runner_exit_code": runner_status.code(),
-        "cli": {
-            "command": "depgraph --store <fixture> health --json",
-            "exit_code": output.status.code(),
-            "envelope": envelope,
-        },
-    });
-    let rendered = format!("{}\n", serde_json::to_string_pretty(&report)?);
     let report_path = std::env::var_os("DEPGRAPH_HEALTH_RANGE_REPORT")
         .map(PathBuf::from)
         .unwrap_or_else(|| work_dir.join("report.json"));
+    let cli = target_dir.join("debug").join(executable_name("depgraph"));
+    let evidence =
+        HealthRangeEvidence::collect(&work_dir, &fixture_dir, &store, &repo, &runner, &cli)?;
+    // The combined report is written on every path (generation failure,
+    // runner failure with or without its own report, CLI failure, failed
+    // comparison) before the verdict is raised, so the CI artifact always
+    // carries the evidence of what went wrong.
+    let verdict = evidence.verdict();
+    let report = evidence.report(&verdict);
+    let rendered = format!("{}\n", serde_json::to_string_pretty(&report)?);
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1264,6 +1202,189 @@ fn health_range_e2e() -> Result<()> {
         report_path.display()
     );
     Ok(())
+}
+
+/// One child step of the health-range gate: its exit status and the JSON it
+/// produced, or why that JSON could not be read.
+struct HealthRangeStep {
+    command: String,
+    exit_code: Option<i32>,
+    success: bool,
+    output: Option<Value>,
+    error: Option<String>,
+}
+
+impl HealthRangeStep {
+    fn run(mut command: Command, report: Option<&Path>) -> Result<Self> {
+        let display = format!("{command:?}");
+        let status = command
+            .status()
+            .with_context(|| format!("failed to start {display}"))?;
+        let (output, error) = match report {
+            Some(path) => match fs::read(path)
+                .with_context(|| format!("missing {}", path.display()))
+                .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?))
+            {
+                Ok(value) => (Some(value), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            },
+            None => (None, None),
+        };
+        Ok(Self {
+            command: display,
+            exit_code: status.code(),
+            success: status.success(),
+            output,
+            error,
+        })
+    }
+
+    fn failure(&self) -> Option<String> {
+        if !self.success {
+            return Some(format!(
+                "{} exited with code {:?}{}",
+                self.command,
+                self.exit_code,
+                self.error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            ));
+        }
+        self.error
+            .as_deref()
+            .map(|error| format!("{} produced no readable report: {error}", self.command))
+    }
+}
+
+/// Everything the health-range gate observed, kept so the report can be
+/// written before the verdict decides the exit status.
+struct HealthRangeEvidence {
+    generate: HealthRangeStep,
+    runner: Option<HealthRangeStep>,
+    cli: Option<(std::process::Output, Option<Value>)>,
+}
+
+impl HealthRangeEvidence {
+    fn collect(
+        work_dir: &Path,
+        fixture_dir: &Path,
+        store: &Path,
+        repo: &Path,
+        runner_args: &[&str],
+        cli: &Path,
+    ) -> Result<Self> {
+        // Generation runs in its own process so the measured peak RSS of the
+        // ranged path does not include building the fixture.
+        let generate_report = work_dir.join("generate-report.json");
+        let mut generate = Command::new("cargo");
+        generate
+            .args(runner_args)
+            .args(["--shape", "over-limit", "--generate-only", "--work-dir"])
+            .arg(fixture_dir)
+            .arg("--report")
+            .arg(&generate_report)
+            .stdout(std::process::Stdio::null());
+        let generate = HealthRangeStep::run(generate, Some(&generate_report))?;
+        if generate.failure().is_some() {
+            return Ok(Self {
+                generate,
+                runner: None,
+                cli: None,
+            });
+        }
+
+        // The runner writes its report before it exits non-zero on a
+        // divergence; a runner that died earlier leaves no report, and both
+        // cases are recorded rather than aborting.
+        let runner_report = work_dir.join("runner-report.json");
+        let mut runner = Command::new("cargo");
+        runner
+            .args(runner_args)
+            .arg("--store")
+            .arg(store)
+            .arg("--root")
+            .arg(repo)
+            .arg("--report")
+            .arg(&runner_report)
+            .stdout(std::process::Stdio::null());
+        let mut runner = HealthRangeStep::run(runner, Some(&runner_report))?;
+        if let (Some(runner), Some(generated)) = (runner.output.as_mut(), &generate.output) {
+            runner["input"] = generated["input"].clone();
+        }
+        if runner.failure().is_some() {
+            return Ok(Self {
+                generate,
+                runner: Some(runner),
+                cli: None,
+            });
+        }
+
+        // The CLI on the generated store must report the same ranged execution.
+        let output = Command::new(cli)
+            .current_dir(repo)
+            .arg("--store")
+            .arg(store)
+            .args(["health", "--json"])
+            .output()
+            .with_context(|| format!("failed to start {}", cli.display()))?;
+        let envelope = serde_json::from_slice::<Value>(&output.stdout).ok();
+        Ok(Self {
+            generate,
+            runner: Some(runner),
+            cli: Some((output, envelope)),
+        })
+    }
+
+    fn verdict(&self) -> Result<()> {
+        if let Some(failure) = self.generate.failure() {
+            bail!("health range e2e: fixture generation failed: {failure}");
+        }
+        let runner = self
+            .runner
+            .as_ref()
+            .context("health range e2e: the runner did not run")?;
+        if let Some(failure) = runner.failure() {
+            bail!("health range e2e: the runner failed: {failure} (see runner.comparison)");
+        }
+        let report = runner
+            .output
+            .as_ref()
+            .context("health range e2e: the runner produced no report")?;
+        let (output, envelope) = self
+            .cli
+            .as_ref()
+            .context("health range e2e: depgraph health --json did not run")?;
+        verify_health_range_evidence(report, output, envelope.as_ref())
+    }
+
+    fn report(&self, verdict: &Result<()>) -> Value {
+        let step = |step: &HealthRangeStep| {
+            json!({
+                "command": step.command,
+                "exit_code": step.exit_code,
+                "error": step.error,
+            })
+        };
+        json!({
+            "contract": "depgraph-health-range-e2e-v1",
+            "gate": {
+                "passed": verdict.is_ok(),
+                "failure": verdict.as_ref().err().map(|error| format!("{error:#}")),
+            },
+            "generate": step(&self.generate),
+            "runner": self.runner.as_ref().and_then(|runner| runner.output.clone()),
+            "runner_step": self.runner.as_ref().map(step),
+            "cli": self.cli.as_ref().map(|(output, envelope)| {
+                json!({
+                    "command": "depgraph --store <fixture> health --json",
+                    "exit_code": output.status.code(),
+                    "envelope": envelope,
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                })
+            }),
+        })
+    }
 }
 
 /// The health-range gate: every comparison the runner recorded must hold, the
@@ -5243,7 +5364,7 @@ mod tests {
         BENCHMARK_REPORT_SCHEMA_VERSION, BOUNDED_QUERY_PACKAGE_SMOKE_SCHEMA_VERSION,
         BoundedQueryPackageSmokeReport, CROSS_LANGUAGE_PACKAGE_SMOKE_SCHEMA_VERSION, Cli,
         CrossLanguagePackageSmokeReport, DependencyPackage, FULL_CI_JOB_NAMES, FullCiJobEvidence,
-        FullCiRunEvidence, MAX_RELEASE_ARCHIVE_ENTRY_BYTES,
+        FullCiRunEvidence, HealthRangeEvidence, HealthRangeStep, MAX_RELEASE_ARCHIVE_ENTRY_BYTES,
         MAX_RELEASE_ARCHIVE_MEMBER_METADATA_BYTES, MCP_OPERATION_CONTRACT_VERSION,
         MCP_PROTOCOL_REVISION, MCP_SDK_VERSION, MCP_TOOL_CONTRACT_VERSION,
         PROJECT_LICENSE_EXPRESSION, RELEASE_CARGO_BUILD_TARGETS,
@@ -8166,5 +8287,52 @@ jobs:
             .unwrap_err()
             .to_string();
         assert!(error.contains("complete ranged execution"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_range_gate_reports_a_runner_that_died_without_a_report() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let generate_report = temp.path().join("generate-report.json");
+        fs::write(&generate_report, br#"{"input": {"shape": "over-limit"}}"#)?;
+        let generate =
+            HealthRangeStep::run(std::process::Command::new("true"), Some(&generate_report))?;
+        assert!(generate.failure().is_none());
+
+        let missing = temp.path().join("runner-report.json");
+        let mut dying = std::process::Command::new("sh");
+        dying.args(["-c", "exit 3"]);
+        let runner = HealthRangeStep::run(dying, Some(&missing))?;
+        let failure = runner.failure().expect("a non-zero runner is a failure");
+        assert!(failure.contains("code Some(3)"), "{failure}");
+        assert!(failure.contains("missing"), "{failure}");
+
+        let evidence = HealthRangeEvidence {
+            generate,
+            runner: Some(runner),
+            cli: None,
+        };
+        let verdict = evidence.verdict();
+        let error = verdict.as_ref().unwrap_err().to_string();
+        assert!(error.contains("the runner failed"), "{error}");
+        let report = evidence.report(&verdict);
+        assert_eq!(report["contract"], json!("depgraph-health-range-e2e-v1"));
+        assert_eq!(report["gate"]["passed"], json!(false));
+        assert!(
+            report["gate"]["failure"]
+                .as_str()
+                .is_some_and(|failure| failure.contains("code Some(3)"))
+        );
+        assert_eq!(report["runner"], Value::Null);
+        assert_eq!(report["runner_step"]["exit_code"], json!(3));
+        assert!(report["runner_step"]["error"].as_str().is_some());
+        assert_eq!(report["generate"]["exit_code"], json!(0));
+        assert_eq!(report["cli"], Value::Null);
+
+        // A runner that exits zero but leaves no report is a failure as well.
+        let silent = HealthRangeStep::run(std::process::Command::new("true"), Some(&missing))?;
+        let failure = silent.failure().expect("a missing report is a failure");
+        assert!(failure.contains("no readable report"), "{failure}");
+        Ok(())
     }
 }
