@@ -408,6 +408,12 @@ pub struct CollectionIdentity {
     pub churn_path_filter: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotspot_weights: Option<BTreeMap<String, u32>>,
+    /// Range status of an opt-in partial collection (`ranges:<done>/<total>
+    /// failed:<n> interrupted:<n>`). `None` for every complete collection, so
+    /// a complete collection's digest is unchanged and a partial view never
+    /// shares a digest with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_ranges: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -837,6 +843,7 @@ mod tests {
             churn_commit_limit: None,
             churn_path_filter: Vec::new(),
             hotspot_weights: None,
+            partial_ranges: None,
         };
         let first = collection_digest(&identity, &["finding:2".to_owned(), "finding:1".to_owned()]);
         let second =
@@ -856,6 +863,7 @@ mod tests {
             churn_commit_limit: None,
             churn_path_filter: Vec::new(),
             hotspot_weights: None,
+            partial_ranges: None,
         };
         let findings = ["finding:a".to_owned()];
         let first = collection_digest_with_policy(&identity, &findings, "policy:a");

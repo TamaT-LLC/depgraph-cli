@@ -70,9 +70,27 @@ pub fn analyze_dependencies_cancellable(
     manifests: &[ManifestIdentity],
     maximum_findings: usize,
     maximum_work: usize,
-    mut is_cancelled: impl FnMut() -> bool,
+    is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
     let mut budget = HealthAnalysisBudget::new(maximum_work);
+    analyze_dependencies_with_budget(
+        snapshot,
+        manifests,
+        maximum_findings,
+        &mut budget,
+        is_cancelled,
+    )
+}
+
+/// Dependency analysis charged to a caller-owned budget so the ranged health
+/// path can report the work this phase consumed.
+pub(crate) fn analyze_dependencies_with_budget(
+    snapshot: &GraphSnapshot,
+    manifests: &[ManifestIdentity],
+    maximum_findings: usize,
+    budget: &mut HealthAnalysisBudget,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
     let mut findings = Vec::new();
     let mut finding_ids = BTreeSet::new();
     let mut nodes = BTreeMap::<&str, &NodeRecord>::new();
@@ -90,12 +108,12 @@ pub fn analyze_dependencies_cancellable(
         budget.step(&mut is_cancelled)?;
         manifests_by_path.insert(manifest.path.as_str(), manifest);
     }
-    let manifest_scopes = manifest_scope_index(snapshot, &nodes, &mut budget, &mut is_cancelled)?;
+    let manifest_scopes = manifest_scope_index(snapshot, &nodes, budget, &mut is_cancelled)?;
     let usage_targets = package_usage_targets(
         snapshot,
         &nodes,
         &manifest_scopes,
-        &mut budget,
+        budget,
         &mut is_cancelled,
     )?;
     let mut graph_names_by_manifest = BTreeMap::<String, BTreeSet<String>>::new();
@@ -128,7 +146,7 @@ pub fn analyze_dependencies_cancellable(
         let scope_enforced = site.kind == "module_requirement";
         let mut scope_uncertain = scope_enforced && usage_scope_path.is_none();
         let usage_paths = if site.kind == "module_requirement" {
-            go_requirement_usage_paths(site, &nodes, &mut budget, &mut is_cancelled)?
+            go_requirement_usage_paths(site, &nodes, budget, &mut is_cancelled)?
         } else {
             vec![specifier.to_owned()]
         };
@@ -143,7 +161,7 @@ pub fn analyze_dependencies_cancellable(
                     &mut scope_uncertain,
                     &mut used_from_production,
                     &mut used_from_test,
-                    &mut budget,
+                    budget,
                     &mut is_cancelled,
                 )?;
             }
@@ -163,7 +181,7 @@ pub fn analyze_dependencies_cancellable(
                         &mut scope_uncertain,
                         &mut used_from_production,
                         &mut used_from_test,
-                        &mut budget,
+                        budget,
                         &mut is_cancelled,
                     )?;
                     if used_from_production && used_from_test {
@@ -178,7 +196,7 @@ pub fn analyze_dependencies_cancellable(
         let production_declared = is_production_declaration(site);
         let profile_coverage = dependency_profile_coverage(
             profiles.get(site.profile_id.as_str()).copied(),
-            &mut budget,
+            budget,
             &mut is_cancelled,
         )?;
         if !used_from_production && !used_from_test {
@@ -291,7 +309,7 @@ pub fn analyze_dependencies_cancellable(
             }
         }
     }
-    consolidate_findings(findings, &mut budget, &mut is_cancelled)
+    consolidate_findings(findings, budget, &mut is_cancelled)
 }
 
 fn push_finding(

@@ -3,6 +3,8 @@ mod budget;
 pub mod contract;
 pub mod dependency;
 pub mod hotspot;
+pub mod range_checkpoint;
+pub mod ranged;
 pub mod surface;
 pub mod unused;
 
@@ -28,7 +30,7 @@ pub use hotspot::{
     hotspot_weighted_total, score_hotspots, score_hotspots_cancellable,
 };
 pub use surface::{SurfaceClassification, SurfaceRole, classify_surface};
-pub use unused::{analyze_unused, analyze_unused_cancellable};
+pub use unused::{analyze_unused, analyze_unused_cancellable, analyze_unused_measured};
 
 /// Return the canonical policy identity bound to a production scan.
 ///

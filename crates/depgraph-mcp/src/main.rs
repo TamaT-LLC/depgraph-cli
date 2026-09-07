@@ -34,13 +34,13 @@ use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType,
-    AgentGraphExportResponse, AgentHealthAudit, AgentHealthFinding, AgentHealthFindingDetail,
-    AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary, AgentId, AgentLocator,
-    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
-    AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
-    AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
-    AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeTraceEvent,
+    AgentGraphExportResponse, AgentHealthAudit, AgentHealthExecution, AgentHealthFinding,
+    AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary,
+    AgentId, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
+    AgentOperationStatus, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
+    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
+    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
+    AgentRemediation, AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeTraceEvent,
     AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
     AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
     AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
@@ -609,6 +609,8 @@ struct HealthSummaryArguments {
     snapshot: Option<String>,
     #[serde(default)]
     kinds: Vec<String>,
+    #[serde(default)]
+    allow_partial_ranges: bool,
 }
 
 #[derive(Deserialize)]
@@ -624,6 +626,8 @@ struct HealthFindingsArguments {
     severities: Vec<String>,
     #[serde(default)]
     confidences: Vec<String>,
+    #[serde(default)]
+    allow_partial_ranges: bool,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -3621,7 +3625,8 @@ fn execute_catalog_read_tool(
             } else {
                 Some(parse_snapshot_scoped_kinds(&arguments.kinds)?)
             };
-            let request = HealthSummaryRequest::try_new(kinds)?;
+            let request = HealthSummaryRequest::try_new(kinds)?
+                .with_allow_partial(arguments.allow_partial_ranges);
             let locator =
                 SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
             let mut snapshot_request =
@@ -3636,6 +3641,8 @@ fn execute_catalog_read_tool(
                 found.coverage().files_skipped,
                 found.coverage().unresolved,
                 found.coverage().candidates,
+                found.partial(),
+                AgentHealthExecution::from_core(found.diagnostics()),
             )
             .map_err(contract_mapping_error)?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
@@ -3658,7 +3665,8 @@ fn execute_catalog_read_tool(
                 parse_health_severities(&arguments.severities)?,
                 parse_health_confidences(&arguments.confidences)?,
                 MAX_HEALTH_FINDINGS,
-            )?;
+            )?
+            .with_allow_partial(arguments.allow_partial_ranges);
             let locator =
                 SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
             let mut snapshot_request =
@@ -3686,8 +3694,13 @@ fn execute_catalog_read_tool(
                 &page_request,
                 cancellation,
             )?;
-            let result = AgentHealthFindingsPage::try_new(found.collection_digest(), page)
-                .map_err(contract_mapping_error)?;
+            let result = AgentHealthFindingsPage::try_new(
+                found.collection_digest(),
+                page,
+                found.partial(),
+                AgentHealthExecution::from_core(found.diagnostics()),
+            )
+            .map_err(contract_mapping_error)?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),

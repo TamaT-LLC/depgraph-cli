@@ -14,6 +14,7 @@ mod analysis_coverage;
 mod build;
 mod cache;
 mod diff;
+mod health_range;
 mod impact_cache;
 mod incremental;
 mod profile_matrix;
@@ -36,6 +37,15 @@ pub use cache::{
 pub use diff::{
     ChangedRecord, GraphSnapshotDiff, NodeRename, NodeRenameEvidence, RecordDiff, RenameConfidence,
     SNAPSHOT_DIFF_SCHEMA_VERSION, diff_graph_snapshots,
+};
+pub use health_range::{
+    CountingHealthWorkBudget, HEALTH_RANGE_ESTIMATE_PER_EDGE, HEALTH_RANGE_ESTIMATE_PER_GO_PROFILE,
+    HEALTH_RANGE_ESTIMATE_PER_SITE, HEALTH_RANGE_ESTIMATE_PER_SUBJECT,
+    HEALTH_RANGE_PLAN_CONTRACT_VERSION, HealthGlobalInput, HealthInputIdentity,
+    HealthInputSelector, HealthLayer, HealthLedgerUnit, HealthRange, HealthRangeInput,
+    HealthRangeLimits, HealthRangePlan, HealthTargetStats, HealthTargetlessSiteFlags,
+    HealthWorkBudget, HealthWorkError, RangeSplitReason, health_range_plan_digest,
+    health_range_subject_ids, health_work_error, resplit_health_range,
 };
 pub use impact_cache::{
     IMPACT_QUERY_CACHE_CONTRACT_VERSION, IMPACT_QUERY_CACHE_MAX_ENTRIES,

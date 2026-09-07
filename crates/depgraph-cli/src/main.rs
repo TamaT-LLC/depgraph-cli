@@ -398,6 +398,11 @@ enum Commands {
         /// Restrict summary counts to these snapshot-scoped kinds.
         #[arg(long, value_name = "KIND")]
         kind: Vec<String>,
+        /// Return the findings of completed health ranges when some ranges
+        /// could not be analyzed; every finding then carries an
+        /// incomplete_coverage blocker and JSON `partial_ranges` is true.
+        #[arg(long)]
+        allow_partial: bool,
     },
     /// List unused-code or unused-dependency findings for cleanup review.
     #[command(long_about = health_render::CLEANUP_LONG_HELP)]
@@ -416,6 +421,11 @@ enum Commands {
         min_severity: Option<String>,
         #[arg(long, value_name = "CONFIDENCE")]
         min_confidence: Option<String>,
+        /// Return completed health ranges when some ranges could not be
+        /// analyzed (every finding is then demoted to indeterminate and JSON
+        /// `partial_ranges` is true).
+        #[arg(long)]
+        allow_partial: bool,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -631,6 +641,11 @@ enum HealthNested {
         min_severity: Option<String>,
         #[arg(long, value_name = "CONFIDENCE")]
         min_confidence: Option<String>,
+        /// Return completed health ranges when some ranges could not be
+        /// analyzed (every finding is then demoted to indeterminate and JSON
+        /// `partial_ranges` is true).
+        #[arg(long)]
+        allow_partial: bool,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -2094,6 +2109,7 @@ async fn run(cli: Cli) -> Result<u8> {
             command,
             json,
             kind,
+            allow_partial,
         } => match command {
             None => {
                 let kinds = if kind.is_empty() {
@@ -2108,7 +2124,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
                 let result = service.health_summary(
                     &mut snapshot,
-                    &HealthSummaryRequest::try_new(kinds)?,
+                    &HealthSummaryRequest::try_new(kinds)?.with_allow_partial(allow_partial),
                     &CancellationToken::new(),
                 )?;
                 print_graph_structured(
@@ -2121,6 +2137,8 @@ async fn run(cli: Cli) -> Result<u8> {
                         counts_by_kind: result.counts_by_kind(),
                         counts_by_confidence: result.counts_by_confidence(),
                         coverage: result.coverage(),
+                        partial_ranges: result.partial(),
+                        execution: result.diagnostics(),
                     },
                     json,
                 )?;
@@ -2136,6 +2154,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 baseline,
                 min_severity,
                 min_confidence,
+                allow_partial,
                 json,
                 output,
             }) => run_health_findings(
@@ -2147,6 +2166,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 baseline.as_deref(),
                 min_severity.as_deref(),
                 min_confidence.as_deref(),
+                allow_partial,
                 json,
                 &output,
             ),
@@ -2172,6 +2192,7 @@ async fn run(cli: Cli) -> Result<u8> {
             baseline,
             min_severity,
             min_confidence,
+            allow_partial,
             json,
             output,
         } => run_health_findings(
@@ -2183,6 +2204,7 @@ async fn run(cli: Cli) -> Result<u8> {
             baseline.as_deref(),
             min_severity.as_deref(),
             min_confidence.as_deref(),
+            allow_partial,
             json,
             &output,
         ),
@@ -2701,6 +2723,7 @@ fn run_health_findings(
     baseline: Option<&std::path::Path>,
     min_severity: Option<&str>,
     min_confidence: Option<&str>,
+    allow_partial: bool,
     json: bool,
     output: &InteractiveOutputArgs,
 ) -> Result<u8> {
@@ -2712,17 +2735,20 @@ fn run_health_findings(
         .map_err(|_| DepgraphServiceError::InvalidInput)?;
     let (service, mut snapshot) = health_snapshot_request(store, scan_id)?;
     let request =
-        HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?;
+        HealthFindingsRequest::try_new(kinds, severities, confidences, MAX_HEALTH_FINDINGS)?
+            .with_allow_partial(allow_partial);
     let result = service.health_findings(&mut snapshot, &request, &CancellationToken::new())?;
     if output.all {
         print_graph_structured(
             "health.list",
             &snapshot,
-            &health_render::CliHealthFindingsView {
+            &health_render::CliHealthListView {
                 snapshot_id: result.snapshot_id().as_str(),
                 scan_id: result.scan_id(),
                 collection_digest: result.collection_digest(),
                 findings: result.findings(),
+                partial_ranges: result.partial(),
+                execution: result.diagnostics(),
             },
             json,
         )?;
@@ -2740,6 +2766,8 @@ fn run_health_findings(
                 "kinds": request.kinds().iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
                 "severities": request.severities().iter().map(|severity| severity.as_str()).collect::<Vec<_>>(),
                 "confidences": request.confidences().iter().map(|confidence| confidence.as_str()).collect::<Vec<_>>(),
+                "partial_ranges": result.partial(),
+                "execution": result.diagnostics(),
             }),
             output,
             json,

@@ -52,11 +52,12 @@ pub use dto::{
 };
 pub use health_dto::{
     AgentFindingKind, AgentFindingKindScope, AgentHealthAudit, AgentHealthBlocker,
-    AgentHealthBlockerKind, AgentHealthConfidence, AgentHealthCoverage, AgentHealthEvidenceRef,
+    AgentHealthBlockerKind, AgentHealthCheckpointReport, AgentHealthConfidence,
+    AgentHealthCoverage, AgentHealthEvidenceRef, AgentHealthExecution, AgentHealthExecutionMode,
     AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage,
     AgentHealthHotspotLayerScore, AgentHealthHotspotScores, AgentHealthHotspots,
-    AgentHealthNamedCount, AgentHealthRemediation, AgentHealthSeverity, AgentHealthSourceLocation,
-    AgentHealthSummary, AgentHealthSuppression,
+    AgentHealthNamedCount, AgentHealthRangeCounts, AgentHealthRemediation, AgentHealthSeverity,
+    AgentHealthSourceLocation, AgentHealthSummary, AgentHealthSuppression, AgentHealthWorkReport,
 };
 pub use host_config::{
     AGENT_HOST_CONFIG_CONTRACT_VERSION, AgentHostCapabilityProfile, AgentHostFormat,
