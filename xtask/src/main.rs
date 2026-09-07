@@ -7759,6 +7759,8 @@ jobs:
     fn cargo_inventory_follows_release_roots_and_excludes_build_dev_xtask_and_workspace_hack_dependencies()
     -> Result<()> {
         let metadata = json!({
+            "workspace_root": "/repo",
+            "workspace_members": ["cli", "worker", "mcp", "operation", "internal", "xtask", "hack"],
             "packages": [
                 {"id":"cli","name":"depgraph-cli","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"worker","name":"depgraph-rust-worker","version":"0.1.0","source":null,"license":"MIT"},
@@ -7766,10 +7768,17 @@ jobs:
                 {"id":"operation","name":"depgraph-operation","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"internal","name":"depgraph-core","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"xtask","name":"xtask","version":"0.1.0","source":null,"license":"MIT"},
-                {"id":"hack","name":"workspace-hack","version":"0.1.0","source":null,"license":"MIT"},
+                {"id":"hack","name":"workspace-hack","version":"0.1.0","source":null,"license":"MIT",
+                 "manifest_path":"/repo/workspace-hack/Cargo.toml"},
+                // A local path package outside the workspace that reuses the
+                // hakari crate's name: it is a real dependency, so its runtime
+                // closure must stay in the inventory.
+                {"id":"lookalike","name":"workspace-hack","version":"0.2.0","source":null,"license":"MIT",
+                 "manifest_path":"/repo/vendor/workspace-hack/Cargo.toml"},
                 {"id":"runtime","name":"runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"runner-runtime","name":"runner-runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"mcp-runtime","name":"mcp-runtime-crate","version":"1.0.0","source":"registry+test","license":"Apache-2.0"},
+                {"id":"lookalike-runtime","name":"lookalike-runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"build","name":"bundled-source-build","version":"2.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"dev","name":"test-only","version":"3.0.0","source":"registry+test","license":"MIT"},
                 {"id":"spdx","name":"spdx","version":"4.0.0","source":"registry+test","license":"MIT"},
@@ -7788,7 +7797,11 @@ jobs:
                 ]},
                 {"id":"mcp","deps":[
                     {"pkg":"mcp-runtime","dep_kinds":[{"kind":null}]},
-                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]},
+                    {"pkg":"lookalike","dep_kinds":[{"kind":null}]}
+                ]},
+                {"id":"lookalike","deps":[
+                    {"pkg":"lookalike-runtime","dep_kinds":[{"kind":null}]}
                 ]},
                 {"id":"operation","deps":[
                     {"pkg":"runner-runtime","dep_kinds":[{"kind":null}]},
@@ -7814,6 +7827,7 @@ jobs:
                 {"id":"runtime","deps":[]},
                 {"id":"runner-runtime","deps":[]},
                 {"id":"mcp-runtime","deps":[]},
+                {"id":"lookalike-runtime","deps":[]},
                 {"id":"build","deps":[]},
                 {"id":"dev","deps":[]},
                 {"id":"spdx","deps":[]},
@@ -7827,11 +7841,30 @@ jobs:
         assert_eq!(
             names,
             std::collections::BTreeSet::from([
+                "lookalike-runtime-crate".to_owned(),
                 "runner-runtime-crate".to_owned(),
                 "mcp-runtime-crate".to_owned(),
                 "runtime-crate".to_owned(),
             ])
         );
+
+        // The hakari skip is bound to the checked-in manifest, not the name:
+        // once the real crate stops being that workspace member, its unified
+        // dev-only lines flow into the inventory like any other dependency.
+        let mut moved_hack = metadata.clone();
+        moved_hack["packages"][6]["manifest_path"] = json!("/repo/tools/workspace-hack/Cargo.toml");
+        let names = cargo_runtime_packages(&moved_hack)?
+            .into_iter()
+            .map(|package| package.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("unified-test-only"), "{names:?}");
+
+        let mut without_root = metadata.clone();
+        without_root["workspace_root"] = Value::Null;
+        let error = cargo_runtime_packages(&without_root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace root"), "{error}");
         Ok(())
     }
 
