@@ -147,11 +147,16 @@ func (request AnalysisUnitRequest) Validate() error {
 	if request.ChunkCount <= 0 || request.ChunkIndex < 0 || request.ChunkIndex >= request.ChunkCount {
 		return fmt.Errorf("analysis unit request chunk_index/count is invalid")
 	}
-	if request.Stage == AnalysisUnitStageTyped && (request.ChunkIndex != 0 || request.ChunkCount != 1) {
-		return fmt.Errorf("typed analysis unit request must use exactly one chunk")
-	}
-	if request.Stage == AnalysisUnitStageTyped && !sameRequestPaths(request.SourcePaths, request.ContextPaths) {
-		return fmt.Errorf("typed analysis unit request source_paths must cover the complete context_paths set")
+	// A typed request loads the module as one operation unless a package
+	// loader binding partitions the typed stage by package; such chunks own a
+	// subset of the module sources they receive as context.
+	if request.Stage == AnalysisUnitStageTyped && !request.packageScoped() {
+		if request.ChunkIndex != 0 || request.ChunkCount != 1 {
+			return fmt.Errorf("typed analysis unit request must use exactly one chunk")
+		}
+		if !sameRequestPaths(request.SourcePaths, request.ContextPaths) {
+			return fmt.Errorf("typed analysis unit request source_paths must cover the complete context_paths set")
+		}
 	}
 	if err := validateRequestPathList("auxiliary_paths", request.AuxiliaryPaths, true); err != nil {
 		return err

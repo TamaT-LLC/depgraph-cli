@@ -79,6 +79,9 @@ const RUST_SYSROOT_ROOT_ENV: &str = "DEPGRAPH_RUST_SYSROOT_ROOT";
 const RUST_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const RUST_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
 const TYPESCRIPT_RELEASE_GATE_ENV: &str = "DEPGRAPH_TYPESCRIPT_RELEASE_GATE";
+/// Scan-scoped Go build cache the package loader shares across the
+/// package-scoped units of one scan (read by `depgraph-go-worker`).
+pub(crate) const GO_BUILD_CACHE_ENV: &str = "DEPGRAPH_GO_BUILD_CACHE";
 const TYPESCRIPT_RELEASE_GATE_PROPERTY: &str = "typescript_release_gate";
 const TYPESCRIPT_RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const TYPESCRIPT_RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
@@ -198,6 +201,11 @@ pub struct WorkerOutput {
     pub error: Option<String>,
     pub(crate) failure_kind: Option<WorkerFailureKind>,
     pub security_violation: bool,
+    /// Peak resident memory of the worker process tree the memory watch
+    /// sampled, in bytes: the measure the worker memory budget is enforced
+    /// against.  `None` when the worker was replayed from a checkpoint, failed
+    /// before it started, or exited before the first sample.
+    pub peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -220,6 +228,7 @@ struct WorkerExecution {
     error: Option<String>,
     failure_kind: Option<WorkerFailureKind>,
     security_violation: bool,
+    peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1441,6 +1450,7 @@ pub async fn execute_worker(
             error: execution.error,
             failure_kind: execution.failure_kind,
             security_violation: execution.security_violation,
+            peak_memory_bytes: execution.peak_memory_bytes,
         },
         Err(error) => {
             let error = format!("{error:#}");
@@ -1452,6 +1462,7 @@ pub async fn execute_worker(
                 failure_kind: Some(WorkerFailureKind::Other),
                 security_violation: is_security_error(&error),
                 error: Some(error),
+                peak_memory_bytes: None,
             }
         }
     }
@@ -1464,6 +1475,9 @@ pub(crate) struct WorkerUnitInput {
     pub profiles: ProfileConfig,
     pub cancellation: CancellationToken,
     pub inventory: PathBuf,
+    /// Scan-scoped Go build cache shared by the package-scoped units of one
+    /// scan.  The Go worker admits it only when it lies outside the scan root.
+    pub build_cache: Option<PathBuf>,
 }
 
 pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput) -> WorkerOutput {
@@ -1477,6 +1491,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
         WorkerRequestFiles {
             delta_request: None,
             inventory: Some(&input.inventory),
+            build_cache: input.build_cache.as_deref(),
         },
         async move {
             input.cancellation.cancelled().await;
@@ -1493,6 +1508,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
             error: execution.error,
             failure_kind: execution.failure_kind,
             security_violation: execution.security_violation,
+            peak_memory_bytes: execution.peak_memory_bytes,
         },
         Err(error) => {
             let error = format!("{error:#}");
@@ -1504,6 +1520,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
                 failure_kind: Some(WorkerFailureKind::Other),
                 security_violation: is_security_error(&error),
                 error: Some(error),
+                peak_memory_bytes: None,
             }
         }
     }
@@ -1605,6 +1622,7 @@ where
         WorkerRequestFiles {
             delta_request,
             inventory: None,
+            build_cache: None,
         },
         cancellation,
     )
@@ -1614,6 +1632,7 @@ where
 struct WorkerRequestFiles<'a> {
     delta_request: Option<&'a WorkerDeltaRequest>,
     inventory: Option<&'a Path>,
+    build_cache: Option<&'a Path>,
 }
 
 async fn execute_worker_inner_with_request<F>(
@@ -1727,10 +1746,21 @@ where
         .env("GOFLAGS", "-mod=readonly")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
+    if spec.adapter == AdapterKind::Go {
+        // Soft cap the Go heap at the same budget the 250ms RSS watch enforces.
+        // A typed/SSA load can otherwise allocate many gigabytes between ticks
+        // and OOM the host before the worker-memory re-split can fire.
+        command.env("GOMEMLIMIT", config.max_worker_memory_bytes.to_string());
+    }
     if spec.adapter == AdapterKind::Rust
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
     {
         command.env("DEPGRAPH_SCAN_PROFILE", "1");
+    }
+    if spec.adapter == AdapterKind::Go
+        && let Some(build_cache) = input.build_cache
+    {
+        command.env(GO_BUILD_CACHE_ENV, build_cache);
     }
     if spec.adapter == AdapterKind::Rust && spec.release_attested {
         let sysroot = spec.attested_rust_sysroot.as_ref().context(
@@ -1923,6 +1953,7 @@ where
         error,
         failure_kind,
         security_violation,
+        peak_memory_bytes: process_guard.peak_memory_bytes(),
     })
 }
 
@@ -2117,6 +2148,10 @@ pub(crate) struct ProcessTreeGuard {
     process_group: i32,
     #[cfg(windows)]
     job: usize,
+    /// Largest resident size the memory watch sampled for the tree, in bytes;
+    /// zero until the first sample.  The watch runs on the executor's timer,
+    /// so a process that exits before the first tick is never sampled.
+    peak_memory_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl ProcessTreeGuard {
@@ -2126,10 +2161,22 @@ impl ProcessTreeGuard {
         loop {
             interval.tick().await;
             let bytes = self.memory_usage_bytes()?;
+            self.peak_memory_bytes
+                .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
             if bytes > limit {
                 return Ok(bytes);
             }
         }
+    }
+
+    /// The peak the memory watch observed for this tree, the same measure the
+    /// worker memory budget is enforced against, or `None` when the tree was
+    /// never sampled.
+    pub(crate) fn peak_memory_bytes(&self) -> Option<u64> {
+        let bytes = self
+            .peak_memory_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (bytes > 0).then_some(bytes)
     }
 
     fn memory_usage_bytes(&self) -> std::io::Result<u64> {
@@ -2171,7 +2218,10 @@ impl ProcessTreeGuard {
         #[cfg(unix)]
         {
             let process_group = child.id().context("worker has no process id")? as i32;
-            Ok(Self { process_group })
+            Ok(Self {
+                process_group,
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
         #[cfg(windows)]
         {
@@ -2208,12 +2258,17 @@ impl ProcessTreeGuard {
                 }
                 return Err(error).context("assign worker to Windows Job Object");
             }
-            Ok(Self { job: job as usize })
+            Ok(Self {
+                job: job as usize,
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = child;
-            Ok(Self {})
+            Ok(Self {
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
     }
 
@@ -2522,6 +2577,7 @@ pub(crate) fn replay_analysis_checkpoint(
         error: None,
         failure_kind: None,
         security_violation: false,
+        peak_memory_bytes: None,
     })
 }
 

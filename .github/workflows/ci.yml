@@ -164,6 +164,22 @@ jobs:
           name: resumable-analysis-report
           path: ${{ runner.temp }}/depgraph-resumable-report.json
           if-no-files-found: error
+      # Public synthetic Go fixtures: the module-loader control fails the
+      # 1,024-file package at a reduced per-unit memory limit while the
+      # package-bounded path completes under the same limit with the same
+      # canonical graph (#463).
+      - name: Verify package-bounded Go loading completes where the whole-module load fails
+        id: go_loader_scope_e2e
+        working-directory: .
+        env:
+          DEPGRAPH_GO_LOADER_SCOPE_REPORT: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+        run: cargo xtask go-loader-scope-e2e
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: "!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'"
+        with:
+          name: go-loader-scope-report
+          path: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+          if-no-files-found: error
       # Public synthetic health fixture: the whole-snapshot path exhausts the
       # single work budget while the ranged path completes under the unchanged
       # per-range limit with identical findings (#467).

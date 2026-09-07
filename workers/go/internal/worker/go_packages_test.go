@@ -117,6 +117,27 @@ func TestConstrainedGoEnvironmentDisablesTelemetryInNeutralConfig(t *testing.T) 
 	if environmentValue(environment.Values, "GOROOT") != "" {
 		t.Fatal("GOROOT must be discovered by the selected Go command, including from a trimpath-built worker")
 	}
+	if environmentValue(environment.Values, "GOMEMLIMIT") != "" {
+		t.Fatal("GOMEMLIMIT must not leak from the host unless it is a decimal byte limit")
+	}
+	t.Setenv("GOMEMLIMIT", "2GiB")
+	poisoned, err := constrainedGoEnvironment(root, pathValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poisoned.cleanup()
+	if environmentValue(poisoned.Values, "GOMEMLIMIT") != "" {
+		t.Fatal("GOMEMLIMIT size suffixes must not be forwarded to go list")
+	}
+	t.Setenv("GOMEMLIMIT", "469762048")
+	limited, err := constrainedGoEnvironment(root, pathValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer limited.cleanup()
+	if environmentValue(limited.Values, "GOMEMLIMIT") != "469762048" {
+		t.Fatalf("decimal GOMEMLIMIT = %q", environmentValue(limited.Values, "GOMEMLIMIT"))
+	}
 	realGo, err := exec.LookPath("go")
 	if err != nil {
 		t.Skipf("Go command unavailable: %v", err)

@@ -1,7 +1,7 @@
 //! A bounded executor shared by CLI, MCP and daemon scans.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::Write,
     path::Path,
     sync::{Arc, Mutex},
@@ -11,16 +11,20 @@ use std::{
 use anyhow::{Context, Result};
 use depgraph_store::Store;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
 use crate::{
-    analysis_checkpoint::{StagedUnitCheckpoint, UnitCheckpointKey, UnitCheckpointStore},
+    analysis_checkpoint::{
+        ScanBuildCache, StagedUnitCheckpoint, UnitCheckpointKey, UnitCheckpointStore,
+    },
     cancellation::CancellationToken,
     config::Config,
     scan::ScanCacheMode,
     worker::{
-        WorkerOutput, WorkerSpec, WorkerUnitInput, execute_worker_unit, replay_analysis_checkpoint,
+        AdapterKind, WorkerOutput, WorkerSpec, WorkerUnitInput, execute_worker_unit,
+        replay_analysis_checkpoint,
     },
 };
 
@@ -57,6 +61,222 @@ pub struct AnalysisUnitProgress {
     pub protocol_events: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Loader observations the worker reported for this execution unit: the
+    /// negotiated split identity, whether the loader scope was applied or
+    /// widened, and the package loader's target, syntax, body, and memory
+    /// counters, plus the peak resident memory the core's own memory watch
+    /// sampled for the worker tree ([`WORKER_PEAK_MEMORY_KEY`]).  Canonical
+    /// profiles strip these per-execution values, so the ledger is where a
+    /// scan explains what each unit actually loaded and held.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loader: BTreeMap<String, String>,
+}
+
+/// Ledger key of the peak resident memory the core sampled for a unit's worker
+/// process tree, in bytes.  It is the measure `scan.max_worker_memory_bytes`
+/// is enforced against, so it is recorded for every executed unit, whether
+/// the worker reported loader metrics or not and whether it completed or was
+/// stopped at the budget.  Replayed checkpoints have no worker to sample.
+pub const WORKER_PEAK_MEMORY_KEY: &str = "analysis_worker_peak_memory_bytes";
+
+/// Worker profile properties copied into the execution ledger of one unit.
+const LOADER_OBSERVATION_KEYS: [&str; 23] = [
+    "analysis_split_plan_id",
+    "analysis_execution_unit_id",
+    "analysis_split_kind",
+    "analysis_loader_kind",
+    "analysis_loader_input_split",
+    "analysis_loader_scope",
+    "analysis_loader_mode",
+    "analysis_scope",
+    "go_call_graph_program_scope",
+    "go_loader_target_packages",
+    "go_loader_target_files",
+    "go_loader_syntax_packages",
+    "go_loader_syntax_equals_targets",
+    "go_loader_loaded_packages",
+    "go_loader_body_files",
+    "go_loader_declaration_only_files",
+    "go_loader_reference_packages_export",
+    "go_loader_reference_packages_source",
+    "go_loader_peak_rss_bytes",
+    "go_loader_child_max_rss_bytes",
+    "go_loader_build_cache",
+    "go_loader_build_cache_reused",
+    "go_reference_fingerprint",
+];
+
+/// The loader observations of a worker stream: the properties of its
+/// source-batch profile declarations that describe what the worker loaded.
+/// Several declarations of one execution unit (a typed prefix echoed on a
+/// semantic stream) agree on these keys; the last declaration wins.
+pub(crate) fn loader_observations(events: &[Value]) -> BTreeMap<String, String> {
+    let mut observations = BTreeMap::new();
+    for event in events {
+        if event["event"] != "profile_declared" {
+            continue;
+        }
+        let Some(properties) = event["profile"]["properties"].as_object() else {
+            continue;
+        };
+        if properties
+            .get("analysis_unit_contract")
+            .and_then(Value::as_str)
+            != Some("depgraph-analysis-unit-v2")
+        {
+            continue;
+        }
+        for key in LOADER_OBSERVATION_KEYS {
+            if let Some(value) = properties.get(key).and_then(Value::as_str) {
+                observations.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    observations
+}
+
+/// A package-bounded Go execution unit: the logical unit, stage, and package
+/// roots its negotiated `split.loader` binds.  Units of workers that did not
+/// negotiate loader scope, and module-bounded units, have no binding.
+struct ReferenceBinding {
+    unit_id: String,
+    stage: String,
+    package_roots: BTreeSet<String>,
+}
+
+/// A completed typed unit's reported in-repo import closure, used when a later
+/// executor (a re-split of only the semantic stage) no longer has that typed
+/// work item in its own list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TypedReferenceFingerprint {
+    pub unit_id: String,
+    pub package_roots: BTreeSet<String>,
+    pub fingerprint: Option<String>,
+}
+
+fn reference_binding(item: &AnalysisWorkItem) -> Option<ReferenceBinding> {
+    let request = item.request.as_ref()?;
+    let loader = &request["split"]["loader"];
+    if loader["kind"] != "package" {
+        return None;
+    }
+    Some(ReferenceBinding {
+        unit_id: request["unit_id"].as_str()?.to_owned(),
+        stage: request["stage"].as_str()?.to_owned(),
+        package_roots: loader["package_roots"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    })
+}
+
+/// Fold the `go_reference_fingerprint` every typed prerequisite of a
+/// package-bounded semantic unit reported into the unit's checkpoint key.
+///
+/// The static key binds the module context the planner saw.  The fingerprint
+/// the typed worker reports binds the in-repository import closure it actually
+/// type-checked for the same package roots, which build constraints, test
+/// variants, and `replace` directives can narrow or widen beyond what static
+/// discovery resolves.  A semantic checkpoint is therefore reused only when
+/// the typed stage of this scan loaded the same closure content.  Typed units
+/// of the same executor are ingested before their semantic stage dispatches;
+/// a re-split that keeps those typed units and only re-runs semantic work
+/// supplies their fingerprints through `retained`.
+///
+/// The fingerprints occupy the key's own `reference_digest` slot: the static
+/// `input_digest` still has to equal the request's context fingerprint for the
+/// input validation that guards every checkpoint write and reuse.  An empty
+/// or incomplete set is not a valid binding: the caller then skips checkpoint
+/// read and write rather than persisting a digest of missing values.
+fn bind_reference_fingerprints(
+    index: usize,
+    item: &mut AnalysisWorkItem,
+    bindings: &[Option<ReferenceBinding>],
+    progress: &AnalysisExecutionProgress,
+    retained: &[TypedReferenceFingerprint],
+) {
+    let Some(binding) = bindings[index].as_ref() else {
+        return;
+    };
+    if binding.stage != "semantic" {
+        return;
+    }
+    let Some(key) = item.checkpoint_key.as_mut() else {
+        return;
+    };
+    let mut fingerprints = BTreeSet::new();
+    let mut matched = false;
+    let mut missing = false;
+    for (other, candidate) in bindings.iter().enumerate() {
+        if other == index {
+            continue;
+        }
+        let Some(candidate) = candidate.as_ref() else {
+            continue;
+        };
+        if candidate.unit_id != binding.unit_id
+            || candidate.stage != "typed"
+            || candidate.package_roots.is_disjoint(&binding.package_roots)
+        {
+            continue;
+        }
+        matched = true;
+        match progress.units.get(other).and_then(|unit| {
+            unit.loader
+                .get("go_reference_fingerprint")
+                .filter(|value| !value.is_empty())
+                .cloned()
+        }) {
+            Some(fingerprint) => {
+                fingerprints.insert(fingerprint);
+            }
+            None => missing = true,
+        }
+    }
+    for prior in retained {
+        if prior.unit_id != binding.unit_id
+            || prior.package_roots.is_disjoint(&binding.package_roots)
+        {
+            continue;
+        }
+        matched = true;
+        match prior
+            .fingerprint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(fingerprint) => {
+                fingerprints.insert(fingerprint.to_owned());
+            }
+            None => missing = true,
+        }
+    }
+    if !matched || missing || fingerprints.is_empty() {
+        return;
+    }
+    let Ok(payload) = serde_json::to_vec(&json!({
+        "contract":"analysis-go-reference-binding-v1",
+        "reference_fingerprints":fingerprints,
+    })) else {
+        return;
+    };
+    key.reference_digest = Some(format!("{:x}", Sha256::digest(payload)));
+}
+
+/// Package-bounded semantic checkpoints are only read or written after the
+/// typed reference closure has been bound into `reference_digest`.  Module
+/// loader units and earlier stages keep the historical key.
+fn package_semantic_checkpoint_bound(item: &AnalysisWorkItem) -> bool {
+    match reference_binding(item) {
+        Some(binding) if binding.stage == "semantic" => item
+            .checkpoint_key
+            .as_ref()
+            .and_then(|key| key.reference_digest.as_deref())
+            .is_some_and(|digest| !digest.is_empty()),
+        _ => true,
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -248,8 +468,36 @@ where
     F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
     V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
 {
+    execute_analysis_units_with_retained_typed(store, context, work, consume, validate_inputs, &[])
+        .await
+}
+
+/// Same as [`execute_analysis_units`], with typed reference fingerprints from
+/// units that completed in an earlier executor of this scan (re-split
+/// replacements that no longer include those typed work items).
+pub(crate) async fn execute_analysis_units_with_retained_typed<F, V>(
+    store: &mut Store,
+    context: &AnalysisExecutionContext<'_>,
+    work: Vec<AnalysisWorkItem>,
+    consume: F,
+    validate_inputs: V,
+    retained_typed: &[TypedReferenceFingerprint],
+) -> Result<AnalysisExecutionProgress>
+where
+    F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
+    V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
+{
     let clock = MonotonicAnalysisClock;
-    execute_analysis_units_with_clock(store, context, work, &clock, consume, validate_inputs).await
+    execute_analysis_units_with_clock(
+        store,
+        context,
+        work,
+        &clock,
+        consume,
+        validate_inputs,
+        retained_typed,
+    )
+    .await
 }
 
 async fn execute_analysis_units_with_clock<F, V>(
@@ -259,6 +507,7 @@ async fn execute_analysis_units_with_clock<F, V>(
     clock: &dyn AnalysisClock,
     mut consume: F,
     validate_inputs: V,
+    retained_typed: &[TypedReferenceFingerprint],
 ) -> Result<AnalysisExecutionProgress>
 where
     F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
@@ -286,6 +535,14 @@ where
     };
     let budget = AnalysisBudget::start(config.scan.total_budget_seconds, clock);
     let prerequisites = stage_prerequisites(&work)?;
+    let reference_bindings = work.iter().map(reference_binding).collect::<Vec<_>>();
+    // One build cache serves every package-scoped Go unit of this scan and is
+    // removed with it; units of workers without loader scope never see it.
+    let build_cache = reference_bindings
+        .iter()
+        .any(Option::is_some)
+        .then(|| ScanBuildCache::open(store.database_path().as_deref(), root))
+        .flatten();
     let mut progress = AnalysisExecutionProgress {
         units: work
             .iter()
@@ -303,6 +560,7 @@ where
                 duration_ms: 0,
                 protocol_events: 0,
                 failure_reason: None,
+                loader: BTreeMap::new(),
             })
             .collect(),
         stop_reason: None,
@@ -321,6 +579,12 @@ where
     loop {
         while let Some((unit_id, output, reused, staged)) = ready.remove(&next_ingest) {
             progress.units[next_ingest].protocol_events = output.events.len() as u64;
+            progress.units[next_ingest].loader = loader_observations(&output.events);
+            if let Some(bytes) = output.peak_memory_bytes {
+                progress.units[next_ingest]
+                    .loader
+                    .insert(WORKER_PEAK_MEMORY_KEY.to_owned(), bytes.to_string());
+            }
             progress.units[next_ingest].failure_reason =
                 output.failure_kind.map(|kind| kind.as_str().to_owned());
             progress.units[next_ingest].duration_ms = started
@@ -363,10 +627,18 @@ where
                     && prerequisites[*index].is_none_or(|previous| previous < next_ingest)
             })
         {
-            let Some((index, item)) = pending.pop_front() else {
+            let Some((index, mut item)) = pending.pop_front() else {
                 break;
             };
+            bind_reference_fingerprints(
+                index,
+                &mut item,
+                &reference_bindings,
+                &progress,
+                retained_typed,
+            );
             if let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
+                && package_semantic_checkpoint_bound(&item)
                 && validate_inputs(&item, AnalysisInputValidation::Reuse)
             {
                 let cached = checkpoints.read(key).ok().flatten().and_then(|events| {
@@ -392,6 +664,10 @@ where
             let profiles = config.profiles.clone();
             let cancellation = cancellation.clone();
             let inventory_bytes = inventory_bytes.clone();
+            let build_cache = (item.spec.adapter == AdapterKind::Go
+                && reference_bindings[index].is_some())
+            .then(|| build_cache.as_ref().map(|cache| cache.path().to_path_buf()))
+            .flatten();
             let task_unit = (index, item.unit_id.clone(), item.spec.adapter);
             let task = running.spawn(async move {
                 let mut spec = item.spec.clone();
@@ -443,6 +719,7 @@ where
                                 profiles,
                                 cancellation,
                                 inventory,
+                                build_cache,
                             },
                         )
                         .await;
@@ -463,6 +740,7 @@ where
                         error: Some(error.to_string()),
                         failure_kind: Some(crate::worker::WorkerFailureKind::Other),
                         security_violation: crate::worker::is_security_error(&error.to_string()),
+                        peak_memory_bytes: None,
                     },
                 };
                 if let Err(error) = validate_unit_output(&item, &output) {
@@ -502,6 +780,7 @@ where
                         crate::worker::WorkerFailureKind::Cancelled
                     }),
                     security_violation: false,
+                    peak_memory_bytes: None,
                 };
                 ready.insert(index, (unit_id, output, false, None));
                 continue;
@@ -512,6 +791,7 @@ where
         let staged = if output.error.is_none()
             && semantic_checkpoint_complete(item.request.as_ref(), &output.events)
             && !cancellation.is_cancelled()
+            && package_semantic_checkpoint_bound(&item)
             && validate_inputs(&item, AnalysisInputValidation::CheckpointWrite)
             && let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
         {
@@ -821,6 +1101,7 @@ mod tests {
                     duration_ms: 0,
                     protocol_events: 0,
                     failure_reason: None,
+                    loader: BTreeMap::new(),
                 }],
                 stop_reason: None,
             };
@@ -937,6 +1218,7 @@ for (const event of [
             &clock,
             |_, _, output| Ok(output.error.is_none()),
             |_, _| true,
+            &[],
         )
         .await?;
 
@@ -975,6 +1257,7 @@ for (const event of [
             &explicit_clock,
             |_, _, output| Ok(output.error.is_none()),
             |_, _| true,
+            &[],
         )
         .await?;
         assert!(explicit_clock.elapsed() > LEGACY_AGGREGATE_DEADLINE);
@@ -1074,6 +1357,7 @@ for (const event of [
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         validate_unit_output(&item, &output)?;
         output.events[1]["path"] = json!("other/main.go");
@@ -1146,7 +1430,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 unit_id: id.clone(),
                 request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":[],"context_paths":[],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":"context"})),
                 spec: spec.clone(),
-                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:"input".into(),execution_digest:"worker".into(),root_digest:"root".into() }),
+                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:"input".into(),execution_digest:"worker".into(),root_digest:"root".into(),reference_digest:None }),
             }
         }).collect()
         };
@@ -1199,6 +1483,239 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         assert_eq!(
             std::fs::read_to_string(&executions)?,
             "syntax\ntyped\nsemantic\nsemantic\n"
+        );
+        Ok(())
+    }
+
+    /// Package-bounded units share one scan-scoped build cache outside the
+    /// scan root that disappears with the scan, and a semantic checkpoint is
+    /// reused only while the typed stage reports the same reference
+    /// fingerprint: a changed in-repository closure re-runs SSA even when the
+    /// semantic unit's own static key did not move.
+    #[tokio::test]
+    async fn package_semantic_checkpoints_bind_the_typed_reference_fingerprint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let worker = temp.path().join("worker.mjs");
+        let fingerprint = temp.path().join("fingerprint");
+        let executions = temp.path().join("executions");
+        let caches = temp.path().join("caches");
+        std::fs::write(&fingerprint, "sha256:closure-a")?;
+        let script = r#"
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+const arg = key => args[args.indexOf(key) + 1];
+const request = JSON.parse(fs.readFileSync(arg('--analysis-unit'), 'utf8'));
+fs.appendFileSync(EXECUTIONS, request.stage + '\n');
+const cache = process.env.DEPGRAPH_GO_BUILD_CACHE ?? '';
+if (!path.isAbsolute(cache) || !fs.statSync(cache).isDirectory() || cache.startsWith(arg('--root'))) {
+  console.error('missing or misplaced build cache: ' + cache); process.exit(2);
+}
+fs.appendFileSync(CACHES, cache + '\n');
+const common = { protocol_version:'1.0',scan_id:arg('--scan-id'),adapter:'go',adapter_version:'0.1.0' };
+const completeness = request.stage === 'semantic' ? ['syntax-complete','semantic-complete'] : ['syntax-complete'];
+const coverage = { profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness,reasons:[] };
+const properties = { analysis_unit_contract:request.contract_version,analysis_unit_id:request.unit_id,analysis_unit_root:request.unit_root,analysis_stage:request.stage,analysis_chunk_id:request.chunk_id,analysis_chunk_index:'0',analysis_chunk_count:'1',analysis_context_fingerprint:request.context_fingerprint,analysis_loader_scope:'applied',go_reference_fingerprint:fs.readFileSync(FINGERPRINT,'utf8'),go_typed_stage_complete:'true' };
+const profile = { id:'go:'+request.stage,language:'go',features:[],environment:{},properties };
+const events = [
+ {event:'scan_started',seq:1,root:arg('--root'),project_code_executed:false,safe_mode:true},
+ {event:'profile_declared',seq:2,profile},
+ {event:'profile_completed',seq:3,profile_id:profile.id,coverage},
+ {event:'scan_completed',seq:4,coverage}
+];
+for (const event of events) console.log(JSON.stringify({...common,...event}));
+"#;
+        let script = script
+            .replace("EXECUTIONS", &serde_json::to_string(&executions)?)
+            .replace("FINGERPRINT", &serde_json::to_string(&fingerprint)?)
+            .replace("CACHES", &serde_json::to_string(&caches)?);
+        std::fs::write(&worker, script)?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: "node".into(),
+            leading_args: vec![worker.clone().into_os_string()],
+            display: "package loader fixture".into(),
+            artifact_path: worker,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let work = |typed_input: &str| {
+            ["typed", "semantic"].into_iter().map(|stage| {
+            let id = format!("unit:{stage}");
+            let input = if stage == "typed" { typed_input.to_owned() } else { "semantic-input".to_owned() };
+            AnalysisWorkItem {
+                unit_id: id.clone(),
+                request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":["app/a.go"],"context_paths":["app/a.go"],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":input,
+                    "split":{"split_plan_id":"plan","execution_unit_id":format!("{stage}-app"),"split_kind":"package","loader":{"kind":"package","paths":["app/a.go"],"package_roots":["app"],"reference_depth":"declarations","reference_paths":[],"input_split":false}}})),
+                spec: spec.clone(),
+                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:input,execution_digest:"worker".into(),root_digest:"root".into(),reference_digest:None }),
+            }
+        }).collect::<Vec<_>>()
+        };
+        let consume = |_: &mut Store, _: &str, output: WorkerOutput| Ok(output.error.is_none());
+        // The production validator admits a source-batch checkpoint write or
+        // reuse only while the key's static input digest is the request's
+        // context fingerprint; the reference binding must not disturb it.
+        let validate = |item: &AnalysisWorkItem, _: AnalysisInputValidation| {
+            item.request
+                .as_ref()
+                .and_then(|request| request["context_fingerprint"].as_str())
+                == item
+                    .checkpoint_key
+                    .as_ref()
+                    .map(|key| key.input_digest.as_str())
+        };
+        let store_path = temp.path().join("store.sqlite");
+        let config = Config::default();
+        let cancellation = CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "package-binding",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+        let mut store = Store::open(&store_path)?;
+        let first =
+            execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
+                .await?;
+        assert!(
+            first.units.iter().all(|unit| unit.status == "completed"),
+            "{first:?}"
+        );
+        assert_eq!(
+            first.units[0]
+                .loader
+                .get("go_reference_fingerprint")
+                .map(String::as_str),
+            Some("sha256:closure-a")
+        );
+        let recorded = std::fs::read_to_string(&caches)?;
+        let cache_dirs = recorded.lines().collect::<BTreeSet<_>>();
+        assert_eq!(
+            cache_dirs.len(),
+            1,
+            "one shared build cache per scan: {recorded}"
+        );
+        let cache_dir = Path::new(cache_dirs.iter().next().unwrap());
+        assert!(cache_dir.starts_with(temp.path().canonicalize()?.join(".depgraph")));
+        assert!(
+            !cache_dir.exists(),
+            "the scan-scoped build cache is removed with the scan"
+        );
+
+        // Same module context and same reported closure: both stages replay.
+        let same = execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
+            .await?;
+        assert_eq!(
+            same.units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [true, true]
+        );
+        assert_eq!(std::fs::read_to_string(&executions)?, "typed\nsemantic\n");
+
+        // The typed stage re-runs and reports a different in-repository closure;
+        // the semantic checkpoint keyed on the old closure must not be reused.
+        std::fs::write(&fingerprint, "sha256:closure-b")?;
+        let changed =
+            execute_analysis_units(&mut store, &context, work("typed-b"), consume, validate)
+                .await?;
+        assert_eq!(
+            changed
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [false, false]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&executions)?,
+            "typed\nsemantic\ntyped\nsemantic\n"
+        );
+        // Restoring the previous closure content brings the old semantic
+        // checkpoint back without re-running SSA.
+        std::fs::write(&fingerprint, "sha256:closure-a")?;
+        let restored =
+            execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
+                .await?;
+        assert_eq!(
+            restored
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [true, true]
+        );
+
+        // A re-split that keeps the typed unit and only re-runs semantic work
+        // has no typed item in the replacement executor. The retained
+        // fingerprint still binds the checkpoint; an empty or missing
+        // fingerprint must not.
+        let semantic_only = || vec![work("typed-a").remove(1)];
+        let retained = |fingerprint: Option<&str>| {
+            vec![TypedReferenceFingerprint {
+                unit_id: "unit".into(),
+                package_roots: ["app".into()].into_iter().collect(),
+                fingerprint: fingerprint.map(str::to_owned),
+            }]
+        };
+        let rebound = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &retained(Some("sha256:closure-a")),
+        )
+        .await?;
+        assert_eq!(
+            rebound
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [true]
+        );
+        let unbound = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &[],
+        )
+        .await?;
+        assert_eq!(
+            unbound
+                .units
+                .iter()
+                .map(|unit| (unit.status.as_str(), unit.reused))
+                .collect::<Vec<_>>(),
+            [("completed", false)]
+        );
+        let mismatched = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &retained(Some("sha256:closure-other")),
+        )
+        .await?;
+        assert_eq!(
+            mismatched
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [false]
         );
         Ok(())
     }
@@ -1257,6 +1774,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                         input_digest: if changed { "changed" } else { "input" }.into(),
                         execution_digest: "worker".into(),
                         root_digest: "root".into(),
+                        reference_digest: None,
                     }),
                 })
                 .collect()

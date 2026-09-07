@@ -53,7 +53,7 @@ func TestRunVersionAdvertisesAnalysisUnitCapability(t *testing.T) {
 	if code := run([]string{"--version"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("run() code = %d, stderr=%s", code, stderr.String())
 	}
-	if got, want := stdout.String(), "depgraph-go-worker 0.5.4 (protocol 1.0; capabilities analysis-source-batch-v1,analysis-unit-typed-v1)\n"; got != want {
+	if got, want := stdout.String(), "depgraph-go-worker 0.5.4 (protocol 1.0; capabilities analysis-go-package-loader-v1,analysis-loader-scope-v1,analysis-source-batch-v1,analysis-unit-typed-v1)\n"; got != want {
 		t.Fatalf("version handshake = %q, want %q", got, want)
 	}
 	if stderr.Len() != 0 {

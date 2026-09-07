@@ -36,9 +36,16 @@ The scheduler derives every batch from the pre-split plan before any worker star
 Go workers also advertising `analysis-unit-typed-v1` receive a separate `typed` stage between them.
 Each later stage waits until all preceding chunks of its own unit have been saved and ingested; other units can proceed concurrently.
 Web stages use source batches; TypeScript retains the project context while AST transfer and dependency extraction select the current batch.
-Go syntax parses selected files, while typed and semantic processing each retain one complete module context.
-`go/packages` and SSA require a consistent universe of package objects.
-[Go validation](analysis-unit-go-validation.md) records the compiler boundary and measured repeated work.
+Go syntax parses selected files. Typed and semantic requests that carry a
+`split` binding with `loader.kind=package` use the hybrid loader: only the
+named package roots are parsed and type-checked with bodies, and in-repo
+dependencies are referenced from export data. Requests without that binding
+(a worker that did not advertise `analysis-loader-scope-v1`, or a unit the
+planner promoted to the module loader) still load one complete module
+context. Each load keeps one `token.FileSet` and one `go/types` universe;
+type objects never cross loads. Cross-unit references use the existing
+string node identities (module-relative directory, package path, `ForTest`).
+[Go validation](analysis-unit-go-validation.md) records both paths.
 
 The typed stage saves declarations, type references, and relations that do not require SSA.
 Its completed stream uses `syntax-complete` and the explicit `go_typed_stage_complete="true"` profile property; it never claims `semantic-complete` by itself.
@@ -46,6 +53,18 @@ The final semantic stage performs SSA and establishes full semantic coverage onl
 If SSA stops, the completed typed graph remains available in the partial attempt and can be reused after restart.
 Go compiler objects cannot be restored from graph records, so SSA reconstructs its type universe on restart even when the typed graph checkpoint is reused.
 No checkpoint is available inside an unfinished `packages.Load` or SSA builder call.
+After `ssa.Program.Build` the worker drops its own `Syntax` and `TypesInfo`
+references before CHA and candidate mapping, and reports `go_ssa_mapping`
+progress every 64 pending call sites so a large package can extend the
+inactivity deadline during mapping. Package-bounded semantic checkpoints
+also fold the worker-reported `go_reference_fingerprint` into
+`UnitCheckpointKey.reference_digest` without rewriting the static
+`input_digest`, so typed/semantic invalidation tracks the in-repo import
+closure the typed stage actually loaded. Keys without that field serialize
+exactly as they did before this change; existing module-loader checkpoints
+stay valid. The first scan after the snapshot source moved from the observed
+NeedDeps load to the module-wide metadata listing invalidates typed and
+semantic checkpoints once (syntax checkpoints are kept).
 
 Auxiliary output belongs to one syntax chunk.
 Cross-unit dependency targets are allowed, but source evidence and file coverage must belong to the request.
@@ -165,5 +184,10 @@ Older readers must reject newer storage versions and must not interpret missing 
 
 Increasing one repository timeout would still discard completed work.
 Treating directories as independent repositories would break workspace imports and local replacements.
-Splitting Go SSA into independent package universes would change call-graph meaning.
+Splitting Go SSA into independent package universes and then claiming
+whole-program RTA/VTA over them would change call-graph meaning. Package
+units therefore run CHA only, declare
+`go_call_graph_program_scope=package-with-declaration-deps`, and treat a
+missing program-scope property as whole-program so historical streams stay
+byte-identical. Mixing `go/types` objects across loads was also rejected.
 Running package managers or project hooks during discovery would cross the static-analysis boundary.

@@ -35,6 +35,11 @@ type goSemanticExtractor struct {
 	pendingCalls          []goSemanticPendingCall
 	complete              bool
 	beforeSites           map[string]bool
+	// referenceNodeIDs and referenceNamedTypes describe in-repo dependencies
+	// loaded without syntax by the package-scope loader; see
+	// semantic_reference.go.
+	referenceNodeIDs    map[string]bool
+	referenceNamedTypes map[string]goSemanticNamedType
 }
 
 type goSemanticPackage struct {
@@ -93,6 +98,8 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 		diagnosticIDs:         map[string]bool{},
 		complete:              true,
 		beforeSites:           make(map[string]bool, len(s.sites)),
+		referenceNodeIDs:      map[string]bool{},
+		referenceNamedTypes:   map[string]goSemanticNamedType{},
 	}
 	for _, diagnostic := range s.diagnostics {
 		if diagnostic.ID != "" {
@@ -112,6 +119,11 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 			extractor.contexts = append(extractor.contexts, context)
 		}
 	}
+	// Package-scope loads satisfy in-repo dependencies from export data. Their
+	// canonical identities are registered first so the owned packages resolve
+	// cross-unit calls, type uses and interfaces to the same nodes the owning
+	// unit emits, without any shared go/types objects.
+	extractor.registerReferencePackages()
 
 	// All package-level types must exist before methods are declared. Go permits
 	// a receiver type to be declared after the method's source file.
@@ -158,6 +170,7 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	// semantic ledger accounts for them; the closure's definition nodes remain
 	// available as cross-unit targets.
 	s.retainAnalysisUnitSemanticScope()
+	extractor.pruneReferenceNodes()
 
 	extractor.accountSemanticSites()
 	if s.goPackages.Status == "loaded" && extractor.complete {
@@ -297,6 +310,9 @@ func (e *goSemanticExtractor) namedTypeRecord(nodeID string) (goSemanticNamedTyp
 				return record, true
 			}
 		}
+	}
+	if record, ok := e.referenceNamedTypes[nodeID]; ok {
+		return record, true
 	}
 	return goSemanticNamedType{}, false
 }

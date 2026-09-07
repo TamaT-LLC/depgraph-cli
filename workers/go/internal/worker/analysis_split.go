@@ -17,13 +17,13 @@ const AnalysisSplitContractVersion = "depgraph-analysis-split-plan-v1"
 // AnalysisLoaderScopeCapability is the handshake capability a worker
 // advertises once it honours the loader scope of the `split` binding: it
 // loads at least the requested loader paths, never fewer, and reports whether
-// it had to load more. This worker does not advertise it yet; it still loads
-// the complete module for typed and semantic stages.
+// it had to load more. This worker honours `module` bindings with the
+// module-whole-program load and `package` bindings with the hybrid loader.
 const AnalysisLoaderScopeCapability = "analysis-loader-scope-v1"
 
 // AnalysisGoPackageLoaderCapability tells the core planner that the worker can
-// type-check a bounded set of packages with declaration-level references and
-// stage the bodies of a large package. It is reserved for the bounded loader.
+// type-check a bounded set of packages with declaration-level references from
+// export data and stage the bodies of a large package across semantic chunks.
 const AnalysisGoPackageLoaderCapability = "analysis-go-package-loader-v1"
 
 // Loader-scope outcomes echoed in the `analysis_loader_scope` profile property.
@@ -163,22 +163,73 @@ func validateRequestRootList(field string, values []string) error {
 	return nil
 }
 
+// packageScoped reports whether the request binds its typed or semantic load
+// to the package-scoped hybrid loader instead of the module-whole-program path.
+func (request AnalysisUnitRequest) packageScoped() bool {
+	return request.Split != nil && request.Stage != AnalysisUnitStageSyntax && request.Split.Loader.Kind == "package"
+}
+
+// stagedBodies reports whether this typed or semantic chunk owns the bodies of
+// a subset of the files its loader reads: the other files of the same packages
+// contribute declarations only, as the `declarations` reference depth allows.
+// Both stages stage bodies the same way because both streams carry the
+// body-derived value references, calls, and type uses of the owned files; a
+// typed chunk that stripped every body would emit a different graph than the
+// module loader. A large package's types and all of its bodies are therefore
+// never held together, and no body is type-checked twice within one stage.
+func (request AnalysisUnitRequest) stagedBodies() bool {
+	return request.packageScoped() && request.Split.SplitKind == "staged_bodies"
+}
+
+// scanOptions maps the negotiated split binding onto the loader selection. A
+// `package` binding on a typed or semantic request selects the hybrid loader
+// for the bound package roots; every other binding, a legacy request, and an
+// unbound request keep the historical module-whole-program path unchanged.
+// The scan-scoped build cache directory is a process input from the core, not
+// part of the request contract, so it is supplied separately.
+func (request AnalysisUnitRequest) scanOptions(buildCacheDir string) scanOptions {
+	options := scanOptions{buildCacheDir: buildCacheDir}
+	if !request.packageScoped() {
+		return options
+	}
+	options.loaderMode = goLoaderModePackage
+	options.loaderTargets = make([]goLoaderTargetSpec, 0, len(request.Split.Loader.PackageRoots))
+	for _, root := range request.Split.Loader.PackageRoots {
+		options.loaderTargets = append(options.loaderTargets, goLoaderTargetSpec{Dir: root})
+	}
+	if request.stagedBodies() {
+		options.bodyPaths = make(map[string]bool, len(request.SourcePaths))
+		for _, sourcePath := range request.SourcePaths {
+			options.bodyPaths[sourcePath] = true
+		}
+	}
+	return options
+}
+
 // loaderScopeOutcome reports how this worker's actual loading relates to the
 // requested loader scope. A syntax request is only valid when its `files`
 // loader names exactly `source_paths`, which is what the parser reads, so its
-// scope is applied. Typed and semantic requests still load the complete
-// module, so a narrower `package` or `files` request is honoured by loading
-// more, never less.
-func (request AnalysisUnitRequest) loaderScopeOutcome() string {
+// scope is applied. A `module` binding is applied by the module-whole-program
+// load. A `package` binding is applied when the hybrid loader type-checked the
+// target packages (`Status==loaded`) and satisfied every dependency from
+// export data; it is widened when a test-recompiled dependency variant had to
+// be read from source, or when the package load fell back.
+func (request AnalysisUnitRequest) loaderScopeOutcome(mode goLoaderMode, loaded goPackagesInventory) string {
 	if request.Split == nil {
 		return ""
 	}
+	kind := request.Split.Loader.Kind
 	switch request.Stage {
 	case AnalysisUnitStageSyntax:
 		return AnalysisLoaderScopeApplied
 	default:
-		if request.Split.Loader.Kind == "module" || request.Split.Loader.Kind == "repository" {
+		switch kind {
+		case "module", "repository", "project":
 			return AnalysisLoaderScopeApplied
+		case "package":
+			if mode == goLoaderModePackage && loaded.Status == "loaded" && loaded.Loader != nil && loaded.Loader.Metrics.ReferencesSource == 0 {
+				return AnalysisLoaderScopeApplied
+			}
 		}
 	}
 	return AnalysisLoaderScopeWidened
@@ -186,7 +237,7 @@ func (request AnalysisUnitRequest) loaderScopeOutcome() string {
 
 // splitProfileProperties echoes the binding identity so the core can join the
 // stream to its execution unit and see whether the loader scope was applied.
-func (request AnalysisUnitRequest) splitProfileProperties() map[string]string {
+func (request AnalysisUnitRequest) splitProfileProperties(outcome string) map[string]string {
 	if request.Split == nil {
 		return nil
 	}
@@ -197,6 +248,6 @@ func (request AnalysisUnitRequest) splitProfileProperties() map[string]string {
 		"analysis_split_kind":         request.Split.SplitKind,
 		"analysis_loader_kind":        request.Split.Loader.Kind,
 		"analysis_loader_input_split": fmt.Sprintf("%t", request.Split.Loader.InputSplit),
-		"analysis_loader_scope":       request.loaderScopeOutcome(),
+		"analysis_loader_scope":       outcome,
 	}
 }

@@ -414,6 +414,10 @@
         },
         "input_split": {
           "type": "boolean"
+        },
+        "reference_closure_roots": {
+          "description": "Package directories a bounded loader is expected to read for reference: the transitive in-repository import closure of `package_roots` as resolved by static discovery, without the loaded roots. A subset of the directories of `reference_paths`; empty for a whole-context loader. Optional and additive; absent means empty.",
+          "$ref": "#/$defs/pathList"
         }
       }
     },
@@ -737,7 +741,8 @@
         "adapter_boundary_unsplittable",
         "cycle_group_retained",
         "staged_after_declarations",
-        "refined"
+        "refined",
+        "whole_context_promoted"
       ]
     },
     "stage": {

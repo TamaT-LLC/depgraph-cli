@@ -95,7 +95,7 @@ fn budget(configure: impl FnOnce(&mut Config)) -> (Config, AnalysisSplitBudget) 
 /// The shipped boundaries as workers that negotiated loader scope execute
 /// them: the same stages, partitioned against the byte budgets.
 fn negotiated_defaults() -> Vec<AnalysisAdapterBoundary> {
-    AnalysisAdapterBoundary::current_defaults()
+    AnalysisAdapterBoundary::module_loader_defaults()
         .into_iter()
         .map(|boundary| boundary.with_loader_scope(true))
         .collect()
@@ -210,6 +210,7 @@ fn projection(split_plan: &AnalysisSplitPlan, plan: &AnalysisPlan) -> Value {
                 "reference_paths": unit.loader.reference_paths,
                 "reference_units": unit.loader.reference_unit_ids.iter().map(|id| root_of(id)).collect::<Vec<_>>(),
                 "input_split": unit.loader.input_split,
+                "reference_closure_roots": unit.loader.reference_closure_roots,
             },
             "estimate": unit.estimate,
             "budget": unit.budget,
@@ -228,9 +229,12 @@ fn scenarios(
         checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
-    scenarios.insert("current-workers-default-budget", (plan.clone(), current));
+    scenarios.insert(
+        "module-loader-workers-default-budget",
+        (plan.clone(), current),
+    );
     let (_, file_budget) = budget(|config| {
         config.scan.max_unit_source_files = 2;
         config.scan.max_concurrent_units = 3;
@@ -239,19 +243,30 @@ fn scenarios(
         checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
-    scenarios.insert("current-workers-two-file-budget", (plan.clone(), files));
+    scenarios.insert(
+        "module-loader-workers-two-file-budget",
+        (plan.clone(), files),
+    );
+    // The shipped workers: the Go worker negotiates the package loader.
     let (staged, _) = split(
         checkout,
         &plan,
         &default_budget,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    scenarios.insert("go-package-loader-default-budget", (plan.clone(), staged));
+    let (bounded, _) = split(
+        checkout,
+        &plan,
+        &bounded_budget().1,
         vec![
             AnalysisAdapterBoundary::go_package_loader(),
             AnalysisAdapterBoundary::web_project_loader(),
         ],
     )?;
-    scenarios.insert("go-package-loader-default-budget", (plan, staged));
+    scenarios.insert("go-package-loader-bounded-budget", (plan, bounded));
     Ok(scenarios)
 }
 
@@ -291,13 +306,13 @@ fn same_input_produces_the_same_split_plan_across_checkouts_and_runs() -> Result
         &first,
         &first_plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (second_split, _) = split(
         &second,
         &second_plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(
         serde_json::to_value(&first_split)?,
@@ -337,13 +352,13 @@ fn budget_change_changes_the_split_plan_but_not_discovery_or_input_fingerprints(
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (file_split, _) = split(
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
 
     assert_eq!(default_split.plan_id, plan.plan_id);
@@ -447,7 +462,7 @@ fn out_of_unit_references_are_retained_in_loader_and_reference_scope() -> Result
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let shared = unit_id(&plan, "services/shared", "go");
     let api_semantic = only(
@@ -544,7 +559,7 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
         let unit = only(&module_split, &plan, "services/big", "go", stage);
@@ -599,8 +614,11 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
             .contains(&AnalysisSplitReason::SourceByteBudget)
     }));
 
-    // A package-capable Go worker receives a declaration stage for the whole
-    // package and body batches that reference those declarations.
+    // A package-capable Go worker receives the large package as staged body
+    // batches in both the typed and the semantic stage: every batch reads
+    // the package's declarations and the bodies of its own files only, so
+    // the types and all bodies of the package are never held together, and
+    // each stage still emits the body-derived references of every file once.
     let (staged_split, _) = split(
         &checkout,
         &plan,
@@ -610,30 +628,12 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
             AnalysisAdapterBoundary::web_project_loader(),
         ],
     )?;
-    let typed = only(
+    let typed = units(
         &staged_split,
         &plan,
         "services/big",
         "go",
         AnalysisStage::Typed,
-    );
-    assert_eq!(typed.loader.kind, AnalysisLoaderKind::Package);
-    assert_eq!(
-        typed.loader.reference_depth,
-        AnalysisReferenceDepth::Declarations
-    );
-    assert_eq!(
-        typed.ownership.package_roots,
-        vec!["services/big".to_owned()]
-    );
-    assert!(
-        typed.estimate.over_budget,
-        "one package cannot be type-checked in pieces"
-    );
-    assert!(
-        typed
-            .split_reasons
-            .contains(&AnalysisSplitReason::SourceByteBudget)
     );
     let bodies = units(
         &staged_split,
@@ -642,52 +642,123 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         "go",
         AnalysisStage::Semantic,
     );
+    assert_eq!(typed.len(), 2);
     assert_eq!(bodies.len(), 2);
-    for batch in &bodies {
-        assert_eq!(batch.split_kind, AnalysisSplitKind::StagedBodies);
-        assert!(
-            batch
-                .split_reasons
-                .contains(&AnalysisSplitReason::StagedAfterDeclarations)
-        );
-        assert_eq!(batch.loader.kind, AnalysisLoaderKind::Package);
-        assert_eq!(batch.loader.paths, batch.ownership.source_paths);
-        assert_eq!(
-            batch.loader.reference_depth,
-            AnalysisReferenceDepth::Declarations
-        );
-        assert!(batch.loader.input_split);
-        assert_eq!(batch.prerequisite_ids, vec![typed.id.clone()]);
-        assert!(!batch.estimate.over_budget);
-        assert_eq!(batch.estimate.owned_source_bytes, 4 * 2_097_152);
-        let overlap = batch
-            .loader
-            .paths
-            .iter()
-            .filter(|path| batch.loader.reference_paths.contains(path))
-            .count();
-        assert_eq!(overlap, 0, "bodies and declaration references are disjoint");
-    }
-    let mut owned = bodies
+    let typed_ids = typed
         .iter()
-        .flat_map(|batch| batch.ownership.source_paths.iter().cloned())
+        .map(|batch| batch.id.clone())
         .collect::<Vec<_>>();
-    owned.sort();
-    assert_eq!(
-        owned,
-        plan.unit(&unit_id(&plan, "services/big", "go"))
-            .unwrap()
-            .source_paths
-    );
-    // The multi-package api module becomes one typed execution unit that
-    // loads both of its packages; small packages share a loader.
-    let api_typed = only(
+    for (stage, batches) in [
+        (AnalysisStage::Typed, &typed),
+        (AnalysisStage::Semantic, &bodies),
+    ] {
+        for batch in batches {
+            assert_eq!(batch.stage, stage);
+            assert_eq!(batch.split_kind, AnalysisSplitKind::StagedBodies);
+            assert!(
+                batch
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::StagedAfterDeclarations)
+            );
+            assert!(
+                batch
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::SourceByteBudget)
+            );
+            assert_eq!(batch.loader.kind, AnalysisLoaderKind::Package);
+            assert_eq!(batch.loader.paths, batch.ownership.source_paths);
+            assert_eq!(
+                batch.ownership.package_roots,
+                vec!["services/big".to_owned()]
+            );
+            assert_eq!(
+                batch.loader.reference_depth,
+                AnalysisReferenceDepth::Declarations
+            );
+            assert!(batch.loader.input_split);
+            assert!(!batch.estimate.over_budget);
+            assert_eq!(batch.estimate.owned_source_bytes, 4 * 2_097_152);
+            let overlap = batch
+                .loader
+                .paths
+                .iter()
+                .filter(|path| batch.loader.reference_paths.contains(path))
+                .count();
+            assert_eq!(overlap, 0, "bodies and declaration references are disjoint");
+        }
+        let mut owned = batches
+            .iter()
+            .flat_map(|batch| batch.ownership.source_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        owned.sort();
+        assert_eq!(
+            owned,
+            plan.unit(&unit_id(&plan, "services/big", "go"))
+                .unwrap()
+                .source_paths,
+            "{stage:?} batches partition the package's files"
+        );
+    }
+    // Every body batch runs after the typed batches of its package, so the
+    // declarations of the whole package are checked before any body batch
+    // starts; the typed batches themselves follow the syntax stage.
+    for batch in &bodies {
+        assert_eq!(batch.prerequisite_ids, typed_ids);
+    }
+    let syntax_ids = units(
         &staged_split,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Syntax,
+    )
+    .iter()
+    .map(|batch| batch.id.clone())
+    .collect::<Vec<_>>();
+    for batch in &typed {
+        assert_eq!(batch.prerequisite_ids, syntax_ids);
+    }
+    // The multi-package api module fits the byte budgets, so its typed and
+    // semantic stages are promoted to the whole-module loader and keep the
+    // whole-program precision of that loader; the plan says so.
+    for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
+        let api = only(&staged_split, &plan, "services/api", "go", stage);
+        assert_eq!(api.split_kind, AnalysisSplitKind::Whole);
+        assert_eq!(api.loader.kind, AnalysisLoaderKind::Module);
+        assert_eq!(api.loader.reference_depth, AnalysisReferenceDepth::Bodies);
+        assert!(!api.loader.input_split);
+        assert!(!api.estimate.over_budget);
+        assert!(
+            api.split_reasons
+                .contains(&AnalysisSplitReason::WholeContextPromoted)
+        );
+        assert!(
+            api.split_reasons
+                .contains(&AnalysisSplitReason::UnitFitsBudget)
+        );
+        assert!(api.loader.reference_closure_roots.is_empty());
+    }
+    // Under a context budget the api module does not fit, its two small
+    // packages share one bounded typed loader, ordered dependencies first,
+    // and the shared module contributes declarations only.
+    let (bounded_split, _) = split(
+        &checkout,
+        &plan,
+        &bounded_budget().1,
+        vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ],
+    )?;
+    let api_typed = only(
+        &bounded_split,
         &plan,
         "services/api",
         "go",
         AnalysisStage::Typed,
     );
+    assert_eq!(api_typed.split_kind, AnalysisSplitKind::Whole);
+    assert_eq!(api_typed.loader.kind, AnalysisLoaderKind::Package);
     assert_eq!(
         api_typed.loader.package_roots,
         vec![
@@ -699,7 +770,28 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         api_typed.loader.input_split,
         "shared module sources are declarations, not loaded bodies"
     );
+    assert!(
+        !api_typed
+            .split_reasons
+            .contains(&AnalysisSplitReason::WholeContextPromoted)
+    );
+    assert!(!api_typed.estimate.over_budget);
+    assert_eq!(
+        api_typed.loader.reference_closure_roots,
+        vec!["services/shared".to_owned()],
+        "the api package imports shared; shared/util is a reference by name only"
+    );
     Ok(())
+}
+
+/// A byte budget the api module's whole context (api + shared, 7,680 bytes)
+/// does not fit while its owned sources (5,120 bytes) do: the api packages
+/// are loaded bounded, with the shared module as declarations.
+fn bounded_budget() -> (Config, AnalysisSplitBudget) {
+    budget(|config| {
+        config.scan.max_unit_source_bytes = 5_120;
+        config.scan.max_context_source_bytes = 5_120;
+    })
 }
 
 #[test]
@@ -711,7 +803,7 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let a = only(
         &split_plan,
@@ -790,11 +882,17 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
 
     // A bounded loader that reads declarations or bodies is widened to the
     // whole cycle instead of separating its members into different loader
-    // scopes; ownership stays with each member.
+    // scopes; ownership stays with each member.  The cycle members fit the
+    // default byte budgets and would be promoted to the module loader, so the
+    // bounded behaviour is observed under a context budget below the cycle.
+    let mut tight_config = Config::default();
+    tight_config.scan.max_unit_source_bytes = 256;
+    tight_config.scan.max_context_source_bytes = 256;
+    let tight_budget = AnalysisSplitBudget::from_config(&tight_config);
     let (bounded, _) = split(
         &checkout,
         &plan,
-        &budget,
+        &tight_budget,
         vec![
             AnalysisAdapterBoundary::go_package_loader(),
             AnalysisAdapterBoundary::web_project_loader(),
@@ -837,13 +935,21 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
     );
     assert_eq!(a_syntax.loader.paths, vec!["services/cycle-a/a.go"]);
     // A unit that merely depends on another package keeps its bounded scope.
-    let api = only(&bounded, &plan, "services/api", "go", AnalysisStage::Typed);
-    assert!(api.loader.input_split);
-    assert!(
-        api.loader
-            .reference_paths
-            .contains(&"services/shared/shared.go".to_owned())
-    );
+    let api = units(&bounded, &plan, "services/api", "go", AnalysisStage::Typed);
+    assert!(!api.is_empty());
+    for unit in api {
+        assert!(unit.loader.input_split);
+        assert!(
+            unit.loader
+                .reference_paths
+                .contains(&"services/shared/shared.go".to_owned())
+        );
+        assert!(
+            !unit
+                .split_reasons
+                .contains(&AnalysisSplitReason::CycleGroupRetained)
+        );
+    }
     Ok(())
 }
 
@@ -875,7 +981,7 @@ fn path_lists_are_sorted_and_unique_as_workers_require() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let api = only(
         &split_plan,
@@ -891,6 +997,128 @@ fn path_lists_are_sorted_and_unique_as_workers_require() -> Result<()> {
             "services/api/main.go".to_owned()
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn promoted_whole_context_is_demoted_to_packages_by_a_memory_refinement() -> Result<()> {
+    let checkout = Checkout::new()?;
+    let (config, budget) = budget(|_| {});
+    let plan = checkout.discover(&config)?;
+    let boundaries = vec![
+        AnalysisAdapterBoundary::go_package_loader(),
+        AnalysisAdapterBoundary::web_project_loader(),
+    ];
+    let (current, input) = split(&checkout, &plan, &budget, boundaries)?;
+    let api_typed = only(&current, &plan, "services/api", "go", AnalysisStage::Typed).clone();
+    let api_semantic = only(
+        &current,
+        &plan,
+        "services/api",
+        "go",
+        AnalysisStage::Semantic,
+    )
+    .clone();
+    assert_eq!(api_typed.loader.kind, AnalysisLoaderKind::Module);
+    assert!(
+        api_typed
+            .split_reasons
+            .contains(&AnalysisSplitReason::WholeContextPromoted)
+    );
+    // The promoted typed unit is exactly the unit the module-loader boundary
+    // plans for a worker without the package loader: the same identity, so a
+    // saved result of either boundary is the same saved result.
+    let (module_plan, _) = split(&checkout, &plan, &budget, negotiated_defaults())?;
+    assert_eq!(
+        only(
+            &module_plan,
+            &plan,
+            "services/api",
+            "go",
+            AnalysisStage::Typed
+        )
+        .id,
+        api_typed.id
+    );
+
+    // The whole-module load exceeded the worker's memory: the refinement
+    // demotes both promotable stages of the unit to the bounded package
+    // loader, and nothing else in the plan changes.
+    let resplit = resplit_execution_unit(
+        &plan,
+        &current,
+        &input,
+        &api_typed.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(resplit.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(
+        resplit.superseded_execution_unit_ids,
+        vec![api_typed.id.clone(), api_semantic.id.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        resplit.retained_execution_unit_ids.len(),
+        current.execution_units.len() - 2
+    );
+    for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
+        let replaced = units(&resplit.plan, &plan, "services/api", "go", stage);
+        assert!(!replaced.is_empty());
+        for unit in replaced {
+            assert!(resplit.replacement_execution_unit_ids.contains(&unit.id));
+            assert_eq!(unit.loader.kind, AnalysisLoaderKind::Package);
+            assert_eq!(
+                unit.loader.reference_depth,
+                AnalysisReferenceDepth::Declarations
+            );
+            assert!(unit.loader.input_split);
+            assert!(unit.split_reasons.contains(&AnalysisSplitReason::Refined));
+            assert!(
+                !unit
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::WholeContextPromoted)
+            );
+            assert_eq!(
+                unit.loader.reference_closure_roots,
+                vec!["services/shared".to_owned()]
+            );
+        }
+    }
+    // The refinement is applied, not reported as unsplittable, and the plan
+    // reproduces from its history.
+    assert!(resplit.plan.unsplittable_refinements.is_empty());
+    let replay = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput {
+            refinements: resplit.plan.refinements.clone(),
+            ..input.clone()
+        },
+    )?;
+    assert_eq!(replay.split_plan_id, resplit.split_plan_id);
+    // A second memory failure of the demoted single-package typed unit has
+    // nothing left to divide and is reported as such.
+    let demoted_typed = only(
+        &resplit.plan,
+        &plan,
+        "services/api",
+        "go",
+        AnalysisStage::Typed,
+    );
+    let again = resplit_execution_unit(
+        &plan,
+        &resplit.plan,
+        &AnalysisSplitInput {
+            refinements: resplit.plan.refinements.clone(),
+            ..input.clone()
+        },
+        &demoted_typed.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(again.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(again.replacement_execution_unit_ids.len(), 2);
     Ok(())
 }
 
@@ -1216,7 +1444,7 @@ fn refinement_history_carried_across_boundaries_is_reported_not_dropped() -> Res
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let target = only(
         &whole_context,
@@ -1288,7 +1516,7 @@ fn loader_scope_and_ownership_scope_are_distinguishable() -> Result<()> {
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let web_semantic = units(
         &split_plan,
@@ -1351,7 +1579,7 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let parallelism = &split_plan.parallelism;
     assert_eq!(parallelism.max_concurrent_units, 2);
@@ -1385,7 +1613,7 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
         &checkout,
         &plan,
         &serial,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(serial_split.parallelism.effective_concurrency, 1);
     assert!(
@@ -1447,7 +1675,7 @@ fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
         &plan,
         &AnalysisSplitInput::new(
             default_budget.clone(),
-            AnalysisAdapterBoundary::current_defaults(),
+            AnalysisAdapterBoundary::module_loader_defaults(),
         ),
     )?;
     assert!(declared.execution_units.is_empty());
@@ -1461,7 +1689,7 @@ fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
         &checkout,
         &checkout.discover(&config)?,
         &serial,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(serial_split.parallelism.effective_concurrency, 1);
     assert_eq!(
@@ -1506,7 +1734,7 @@ fn measured_sizes_match_fixture_bytes_and_drive_byte_splits() -> Result<()> {
     );
     let partial = AnalysisSplitInput::new(
         AnalysisSplitBudget::from_config(&config),
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     );
     assert!(
         plan_analysis_split(&plan, &partial)?
@@ -1538,7 +1766,7 @@ fn split_plan_and_resplit_plan_satisfy_the_closed_schema() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let target = units(&current, &plan, "services/big", "go", AnalysisStage::Syntax)[0]
         .id
@@ -1663,10 +1891,41 @@ fn bounded_package_boundary_requires_the_loader_scope_capability() -> Result<()>
     assert!(!web.loader_scope);
     assert!(select(AnalysisAdapter::Web, &[ANALYSIS_LOADER_SCOPE_CAPABILITY]).loader_scope);
     assert!(
-        AnalysisAdapterBoundary::current_defaults()
+        AnalysisAdapterBoundary::module_loader_defaults()
             .iter()
             .all(|boundary| !boundary.loader_scope),
-        "the shipped workers have not negotiated loader scope"
+        "the module-loader defaults describe workers without loader scope"
+    );
+    // The shipped Go worker advertises exactly the handshake that selects
+    // the package loader, so `scan --split-plan` explains a repository with
+    // the boundary the scan will execute.
+    let shipped_go_capabilities = [
+        ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY,
+        ANALYSIS_LOADER_SCOPE_CAPABILITY,
+        "analysis-source-batch-v1",
+        "analysis-unit-typed-v1",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(AnalysisAdapterBoundary::current_defaults())?,
+        serde_json::to_value(vec![
+            AnalysisAdapterBoundary::for_capabilities(
+                AnalysisAdapter::Go,
+                &shipped_go_capabilities
+            )
+            .expect("shipped Go worker has a boundary"),
+            select(AnalysisAdapter::Web, &[]),
+        ])?,
+        "the shipped defaults are the boundaries the shipped workers negotiate"
+    );
+    assert_eq!(
+        serde_json::to_value(AnalysisAdapterBoundary::current_defaults())?,
+        serde_json::to_value(vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ])?
     );
 
     // The planner refuses the inconsistent combination outright.
@@ -1709,7 +1968,7 @@ fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (negotiated, _) = split(&checkout, &plan, &default_budget, negotiated_defaults())?;
     assert_eq!(legacy.plan_id, negotiated.plan_id);
@@ -1764,7 +2023,7 @@ fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let chunks = units(
         &legacy_files,

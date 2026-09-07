@@ -20,6 +20,12 @@ import (
 
 const goVTACallGraphEngine = "golang.org/x/tools/go/callgraph/vta@v0.48.0"
 
+// Heartbeat cadence for SSA candidate mapping. The Go APIs expose no
+// finer checkpoint inside packages.Load or ssa.Program.Build, so the
+// inactivity deadline can only be extended between inputs and while
+// mapping pending call sites onto repository symbols.
+const goSSAMappingProgressInterval = 64
+
 type goSSACallKey struct {
 	input       *goSSAInput
 	callerTypes *types.Package
@@ -32,10 +38,14 @@ type goSSAGraphIndex struct {
 }
 
 type goSSABuild struct {
-	program  *ssa.Program
-	initial  []*ssa.Package
+	program *ssa.Program
+	initial []*ssa.Package
+	// complete reports a whole program: every dependency carries bodies, so
+	// RTA (and VTA on request) may run. It is never true for a declared
+	// package scope, whose dependencies are declaration-only by construction.
 	complete bool
 	reason   string
+	scope    goSSAProgramScope
 }
 
 type goSSAOutcome struct {
@@ -55,6 +65,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 	}
 	defer e.recordSSAOutcome(outcome)
 	if len(e.pendingCalls) == 0 {
+		e.state.reportProgress("go_ssa_mapping", "completed", 0)
 		return
 	}
 
@@ -80,6 +91,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 	vtaByInput := map[*goSSAInput]goSSAGraphIndex{}
 	vtaFallbackByInput := map[*goSSAInput]string{}
 	completeByInput := map[*goSSAInput]bool{}
+	scopeByInput := map[*goSSAInput]goSSAProgramScope{}
 	buildFailures := map[*goSSAInput]bool{}
 	completedInputs := 0
 	reportInputCompleted := func() {
@@ -87,6 +99,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		e.state.reportProgress("go_ssa", "progress", completedInputs)
 	}
 	for _, input := range inputs {
+		scopeByInput[input] = input.programScope()
 		build, err := buildGoSSA(input)
 		if err != nil {
 			buildFailures[input] = true
@@ -95,11 +108,25 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 			e.complete = false
 			e.addSSABuildDiagnostic(input, err)
+			releaseGoSSASyntaxAfterBuild(input, e)
 			reportInputCompleted()
 			continue
 		}
+		// SSA has copied the syntax it needs. Drop the loader's Syntax and
+		// TypesInfo before CHA and candidate mapping so a large package does
+		// not retain the typed AST beside the SSA program.
+		releaseGoSSASyntaxAfterBuild(input, e)
 		completeByInput[input] = build.complete
-		if !build.complete {
+		switch {
+		case build.scope == goSSAProgramScopePackage:
+			// A declared package scope is complete by its own contract: the
+			// loader promised declaration-only dependencies, so CHA is the
+			// sound choice and no partial-program diagnostic is warranted.
+			if outcome.requestedVTA {
+				vtaFallbackByInput[input] = "vta_package_scope_fallback"
+				outcome.fallbackReasons[vtaFallbackByInput[input]] = true
+			}
+		case !build.complete:
 			e.complete = false
 			e.addSSAPartialDiagnostic(input, build.reason, outcome.requestedVTA)
 			if outcome.requestedVTA {
@@ -108,7 +135,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 		}
 
-		chaGraph, err := buildGoCHAGraph(build.program)
+		chaGraph, err := buildGoCHAGraph(build.program, build.scope)
 		if err != nil {
 			buildFailures[input] = true
 			e.complete = false
@@ -153,15 +180,21 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		reportInputCompleted()
 	}
 
+	mapped := 0
 	for _, pending := range e.pendingCalls {
+		mapped++
+		if mapped == 1 || mapped%goSSAMappingProgressInterval == 0 {
+			e.state.reportProgress("go_ssa_mapping", "progress", mapped)
+		}
 		input := pending.context.typed.SSAInput
 		if input == nil || buildFailures[input] {
 			e.emitPendingUnresolved(pending)
 			continue
 		}
 		key := goSSACallKey{input: input, callerTypes: pending.context.typed.Types, position: pending.call.Lparen}
+		scope := scopeByInput[input]
 		algorithm, selectionReason, fallbackReason, index := e.selectGoSSAIndex(
-			pending, key, completeByInput[input], chaByInput[input], rtaByInput[input],
+			pending, key, scope, completeByInput[input], chaByInput[input], rtaByInput[input],
 			outcome.requestedVTA, vtaByInput[input], vtaFallbackByInput[input],
 		)
 		outcome.algorithms[algorithm] = true
@@ -222,7 +255,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		}
 		sort.Strings(targetIDs)
 		evidence := goSSACandidateEvidence(
-			pending, algorithm, selectionReason, fallbackReason, len(targetIDs), outcome.requestedVTA,
+			pending, algorithm, selectionReason, fallbackReason, scope, len(targetIDs), outcome.requestedVTA,
 		)
 		if !e.addCandidateCall(pending, targetIDs, evidence) {
 			siteID := goSSAPendingSiteID(e.state.identityProfileID(), pending, evidence)
@@ -237,12 +270,73 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 		}
 	}
+	e.state.reportProgress("go_ssa_mapping", "completed", mapped)
 
 	// The packages.Package graph is only needed while this pass runs. Dropping
 	// the roots here keeps a completed scan from retaining the full dependency
 	// syntax graph through its Result.
 	for _, input := range inputs {
 		input.Roots = nil
+	}
+}
+
+// releaseGoSSASyntaxAfterBuild drops the loader's Syntax and TypesInfo after
+// ssa.Program.Build. The SSA program keeps the function syntax it needs for
+// mapping; CHA and candidate mapping do not consult the typed AST. Clearing
+// the AST-retaining maps on the extractor context lets the garbage collector
+// reclaim the typed trees before call-graph construction on a large package.
+func releaseGoSSASyntaxAfterBuild(input *goSSAInput, extractor *goSemanticExtractor) {
+	if input == nil {
+		return
+	}
+	seen := map[*packages.Package]bool{}
+	var walk func(*packages.Package)
+	walk = func(pkg *packages.Package) {
+		if pkg == nil || seen[pkg] {
+			return
+		}
+		seen[pkg] = true
+		pkg.Syntax = nil
+		pkg.TypesInfo = nil
+		for _, imported := range pkg.Imports {
+			walk(imported)
+		}
+	}
+	for _, root := range input.Roots {
+		walk(root)
+	}
+	if extractor == nil {
+		return
+	}
+	for _, context := range extractor.contexts {
+		if context == nil || context.typed.SSAInput != input {
+			continue
+		}
+		context.typed.TypesInfo = nil
+		for i := range context.typed.Files {
+			context.typed.Files[i].Syntax = nil
+		}
+		for i := range context.files {
+			context.files[i].Syntax = nil
+		}
+		for i := range context.universeFiles {
+			context.universeFiles[i].Syntax = nil
+		}
+		context.parents = nil
+		context.owners = nil
+		context.instanceNodes = nil
+		context.callInitializers = nil
+		context.typeSpecNodes = nil
+	}
+	for i := range extractor.state.goPackages.TypedPackages {
+		pkg := &extractor.state.goPackages.TypedPackages[i]
+		if pkg.SSAInput != input {
+			continue
+		}
+		pkg.TypesInfo = nil
+		for j := range pkg.Files {
+			pkg.Files[j].Syntax = nil
+		}
 	}
 }
 
@@ -291,9 +385,15 @@ func (e *goSemanticExtractor) recordSSAPolicy() {
 	e.state.profile.Properties["go_call_graph_library_partial"] = "cha"
 	e.state.profile.Properties["go_call_graph_vta_prerequisites"] = "complete-program,instantiate-generics,serial-ssa"
 	e.state.profile.Properties["go_call_graph_vta_engine"] = goVTACallGraphEngine
+	// The declaration is explicit only when a package-scoped input took part;
+	// its absence means whole-program, which keeps module-whole-program
+	// streams byte-identical to earlier workers and their golden fixtures.
+	if scope := e.declaredProgramScope(); scope != goSSAProgramScopeWholeProgram {
+		e.state.profile.Properties["go_call_graph_program_scope"] = string(scope)
+	}
 	if e.state.analysisUnit != nil {
 		e.state.profile.Properties["go_typed_load_progress_granularity"] = "package-boundary-after-packages-load"
-		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build"
+		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build,mapping-every-64-sites"
 		e.state.profile.Properties["go_analysis_atomic_operations"] = "go_packages_load,ssa_program_build"
 	}
 }
@@ -332,6 +432,19 @@ func (e *goSemanticExtractor) recordSSAOutcome(outcome *goSSAOutcome) {
 	e.state.profile.Properties["go_call_graph_vta_fallback_reasons"] = strings.Join(reasons, ",")
 }
 
+// declaredProgramScope aggregates the loader declarations of every typed
+// package in this extraction to the weakest value: one package-scoped input is
+// enough to make the unit's call graph declaration-deps precise only.
+func (e *goSemanticExtractor) declaredProgramScope() goSSAProgramScope {
+	scope := goSSAProgramScopeWholeProgram
+	for _, context := range e.contexts {
+		if context.typed.SSAInput.programScope() == goSSAProgramScopePackage {
+			scope = goSSAProgramScopePackage
+		}
+	}
+	return scope
+}
+
 func buildGoSSA(input *goSSAInput) (build goSSABuild, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -351,8 +464,25 @@ func buildGoSSA(input *goSSAInput) (build goSSABuild, err error) {
 	if len(initialPackages) == 0 {
 		return goSSABuild{}, fmt.Errorf("SSA input has no non-nil packages")
 	}
-	complete, reason := goSSAInputCompleteness(initialPackages)
 	mode := ssa.InstantiateGenerics | ssa.BuildSerially
+	scope := input.programScope()
+	if scope == goSSAProgramScopePackage {
+		// The loader declared declaration-only dependencies. Verify the
+		// declaration rather than inferring completeness from the graph, then
+		// build only the targets with bodies: ssautil.Packages creates every
+		// dependency as an importable package without functions (blocks=0), so
+		// rta.Analyze must never see this program.
+		if reason := goSSAPackageScopeInputCheck(initialPackages); reason != "" {
+			return goSSABuild{}, fmt.Errorf("package-scope SSA input violates its declaration: %s", reason)
+		}
+		program, initial := ssautil.Packages(initialPackages, mode)
+		if program == nil {
+			return goSSABuild{}, fmt.Errorf("SSA program is unavailable")
+		}
+		program.Build()
+		return goSSABuild{program: program, initial: initial, complete: false, scope: scope}, nil
+	}
+	complete, reason := goSSAInputCompleteness(initialPackages)
 	var program *ssa.Program
 	var initial []*ssa.Package
 	if complete {
@@ -364,7 +494,75 @@ func buildGoSSA(input *goSSAInput) (build goSSABuild, err error) {
 		return goSSABuild{}, fmt.Errorf("SSA program is unavailable")
 	}
 	program.Build()
-	return goSSABuild{program: program, initial: initial, complete: complete, reason: reason}, nil
+	return goSSABuild{program: program, initial: initial, complete: complete, reason: reason, scope: scope}, nil
+}
+
+// goSSAPackageScopeInputCheck validates a package-with-declaration-deps input:
+// every root carries syntax for all of its compiled files plus full type
+// information, and every transitive dependency carries a type package without
+// load errors. Dependencies are expected to have no syntax; a dependency that
+// does carry syntax is not an error because the SSA builder ignores non-root
+// bodies in this mode.
+func goSSAPackageScopeInputCheck(roots []*packages.Package) string {
+	isRoot := map[*packages.Package]bool{}
+	for _, root := range roots {
+		isRoot[root] = true
+	}
+	queue := append([]*packages.Package(nil), roots...)
+	seen := map[*packages.Package]bool{}
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		if pkg == nil {
+			return "the package graph contains a nil package"
+		}
+		if seen[pkg] {
+			continue
+		}
+		seen[pkg] = true
+		label := pkg.ID
+		if label == "" {
+			label = pkg.PkgPath
+		}
+		switch {
+		case len(pkg.Errors) > 0:
+			return fmt.Sprintf("package %q reports load errors", label)
+		case pkg.IllTyped:
+			return fmt.Sprintf("package %q is ill-typed", label)
+		case pkg.Types == nil:
+			return fmt.Sprintf("package %q has no type package", label)
+		}
+		if isRoot[pkg] {
+			switch {
+			case pkg.TypesSizes == nil:
+				return fmt.Sprintf("target %q has no type-size information", label)
+			case pkg.Fset == nil:
+				return fmt.Sprintf("target %q has no file set", label)
+			case pkg.TypesInfo == nil:
+				return fmt.Sprintf("target %q has no type information", label)
+			case len(pkg.Syntax) != len(pkg.CompiledGoFiles):
+				return fmt.Sprintf("target %q syntax count %d does not match compiled file count %d", label, len(pkg.Syntax), len(pkg.CompiledGoFiles))
+			}
+			for _, syntax := range pkg.Syntax {
+				if syntax == nil {
+					return fmt.Sprintf("target %q contains nil syntax", label)
+				}
+			}
+		}
+		importPaths := make([]string, 0, len(pkg.Imports))
+		for importPath := range pkg.Imports {
+			importPaths = append(importPaths, importPath)
+		}
+		sort.Strings(importPaths)
+		for _, importPath := range importPaths {
+			imported := pkg.Imports[importPath]
+			if imported == nil {
+				return fmt.Sprintf("package %q has no metadata for import %q", label, importPath)
+			}
+			queue = append(queue, imported)
+		}
+	}
+	return ""
 }
 
 func goSSAInputCompleteness(roots []*packages.Package) (bool, string) {
@@ -424,7 +622,7 @@ func goSSAInputCompleteness(roots []*packages.Package) (bool, string) {
 	return true, ""
 }
 
-func buildGoCHAGraph(program *ssa.Program) (graph *callgraph.Graph, err error) {
+func buildGoCHAGraph(program *ssa.Program, scope goSSAProgramScope) (graph *callgraph.Graph, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("%v", recovered)
@@ -434,7 +632,13 @@ func buildGoCHAGraph(program *ssa.Program) (graph *callgraph.Graph, err error) {
 	if program == nil {
 		return nil, fmt.Errorf("SSA program is unavailable")
 	}
-	graph = cha.CallGraph(program)
+	if scope == goSSAProgramScopePackage {
+		// Dependencies carry declarations only; restore the whole-program
+		// candidate universe from their method sets (see semantic_cha_scope.go).
+		graph = goPackageScopeCallGraph(program)
+	} else {
+		graph = cha.CallGraph(program)
+	}
 	inlineGoSSASyntheticWrappers(graph)
 	return graph, nil
 }
@@ -650,6 +854,7 @@ func goSSAFunctionPackage(function *ssa.Function) *types.Package {
 func (e *goSemanticExtractor) selectGoSSAIndex(
 	pending goSemanticPendingCall,
 	key goSSACallKey,
+	scope goSSAProgramScope,
 	complete bool,
 	chaIndex goSSAGraphIndex,
 	rtaIndex goSSAGraphIndex,
@@ -667,7 +872,7 @@ func (e *goSemanticExtractor) selectGoSSAIndex(
 			vtaFallback = "vta_site_unavailable_fallback"
 		}
 	}
-	algorithm, reason, index := e.selectDefaultGoSSAIndex(pending, key, complete, chaIndex, rtaIndex)
+	algorithm, reason, index := e.selectDefaultGoSSAIndex(pending, key, scope, complete, chaIndex, rtaIndex)
 	if !vtaRequested {
 		return algorithm, reason, "not_requested", index
 	}
@@ -677,10 +882,17 @@ func (e *goSemanticExtractor) selectGoSSAIndex(
 func (e *goSemanticExtractor) selectDefaultGoSSAIndex(
 	pending goSemanticPendingCall,
 	key goSSACallKey,
+	scope goSSAProgramScope,
 	complete bool,
 	chaIndex goSSAGraphIndex,
 	rtaIndex goSSAGraphIndex,
 ) (string, string, goSSAGraphIndex) {
+	if scope == goSSAProgramScopePackage {
+		// Declared package scope: dependencies have no bodies, so RTA cannot
+		// run regardless of the package kind. CHA over the declared method
+		// sets is the only sound choice, for main and test packages too.
+		return "cha", "package_scope_declaration_deps", chaIndex
+	}
 	if pending.context.typed.Name == "main" || pending.context.typed.ForTest != "" {
 		if !complete {
 			return "cha", "incomplete_program_fallback", chaIndex
@@ -903,6 +1115,7 @@ func (p *goSemanticPackage) ssaSymbolVisible(nodeID string, object *types.Func) 
 func goSSACandidateEvidence(
 	pending goSemanticPendingCall,
 	algorithm, selectionReason, fallbackReason string,
+	scope goSSAProgramScope,
 	candidateCount int,
 	vtaRequested bool,
 ) []Evidence {
@@ -920,6 +1133,10 @@ func goSSACandidateEvidence(
 	properties["analysis_scope"] = map[string]string{
 		"rta": "complete_program", "cha": "partial_program", "vta": "complete_program",
 	}[algorithm]
+	if scope != "" && scope != goSSAProgramScopeWholeProgram {
+		// Absent means whole-program; see recordSSAPolicy.
+		properties["program_scope"] = string(scope)
+	}
 	properties["candidate_count"] = candidateCount
 	properties["fallback_reason"] = fallbackReason
 	if vtaRequested {

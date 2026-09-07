@@ -21,9 +21,17 @@ const MAX_ENTRIES: usize = 4_096;
 #[serde(deny_unknown_fields)]
 pub(crate) struct UnitCheckpointKey {
     pub unit_id: String,
+    /// The static input witness the schedule derived from the discovery plan;
+    /// for a source-batch unit it equals the request's `context_fingerprint`.
     pub input_digest: String,
     pub execution_digest: String,
     pub root_digest: String,
+    /// The worker-reported reference closure a package-bounded semantic unit
+    /// was type-checked against, folded in at dispatch.  Absent for every
+    /// other unit, whose key digest therefore stays what it was before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_digest: Option<String>,
 }
 
 impl UnitCheckpointKey {
@@ -199,6 +207,65 @@ impl UnitCheckpointStore {
     }
 }
 
+/// The Go build cache one scan shares across its package-scoped units.
+///
+/// `go list -export` of a package-bounded unit compiles the export data of
+/// every dependency it references; without a shared cache each unit of the
+/// same module recompiles the same dependencies.  The cache is acceleration
+/// data for one scan only: it is created beside the checkpoints of the Store
+/// (or in the system temporary directory when the Store has no directory or
+/// lies inside the scan root, which the Go worker rejects), it is private to
+/// the process, and it is removed when the scan's execution ends.
+pub(crate) struct ScanBuildCache {
+    directory: tempfile::TempDir,
+}
+
+impl ScanBuildCache {
+    /// Open a fresh cache directory outside `root`.  Returns `None` when no
+    /// admissible directory exists; the worker then keeps its private cache.
+    pub fn open(store_path: Option<&Path>, root: &Path) -> Option<Self> {
+        let root = root.canonicalize().ok()?;
+        let mut bases = Vec::new();
+        if let Some(parent) = store_path
+            .and_then(Path::parent)
+            .and_then(|parent| parent.canonicalize().ok())
+        {
+            let base = parent.join(".depgraph");
+            if ensure_directory(&base).is_ok() {
+                bases.push(base.join("go-build-cache-v1"));
+            }
+        }
+        bases.push(std::env::temp_dir());
+        bases.into_iter().find_map(|base| {
+            ensure_directory(&base).ok()?;
+            let base = base.canonicalize().ok()?;
+            // The worker refuses a cache inside the scan root and a path that
+            // could be smuggled into a path-list variable.
+            if base.starts_with(&root)
+                || base
+                    .to_str()
+                    .is_none_or(|text| text.contains(PATH_LIST_SEPARATOR))
+            {
+                return None;
+            }
+            tempfile::Builder::new()
+                .prefix("depgraph-go-build-cache-")
+                .tempdir_in(&base)
+                .ok()
+                .map(|directory| Self { directory })
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+#[cfg(windows)]
+const PATH_LIST_SEPARATOR: char = ';';
+#[cfg(not(windows))]
+const PATH_LIST_SEPARATOR: char = ':';
+
 fn ensure_directory(path: &Path) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => {}
@@ -243,6 +310,7 @@ mod tests {
             input_digest: "input".into(),
             execution_digest: "toolchain".into(),
             root_digest: "root".into(),
+            reference_digest: None,
         }
     }
 
@@ -251,6 +319,37 @@ mod tests {
             json!({"event":"scan_started"}),
             json!({"event":"scan_completed"}),
         ]
+    }
+
+    #[test]
+    fn reference_digest_extends_the_key_without_moving_existing_checkpoints() -> Result<()> {
+        // Keys of units that bind no reference closure keep the digest they
+        // had before the field existed, so their checkpoint files stay valid.
+        let legacy = json!({"unit_id":"go:service","input_digest":"input",
+            "execution_digest":"toolchain","root_digest":"root"});
+        assert_eq!(
+            key().digest()?,
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy)?))
+        );
+        assert_eq!(serde_json::from_value::<UnitCheckpointKey>(legacy)?, key());
+        let bound = UnitCheckpointKey {
+            reference_digest: Some("closure-a".into()),
+            ..key()
+        };
+        assert_ne!(bound.digest()?, key().digest()?);
+        let temp = tempfile::tempdir()?;
+        let store = UnitCheckpointStore::open(&temp.path().join("store"), 4096)?;
+        assert!(store.write(&bound, &events())?);
+        assert_eq!(store.read(&bound)?, Some(events()));
+        assert_eq!(store.read(&key())?, None);
+        assert_eq!(
+            store.read(&UnitCheckpointKey {
+                reference_digest: Some("closure-b".into()),
+                ..key()
+            })?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
@@ -303,6 +402,35 @@ mod tests {
         let outside = tempfile::tempdir()?;
         std::os::unix::fs::symlink(outside.path(), temp.path().join(".depgraph"))?;
         assert!(UnitCheckpointStore::open(&temp.path().join("store"), 4096).is_err());
+        Ok(())
+    }
+
+    /// The shared build cache lives beside the checkpoints of a Store outside
+    /// the scan root, moves to the system temporary directory when the Store
+    /// is inside the root (the worker would reject it), and disappears with
+    /// the scan's execution.
+    #[test]
+    fn scan_build_cache_stays_outside_the_root_and_is_removed_on_drop() -> Result<()> {
+        let store_dir = tempfile::tempdir()?;
+        let root = tempfile::tempdir()?;
+        let store_path = store_dir.path().join("scan.sqlite");
+        let cache = ScanBuildCache::open(Some(&store_path), root.path()).expect("cache");
+        let path = cache.path().to_path_buf();
+        assert!(path.starts_with(store_dir.path().canonicalize()?.join(".depgraph")));
+        assert!(!path.starts_with(root.path().canonicalize()?));
+        assert!(path.is_dir());
+        drop(cache);
+        assert!(!path.exists());
+
+        let inside = ScanBuildCache::open(Some(&root.path().join("scan.sqlite")), root.path())
+            .expect("fallback cache");
+        assert!(!inside.path().starts_with(root.path().canonicalize()?));
+        assert!(
+            inside
+                .path()
+                .starts_with(std::env::temp_dir().canonicalize()?)
+        );
+        assert!(ScanBuildCache::open(None, root.path()).is_some());
         Ok(())
     }
 }

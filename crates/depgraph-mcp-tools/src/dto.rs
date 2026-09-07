@@ -1566,6 +1566,7 @@ mod analysis_contract_tests {
                 duration_ms: 17,
                 protocol_events: 3,
                 failure_reason: None,
+                loader: Default::default(),
             }],
             stop_reason: Some("total-budget-exceeded".to_owned()),
         };

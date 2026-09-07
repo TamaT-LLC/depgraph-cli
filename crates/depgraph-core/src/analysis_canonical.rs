@@ -110,6 +110,7 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
                 .as_str()
                 .context("profile ID is missing")?;
             let features_present = event["profile"].get("features").is_some();
+            let go_profile = event["profile"]["language"] == "go";
             event["profile"]["id"] = json!(aliases[wire]);
             let properties = event["profile"]["properties"]
                 .as_object_mut()
@@ -128,6 +129,9 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
             // worker/checkpoint stream; canonical profiles carry configuration
             // and semantic status, while graph/coverage provide logical counts.
             properties.retain(|key, _| !execution_counter(key));
+            if go_profile {
+                properties.retain(|key, _| !go_execution_observation(key));
+            }
             if let Some(ledger) = properties.get_mut("web_framework_completeness_ledger") {
                 *ledger = json!(serde_json::to_string(
                     &parse_framework_ledger(ledger)?
@@ -227,6 +231,155 @@ pub(crate) fn merge_shared_web_node(previous: &Value, incoming: &mut Value) -> R
     incoming["properties"]["profile_id"] = json!(profiles.first());
     incoming["properties"]["profile_ids"] = json!(profiles);
     Ok(())
+}
+
+/// Per-execution observations of the Go package loader.  A logical Go unit
+/// may be typed and analysed as several package-bounded execution units whose
+/// loader metrics, reference fingerprints, and split identity differ by
+/// construction, and the split plan they were derived from changes with the
+/// budget while the canonical graph must not.  They remain on the raw
+/// worker/checkpoint stream and in the scan's execution ledger; the canonical
+/// profile carries the loader policy and the joined status only.
+fn go_execution_observation(key: &str) -> bool {
+    matches!(
+        key,
+        "analysis_split_contract"
+            | "analysis_split_plan_id"
+            | "analysis_execution_unit_id"
+            | "analysis_split_kind"
+            | "analysis_loader_input_split"
+            | "analysis_context_path_count"
+            | "go_loader_target_packages"
+            | "go_loader_target_files"
+            | "go_loader_target_bytes"
+            | "go_loader_body_files"
+            | "go_loader_declaration_only_files"
+            | "go_loader_loaded_packages"
+            | "go_loader_syntax_packages"
+            | "go_loader_parsed_files"
+            | "go_loader_syntax_equals_targets"
+            | "go_loader_reference_packages_export"
+            | "go_loader_reference_packages_source"
+            | "go_loader_reference_packages_in_repo"
+            | "go_loader_reference_packages_external"
+            | "go_loader_reference_packages_standard"
+            | "go_loader_child_processes"
+            | "go_loader_child_max_rss_bytes"
+            | "go_loader_peak_rss_bytes"
+            | "go_loader_listing_ms"
+            | "go_loader_export_compile_ms"
+            | "go_loader_type_check_ms"
+            | "go_loader_build_cache"
+            | "go_loader_build_cache_reused"
+            | "go_loader_build_cache_rejected"
+            | "go_loader_witness"
+            | "go_loader_scope_invalid"
+            | "go_reference_fingerprint"
+            | "go_reference_fingerprint_packages"
+            | "go_reference_fingerprint_files"
+            | "go_reference_fingerprint_reasons"
+            | "go_packages_packages"
+            | "go_packages_typed_packages"
+            | "go_packages_typed_files"
+            | "go_packages_active_files"
+            | "go_packages_compiled_files"
+            | "go_packages_embed_files"
+            | "go_packages_modules"
+            | "go_packages_test_variants"
+    )
+}
+
+/// Go observations joined across the execution units of one logical stage.
+///
+/// The loader scope is `widened` when any unit had to widen it and the typed
+/// stage is complete only when every unit completed it.  The call-graph
+/// outcome describes the dynamic sites a unit actually resolved: a
+/// package-bounded batch whose owned bodies hold no dynamic call used no
+/// algorithm at all, so the algorithms and VTA fallback reasons are unions,
+/// the VTA site counts are sums, and the VTA status is the weakest outcome
+/// any unit reached.
+const GO_OBSERVATIONS: [&str; 7] = [
+    "analysis_loader_scope",
+    "go_typed_stage_complete",
+    "go_call_graph_effective_algorithms",
+    "go_call_graph_vta_status",
+    "go_call_graph_vta_site_count",
+    "go_call_graph_vta_fallback_site_count",
+    "go_call_graph_vta_fallback_reasons",
+];
+
+fn string_property<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+/// Union of two comma-separated sets, sorted and without duplicates.
+fn join_list(left: &str, right: &str) -> String {
+    left.split(',')
+        .chain(right.split(','))
+        .filter(|item| !item.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The weakest VTA outcome of two units: a fallback beside an applied or
+/// partial unit is `partial`, beside an inapplicable one it stays `fallback`.
+fn join_vta_status<'a>(left: &'a str, right: &'a str) -> &'a str {
+    if left == right {
+        return left;
+    }
+    let has = |status: &str| left == status || right == status;
+    if has("fallback") {
+        if has("applied") || has("partial") {
+            "partial"
+        } else {
+            "fallback"
+        }
+    } else if has("partial") {
+        "partial"
+    } else if has("applied") {
+        "applied"
+    } else if has("not-applicable") {
+        "not-applicable"
+    } else {
+        left
+    }
+}
+
+fn join_go_observation(key: &str, left: &str, right: &str) -> Value {
+    match key {
+        "analysis_loader_scope" => json!(if left == "widened" || right == "widened" {
+            "widened"
+        } else {
+            left
+        }),
+        "go_typed_stage_complete" => json!(if left == "true" && right == "true" {
+            "true"
+        } else {
+            "false"
+        }),
+        "go_call_graph_effective_algorithms" | "go_call_graph_vta_fallback_reasons" => {
+            json!(join_list(left, right))
+        }
+        "go_call_graph_vta_status" => json!(join_vta_status(left, right)),
+        _ => match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => json!((left + right).to_string()),
+            _ => json!(left),
+        },
+    }
+}
+
+fn join_go_observations(left: &Value, right: &Value) -> Vec<(&'static str, Value)> {
+    let mut joined = Vec::new();
+    for key in GO_OBSERVATIONS {
+        match (string_property(left, key), string_property(right, key)) {
+            (None, None) => {}
+            (Some(left), Some(right)) => joined.push((key, join_go_observation(key, left, right))),
+            (Some(value), None) | (None, Some(value)) => joined.push((key, json!(value))),
+        }
+    }
+    joined
 }
 
 fn execution_counter(key: &str) -> bool {
@@ -439,6 +592,9 @@ pub(crate) fn merge_logical_profile(previous: &Value, incoming: &mut Value) -> R
         for key in TYPESCRIPT_PROJECT_OBSERVATIONS {
             properties.remove(key);
         }
+        for key in GO_OBSERVATIONS {
+            properties.remove(key);
+        }
         properties.remove(TYPESCRIPT_PROJECT_METADATA_AVAILABLE);
     }
     for key in ["features", "package_manager", "lockfile"] {
@@ -458,6 +614,18 @@ pub(crate) fn merge_logical_profile(previous: &Value, incoming: &mut Value) -> R
     }
     for key in ["features", "package_manager", "lockfile"] {
         adopt_known_profile_metadata(previous, incoming, key)?;
+    }
+    if previous["language"] == "go" {
+        // Go profiles carry no framework or TypeScript observations; once the
+        // axes agree, only the Go observations remain to be joined.
+        let joined = join_go_observations(&previous["properties"], &incoming["properties"]);
+        let properties = incoming["properties"]
+            .as_object_mut()
+            .context("profile properties are missing")?;
+        for (key, value) in joined {
+            properties.insert(key.into(), value);
+        }
+        return Ok(());
     }
     let left = &previous["properties"];
     let right = &incoming["properties"];
@@ -1267,6 +1435,159 @@ mod tests {
             "package-lock.json",
         );
         assert!(merge_logical_profile(&failed_after_empty, &mut changed).is_err());
+        Ok(())
+    }
+
+    /// Package-bounded Go execution units of one logical stage differ in
+    /// their loader metrics and split identity by construction.  Those are
+    /// stripped as per-execution observations, the loader scope and typed
+    /// completion are joined conservatively, and a real configuration change
+    /// between units is still rejected.
+    #[test]
+    fn go_package_execution_units_join_into_one_logical_profile() -> Result<()> {
+        let logical = stable_id_from_value(
+            "profile",
+            &json!({"kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":["go:base","unit","typed"]}),
+        );
+        let declared = |chunk: &str, scope: &str, complete: &str, targets: &str| {
+            json!({"event":"profile_declared","profile":{"id":format!("wire-{chunk}"),"language":"go","properties":{
+                "analysis_unit_contract":V2,"analysis_base_profile_id":"go:base","analysis_unit_id":"unit","analysis_stage":"typed",
+                "analysis_logical_profile_id":logical,"analysis_chunk_count":"2","analysis_chunk_index":"0","analysis_chunk_id":chunk,
+                "analysis_source_path_count":"1","analysis_context_path_count":"2",
+                "analysis_split_contract":"depgraph-analysis-split-plan-v1","analysis_split_plan_id":format!("analysis-split-plan:{chunk}"),
+                "analysis_execution_unit_id":format!("analysis-execution-unit:{chunk}"),"analysis_split_kind":"output_batch",
+                "analysis_loader_kind":"package","analysis_loader_input_split":"true","analysis_loader_scope":scope,
+                "analysis_loader_mode":"package","go_call_graph_program_scope":"package-with-declaration-deps",
+                "go_loader_program_scope":"package-with-declaration-deps",
+                "go_loader_target_packages":targets,"go_loader_peak_rss_bytes":"1024","go_loader_type_check_ms":"3",
+                "go_reference_fingerprint":format!("sha256:{chunk}"),"go_typed_stage_complete":complete,
+            }}})
+        };
+        let mut first = vec![declared("a", "applied", "true", "1")];
+        let mut second = vec![declared("b", "widened", "true", "2")];
+        normalize_source_batch_profiles(&mut first)?;
+        normalize_source_batch_profiles(&mut second)?;
+        let first = first.remove(0)["profile"].clone();
+        let mut second = second.remove(0)["profile"].clone();
+        for key in [
+            "analysis_split_contract",
+            "analysis_split_plan_id",
+            "analysis_execution_unit_id",
+            "analysis_split_kind",
+            "go_loader_target_packages",
+            "go_loader_peak_rss_bytes",
+            "go_reference_fingerprint",
+        ] {
+            assert!(
+                first["properties"].get(key).is_none(),
+                "{key} survived normalization"
+            );
+        }
+        assert_eq!(first["properties"]["analysis_loader_mode"], "package");
+        assert_eq!(
+            first["properties"]["go_call_graph_program_scope"],
+            "package-with-declaration-deps"
+        );
+        assert_eq!(
+            first["properties"]["go_loader_program_scope"],
+            "package-with-declaration-deps"
+        );
+        merge_logical_profile(&first, &mut second)?;
+        assert_eq!(second["properties"]["analysis_loader_scope"], "widened");
+        assert_eq!(second["properties"]["go_typed_stage_complete"], "true");
+        let mut reverse = first.clone();
+        let mut widened = vec![declared("b", "widened", "false", "2")];
+        normalize_source_batch_profiles(&mut widened)?;
+        merge_logical_profile(&widened.remove(0)["profile"], &mut reverse)?;
+        assert_eq!(reverse["properties"]["analysis_loader_scope"], "widened");
+        assert_eq!(reverse["properties"]["go_typed_stage_complete"], "false");
+
+        let mut changed = vec![declared("c", "applied", "true", "1")];
+        changed[0]["profile"]["properties"]["analysis_loader_mode"] = json!("module");
+        normalize_source_batch_profiles(&mut changed)?;
+        assert!(merge_logical_profile(&first, &mut changed.remove(0)["profile"]).is_err());
+        Ok(())
+    }
+
+    /// The call-graph outcome of a semantic batch describes the dynamic sites
+    /// its owned bodies hold: a batch without any used no algorithm, a batch
+    /// whose VTA fell back did so for its own sites.  Batches therefore join
+    /// by union, sum, and weakest status instead of having to agree.
+    #[test]
+    fn go_semantic_batches_join_their_call_graph_outcome() -> Result<()> {
+        let logical = stable_id_from_value(
+            "profile",
+            &json!({"kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":["go:base","unit","semantic"]}),
+        );
+        let declared = |chunk: &str, outcome: Value| {
+            let mut properties = json!({
+                "analysis_unit_contract":V2,"analysis_base_profile_id":"go:base","analysis_unit_id":"unit","analysis_stage":"semantic",
+                "analysis_logical_profile_id":logical,"analysis_chunk_count":"3","analysis_chunk_index":"0","analysis_chunk_id":chunk,
+                "analysis_source_path_count":"1","analysis_context_path_count":"3",
+                "analysis_loader_kind":"package","analysis_loader_scope":"applied","analysis_loader_mode":"package",
+                "go_call_graph_program_scope":"package-with-declaration-deps","go_call_graph_requested":"vta",
+            });
+            for (key, value) in outcome.as_object().unwrap() {
+                properties[key] = value.clone();
+            }
+            json!({"event":"profile_declared","profile":{"id":format!("wire-{chunk}"),"language":"go","properties":properties}})
+        };
+        let batch = |chunk: &str, outcome: Value| -> Result<Value> {
+            let mut events = vec![declared(chunk, outcome)];
+            normalize_source_batch_profiles(&mut events)?;
+            Ok(events.remove(0)["profile"].clone())
+        };
+        let quiet = batch(
+            "a",
+            json!({
+                "go_call_graph_effective_algorithms":"","go_call_graph_vta_status":"not-applicable",
+                "go_call_graph_vta_site_count":"0","go_call_graph_vta_fallback_site_count":"0","go_call_graph_vta_fallback_reasons":"",
+            }),
+        )?;
+        let mut applied = batch(
+            "b",
+            json!({
+                "go_call_graph_effective_algorithms":"cha,vta","go_call_graph_vta_status":"applied",
+                "go_call_graph_vta_site_count":"4","go_call_graph_vta_fallback_site_count":"0","go_call_graph_vta_fallback_reasons":"",
+            }),
+        )?;
+        merge_logical_profile(&quiet, &mut applied)?;
+        assert_eq!(
+            applied["properties"]["go_call_graph_effective_algorithms"],
+            "cha,vta"
+        );
+        assert_eq!(applied["properties"]["go_call_graph_vta_status"], "applied");
+        assert_eq!(applied["properties"]["go_call_graph_vta_site_count"], "4");
+        let mut fallback = batch(
+            "c",
+            json!({
+                "go_call_graph_effective_algorithms":"cha","go_call_graph_vta_status":"fallback",
+                "go_call_graph_vta_site_count":"0","go_call_graph_vta_fallback_site_count":"2",
+                "go_call_graph_vta_fallback_reasons":"vta_package_scope_fallback",
+            }),
+        )?;
+        merge_logical_profile(&applied, &mut fallback)?;
+        assert_eq!(
+            fallback["properties"]["go_call_graph_effective_algorithms"],
+            "cha,vta"
+        );
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_status"],
+            "partial"
+        );
+        assert_eq!(fallback["properties"]["go_call_graph_vta_site_count"], "4");
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_fallback_site_count"],
+            "2"
+        );
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_fallback_reasons"],
+            "vta_package_scope_fallback"
+        );
+        // The requested algorithm is configuration and still has to agree.
+        let mut requested = batch("d", json!({"go_call_graph_effective_algorithms":"cha"}))?;
+        requested["properties"]["go_call_graph_requested"] = json!("rta-cha");
+        assert!(merge_logical_profile(&quiet, &mut requested).is_err());
         Ok(())
     }
 
