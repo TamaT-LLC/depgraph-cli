@@ -1,0 +1,24 @@
+{
+  "description": "Synthetic owned-source byte sizes for the analysis-split-plan-v1 contract tests. The checked-in files stay small; these sizes stand in for a large single Go package so the planner's byte budgets and staged split can be verified without large public fixtures. Paths absent here use the measured file size.",
+  "sizes": {
+    "services/big/part0.go": 2097152,
+    "services/big/part1.go": 2097152,
+    "services/big/part2.go": 2097152,
+    "services/big/part3.go": 2097152,
+    "services/big/part4.go": 2097152,
+    "services/big/part5.go": 2097152,
+    "services/big/part6.go": 2097152,
+    "services/big/part7.go": 2097152,
+    "services/api/main.go": 4096,
+    "services/api/handlers/handlers.go": 1024,
+    "services/shared/shared.go": 2048,
+    "services/shared/util/util.go": 512,
+    "services/cycle-a/a.go": 256,
+    "services/cycle-b/b.go": 256,
+    "services/unrelated/unrelated.go": 128,
+    "frontend/apps/web/src/index.ts": 300,
+    "frontend/apps/web/src/pages.ts": 200,
+    "frontend/apps/web/src/routes.ts": 400,
+    "frontend/packages/shared-web/src/index.ts": 100
+  }
+}

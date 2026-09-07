@@ -43,8 +43,9 @@ depgraph doctor
 Go・Web のスキャンは、先にディレクトリと workspace を調べ、解析単位と source batch ごとに処理する。
 同じ保存先で `scan` を再実行すると、入力と worker の互換性を検証して完了済みの処理を再利用する。
 既定では全体の時間制限はなく、個々の worker の無進捗時間、メモリ、出力量と同時実行数を制限する。
-`.depgraph.toml` の `[scan]` で `max_unit_source_files`（既定 128）、`max_concurrent_units`（2）、`max_worker_memory_bytes`（2 GiB）、`worker_timeout_seconds`（無進捗 300 秒）を指定できる。
+`.depgraph.toml` の `[scan]` で `max_unit_source_files`（既定 128）、`max_unit_source_bytes`（8 MiB）、`max_context_source_bytes`（64 MiB）、`max_concurrent_units`（2）、`max_worker_memory_bytes`（2 GiB）、`worker_timeout_seconds`（無進捗 300 秒）を指定できる。
 全体の時間予算が必要な場合は `total_budget_seconds` を指定する。
+`scan --split-plan [--json]` は worker を起動せずに、各実行単位の所有範囲・ローダーが実際に読む範囲・参照のみの入力・処理量の見積もり・分割理由・並列度の決定を表示する（[事前分割計画 ADR](docs/40_arch_design/adr-presplit-analysis-planning.md)）。
 分割・中断・再開・依存変更の検証方法は[統合検証](docs/40_arch_design/resumable-analysis-validation.md)に記載している。
 
 未完了の試行を調べる場合は、`scan --json` の `scan_id` を使い、`depgraph --scan-id "attempt:$SCAN_ID" deps path:src/app.ts --json` のように明示する。
@@ -293,6 +294,7 @@ depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
 depgraph scan /path/to/repository --plan --json
+depgraph scan /path/to/repository --split-plan --json
 
 # ワーカーの起動やストアの変更をせず、プロファイル選択を確認する。
 depgraph profiles plan /path/to/repository

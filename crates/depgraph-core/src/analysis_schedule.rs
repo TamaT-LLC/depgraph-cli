@@ -1,7 +1,7 @@
 //! Bind static discovery to an explicitly negotiated worker capability.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::Path,
     sync::{Arc, OnceLock},
@@ -15,8 +15,13 @@ use crate::{
     analysis_checkpoint::UnitCheckpointKey,
     analysis_execution::{AnalysisExecutionContext, AnalysisInputValidation, AnalysisWorkItem},
     analysis_plan::{
-        AnalysisPlan, AnalysisUnit, AnalysisUnitKind, path_belongs_to_adapter, plan_analysis_units,
-        source_path_belongs_to_adapter,
+        AnalysisAdapter, AnalysisPlan, AnalysisUnit, AnalysisUnitKind, path_belongs_to_adapter,
+        plan_analysis_units, source_path_belongs_to_adapter,
+    },
+    analysis_split::{
+        ANALYSIS_LOADER_SCOPE_CAPABILITY, AnalysisAdapterBoundary, AnalysisSplitBudget,
+        AnalysisSplitInput, AnalysisSplitPlan, AnalysisStage, measure_source_sizes,
+        plan_analysis_split,
     },
     cache::{
         ScanCachePreparation, fingerprint_adapters, fingerprint_scan_inputs,
@@ -31,8 +36,28 @@ use crate::{
 
 pub(crate) struct AnalysisSchedule {
     pub plan: Option<AnalysisPlan>,
+    /// The pre-split decision for every source-batch adapter: ownership and
+    /// loader scopes, estimates, split reasons, and the parallelism decision.
+    /// `None` when no worker negotiated source batches.
+    pub split_plan: Option<AnalysisSplitPlan>,
     pub work: Vec<AnalysisWorkItem>,
     pub input_proof: Option<Arc<AnalysisInputProof>>,
+}
+
+/// Work for one adapter, kept in worker order until the shared split plan
+/// has been decided for every source-batch adapter.
+enum ScheduledAdapter<'a> {
+    Ready(Vec<AnalysisWorkItem>),
+    SourceBatches(Box<SourceBatchSchedule<'a>>),
+}
+
+struct SourceBatchSchedule<'a> {
+    adapter: AdapterKind,
+    spec: WorkerSpec,
+    units: Vec<&'a AnalysisUnit>,
+    capabilities: Vec<String>,
+    batch_contexts: Vec<SourceBatchContext>,
+    execution_digest: Option<String>,
 }
 
 /// A repository-wide content witness shared by all analysis units.  The
@@ -115,8 +140,9 @@ pub(crate) async fn prepare_analysis_schedule(
     };
     let mut input_proof = None;
     let mut batch_inventory = None;
-    let mut work = Vec::new();
+    let mut scheduled = Vec::new();
     for (adapter, spec) in workers {
+        let mut work = Vec::new();
         let units = plan
             .as_ref()
             .map(|plan| {
@@ -201,6 +227,7 @@ pub(crate) async fn prepare_analysis_schedule(
                 checkpoint_key,
                 spec,
             });
+            scheduled.push(ScheduledAdapter::Ready(work));
             continue;
         }
         if supports_batches {
@@ -218,55 +245,16 @@ pub(crate) async fn prepare_analysis_schedule(
                     prepare_source_batch_context(context.root, plan, unit, inventory, store_path)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let stages: &[&str] = if adapter == AdapterKind::Go
-                && capabilities
-                    .iter()
-                    .any(|capability| capability == "analysis-unit-typed-v1")
-            {
-                &["syntax", "typed", "semantic"]
-            } else {
-                &["syntax", "semantic"]
-            };
-            for &stage in stages {
-                for (unit, batch_context) in units.iter().zip(&batch_contexts) {
-                    let requests = source_batch_requests_with_context(
-                        context.config,
-                        unit,
-                        stage,
-                        batch_context,
-                    );
-                    for request in requests {
-                        let unit_id = format!(
-                            "{}:{stage}:{}",
-                            unit.id,
-                            request["chunk_id"].as_str().unwrap_or_default()
-                        );
-                        let input_digest = if stage == "syntax" || batch_context.semantic_reusable {
-                            request["context_fingerprint"].as_str().map(str::to_owned)
-                        } else {
-                            None
-                        };
-                        let checkpoint_key = if context.cache_mode == ScanCacheMode::Enabled {
-                            input_digest
-                                .zip(execution_digest.as_ref())
-                                .map(|(input, execution)| UnitCheckpointKey {
-                                    unit_id: unit_id.clone(),
-                                    input_digest: input,
-                                    execution_digest: execution.clone(),
-                                    root_digest: root_digest(context.root),
-                                })
-                        } else {
-                            None
-                        };
-                        work.push(AnalysisWorkItem {
-                            unit_id,
-                            request: Some(request),
-                            checkpoint_key,
-                            spec: spec.clone(),
-                        });
-                    }
-                }
-            }
+            scheduled.push(ScheduledAdapter::SourceBatches(Box::new(
+                SourceBatchSchedule {
+                    adapter,
+                    spec,
+                    units,
+                    capabilities,
+                    batch_contexts,
+                    execution_digest,
+                },
+            )));
             continue;
         }
         // Persist syntax before the expensive semantic queue. A semantic
@@ -313,12 +301,137 @@ pub(crate) async fn prepare_analysis_schedule(
                 });
             }
         }
+        scheduled.push(ScheduledAdapter::Ready(work));
+    }
+
+    // Decide ownership, loader scope, estimates, and parallelism for every
+    // source-batch adapter at once, before any worker starts. The decision is
+    // a pure function of the discovery plan, budgets, boundaries, sizes, and
+    // the worker context closure; it never reads file contents.
+    let split_plan = {
+        let mut boundaries = Vec::new();
+        let mut contexts = BTreeMap::new();
+        for entry in &scheduled {
+            let ScheduledAdapter::SourceBatches(schedule) = entry else {
+                continue;
+            };
+            let SourceBatchSchedule {
+                adapter,
+                units,
+                capabilities,
+                batch_contexts,
+                ..
+            } = schedule.as_ref();
+            let Some(boundary) =
+                AnalysisAdapterBoundary::for_capabilities(analysis_adapter(*adapter), capabilities)
+            else {
+                continue;
+            };
+            boundaries.push(boundary);
+            for (unit, batch_context) in units.iter().zip(batch_contexts) {
+                contexts.insert(unit.id.clone(), batch_context.source_context_paths.clone());
+            }
+        }
+        match (plan.as_ref(), boundaries.is_empty()) {
+            (Some(plan), false) => {
+                let sizes = measure_source_sizes(context.root, plan)?;
+                let input = AnalysisSplitInput::new(
+                    AnalysisSplitBudget::from_config(context.config),
+                    boundaries,
+                )
+                .with_sizes(sizes)
+                .with_contexts(contexts);
+                Some(plan_analysis_split(plan, &input)?)
+            }
+            _ => None,
+        }
+    };
+
+    let mut work = Vec::new();
+    for entry in scheduled {
+        match entry {
+            ScheduledAdapter::Ready(items) => work.extend(items),
+            ScheduledAdapter::SourceBatches(schedule) => {
+                let SourceBatchSchedule {
+                    adapter,
+                    spec,
+                    units,
+                    capabilities,
+                    batch_contexts,
+                    execution_digest,
+                } = *schedule;
+                let split_plan = split_plan
+                    .as_ref()
+                    .expect("source batches require a split plan");
+                let boundary = split_plan
+                    .boundaries
+                    .iter()
+                    .find(|boundary| boundary.adapter == analysis_adapter(adapter))
+                    .expect("source batches require an adapter boundary");
+                let loader_scope = capabilities
+                    .iter()
+                    .any(|capability| capability == ANALYSIS_LOADER_SCOPE_CAPABILITY);
+                for stage in boundary.stages() {
+                    for (unit, batch_context) in units.iter().zip(&batch_contexts) {
+                        let requests = source_batch_requests_for_stage(
+                            split_plan,
+                            unit,
+                            stage,
+                            batch_context,
+                            loader_scope,
+                        );
+                        for request in requests {
+                            let unit_id = format!(
+                                "{}:{}:{}",
+                                unit.id,
+                                stage.as_str(),
+                                request["chunk_id"].as_str().unwrap_or_default()
+                            );
+                            let input_digest = if stage == AnalysisStage::Syntax
+                                || batch_context.semantic_reusable
+                            {
+                                request["context_fingerprint"].as_str().map(str::to_owned)
+                            } else {
+                                None
+                            };
+                            let checkpoint_key = if context.cache_mode == ScanCacheMode::Enabled {
+                                input_digest.zip(execution_digest.as_ref()).map(
+                                    |(input, execution)| UnitCheckpointKey {
+                                        unit_id: unit_id.clone(),
+                                        input_digest: input,
+                                        execution_digest: execution.clone(),
+                                        root_digest: root_digest(context.root),
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            work.push(AnalysisWorkItem {
+                                unit_id,
+                                request: Some(request),
+                                checkpoint_key,
+                                spec: spec.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(AnalysisSchedule {
         plan,
+        split_plan,
         work,
         input_proof,
     })
+}
+
+fn analysis_adapter(adapter: AdapterKind) -> AnalysisAdapter {
+    match adapter {
+        AdapterKind::Rust => AnalysisAdapter::Rust,
+        AdapterKind::Go => AnalysisAdapter::Go,
+        AdapterKind::Web => AnalysisAdapter::Web,
+    }
 }
 
 struct SourceBatchContext {
@@ -332,6 +445,40 @@ struct SourceBatchContext {
     auxiliary_paths: Vec<String>,
 }
 
+/// Build the split plan the scheduler would use for the shipped worker
+/// boundaries, with the worker context closure of every source-batch unit.
+#[cfg(test)]
+fn split_plan_for_default_workers(
+    root: &Path,
+    config: &crate::Config,
+    plan: &AnalysisPlan,
+    store_path: Option<&Path>,
+) -> Result<(AnalysisSplitPlan, BTreeMap<String, SourceBatchContext>)> {
+    let inventory = build_repository_file_inventory(root)?;
+    let mut contexts = BTreeMap::new();
+    let mut batch_contexts = BTreeMap::new();
+    let mut adapters = BTreeSet::new();
+    for unit in plan.executable_units() {
+        if !matches!(unit.adapter, AnalysisAdapter::Go | AnalysisAdapter::Web) {
+            continue;
+        }
+        adapters.insert(unit.adapter);
+        let context = prepare_source_batch_context(root, plan, unit, &inventory.paths, store_path)?;
+        contexts.insert(unit.id.clone(), context.source_context_paths.clone());
+        batch_contexts.insert(unit.id.clone(), context);
+    }
+    // Production only declares boundaries for adapters whose worker negotiated
+    // source batches; mirror that with the adapters the plan actually contains.
+    let boundaries = AnalysisAdapterBoundary::current_defaults()
+        .into_iter()
+        .filter(|boundary| adapters.contains(&boundary.adapter))
+        .collect();
+    let input = AnalysisSplitInput::new(AnalysisSplitBudget::from_config(config), boundaries)
+        .with_sizes(measure_source_sizes(root, plan)?)
+        .with_contexts(contexts);
+    Ok((plan_analysis_split(plan, &input)?, batch_contexts))
+}
+
 #[cfg(test)]
 fn source_batch_requests(
     root: &Path,
@@ -341,10 +488,18 @@ fn source_batch_requests(
     stage: &str,
     store_path: Option<&Path>,
 ) -> Result<Vec<serde_json::Value>> {
-    let inventory = build_repository_file_inventory(root)?;
-    let context = prepare_source_batch_context(root, plan, unit, &inventory.paths, store_path)?;
-    Ok(source_batch_requests_with_context(
-        config, unit, stage, &context,
+    let (split_plan, contexts) = split_plan_for_default_workers(root, config, plan, store_path)?;
+    let stage = match stage {
+        "syntax" => AnalysisStage::Syntax,
+        "typed" => AnalysisStage::Typed,
+        _ => AnalysisStage::Semantic,
+    };
+    Ok(source_batch_requests_for_stage(
+        &split_plan,
+        unit,
+        stage,
+        &contexts[&unit.id],
+        false,
     ))
 }
 
@@ -411,40 +566,57 @@ fn prepare_source_batch_context(
     })
 }
 
-fn source_batch_requests_with_context(
-    config: &crate::Config,
+/// Turn the execution units the split plan decided for one logical unit and
+/// stage into v2 worker requests.  Chunk identity, path sets, and field
+/// order are unchanged for workers that did not negotiate loader scope, so
+/// existing checkpoints and worker validation keep working.  A worker that
+/// advertises `analysis-loader-scope-v1` additionally receives the `split`
+/// binding with the loader target it must honour or reject.
+fn source_batch_requests_for_stage(
+    split_plan: &AnalysisSplitPlan,
     unit: &AnalysisUnit,
-    stage: &str,
+    stage: AnalysisStage,
     context: &SourceBatchContext,
+    loader_scope_negotiated: bool,
 ) -> Vec<serde_json::Value> {
-    let batch_size = if unit.adapter.as_str() == "go" && matches!(stage, "typed" | "semantic") {
-        unit.source_paths.len().max(1)
-    } else {
-        config.scan.max_unit_source_files.max(1)
-    };
-    let chunks = if unit.source_paths.is_empty() {
-        vec![&[][..]]
-    } else {
-        unit.source_paths.chunks(batch_size).collect::<Vec<_>>()
-    };
-    let count = chunks.len();
-    chunks.into_iter().enumerate().map(|(index, paths)| {
-        let chunk_id = depgraph_protocol::stable_id_from_value("analysis-chunk", &json!({"contract":SOURCE_BATCH_CONTRACT,"unit":unit.id,"stage":stage,"paths":paths}));
-        let context_paths = if matches!(unit.adapter.as_str(), "go" | "web")
-            && !(unit.adapter.as_str() == "go" && stage == "typed")
-        {
-            &context.source_context_paths
-        } else {
-            &unit.source_paths
-        };
-        json!({
-            "contract_version":SOURCE_BATCH_CONTRACT,"unit_id":unit.id,"adapter":unit.adapter.as_str(),
-            "unit_root":unit.unit_root,"source_paths":paths,"context_paths":context_paths,
-            "auxiliary_paths":if index == 0 && stage == "syntax" { context.auxiliary_paths.clone() } else { Vec::new() },
-            "context_fingerprint":context.context_fingerprint,"stage":stage,
-            "chunk_id":chunk_id,"chunk_index":index,"chunk_count":count,
+    let stage_name = stage.as_str();
+    split_plan
+        .execution_units_for(&unit.id, stage)
+        .into_iter()
+        .map(|execution_unit| {
+            let paths = &execution_unit.ownership.source_paths;
+            let chunk_id = depgraph_protocol::stable_id_from_value(
+                "analysis-chunk",
+                &json!({"contract":SOURCE_BATCH_CONTRACT,"unit":unit.id,"stage":stage_name,"paths":paths}),
+            );
+            // The Go typed stage currently receives its own sources as the
+            // context; the loader scope in `split` describes the module the
+            // worker actually loads.
+            let context_paths = if matches!(unit.adapter, AnalysisAdapter::Go | AnalysisAdapter::Web)
+                && !(unit.adapter == AnalysisAdapter::Go && stage == AnalysisStage::Typed)
+            {
+                &context.source_context_paths
+            } else {
+                &unit.source_paths
+            };
+            let index = execution_unit.batch_index;
+            let mut request = json!({
+                "contract_version":SOURCE_BATCH_CONTRACT,"unit_id":unit.id,"adapter":unit.adapter.as_str(),
+                "unit_root":unit.unit_root,"source_paths":paths,"context_paths":context_paths,
+                "auxiliary_paths":if index == 0 && stage == AnalysisStage::Syntax { context.auxiliary_paths.clone() } else { Vec::new() },
+                "context_fingerprint":context.context_fingerprint,"stage":stage_name,
+                "chunk_id":chunk_id,"chunk_index":index,"chunk_count":execution_unit.batch_count,
+            });
+            if loader_scope_negotiated
+                && let Some(object) = request.as_object_mut()
+                && let Ok(binding) =
+                    serde_json::to_value(execution_unit.binding(&split_plan.split_plan_id))
+            {
+                object.insert("split".to_owned(), binding);
+            }
+            request
         })
-    }).collect()
+        .collect()
 }
 
 fn auxiliary_owner<'a>(
@@ -991,6 +1163,131 @@ mod tests {
             source_batch_requests(root, &config, &changed_plan, changed_app, "syntax", None)?;
         assert_eq!(changed[0]["context_paths"], json!(["app/file.go"]));
         assert_ne!(before, changed[0]["context_fingerprint"]);
+        Ok(())
+    }
+
+    #[test]
+    fn loader_scope_binding_is_attached_only_after_negotiation_and_keeps_requests_stable()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        for name in ["app", "shared"] {
+            std::fs::create_dir(root.join(name))?;
+            std::fs::write(
+                root.join(format!("{name}/go.mod")),
+                format!("module example.test/{name}\n\ngo 1.26\n"),
+            )?;
+            for index in 0..3 {
+                std::fs::write(
+                    root.join(format!("{name}/file{index}.go")),
+                    format!("package {name}\nconst Value{index} = {index}\n"),
+                )?;
+            }
+        }
+        // A nested package: its directory sorts after `file*.go` as a package
+        // root but before them as a path, which is the order workers check.
+        std::fs::create_dir(root.join("app/zed"))?;
+        std::fs::write(
+            root.join("app/zed/zed.go"),
+            "package zed\nconst Value = 1\n",
+        )?;
+        std::fs::write(
+            root.join("app/go.mod"),
+            "module example.test/app\n\ngo 1.26\nrequire example.test/shared v0.0.0\nreplace example.test/shared => ../shared\n",
+        )?;
+        let mut config = crate::Config::default();
+        config.scan.max_unit_source_files = 2;
+        let plan = plan_analysis_units(root, &config, None)?;
+        let app = plan
+            .executable_units()
+            .into_iter()
+            .find(|unit| unit.unit_root == "app")
+            .expect("app module");
+        let (split_plan, contexts) = split_plan_for_default_workers(root, &config, &plan, None)?;
+        assert_eq!(
+            split_plan.boundaries.len(),
+            1,
+            "only the Go adapter is present"
+        );
+
+        for stage in [
+            AnalysisStage::Syntax,
+            AnalysisStage::Typed,
+            AnalysisStage::Semantic,
+        ] {
+            let legacy =
+                source_batch_requests_for_stage(&split_plan, app, stage, &contexts[&app.id], false);
+            let negotiated =
+                source_batch_requests_for_stage(&split_plan, app, stage, &contexts[&app.id], true);
+            assert_eq!(legacy.len(), negotiated.len());
+            for (legacy, negotiated) in legacy.iter().zip(&negotiated) {
+                assert!(legacy.get("split").is_none());
+                let mut stripped = negotiated.clone();
+                let split = stripped
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("split")
+                    .expect("negotiated request carries the split binding");
+                assert_eq!(&stripped, legacy, "binding is purely additive");
+                assert_eq!(split["contract_version"], "depgraph-analysis-split-plan-v1");
+                assert_eq!(split["split_plan_id"], split_plan.split_plan_id);
+                let execution_unit = split_plan
+                    .execution_unit(split["execution_unit_id"].as_str().unwrap())
+                    .expect("binding names an execution unit of the plan");
+                assert_eq!(
+                    json!(execution_unit.ownership.source_paths),
+                    negotiated["source_paths"]
+                );
+                let loader_paths = split["loader"]["paths"].as_array().unwrap();
+                for owned in negotiated["source_paths"].as_array().unwrap() {
+                    assert!(loader_paths.contains(owned), "loader covers owned files");
+                }
+                // The chunk identity is the pre-existing formula, so checkpoint
+                // keys do not change when a worker starts negotiating scope.
+                assert_eq!(
+                    negotiated["chunk_id"],
+                    json!(depgraph_protocol::stable_id_from_value(
+                        "analysis-chunk",
+                        &json!({
+                            "contract": SOURCE_BATCH_CONTRACT,
+                            "unit": app.id,
+                            "stage": stage.as_str(),
+                            "paths": execution_unit.ownership.source_paths,
+                        })
+                    ))
+                );
+            }
+            let split = &negotiated[0]["split"];
+            match stage {
+                AnalysisStage::Syntax => {
+                    assert_eq!(negotiated.len(), 2);
+                    assert_eq!(split["split_kind"], "input_batch");
+                    assert_eq!(split["loader"]["kind"], "files");
+                    assert_eq!(split["loader"]["input_split"], true);
+                    assert_eq!(split["loader"]["reference_depth"], "paths_only");
+                    assert!(
+                        split["loader"]["reference_paths"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!("shared/file0.go"))
+                    );
+                }
+                AnalysisStage::Typed | AnalysisStage::Semantic => {
+                    // Output only: the shipped worker still loads the whole
+                    // module, and the binding says so instead of implying a
+                    // bounded loader.
+                    assert_eq!(negotiated.len(), 1);
+                    assert_eq!(split["split_kind"], "whole");
+                    assert_eq!(split["loader"]["kind"], "module");
+                    assert_eq!(split["loader"]["input_split"], false);
+                    assert_eq!(split["loader"]["reference_depth"], "bodies");
+                    assert_eq!(
+                        split["loader"]["paths"],
+                        json!(contexts[&app.id].source_context_paths)
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
