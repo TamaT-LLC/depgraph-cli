@@ -66,6 +66,11 @@ pub struct CliHealthSummaryView<'a> {
     pub counts_by_kind: &'a BTreeMap<String, u64>,
     pub counts_by_confidence: &'a BTreeMap<String, u64>,
     pub coverage: &'a depgraph_core::service::HealthCoverageOverview,
+    /// `true` only with `--allow-partial` when some health ranges did not
+    /// complete; every finding then carries an incomplete_coverage blocker.
+    pub partial: bool,
+    /// Range plan, per-phase work, checkpoint reuse, and peak memory.
+    pub execution: &'a depgraph_core::health::ranged::HealthRangeDiagnostics,
 }
 
 #[derive(Serialize)]
@@ -74,6 +79,18 @@ pub struct CliHealthFindingsView<'a> {
     pub scan_id: &'a str,
     pub collection_digest: &'a str,
     pub findings: &'a [HealthFinding],
+}
+
+/// `health list` / `cleanup` envelope: the findings view plus the ranged
+/// execution diagnostics of the snapshot-scoped collection.
+#[derive(Serialize)]
+pub struct CliHealthListView<'a> {
+    pub snapshot_id: &'a str,
+    pub scan_id: &'a str,
+    pub collection_digest: &'a str,
+    pub findings: &'a [HealthFinding],
+    pub partial: bool,
+    pub execution: &'a depgraph_core::health::ranged::HealthRangeDiagnostics,
 }
 
 #[derive(Serialize)]
@@ -132,9 +149,47 @@ pub fn print_health_summary_human(summary: &depgraph_core::service::HealthSummar
     for (confidence, count) in summary.counts_by_confidence() {
         println!("confidence {confidence}: {count}");
     }
+    print_health_execution_human(summary.diagnostics());
     println!(
         "summary excludes audit and hotspot findings; confirmed is reserved for semantic-complete unused-file, unused-export, unused-type, and unused-dependency findings without hard blockers"
     );
+}
+
+pub fn print_health_execution_human(
+    diagnostics: &depgraph_core::health::ranged::HealthRangeDiagnostics,
+) {
+    match diagnostics.mode {
+        depgraph_core::health::ranged::HealthExecutionMode::Ranged => {
+            println!(
+                "execution: ranged; ranges {}/{} completed (reused {}, resplit {}, failed {}, interrupted {}); work per range max {} of limit {}, total {}; dependencies {}+{}",
+                diagnostics.ranges.completed,
+                diagnostics.ranges.total,
+                diagnostics.ranges.reused,
+                diagnostics.ranges.resplit,
+                diagnostics.ranges.failed,
+                diagnostics.ranges.interrupted,
+                diagnostics.work.ranges_max,
+                diagnostics.work.range_limit,
+                diagnostics.work.ranges_total,
+                diagnostics.work.dependencies_load,
+                diagnostics.work.dependencies,
+            );
+        }
+        depgraph_core::health::ranged::HealthExecutionMode::WholeSnapshot => {
+            println!(
+                "execution: whole-snapshot ({} layers); work limit {}",
+                diagnostics.layers.len(),
+                diagnostics.work.range_limit
+            );
+        }
+    }
+    if diagnostics.partial {
+        println!(
+            "partial: {} of {} health ranges were not analysed; every finding carries an incomplete_coverage blocker and nothing is confirmed",
+            diagnostics.ranges.failed + diagnostics.ranges.interrupted,
+            diagnostics.ranges.total
+        );
+    }
 }
 
 pub fn print_findings_human(findings: &[HealthFinding]) {
