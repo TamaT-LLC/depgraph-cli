@@ -621,10 +621,15 @@ pub struct RangedDependencyProjection {
 }
 
 /// Load the dependency projection of a plain input under one range budget.
+///
+/// `diagnostics` is the ranged execution state so far (the unused phase that
+/// preceded this load); a budget failure reports it unchanged so the failure
+/// is attributed to the ranged run, not to a whole-snapshot pass.
 pub fn load_dependency_projection(
     store: &Store,
     identity: &HealthInputIdentity,
     limits: &HealthRangeLimits,
+    diagnostics: &HealthRangeDiagnostics,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<RangedDependencyProjection, RangedHealthError> {
     let mut budget = RangeBudget {
@@ -641,10 +646,7 @@ pub fn load_dependency_projection(
         Err(error) => Err(match analysis_error(&error) {
             Some(error) => RangedHealthError::Analysis(Box::new(RangedHealthFailure {
                 error,
-                diagnostics: HealthRangeDiagnostics::whole_snapshot(
-                    identity.layers.clone(),
-                    limits.per_range_work,
-                ),
+                diagnostics: diagnostics.clone(),
             })),
             None => RangedHealthError::Store(error),
         }),

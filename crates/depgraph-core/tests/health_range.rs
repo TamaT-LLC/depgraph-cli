@@ -21,7 +21,7 @@ use depgraph_core::{
         range_checkpoint::HealthRangeCheckpointStore,
         ranged::{
             HealthExecutionMode, RangeOrder, RangedHealthError, RangedUnusedOptions,
-            RangedUnusedOutcome, analyze_unused_ranged,
+            RangedUnusedOutcome, analyze_unused_ranged, load_dependency_projection,
         },
     },
     service::{
@@ -431,6 +431,52 @@ fn range_and_global_loaders_charge_their_own_budgets() -> Result<()> {
     assert!(projection.evidence.is_empty());
     assert!(projection.diagnostics.is_empty());
     assert_eq!(projection.edges.len() as u64, fixture.edges);
+    Ok(())
+}
+
+#[test]
+fn dependency_projection_budget_failure_keeps_the_ranged_diagnostics() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let fixture = generate(temporary.path(), &HealthRangeFixtureShape::small())?;
+    let store = open(&fixture)?;
+    let identity = identity(&store, &fixture)?;
+    let unused = ranged(
+        &store,
+        &fixture,
+        SMALL_RANGE_BUDGET,
+        RangeOrder::Forward,
+        false,
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(unused.diagnostics.mode, HealthExecutionMode::Ranged);
+    assert!(unused.diagnostics.ranges.total > 1);
+
+    // A one-step budget cannot load the projection; the failure must carry the
+    // ranged run's diagnostics (mode, ranges, work so far), never a
+    // whole-snapshot placeholder.
+    let error =
+        load_dependency_projection(&store, &identity, &limits(1), &unused.diagnostics, || false)
+            .err()
+            .context("a one-step budget must not load the dependency projection")?;
+    match error {
+        RangedHealthError::Analysis(failure) => {
+            assert_eq!(failure.error, HealthAnalysisError::ResourceExhausted);
+            assert_eq!(failure.diagnostics, unused.diagnostics);
+        }
+        other => anyhow::bail!("expected an analysis failure, got {other}"),
+    }
+
+    let projection = load_dependency_projection(
+        &store,
+        &identity,
+        &limits(u64::MAX),
+        &unused.diagnostics,
+        || false,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert!(projection.work_used > 1);
+    assert_eq!(projection.snapshot.edges.len() as u64, fixture.edges);
     Ok(())
 }
 

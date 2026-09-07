@@ -1181,9 +1181,10 @@ fn collect_ranged(
 
     // Dependency findings read the trimmed projection (no evidence or
     // diagnostics) under two more budgets: one for loading, one for matching.
-    let projection =
-        load_dependency_projection(store, identity, &limits, || cancellation.is_cancelled())
-            .map_err(map_ranged_error)?;
+    let projection = load_dependency_projection(store, identity, &limits, &diagnostics, || {
+        cancellation.is_cancelled()
+    })
+    .map_err(map_ranged_error)?;
     diagnostics.work.dependencies_load = projection.work_used;
     let manifests = load_manifests(root, &projection.snapshot, cancellation)?;
     let remaining = MAX_HEALTH_FINDINGS.saturating_sub(findings.len());
