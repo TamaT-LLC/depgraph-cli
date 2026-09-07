@@ -29,12 +29,10 @@ const cli = path.resolve(process.env.DEPGRAPH_BIN ?? path.join(workspace, `targe
 const parent = mkdtempSync(path.join(tmpdir(), "depgraph-go-loader-scope-e2e-"));
 const MIB = 1024 * 1024;
 // Reduced from the 2 GiB default; identical for the control and the package
-// path of the same fixture. The whole-module units of `bigpkg` need several
-// times this much.
-// Reduced from the 2 GiB default; identical for the control and the package
 // path of the same fixture. Chosen above the measured package-path peaks
 // (hybrid self ~318 MiB for the 1,024-file package, batch-of-8 ~81 MiB)
-// and below the measured whole-module peaks (~555 MiB / ~721 MiB).
+// and below the measured whole-module peaks (~555 MiB / ~721 MiB). Never
+// raised: the whole-module units of `bigpkg` still need several times this.
 const REDUCED_WORKER_MEMORY_BYTES = 448 * MIB;
 const BIG_PACKAGE_FILES = 1024;
 const BIG_PACKAGE_TABLE = 512;
@@ -45,11 +43,10 @@ const FANOUT_TABLE = 16;
 // count is required as well as bytes: unmeasured 0-byte granules would
 // otherwise pack every package into one unit (the default 128-file budget
 // exactly fit the previous 32×4 fixture and still OOM'd after a 1→2 re-split).
+// The byte cap also stops the default 8 MiB budget from promoting the small
+// module to one whole context.
 const FANOUT_UNIT_SOURCE_BYTES = 64 * 1024;
 const FANOUT_UNIT_SOURCE_FILES = 64;
-// Bounds the fan-out packages into a few package batches per stage; the
-// default 8 MiB budget would promote the small module to one whole context.
-const FANOUT_UNIT_SOURCE_BYTES = 64 * 1024;
 const shippedWorker = process.env.DEPGRAPH_GO_WORKER
   ?? path.join(workspace, `workers/go/bin/depgraph-go-worker${executableSuffix}`);
 const environment = {
