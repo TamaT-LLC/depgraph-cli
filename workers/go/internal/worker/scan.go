@@ -565,6 +565,9 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 			(analysisUnit.Stage == AnalysisUnitStageTyped || analysisUnit.Stage == AnalysisUnitStageSemantic) {
 			profileProperties["go_typed_stage_complete"] = "false"
 		}
+		for key, value := range analysisUnit.splitProfileProperties() {
+			profileProperties[key] = value
+		}
 	}
 	for key, value := range inventoryProperties(goPackages) {
 		profileProperties[key] = value
