@@ -2761,6 +2761,7 @@ mod tests {
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
 
         assert_eq!(
@@ -3662,6 +3663,7 @@ mod tests {
             error: Some("malformed NDJSON after valid prefix".to_owned()),
             failure_kind: Some(WorkerFailureKind::MalformedProtocol),
             security_violation: false,
+            peak_memory_bytes: None,
         };
 
         assert!(
@@ -3760,6 +3762,7 @@ mod tests {
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         let mut global_upserts = BTreeMap::new();
         let mut file_ledgers = BTreeMap::new();
@@ -4108,6 +4111,7 @@ mod tests {
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         let bound = bind_worker_output_to_profile_plan(output, &plan)?;
         let properties = &bound.events[0]["profile"]["properties"];
@@ -4148,6 +4152,7 @@ mod tests {
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         let bound = bind_worker_output_to_profile_plan(null_properties, &plan)?;
         assert_eq!(
@@ -4172,6 +4177,7 @@ mod tests {
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         let mut failures = Vec::new();
         assert!(

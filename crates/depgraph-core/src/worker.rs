@@ -201,6 +201,11 @@ pub struct WorkerOutput {
     pub error: Option<String>,
     pub(crate) failure_kind: Option<WorkerFailureKind>,
     pub security_violation: bool,
+    /// Peak resident memory of the worker process tree the memory watch
+    /// sampled, in bytes: the measure the worker memory budget is enforced
+    /// against.  `None` when the worker was replayed from a checkpoint, failed
+    /// before it started, or exited before the first sample.
+    pub peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -223,6 +228,7 @@ struct WorkerExecution {
     error: Option<String>,
     failure_kind: Option<WorkerFailureKind>,
     security_violation: bool,
+    peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1444,6 +1450,7 @@ pub async fn execute_worker(
             error: execution.error,
             failure_kind: execution.failure_kind,
             security_violation: execution.security_violation,
+            peak_memory_bytes: execution.peak_memory_bytes,
         },
         Err(error) => {
             let error = format!("{error:#}");
@@ -1455,6 +1462,7 @@ pub async fn execute_worker(
                 failure_kind: Some(WorkerFailureKind::Other),
                 security_violation: is_security_error(&error),
                 error: Some(error),
+                peak_memory_bytes: None,
             }
         }
     }
@@ -1500,6 +1508,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
             error: execution.error,
             failure_kind: execution.failure_kind,
             security_violation: execution.security_violation,
+            peak_memory_bytes: execution.peak_memory_bytes,
         },
         Err(error) => {
             let error = format!("{error:#}");
@@ -1511,6 +1520,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
                 failure_kind: Some(WorkerFailureKind::Other),
                 security_violation: is_security_error(&error),
                 error: Some(error),
+                peak_memory_bytes: None,
             }
         }
     }
@@ -1937,6 +1947,7 @@ where
         error,
         failure_kind,
         security_violation,
+        peak_memory_bytes: process_guard.peak_memory_bytes(),
     })
 }
 
@@ -2131,6 +2142,10 @@ pub(crate) struct ProcessTreeGuard {
     process_group: i32,
     #[cfg(windows)]
     job: usize,
+    /// Largest resident size the memory watch sampled for the tree, in bytes;
+    /// zero until the first sample.  The watch runs on the executor's timer,
+    /// so a process that exits before the first tick is never sampled.
+    peak_memory_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl ProcessTreeGuard {
@@ -2140,10 +2155,22 @@ impl ProcessTreeGuard {
         loop {
             interval.tick().await;
             let bytes = self.memory_usage_bytes()?;
+            self.peak_memory_bytes
+                .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
             if bytes > limit {
                 return Ok(bytes);
             }
         }
+    }
+
+    /// The peak the memory watch observed for this tree, the same measure the
+    /// worker memory budget is enforced against, or `None` when the tree was
+    /// never sampled.
+    pub(crate) fn peak_memory_bytes(&self) -> Option<u64> {
+        let bytes = self
+            .peak_memory_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (bytes > 0).then_some(bytes)
     }
 
     fn memory_usage_bytes(&self) -> std::io::Result<u64> {
@@ -2185,7 +2212,10 @@ impl ProcessTreeGuard {
         #[cfg(unix)]
         {
             let process_group = child.id().context("worker has no process id")? as i32;
-            Ok(Self { process_group })
+            Ok(Self {
+                process_group,
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
         #[cfg(windows)]
         {
@@ -2222,12 +2252,17 @@ impl ProcessTreeGuard {
                 }
                 return Err(error).context("assign worker to Windows Job Object");
             }
-            Ok(Self { job: job as usize })
+            Ok(Self {
+                job: job as usize,
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = child;
-            Ok(Self {})
+            Ok(Self {
+                peak_memory_bytes: std::sync::atomic::AtomicU64::new(0),
+            })
         }
     }
 
@@ -2536,6 +2571,7 @@ pub(crate) fn replay_analysis_checkpoint(
         error: None,
         failure_kind: None,
         security_violation: false,
+        peak_memory_bytes: None,
     })
 }
 

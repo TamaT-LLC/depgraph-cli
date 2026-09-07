@@ -64,11 +64,20 @@ pub struct AnalysisUnitProgress {
     /// Loader observations the worker reported for this execution unit: the
     /// negotiated split identity, whether the loader scope was applied or
     /// widened, and the package loader's target, syntax, body, and memory
-    /// counters.  Canonical profiles strip these per-execution values, so the
-    /// ledger is where a scan explains what each unit actually loaded.
+    /// counters, plus the peak resident memory the core's own memory watch
+    /// sampled for the worker tree ([`WORKER_PEAK_MEMORY_KEY`]).  Canonical
+    /// profiles strip these per-execution values, so the ledger is where a
+    /// scan explains what each unit actually loaded and held.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loader: BTreeMap<String, String>,
 }
+
+/// Ledger key of the peak resident memory the core sampled for a unit's worker
+/// process tree, in bytes.  It is the measure `scan.max_worker_memory_bytes`
+/// is enforced against, so it is recorded for every executed unit, whether
+/// the worker reported loader metrics or not and whether it completed or was
+/// stopped at the budget.  Replayed checkpoints have no worker to sample.
+pub const WORKER_PEAK_MEMORY_KEY: &str = "analysis_worker_peak_memory_bytes";
 
 /// Worker profile properties copied into the execution ledger of one unit.
 const LOADER_OBSERVATION_KEYS: [&str; 23] = [
@@ -478,6 +487,11 @@ where
         while let Some((unit_id, output, reused, staged)) = ready.remove(&next_ingest) {
             progress.units[next_ingest].protocol_events = output.events.len() as u64;
             progress.units[next_ingest].loader = loader_observations(&output.events);
+            if let Some(bytes) = output.peak_memory_bytes {
+                progress.units[next_ingest]
+                    .loader
+                    .insert(WORKER_PEAK_MEMORY_KEY.to_owned(), bytes.to_string());
+            }
             progress.units[next_ingest].failure_reason =
                 output.failure_kind.map(|kind| kind.as_str().to_owned());
             progress.units[next_ingest].duration_ms = started
@@ -626,6 +640,7 @@ where
                         error: Some(error.to_string()),
                         failure_kind: Some(crate::worker::WorkerFailureKind::Other),
                         security_violation: crate::worker::is_security_error(&error.to_string()),
+                        peak_memory_bytes: None,
                     },
                 };
                 if let Err(error) = validate_unit_output(&item, &output) {
@@ -665,6 +680,7 @@ where
                         crate::worker::WorkerFailureKind::Cancelled
                     }),
                     security_violation: false,
+                    peak_memory_bytes: None,
                 };
                 ready.insert(index, (unit_id, output, false, None));
                 continue;
@@ -1238,6 +1254,7 @@ for (const event of [
             error: None,
             failure_kind: None,
             security_violation: false,
+            peak_memory_bytes: None,
         };
         validate_unit_output(&item, &output)?;
         output.events[1]["path"] = json!("other/main.go");

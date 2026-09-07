@@ -7420,6 +7420,20 @@ async fn worker_memory_budget_terminates_a_live_process_without_waiting_for_time
     .await?;
     assert_eq!(execution.failure_kind, Some(WorkerFailureKind::MemoryLimit));
     assert!(started.elapsed() < Duration::from_secs(5));
+    // The sample that stopped the tree is the peak the ledger reports, so a
+    // budget failure always carries the resident size it was measured at.
+    let peak = execution
+        .peak_memory_bytes
+        .expect("memory budget failure records the sampled peak");
+    assert!(peak > 1, "sampled peak {peak} does not exceed the budget");
+    assert!(
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(&format!("{peak} bytes > 1 bytes"))),
+        "{:?}",
+        execution.error
+    );
     Ok(())
 }
 
