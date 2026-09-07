@@ -50,11 +50,35 @@ jobs:
           # 10 GB cache quota and evicts the entries the other jobs depend on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install the pinned cargo tools
-        # Both land in ~/.cargo/bin, which rust-cache restores, so these
-        # installs are no-ops on every run after the first for a cache lineage.
+        # Upstream release archives, checked against digests pinned here, install
+        # in seconds; `cargo install --locked` compiled the same two versions from
+        # source for about five minutes whenever the rust-cache lineage was cold.
+        # The version and digest of each archive change together; the digest is
+        # the one GitHub records on the release asset, and for nextest it also
+        # matches the .sha256 file published beside the archive.
+        env:
+          NEXTEST_ARCHIVE_VERSION: 0.9.143
+          NEXTEST_ARCHIVE_SHA256: 66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e
+          HAKARI_ARCHIVE_VERSION: 0.9.38
+          HAKARI_ARCHIVE_SHA256: 19fcbaf488dd51b4b0fe2412d8da37c65ba6aa72349351ba73f6c9f7c1087e04
         run: |
-          cargo install cargo-hakari --locked --version 0.9.38
-          cargo install cargo-nextest --locked --version 0.9.143
+          set -euo pipefail
+          install_pinned_tool() {
+            local name="$1" url="$2" sha256="$3"
+            local archive
+            archive="$(mktemp --suffix=.tar.gz)"
+            curl --fail --silent --show-error --location --output "$archive" "$url"
+            printf '%s  %s\n' "$sha256" "$archive" | sha256sum --check --strict --quiet
+            tar -xzf "$archive" -C "$HOME/.cargo/bin" "$name"
+            rm -f "$archive"
+            "$HOME/.cargo/bin/$name" --version
+          }
+          install_pinned_tool cargo-nextest \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_ARCHIVE_VERSION}/cargo-nextest-${NEXTEST_ARCHIVE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "$NEXTEST_ARCHIVE_SHA256"
+          install_pinned_tool cargo-hakari \
+            "https://github.com/guppy-rs/guppy/releases/download/cargo-hakari-${HAKARI_ARCHIVE_VERSION}/cargo-hakari-${HAKARI_ARCHIVE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "$HAKARI_ARCHIVE_SHA256"
       - name: Verify the workspace-hack feature unification is current
         run: |
           cargo hakari generate --diff

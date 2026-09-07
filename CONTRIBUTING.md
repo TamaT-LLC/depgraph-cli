@@ -70,6 +70,11 @@ cargo hakari generate
 cargo hakari manage-deps
 ```
 
+The `rust` job installs that same `cargo-hakari` version, and the `cargo-nextest`
+version it runs the test suite with, from the upstream Linux release archives
+whose SHA-256 digests are pinned in `.github/workflows/ci.yml`. Bump a tool by
+changing its version and digest together in that step.
+
 `workspace-hack` is build-time only. It is never published, and the release
 SBOM and third-party license inventory do not traverse through it, so its
 dependency lines do not change what a release archive declares.
