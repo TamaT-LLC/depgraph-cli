@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package worker
 
@@ -6,12 +6,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
+
+func referenceOpenNoFollowAvailable() bool { return true }
 
 // openReferenceFile opens a confined path from a trusted root descriptor.
 // The root and every subsequent component are opened with O_NOFOLLOW so a
 // swapped scan-root or parent symlink cannot escape the scan root.
+//
+// Linux and Darwin both expose openat(2) with O_NOFOLLOW. The syscall
+// package only exports Openat on Linux, so this shared walk uses
+// golang.org/x/sys/unix on both GOOS values and produces the same
+// go_reference_fingerprint bytes for the same confined listing.
 func openReferenceFile(root, path string) (*os.File, error) {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
@@ -33,26 +41,26 @@ func openReferenceFile(root, path string) (*os.File, error) {
 	if len(components) == 0 {
 		return nil, os.ErrInvalid
 	}
-	dirfd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	dirfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
 	owned := true
 	defer func() {
 		if owned {
-			_ = syscall.Close(dirfd)
+			_ = unix.Close(dirfd)
 		}
 	}()
 	for index, name := range components {
-		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 		if index < len(components)-1 {
-			flags |= syscall.O_DIRECTORY
+			flags |= unix.O_DIRECTORY
 		}
-		next, err := syscall.Openat(dirfd, name, flags, 0)
+		next, err := unix.Openat(dirfd, name, flags, 0)
 		if err != nil {
 			return nil, err
 		}
-		_ = syscall.Close(dirfd)
+		_ = unix.Close(dirfd)
 		dirfd = next
 		if index == len(components)-1 {
 			owned = false

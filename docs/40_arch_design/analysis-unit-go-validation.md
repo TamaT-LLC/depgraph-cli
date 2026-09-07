@@ -222,3 +222,12 @@ Typed and semantic checkpoint keys of a package-bounded unit include
 Syntax checkpoints are unchanged. The first scan after the dependency
 snapshot moved from the observed NeedDeps load to the module-wide metadata
 listing invalidates typed and semantic checkpoints once.
+
+Linux and macOS generate that fingerprint by walking each confined path
+component with `openat(2)` and `O_NOFOLLOW` (via `golang.org/x/sys/unix`;
+the `syscall` package exports `Openat` only on Linux). The same module
+listing therefore produces the same digest on both hosts, and a second
+scan reuses package semantic checkpoints until an in-repo dependency
+source changes. Platforms without a no-follow open omit
+`go_reference_fingerprint`; Core then leaves `reference_digest` unbound
+and does not read or write those semantic checkpoints.
