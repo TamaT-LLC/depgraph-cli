@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
 
@@ -348,9 +349,18 @@ function printUnitTable(rows) {
   for (const row of rows) lines.push(TABLE_COLUMNS.map(([key, width]) => cell(row[key], width)).join(" "));
   console.error(lines.join("\n"));
 }
-// Every persisted graph payload of the current completed snapshot. Profiles
-// are returned separately: their identities must match while the loader
-// policy properties legitimately differ between the module and package paths.
+// Canonical graph equality without materialising nodes in the runner: a
+// 1,024-file SSA graph is hundreds of megabytes of JSON and OOM'd the host
+// when `graph()` parsed every payload. Hash the stored bytes in id order.
+function hashRows(database, sql, scanId, write) {
+  const hash = createHash("sha256");
+  let count = 0;
+  for (const row of database.prepare(sql).iterate(scanId)) {
+    write(hash, row);
+    count += 1;
+  }
+  return { sha256: hash.digest("hex"), count };
+}
 function graph(store) {
   const database = new DatabaseSync(store, { readOnly: true });
   try {
@@ -358,29 +368,72 @@ function graph(store) {
       SELECT s.scan_id FROM completed_snapshots s
       JOIN current_completed_snapshot c ON c.snapshot_id = s.id
     `).get().scan_id;
-    const payloads = (table, column) => database.prepare(
+    const raw = (table, column) => hashRows(
+      database,
       `SELECT ${column} AS payload FROM ${table} WHERE scan_id = ? ORDER BY id`,
+      scanId,
+      (hash, row) => { hash.update(row.payload); hash.update("\n"); },
+    );
+    const profiles = database.prepare(
+      "SELECT json AS payload FROM profiles WHERE scan_id = ? ORDER BY id",
     ).all(scanId).map((row) => JSON.parse(row.payload));
-    const profiles = payloads("profiles", "json");
     assert.ok(profiles.length > 0, "completed scan has no persisted profiles");
-    return {
-      profiles,
-      payloads: {
-        nodes: payloads("nodes", "raw_json"),
-        edges: payloads("edges", "raw_json"),
-        sites: payloads("sites", "raw_json"),
+    const nodes = raw("nodes", "raw_json");
+    const edges = raw("edges", "raw_json");
+    const sites = raw("sites", "raw_json");
+    const diagnostics = hashRows(
+      database,
+      "SELECT raw_json AS payload FROM diagnostics WHERE scan_id = ? ORDER BY id",
+      scanId,
+      (hash, row) => {
         // The package path records its re-split as an informational core
         // diagnostic; worker diagnostics must be identical.
-        diagnostics: payloads("diagnostics", "raw_json").filter((diagnostic) => diagnostic.code !== "analysis-resplit"),
-        evidence: database.prepare(`SELECT owner_type, owner_id, ordinal, raw_json
-          FROM evidence WHERE scan_id = ? ORDER BY owner_type, owner_id, ordinal`)
-          .all(scanId).map(({ raw_json, ...owner }) => ({ ...owner, evidence: JSON.parse(raw_json) })),
-        coverage: JSON.parse(database.prepare("SELECT json FROM coverage WHERE scan_id = ?").get(scanId).json),
-        profile_coverage: database.prepare("SELECT profile_id, json FROM profile_coverage WHERE scan_id = ? ORDER BY profile_id")
-          .all(scanId).map((row) => ({ profile_id: row.profile_id, coverage: JSON.parse(row.json) })),
-        file_coverage: database.prepare(`SELECT path, discovered_sites, emitted_sites,
-          skipped_sites, skipped, reason, adapter FROM file_coverage
-          WHERE scan_id = ? ORDER BY path, adapter`).all(scanId),
+        if (JSON.parse(row.payload).code === "analysis-resplit") return;
+        hash.update(row.payload);
+        hash.update("\n");
+      },
+    );
+    const evidence = hashRows(
+      database,
+      `SELECT owner_type, owner_id, ordinal, raw_json AS payload
+       FROM evidence WHERE scan_id = ? ORDER BY owner_type, owner_id, ordinal`,
+      scanId,
+      (hash, row) => {
+        hash.update(`${row.owner_type}\0${row.owner_id}\0${row.ordinal}\n`);
+        hash.update(row.payload);
+        hash.update("\n");
+      },
+    );
+    const coverage = database.prepare("SELECT json FROM coverage WHERE scan_id = ?").get(scanId).json;
+    const profileCoverage = hashRows(
+      database,
+      "SELECT profile_id, json AS payload FROM profile_coverage WHERE scan_id = ? ORDER BY profile_id",
+      scanId,
+      (hash, row) => {
+        hash.update(`${row.profile_id}\n`);
+        hash.update(row.payload);
+        hash.update("\n");
+      },
+    );
+    const fileCoverage = hashRows(
+      database,
+      `SELECT path, discovered_sites, emitted_sites, skipped_sites, skipped, reason, adapter
+       FROM file_coverage WHERE scan_id = ? ORDER BY path, adapter`,
+      scanId,
+      (hash, row) => { hash.update(JSON.stringify(row)); hash.update("\n"); },
+    );
+    return {
+      profiles,
+      counts: { nodes: nodes.count, edges: edges.count, sites: sites.count },
+      payloads: {
+        nodes: nodes.sha256,
+        edges: edges.sha256,
+        sites: sites.sha256,
+        diagnostics: diagnostics.sha256,
+        evidence: evidence.sha256,
+        coverage: createHash("sha256").update(coverage).digest("hex"),
+        profile_coverage: profileCoverage.sha256,
+        file_coverage: fileCoverage.sha256,
       },
     };
   } finally {
@@ -388,9 +441,10 @@ function graph(store) {
   }
 }
 function assertSameCanonicalGraph(actual, expected, label) {
-  assert.ok(actual.payloads.nodes.length > 0 && actual.payloads.edges.length > 0 && actual.payloads.sites.length > 0, `${label}: empty graph`);
+  assert.ok(actual.counts.nodes > 0 && actual.counts.edges > 0 && actual.counts.sites > 0, `${label}: empty graph`);
+  assert.deepEqual(actual.counts, expected.counts, `${label}: graph counts differ from the module-loader control`);
   for (const key of Object.keys(expected.payloads)) {
-    assert.deepEqual(actual.payloads[key], expected.payloads[key], `${label}: ${key} differ from the module-loader control`);
+    assert.equal(actual.payloads[key], expected.payloads[key], `${label}: ${key} differ from the module-loader control`);
   }
   const strip = (profile) => ({
     ...profile,
