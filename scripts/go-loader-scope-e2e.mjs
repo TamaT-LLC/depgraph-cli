@@ -31,9 +31,9 @@ const parent = mkdtempSync(path.join(tmpdir(), "depgraph-go-loader-scope-e2e-"))
 const MIB = 1024 * 1024;
 // Reduced from the 2 GiB default; identical for the control and the package
 // path of the same fixture. Chosen above the measured package-path peaks
-// (fan-out batches ~98 MiB, staged 1,024-file bodies well under 320 MiB)
-// and below the measured whole-module peaks (~650–720 MiB). Never raised.
-const REDUCED_WORKER_MEMORY_BYTES = 320 * MIB;
+// (fan-out batches ~98 MiB) and well below whole-module live data
+// (~320–640 MiB even with GOMEMLIMIT). Never raised.
+const REDUCED_WORKER_MEMORY_BYTES = 192 * MIB;
 const BIG_PACKAGE_FILES = 1024;
 const BIG_PACKAGE_TABLE = 512;
 const FANOUT_PACKAGES = 64;
