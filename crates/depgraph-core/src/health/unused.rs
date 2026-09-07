@@ -24,31 +24,31 @@ pub fn analyze_unused_cancellable(
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
     let mut budget = HealthAnalysisBudget::new(maximum_work);
-    let index = SnapshotIndex::build(snapshot, &mut budget, &mut is_cancelled)?;
-    let mut findings = Vec::new();
-    for node in &snapshot.nodes {
-        budget.step(&mut is_cancelled)?;
-        let kind = match node.kind.as_str() {
-            "file" => FindingKind::UnusedFile,
-            "symbol" => FindingKind::UnusedExport,
-            "type" => FindingKind::UnusedType,
-            _ => continue,
-        };
-        if let Some(finding) = analyze_subject(&index, node, kind, &mut budget, &mut is_cancelled)?
-        {
-            if findings.len() >= maximum_findings {
-                return Err(HealthAnalysisError::ResourceExhausted);
-            }
-            findings.push(finding);
-        }
-    }
-    budget.step(&mut is_cancelled)?;
-    findings.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(findings)
+    let (source, dynamic_site_ids) =
+        GlobalSource::from_snapshot(snapshot, &mut budget, &mut is_cancelled)?;
+    let global = GlobalIndex::build(&source, &mut budget, &mut is_cancelled)?;
+    let local = LocalIndex::build(
+        &global,
+        &snapshot.nodes,
+        &snapshot.edges,
+        &snapshot.sites,
+        dynamic_site_ids,
+        &mut budget,
+        &mut is_cancelled,
+    )?;
+    analyze_subjects(
+        &global,
+        &local,
+        &snapshot.nodes,
+        maximum_findings,
+        &mut budget,
+        &mut is_cancelled,
+    )
 }
 
 fn analyze_subject<'a>(
-    index: &SnapshotIndex<'a>,
+    index: &'a GlobalIndex<'a>,
+    local: &LocalIndex<'a>,
     node: &'a NodeRecord,
     kind: FindingKind,
     budget: &mut HealthAnalysisBudget,
@@ -57,7 +57,7 @@ fn analyze_subject<'a>(
     if kind == FindingKind::UnusedExport && classify_surface(node).role == SurfaceRole::Internal {
         return Ok(None);
     }
-    let incoming = index
+    let incoming = local
         .incoming
         .get(node.id.as_str())
         .map_or(&[][..], Vec::as_slice);
@@ -78,7 +78,7 @@ fn analyze_subject<'a>(
     let mut blockers = Vec::new();
     collect_surface_blockers(node, &mut blockers);
     collect_edge_blockers(&incoming_usage, &mut blockers, budget, is_cancelled)?;
-    collect_site_blockers(index, &node.id, &mut blockers, budget, is_cancelled)?;
+    collect_site_blockers(index, local, &node.id, &mut blockers, budget, is_cancelled)?;
     collect_coverage_blockers(index, node, &mut blockers, budget, is_cancelled)?;
     if index.analysis_coverage_incomplete {
         blockers.push(FindingBlocker {
@@ -142,7 +142,7 @@ fn analyze_subject<'a>(
         // The Go worker's import edge targets the package/module node, not an
         // arbitrary source file.  An exact package import therefore accounts
         // for every source file in that package for the matching profile.
-        if let Some(package_profiles) = index.go_file_usage_profiles.get(node.id.as_str()) {
+        if let Some(package_profiles) = local.go_file_usage_profiles.get(node.id.as_str()) {
             usage_profiles.extend(package_profiles.iter().copied());
         }
         // A Go main package is selected by the build as an entry surface even
@@ -156,13 +156,13 @@ fn analyze_subject<'a>(
             .and_then(serde_json::Value::as_bool)
             == Some(true);
         if !is_go_test
-            && index.go_main_file_ids.contains(node.id.as_str())
-            && let Some(active_profiles) = index.go_file_active_profiles.get(node.id.as_str())
+            && local.go_main_file_ids.contains(node.id.as_str())
+            && let Some(active_profiles) = local.go_file_active_profiles.get(node.id.as_str())
         {
             usage_profiles.extend(active_profiles.iter().copied());
         }
         blockers.extend(
-            index
+            local
                 .go_file_blockers
                 .get(node.id.as_str())
                 .into_iter()
@@ -329,7 +329,50 @@ impl ApplicableProfiles<'_> {
     }
 }
 
-struct SnapshotIndex<'a> {
+/// Snapshot-wide inputs of the unused analysis that do not depend on which
+/// subjects are analysed.
+///
+/// Both the whole-snapshot path and the ranged path build one `GlobalIndex`
+/// from the same inputs (profiles, matrix, coverage, Go module nodes, and the
+/// edges/sites that target Go modules), so every subject sees identical
+/// applicable-profile sets, condition groups, and package projections no
+/// matter which execution range it belongs to.
+pub(crate) struct GlobalIndex<'a> {
+    profiles_by_id: HashMap<&'a str, &'a depgraph_store::ProfileRecord>,
+    // Go analysis stages often produce distinct profile records with the
+    // same environment and feature axes. Conditions only inspect those axes,
+    // so keep stage IDs for provenance while sharing the expensive condition
+    // evaluation through a deterministic representative profile.
+    go_profile_representatives: HashMap<&'a str, &'a str>,
+    go_condition_group_members: HashMap<&'a str, Vec<&'a str>>,
+    go_condition_profile_ids: Vec<&'a str>,
+    go_group_semantic_complete: HashMap<&'a str, bool>,
+    go_group_syntax_coverage: HashMap<&'a str, bool>,
+    applicable_profiles_by_language: HashMap<String, ApplicableProfileSet<'a>>,
+    applicable_profiles_all: Option<ApplicableProfileSet<'a>>,
+    // Package scopes and the package-level projections are global because a
+    // Go package is compiled as one unit: a file's usage comes from imports
+    // that target the package node, wherever the importing file lives.
+    go_package_scopes_by_path: HashMap<&'a str, BTreeSet<GoPackageIdentity<'a>>>,
+    go_main_package_scopes: HashSet<GoPackageIdentity<'a>>,
+    go_package_usage_profiles: GoPackageProfileGroups<'a>,
+    go_package_uncertain_profiles: GoPackageProfileGroups<'a>,
+    go_package_candidate_profiles: GoPackageProfileGroups<'a>,
+    go_candidates_by_path: HashMap<&'a str, GoProfilesByGroup<'a>>,
+    targetless_candidate: bool,
+    targetless_unresolved: bool,
+    targetless_dynamic: bool,
+    coverage_omitted_paths: HashSet<&'a str>,
+    analysis_coverage_incomplete: bool,
+}
+
+/// The inbound side of one set of subjects: the whole snapshot for the
+/// legacy path, or one execution range for the ranged path.
+///
+/// Every subject in the set must see all of its inbound edges and sites, no
+/// matter where their sources live; range loading is keyed by target for
+/// exactly that reason.
+pub(crate) struct LocalIndex<'a> {
     incoming: HashMap<&'a str, Vec<&'a EdgeRecord>>,
     // Go imports are resolved to package/module nodes because a Go package is
     // compiled as one unit. Keep production package-level usage profiles
@@ -347,22 +390,28 @@ struct SnapshotIndex<'a> {
     go_main_file_ids: HashSet<&'a str>,
     sites_by_target: HashMap<&'a str, Vec<&'a SiteRecord>>,
     dynamic_site_ids: HashSet<&'a str>,
-    targetless_candidate: bool,
-    targetless_unresolved: bool,
-    targetless_dynamic: bool,
-    coverage_omitted_paths: HashSet<&'a str>,
-    profiles_by_id: HashMap<&'a str, &'a depgraph_store::ProfileRecord>,
-    // Go analysis stages often produce distinct profile records with the
-    // same environment and feature axes. Conditions only inspect those axes,
-    // so keep stage IDs for provenance while sharing the expensive condition
-    // evaluation through a deterministic representative profile.
-    go_profile_representatives: HashMap<&'a str, &'a str>,
-    go_condition_group_members: HashMap<&'a str, Vec<&'a str>>,
-    go_group_semantic_complete: HashMap<&'a str, bool>,
-    go_group_syntax_coverage: HashMap<&'a str, bool>,
-    applicable_profiles_by_language: HashMap<String, ApplicableProfileSet<'a>>,
-    applicable_profiles_all: Option<ApplicableProfileSet<'a>>,
-    analysis_coverage_incomplete: bool,
+}
+
+/// Snapshot-wide raw inputs of [`GlobalIndex::build`].
+///
+/// `edges` and `sites` may be supersets of the rows that matter (the whole
+/// snapshot passes every edge and site; the store's ranged loader passes only
+/// the edges that target Go module nodes and the candidate sites).
+pub(crate) struct GlobalSource<'a> {
+    pub(crate) scan_status: &'a str,
+    pub(crate) coverage_reasons: &'a [String],
+    pub(crate) profiles: &'a [depgraph_store::ProfileRecord],
+    pub(crate) matrix_entries: &'a [depgraph_store::ProfileMatrixEntryRecord],
+    /// Distinct `language` values of subject nodes; `None` marks subjects
+    /// without a string language.
+    pub(crate) subject_languages: Vec<Option<&'a str>>,
+    pub(crate) go_module_nodes: Vec<&'a NodeRecord>,
+    pub(crate) edges: &'a [EdgeRecord],
+    pub(crate) sites: &'a [SiteRecord],
+    pub(crate) targetless_candidate: bool,
+    pub(crate) targetless_unresolved: bool,
+    pub(crate) targetless_dynamic: bool,
+    pub(crate) coverage_omitted_paths: Vec<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -613,23 +662,100 @@ impl<'a> GoFileConditions<'a> {
     }
 }
 
-impl<'a> SnapshotIndex<'a> {
-    fn build(
+impl<'a> GlobalSource<'a> {
+    /// Derive the snapshot-wide inputs from an in-memory graph, charging one
+    /// step per node, site, evidence record, and coverage row as the
+    /// whole-snapshot index always did.
+    pub(crate) fn from_snapshot(
         snapshot: &'a GraphSnapshot,
         budget: &mut HealthAnalysisBudget,
         is_cancelled: &mut impl FnMut() -> bool,
-    ) -> Result<Self, HealthAnalysisError> {
-        let mut incoming = HashMap::<&str, Vec<&EdgeRecord>>::new();
-        for edge in &snapshot.edges {
+    ) -> Result<(Self, HashSet<&'a str>), HealthAnalysisError> {
+        let mut subject_languages = BTreeSet::new();
+        let mut go_module_nodes = Vec::new();
+        for node in &snapshot.nodes {
             budget.step(is_cancelled)?;
-            incoming.entry(edge.target.as_str()).or_default().push(edge);
+            if matches!(node.kind.as_str(), "file" | "symbol" | "type") {
+                subject_languages.insert(
+                    node.properties
+                        .get("language")
+                        .and_then(serde_json::Value::as_str),
+                );
+            }
+            if node.kind == "module"
+                && node
+                    .properties
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("go")
+            {
+                go_module_nodes.push(node);
+            }
         }
+        let mut dynamic_site_ids = HashSet::new();
+        for evidence in &snapshot.evidence {
+            budget.step(is_cancelled)?;
+            if evidence.owner_type == "site"
+                && evidence
+                    .properties
+                    .get("occurrence_kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("dynamic_import")
+            {
+                dynamic_site_ids.insert(evidence.owner_id.as_str());
+            }
+        }
+        let mut targetless_candidate = false;
+        let mut targetless_unresolved = false;
+        let mut targetless_dynamic = false;
+        for site in &snapshot.sites {
+            budget.step(is_cancelled)?;
+            if site.target_ids.is_empty() {
+                targetless_candidate |= site.resolution_status == "candidates";
+                targetless_unresolved |= site.resolution_status == "unresolved";
+                targetless_dynamic |=
+                    matches!(site.kind.as_str(), "dynamic_import" | "dynamic-load")
+                        || dynamic_site_ids.contains(site.id.as_str());
+            }
+        }
+        let mut coverage_omitted_paths = Vec::new();
+        for record in &snapshot.file_coverage {
+            budget.step(is_cancelled)?;
+            if record.skipped || record.reason.as_deref() == Some("unsupported_syntax") {
+                coverage_omitted_paths.push(record.path.as_str());
+            }
+        }
+        Ok((
+            Self {
+                scan_status: snapshot.scan.status.as_str(),
+                coverage_reasons: snapshot.coverage.reasons.as_slice(),
+                profiles: snapshot.profiles.as_slice(),
+                matrix_entries: snapshot.profile_matrix.entries.as_slice(),
+                subject_languages: subject_languages.into_iter().collect(),
+                go_module_nodes,
+                edges: snapshot.edges.as_slice(),
+                sites: snapshot.sites.as_slice(),
+                targetless_candidate,
+                targetless_unresolved,
+                targetless_dynamic,
+                coverage_omitted_paths,
+            },
+            dynamic_site_ids,
+        ))
+    }
+}
 
+impl<'a> GlobalIndex<'a> {
+    pub(crate) fn build(
+        source: &GlobalSource<'a>,
+        budget: &mut HealthAnalysisBudget,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self, HealthAnalysisError> {
         let mut profiles_by_id = HashMap::new();
         let mut profile_ids_by_language = HashMap::<String, Vec<&str>>::new();
         let mut fixture_profile_ids = Vec::new();
         let mut all_profile_ids = Vec::new();
-        for profile in &snapshot.profiles {
+        for profile in source.profiles {
             budget.step(is_cancelled)?;
             profiles_by_id.insert(profile.id.as_str(), profile);
             all_profile_ids.push(profile.id.as_str());
@@ -654,7 +780,7 @@ impl<'a> SnapshotIndex<'a> {
         // by the snapshot, including matrix entries that refer to a profile
         // record. This keeps inactive files visible even when they have no
         // package import or main-entry edge.
-        for entry in &snapshot.profile_matrix.entries {
+        for entry in source.matrix_entries {
             budget.step(is_cancelled)?;
             for profile_id in &entry.profile_ids {
                 budget.step(is_cancelled)?;
@@ -717,29 +843,18 @@ impl<'a> SnapshotIndex<'a> {
         let mut go_main_package_scopes = HashSet::<GoPackageIdentity<'a>>::new();
         let mut required_applicable_languages = BTreeSet::new();
         let mut needs_all_applicable_profiles = false;
-        for node in &snapshot.nodes {
+        for language in &source.subject_languages {
             budget.step(is_cancelled)?;
-            if matches!(node.kind.as_str(), "file" | "symbol" | "type") {
-                if let Some(language) = node
-                    .properties
-                    .get("language")
-                    .and_then(serde_json::Value::as_str)
-                {
+            match language {
+                Some(language) => {
                     required_applicable_languages
                         .insert(health_language_family(language).to_owned());
-                } else {
-                    needs_all_applicable_profiles = true;
                 }
+                None => needs_all_applicable_profiles = true,
             }
-            if node.kind != "module"
-                || node
-                    .properties
-                    .get("language")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("go")
-            {
-                continue;
-            }
+        }
+        for node in &source.go_module_nodes {
+            budget.step(is_cancelled)?;
             if let Some(identity) = go_package_identity(node) {
                 go_package_identity_by_id.insert(node.id.as_str(), identity);
                 go_package_scopes_by_path
@@ -804,7 +919,7 @@ impl<'a> SnapshotIndex<'a> {
             HashMap::<GoPackageIdentity<'a>, HashSet<&'a str>>::new();
         let mut go_package_candidate_profiles =
             HashMap::<GoPackageIdentity<'a>, HashSet<&'a str>>::new();
-        for edge in &snapshot.edges {
+        for edge in source.edges {
             budget.step(is_cancelled)?;
             let Some(package_identity) = go_package_identity_by_id.get(edge.target.as_str()) else {
                 continue;
@@ -842,7 +957,7 @@ impl<'a> SnapshotIndex<'a> {
         // dependency site but its edge delta was omitted. Worker output
         // normally emits both records, while replayed/partial snapshots are
         // still required to fail closed for every package file target.
-        for site in &snapshot.sites {
+        for site in source.sites {
             budget.step(is_cancelled)?;
             if site.resolution_status != "candidates" {
                 continue;
@@ -889,10 +1004,10 @@ impl<'a> SnapshotIndex<'a> {
         )?;
         // Ambiguous file ownership needs the union of candidate evidence from
         // every package scope with that path, preserving each stage identity.
-        let mut candidates_by_path = HashMap::<&str, GoProfilesByGroup<'a>>::new();
+        let mut go_candidates_by_path = HashMap::<&str, GoProfilesByGroup<'a>>::new();
         for (scope, groups) in &go_package_candidate_profiles {
             budget.step(is_cancelled)?;
-            let path_groups = candidates_by_path.entry(scope.package_path).or_default();
+            let path_groups = go_candidates_by_path.entry(scope.package_path).or_default();
             for (representative, profiles) in groups {
                 budget.step(is_cancelled)?;
                 let members = path_groups.entry(*representative).or_default();
@@ -902,12 +1017,77 @@ impl<'a> SnapshotIndex<'a> {
                 }
             }
         }
+        let analysis_coverage_incomplete = source.scan_status != "completed"
+            || source.coverage_reasons.iter().any(|reason| {
+                reason.starts_with("analysis-unit-")
+                    || reason == "analysis-input-changed-during-scan"
+            });
+        Ok(Self {
+            profiles_by_id,
+            go_profile_representatives,
+            go_condition_group_members,
+            go_condition_profile_ids,
+            go_group_semantic_complete,
+            go_group_syntax_coverage,
+            applicable_profiles_by_language,
+            applicable_profiles_all,
+            go_package_scopes_by_path,
+            go_main_package_scopes,
+            go_package_usage_profiles,
+            go_package_uncertain_profiles,
+            go_package_candidate_profiles,
+            go_candidates_by_path,
+            targetless_candidate: source.targetless_candidate,
+            targetless_unresolved: source.targetless_unresolved,
+            targetless_dynamic: source.targetless_dynamic,
+            coverage_omitted_paths: source.coverage_omitted_paths.iter().copied().collect(),
+            analysis_coverage_incomplete,
+        })
+    }
+
+    pub(crate) const fn analysis_coverage_incomplete(&self) -> bool {
+        self.analysis_coverage_incomplete
+    }
+}
+
+impl<'a> LocalIndex<'a> {
+    /// Index the inbound side of `subjects`.
+    ///
+    /// `edges` must contain every edge whose target is one of the subjects and
+    /// `sites` every site that lists one of the subjects as a target; both may
+    /// contain more. `dynamic_site_ids` are the sites carrying dynamic-import
+    /// evidence among `sites`.
+    pub(crate) fn build(
+        global: &GlobalIndex<'a>,
+        subjects: impl IntoIterator<Item = &'a NodeRecord>,
+        edges: &'a [EdgeRecord],
+        sites: &'a [SiteRecord],
+        dynamic_site_ids: HashSet<&'a str>,
+        budget: &mut HealthAnalysisBudget,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self, HealthAnalysisError> {
+        let mut incoming = HashMap::<&str, Vec<&EdgeRecord>>::new();
+        for edge in edges {
+            budget.step(is_cancelled)?;
+            incoming.entry(edge.target.as_str()).or_default().push(edge);
+        }
+        let mut sites_by_target = HashMap::<&str, Vec<&SiteRecord>>::new();
+        for site in sites {
+            budget.step(is_cancelled)?;
+            for target_id in &site.target_ids {
+                budget.step(is_cancelled)?;
+                sites_by_target
+                    .entry(target_id.as_str())
+                    .or_default()
+                    .push(site);
+            }
+        }
 
         let mut go_file_usage_profiles = HashMap::<&str, HashSet<&str>>::new();
         let mut go_file_blockers = HashMap::<&str, Vec<FindingBlocker>>::new();
         let mut go_file_active_profiles = HashMap::<&str, HashSet<&str>>::new();
         let mut go_main_file_ids = HashSet::<&str>::new();
-        for node in &snapshot.nodes {
+        for node in subjects {
             budget.step(is_cancelled)?;
             if node.kind != "file"
                 || node
@@ -927,17 +1107,17 @@ impl<'a> SnapshotIndex<'a> {
             let conditions = GoFileConditions::build(
                 has_build_constraint,
                 incoming.get(node_id).map(Vec::as_slice),
-                &go_profile_representatives,
-                &profiles_by_id,
+                &global.go_profile_representatives,
+                &global.profiles_by_id,
                 budget,
                 is_cancelled,
             )?;
             let blockers = go_file_blockers.entry(node_id).or_default();
             let mut eligible_groups = Vec::new();
             let mut active_groups = HashSet::new();
-            for representative in &go_condition_profile_ids {
+            for representative in &global.go_condition_profile_ids {
                 budget.step(is_cancelled)?;
-                let members = &go_condition_group_members[representative];
+                let members = &global.go_condition_group_members[representative];
                 let active = conditions.group_has_state(
                     representative,
                     members.len(),
@@ -983,7 +1163,7 @@ impl<'a> SnapshotIndex<'a> {
             };
             let package_path = file_identity.package_path;
             let mut matching_scopes = Vec::new();
-            if let Some(scopes) = go_package_scopes_by_path.get(package_path) {
+            if let Some(scopes) = global.go_package_scopes_by_path.get(package_path) {
                 for scope in scopes {
                     budget.step(is_cancelled)?;
                     if go_package_scope_matches(file_identity, *scope) {
@@ -996,10 +1176,11 @@ impl<'a> SnapshotIndex<'a> {
                 // part of the finding. Inactive stages cannot supply a blocker.
                 for representative in eligible_groups {
                     budget.step(is_cancelled)?;
-                    let candidates = candidates_by_path
+                    let candidates = global
+                        .go_candidates_by_path
                         .get(package_path)
                         .and_then(|groups| groups.get(representative));
-                    for profile_id in &go_condition_group_members[representative] {
+                    for profile_id in &global.go_condition_group_members[representative] {
                         budget.step(is_cancelled)?;
                         if conditions.state(representative, profile_id) == GoConditionState::False {
                             continue;
@@ -1017,12 +1198,13 @@ impl<'a> SnapshotIndex<'a> {
                 continue;
             }
             let scope = matching_scopes[0];
-            if go_main_package_scopes.contains(&scope) {
+            if global.go_main_package_scopes.contains(&scope) {
                 go_main_file_ids.insert(node_id);
             }
             for representative in eligible_groups {
                 budget.step(is_cancelled)?;
-                if let Some(usage) = go_package_usage_profiles
+                if let Some(usage) = global
+                    .go_package_usage_profiles
                     .get(&scope)
                     .and_then(|groups| groups.get(representative))
                     && conditions.has_usage(representative, usage, budget, is_cancelled)?
@@ -1032,7 +1214,8 @@ impl<'a> SnapshotIndex<'a> {
                         .or_default()
                         .insert(representative);
                 }
-                if let Some(uncertain) = go_package_uncertain_profiles
+                if let Some(uncertain) = global
+                    .go_package_uncertain_profiles
                     .get(&scope)
                     .and_then(|groups| groups.get(representative))
                 {
@@ -1046,7 +1229,8 @@ impl<'a> SnapshotIndex<'a> {
                         }
                     }
                 }
-                if let Some(candidates) = go_package_candidate_profiles
+                if let Some(candidates) = global
+                    .go_package_candidate_profiles
                     .get(&scope)
                     .and_then(|groups| groups.get(representative))
                 {
@@ -1059,52 +1243,6 @@ impl<'a> SnapshotIndex<'a> {
                 }
             }
         }
-        let mut dynamic_site_ids = HashSet::new();
-        for evidence in &snapshot.evidence {
-            budget.step(is_cancelled)?;
-            if evidence.owner_type == "site"
-                && evidence
-                    .properties
-                    .get("occurrence_kind")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("dynamic_import")
-            {
-                dynamic_site_ids.insert(evidence.owner_id.as_str());
-            }
-        }
-        let mut sites_by_target = HashMap::<&str, Vec<&SiteRecord>>::new();
-        let mut targetless_candidate = false;
-        let mut targetless_unresolved = false;
-        let mut targetless_dynamic = false;
-        for site in &snapshot.sites {
-            budget.step(is_cancelled)?;
-            if site.target_ids.is_empty() {
-                targetless_candidate |= site.resolution_status == "candidates";
-                targetless_unresolved |= site.resolution_status == "unresolved";
-                targetless_dynamic |=
-                    matches!(site.kind.as_str(), "dynamic_import" | "dynamic-load")
-                        || dynamic_site_ids.contains(site.id.as_str());
-            }
-            for target_id in &site.target_ids {
-                budget.step(is_cancelled)?;
-                sites_by_target
-                    .entry(target_id.as_str())
-                    .or_default()
-                    .push(site);
-            }
-        }
-        let mut coverage_omitted_paths = HashSet::new();
-        for record in &snapshot.file_coverage {
-            budget.step(is_cancelled)?;
-            if record.skipped || record.reason.as_deref() == Some("unsupported_syntax") {
-                coverage_omitted_paths.insert(record.path.as_str());
-            }
-        }
-        let analysis_coverage_incomplete = snapshot.scan.status != "completed"
-            || snapshot.coverage.reasons.iter().any(|reason| {
-                reason.starts_with("analysis-unit-")
-                    || reason == "analysis-input-changed-during-scan"
-            });
         Ok(Self {
             incoming,
             go_file_usage_profiles,
@@ -1113,20 +1251,41 @@ impl<'a> SnapshotIndex<'a> {
             go_main_file_ids,
             sites_by_target,
             dynamic_site_ids,
-            targetless_candidate,
-            targetless_unresolved,
-            targetless_dynamic,
-            coverage_omitted_paths,
-            profiles_by_id,
-            go_profile_representatives,
-            go_condition_group_members,
-            go_group_semantic_complete,
-            go_group_syntax_coverage,
-            applicable_profiles_by_language,
-            applicable_profiles_all,
-            analysis_coverage_incomplete,
         })
     }
+}
+
+/// Analyse `subjects` against an already built global/local index pair.
+///
+/// Findings are returned sorted by id. The caller owns the budget so that the
+/// whole-snapshot path and a single execution range charge the same steps.
+pub(crate) fn analyze_subjects<'a>(
+    global: &'a GlobalIndex<'a>,
+    local: &LocalIndex<'a>,
+    subjects: impl IntoIterator<Item = &'a NodeRecord>,
+    maximum_findings: usize,
+    budget: &mut HealthAnalysisBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
+    let mut findings = Vec::new();
+    for node in subjects {
+        budget.step(is_cancelled)?;
+        let kind = match node.kind.as_str() {
+            "file" => FindingKind::UnusedFile,
+            "symbol" => FindingKind::UnusedExport,
+            "type" => FindingKind::UnusedType,
+            _ => continue,
+        };
+        if let Some(finding) = analyze_subject(global, local, node, kind, budget, is_cancelled)? {
+            if findings.len() >= maximum_findings {
+                return Err(HealthAnalysisError::ResourceExhausted);
+            }
+            findings.push(finding);
+        }
+    }
+    budget.step(is_cancelled)?;
+    findings.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(findings)
 }
 
 fn go_package_identity<'a>(node: &'a NodeRecord) -> Option<GoPackageIdentity<'a>> {
@@ -1590,16 +1749,17 @@ fn collect_edge_blockers(
 }
 
 fn collect_site_blockers(
-    index: &SnapshotIndex<'_>,
+    index: &GlobalIndex<'_>,
+    local: &LocalIndex<'_>,
     subject_id: &str,
     blockers: &mut Vec<FindingBlocker>,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), HealthAnalysisError> {
-    for site in index.sites_by_target.get(subject_id).into_iter().flatten() {
+    for site in local.sites_by_target.get(subject_id).into_iter().flatten() {
         budget.step(is_cancelled)?;
         let dynamic = matches!(site.kind.as_str(), "dynamic_import" | "dynamic-load")
-            || index.dynamic_site_ids.contains(site.id.as_str());
+            || local.dynamic_site_ids.contains(site.id.as_str());
         if dynamic {
             blockers.push(FindingBlocker {
                 kind: BlockerKind::DynamicLoading,
@@ -1645,7 +1805,7 @@ fn collect_site_blockers(
 }
 
 fn collect_coverage_blockers(
-    index: &SnapshotIndex<'_>,
+    index: &GlobalIndex<'_>,
     node: &NodeRecord,
     blockers: &mut Vec<FindingBlocker>,
     budget: &mut HealthAnalysisBudget,
@@ -1674,7 +1834,7 @@ fn collect_coverage_blockers(
 }
 
 fn applicable_profiles<'a>(
-    index: &'a SnapshotIndex<'a>,
+    index: &'a GlobalIndex<'a>,
     node: &'a NodeRecord,
     budget: &mut HealthAnalysisBudget,
     is_cancelled: &mut impl FnMut() -> bool,
@@ -1718,7 +1878,7 @@ fn health_language_family(language: &str) -> &str {
 }
 
 fn append_missing_profile_blockers<'a>(
-    index: &SnapshotIndex<'a>,
+    index: &GlobalIndex<'a>,
     profile_id: &'a str,
     is_go_subject: bool,
     blockers: &mut Vec<FindingBlocker>,
@@ -1839,7 +1999,7 @@ fn build_applicable_profile_set<'a>(
 }
 
 fn profiles_satisfy(
-    index: &SnapshotIndex<'_>,
+    index: &GlobalIndex<'_>,
     applicable: &ApplicableProfiles<'_>,
     kind: CompletenessKind,
     budget: &mut HealthAnalysisBudget,
@@ -1860,7 +2020,7 @@ fn profiles_satisfy(
 }
 
 fn go_profiles_satisfy(
-    index: &SnapshotIndex<'_>,
+    index: &GlobalIndex<'_>,
     applicable: &ApplicableProfiles<'_>,
     kind: CompletenessKind,
     budget: &mut HealthAnalysisBudget,
@@ -3176,10 +3336,23 @@ mod tests {
         );
         let mut budget = HealthAnalysisBudget::new(usize::MAX);
         let mut cancelled = || false;
-        let index = SnapshotIndex::build(&graph, &mut budget, &mut cancelled)
+        let (source, dynamic_site_ids) =
+            GlobalSource::from_snapshot(&graph, &mut budget, &mut cancelled)
+                .expect("synthetic Go snapshot sources");
+        let index = GlobalIndex::build(&source, &mut budget, &mut cancelled)
             .expect("synthetic Go snapshot indexes");
+        let local = LocalIndex::build(
+            &index,
+            &graph.nodes,
+            &graph.edges,
+            &graph.sites,
+            dynamic_site_ids,
+            &mut budget,
+            &mut cancelled,
+        )
+        .expect("synthetic Go snapshot local index");
         assert_eq!(index.go_condition_group_members.len(), 2);
-        let incoming = index
+        let incoming = local
             .incoming
             .get("go:file")
             .expect("contains edges indexed");
