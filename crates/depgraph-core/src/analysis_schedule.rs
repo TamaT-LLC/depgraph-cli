@@ -554,10 +554,11 @@ struct SourceBatchContext {
     auxiliary_paths: Vec<String>,
 }
 
-/// Build the split plan the scheduler would use for the shipped worker
-/// boundaries, with the worker context closure of every source-batch unit.
+/// Build the split plan the scheduler would use for workers that have not
+/// negotiated loader scope, with the worker context closure of every
+/// source-batch unit.
 #[cfg(test)]
-fn split_plan_for_default_workers(
+fn split_plan_for_module_loader_workers(
     root: &Path,
     config: &crate::Config,
     plan: &AnalysisPlan,
@@ -568,7 +569,7 @@ fn split_plan_for_default_workers(
         config,
         plan,
         store_path,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )
 }
 
@@ -632,7 +633,8 @@ fn source_batch_requests(
     stage: &str,
     store_path: Option<&Path>,
 ) -> Result<Vec<serde_json::Value>> {
-    let (split_plan, contexts) = split_plan_for_default_workers(root, config, plan, store_path)?;
+    let (split_plan, contexts) =
+        split_plan_for_module_loader_workers(root, config, plan, store_path)?;
     let stage = match stage {
         "syntax" => AnalysisStage::Syntax,
         "typed" => AnalysisStage::Typed,
@@ -1396,10 +1398,10 @@ mod tests {
             1,
             "only the Go adapter is present"
         );
-        let (legacy_default, _) = split_plan_for_default_workers(root, &config, &plan, None)?;
+        let (legacy_default, _) = split_plan_for_module_loader_workers(root, &config, &plan, None)?;
         assert_eq!(
             legacy_default.split_plan_id, legacy_plan.split_plan_id,
-            "the shipped defaults describe workers that have not negotiated loader scope"
+            "the module-loader defaults describe workers that have not negotiated loader scope"
         );
 
         // The chunking the scheduler performed before the split plan existed;

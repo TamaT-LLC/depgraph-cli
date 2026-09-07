@@ -95,7 +95,7 @@ fn budget(configure: impl FnOnce(&mut Config)) -> (Config, AnalysisSplitBudget) 
 /// The shipped boundaries as workers that negotiated loader scope execute
 /// them: the same stages, partitioned against the byte budgets.
 fn negotiated_defaults() -> Vec<AnalysisAdapterBoundary> {
-    AnalysisAdapterBoundary::current_defaults()
+    AnalysisAdapterBoundary::module_loader_defaults()
         .into_iter()
         .map(|boundary| boundary.with_loader_scope(true))
         .collect()
@@ -229,9 +229,12 @@ fn scenarios(
         checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
-    scenarios.insert("current-workers-default-budget", (plan.clone(), current));
+    scenarios.insert(
+        "module-loader-workers-default-budget",
+        (plan.clone(), current),
+    );
     let (_, file_budget) = budget(|config| {
         config.scan.max_unit_source_files = 2;
         config.scan.max_concurrent_units = 3;
@@ -240,17 +243,18 @@ fn scenarios(
         checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
-    scenarios.insert("current-workers-two-file-budget", (plan.clone(), files));
+    scenarios.insert(
+        "module-loader-workers-two-file-budget",
+        (plan.clone(), files),
+    );
+    // The shipped workers: the Go worker negotiates the package loader.
     let (staged, _) = split(
         checkout,
         &plan,
         &default_budget,
-        vec![
-            AnalysisAdapterBoundary::go_package_loader(),
-            AnalysisAdapterBoundary::web_project_loader(),
-        ],
+        AnalysisAdapterBoundary::current_defaults(),
     )?;
     scenarios.insert("go-package-loader-default-budget", (plan.clone(), staged));
     let (bounded, _) = split(
@@ -302,13 +306,13 @@ fn same_input_produces_the_same_split_plan_across_checkouts_and_runs() -> Result
         &first,
         &first_plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (second_split, _) = split(
         &second,
         &second_plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(
         serde_json::to_value(&first_split)?,
@@ -348,13 +352,13 @@ fn budget_change_changes_the_split_plan_but_not_discovery_or_input_fingerprints(
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (file_split, _) = split(
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
 
     assert_eq!(default_split.plan_id, plan.plan_id);
@@ -458,7 +462,7 @@ fn out_of_unit_references_are_retained_in_loader_and_reference_scope() -> Result
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let shared = unit_id(&plan, "services/shared", "go");
     let api_semantic = only(
@@ -555,7 +559,7 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
         let unit = only(&module_split, &plan, "services/big", "go", stage);
@@ -799,7 +803,7 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let a = only(
         &split_plan,
@@ -977,7 +981,7 @@ fn path_lists_are_sorted_and_unique_as_workers_require() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let api = only(
         &split_plan,
@@ -1440,7 +1444,7 @@ fn refinement_history_carried_across_boundaries_is_reported_not_dropped() -> Res
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let target = only(
         &whole_context,
@@ -1512,7 +1516,7 @@ fn loader_scope_and_ownership_scope_are_distinguishable() -> Result<()> {
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let web_semantic = units(
         &split_plan,
@@ -1575,7 +1579,7 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let parallelism = &split_plan.parallelism;
     assert_eq!(parallelism.max_concurrent_units, 2);
@@ -1609,7 +1613,7 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
         &checkout,
         &plan,
         &serial,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(serial_split.parallelism.effective_concurrency, 1);
     assert!(
@@ -1671,7 +1675,7 @@ fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
         &plan,
         &AnalysisSplitInput::new(
             default_budget.clone(),
-            AnalysisAdapterBoundary::current_defaults(),
+            AnalysisAdapterBoundary::module_loader_defaults(),
         ),
     )?;
     assert!(declared.execution_units.is_empty());
@@ -1685,7 +1689,7 @@ fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
         &checkout,
         &checkout.discover(&config)?,
         &serial,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     assert_eq!(serial_split.parallelism.effective_concurrency, 1);
     assert_eq!(
@@ -1730,7 +1734,7 @@ fn measured_sizes_match_fixture_bytes_and_drive_byte_splits() -> Result<()> {
     );
     let partial = AnalysisSplitInput::new(
         AnalysisSplitBudget::from_config(&config),
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     );
     assert!(
         plan_analysis_split(&plan, &partial)?
@@ -1762,7 +1766,7 @@ fn split_plan_and_resplit_plan_satisfy_the_closed_schema() -> Result<()> {
         &checkout,
         &plan,
         &budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let target = units(&current, &plan, "services/big", "go", AnalysisStage::Syntax)[0]
         .id
@@ -1887,10 +1891,41 @@ fn bounded_package_boundary_requires_the_loader_scope_capability() -> Result<()>
     assert!(!web.loader_scope);
     assert!(select(AnalysisAdapter::Web, &[ANALYSIS_LOADER_SCOPE_CAPABILITY]).loader_scope);
     assert!(
-        AnalysisAdapterBoundary::current_defaults()
+        AnalysisAdapterBoundary::module_loader_defaults()
             .iter()
             .all(|boundary| !boundary.loader_scope),
-        "the shipped workers have not negotiated loader scope"
+        "the module-loader defaults describe workers without loader scope"
+    );
+    // The shipped Go worker advertises exactly the handshake that selects
+    // the package loader, so `scan --split-plan` explains a repository with
+    // the boundary the scan will execute.
+    let shipped_go_capabilities = [
+        ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY,
+        ANALYSIS_LOADER_SCOPE_CAPABILITY,
+        "analysis-source-batch-v1",
+        "analysis-unit-typed-v1",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(AnalysisAdapterBoundary::current_defaults())?,
+        serde_json::to_value(vec![
+            AnalysisAdapterBoundary::for_capabilities(
+                AnalysisAdapter::Go,
+                &shipped_go_capabilities
+            )
+            .expect("shipped Go worker has a boundary"),
+            select(AnalysisAdapter::Web, &[]),
+        ])?,
+        "the shipped defaults are the boundaries the shipped workers negotiate"
+    );
+    assert_eq!(
+        serde_json::to_value(AnalysisAdapterBoundary::current_defaults())?,
+        serde_json::to_value(vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ])?
     );
 
     // The planner refuses the inconsistent combination outright.
@@ -1933,7 +1968,7 @@ fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
         &checkout,
         &plan,
         &default_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let (negotiated, _) = split(&checkout, &plan, &default_budget, negotiated_defaults())?;
     assert_eq!(legacy.plan_id, negotiated.plan_id);
@@ -1988,7 +2023,7 @@ fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
         &checkout,
         &plan,
         &file_budget,
-        AnalysisAdapterBoundary::current_defaults(),
+        AnalysisAdapterBoundary::module_loader_defaults(),
     )?;
     let chunks = units(
         &legacy_files,

@@ -452,8 +452,18 @@ impl AnalysisAdapterBoundary {
     }
 
     /// Boundaries of the workers shipped with this core, as they negotiate
-    /// today: neither advertises loader scope yet.
+    /// today: the Go worker advertises loader scope and the package loader,
+    /// the Web worker advertises neither.  `depgraph scan --split-plan`
+    /// explains a repository with these boundaries before any worker runs.
     pub fn current_defaults() -> Vec<Self> {
+        vec![Self::go_package_loader(), Self::web_project_loader()]
+    }
+
+    /// Boundaries of the same workers before the Go package loader: the Go
+    /// module loader without loader scope and the Web project loader.  A Go
+    /// worker that does not advertise the loader-scope and package-loader
+    /// capabilities is still planned this way.
+    pub fn module_loader_defaults() -> Vec<Self> {
         vec![Self::go_module_loader(true), Self::web_project_loader()]
     }
 
