@@ -31,12 +31,22 @@ const MIB = 1024 * 1024;
 // Reduced from the 2 GiB default; identical for the control and the package
 // path of the same fixture. The whole-module units of `bigpkg` need several
 // times this much.
-const REDUCED_WORKER_MEMORY_BYTES = 384 * MIB;
+// Reduced from the 2 GiB default; identical for the control and the package
+// path of the same fixture. Chosen above the measured package-path peaks
+// (hybrid self ~318 MiB for the 1,024-file package, batch-of-8 ~81 MiB)
+// and below the measured whole-module peaks (~555 MiB / ~721 MiB).
+const REDUCED_WORKER_MEMORY_BYTES = 448 * MIB;
 const BIG_PACKAGE_FILES = 1024;
 const BIG_PACKAGE_TABLE = 512;
 const FANOUT_PACKAGES = 64;
 const FANOUT_FILES = 8;
 const FANOUT_TABLE = 16;
+// Bounds the fan-out packages into several package batches per stage. File
+// count is required as well as bytes: unmeasured 0-byte granules would
+// otherwise pack every package into one unit (the default 128-file budget
+// exactly fit the previous 32×4 fixture and still OOM'd after a 1→2 re-split).
+const FANOUT_UNIT_SOURCE_BYTES = 64 * 1024;
+const FANOUT_UNIT_SOURCE_FILES = 64;
 // Bounds the fan-out packages into a few package batches per stage; the
 // default 8 MiB budget would promote the small module to one whole context.
 const FANOUT_UNIT_SOURCE_BYTES = 64 * 1024;
@@ -322,7 +332,7 @@ function printUnitTable(rows) {
   const lines = [TABLE_COLUMNS.map(([key, width]) => cell(TABLE_HEADERS[key], width)).join(" ")];
   lines.push(TABLE_COLUMNS.map(([, width]) => "-".repeat(width)).join(" "));
   for (const row of rows) lines.push(TABLE_COLUMNS.map(([key, width]) => cell(row[key], width)).join(" "));
-  console.log(lines.join("\n"));
+  console.error(lines.join("\n"));
 }
 // Every persisted graph payload of the current completed snapshot. Profiles
 // are returned separately: their identities must match while the loader
@@ -454,7 +464,10 @@ const report = {
   contract_version: "depgraph-go-loader-scope-e2e-v1",
   reduced_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES,
   fixtures: {
-    fanout: { packages: FANOUT_PACKAGES, files_per_package: FANOUT_FILES, unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES },
+    fanout: {
+      packages: FANOUT_PACKAGES, files_per_package: FANOUT_FILES,
+      unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES, unit_source_files: FANOUT_UNIT_SOURCE_FILES,
+    },
     bigpkg: { files: BIG_PACKAGE_FILES, table: BIG_PACKAGE_TABLE },
   },
   scenarios: {},
@@ -512,7 +525,11 @@ try {
   const { expected: fanoutExpected, wholeModulePeak: fanoutWholePeak } = controlScenarios("fanout", fanoutRoot, control);
 
   // --- fan-out: shipped worker, packages batched under a byte budget ------
-  configure(fanoutRoot, { max_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES, max_unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES });
+  configure(fanoutRoot, {
+    max_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES,
+    max_unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES,
+    max_unit_source_files: FANOUT_UNIT_SOURCE_FILES,
+  });
   const fanoutStore = path.join(parent, "fanout-package.sqlite");
   const fanoutPackage = scan("fanout-package", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutPackage.output.status, "completed", JSON.stringify(fanoutPackage.output.diagnostics));
