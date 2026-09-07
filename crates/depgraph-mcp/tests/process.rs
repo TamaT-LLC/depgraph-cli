@@ -7294,6 +7294,71 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
         findings["structuredContent"]["result"]["collection_digest"],
         cli_findings["data"]["collection_digest"]
     );
+    // Ranged execution diagnostics (#467) are reported on both surfaces with
+    // the same plan; the MCP shape omits process-level observations. The CLI
+    // ran first and wrote the range checkpoints, so the MCP process must have
+    // reused every range instead of recomputing it.
+    for (mcp_result, cli_data) in [
+        (
+            &summary["structuredContent"]["result"],
+            &cli_summary["data"],
+        ),
+        (
+            &findings["structuredContent"]["result"],
+            &cli_findings["data"],
+        ),
+    ] {
+        assert_eq!(mcp_result["partial"], json!(false), "{mcp_result}");
+        assert_eq!(cli_data["partial"], json!(false), "{cli_data}");
+        assert_eq!(mcp_result["execution"]["mode"], json!("ranged"));
+        for pointer in [
+            "/mode",
+            "/ranges/total",
+            "/ranges/completed",
+            "/ranges/failed",
+            "/ranges/interrupted",
+            "/work/planner",
+            "/work/global_context",
+            "/work/range_limit",
+            "/work/dependencies_load",
+            "/work/dependencies",
+            "/checkpoints/enabled",
+        ] {
+            assert_eq!(
+                mcp_result["execution"].pointer(pointer),
+                cli_data["execution"].pointer(pointer),
+                "MCP/CLI health execution parity for {pointer}"
+            );
+        }
+        assert!(mcp_result["execution"].get("peak_rss_kib").is_none());
+        assert!(mcp_result["execution"].get("plan_digest").is_none());
+        assert!(mcp_result["execution"].get("layers").is_none());
+        let ranges = &mcp_result["execution"]["ranges"];
+        assert!(ranges["total"].as_u64().unwrap() >= 1, "{ranges}");
+        assert_eq!(ranges["completed"], ranges["total"]);
+        assert_eq!(ranges["reused"], ranges["total"], "{ranges}");
+        assert_eq!(ranges["failed"], json!(0));
+        assert_eq!(mcp_result["execution"]["work"]["ranges_total"], json!(0));
+    }
+    // The first CLI process computed and wrote every range; the second CLI
+    // process (a new process on the same store) already reused them.
+    let first = &cli_summary["data"]["execution"];
+    assert_eq!(first["ranges"]["reused"], json!(0), "{first}");
+    assert_eq!(
+        first["checkpoints"]["written"], first["ranges"]["total"],
+        "{first}"
+    );
+    assert!(
+        first["work"]["ranges_total"].as_u64().unwrap() > 0
+            && first["work"]["ranges_max"].as_u64().unwrap()
+                <= first["work"]["range_limit"].as_u64().unwrap(),
+        "{first}"
+    );
+    let second = &cli_findings["data"]["execution"];
+    assert_eq!(
+        second["ranges"]["reused"], second["ranges"]["total"],
+        "{second}"
+    );
     assert_eq!(
         findings["structuredContent"]["result"]["findings"]["items"][0]["id"],
         unused_id
@@ -7399,6 +7464,52 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
             "{tool}: {rejected}"
         );
     }
+
+    // The opt-in partial view is accepted on both tools and never changes a
+    // complete collection: same digest, `partial` stays false, and the reused
+    // range checkpoints keep the plan identical.
+    for (id, tool) in [(13, "health_summary_get"), (14, "health_findings_list")] {
+        let opted_in = interactive_tool_call(&mut mcp, id, tool, {
+            let mut arguments = common.clone();
+            arguments["allow_partial_ranges"] = json!(true);
+            if tool == "health_findings_list" {
+                arguments["kinds"] = json!(["unused-file"]);
+                arguments["limit"] = json!(100);
+            }
+            arguments
+        });
+        assert_eq!(opted_in["isError"], false, "{tool}: {opted_in}");
+        let complete = if tool == "health_summary_get" {
+            &summary
+        } else {
+            &findings
+        };
+        assert_eq!(
+            opted_in["structuredContent"]["result"]["collection_digest"],
+            complete["structuredContent"]["result"]["collection_digest"],
+            "{tool}"
+        );
+        assert_eq!(
+            opted_in["structuredContent"]["result"]["partial"],
+            json!(false),
+            "{tool}"
+        );
+        assert_eq!(
+            opted_in["structuredContent"]["result"]["execution"]["ranges"]["reused"],
+            opted_in["structuredContent"]["result"]["execution"]["ranges"]["total"],
+            "{tool}: {opted_in}"
+        );
+    }
+    let rejected = interactive_tool_call(&mut mcp, 15, "health_summary_get", {
+        let mut arguments = common.clone();
+        arguments["allow_partial_ranges"] = json!("yes");
+        arguments
+    });
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    assert_eq!(
+        rejected["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
 
     for result in [&summary, &findings, &detail, &audit, &hotspots] {
         let encoded = result.to_string();
