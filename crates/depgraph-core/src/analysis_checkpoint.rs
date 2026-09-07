@@ -21,9 +21,17 @@ const MAX_ENTRIES: usize = 4_096;
 #[serde(deny_unknown_fields)]
 pub(crate) struct UnitCheckpointKey {
     pub unit_id: String,
+    /// The static input witness the schedule derived from the discovery plan;
+    /// for a source-batch unit it equals the request's `context_fingerprint`.
     pub input_digest: String,
     pub execution_digest: String,
     pub root_digest: String,
+    /// The worker-reported reference closure a package-bounded semantic unit
+    /// was type-checked against, folded in at dispatch.  Absent for every
+    /// other unit, whose key digest therefore stays what it was before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_digest: Option<String>,
 }
 
 impl UnitCheckpointKey {
@@ -302,6 +310,7 @@ mod tests {
             input_digest: "input".into(),
             execution_digest: "toolchain".into(),
             root_digest: "root".into(),
+            reference_digest: None,
         }
     }
 
@@ -310,6 +319,37 @@ mod tests {
             json!({"event":"scan_started"}),
             json!({"event":"scan_completed"}),
         ]
+    }
+
+    #[test]
+    fn reference_digest_extends_the_key_without_moving_existing_checkpoints() -> Result<()> {
+        // Keys of units that bind no reference closure keep the digest they
+        // had before the field existed, so their checkpoint files stay valid.
+        let legacy = json!({"unit_id":"go:service","input_digest":"input",
+            "execution_digest":"toolchain","root_digest":"root"});
+        assert_eq!(
+            key().digest()?,
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy)?))
+        );
+        assert_eq!(serde_json::from_value::<UnitCheckpointKey>(legacy)?, key());
+        let bound = UnitCheckpointKey {
+            reference_digest: Some("closure-a".into()),
+            ..key()
+        };
+        assert_ne!(bound.digest()?, key().digest()?);
+        let temp = tempfile::tempdir()?;
+        let store = UnitCheckpointStore::open(&temp.path().join("store"), 4096)?;
+        assert!(store.write(&bound, &events())?);
+        assert_eq!(store.read(&bound)?, Some(events()));
+        assert_eq!(store.read(&key())?, None);
+        assert_eq!(
+            store.read(&UnitCheckpointKey {
+                reference_digest: Some("closure-b".into()),
+                ..key()
+            })?,
+            None
+        );
+        Ok(())
     }
 
     #[test]

@@ -173,6 +173,10 @@ fn reference_binding(item: &AnalysisWorkItem) -> Option<ReferenceBinding> {
 /// the typed stage of this scan loaded the same closure content.  Typed units
 /// are always ingested before their semantic stage dispatches, so the
 /// fingerprints are known here for fresh and replayed typed units alike.
+///
+/// The fingerprints occupy the key's own `reference_digest` slot: the static
+/// `input_digest` still has to equal the request's context fingerprint for the
+/// input validation that guards every checkpoint write and reuse.
 fn bind_reference_fingerprints(
     index: usize,
     item: &mut AnalysisWorkItem,
@@ -207,12 +211,12 @@ fn bind_reference_fingerprints(
         })
         .collect::<BTreeSet<_>>();
     let Ok(payload) = serde_json::to_vec(&json!({
-        "contract":"analysis-go-reference-binding-v1","input":key.input_digest,
+        "contract":"analysis-go-reference-binding-v1",
         "reference_fingerprints":fingerprints,
     })) else {
         return;
     };
-    key.input_digest = format!("{:x}", Sha256::digest(payload));
+    key.reference_digest = Some(format!("{:x}", Sha256::digest(payload)));
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1327,7 +1331,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 unit_id: id.clone(),
                 request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":[],"context_paths":[],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":"context"})),
                 spec: spec.clone(),
-                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:"input".into(),execution_digest:"worker".into(),root_digest:"root".into() }),
+                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:"input".into(),execution_digest:"worker".into(),root_digest:"root".into(),reference_digest:None }),
             }
         }).collect()
         };
@@ -1415,7 +1419,7 @@ fs.appendFileSync(CACHES, cache + '\n');
 const common = { protocol_version:'1.0',scan_id:arg('--scan-id'),adapter:'go',adapter_version:'0.1.0' };
 const completeness = request.stage === 'semantic' ? ['syntax-complete','semantic-complete'] : ['syntax-complete'];
 const coverage = { profiles:1,files_discovered:0,files_analyzed:0,files_skipped:0,dependency_sites:0,resolved:0,candidates:0,external:0,unresolved:0,unsupported_syntax:0,project_code_executed:false,completeness,reasons:[] };
-const properties = { analysis_unit_contract:request.contract_version,analysis_unit_id:request.unit_id,analysis_unit_root:request.unit_root,analysis_stage:request.stage,analysis_chunk_id:request.chunk_id,analysis_chunk_index:'0',analysis_chunk_count:'1',analysis_context_fingerprint:'context',analysis_loader_scope:'applied',go_reference_fingerprint:fs.readFileSync(FINGERPRINT,'utf8'),go_typed_stage_complete:'true' };
+const properties = { analysis_unit_contract:request.contract_version,analysis_unit_id:request.unit_id,analysis_unit_root:request.unit_root,analysis_stage:request.stage,analysis_chunk_id:request.chunk_id,analysis_chunk_index:'0',analysis_chunk_count:'1',analysis_context_fingerprint:request.context_fingerprint,analysis_loader_scope:'applied',go_reference_fingerprint:fs.readFileSync(FINGERPRINT,'utf8'),go_typed_stage_complete:'true' };
 const profile = { id:'go:'+request.stage,language:'go',features:[],environment:{},properties };
 const events = [
  {event:'scan_started',seq:1,root:arg('--root'),project_code_executed:false,safe_mode:true},
@@ -1444,16 +1448,29 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         let work = |typed_input: &str| {
             ["typed", "semantic"].into_iter().map(|stage| {
             let id = format!("unit:{stage}");
+            let input = if stage == "typed" { typed_input.to_owned() } else { "semantic-input".to_owned() };
             AnalysisWorkItem {
                 unit_id: id.clone(),
-                request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":["app/a.go"],"context_paths":["app/a.go"],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":"context",
+                request: Some(json!({"contract_version":"depgraph-analysis-unit-v2","unit_id":"unit","unit_root":".","stage":stage,"source_paths":["app/a.go"],"context_paths":["app/a.go"],"auxiliary_paths":[],"chunk_id":stage,"chunk_index":0,"chunk_count":1,"context_fingerprint":input,
                     "split":{"split_plan_id":"plan","execution_unit_id":format!("{stage}-app"),"split_kind":"package","loader":{"kind":"package","paths":["app/a.go"],"package_roots":["app"],"reference_depth":"declarations","reference_paths":[],"input_split":false}}})),
                 spec: spec.clone(),
-                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:if stage == "typed" { typed_input.to_owned() } else { "semantic-input".to_owned() },execution_digest:"worker".into(),root_digest:"root".into() }),
+                checkpoint_key: Some(UnitCheckpointKey { unit_id:id,input_digest:input,execution_digest:"worker".into(),root_digest:"root".into(),reference_digest:None }),
             }
         }).collect::<Vec<_>>()
         };
         let consume = |_: &mut Store, _: &str, output: WorkerOutput| Ok(output.error.is_none());
+        // The production validator admits a source-batch checkpoint write or
+        // reuse only while the key's static input digest is the request's
+        // context fingerprint; the reference binding must not disturb it.
+        let validate = |item: &AnalysisWorkItem, _: AnalysisInputValidation| {
+            item.request
+                .as_ref()
+                .and_then(|request| request["context_fingerprint"].as_str())
+                == item
+                    .checkpoint_key
+                    .as_ref()
+                    .map(|key| key.input_digest.as_str())
+        };
         let store_path = temp.path().join("store.sqlite");
         let config = Config::default();
         let cancellation = CancellationToken::new();
@@ -1466,7 +1483,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         };
         let mut store = Store::open(&store_path)?;
         let first =
-            execute_analysis_units(&mut store, &context, work("typed-a"), consume, |_, _| true)
+            execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
                 .await?;
         assert!(
             first.units.iter().all(|unit| unit.status == "completed"),
@@ -1494,9 +1511,8 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         );
 
         // Same module context and same reported closure: both stages replay.
-        let same =
-            execute_analysis_units(&mut store, &context, work("typed-a"), consume, |_, _| true)
-                .await?;
+        let same = execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
+            .await?;
         assert_eq!(
             same.units
                 .iter()
@@ -1510,7 +1526,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         // the semantic checkpoint keyed on the old closure must not be reused.
         std::fs::write(&fingerprint, "sha256:closure-b")?;
         let changed =
-            execute_analysis_units(&mut store, &context, work("typed-b"), consume, |_, _| true)
+            execute_analysis_units(&mut store, &context, work("typed-b"), consume, validate)
                 .await?;
         assert_eq!(
             changed
@@ -1528,7 +1544,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
         // checkpoint back without re-running SSA.
         std::fs::write(&fingerprint, "sha256:closure-a")?;
         let restored =
-            execute_analysis_units(&mut store, &context, work("typed-a"), consume, |_, _| true)
+            execute_analysis_units(&mut store, &context, work("typed-a"), consume, validate)
                 .await?;
         assert_eq!(
             restored
@@ -1595,6 +1611,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                         input_digest: if changed { "changed" } else { "input" }.into(),
                         execution_digest: "worker".into(),
                         root_digest: "root".into(),
+                        reference_digest: None,
                     }),
                 })
                 .collect()

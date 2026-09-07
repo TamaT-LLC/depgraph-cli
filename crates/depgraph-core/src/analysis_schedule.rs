@@ -171,6 +171,7 @@ fn source_batch_work_items(
                             input_digest: input,
                             execution_digest: execution.to_owned(),
                             root_digest: root_digest(context.root),
+                            reference_digest: None,
                         })
                 } else {
                     None
@@ -350,6 +351,7 @@ pub(crate) async fn prepare_analysis_schedule(
                     input_digest: cache.key.clone(),
                     execution_digest: execution.clone(),
                     root_digest: root_digest(context.root),
+                    reference_digest: None,
                 });
             work.push(AnalysisWorkItem {
                 unit_id,
@@ -415,6 +417,7 @@ pub(crate) async fn prepare_analysis_schedule(
                             input_digest: input,
                             execution_digest: execution.clone(),
                             root_digest: root_digest(context.root),
+                            reference_digest: None,
                         })
                 } else {
                     None
@@ -1749,6 +1752,7 @@ mod tests {
                 input_digest: input_digest.clone(),
                 execution_digest: execution,
                 root_digest: root_digest(&root),
+                reference_digest: None,
             });
             assert!(validate_work_inputs(
                 &context,
