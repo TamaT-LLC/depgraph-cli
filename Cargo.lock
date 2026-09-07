@@ -531,6 +531,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
  "zip",
 ]
 
@@ -565,6 +566,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "windows-sys 0.61.2",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -590,6 +592,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wait-timeout",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -608,6 +611,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "workspace-hack",
  "zeroize",
 ]
 
@@ -628,6 +632,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "windows-sys 0.61.2",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -641,6 +646,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -668,6 +674,7 @@ dependencies = [
  "triomphe",
  "walkdir",
  "windows-sys 0.61.2",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -682,6 +689,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -697,6 +705,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3723,6 +3732,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "workspace-hack"
+version = "0.5.4"
+dependencies = [
+ "aho-corasick",
+ "bitflags",
+ "bstr",
+ "chrono",
+ "crossbeam-utils",
+ "crypto-common",
+ "either",
+ "errno",
+ "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "libc",
+ "log",
+ "memchr",
+ "mio",
+ "num-traits",
+ "once_cell",
+ "petgraph",
+ "predicates",
+ "proc-macro2",
+ "quote",
+ "regex-automata",
+ "regex-syntax",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "smallvec",
+ "syn 2.0.119",
+ "syn 3.0.3",
+ "tokio",
+ "tokio-util",
+ "toml_parser",
+ "toml_writer",
+ "tracing-core",
+ "tracing-subscriber",
+ "uuid",
+ "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
+ "winnow 1.0.4",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3751,6 +3807,7 @@ dependencies = [
  "tempfile",
  "toml",
  "walkdir",
+ "workspace-hack",
  "zip",
 ]
 

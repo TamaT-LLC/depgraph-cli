@@ -7755,7 +7755,7 @@ jobs:
     }
 
     #[test]
-    fn cargo_inventory_follows_release_roots_and_excludes_build_dev_and_xtask_dependencies()
+    fn cargo_inventory_follows_release_roots_and_excludes_build_dev_xtask_and_workspace_hack_dependencies()
     -> Result<()> {
         let metadata = json!({
             "packages": [
@@ -7765,30 +7765,58 @@ jobs:
                 {"id":"operation","name":"depgraph-operation","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"internal","name":"depgraph-core","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"xtask","name":"xtask","version":"0.1.0","source":null,"license":"MIT"},
+                {"id":"hack","name":"workspace-hack","version":"0.1.0","source":null,"license":"MIT"},
                 {"id":"runtime","name":"runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"runner-runtime","name":"runner-runtime-crate","version":"1.0.0","source":"registry+test","license":"MIT"},
                 {"id":"mcp-runtime","name":"mcp-runtime-crate","version":"1.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"build","name":"bundled-source-build","version":"2.0.0","source":"registry+test","license":"Apache-2.0"},
                 {"id":"dev","name":"test-only","version":"3.0.0","source":"registry+test","license":"MIT"},
-                {"id":"spdx","name":"spdx","version":"4.0.0","source":"registry+test","license":"MIT"}
+                {"id":"spdx","name":"spdx","version":"4.0.0","source":"registry+test","license":"MIT"},
+                {"id":"unified-dev","name":"unified-test-only","version":"5.0.0","source":"registry+test","license":"MIT"}
             ],
             "resolve": {"nodes": [
                 {"id":"cli","deps":[
                     {"pkg":"internal","dep_kinds":[{"kind":null}]},
                     {"pkg":"runtime","dep_kinds":[{"kind":null}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]},
                     {"pkg":"dev","dep_kinds":[{"kind":"dev"}]}
                 ]},
-                {"id":"worker","deps":[{"pkg":"runtime","dep_kinds":[{"kind":null}]}]},
-                {"id":"mcp","deps":[{"pkg":"mcp-runtime","dep_kinds":[{"kind":null}]}]},
-                {"id":"operation","deps":[{"pkg":"runner-runtime","dep_kinds":[{"kind":null}]}]},
-                {"id":"internal","deps":[{"pkg":"build","dep_kinds":[{"kind":"build"}]}]},
-                {"id":"xtask","deps":[{"pkg":"spdx","dep_kinds":[{"kind":null}]}]},
+                {"id":"worker","deps":[
+                    {"pkg":"runtime","dep_kinds":[{"kind":null}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                ]},
+                {"id":"mcp","deps":[
+                    {"pkg":"mcp-runtime","dep_kinds":[{"kind":null}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                ]},
+                {"id":"operation","deps":[
+                    {"pkg":"runner-runtime","dep_kinds":[{"kind":null}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                ]},
+                {"id":"internal","deps":[
+                    {"pkg":"build","dep_kinds":[{"kind":"build"}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                ]},
+                {"id":"xtask","deps":[
+                    {"pkg":"spdx","dep_kinds":[{"kind":null}]},
+                    {"pkg":"hack","dep_kinds":[{"kind":null}]}
+                ]},
+                // hakari lists every unified third-party crate as a normal
+                // dependency of the hack, including dev-only and xtask-only
+                // ones, and runtime crates the roots already reach directly.
+                {"id":"hack","deps":[
+                    {"pkg":"runtime","dep_kinds":[{"kind":null}]},
+                    {"pkg":"spdx","dep_kinds":[{"kind":null}]},
+                    {"pkg":"dev","dep_kinds":[{"kind":null}]},
+                    {"pkg":"unified-dev","dep_kinds":[{"kind":null}]}
+                ]},
                 {"id":"runtime","deps":[]},
                 {"id":"runner-runtime","deps":[]},
                 {"id":"mcp-runtime","deps":[]},
                 {"id":"build","deps":[]},
                 {"id":"dev","deps":[]},
-                {"id":"spdx","deps":[]}
+                {"id":"spdx","deps":[]},
+                {"id":"unified-dev","deps":[]}
             ]}
         });
         let names = cargo_runtime_packages(&metadata)?

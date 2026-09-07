@@ -34,7 +34,11 @@ const MCP_SERVER_DIRECT_DEPENDENCIES: &[&str] = &[
     "tokio",
     "tracing",
     "tracing-subscriber",
+    WORKSPACE_HACK_PACKAGE_NAME,
 ];
+/// The hakari-managed crate that pins one third-party feature unification for
+/// the whole workspace. See `.config/hakari.toml`.
+pub(crate) const WORKSPACE_HACK_PACKAGE_NAME: &str = "workspace-hack";
 const RUST_SYSROOT_SBOM_PACKAGE_NAME: &str = depgraph_core::RUST_SYSROOT_SBOM_PACKAGE_NAME;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
     "ra_ap_flycheck",
@@ -1115,6 +1119,18 @@ pub(crate) fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyP
         if !reachable.insert(id.clone()) {
             continue;
         }
+        // The hakari workspace-hack crate only pins one feature unification for
+        // the build graph; it links nothing into a shipped executable. Its
+        // dependency lines are the union of every workspace member's normal,
+        // build, and dev dependencies, so traversing through it would put
+        // test-only and xtask-only crates into the runtime SBOM and license
+        // inventory.
+        if packages_by_id
+            .get(&id)
+            .is_some_and(|package| is_workspace_hack_package(package))
+        {
+            continue;
+        }
         let node = nodes_by_id
             .get(&id)
             .with_context(|| format!("cargo metadata resolve graph is missing {id}"))?;
@@ -1150,6 +1166,13 @@ pub(crate) fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyP
             }))
         })
         .collect()
+}
+
+/// The local hakari-managed crate every workspace member depends on. Only the
+/// checked-in path crate qualifies; a registry package that happened to reuse
+/// the name would still be traversed like any other dependency.
+pub(crate) fn is_workspace_hack_package(package: &Value) -> bool {
+    package["name"] == WORKSPACE_HACK_PACKAGE_NAME && package["source"].is_null()
 }
 
 pub(crate) fn web_runtime_packages(inventory: &Value) -> Result<Vec<DependencyPackage>> {

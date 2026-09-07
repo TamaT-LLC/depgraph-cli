@@ -56,6 +56,24 @@ user-visible behavior. Generated files and dependency updates must identify
 their source, exact version, reproduction command, license/provenance impact,
 and resulting lockfile or artifact changes.
 
+Cargo dependency changes must also regenerate the `workspace-hack` crate. It is
+managed by [cargo-hakari](https://docs.rs/cargo-hakari) from
+`.config/hakari.toml` and pins one third-party feature unification for every
+package selection, so `cargo build -p depgraph-cli`, `cargo run -p xtask`, and
+`cargo test -p depgraph-core` reuse the same dependency artifacts instead of
+recompiling `depgraph-core` and its dependency graph per selection. The `rust`
+CI job fails when the checked-in crate is stale:
+
+```sh
+cargo install cargo-hakari --locked --version 0.9.38
+cargo hakari generate
+cargo hakari manage-deps
+```
+
+`workspace-hack` is build-time only. It is never published, and the release
+SBOM and third-party license inventory do not traverse through it, so its
+dependency lines do not change what a release archive declares.
+
 Security-sensitive changes, workflows, release code, schemas/migrations,
 dependency manifests, and governance documents normally require an independent
 organization-assigned reviewer. Authors cannot provide their own independent

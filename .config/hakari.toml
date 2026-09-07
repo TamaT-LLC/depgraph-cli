@@ -1,0 +1,29 @@
+# This file contains settings for `cargo hakari`.
+# See https://docs.rs/cargo-hakari/latest/cargo_hakari/config for a full list of options.
+#
+# The workspace-hack crate pins one feature unification for every third-party
+# dependency, so `cargo build -p depgraph-cli`, `cargo run -p xtask`,
+# `cargo test -p depgraph-core`, and `cargo build --workspace` all reuse the
+# same dependency artifacts instead of recompiling depgraph-core and its
+# dependency graph once per package selection.
+
+hakari-package = "workspace-hack"
+
+# Format version for hakari's output. Version 4 requires cargo-hakari 0.9.22 or above.
+dep-format-version = "4"
+
+# The workspace already sets workspace.resolver = "2".
+resolver = "2"
+
+# The five release targets from xtask's RELEASE_TARGETS. CI runs the first,
+# fourth, and fifth; the release workflow builds all of them.
+platforms = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Write out exact versions rather than a semver range. (Defaults to false.)
+# exact-versions = true
