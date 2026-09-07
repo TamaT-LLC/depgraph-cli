@@ -29,6 +29,12 @@ pub struct ScanConfig {
     pub max_worker_memory_bytes: u64,
     pub max_concurrent_units: usize,
     pub max_unit_source_files: usize,
+    /// Owned source bytes one execution unit may emit before the pre-split
+    /// planner partitions it, where the adapter boundary permits a split.
+    pub max_unit_source_bytes: u64,
+    /// Source bytes one loader context may hold before the planner reports the
+    /// execution unit as over budget or stages its bodies.
+    pub max_context_source_bytes: u64,
     /// An explicit caller budget; progressing scans have no aggregate deadline by default.
     pub total_budget_seconds: Option<u64>,
     pub max_protocol_line_bytes: usize,
@@ -92,6 +98,8 @@ impl Default for ScanConfig {
             max_worker_memory_bytes: 2 * 1024 * 1024 * 1024,
             max_concurrent_units: 2,
             max_unit_source_files: 128,
+            max_unit_source_bytes: 8 * 1024 * 1024,
+            max_context_source_bytes: 64 * 1024 * 1024,
             total_budget_seconds: None,
             max_protocol_line_bytes: 1024 * 1024,
             max_protocol_bytes: 256 * 1024 * 1024,
@@ -166,6 +174,12 @@ impl Config {
         }
         if !(1..=4096).contains(&self.scan.max_unit_source_files) {
             bail!("scan.max_unit_source_files must be between 1 and 4096");
+        }
+        if self.scan.max_unit_source_bytes == 0 {
+            bail!("scan.max_unit_source_bytes must be at least 1");
+        }
+        if self.scan.max_context_source_bytes < self.scan.max_unit_source_bytes {
+            bail!("scan.max_context_source_bytes must be at least scan.max_unit_source_bytes");
         }
         if self
             .scan
@@ -293,6 +307,8 @@ mod tests {
         let parsed: Config = toml::from_str(&rendered)?;
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.scan.worker_timeout_seconds, 300);
+        assert_eq!(parsed.scan.max_unit_source_bytes, 8 * 1024 * 1024);
+        assert_eq!(parsed.scan.max_context_source_bytes, 64 * 1024 * 1024);
         assert_eq!(parsed.daemon.debounce_milliseconds, 200);
         assert_eq!(parsed.strict.max_unresolved, 0);
         assert_eq!(parsed.profiles.rust_mode, "check");
@@ -333,6 +349,8 @@ mod tests {
             "schema_version = 1\n[scan]\nmax_concurrent_units = 65\n",
             "schema_version = 1\n[scan]\nmax_unit_source_files = 0\n",
             "schema_version = 1\n[scan]\nmax_unit_source_files = 4097\n",
+            "schema_version = 1\n[scan]\nmax_unit_source_bytes = 0\n",
+            "schema_version = 1\n[scan]\nmax_unit_source_bytes = 2\nmax_context_source_bytes = 1\n",
             "schema_version = 1\n[scan]\ntotal_budget_seconds = 0\n",
             "schema_version = 1\n[scan]\ntotal_budget_seconds = 30931201\n",
             "schema_version = 1\n[scan]\nmax_protocol_line_bytes = 0\n",
