@@ -18,6 +18,7 @@
 | PROJ-ARC-001-ADR-007 | PROJ-ARC-001 | [v0.5 release, migration, and source contract](../40_arch_design/adr-v0.5-release-contract.md) | Accepted |
 | PROJ-ARC-001-ADR-008 | PROJ-ARC-001 | [npm distribution for the native CLI](../40_arch_design/adr-npm-distribution.md) | Accepted |
 | PROJ-ARC-001-ADR-009 | PROJ-ARC-001 | [Explainable code-health finding contract](../40_arch_design/adr-code-health-finding-contract.md) | Accepted |
+| PROJ-ARC-001-ADR-010 | PROJ-ARC-001 | [Pre-split analysis planning by dependency scope and work estimate](../40_arch_design/adr-presplit-analysis-planning.md) | Implemented |
 
 ## 運用手順
 

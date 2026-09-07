@@ -53,9 +53,14 @@ units and source batches. Run `scan` again with the same Store to reuse complete
 work after validating its inputs and worker compatibility. There is no default
 whole-scan deadline. Each worker has inactivity, memory, output, and concurrency
 limits. In `.depgraph.toml`, `[scan]` supports `max_unit_source_files` (default 128),
+`max_unit_source_bytes` (8 MiB), `max_context_source_bytes` (64 MiB),
 `max_concurrent_units` (2), `max_worker_memory_bytes` (2 GiB), and
 `worker_timeout_seconds` (300 seconds without progress). Set
 `total_budget_seconds` when an explicit whole-scan time budget is needed.
+`scan --split-plan [--json]` explains, without launching workers, each execution
+unit's ownership scope, the scope its loader actually reads, reference-only
+inputs, work estimate, split reasons, and the parallelism decision (see the
+[pre-split planning ADR](docs/40_arch_design/adr-presplit-analysis-planning.md)).
 See [integration validation](docs/40_arch_design/resumable-analysis-validation.md)
 for batching, interruption, recovery, and dependency invalidation checks.
 
@@ -341,6 +346,7 @@ depgraph scan /path/to/repository
 depgraph scan /path/to/repository --strict
 depgraph scan /path/to/repository --no-cache
 depgraph scan /path/to/repository --plan --json
+depgraph scan /path/to/repository --split-plan --json
 
 # Inspect profile selection without starting workers or changing the Store.
 depgraph profiles plan /path/to/repository

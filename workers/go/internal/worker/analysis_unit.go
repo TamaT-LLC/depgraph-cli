@@ -54,6 +54,11 @@ type AnalysisUnitRequest struct {
 	ChunkCount         int               `json:"chunk_count"`
 	AuxiliaryPaths     []string          `json:"auxiliary_paths"`
 	ContextFingerprint string            `json:"context_fingerprint"`
+	// Split is the optional pre-split planning binding
+	// (depgraph-analysis-split-plan-v1). The core attaches it only after the
+	// worker advertised AnalysisLoaderScopeCapability; it never changes which
+	// results the request may emit, only what the loader is asked to read.
+	Split *AnalysisSplitBinding `json:"split,omitempty"`
 }
 
 // ReadAnalysisUnitRequest reads and strictly validates a request file before
@@ -117,6 +122,9 @@ func (request AnalysisUnitRequest) Validate() error {
 		}
 	}
 	if request.ContractVersion == LegacyAnalysisUnitContractVersion {
+		if request.Split != nil {
+			return fmt.Errorf("analysis unit request split requires %s", AnalysisUnitContractVersion)
+		}
 		return nil
 	}
 	if err := validateRequestPathList("context_paths", request.ContextPaths, true); err != nil {
@@ -161,6 +169,11 @@ func (request AnalysisUnitRequest) Validate() error {
 	}
 	if !boundedRequestString(request.ContextFingerprint) {
 		return fmt.Errorf("analysis unit request context_fingerprint is empty or exceeds its limit")
+	}
+	if request.Split != nil {
+		if err := request.Split.Validate(request); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -275,6 +288,14 @@ func (request AnalysisUnitRequest) ValidateForRoot(root string) error {
 		absolute := canonicalPathForConfinement(pathJoin(root, auxiliaryPath))
 		if absolute == "" || !isWithinRoot(root, absolute) {
 			return fmt.Errorf("analysis unit auxiliary path %q escapes repository root", auxiliaryPath)
+		}
+	}
+	if request.Split != nil {
+		for _, loaderPath := range append(append([]string(nil), request.Split.Loader.Paths...), request.Split.Loader.ReferencePaths...) {
+			absolute := canonicalPathForConfinement(pathJoin(root, loaderPath))
+			if absolute == "" || !isWithinRoot(root, absolute) {
+				return fmt.Errorf("analysis unit split loader path %q escapes repository root", loaderPath)
+			}
 		}
 	}
 	return nil

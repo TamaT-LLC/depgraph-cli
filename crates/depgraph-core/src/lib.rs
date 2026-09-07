@@ -3,6 +3,7 @@ mod analysis_checkpoint;
 pub mod analysis_execution;
 pub mod analysis_plan;
 mod analysis_schedule;
+pub mod analysis_split;
 pub mod bounded_query;
 pub mod bounded_query_execute;
 pub mod bounded_query_plan;
