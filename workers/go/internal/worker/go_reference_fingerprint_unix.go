@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package worker
 
@@ -6,7 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // openReferenceFile opens a confined path from a trusted root descriptor.
@@ -33,26 +34,26 @@ func openReferenceFile(root, path string) (*os.File, error) {
 	if len(components) == 0 {
 		return nil, os.ErrInvalid
 	}
-	dirfd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	dirfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
 	owned := true
 	defer func() {
 		if owned {
-			_ = syscall.Close(dirfd)
+			_ = unix.Close(dirfd)
 		}
 	}()
 	for index, name := range components {
-		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 		if index < len(components)-1 {
-			flags |= syscall.O_DIRECTORY
+			flags |= unix.O_DIRECTORY
 		}
-		next, err := syscall.Openat(dirfd, name, flags, 0)
+		next, err := unix.Openat(dirfd, name, flags, 0)
 		if err != nil {
 			return nil, err
 		}
-		_ = syscall.Close(dirfd)
+		_ = unix.Close(dirfd)
 		dirfd = next
 		if index == len(components)-1 {
 			owned = false

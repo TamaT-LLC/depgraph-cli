@@ -1227,6 +1227,51 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
     )?;
     assert_eq!(second.previous_split_plan_id, resplit.split_plan_id);
     assert_eq!(second.plan.refinements.len(), 2);
+    // Existing siblings may already have persisted profiles. Refinement must
+    // not renumber them, including when another replacement is split again.
+    for (before, after) in [(&current, &resplit), (&resplit.plan, &second)] {
+        for id in &after.retained_execution_unit_ids {
+            let original = before.execution_unit(id).unwrap();
+            let retained = after.plan.execution_unit(id).unwrap();
+            assert_eq!(
+                (original.batch_index, original.batch_count),
+                (retained.batch_index, retained.batch_count),
+                "retained batch {id} changed its persisted coordinates"
+            );
+        }
+        let batches = units(
+            &after.plan,
+            &plan,
+            "services/big",
+            "go",
+            AnalysisStage::Syntax,
+        );
+        let slots = batches
+            .iter()
+            .map(|unit| unit.batch_index)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(slots.len(), batches.len());
+        assert!(
+            batches
+                .iter()
+                .all(|unit| unit.batch_index < unit.batch_count)
+        );
+        assert_eq!(
+            batches.iter().filter(|unit| unit.batch_index == 0).count(),
+            1
+        );
+        let replay = plan_analysis_split(
+            &plan,
+            &input
+                .clone()
+                .with_refinements(after.plan.refinements.clone()),
+        )?;
+        assert_eq!(
+            serde_json::to_value(replay)?,
+            serde_json::to_value(&after.plan)?
+        );
+    }
+
     // Input that does not reproduce the current plan is rejected instead of
     // misclassifying unrelated saved results.
     let mut other_config = config.clone();

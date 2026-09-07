@@ -757,7 +757,9 @@ pub struct AnalysisExecutionUnit {
     pub unit_id: String,
     pub adapter: AnalysisAdapter,
     pub stage: AnalysisStage,
+    /// Stable slot within this unit and stage; retained batches are never renumbered.
     pub batch_index: u64,
+    /// Slot count when this batch was created, preserved across later refinements.
     pub batch_count: u64,
     pub split_kind: AnalysisSplitKind,
     pub split_reasons: Vec<AnalysisSplitReason>,
@@ -1215,7 +1217,7 @@ pub fn plan_analysis_split(
                     context,
                 );
                 promotion.annotate(&mut batches);
-                apply_refinements(
+                let batch_coordinates = apply_refinements(
                     unit,
                     stage_boundary,
                     input,
@@ -1225,9 +1227,8 @@ pub fn plan_analysis_split(
                     &mut unsplittable_refinements,
                     &mut matched_refinements,
                 );
-                let count = batches.len() as u64;
                 let mut ids = Vec::with_capacity(batches.len());
-                for (index, batch) in batches.into_iter().enumerate() {
+                for (batch, (index, count)) in batches.into_iter().zip(batch_coordinates) {
                     let mut execution_unit = build_execution_unit(
                         unit,
                         stage_boundary,
@@ -1235,7 +1236,7 @@ pub fn plan_analysis_split(
                         context,
                         group,
                         batch,
-                        index as u64,
+                        index,
                         count,
                     );
                     execution_unit.prerequisite_ids = previous_stage_ids
@@ -1934,7 +1935,16 @@ fn apply_refinements(
     batches: &mut Vec<Batch>,
     unsplittable: &mut Vec<AnalysisUnsplittableRefinement>,
     matched: &mut BTreeSet<usize>,
-) {
+) -> Vec<(u64, u64)> {
+    // Coordinates describe the generation in which a batch was created.
+    // Retained batches must preserve the coordinates already persisted in
+    // profiles and checkpoints. The first child inherits its parent's slot
+    // (including syntax's auxiliary owner at zero); the second gets a new
+    // slot. Counts can differ across generations, but slots remain unique.
+    let mut next_slot = batches.len() as u64;
+    let mut coordinates = (0..next_slot)
+        .map(|index| (index, next_slot))
+        .collect::<Vec<_>>();
     // An execution unit ID depends on the batch's ownership and loader scope
     // only, never on its position or the batch count, so the IDs are computed
     // once and only the two halves of a refined batch are recomputed.
@@ -1999,6 +2009,11 @@ fn apply_refinements(
         reasons.insert(AnalysisSplitReason::Refined);
         let removed = batches.remove(position);
         ids.remove(position);
+        let (parent_slot, _) = coordinates.remove(position);
+        let child_slot = next_slot;
+        next_slot += 1;
+        coordinates.insert(position, (child_slot, next_slot));
+        coordinates.insert(position, (parent_slot, next_slot));
         let (head, tail) = removed.granules.split_at(split_at);
         let tail = Batch {
             granules: tail.to_vec(),
@@ -2013,6 +2028,7 @@ fn apply_refinements(
         ids.insert(position, id_of(&head));
         batches.insert(position, head);
     }
+    coordinates
 }
 
 #[allow(clippy::too_many_arguments)]

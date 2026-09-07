@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -161,6 +163,33 @@ impl PendingScanPromotion {
 pub(crate) struct PreparedScan {
     pub(crate) outcome: ScanOutcome,
     pub(crate) promotion: Option<PendingScanPromotion>,
+}
+
+// A resource-limited prefix belongs to the attempted loader scope. Publishing
+// it before re-splitting can conflict with a replacement's narrower profile.
+// Spill one prefix at a time so failed units do not accumulate in memory.
+struct DeferredAnalysisFailure {
+    events: tempfile::NamedTempFile,
+    output: WorkerOutput,
+}
+
+impl DeferredAnalysisFailure {
+    fn stage(mut output: WorkerOutput) -> Result<Self> {
+        let events = tempfile::NamedTempFile::new()?;
+        {
+            let mut writer = BufWriter::new(events.as_file());
+            serde_json::to_writer(&mut writer, &output.events)?;
+            writer.flush()?;
+        }
+        output.events = Vec::new();
+        Ok(Self { events, output })
+    }
+
+    fn restore(mut self) -> Result<WorkerOutput> {
+        self.events.as_file_mut().rewind()?;
+        self.output.events = serde_json::from_reader(BufReader::new(self.events.as_file()))?;
+        Ok(self.output)
+    }
 }
 
 #[derive(Debug)]
@@ -791,6 +820,9 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     // execution has ended.
     let analysis_unit_failures = std::sync::Mutex::new(BTreeMap::<String, String>::new());
     let unit_failures = std::sync::Mutex::new(BTreeMap::<String, ScanFailure>::new());
+    let deferred_failures =
+        std::sync::Mutex::new(BTreeMap::<String, DeferredAnalysisFailure>::new());
+    let defer_resource_prefixes = AtomicBool::new(resplit_context.is_some());
     let mut consume = |store: &mut Store, unit_id: &str, output: WorkerOutput| -> Result<bool> {
         let ingest_started = Instant::now();
         if profiling {
@@ -800,17 +832,45 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         let adapter = output.adapter;
         let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
-        let result = bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
-            ingest_worker_output(
-                store,
+        let result = if defer_resource_prefixes.load(Ordering::Relaxed)
+            && !security_violation
+            && matches!(
+                failure_kind,
+                Some(
+                    WorkerFailureKind::MemoryLimit
+                        | WorkerFailureKind::Timeout
+                        | WorkerFailureKind::OutputLimit
+                )
+            ) {
+            store.save_adapter_log(
                 &scan_id,
-                output,
-                Some(&mut global_upserts),
-                Some(&mut file_coverage_ledgers),
-                Some(&mut analysis_unit_file_paths),
-                Some(&mut pending_analysis_unit_completions),
-            )
-        });
+                adapter.name(),
+                &output.stderr,
+                output.stderr_truncated,
+            )?;
+            let detail = output
+                .error
+                .clone()
+                .unwrap_or_else(|| "worker resource limit".to_owned());
+            lock_failures(&deferred_failures)
+                .insert(unit_id.to_owned(), DeferredAnalysisFailure::stage(output)?);
+            Err(anyhow::anyhow!(
+                "{} worker failed: {detail}",
+                adapter.name()
+            ))
+        } else {
+            bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
+                ingest_worker_output(
+                    store,
+                    &scan_id,
+                    output,
+                    Some(&mut global_upserts),
+                    Some(&mut file_coverage_ledgers),
+                    Some(&mut analysis_unit_file_paths),
+                    Some(&mut pending_analysis_unit_completions),
+                )
+            })
+        };
         ingest_ms += elapsed_ms(ingest_started);
         match result {
             Ok(()) => Ok(true),
@@ -850,7 +910,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         &validate,
     )
     .await?;
-    // A unit whose worker exceeded its memory or time limit is re-planned at
+    // A unit whose worker exceeded its memory, time, or output limit is re-planned at
     // the next finer boundary of the same discovery plan; its replacements
     // run in the same attempt and its failure is withdrawn.  The superseded
     // attempt stays visible in the progress ledger as a failed unit.
@@ -868,12 +928,18 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                     .iter()
                     .enumerate()
                     .find_map(|(index, progress)| {
-                        if superseded_indices.contains(&index) || progress.status != "failed" {
+                        if superseded_indices.contains(&index)
+                            || progress.status != "failed"
+                            || lock_failures(&unit_failures)
+                                .get(&progress.unit_id)
+                                .is_some_and(|failure| failure.security_violation)
+                        {
                             return None;
                         }
                         let trigger = match progress.failure_reason.as_deref()? {
                             "memory-limit" => AnalysisResplitTrigger::WorkerMemory,
                             "timeout" => AnalysisResplitTrigger::WorkerTimeout,
+                            "output-limit" => AnalysisResplitTrigger::OutputLimit,
                             _ => return None,
                         };
                         let id = execution_unit_ids.get(index)?.clone()?;
@@ -903,9 +969,13 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             // removed, and retained siblings must keep their chunk numbering
             // because their profiles already carry it.
             let withdrawable = superseded.len() == resplit_plan.superseded_execution_unit_ids.len()
-                && superseded
-                    .iter()
-                    .all(|index| analysis.units[*index].status == "failed")
+                && superseded.iter().all(|index| {
+                    let unit = &analysis.units[*index];
+                    unit.status == "failed"
+                        && !lock_failures(&unit_failures)
+                            .get(&unit.unit_id)
+                            .is_some_and(|failure| failure.security_violation)
+                })
                 && resplit_plan.retained_execution_unit_ids.iter().all(|id| {
                     current
                         .execution_unit(id)
@@ -973,6 +1043,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             for index in superseded {
                 superseded_indices.insert(index);
                 let unit_id = &analysis.units[index].unit_id;
+                lock_failures(&deferred_failures).remove(unit_id);
                 lock_failures(&unit_failures).remove(unit_id);
                 lock_failures(&analysis_unit_failures).remove(unit_id);
                 let loader = &mut analysis.units[index].loader;
@@ -1012,6 +1083,15 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             if replacement_progress.stop_reason.is_some() {
                 analysis.stop_reason = replacement_progress.stop_reason;
             }
+        }
+    }
+    // Only prefixes that were not superseded remain useful partial results.
+    // Restore in execution order, one file at a time, including on cancellation.
+    defer_resource_prefixes.store(false, Ordering::Relaxed);
+    for unit in &analysis.units {
+        let deferred = lock_failures(&deferred_failures).remove(&unit.unit_id);
+        if let Some(deferred) = deferred {
+            consume(store, &unit.unit_id, deferred.restore()?)?;
         }
     }
     failures.extend(

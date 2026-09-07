@@ -214,7 +214,7 @@ section is the remaining pre-split contract.
 | Health store load and preprocess split so repo-wide cumulative volume alone cannot fail the request | `cargo xtask health-range-e2e`; `whole_graph_over_the_budget_completes_in_ranges_under_the_same_budget` | Pass. Whole-snapshot control is `resource_exhausted` at the unchanged 1,000,000 budget; ranged path completes 4 ranges (max 433,340 steps) with 72 identical findings. |
 | Out-of-unit refs, cycles, and coverage preserved; graph / evidence / findings match across split and resume | `out_of_unit_references_are_retained_in_loader_and_reference_scope`, `cycle_group_is_kept_in_one_analysis_context`; Go e2e canonical-graph equality vs the module-loader control; `ranged_findings_equal_whole_snapshot_findings_on_every_public_shape`, `range_order_permutations_produce_identical_findings`, `interrupt_after_each_range_then_resume_matches_the_uninterrupted_run`; `cargo xtask resumable-analysis-e2e` | Pass. Split vs resume of the same loader mode keeps nodes, sites, exact edges, evidence, and coverage. Package-mode vs the module-loader control matches those payloads too; CHA `may_call` is the one declared exception (a subset under `package-with-declaration-deps`). |
 | A public synthetic fixture that used to hit the limit now completes without raising per-unit limits | Go e2e control `partial` vs package path `completed` at 192 MiB; health-range whole-snapshot `"resource_exhausted"` vs ranged complete at 1,000,000 | Pass. Do not close on scan JSON `status: "partial"` or health-range e2e `"resource_exhausted"` (from internal `HealthAnalysisError::ResourceExhausted`). Public JSON success is `status: "completed"` with `partial_ranges: false`. |
-| Original private trial target: scan and health complete | Not runnable here. Public fixtures prove the same contracts. Maintainer follow-up below. | Out of band. Not a closer blocker. |
+| Original private trial target: scan and health complete | Requires a run by a maintainer with access to the original target; public fixtures provide separate evidence. See the required verification below. | Required before closing #464; tracked in #482. |
 
 **Large single package vs `staged_bodies`.** Semantic work is still
 file-batch `staged_bodies`, not package-granular SSA: `ssautil.Packages` has
@@ -231,8 +231,12 @@ own.
 and `go_call_graph_program_scope` are merge identity keys, not coverage
 `profile_axes`. Package-mode CHA is not exact whole-program RTA.
 
-**Maintainer private-tree follow-up** (aggregates only; do not publish
-paths or measurements). `--no-cache` disables the unit checkpoint store
+**Required maintainer verification of the original trial target**.
+This is a prerequisite for closing #464 and #482. Public fixture results do
+not replace it. Keep target names, paths, configuration, measurements, and raw
+reports private; publish only the tested depgraph commit and completion verdict.
+
+`--no-cache` disables the unit checkpoint store
 (`ScanCacheMode::Disabled`), so a cold-scan check and a resume check cannot
 share one command line.
 
@@ -255,8 +259,37 @@ depgraph --store /tmp/trial-resume.sqlite scan /path/to/repository --json
 cargo run -p depgraph-core --example health_range_e2e -- --store /tmp/trial.sqlite --root /path/to/repository --report /tmp/trial-health-report.json
 ```
 
-Accept only `status=completed` / `partial_ranges=false`. Capture unit count,
-max unit peak RSS, completeness, finding counts, work, and digests.
+Require the fresh scan to report `status=completed`, then run normal `health`
+against that completed snapshot and require `partial_ranges=false`. A health
+request with `--scan-id attempt:...` can finish every range of a partial graph;
+that does not establish scan completion and cannot satisfy this requirement.
+Keep individual resource limits and the target unchanged. In the checkpoint
+store, finish a scan and repeat it to verify reuse of valid units, then repeat
+health and compare findings and digests. Capture commit, conditions, unit count,
+peak RSS, completeness, findings, work, and digests in the private record.
+If any required check is incomplete or fails, leave #464 and #482 open.
+
+## Regression checks for #479 and #480
+
+`cargo xtask resumable-analysis-e2e` also runs
+`scripts/analysis-resplit-e2e.mjs` on POSIX. Its public five-file Go fixture
+starts with multiple batches and a fixed 192 MiB worker limit. A wrapper
+forces larger batches over that limit, then pauses a replacement so the test
+can interrupt and restart the CLI. A separate run exceeds the output cap
+under the same fixture configuration, after emitting a valid partial stream,
+and must recover by refinement as well. An unsplittable run keeps the valid
+leaf prefixes as partial evidence and cannot confirm unused findings.
+The test checks repeated refinement,
+retained syntax/typed checkpoints, completed replacement execution, and equal
+graph, evidence, and coverage against a run without injected failures.
+Semantic results produced before all typed references are bound remain
+ineligible for checkpoint reuse and are replayed conservatively.
+
+A separate two-package fixture verifies that an unchanged second scan reuses
+both semantic units and that editing the referenced package invalidates them.
+Its result must match a fresh scan after the edit. Go's no-follow, loader,
+fingerprint, and race tests run in the regular Linux CI job and the macOS
+leg of full CI. These public regressions supplement the original-target completion requirement above.
 
 ## Acceptance matrix
 
@@ -282,7 +315,7 @@ and retains its integration report separately from these local measurements.
 | #462 | Web project batches preserve compiler context, semantic targets, diagnostics, and canonical graph behavior | `cd workers/web && pnpm test`; `analysis-unit.test.ts` (`semantic source batches keep context targets while bounding dependency traversal`, `semantic source batches retain ambient declarations in the full compiler context`, `source batch size and order preserve one canonical graph`); `analysis-unit-issues.test.ts` (`batch semantic issue counts describe emitted diagnostics while context failures stay incomplete`); `DEPGRAPH_WEB_BENCHMARK=1 pnpm exec tsx --test test/analysis-unit-benchmark.test.ts` | Full Web suite, quality, and 1,024-file semantic benchmark passed; canonical joins also pass failed-chunk permutation and shared-external membership regressions |
 | #463 | Remaining pre-split: lightweight listing then bounded loader and budget; package units that do not re-load the module; staged bodies for a large single package; cross-unit types, calls, and cycles with declared CHA completeness; public fixture where the whole-module path fails the same per-unit memory limit the package path completes; maintainer verification of the original private tree | `cargo xtask go-loader-scope-e2e`; Go `TestSyntheticAnalysisUnitCanonicalProjection`, `TestGoLoader*`, `TestAnalysisSplit*`, `TestReleaseGoSSASyntaxAfterBuildDropsLoaderTrees`; Core `go_package_execution_units_join_into_one_logical_profile`, `go_semantic_batches_join_their_call_graph_outcome`, `package_semantic_checkpoints_bind_the_typed_reference_fingerprint`, `reference_digest_extends_the_key`; store `v2_typed_rows_may_partition_the_owned_sources` | Package-bounded hybrid loader, declared CHA program scope, shared scan GOCACHE, reference fingerprint in `UnitCheckpointKey.reference_digest`, syntax drop after SSA, mapping progress, and the public 64-by-8 / 1,024-file evidence gate. The original private repository item needs the maintainer's `depgraph scan --no-cache --json` on that tree (aggregates only). See [Go validation](analysis-unit-go-validation.md) |
 | #464 | Repository-first planning, unit scheduling, interruption/restart, invalidation, and public fixture evidence | `cargo xtask resumable-analysis-e2e` (calls `scripts/resumable-analysis-e2e.mjs`) | Passed: 13 baseline units, 22 split units, and all 22 reused after process restart; interruption and invalidation checks also passed |
-| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. The original private trial tree is a maintainer follow-up, not a closer blocker. | `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. See "Epic #464 pre-split integration". | Passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Private scan+health remains out of band. |
+| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. Completion on the original private trial tree is also required before closing #464. | `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. See "Epic #464 pre-split integration". | Passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Original-target scan+health requires separate private evidence before the Epic can close. |
 | #465 | Pre-split planning contract: explainable execution units, budget- and boundary-driven scope and parallelism before execution, dependency/cycle/shared-input retention, staged large package, re-split dispositions, the worker loader binding, and the review follow-ups (loader-scope capability required for the bounded package boundary, file-count-only partition and byte-identical requests for workers without loader scope, zero admitted memory for an empty plan, exact syntax loader scope in the Go worker) | `cargo test -p depgraph-core --test analysis_split_contract` (16 tests over `fixtures/analysis-split-plan-v1`, golden `expected/split-plans.json`); `cargo test -p depgraph-core loader_scope_binding_is_attached_only_after_negotiation_and_keeps_requests_stable`; `cd workers/go && go test ./internal/worker -run TestAnalysisSplit`; `cd workers/go && go test ./internal/worker -run TestReadAnalysisUnitRequestAcceptsSplit`; `cargo test -p depgraph-cli --test cli scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store` | Passed locally on 2026-09-07; see [the pre-split planning ADR](adr-presplit-analysis-planning.md) |
 | #466 | Atomic checkpoint publication, failure/cancel retention, resource limits, and Store/journal compatibility | `cargo test -p depgraph-core incomplete_semantics_remain_readable_but_are_not_reused`; `cargo test -p depgraph-core typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa`; `cargo test -p depgraph-store analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger`; `cargo test -p depgraph-store analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors` | Passed in the pinned full Rust gate, including fake-clock aggregate-budget behavior, atomic ledger/checkpoint, input-proof snapshot identity, and metadata-only terminal summary regressions |
 | #467 | Cross-unit `deps`, `dependents`, `why`, and `impact`, exact stored provenance, partial selection, and conservative unused confidence | `cargo xtask resumable-analysis-e2e`; query assertions are in `scripts/resumable-analysis-query-assertions.mjs`; `cargo test -p depgraph-core incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles`; `cargo test -p depgraph-core health::unused::tests::issue_467` | Passed: all four partial queries with exact stored provenance, unchanged current completed snapshot, canonical graph equality, 8 partial unused-file findings with no confirmed confidence, and equivalent-stage health work/provenance regressions |

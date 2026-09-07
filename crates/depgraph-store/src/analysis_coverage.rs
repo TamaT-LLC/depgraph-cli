@@ -271,7 +271,10 @@ fn valid_chunks(rows: &[&AnalysisUnitLedgerRecord], reasons: &mut BTreeSet<Strin
         reasons.insert("analysis-unit-missing-stage".to_owned());
         return false;
     }
-    let Some(expected) = rows[0].chunk_count else {
+    // Retained batches keep their creation-generation count. The newest
+    // refinement owns the highest count; its active slots must still form
+    // one complete, unique partition. A count alone never proves completion.
+    let Some(expected) = rows.iter().filter_map(|row| row.chunk_count).max() else {
         reasons.insert("analysis-unit-chunk-metadata".to_owned());
         return false;
     };
@@ -289,9 +292,9 @@ fn valid_chunks(rows: &[&AnalysisUnitLedgerRecord], reasons: &mut BTreeSet<Strin
         // result look complete.
         let empty_manifest_batch =
             expected == 1 && row.source_paths.is_empty() && row.context_paths.is_empty();
-        if row.chunk_count != Some(expected)
-            || row.chunk_index.is_none()
-            || row.chunk_id.is_empty()
+        if !row.chunk_count.is_some_and(|count| {
+            count > 0 && count <= expected && row.chunk_index.is_some_and(|index| index < count)
+        }) || row.chunk_id.is_empty()
             || (!empty_manifest_batch && row.context_paths.is_empty())
         {
             reasons.insert("analysis-unit-chunk-metadata".to_owned());
@@ -736,6 +739,38 @@ mod tests {
             unknown_dependencies: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn refined_chunks_keep_generation_counts_but_require_every_active_slot() {
+        let mut rows = vec![
+            unit_row("typed", "first-child", 0, 4, &["app/a.go"]),
+            unit_row("typed", "retained", 1, 2, &["app/b.go"]),
+            unit_row("typed", "previous-child", 2, 3, &["app/c.go"]),
+            unit_row("typed", "second-child", 3, 4, &["app/d.go"]),
+        ];
+        let valid = |rows: &[AnalysisUnitLedgerRecord]| {
+            valid_chunks(&rows.iter().collect::<Vec<_>>(), &mut BTreeSet::new())
+        };
+        assert!(valid(&rows));
+        rows.rotate_left(1);
+        assert!(
+            valid(&rows),
+            "retained generation may be the first ledger row"
+        );
+        rows.rotate_right(1);
+        for index in 0..rows.len() {
+            let mut missing = rows.clone();
+            missing.remove(index);
+            assert!(!valid(&missing), "missing slot {index} accepted");
+        }
+        rows[3].chunk_index = Some(2);
+        assert!(!valid(&rows), "duplicate slot accepted");
+        rows[3].chunk_index = Some(3);
+        rows[3].chunk_count = Some(3);
+        assert!(!valid(&rows), "slot beyond its generation count accepted");
+        rows[3].chunk_count = None;
+        assert!(!valid(&rows), "missing generation count accepted");
     }
 
     #[test]

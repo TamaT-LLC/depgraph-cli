@@ -1146,7 +1146,14 @@ fn resumable_analysis_e2e() -> Result<()> {
         .join(executable_name("depgraph"));
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
-        .env("DEPGRAPH_BIN", cli))
+        .env("DEPGRAPH_BIN", &cli))?;
+    // The fault-injection wrapper and interruption signals require POSIX.
+    if cfg!(unix) {
+        run(Command::new("node")
+            .arg("scripts/analysis-resplit-e2e.mjs")
+            .env("DEPGRAPH_BIN", &cli))?;
+    }
+    Ok(())
 }
 
 /// Go loader-scope evidence (#463): the module-loader control must fail the

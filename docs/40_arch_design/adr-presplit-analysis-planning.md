@@ -204,6 +204,24 @@ stage's granularity; the two halves report `refined`. Refinements are part of
 the split plan identity, so the same discovery plan, budget, boundaries, and
 refinement history reproduce the same plan.
 
+Batch coordinates are stable across refinements. `batch_index` is a slot
+within a logical unit and stage; `batch_count` is the number of slots when
+that batch was created. Retained batches keep both values because profiles
+and checkpoints already contain them. A split's first child inherits the
+parent slot, preserving syntax's auxiliary-file owner at zero. Its second
+child takes the next unused slot, and both children receive the new slot
+count. Later refinements can therefore leave different counts on retained
+batches. These counts are not a completion test: the active execution units
+and their ledger states determine completion. Replaying the refinement
+history reconstructs every coordinate without changing retained results.
+
+The executor holds resource-limited output prefixes in temporary files until
+refinement is decided. A superseded prefix is discarded before replacement
+profiles are ingested; it cannot contaminate the narrower loader scope.
+Unrecovered prefixes are restored in execution order for partial queries,
+including after cancellation. Successful results and their checkpoints stay
+in place. Security violations are never withdrawn by refinement.
+
 The relationship to existing state is explicit in `AnalysisResplitPlan`:
 
 - `plan_id` and every logical unit `input_fingerprint` are unchanged. A
