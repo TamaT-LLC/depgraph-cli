@@ -195,7 +195,7 @@ pub struct RangedHealthFailure {
 #[derive(Debug, thiserror::Error)]
 pub enum RangedHealthError {
     #[error("{}", .0.error)]
-    Analysis(RangedHealthFailure),
+    Analysis(Box<RangedHealthFailure>),
     #[error(transparent)]
     Store(anyhow::Error),
 }
@@ -394,7 +394,7 @@ pub fn analyze_unused_ranged(
     };
     let fail = |error: HealthAnalysisError, mut diagnostics: HealthRangeDiagnostics| {
         diagnostics.peak_rss_kib = peak_rss_kib();
-        RangedHealthError::Analysis(RangedHealthFailure { error, diagnostics })
+        RangedHealthError::Analysis(Box::new(RangedHealthFailure { error, diagnostics }))
     };
 
     // Phase 0: plan from aggregates only.
@@ -450,11 +450,11 @@ pub fn analyze_unused_ranged(
             diagnostics.ranges.interrupted += 1;
             continue;
         }
-        if let Some(error) = stop {
-            if error == HealthAnalysisError::Cancelled || !allow_partial {
-                diagnostics.ranges.interrupted += 1;
-                continue;
-            }
+        if let Some(error) = stop
+            && (error == HealthAnalysisError::Cancelled || !allow_partial)
+        {
+            diagnostics.ranges.interrupted += 1;
+            continue;
         }
         let key = HealthRangeCheckpointKey::new(
             &plan.plan_digest,
@@ -639,13 +639,13 @@ pub fn load_dependency_projection(
             work_used,
         }),
         Err(error) => Err(match analysis_error(&error) {
-            Some(error) => RangedHealthError::Analysis(RangedHealthFailure {
+            Some(error) => RangedHealthError::Analysis(Box::new(RangedHealthFailure {
                 error,
                 diagnostics: HealthRangeDiagnostics::whole_snapshot(
                     identity.layers.clone(),
                     limits.per_range_work,
                 ),
-            }),
+            })),
             None => RangedHealthError::Store(error),
         }),
     }

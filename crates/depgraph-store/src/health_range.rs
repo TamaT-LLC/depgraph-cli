@@ -644,9 +644,9 @@ fn ensure_site_target_projection(connection: &Connection, scan_id: &str) -> Resu
         ),
         [scan_id],
     )?;
-    connection.execute_batch(&format!(
-        "CREATE INDEX temp.health_site_targets_target ON health_site_targets(target_id, site_id);"
-    ))?;
+    connection.execute_batch(
+        "CREATE INDEX temp.health_site_targets_target ON health_site_targets(target_id, site_id);",
+    )?;
     connection.execute(
         "INSERT INTO temp.health_site_targets_scan(scan_id, row_count) VALUES (?1, ?2)",
         params![scan_id, inserted as u64],
@@ -1081,7 +1081,7 @@ impl Store {
             let id = row.get::<_, String>(0)?;
             let is_go_file = row.get::<_, i64>(1)? == 1;
             rows_read += 1;
-            if rows_read % 4096 == 0 {
+            if rows_read.is_multiple_of(4096) {
                 check(rows_read)?;
             }
             let inbound_edges = edges.count_for(&id, &mut rows_read)?;
@@ -1217,7 +1217,7 @@ impl Store {
                   ORDER BY id"
             ),
             &[&scan_id],
-            work.budget,
+            &mut work,
             &mut go_module_nodes,
         )?;
         let module_ids = go_module_nodes
@@ -1237,7 +1237,7 @@ impl Store {
                       WHERE scan_id=?1 AND target IN ({marks}) ORDER BY id"
                 ),
                 &parameters,
-                work.budget,
+                &mut work,
                 &mut go_package_edges,
             )?;
             let mut sites = Vec::new();
@@ -1251,7 +1251,7 @@ impl Store {
                       ORDER BY site.id"
                 ),
                 &parameters,
-                work.budget,
+                &mut work,
                 &mut sites,
             )?;
             for site in sites {
@@ -1352,7 +1352,7 @@ impl Store {
                   ORDER BY id"
             ),
             &[&scan_id, &lo, &hi],
-            work.budget,
+            &mut work,
             &mut subjects,
         )?;
         // Non-subject node ids (modules, packages) can sort inside the
@@ -1370,7 +1370,7 @@ impl Store {
                   ORDER BY edge.id"
             ),
             &[&scan_id, &lo, &hi],
-            work.budget,
+            &mut work,
             &mut inbound_edges,
         )?;
         let range_site_ids = format!(
@@ -1389,7 +1389,7 @@ impl Store {
                   ORDER BY site.id"
             ),
             &[&scan_id, &lo, &hi],
-            work.budget,
+            &mut work,
             &mut inbound_sites,
         )?;
         let mut dynamic_site_ids = BTreeSet::new();
@@ -1442,7 +1442,7 @@ impl Store {
             connection,
             &format!("SELECT {NODE_COLUMNS} FROM nodes WHERE scan_id=?1 ORDER BY id"),
             &[&scan_id],
-            work.budget,
+            &mut work,
             &mut nodes,
         )?;
         let mut sites = Vec::new();
@@ -1450,7 +1450,7 @@ impl Store {
             connection,
             &format!("SELECT {SITE_COLUMNS} FROM sites WHERE scan_id=?1 ORDER BY id"),
             &[&scan_id],
-            work.budget,
+            &mut work,
             &mut sites,
         )?;
         let mut edges = Vec::new();
@@ -1458,7 +1458,7 @@ impl Store {
             connection,
             &format!("SELECT {EDGE_COLUMNS} FROM edges WHERE scan_id=?1 ORDER BY id"),
             &[&scan_id],
-            work.budget,
+            &mut work,
             &mut edges,
         )?;
         let work_used = work.used;
@@ -1497,7 +1497,15 @@ impl<'b> WorkCounter<'b> {
     }
 
     fn charge(&mut self) -> Result<()> {
-        charge(self.budget)?;
+        charge(self)
+    }
+}
+
+/// Every step of a loader goes through the counter so the reported
+/// `work_used` equals what the caller's budget was charged.
+impl HealthWorkBudget for WorkCounter<'_> {
+    fn step(&mut self) -> std::result::Result<(), HealthWorkError> {
+        self.budget.step()?;
         self.used += 1;
         Ok(())
     }
