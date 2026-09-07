@@ -3,11 +3,16 @@ package worker
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"sort"
 
 	"golang.org/x/tools/go/packages"
 )
+
+// errReferenceOpenNoFollowUnavailable is returned when this platform cannot
+// open a confined path without following a swapped final-component symlink.
+var errReferenceOpenNoFollowUnavailable = errors.New("reference-file no-follow open is unavailable on this platform")
 
 const goReferenceFingerprintSchema = "go-reference-fingerprint-v1"
 

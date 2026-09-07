@@ -1,16 +1,12 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package worker
 
 import "os"
 
-func openReferenceFile(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, os.ErrInvalid
-	}
-	return os.Open(path)
+// openReferenceFile refuses to hash on platforms that cannot open the final
+// path component without following a symlink. Lstat-then-Open would race with
+// a swap of that component, so those targets fail closed instead.
+func openReferenceFile(string) (*os.File, error) {
+	return nil, errReferenceOpenNoFollowUnavailable
 }
