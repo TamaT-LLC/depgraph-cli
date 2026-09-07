@@ -480,10 +480,14 @@ function assertSameCanonicalGraph(actual, expected, label) {
   for (const key of Object.keys(expected.payloads)) {
     assert.equal(actual.payloads[key], expected.payloads[key], `${label}: ${key} differ from the module-loader control`);
   }
-  assert.ok(actual.counts.may_call > 0, `${label}: package path emitted no CHA may_call edges`);
-  const controlCalls = new Set(expected.may_call_pairs);
-  for (const pair of actual.may_call_pairs) {
-    assert.ok(controlCalls.has(pair), `${label}: package CHA may_call is not a subset of whole-program CHA`);
+  if (expected.counts.may_call === 0) {
+    assert.equal(actual.counts.may_call, 0, `${label}: package path invented CHA may_call edges`);
+  } else {
+    assert.ok(actual.counts.may_call > 0, `${label}: package path emitted no CHA may_call edges`);
+    const controlCalls = new Set(expected.may_call_pairs);
+    for (const pair of actual.may_call_pairs) {
+      assert.ok(controlCalls.has(pair), `${label}: package CHA may_call is not a subset of whole-program CHA`);
+    }
   }
   for (const [siteId, targets] of actual.overapprox_candidates) {
     const control = new Set(expected.overapprox_candidates.get(siteId) ?? []);
