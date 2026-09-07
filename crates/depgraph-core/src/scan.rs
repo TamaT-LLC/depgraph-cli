@@ -1003,7 +1003,6 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             }
         }
     }
-    drop(consume);
     failures.extend(
         unit_failures
             .into_inner()

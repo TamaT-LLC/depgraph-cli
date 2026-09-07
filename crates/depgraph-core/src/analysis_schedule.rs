@@ -1828,7 +1828,7 @@ mod tests {
     fn resplit_derives_package_bounded_replacements_for_a_promoted_unit() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().canonicalize()?;
-        std::fs::write(&root.join("go.mod"), "module example.test/app\n\ngo 1.26\n")?;
+        std::fs::write(root.join("go.mod"), "module example.test/app\n\ngo 1.26\n")?;
         for name in ["core", "api", "cli"] {
             std::fs::create_dir(root.join(name))?;
             let import = if name == "core" {
