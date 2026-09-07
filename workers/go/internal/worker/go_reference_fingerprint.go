@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"os"
 	"sort"
 
 	"golang.org/x/tools/go/packages"
@@ -128,12 +127,13 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 }
 
 func goReferenceFileDigest(path string) (string, bool) {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() {
+	file, err := openReferenceFile(path)
+	if err != nil {
 		return "", false
 	}
-	file, err := os.Open(path)
-	if err != nil {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = file.Close()
 		return "", false
 	}
 	hasher := sha256.New()
