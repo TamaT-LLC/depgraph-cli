@@ -21,11 +21,15 @@ use uuid::Uuid;
 use crate::{
     analysis_execution::{
         AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisWorkItem,
-        execute_analysis_units,
+        TypedReferenceFingerprint, execute_analysis_units,
+        execute_analysis_units_with_retained_typed,
     },
     analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
     analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
-    analysis_split::{AnalysisResplitOutcome, AnalysisResplitTrigger, resplit_execution_unit},
+    analysis_split::{
+        AnalysisLoaderKind, AnalysisResplitOutcome, AnalysisResplitTrigger, AnalysisSplitPlan,
+        resplit_execution_unit,
+    },
     cache::{
         CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
         validate_scan_cache_hit_inputs,
@@ -979,12 +983,19 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 );
             }
             *current = resplit_plan.plan;
-            let replacement_progress = execute_analysis_units(
+            let retained_typed = retained_typed_reference_fingerprints(
+                &analysis,
+                &execution_unit_ids,
+                current,
+                &resplit_plan.retained_execution_unit_ids,
+            );
+            let replacement_progress = execute_analysis_units_with_retained_typed(
                 store,
                 &execution_context,
                 replacement_work,
                 &mut consume,
                 &validate,
+                &retained_typed,
             )
             .await?;
             ledger_records.extend(replacement_records);
@@ -2603,6 +2614,46 @@ fn lock_failures<T>(failures: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_,
     failures
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Typed units retained across a re-split still own the reference fingerprints
+/// a replacement semantic executor must bind. Failed or superseded units are
+/// not included; a missing fingerprint is recorded as `None` so the executor
+/// refuses the semantic checkpoint rather than hashing an empty set.
+fn retained_typed_reference_fingerprints(
+    analysis: &AnalysisExecutionProgress,
+    execution_unit_ids: &[Option<String>],
+    plan: &AnalysisSplitPlan,
+    retained_ids: &[String],
+) -> Vec<TypedReferenceFingerprint> {
+    let retained = retained_ids.iter().cloned().collect::<BTreeSet<_>>();
+    analysis
+        .units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| {
+            if unit.stage != "typed" || unit.status != "completed" {
+                return None;
+            }
+            let id = execution_unit_ids.get(index)?.as_ref()?;
+            if !retained.contains(id) {
+                return None;
+            }
+            let execution = plan.execution_unit(id)?;
+            if execution.loader.kind != AnalysisLoaderKind::Package {
+                return None;
+            }
+            Some(TypedReferenceFingerprint {
+                unit_id: execution.unit_id.clone(),
+                package_roots: execution.loader.package_roots.iter().cloned().collect(),
+                fingerprint: unit
+                    .loader
+                    .get("go_reference_fingerprint")
+                    .cloned()
+                    .filter(|value| !value.is_empty()),
+            })
+        })
+        .collect()
 }
 
 fn analysis_ledger_records(

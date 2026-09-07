@@ -144,6 +144,16 @@ struct ReferenceBinding {
     package_roots: BTreeSet<String>,
 }
 
+/// A completed typed unit's reported in-repo import closure, used when a later
+/// executor (a re-split of only the semantic stage) no longer has that typed
+/// work item in its own list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TypedReferenceFingerprint {
+    pub unit_id: String,
+    pub package_roots: BTreeSet<String>,
+    pub fingerprint: Option<String>,
+}
+
 fn reference_binding(item: &AnalysisWorkItem) -> Option<ReferenceBinding> {
     let request = item.request.as_ref()?;
     let loader = &request["split"]["loader"];
@@ -171,17 +181,21 @@ fn reference_binding(item: &AnalysisWorkItem) -> Option<ReferenceBinding> {
 /// variants, and `replace` directives can narrow or widen beyond what static
 /// discovery resolves.  A semantic checkpoint is therefore reused only when
 /// the typed stage of this scan loaded the same closure content.  Typed units
-/// are always ingested before their semantic stage dispatches, so the
-/// fingerprints are known here for fresh and replayed typed units alike.
+/// of the same executor are ingested before their semantic stage dispatches;
+/// a re-split that keeps those typed units and only re-runs semantic work
+/// supplies their fingerprints through `retained`.
 ///
 /// The fingerprints occupy the key's own `reference_digest` slot: the static
 /// `input_digest` still has to equal the request's context fingerprint for the
-/// input validation that guards every checkpoint write and reuse.
+/// input validation that guards every checkpoint write and reuse.  An empty
+/// or incomplete set is not a valid binding: the caller then skips checkpoint
+/// read and write rather than persisting a digest of missing values.
 fn bind_reference_fingerprints(
     index: usize,
     item: &mut AnalysisWorkItem,
     bindings: &[Option<ReferenceBinding>],
     progress: &AnalysisExecutionProgress,
+    retained: &[TypedReferenceFingerprint],
 ) {
     let Some(binding) = bindings[index].as_ref() else {
         return;
@@ -192,24 +206,56 @@ fn bind_reference_fingerprints(
     let Some(key) = item.checkpoint_key.as_mut() else {
         return;
     };
-    let fingerprints = bindings
-        .iter()
-        .enumerate()
-        .filter(|(other, candidate)| {
-            *other != index
-                && candidate.as_ref().is_some_and(|candidate| {
-                    candidate.unit_id == binding.unit_id
-                        && candidate.stage == "typed"
-                        && !candidate.package_roots.is_disjoint(&binding.package_roots)
-                })
-        })
-        .map(|(other, _)| {
-            progress.units[other]
-                .loader
+    let mut fingerprints = BTreeSet::new();
+    let mut matched = false;
+    let mut missing = false;
+    for (other, candidate) in bindings.iter().enumerate() {
+        if other == index {
+            continue;
+        }
+        let Some(candidate) = candidate.as_ref() else {
+            continue;
+        };
+        if candidate.unit_id != binding.unit_id
+            || candidate.stage != "typed"
+            || candidate.package_roots.is_disjoint(&binding.package_roots)
+        {
+            continue;
+        }
+        matched = true;
+        match progress.units.get(other).and_then(|unit| {
+            unit.loader
                 .get("go_reference_fingerprint")
+                .filter(|value| !value.is_empty())
                 .cloned()
-        })
-        .collect::<BTreeSet<_>>();
+        }) {
+            Some(fingerprint) => {
+                fingerprints.insert(fingerprint);
+            }
+            None => missing = true,
+        }
+    }
+    for prior in retained {
+        if prior.unit_id != binding.unit_id
+            || prior.package_roots.is_disjoint(&binding.package_roots)
+        {
+            continue;
+        }
+        matched = true;
+        match prior
+            .fingerprint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(fingerprint) => {
+                fingerprints.insert(fingerprint.to_owned());
+            }
+            None => missing = true,
+        }
+    }
+    if !matched || missing || fingerprints.is_empty() {
+        return;
+    }
     let Ok(payload) = serde_json::to_vec(&json!({
         "contract":"analysis-go-reference-binding-v1",
         "reference_fingerprints":fingerprints,
@@ -217,6 +263,20 @@ fn bind_reference_fingerprints(
         return;
     };
     key.reference_digest = Some(format!("{:x}", Sha256::digest(payload)));
+}
+
+/// Package-bounded semantic checkpoints are only read or written after the
+/// typed reference closure has been bound into `reference_digest`.  Module
+/// loader units and earlier stages keep the historical key.
+fn package_semantic_checkpoint_bound(item: &AnalysisWorkItem) -> bool {
+    match reference_binding(item) {
+        Some(binding) if binding.stage == "semantic" => item
+            .checkpoint_key
+            .as_ref()
+            .and_then(|key| key.reference_digest.as_deref())
+            .is_some_and(|digest| !digest.is_empty()),
+        _ => true,
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -408,8 +468,36 @@ where
     F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
     V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
 {
+    execute_analysis_units_with_retained_typed(store, context, work, consume, validate_inputs, &[])
+        .await
+}
+
+/// Same as [`execute_analysis_units`], with typed reference fingerprints from
+/// units that completed in an earlier executor of this scan (re-split
+/// replacements that no longer include those typed work items).
+pub(crate) async fn execute_analysis_units_with_retained_typed<F, V>(
+    store: &mut Store,
+    context: &AnalysisExecutionContext<'_>,
+    work: Vec<AnalysisWorkItem>,
+    consume: F,
+    validate_inputs: V,
+    retained_typed: &[TypedReferenceFingerprint],
+) -> Result<AnalysisExecutionProgress>
+where
+    F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
+    V: Fn(&AnalysisWorkItem, AnalysisInputValidation) -> bool,
+{
     let clock = MonotonicAnalysisClock;
-    execute_analysis_units_with_clock(store, context, work, &clock, consume, validate_inputs).await
+    execute_analysis_units_with_clock(
+        store,
+        context,
+        work,
+        &clock,
+        consume,
+        validate_inputs,
+        retained_typed,
+    )
+    .await
 }
 
 async fn execute_analysis_units_with_clock<F, V>(
@@ -419,6 +507,7 @@ async fn execute_analysis_units_with_clock<F, V>(
     clock: &dyn AnalysisClock,
     mut consume: F,
     validate_inputs: V,
+    retained_typed: &[TypedReferenceFingerprint],
 ) -> Result<AnalysisExecutionProgress>
 where
     F: FnMut(&mut Store, &str, WorkerOutput) -> Result<bool>,
@@ -541,8 +630,15 @@ where
             let Some((index, mut item)) = pending.pop_front() else {
                 break;
             };
-            bind_reference_fingerprints(index, &mut item, &reference_bindings, &progress);
+            bind_reference_fingerprints(
+                index,
+                &mut item,
+                &reference_bindings,
+                &progress,
+                retained_typed,
+            );
             if let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
+                && package_semantic_checkpoint_bound(&item)
                 && validate_inputs(&item, AnalysisInputValidation::Reuse)
             {
                 let cached = checkpoints.read(key).ok().flatten().and_then(|events| {
@@ -695,6 +791,7 @@ where
         let staged = if output.error.is_none()
             && semantic_checkpoint_complete(item.request.as_ref(), &output.events)
             && !cancellation.is_cancelled()
+            && package_semantic_checkpoint_bound(&item)
             && validate_inputs(&item, AnalysisInputValidation::CheckpointWrite)
             && let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
         {
@@ -1121,6 +1218,7 @@ for (const event of [
             &clock,
             |_, _, output| Ok(output.error.is_none()),
             |_, _| true,
+            &[],
         )
         .await?;
 
@@ -1159,6 +1257,7 @@ for (const event of [
             &explicit_clock,
             |_, _, output| Ok(output.error.is_none()),
             |_, _| true,
+            &[],
         )
         .await?;
         assert!(explicit_clock.elapsed() > LEGACY_AGGREGATE_DEADLINE);
@@ -1553,6 +1652,70 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 .map(|unit| unit.reused)
                 .collect::<Vec<_>>(),
             [true, true]
+        );
+
+        // A re-split that keeps the typed unit and only re-runs semantic work
+        // has no typed item in the replacement executor. The retained
+        // fingerprint still binds the checkpoint; an empty or missing
+        // fingerprint must not.
+        let semantic_only = || vec![work("typed-a").remove(1)];
+        let retained = |fingerprint: Option<&str>| {
+            vec![TypedReferenceFingerprint {
+                unit_id: "unit".into(),
+                package_roots: ["app".into()].into_iter().collect(),
+                fingerprint: fingerprint.map(str::to_owned),
+            }]
+        };
+        let rebound = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &retained(Some("sha256:closure-a")),
+        )
+        .await?;
+        assert_eq!(
+            rebound
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [true]
+        );
+        let unbound = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &[],
+        )
+        .await?;
+        assert_eq!(
+            unbound
+                .units
+                .iter()
+                .map(|unit| (unit.status.as_str(), unit.reused))
+                .collect::<Vec<_>>(),
+            [("completed", false)]
+        );
+        let mismatched = execute_analysis_units_with_retained_typed(
+            &mut store,
+            &context,
+            semantic_only(),
+            consume,
+            validate,
+            &retained(Some("sha256:closure-other")),
+        )
+        .await?;
+        assert_eq!(
+            mismatched
+                .units
+                .iter()
+                .map(|unit| unit.reused)
+                .collect::<Vec<_>>(),
+            [false]
         );
         Ok(())
     }
