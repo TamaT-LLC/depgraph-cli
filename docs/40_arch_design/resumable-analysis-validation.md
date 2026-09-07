@@ -210,10 +210,10 @@ section is the remaining pre-split contract.
 | Reopen item | Public evidence | Result |
 | --- | --- | --- |
 | Same input and budget plan the same execution units before heavy analysis | `same_input_produces_the_same_split_plan_across_checkouts_and_runs`, `parallelism_is_decided_before_execution_and_respects_prerequisites`, `cargo test -p depgraph-cli --test cli scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store` | Pass. `depgraph scan --split-plan` writes no store and starts no worker. |
-| Many packages **and** a large single package shrink loaded input and simultaneous retention | `cargo xtask go-loader-scope-e2e` at the unchanged 192 MiB per-unit limit (`scripts/go-loader-scope-e2e.mjs`) | Pass on `564c064` (this checkout, 2026-09-07). Fan-out (64×8): whole-module peak 574.7 MiB, control `partial` at 192 MiB; package batches `completed` at 92.3 MiB, resume 27/27 reused. 1,024-file package: whole-module peak 604.1 MiB, control `partial` at 192 MiB; `staged_bodies` `completed` at 86.7 MiB (74 typed + 74 semantic), resume 222/222 reused. Production `max_worker_memory_bytes` stays 2 GiB. |
+| Splits for many-package repositories and large single packages reduce loaded input and simultaneous retention | `cargo xtask go-loader-scope-e2e` at the unchanged 192 MiB per-unit limit (`scripts/go-loader-scope-e2e.mjs`) | Pass on `564c064` (this checkout, 2026-09-07). Fan-out (64×8): whole-module peak 574.7 MiB, control `partial` at 192 MiB; package batches `completed` at 92.3 MiB, resume 27/27 reused. 1,024-file package: whole-module peak 604.1 MiB, control `partial` at 192 MiB; `staged_bodies` `completed` at 86.7 MiB (74 typed + 74 semantic), resume 222/222 reused. Production `max_worker_memory_bytes` stays 2 GiB. |
 | Health store load and preprocess split so repo-wide cumulative volume alone cannot fail the request | `cargo xtask health-range-e2e`; `whole_graph_over_the_budget_completes_in_ranges_under_the_same_budget` | Pass. Whole-snapshot control is `resource_exhausted` at the unchanged 1,000,000 budget; ranged path completes 4 ranges (max 433,340 steps) with 72 identical findings. |
 | Out-of-unit refs, cycles, and coverage preserved; graph / evidence / findings match across split and resume | `out_of_unit_references_are_retained_in_loader_and_reference_scope`, `cycle_group_is_kept_in_one_analysis_context`; Go e2e canonical-graph equality vs the module-loader control; `ranged_findings_equal_whole_snapshot_findings_on_every_public_shape`, `range_order_permutations_produce_identical_findings`, `interrupt_after_each_range_then_resume_matches_the_uninterrupted_run`; `cargo xtask resumable-analysis-e2e` | Pass. Split vs resume of the same loader mode keeps nodes, sites, exact edges, evidence, and coverage. Package-mode vs the module-loader control matches those payloads too; CHA `may_call` is the one declared exception (a subset under `package-with-declaration-deps`). |
-| A public synthetic fixture that used to hit the limit now completes without raising per-unit limits | Go e2e control `partial` vs package path `completed` at 192 MiB; health-range whole-snapshot `resource_exhausted` vs ranged complete at 1,000,000 | Pass. Do not close on `partial` or `ResourceExhausted`. |
+| A public synthetic fixture that used to hit the limit now completes without raising per-unit limits | Go e2e control `partial` vs package path `completed` at 192 MiB; health-range whole-snapshot `"resource_exhausted"` vs ranged complete at 1,000,000 | Pass. Do not close on scan JSON `status: "partial"` or health-range e2e `"resource_exhausted"` (from internal `HealthAnalysisError::ResourceExhausted`). Public JSON success is `status: "completed"` with `partial_ranges: false`. |
 | Original private trial target: scan and health complete | Not runnable here. Public fixtures prove the same contracts. Maintainer follow-up below. | Out of band. Not a closer blocker. |
 
 **Large single package vs `staged_bodies`.** Semantic work is still
@@ -237,7 +237,11 @@ paths or measurements). `--no-cache` disables the unit checkpoint store
 share one command line.
 
 ```text
-# 1. Fresh scan + health. Must complete; not partial / ResourceExhausted.
+# 1. Fresh scan + health. Public JSON must be status: "completed" with
+#    partial_ranges: false. Reject scan status: "partial". The internal
+#    HealthAnalysisError::ResourceExhausted maps to e2e
+#    whole_snapshot.bounded.outcome "resource_exhausted"; that is a control
+#    failure, not a public JSON field.
 depgraph --store /tmp/trial.sqlite scan /path/to/repository --no-cache --json
 depgraph --store /tmp/trial.sqlite health --json
 
