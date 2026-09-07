@@ -200,8 +200,19 @@ func TestGoSSAVTAConstructionAndSelectionFailClosed(t *testing.T) {
 	}}}, algorithm, reason, fallback, goSSAProgramScopeWholeProgram, 2, true)
 	if len(evidence) != 1 || evidence[0].Properties["requested_algorithm"] != "vta" ||
 		evidence[0].Properties["algorithm"] != "rta" || evidence[0].Properties["fallback_reason"] != fallback ||
-		evidence[0].Properties["candidate_count"] != 2 || evidence[0].Properties["program_scope"] != "whole-program" {
+		evidence[0].Properties["candidate_count"] != 2 {
 		t.Fatalf("VTA fallback evidence is incomplete: %+v", evidence)
+	}
+	// Whole-program evidence stays byte-identical to earlier workers: the
+	// program scope is declared only for package-scoped inputs.
+	if _, declared := evidence[0].Properties["program_scope"]; declared {
+		t.Fatalf("whole-program evidence declared a program scope: %+v", evidence)
+	}
+	packageEvidence := goSSACandidateEvidence(goSemanticPendingCall{evidence: []Evidence{{
+		Kind: "semantic", Properties: map[string]any{"dispatch": "interface"},
+	}}}, "cha", "package_scope_declaration_deps", "not_requested", goSSAProgramScopePackage, 2, false)
+	if len(packageEvidence) != 1 || packageEvidence[0].Properties["program_scope"] != "package-with-declaration-deps" || packageEvidence[0].Properties["analysis_scope"] != "partial_program" {
+		t.Fatalf("package-scope evidence lacks its declaration: %+v", packageEvidence)
 	}
 	// A declared package scope never selects RTA, even for a main package
 	// with a reachable RTA site and even when VTA was requested.

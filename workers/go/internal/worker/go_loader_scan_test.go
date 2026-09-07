@@ -316,17 +316,15 @@ func TestGoLoaderPackageScopeScanRunsCHAOverDeclaredScopeWithSharedIdentity(t *t
 			t.Fatalf("package-scope property %s = %q, want %q", key, got, value)
 		}
 	}
-	wantWhole := map[string]string{
-		"analysis_scope":              "full_module",
-		"go_call_graph_program_scope": "whole-program",
+	if got := whole.Profile.Properties["analysis_scope"]; got != "full_module" {
+		t.Fatalf("module-whole-program analysis_scope = %q, want full_module", got)
 	}
-	for key, value := range wantWhole {
-		if got := whole.Profile.Properties[key]; got != value {
-			t.Fatalf("module-whole-program property %s = %q, want %q", key, got, value)
+	// The whole-program stream stays byte-identical to earlier workers: the
+	// scope declaration and the loader evidence appear only in package mode.
+	for _, key := range []string{"go_call_graph_program_scope", "analysis_loader_mode", "go_loader_program_scope", "go_reference_fingerprint"} {
+		if value, present := whole.Profile.Properties[key]; present {
+			t.Fatalf("module-whole-program profile carries %s=%q", key, value)
 		}
-	}
-	if _, present := whole.Profile.Properties["analysis_loader_mode"]; present {
-		t.Fatalf("module-whole-program profile carries loader properties: %+v", whole.Profile.Properties)
 	}
 	if scoped.Profile.ID != whole.Profile.ID {
 		t.Fatalf("profile identity differs between loaders: %s vs %s", scoped.Profile.ID, whole.Profile.ID)
@@ -351,8 +349,8 @@ func TestGoLoaderPackageScopeScanRunsCHAOverDeclaredScopeWithSharedIdentity(t *t
 	if wholeInvoke.ID != invoke.ID || !reflect.DeepEqual(wholeInvoke.TargetIDs, invoke.TargetIDs) {
 		t.Fatalf("invoke site identity differs: whole=%+v scoped=%+v", wholeInvoke, invoke)
 	}
-	if got := wholeInvoke.Evidence[0].Properties["program_scope"]; got != "whole-program" {
-		t.Fatalf("module-whole-program invoke evidence program_scope = %v", got)
+	if got, declared := wholeInvoke.Evidence[0].Properties["program_scope"]; declared {
+		t.Fatalf("module-whole-program invoke evidence declared program_scope = %v", got)
 	}
 	for _, method := range []Node{square, circle} {
 		if whole := semanticFindNamedNode(t, whole, "symbol", "method", semanticIdentity(t, method)["resolver_identity"].(string)); whole.ID != method.ID {

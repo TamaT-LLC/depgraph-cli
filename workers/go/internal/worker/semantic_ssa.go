@@ -307,7 +307,12 @@ func (e *goSemanticExtractor) recordSSAPolicy() {
 	e.state.profile.Properties["go_call_graph_library_partial"] = "cha"
 	e.state.profile.Properties["go_call_graph_vta_prerequisites"] = "complete-program,instantiate-generics,serial-ssa"
 	e.state.profile.Properties["go_call_graph_vta_engine"] = goVTACallGraphEngine
-	e.state.profile.Properties["go_call_graph_program_scope"] = string(e.declaredProgramScope())
+	// The declaration is explicit only when a package-scoped input took part;
+	// its absence means whole-program, which keeps module-whole-program
+	// streams byte-identical to earlier workers and their golden fixtures.
+	if scope := e.declaredProgramScope(); scope != goSSAProgramScopeWholeProgram {
+		e.state.profile.Properties["go_call_graph_program_scope"] = string(scope)
+	}
 	if e.state.analysisUnit != nil {
 		e.state.profile.Properties["go_typed_load_progress_granularity"] = "package-boundary-after-packages-load"
 		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build"
@@ -1041,7 +1046,7 @@ func goSSACandidateEvidence(
 		return evidence
 	}
 	primary := evidence[0]
-	properties := make(map[string]any, len(primary.Properties)+8)
+	properties := make(map[string]any, len(primary.Properties)+7)
 	for key, value := range primary.Properties {
 		properties[key] = value
 	}
@@ -1050,10 +1055,10 @@ func goSSACandidateEvidence(
 	properties["analysis_scope"] = map[string]string{
 		"rta": "complete_program", "cha": "partial_program", "vta": "complete_program",
 	}[algorithm]
-	if scope == "" {
-		scope = goSSAProgramScopeWholeProgram
+	if scope != "" && scope != goSSAProgramScopeWholeProgram {
+		// Absent means whole-program; see recordSSAPolicy.
+		properties["program_scope"] = string(scope)
 	}
-	properties["program_scope"] = string(scope)
 	properties["candidate_count"] = candidateCount
 	properties["fallback_reason"] = fallbackReason
 	if vtaRequested {
