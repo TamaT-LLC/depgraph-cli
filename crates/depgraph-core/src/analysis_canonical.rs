@@ -289,49 +289,94 @@ fn go_execution_observation(key: &str) -> bool {
     )
 }
 
-/// Go observations joined across the execution units of one logical stage:
-/// the loader scope is `widened` when any unit had to widen it, and the typed
-/// stage is complete only when every unit completed it.
-const GO_OBSERVATIONS: [&str; 2] = ["analysis_loader_scope", "go_typed_stage_complete"];
+/// Go observations joined across the execution units of one logical stage.
+///
+/// The loader scope is `widened` when any unit had to widen it and the typed
+/// stage is complete only when every unit completed it.  The call-graph
+/// outcome describes the dynamic sites a unit actually resolved: a
+/// package-bounded batch whose owned bodies hold no dynamic call used no
+/// algorithm at all, so the algorithms and VTA fallback reasons are unions,
+/// the VTA site counts are sums, and the VTA status is the weakest outcome
+/// any unit reached.
+const GO_OBSERVATIONS: [&str; 7] = [
+    "analysis_loader_scope",
+    "go_typed_stage_complete",
+    "go_call_graph_effective_algorithms",
+    "go_call_graph_vta_status",
+    "go_call_graph_vta_site_count",
+    "go_call_graph_vta_fallback_site_count",
+    "go_call_graph_vta_fallback_reasons",
+];
 
 fn string_property<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+/// Union of two comma-separated sets, sorted and without duplicates.
+fn join_list(left: &str, right: &str) -> String {
+    left.split(',')
+        .chain(right.split(','))
+        .filter(|item| !item.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The weakest VTA outcome of two units: a fallback beside an applied or
+/// partial unit is `partial`, beside an inapplicable one it stays `fallback`.
+fn join_vta_status<'a>(left: &'a str, right: &'a str) -> &'a str {
+    if left == right {
+        return left;
+    }
+    let has = |status: &str| left == status || right == status;
+    if has("fallback") {
+        if has("applied") || has("partial") {
+            "partial"
+        } else {
+            "fallback"
+        }
+    } else if has("partial") {
+        "partial"
+    } else if has("applied") {
+        "applied"
+    } else if has("not-applicable") {
+        "not-applicable"
+    } else {
+        left
+    }
+}
+
+fn join_go_observation(key: &str, left: &str, right: &str) -> Value {
+    match key {
+        "analysis_loader_scope" => json!(if left == "widened" || right == "widened" {
+            "widened"
+        } else {
+            left
+        }),
+        "go_typed_stage_complete" => json!(if left == "true" && right == "true" {
+            "true"
+        } else {
+            "false"
+        }),
+        "go_call_graph_effective_algorithms" | "go_call_graph_vta_fallback_reasons" => {
+            json!(join_list(left, right))
+        }
+        "go_call_graph_vta_status" => json!(join_vta_status(left, right)),
+        _ => match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => json!((left + right).to_string()),
+            _ => json!(left),
+        },
+    }
+}
+
 fn join_go_observations(left: &Value, right: &Value) -> Vec<(&'static str, Value)> {
     let mut joined = Vec::new();
-    match (
-        string_property(left, GO_OBSERVATIONS[0]),
-        string_property(right, GO_OBSERVATIONS[0]),
-    ) {
-        (None, None) => {}
-        (Some(left), Some(right)) => {
-            let value = if left == "widened" || right == "widened" {
-                "widened"
-            } else {
-                left
-            };
-            joined.push((GO_OBSERVATIONS[0], json!(value)));
-        }
-        (Some(value), None) | (None, Some(value)) => {
-            joined.push((GO_OBSERVATIONS[0], json!(value)));
-        }
-    }
-    match (
-        string_property(left, GO_OBSERVATIONS[1]),
-        string_property(right, GO_OBSERVATIONS[1]),
-    ) {
-        (None, None) => {}
-        (Some(left), Some(right)) => {
-            let value = if left == "true" && right == "true" {
-                "true"
-            } else {
-                "false"
-            };
-            joined.push((GO_OBSERVATIONS[1], json!(value)));
-        }
-        (Some(value), None) | (None, Some(value)) => {
-            joined.push((GO_OBSERVATIONS[1], json!(value)));
+    for key in GO_OBSERVATIONS {
+        match (string_property(left, key), string_property(right, key)) {
+            (None, None) => {}
+            (Some(left), Some(right)) => joined.push((key, join_go_observation(key, left, right))),
+            (Some(value), None) | (None, Some(value)) => joined.push((key, json!(value))),
         }
     }
     joined
@@ -1456,6 +1501,88 @@ mod tests {
         changed[0]["profile"]["properties"]["analysis_loader_mode"] = json!("module");
         normalize_source_batch_profiles(&mut changed)?;
         assert!(merge_logical_profile(&first, &mut changed.remove(0)["profile"]).is_err());
+        Ok(())
+    }
+
+    /// The call-graph outcome of a semantic batch describes the dynamic sites
+    /// its owned bodies hold: a batch without any used no algorithm, a batch
+    /// whose VTA fell back did so for its own sites.  Batches therefore join
+    /// by union, sum, and weakest status instead of having to agree.
+    #[test]
+    fn go_semantic_batches_join_their_call_graph_outcome() -> Result<()> {
+        let logical = stable_id_from_value(
+            "profile",
+            &json!({"kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":["go:base","unit","semantic"]}),
+        );
+        let declared = |chunk: &str, outcome: Value| {
+            let mut properties = json!({
+                "analysis_unit_contract":V2,"analysis_base_profile_id":"go:base","analysis_unit_id":"unit","analysis_stage":"semantic",
+                "analysis_logical_profile_id":logical,"analysis_chunk_count":"3","analysis_chunk_index":"0","analysis_chunk_id":chunk,
+                "analysis_source_path_count":"1","analysis_context_path_count":"3",
+                "analysis_loader_kind":"package","analysis_loader_scope":"applied","analysis_loader_mode":"package",
+                "go_call_graph_program_scope":"package-with-declaration-deps","go_call_graph_requested":"vta",
+            });
+            for (key, value) in outcome.as_object().unwrap() {
+                properties[key] = value.clone();
+            }
+            json!({"event":"profile_declared","profile":{"id":format!("wire-{chunk}"),"language":"go","properties":properties}})
+        };
+        let batch = |chunk: &str, outcome: Value| -> Result<Value> {
+            let mut events = vec![declared(chunk, outcome)];
+            normalize_source_batch_profiles(&mut events)?;
+            Ok(events.remove(0)["profile"].clone())
+        };
+        let quiet = batch(
+            "a",
+            json!({
+                "go_call_graph_effective_algorithms":"","go_call_graph_vta_status":"not-applicable",
+                "go_call_graph_vta_site_count":"0","go_call_graph_vta_fallback_site_count":"0","go_call_graph_vta_fallback_reasons":"",
+            }),
+        )?;
+        let mut applied = batch(
+            "b",
+            json!({
+                "go_call_graph_effective_algorithms":"cha,vta","go_call_graph_vta_status":"applied",
+                "go_call_graph_vta_site_count":"4","go_call_graph_vta_fallback_site_count":"0","go_call_graph_vta_fallback_reasons":"",
+            }),
+        )?;
+        merge_logical_profile(&quiet, &mut applied)?;
+        assert_eq!(
+            applied["properties"]["go_call_graph_effective_algorithms"],
+            "cha,vta"
+        );
+        assert_eq!(applied["properties"]["go_call_graph_vta_status"], "applied");
+        assert_eq!(applied["properties"]["go_call_graph_vta_site_count"], "4");
+        let mut fallback = batch(
+            "c",
+            json!({
+                "go_call_graph_effective_algorithms":"cha","go_call_graph_vta_status":"fallback",
+                "go_call_graph_vta_site_count":"0","go_call_graph_vta_fallback_site_count":"2",
+                "go_call_graph_vta_fallback_reasons":"vta_package_scope_fallback",
+            }),
+        )?;
+        merge_logical_profile(&applied, &mut fallback)?;
+        assert_eq!(
+            fallback["properties"]["go_call_graph_effective_algorithms"],
+            "cha,vta"
+        );
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_status"],
+            "partial"
+        );
+        assert_eq!(fallback["properties"]["go_call_graph_vta_site_count"], "4");
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_fallback_site_count"],
+            "2"
+        );
+        assert_eq!(
+            fallback["properties"]["go_call_graph_vta_fallback_reasons"],
+            "vta_package_scope_fallback"
+        );
+        // The requested algorithm is configuration and still has to agree.
+        let mut requested = batch("d", json!({"go_call_graph_effective_algorithms":"cha"}))?;
+        requested["properties"]["go_call_graph_requested"] = json!("rta-cha");
+        assert!(merge_logical_profile(&quiet, &mut requested).is_err());
         Ok(())
     }
 
