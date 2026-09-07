@@ -36,7 +36,10 @@ pub const ANALYSIS_SPLIT_PLAN_CONTRACT_VERSION: &str = "depgraph-analysis-split-
 /// at least `loader.paths`, never fewer, and rejects a binding it cannot
 /// validate.  It reports in the [`ANALYSIS_LOADER_SCOPE_PROPERTY`] profile
 /// property whether it loaded exactly the requested scope or had to widen it,
-/// so the core can tell a real input split from an output-only one.
+/// so the core can tell a real input split from an output-only one.  Only
+/// such a worker is partitioned against the byte budgets of this contract
+/// ([`AnalysisAdapterBoundary::loader_scope`]); a worker without it keeps the
+/// file-count partition and the request identity it had before.
 pub const ANALYSIS_LOADER_SCOPE_CAPABILITY: &str = "analysis-loader-scope-v1";
 
 /// A Go worker that advertises this capability can type-check a bounded set of
@@ -275,12 +278,19 @@ pub struct AnalysisStageBoundary {
 pub struct AnalysisAdapterBoundary {
     pub adapter: AnalysisAdapter,
     pub id: String,
+    /// The worker advertised [`ANALYSIS_LOADER_SCOPE_CAPABILITY`]: it receives
+    /// the `split` binding and its ownership is partitioned against the byte
+    /// budgets of this contract.  Without it the ownership is partitioned by
+    /// file count alone, exactly as before this contract, so the requests of
+    /// such a worker keep their chunk identity and their checkpoints.
+    pub loader_scope: bool,
     pub stages: Vec<AnalysisStageBoundary>,
 }
 
 impl AnalysisAdapterBoundary {
     /// Current Go worker: syntax parses selected files; typed and semantic
-    /// stages load the complete module and cannot be split.
+    /// stages load the complete module and cannot be split.  The shipped
+    /// worker has not negotiated loader scope; see [`Self::with_loader_scope`].
     pub fn go_module_loader(typed_stage: bool) -> Self {
         let mut stages = vec![AnalysisStageBoundary {
             stage: AnalysisStage::Syntax,
@@ -318,16 +328,20 @@ impl AnalysisAdapterBoundary {
             } else {
                 "go-module-loader".to_owned()
             },
+            loader_scope: false,
             stages,
         }
     }
 
     /// Target Go boundary for issue #463: typed loading is bounded to packages
     /// with declaration references, and a large package's bodies are staged.
+    /// The bounded scope only reaches the worker through the `split` binding,
+    /// so this boundary always requires the loader-scope capability.
     pub fn go_package_loader() -> Self {
         Self {
             adapter: AnalysisAdapter::Go,
             id: "go-package-loader".to_owned(),
+            loader_scope: true,
             stages: vec![
                 AnalysisStageBoundary {
                     stage: AnalysisStage::Syntax,
@@ -361,11 +375,13 @@ impl AnalysisAdapterBoundary {
     }
 
     /// Current Web worker: syntax parses selected files; the semantic stage
-    /// builds the full project program and only partitions its output.
+    /// builds the full project program and only partitions its output.  The
+    /// shipped worker has not negotiated loader scope.
     pub fn web_project_loader() -> Self {
         Self {
             adapter: AnalysisAdapter::Web,
             id: "web-project-loader".to_owned(),
+            loader_scope: false,
             stages: vec![
                 AnalysisStageBoundary {
                     stage: AnalysisStage::Syntax,
@@ -389,7 +405,15 @@ impl AnalysisAdapterBoundary {
         }
     }
 
-    /// Boundaries of the workers shipped with this core.
+    /// The same boundary for a worker that did (not) advertise
+    /// [`ANALYSIS_LOADER_SCOPE_CAPABILITY`].
+    pub fn with_loader_scope(mut self, loader_scope: bool) -> Self {
+        self.loader_scope = loader_scope;
+        self
+    }
+
+    /// Boundaries of the workers shipped with this core, as they negotiate
+    /// today: neither advertises loader scope yet.
     pub fn current_defaults() -> Vec<Self> {
         vec![Self::go_module_loader(true), Self::web_project_loader()]
     }
@@ -398,17 +422,23 @@ impl AnalysisAdapterBoundary {
     /// worker did not negotiate unit execution at all.
     pub fn for_capabilities(adapter: AnalysisAdapter, capabilities: &[String]) -> Option<Self> {
         let has = |name: &str| capabilities.iter().any(|capability| capability == name);
+        let loader_scope = has(ANALYSIS_LOADER_SCOPE_CAPABILITY);
         match adapter {
             AnalysisAdapter::Go if has("analysis-source-batch-v1") => {
-                if has(ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY) && has("analysis-unit-typed-v1") {
+                let typed_stage = has("analysis-unit-typed-v1");
+                // A bounded package scope only reaches the worker through the
+                // `split` binding. A worker that advertises the package loader
+                // without loader scope never receives that binding and loads
+                // whole modules, so it is planned as a module loader.
+                if loader_scope && typed_stage && has(ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY) {
                     Some(Self::go_package_loader())
                 } else {
-                    Some(Self::go_module_loader(has("analysis-unit-typed-v1")))
+                    Some(Self::go_module_loader(typed_stage).with_loader_scope(loader_scope))
                 }
             }
             AnalysisAdapter::Go if has("analysis-unit-v1") => Some(Self::go_module_loader(false)),
             AnalysisAdapter::Web if has("analysis-source-batch-v1") => {
-                Some(Self::web_project_loader())
+                Some(Self::web_project_loader().with_loader_scope(loader_scope))
             }
             _ => None,
         }
@@ -422,6 +452,16 @@ impl AnalysisAdapterBoundary {
         ensure!(
             !self.stages.is_empty(),
             "analysis adapter boundary {} declares no stages",
+            self.id
+        );
+        // A loader bounded below the whole context beyond the syntax stage is
+        // only executable when the binding conveys that scope to the worker.
+        ensure!(
+            self.loader_scope
+                || self.stages.iter().all(|stage| {
+                    stage.stage == AnalysisStage::Syntax || stage.loader_kind.loads_whole_context()
+                }),
+            "analysis adapter boundary {} bounds a loader without negotiated loader scope",
             self.id
         );
         for pair in self.stages.windows(2) {
@@ -1099,7 +1139,13 @@ pub fn plan_analysis_split(
             for unit in &units {
                 let group = group_by_unit.get(unit.id.as_str());
                 let context = &contexts[unit.id.as_str()];
-                let mut batches = partition(unit, stage_boundary, &input.budget, context);
+                let mut batches = partition(
+                    unit,
+                    stage_boundary,
+                    boundary.loader_scope,
+                    &input.budget,
+                    context,
+                );
                 apply_refinements(
                     unit,
                     stage_boundary,
@@ -1495,9 +1541,16 @@ fn granules(
     }
 }
 
+/// Partition the ownership of one stage along the boundary's granularity.
+/// The byte budget applies only to a worker that negotiated loader scope;
+/// a worker that did not is partitioned by file count alone, exactly as
+/// before this contract, so its requests keep their chunk identity.  Its
+/// batches above the byte budget are still reported over budget by
+/// [`build_execution_unit`], and a refinement can still divide them.
 fn partition(
     unit: &AnalysisUnit,
     boundary: &AnalysisStageBoundary,
+    byte_budget: bool,
     budget: &AnalysisSplitBudget,
     context: &UnitContext,
 ) -> Vec<Batch> {
@@ -1516,7 +1569,8 @@ fn partition(
     for granule in granules {
         let files = granule.paths.len() as u64;
         let exceeds_files = current_files + files > budget.max_unit_source_files;
-        let exceeds_bytes = current_bytes + granule.bytes > budget.max_unit_source_bytes;
+        let exceeds_bytes =
+            byte_budget && current_bytes + granule.bytes > budget.max_unit_source_bytes;
         if !current.is_empty() && (exceeds_files || exceeds_bytes) {
             if exceeds_files {
                 reasons.insert(AnalysisSplitReason::SourceFileBudget);

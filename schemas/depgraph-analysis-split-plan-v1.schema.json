@@ -97,6 +97,7 @@
       "required": [
         "adapter",
         "id",
+        "loader_scope",
         "stages"
       ],
       "properties": {
@@ -105,6 +106,10 @@
         },
         "id": {
           "$ref": "#/$defs/text"
+        },
+        "loader_scope": {
+          "description": "The worker advertised analysis-loader-scope-v1: it receives the split binding and its ownership is partitioned against the byte budgets. Without it the ownership is partitioned by file count alone, exactly as before this contract, so its requests keep their chunk identity.",
+          "type": "boolean"
         },
         "stages": {
           "type": "array",
