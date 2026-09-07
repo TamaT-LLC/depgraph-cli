@@ -179,7 +179,11 @@ with a complete collection; plan estimates bound the measured range work; and
 the diagnostics serialize with a stable shape. `crates/depgraph-mcp/tests/process.rs`
 checks that `health_summary_get` / `health_findings_list` report the same
 `execution` accounting as the CLI, accept `allow_partial_ranges`, and reject a
-non-boolean value.
+non-boolean value. `crates/depgraph-cli/tests/cli.rs`
+(`issue_467_health_reports_ranged_execution_for_plain_and_whole_snapshot_for_layered`)
+checks that a plain snapshot is collected in ranges with one `scan` layer while
+a runtime-session child reports `mode: whole_snapshot`, the `runtime_sessions`
+and `scan` layers, and zero ranges.
 
 The item of #467 that refers to the original private test repository cannot be
 verified from this public checkout; the maintainer must run
