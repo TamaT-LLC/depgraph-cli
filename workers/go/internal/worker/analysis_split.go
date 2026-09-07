@@ -210,10 +210,10 @@ func (request AnalysisUnitRequest) scanOptions(buildCacheDir string) scanOptions
 // requested loader scope. A syntax request is only valid when its `files`
 // loader names exactly `source_paths`, which is what the parser reads, so its
 // scope is applied. A `module` binding is applied by the module-whole-program
-// load. A `package` binding is applied when the hybrid loader bounded the load
-// to the target packages and satisfied every dependency from export data; it
-// is widened when a test-recompiled dependency variant had to be read from
-// source, or when a narrower `files` request was honoured by loading more.
+// load. A `package` binding is applied when the hybrid loader type-checked the
+// target packages (`Status==loaded`) and satisfied every dependency from
+// export data; it is widened when a test-recompiled dependency variant had to
+// be read from source, or when the package load fell back.
 func (request AnalysisUnitRequest) loaderScopeOutcome(mode goLoaderMode, loaded goPackagesInventory) string {
 	if request.Split == nil {
 		return ""
@@ -227,7 +227,7 @@ func (request AnalysisUnitRequest) loaderScopeOutcome(mode goLoaderMode, loaded 
 		case "module", "repository", "project":
 			return AnalysisLoaderScopeApplied
 		case "package":
-			if mode == goLoaderModePackage && (loaded.Loader == nil || loaded.Loader.Metrics.ReferencesSource == 0) {
+			if mode == goLoaderModePackage && loaded.Status == "loaded" && loaded.Loader != nil && loaded.Loader.Metrics.ReferencesSource == 0 {
 				return AnalysisLoaderScopeApplied
 			}
 		}

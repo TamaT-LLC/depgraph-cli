@@ -184,6 +184,23 @@ func TestAnalysisSplitBindingSyntaxScopeIsExactWhileLaterStagesMayCoverMore(t *t
 	if got := syntax.loaderScopeOutcome("", goPackagesInventory{}); got != AnalysisLoaderScopeApplied {
 		t.Fatalf("analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeApplied)
 	}
+
+	packageBound := semantic
+	packageBinding := *semantic.Split
+	packageBound.Split = &packageBinding
+	packageBound.Split.Loader.Kind = "package"
+	packageBound.Split.Loader.ReferenceDepth = "declarations"
+	if got := packageBound.loaderScopeOutcome(goLoaderModePackage, goPackagesInventory{}); got != AnalysisLoaderScopeWidened {
+		t.Fatalf("failed package load analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeWidened)
+	}
+	appliedLoad := goPackagesInventory{Status: "loaded", Loader: &goLoaderReport{Metrics: goLoaderMetrics{ReferencesSource: 0}}}
+	if got := packageBound.loaderScopeOutcome(goLoaderModePackage, appliedLoad); got != AnalysisLoaderScopeApplied {
+		t.Fatalf("export-only package load analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeApplied)
+	}
+	sourceFallback := goPackagesInventory{Status: "loaded", Loader: &goLoaderReport{Metrics: goLoaderMetrics{ReferencesSource: 1}}}
+	if got := packageBound.loaderScopeOutcome(goLoaderModePackage, sourceFallback); got != AnalysisLoaderScopeWidened {
+		t.Fatalf("source-reference package load analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeWidened)
+	}
 }
 
 func TestReadAnalysisUnitRequestAcceptsSplitBindingAndStaysStrict(t *testing.T) {
@@ -360,7 +377,12 @@ func TestAnalysisSplitBindingIsEchoedWithoutChangingResultsOrIdentity(t *testing
 		t.Fatalf("typed request with a package binding failed: %v", err)
 	}
 	if bounded.Profile.Properties["go_packages_status"] != "loaded" {
-		t.Skipf("constrained Go environment unavailable: %+v", bounded.Diagnostics)
+		for _, diagnostic := range bounded.Diagnostics {
+			if diagnostic.Code == "go_packages_environment" {
+				t.Skipf("constrained Go environment unavailable: %+v", bounded.Diagnostics)
+			}
+		}
+		t.Fatalf("package-bound typed load failed: status=%s diagnostics=%+v", bounded.Profile.Properties["go_packages_status"], bounded.Diagnostics)
 	}
 	for key, want := range map[string]string{
 		"analysis_loader_scope":           AnalysisLoaderScopeApplied,
