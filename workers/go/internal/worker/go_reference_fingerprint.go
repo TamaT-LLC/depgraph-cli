@@ -87,7 +87,7 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 				digest, ok := digests[confined]
 				if !ok {
 					var err error
-					digest, err = hashReferenceFile(confined)
+					digest, err = hashReferenceFile(root, confined)
 					if errors.Is(err, errReferenceOpenNoFollowUnavailable) {
 						reasons["reference-file-nofollow-unavailable"] = true
 						incomplete = true
@@ -148,13 +148,13 @@ func computeGoReferenceFingerprint(root string, modules []Module, targets []*pac
 	}
 }
 
-func goReferenceFileDigest(path string) (string, bool) {
-	digest, err := hashReferenceFile(path)
+func goReferenceFileDigest(root, path string) (string, bool) {
+	digest, err := hashReferenceFile(root, path)
 	return digest, err == nil
 }
 
-func hashReferenceFile(path string) (string, error) {
-	file, err := openReferenceFile(path)
+func hashReferenceFile(root, path string) (string, error) {
+	file, err := openReferenceFile(root, path)
 	if err != nil {
 		return "", err
 	}

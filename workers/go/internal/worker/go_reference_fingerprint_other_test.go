@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !linux
 
 package worker
 
@@ -12,14 +12,14 @@ import (
 func TestOpenReferenceFileFailsClosedWithoutNoFollow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "real.go")
 	writeTestFile(t, path, "package p\n")
-	file, err := openReferenceFile(path)
+	file, err := openReferenceFile(filepath.Dir(path), path)
 	if file != nil {
 		_ = file.Close()
 	}
 	if !errors.Is(err, errReferenceOpenNoFollowUnavailable) {
 		t.Fatalf("openReferenceFile = (%v, %v)", file, err)
 	}
-	if _, ok := goReferenceFileDigest(path); ok {
+	if _, ok := goReferenceFileDigest(filepath.Dir(path), path); ok {
 		t.Fatal("digest succeeded without a no-follow open")
 	}
 }

@@ -30,9 +30,10 @@ func referenceFingerprintWithInRepoDep(t *testing.T) goReferenceFingerprint {
 }
 
 func TestOpenReferenceFileOpensRegularFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "real.go")
+	root := t.TempDir()
+	path := filepath.Join(root, "real.go")
 	writeTestFile(t, path, "package p\n")
-	file, err := openReferenceFile(path)
+	file, err := openReferenceFile(root, path)
 	if errors.Is(err, errReferenceOpenNoFollowUnavailable) {
 		t.Skip("no-follow open is unavailable on this platform")
 	}
@@ -57,7 +58,7 @@ func TestOpenReferenceFileRejectsFinalComponentSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	file, err := openReferenceFile(link)
+	file, err := openReferenceFile(dir, link)
 	if file != nil {
 		_ = file.Close()
 		t.Fatal("expected symlink open to fail")
@@ -65,17 +66,54 @@ func TestOpenReferenceFileRejectsFinalComponentSymlink(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected symlink open to fail")
 	}
-	if _, ok := goReferenceFileDigest(link); ok {
+	if _, ok := goReferenceFileDigest(dir, link); ok {
 		t.Fatal("digest followed a final-component symlink")
 	}
 }
 
-func TestGoReferenceFileDigestHashesOpenedHandle(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "real.go")
-	writeTestFile(t, path, "package p\n")
-	digest, ok := goReferenceFileDigest(path)
+func TestOpenReferenceFileRejectsParentDirectorySymlinkSwap(t *testing.T) {
+	root := canonicalTestRoot(t, t.TempDir())
+	parent := filepath.Join(root, "pkg")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(parent, "dep.go")
+	writeTestFile(t, inside, "package dep\n")
+	if _, err := openReferenceFile(root, inside); errors.Is(err, errReferenceOpenNoFollowUnavailable) {
+		t.Skip("no-follow open is unavailable on this platform")
+	}
+	confined, ok := confinedMetadataFile(root, inside)
 	if !ok {
-		if _, err := openReferenceFile(path); errors.Is(err, errReferenceOpenNoFollowUnavailable) {
+		t.Fatal("confinement failed")
+	}
+	outsideDir := t.TempDir()
+	writeTestFile(t, filepath.Join(outsideDir, "dep.go"), "package leaked\nconst Secret = true\n")
+	if err := os.Rename(parent, parent+".orig"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, parent); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	file, err := openReferenceFile(root, confined)
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("parent symlink swap was followed")
+	}
+	if err == nil {
+		t.Fatal("parent symlink swap was followed")
+	}
+	if _, ok := goReferenceFileDigest(root, confined); ok {
+		t.Fatal("digest followed a swapped parent directory")
+	}
+}
+
+func TestGoReferenceFileDigestHashesOpenedHandle(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "real.go")
+	writeTestFile(t, path, "package p\n")
+	digest, ok := goReferenceFileDigest(root, path)
+	if !ok {
+		if _, err := openReferenceFile(root, path); errors.Is(err, errReferenceOpenNoFollowUnavailable) {
 			t.Skip("no-follow open is unavailable on this platform")
 		}
 		t.Fatal("digest missing for a regular file")
