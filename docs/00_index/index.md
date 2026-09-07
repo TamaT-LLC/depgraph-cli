@@ -58,6 +58,7 @@
 
 ## 更新履歴
 
+- 2026-09-07: Issue #467としてsnapshot-scoped healthの読み込み・集計をStore range単位へ事前分割し（`GraphSnapshot`全体を構築しないplanner、range別budget・checkpoint・resume、cross-range参照、opt-in partial view）、`PROJ-ARC-001-ADR-009`の「Bounded range execution」節、MCP `execution`/`partial_ranges`/`allow_partial_ranges`、[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md)のranged health fixture計測を追加
 - 2026-08-30: code-health Agent dogfood v2の実配布検証用`v0.5.4-rc.1`リリースノートを追加
 - 2026-08-30: Issue #440としてhotspotの5層scoreを`hotspot_scores`へ構造化し、MCP schema/catalog goldenとCLI/MCP parity、`probable`上限のconfidence意味論、reason非fingerprint、path依存ID／rename deferredをADRへ追加
 - 2026-08-28: Agent dogfood v2 corpus（code health）と pending-release 契約を追加

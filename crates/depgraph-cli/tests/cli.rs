@@ -1933,6 +1933,104 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
     );
 }
 
+/// #467: a plain snapshot is collected in store ranges; a layered snapshot
+/// (here a runtime-session child) keeps the whole-snapshot path and says so in
+/// the execution diagnostics instead of silently changing overlay semantics.
+#[test]
+fn issue_467_health_reports_ranged_execution_for_plain_and_whole_snapshot_for_layered() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    seed_runtime_trace_snapshot(&store_path, root.path());
+    let health = || {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(root.path())
+            .args(["--store", store_path.to_str().unwrap(), "health", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["command"], "health");
+        assert!(envelope.get("partial").is_none(), "{envelope}");
+        envelope["data"].clone()
+    };
+
+    let plain = health();
+    assert_eq!(plain["partial_ranges"], false, "{plain}");
+    assert_eq!(plain["execution"]["mode"], "ranged", "{plain}");
+    assert_eq!(
+        plain["execution"]["layers"],
+        json!([{ "kind": "scan", "scan_id": "runtime-base" }]),
+        "{plain}"
+    );
+    assert!(plain["execution"]["plan_digest"].is_string(), "{plain}");
+    assert_eq!(
+        plain["execution"]["ranges"]["total"], plain["execution"]["ranges"]["completed"],
+        "{plain}"
+    );
+    assert!(plain["execution"]["ranges"]["total"].as_u64().unwrap() >= 1);
+    assert!(
+        plain["execution"]["checkpoints"]["enabled"]
+            .as_bool()
+            .unwrap()
+    );
+
+    let trace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depgraph-core/tests/fixtures/runtime-trace-v1.golden.json");
+    fs::copy(&trace, root.path().join("runtime-trace.json")).unwrap();
+    let import = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "runtime",
+            "import",
+            "runtime-trace.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let import: serde_json::Value = serde_json::from_slice(&import.stdout).unwrap();
+    let session_id = import["data"]["session_id"].as_str().unwrap().to_owned();
+
+    let layered = health();
+    assert_eq!(layered["partial_ranges"], false, "{layered}");
+    assert_eq!(layered["execution"]["mode"], "whole_snapshot", "{layered}");
+    assert_eq!(
+        layered["execution"]["layers"],
+        json!([
+            { "kind": "runtime_sessions", "session_ids": [session_id] },
+            { "kind": "scan", "scan_id": "runtime-base" },
+        ]),
+        "{layered}"
+    );
+    assert!(
+        layered["execution"].get("plan_digest").is_none(),
+        "{layered}"
+    );
+    assert_eq!(layered["execution"]["ranges"]["total"], 0, "{layered}");
+    assert_eq!(
+        layered["execution"]["checkpoints"]["written"], 0,
+        "{layered}"
+    );
+    assert_eq!(
+        layered["execution"]["work"]["range_limit"], plain["execution"]["work"]["range_limit"],
+        "{layered}"
+    );
+    assert_ne!(layered["snapshot_id"], plain["snapshot_id"]);
+}
+
 #[test]
 fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
     let root = tempfile::tempdir().unwrap();

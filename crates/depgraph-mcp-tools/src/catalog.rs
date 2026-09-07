@@ -574,8 +574,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_summary_get",
-        "Summarize snapshot-scoped code-health findings. Confidence is confirmed, probable, or indeterminate. Summary excludes audit and hotspot findings. confirmed is reserved for unused-file, unused-export, unused-type, and unused-dependency when every applicable profile is semantic-complete and no hard blocker remains; test-only-dependency and manifest-mismatch are capped at probable.",
-        ["snapshot", "kinds"],
+        "Summarize snapshot-scoped code-health findings. Confidence is confirmed, probable, or indeterminate. Summary excludes audit and hotspot findings. confirmed is reserved for unused-file, unused-export, unused-type, and unused-dependency when every applicable profile is semantic-complete and no hard blocker remains; test-only-dependency and manifest-mismatch are capped at probable. Plain snapshots are analyzed in bounded store ranges; execution reports the ranges, per-phase work, and checkpoint reuse. allow_partial_ranges opts into a partial view when some ranges fail after re-splitting: partial becomes true, every finding carries an incomplete_coverage blocker, and the digest never matches a complete collection.",
+        ["snapshot", "kinds", "allow_partial_ranges"],
         [CliAction::HealthSummary],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -583,12 +583,13 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_findings_list",
-        "List snapshot-scoped unused-file, unused-export, unused-type, unused-dependency, test-only-dependency, and manifest-mismatch findings. confirmed is reserved for the four unused kinds; test-only-dependency and manifest-mismatch are capped at probable. Read blockers before treating a finding as unused.",
+        "List snapshot-scoped unused-file, unused-export, unused-type, unused-dependency, test-only-dependency, and manifest-mismatch findings. confirmed is reserved for the four unused kinds; test-only-dependency and manifest-mismatch are capped at probable. Read blockers before treating a finding as unused. Plain snapshots are analyzed in bounded store ranges; execution reports the ranges, per-phase work, and checkpoint reuse. allow_partial_ranges opts into a partial view when some ranges fail after re-splitting: partial becomes true, every finding carries an incomplete_coverage blocker, and the digest never matches a complete collection.",
         [
             "snapshot",
             "kinds",
             "severities",
             "confidences",
+            "allow_partial_ranges",
             "cursor",
             "limit"
         ],
@@ -1136,6 +1137,10 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "acknowledgement" => json!({
             "type": "boolean",
             "description": "must be true after independent Agent-host human confirmation; it does not grant authorization or capabilities, or replace that confirmation."
+        }),
+        "allow_partial_ranges" => json!({
+            "type": "boolean",
+            "description": "Return the findings of the completed health ranges when some ranges fail after re-splitting, instead of a resource-exhausted error. The result is marked partial, every finding carries an incomplete_coverage blocker, and no finding is confirmed. Defaults to false."
         }),
         "profile_budget" => json!({"type": "integer", "minimum": 1, "maximum": 32}),
         "depth" => json!({"type": "integer", "minimum": 0}),

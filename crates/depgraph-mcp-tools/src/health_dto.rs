@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 
-use depgraph_core::health::{BASIS_POINTS_MAX, hotspot_weighted_total};
+use depgraph_core::health::{
+    BASIS_POINTS_MAX, hotspot_weighted_total,
+    ranged::{HealthExecutionMode, HealthRangeDiagnostics},
+};
 use depgraph_core::service::{
     MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_EVIDENCE_PER_FINDING,
     MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
@@ -783,6 +786,103 @@ pub struct AgentHealthCoverage {
     candidates: u64,
 }
 
+/// How a snapshot-scoped health collection was executed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthExecutionMode {
+    /// Planned ranges over one scan's stored tables under the per-range budget.
+    Ranged,
+    /// Whole-snapshot path kept for layered inputs (build deltas, runtime
+    /// sessions, semantic no-op overlays).
+    WholeSnapshot,
+}
+
+/// Range accounting of one ranged collection; all zero for whole-snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthRangeCounts {
+    total: u32,
+    completed: u32,
+    reused: u32,
+    resplit: u32,
+    failed: u32,
+    interrupted: u32,
+}
+
+/// Work steps charged per phase; `ranges_max` never exceeds `range_limit`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthWorkReport {
+    planner: u64,
+    global_context: u64,
+    ranges_total: u64,
+    ranges_max: u64,
+    range_limit: u64,
+    dependencies_load: u64,
+    dependencies: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthCheckpointReport {
+    enabled: bool,
+    written: u32,
+    reused: u32,
+    write_failures: u32,
+}
+
+/// Execution accounting of a snapshot-scoped health collection: mode, range
+/// counts, per-phase work, and checkpoint reuse. Process-level observations
+/// (peak RSS, plan digest, reconstruction layers) are CLI-only.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHealthExecution {
+    mode: AgentHealthExecutionMode,
+    ranges: AgentHealthRangeCounts,
+    work: AgentHealthWorkReport,
+    checkpoints: AgentHealthCheckpointReport,
+}
+
+impl AgentHealthExecution {
+    #[must_use]
+    pub const fn from_core(source: &HealthRangeDiagnostics) -> Self {
+        Self {
+            mode: match source.mode {
+                HealthExecutionMode::Ranged => AgentHealthExecutionMode::Ranged,
+                HealthExecutionMode::WholeSnapshot => AgentHealthExecutionMode::WholeSnapshot,
+            },
+            ranges: AgentHealthRangeCounts {
+                total: source.ranges.total,
+                completed: source.ranges.completed,
+                reused: source.ranges.reused,
+                resplit: source.ranges.resplit,
+                failed: source.ranges.failed,
+                interrupted: source.ranges.interrupted,
+            },
+            work: AgentHealthWorkReport {
+                planner: source.work.planner,
+                global_context: source.work.global_context,
+                ranges_total: source.work.ranges_total,
+                ranges_max: source.work.ranges_max,
+                range_limit: source.work.range_limit,
+                dependencies_load: source.work.dependencies_load,
+                dependencies: source.work.dependencies,
+            },
+            checkpoints: AgentHealthCheckpointReport {
+                enabled: source.checkpoints.enabled,
+                written: source.checkpoints.written,
+                reused: source.checkpoints.reused,
+                write_failures: source.checkpoints.write_failures,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> AgentHealthExecutionMode {
+        self.mode
+    }
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHealthSummary {
@@ -790,9 +890,17 @@ pub struct AgentHealthSummary {
     counts_by_kind: Vec<AgentHealthNamedCount>,
     counts_by_confidence: Vec<AgentHealthNamedCount>,
     coverage: AgentHealthCoverage,
+    /// `true` only for the opt-in `allow_partial_ranges` view of an
+    /// incomplete range set; every finding then carries an
+    /// `incomplete_coverage` blocker and the digest differs from a complete
+    /// collection. Distinct from the partial-attempt (`attempt:`) contract,
+    /// which describes unanalysed scan units rather than health ranges.
+    partial_ranges: bool,
+    execution: AgentHealthExecution,
 }
 
 impl AgentHealthSummary {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         collection_digest: &str,
         counts_by_kind: impl IntoIterator<Item = (String, u64)>,
@@ -801,6 +909,8 @@ impl AgentHealthSummary {
         files_skipped: u64,
         unresolved: u64,
         candidates: u64,
+        partial_ranges: bool,
+        execution: AgentHealthExecution,
     ) -> Result<Self, ContractBuildError> {
         Ok(Self {
             collection_digest: parse_id(collection_digest)?,
@@ -815,12 +925,24 @@ impl AgentHealthSummary {
                 unresolved,
                 candidates,
             },
+            partial_ranges,
+            execution,
         })
     }
 
     #[must_use]
     pub const fn collection_digest(&self) -> &AgentId {
         &self.collection_digest
+    }
+
+    #[must_use]
+    pub const fn partial_ranges(&self) -> bool {
+        self.partial_ranges
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &AgentHealthExecution {
+        &self.execution
     }
 }
 
@@ -831,6 +953,8 @@ struct AgentHealthSummaryWire {
     counts_by_kind: Vec<AgentHealthNamedCount>,
     counts_by_confidence: Vec<AgentHealthNamedCount>,
     coverage: AgentHealthCoverage,
+    partial_ranges: bool,
+    execution: AgentHealthExecution,
 }
 
 impl<'de> Deserialize<'de> for AgentHealthSummary {
@@ -844,6 +968,8 @@ impl<'de> Deserialize<'de> for AgentHealthSummary {
             counts_by_kind: wire.counts_by_kind,
             counts_by_confidence: wire.counts_by_confidence,
             coverage: wire.coverage,
+            partial_ranges: wire.partial_ranges,
+            execution: wire.execution,
         })
     }
 }
@@ -897,16 +1023,25 @@ impl<'de> Deserialize<'de> for AgentHealthFindingDetail {
 pub struct AgentHealthFindingsPage {
     collection_digest: AgentId,
     findings: Page<AgentHealthFinding>,
+    /// `true` only for the opt-in `allow_partial_ranges` view of an
+    /// incomplete range set; every listed finding then carries an
+    /// `incomplete_coverage` blocker and is indeterminate.
+    partial_ranges: bool,
+    execution: AgentHealthExecution,
 }
 
 impl AgentHealthFindingsPage {
     pub fn try_new(
         collection_digest: &str,
         findings: Page<AgentHealthFinding>,
+        partial_ranges: bool,
+        execution: AgentHealthExecution,
     ) -> Result<Self, ContractBuildError> {
         Ok(Self {
             collection_digest: parse_id(collection_digest)?,
             findings,
+            partial_ranges,
+            execution,
         })
     }
 
@@ -919,6 +1054,16 @@ impl AgentHealthFindingsPage {
     pub const fn findings(&self) -> &Page<AgentHealthFinding> {
         &self.findings
     }
+
+    #[must_use]
+    pub const fn partial_ranges(&self) -> bool {
+        self.partial_ranges
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &AgentHealthExecution {
+        &self.execution
+    }
 }
 
 #[derive(Deserialize)]
@@ -926,6 +1071,8 @@ impl AgentHealthFindingsPage {
 struct AgentHealthFindingsPageWire {
     collection_digest: AgentId,
     findings: Page<AgentHealthFinding>,
+    partial_ranges: bool,
+    execution: AgentHealthExecution,
 }
 
 impl<'de> Deserialize<'de> for AgentHealthFindingsPage {
@@ -937,6 +1084,8 @@ impl<'de> Deserialize<'de> for AgentHealthFindingsPage {
         Ok(Self {
             collection_digest: wire.collection_digest,
             findings: wire.findings,
+            partial_ranges: wire.partial_ranges,
+            execution: wire.execution,
         })
     }
 }

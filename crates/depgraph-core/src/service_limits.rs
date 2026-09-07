@@ -36,6 +36,21 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 /// Maximum snapshot-scoped health findings retained for one request.
 pub const MAX_HEALTH_FINDINGS: usize = 10_000;
 
+/// Maximum health execution ranges (planned plus re-split halves) for one
+/// snapshot-scoped request. Each range and each phase is bounded by
+/// [`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`]; this caps the total.
+pub const MAX_HEALTH_RANGES: u32 = 256;
+
+/// Maximum rows the health range planner may read (aggregates and sorted
+/// index scans only) before failing closed.
+pub const MAX_HEALTH_PLANNER_ROWS: u64 = 4 * MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS as u64;
+
+/// Maximum times one health range that overran its estimate is split in half.
+pub const MAX_HEALTH_RANGE_RESPLIT_DEPTH: u8 = 4;
+
+/// Upper bound of one health range checkpoint file.
+pub const MAX_HEALTH_RANGE_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Maximum blockers retained on one health finding.
 pub const MAX_HEALTH_BLOCKERS_PER_FINDING: usize = 32;
 

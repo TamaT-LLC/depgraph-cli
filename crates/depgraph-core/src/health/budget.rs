@@ -18,6 +18,10 @@ impl HealthAnalysisBudget {
         Self { used: 0, maximum }
     }
 
+    pub(crate) const fn used(&self) -> usize {
+        self.used
+    }
+
     pub(crate) fn step(
         &mut self,
         is_cancelled: &mut impl FnMut() -> bool,
