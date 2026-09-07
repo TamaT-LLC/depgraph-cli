@@ -2860,8 +2860,8 @@ mod tests {
     #[test]
     fn intermediate_state_bound_rejects_a_bound_moved_to_another_job() {
         let ci = checked_in_ci_workflow();
-        let rust_job = "  rust:\n    runs-on: ubuntu-24.04\n    steps:\n";
-        assert_eq!(ci.matches(rust_job).count(), 1);
+        let web_job = "  web:\n    runs-on: ubuntu-24.04\n    defaults:\n";
+        assert_eq!(ci.matches(web_job).count(), 1);
         let drift = ci
             .replacen(
                 WINDOWS_SMOKE_BOUND,
@@ -2869,15 +2869,15 @@ mod tests {
                 1,
             )
             .replacen(
-                rust_job,
+                web_job,
                 concat!(
-                    "  rust:\n",
+                    "  web:\n",
                     "    runs-on: ubuntu-24.04\n",
                     "    env:\n",
                     "      CARGO_INCREMENTAL: \"0\"\n",
                     "      CARGO_PROFILE_DEV_DEBUG: \"0\"\n",
                     "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n",
-                    "    steps:\n",
+                    "    defaults:\n",
                 ),
                 1,
             );

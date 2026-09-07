@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -34,7 +34,11 @@ const MCP_SERVER_DIRECT_DEPENDENCIES: &[&str] = &[
     "tokio",
     "tracing",
     "tracing-subscriber",
+    WORKSPACE_HACK_PACKAGE_NAME,
 ];
+/// The hakari-managed crate that pins one third-party feature unification for
+/// the whole workspace. See `.config/hakari.toml`.
+pub(crate) const WORKSPACE_HACK_PACKAGE_NAME: &str = "workspace-hack";
 const RUST_SYSROOT_SBOM_PACKAGE_NAME: &str = depgraph_core::RUST_SYSROOT_SBOM_PACKAGE_NAME;
 const FORBIDDEN_RUST_ANALYZER_DEPENDENCIES: &[&str] = &[
     "ra_ap_flycheck",
@@ -1110,9 +1114,22 @@ pub(crate) fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyP
         pending.push_back(roots[0].to_owned());
     }
 
+    let workspace_hack = WorkspaceHackIdentity::from_metadata(metadata)?;
     let mut reachable = BTreeSet::new();
     while let Some(id) = pending.pop_front() {
         if !reachable.insert(id.clone()) {
+            continue;
+        }
+        // The hakari workspace-hack crate only pins one feature unification for
+        // the build graph; it links nothing into a shipped executable. Its
+        // dependency lines are the union of every workspace member's normal,
+        // build, and dev dependencies, so traversing through it would put
+        // test-only and xtask-only crates into the runtime SBOM and license
+        // inventory.
+        if packages_by_id
+            .get(&id)
+            .is_some_and(|package| workspace_hack.matches(package))
+        {
             continue;
         }
         let node = nodes_by_id
@@ -1150,6 +1167,47 @@ pub(crate) fn cargo_runtime_packages(metadata: &Value) -> Result<Vec<DependencyP
             }))
         })
         .collect()
+}
+
+/// Identifies the checked-in hakari-managed crate every workspace member
+/// depends on. Only the workspace member whose manifest is
+/// `<workspace_root>/workspace-hack/Cargo.toml` qualifies; a registry package
+/// or another local path package that reused the name is still traversed like
+/// any other dependency, so its runtime closure stays in the inventory.
+struct WorkspaceHackIdentity {
+    manifest_path: PathBuf,
+    workspace_members: BTreeSet<String>,
+}
+
+impl WorkspaceHackIdentity {
+    fn from_metadata(metadata: &Value) -> Result<Self> {
+        let workspace_root = metadata["workspace_root"]
+            .as_str()
+            .context("cargo metadata has no workspace root")?;
+        let workspace_members = metadata["workspace_members"]
+            .as_array()
+            .context("cargo metadata has no workspace member list")?
+            .iter()
+            .filter_map(|member| Some(member.as_str()?.to_owned()))
+            .collect();
+        Ok(Self {
+            manifest_path: Path::new(workspace_root)
+                .join(WORKSPACE_HACK_PACKAGE_NAME)
+                .join("Cargo.toml"),
+            workspace_members,
+        })
+    }
+
+    fn matches(&self, package: &Value) -> bool {
+        package["name"] == WORKSPACE_HACK_PACKAGE_NAME
+            && package["source"].is_null()
+            && package["id"]
+                .as_str()
+                .is_some_and(|id| self.workspace_members.contains(id))
+            && package["manifest_path"]
+                .as_str()
+                .is_some_and(|manifest_path| Path::new(manifest_path) == self.manifest_path)
+    }
 }
 
 pub(crate) fn web_runtime_packages(inventory: &Value) -> Result<Vec<DependencyPackage>> {
