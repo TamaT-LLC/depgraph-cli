@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -68,7 +69,8 @@ var analysisReferenceDepths = map[string]struct{}{
 }
 
 // Validate checks the binding against the request it is attached to. Every
-// owned source path must be inside the loader scope, reference paths must be
+// owned source path must be inside the loader scope, a syntax request's
+// `files` loader must name exactly the owned paths, reference paths must be
 // disjoint from loaded paths, and `input_split` must agree with the presence
 // of reference-only inputs so an output-only split cannot pose as a bounded
 // loader.
@@ -119,6 +121,17 @@ func (binding AnalysisSplitBinding) Validate(request AnalysisUnitRequest) error 
 	for _, sourcePath := range request.SourcePaths {
 		if _, ok := loaded[sourcePath]; !ok {
 			return fmt.Errorf("analysis unit request source path %q is not included in split.loader.paths", sourcePath)
+		}
+	}
+	// The syntax stage parses exactly the owned files. A binding that asks it
+	// to load more than source_paths would be honoured by loading less than
+	// requested, which the contract forbids, so it is rejected up front.
+	if request.Stage == AnalysisUnitStageSyntax {
+		if loader.Kind != "files" {
+			return fmt.Errorf("analysis unit request syntax split loader kind %q is not files", loader.Kind)
+		}
+		if !slices.Equal(loader.Paths, request.SourcePaths) {
+			return fmt.Errorf("analysis unit request syntax split.loader.paths must equal source_paths")
 		}
 	}
 	if loader.InputSplit != (len(loader.ReferencePaths) > 0) {
@@ -189,12 +202,13 @@ func (request AnalysisUnitRequest) scanOptions(buildCacheDir string) scanOptions
 }
 
 // loaderScopeOutcome reports how this worker's actual loading relates to the
-// requested loader scope. Syntax requests parse exactly the requested files. A
-// `module` binding is applied by the module-whole-program load. A `package`
-// binding is applied when the hybrid loader bounded the load to the target
-// packages and satisfied every dependency from export data; it is widened when
-// a test-recompiled dependency variant had to be read from source, or when a
-// narrower `files` request was honoured by loading its packages.
+// requested loader scope. A syntax request is only valid when its `files`
+// loader names exactly `source_paths`, which is what the parser reads, so its
+// scope is applied. A `module` binding is applied by the module-whole-program
+// load. A `package` binding is applied when the hybrid loader bounded the load
+// to the target packages and satisfied every dependency from export data; it
+// is widened when a test-recompiled dependency variant had to be read from
+// source, or when a narrower `files` request was honoured by loading more.
 func (request AnalysisUnitRequest) loaderScopeOutcome(mode goLoaderMode, loaded goPackagesInventory) string {
 	if request.Split == nil {
 		return ""
@@ -202,9 +216,7 @@ func (request AnalysisUnitRequest) loaderScopeOutcome(mode goLoaderMode, loaded 
 	kind := request.Split.Loader.Kind
 	switch request.Stage {
 	case AnalysisUnitStageSyntax:
-		if kind == "files" {
-			return AnalysisLoaderScopeApplied
-		}
+		return AnalysisLoaderScopeApplied
 	default:
 		switch kind {
 		case "module", "repository", "project":

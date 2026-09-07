@@ -80,6 +80,15 @@ func TestAnalysisSplitBindingValidatesLoaderScopeAgainstOwnership(t *testing.T) 
 		{name: "ownership outside loader", mutate: func(request *AnalysisUnitRequest) {
 			request.Split.Loader.Paths = []string{"app/c.go"}
 		}, want: "not included in split.loader.paths"},
+		{name: "syntax loader wider than ownership", mutate: func(request *AnalysisUnitRequest) {
+			// The parser reads source_paths only; accepting a wider loader
+			// scope would report `applied` for a scope that was never read.
+			request.Split.Loader.Paths = []string{"app/a.go", "app/b.go"}
+			request.Split.Loader.ReferencePaths = []string{"shared/shared.go"}
+		}, want: "syntax split.loader.paths must equal source_paths"},
+		{name: "syntax loader kind not files", mutate: func(request *AnalysisUnitRequest) {
+			request.Split.Loader.Kind = "package"
+		}, want: "syntax split loader kind \"package\" is not files"},
 		{name: "reference overlaps loader", mutate: func(request *AnalysisUnitRequest) {
 			request.Split.Loader.ReferencePaths = []string{"app/a.go", "shared/shared.go"}
 		}, want: "also a loader path"},
@@ -114,6 +123,66 @@ func TestAnalysisSplitBindingValidatesLoaderScopeAgainstOwnership(t *testing.T) 
 				t.Fatalf("Validate() error = %v, want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestAnalysisSplitBindingSyntaxScopeIsExactWhileLaterStagesMayCoverMore(t *testing.T) {
+	semantic := AnalysisUnitRequest{
+		ContractVersion:    AnalysisUnitContractVersion,
+		UnitID:             "analysis-unit:split",
+		Adapter:            AdapterName,
+		UnitRoot:           "app",
+		SourcePaths:        []string{"app/a.go"},
+		Stage:              AnalysisUnitStageSemantic,
+		ContextPaths:       []string{"app/a.go", "app/b.go", "shared/shared.go"},
+		ChunkID:            "chunk-0",
+		ChunkIndex:         0,
+		ChunkCount:         2,
+		ContextFingerprint: "context-sha256:split",
+		Split: &AnalysisSplitBinding{
+			ContractVersion: AnalysisSplitContractVersion,
+			SplitPlanID:     "analysis-split-plan:test",
+			ExecutionUnitID: "analysis-execution-unit:test",
+			SplitKind:       "output_batch",
+			Loader: AnalysisLoaderBinding{
+				Kind:           "module",
+				Paths:          []string{"app/a.go", "app/b.go", "shared/shared.go"},
+				PackageRoots:   []string{"app", "shared"},
+				ReferenceDepth: "bodies",
+				InputSplit:     false,
+			},
+		},
+	}
+	// A later stage loads the whole module, so a loader wider than the
+	// ownership is what actually happens and is applied as requested.
+	if err := semantic.Validate(); err != nil {
+		t.Fatalf("semantic output batch with a wider loader rejected: %v", err)
+	}
+	if got := semantic.loaderScopeOutcome("", goPackagesInventory{}); got != AnalysisLoaderScopeApplied {
+		t.Fatalf("analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeApplied)
+	}
+
+	// The parser reads source_paths only: the same wider loader on a syntax
+	// request would be reported as applied without ever being read.
+	syntax := semantic
+	binding := *semantic.Split
+	syntax.Split = &binding
+	syntax.Stage = AnalysisUnitStageSyntax
+	syntax.Split.Loader.Kind = "files"
+	syntax.Split.Loader.ReferenceDepth = "paths_only"
+	if err := syntax.Validate(); err == nil || !strings.Contains(err.Error(), "syntax split.loader.paths must equal source_paths") {
+		t.Fatalf("Validate() error = %v, want the syntax loader to equal source_paths", err)
+	}
+	syntax.Split.SplitKind = "input_batch"
+	syntax.Split.Loader.Paths = []string{"app/a.go"}
+	syntax.Split.Loader.PackageRoots = []string{"app"}
+	syntax.Split.Loader.ReferencePaths = []string{"app/b.go", "shared/shared.go"}
+	syntax.Split.Loader.InputSplit = true
+	if err := syntax.Validate(); err != nil {
+		t.Fatalf("syntax binding naming exactly the owned files rejected: %v", err)
+	}
+	if got := syntax.loaderScopeOutcome("", goPackagesInventory{}); got != AnalysisLoaderScopeApplied {
+		t.Fatalf("analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeApplied)
 	}
 }
 
