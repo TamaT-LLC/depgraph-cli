@@ -91,7 +91,10 @@ root and source paths. Source batches use
 `contract_version = depgraph-analysis-unit-v2` after negotiating
 `analysis-source-batch-v1`. The legacy Go `analysis-unit-v1` capability retains
 its v1 request shape. See [the execution contract](adr-analysis-unit-execution.md)
-for stage, full-context, auxiliary-input, and checkpoint bindings.
+for stage, full-context, auxiliary-input, and checkpoint bindings, and
+[pre-split planning](adr-presplit-analysis-planning.md) for how each unit is
+divided into execution units with explicit ownership, loader, and reference
+scopes before any worker starts.
 
 ## Dependency graph
 
