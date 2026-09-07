@@ -7783,12 +7783,20 @@ mod tests {
         unknown.chunk_id = "typed-missing".into();
         assert!(
             store
-                .resplit_analysis_unit_ledger("resplit-scan", &[unknown], &[typed_a.clone()])
+                .resplit_analysis_unit_ledger(
+                    "resplit-scan",
+                    &[unknown],
+                    std::slice::from_ref(&typed_a)
+                )
                 .is_err()
         );
         assert!(
             store
-                .resplit_analysis_unit_ledger("resplit-scan", &[whole.clone()], &[syntax.clone()])
+                .resplit_analysis_unit_ledger(
+                    "resplit-scan",
+                    std::slice::from_ref(&whole),
+                    std::slice::from_ref(&syntax)
+                )
                 .is_err(),
             "a replacement must not duplicate an existing chunk"
         );
@@ -7796,7 +7804,7 @@ mod tests {
 
         store.resplit_analysis_unit_ledger(
             "resplit-scan",
-            &[whole.clone()],
+            std::slice::from_ref(&whole),
             &[typed_a.clone(), typed_b.clone()],
         )?;
         let rows = store.analysis_units("resplit-scan")?;
@@ -7815,7 +7823,11 @@ mod tests {
         assert!(summary.complete, "{:?}", summary.reasons);
         assert!(
             store
-                .resplit_analysis_unit_ledger("resplit-scan", &[terminal[1].clone()], &[whole])
+                .resplit_analysis_unit_ledger(
+                    "resplit-scan",
+                    std::slice::from_ref(&terminal[1]),
+                    &[whole],
+                )
                 .is_err(),
             "a completed row is never superseded"
         );
