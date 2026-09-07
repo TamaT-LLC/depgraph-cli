@@ -49,6 +49,16 @@ jobs:
           # one more ~700 MB copy per pull request only fills the repository's
           # 10 GB cache quota and evicts the entries the other jobs depend on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the pinned cargo tools
+        # Both land in ~/.cargo/bin, which rust-cache restores, so these
+        # installs are no-ops on every run after the first for a cache lineage.
+        run: |
+          cargo install cargo-hakari --locked --version 0.9.38
+          cargo install cargo-nextest --locked --version 0.9.143
+      - name: Verify the workspace-hack feature unification is current
+        run: |
+          cargo hakari generate --diff
+          cargo hakari manage-deps --dry-run
       - name: Install the compiler-precise Linux namespace boundary
         run: |
           sudo apt-get update
@@ -58,7 +68,11 @@ jobs:
           fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # nextest schedules every test binary's tests across the runner's cores
+      # at once instead of draining one binary at a time. It does not run
+      # doctests, so those keep the libtest runner.
+      - run: cargo nextest run --workspace --locked
+      - run: cargo test --workspace --locked --doc
 
   go:
     runs-on: ubuntu-24.04
