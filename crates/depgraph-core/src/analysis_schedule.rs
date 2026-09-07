@@ -2060,4 +2060,174 @@ mod tests {
         assert_eq!(typed_index, typed_replacements.len());
         Ok(())
     }
+
+    #[test]
+    fn resplit_of_pre_split_typed_batches_keeps_retained_work_item_numbering() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        std::fs::write(root.join("go.mod"), "module example.test/app\n\ngo 1.26\n")?;
+        for name in ["a", "b", "c"] {
+            std::fs::write(
+                root.join(format!("{name}.go")),
+                format!("package app\n\nfunc {name}() {{}}\n"),
+            )?;
+        }
+        let mut config = crate::Config::default();
+        config.scan.max_unit_source_files = 2;
+        config.scan.max_unit_source_bytes = 2_100;
+        config.scan.max_context_source_bytes = 64_000;
+        let plan = plan_analysis_units(&root, &config, None)?;
+        let app = plan
+            .executable_units()
+            .into_iter()
+            .find(|unit| unit.adapter == AnalysisAdapter::Go)
+            .expect("one Go module");
+        let boundary = AnalysisAdapterBoundary::go_package_loader();
+        let (_, batch_contexts, measured) =
+            split_plan_and_input_for_boundaries(&root, &config, &plan, None, vec![boundary])?;
+        let split_input = AnalysisSplitInput {
+            sizes: ["a.go", "b.go", "c.go"]
+                .into_iter()
+                .map(|path| (path.to_owned(), 1_000))
+                .collect(),
+            ..measured
+        };
+        let current = plan_analysis_split(&plan, &split_input)?;
+        let typed = current.execution_units_for(&app.id, AnalysisStage::Typed);
+        assert_eq!(typed.len(), 2);
+        assert_eq!(
+            (
+                typed[0].batch_index,
+                typed[0].batch_count,
+                typed[0].ownership.source_paths.len()
+            ),
+            (0, 2, 2)
+        );
+        assert_eq!(
+            (
+                typed[1].batch_index,
+                typed[1].batch_count,
+                typed[1].ownership.source_paths.len()
+            ),
+            (1, 2, 1)
+        );
+        let sibling_id = typed[1].id.clone();
+        let cancellation = crate::cancellation::CancellationToken::new();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "resplit-retained",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+        };
+        let artifact = fixture.path().join("go-worker");
+        std::fs::write(&artifact, "synthetic go worker\n")?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: artifact.clone().into_os_string(),
+            leading_args: Vec::new(),
+            display: "synthetic go worker".into(),
+            artifact_path: artifact,
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let unit_contexts = vec![batch_contexts[&app.id].clone()];
+        let original = source_batch_work_items(
+            &context,
+            &current,
+            AdapterKind::Go,
+            &spec,
+            &[app],
+            &unit_contexts,
+            Some("execution"),
+        );
+        let original_sibling = original
+            .iter()
+            .find(|(id, _)| *id == sibling_id)
+            .expect("retained sibling work item");
+        let sibling_chunk = (
+            original_sibling.1.request.as_ref().unwrap()["chunk_index"].clone(),
+            original_sibling.1.request.as_ref().unwrap()["chunk_count"].clone(),
+        );
+        let sibling_key = original_sibling
+            .1
+            .checkpoint_key
+            .as_ref()
+            .expect("checkpoint key")
+            .clone();
+
+        let outcome = crate::analysis_split::resplit_execution_unit(
+            &plan,
+            &current,
+            &split_input,
+            &typed[0].id,
+            crate::analysis_split::AnalysisResplitTrigger::WorkerMemory,
+        )?;
+        assert_eq!(
+            outcome.outcome,
+            crate::analysis_split::AnalysisResplitOutcome::Split
+        );
+        assert!(outcome.retained_chunk_numbering_unchanged(&current));
+        assert!(outcome.retained_execution_unit_ids.contains(&sibling_id));
+
+        let resplit = AnalysisResplitContext {
+            split_input,
+            adapters: vec![ResplitAdapter {
+                adapter: AdapterKind::Go,
+                spec: spec.clone(),
+                unit_ids: vec![app.id.clone()],
+                batch_contexts: vec![batch_contexts[&app.id].clone()],
+                execution_digest: Some("execution".into()),
+            }],
+        };
+        let retained_work = resplit.work_items(
+            &context,
+            &plan,
+            &outcome.plan,
+            &outcome
+                .retained_execution_unit_ids
+                .iter()
+                .cloned()
+                .collect(),
+        );
+        let after_sibling = retained_work
+            .iter()
+            .find(|(id, _)| *id == sibling_id)
+            .expect("retained sibling after re-split");
+        let request = after_sibling.1.request.as_ref().unwrap();
+        assert_eq!(
+            (
+                request["chunk_index"].clone(),
+                request["chunk_count"].clone()
+            ),
+            sibling_chunk,
+            "retained sibling keeps the chunk numbering already on its ledger row"
+        );
+        assert_eq!(
+            after_sibling.1.checkpoint_key.as_ref().unwrap(),
+            &sibling_key,
+            "retained sibling keeps its checkpoint key"
+        );
+        let replacements = resplit.work_items(
+            &context,
+            &plan,
+            &outcome.plan,
+            &outcome
+                .replacement_execution_unit_ids
+                .iter()
+                .cloned()
+                .collect(),
+        );
+        assert_eq!(
+            replacements.len(),
+            outcome.replacement_execution_unit_ids.len()
+        );
+        assert!(replacements.iter().all(|(id, item)| {
+            outcome.replacement_execution_unit_ids.contains(id)
+                && item.checkpoint_key.as_ref() != Some(&sibling_key)
+        }));
+        Ok(())
+    }
 }

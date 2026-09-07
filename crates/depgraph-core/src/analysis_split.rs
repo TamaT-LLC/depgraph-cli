@@ -911,6 +911,23 @@ pub struct AnalysisResplitPlan {
     pub plan: AnalysisSplitPlan,
 }
 
+impl AnalysisResplitPlan {
+    /// Whether every retained execution unit kept the chunk numbering a saved
+    /// profile and ledger row already published.  The runtime uses this with
+    /// "only failed attempts are withdrawn" to apply a `Split` or defer it.
+    pub fn retained_chunk_numbering_unchanged(&self, previous: &AnalysisSplitPlan) -> bool {
+        self.retained_execution_unit_ids.iter().all(|id| {
+            previous
+                .execution_unit(id)
+                .zip(self.plan.execution_unit(id))
+                .is_some_and(|(before, after)| {
+                    before.batch_index == after.batch_index
+                        && before.batch_count == after.batch_count
+                })
+        })
+    }
+}
+
 /// Measure owned source sizes for every executable unit without reading
 /// file contents.  Paths that cannot be measured are omitted so the planner
 /// reports incomplete sizes instead of failing the scan.
@@ -1215,6 +1232,7 @@ pub fn plan_analysis_split(
                     context,
                 );
                 promotion.annotate(&mut batches);
+                assign_initial_batch_numbers(&mut batches);
                 apply_refinements(
                     unit,
                     stage_boundary,
@@ -1225,9 +1243,8 @@ pub fn plan_analysis_split(
                     &mut unsplittable_refinements,
                     &mut matched_refinements,
                 );
-                let count = batches.len() as u64;
                 let mut ids = Vec::with_capacity(batches.len());
-                for (index, batch) in batches.into_iter().enumerate() {
+                for batch in batches {
                     let mut execution_unit = build_execution_unit(
                         unit,
                         stage_boundary,
@@ -1235,8 +1252,6 @@ pub fn plan_analysis_split(
                         context,
                         group,
                         batch,
-                        index as u64,
-                        count,
                     );
                     execution_unit.prerequisite_ids = previous_stage_ids
                         .get(&unit.id)
@@ -1739,12 +1754,7 @@ fn promote_whole_context(
                 &input.budget,
                 context,
                 group,
-                Batch {
-                    granules: granules(unit, AnalysisSplitGranularity::Package, context),
-                    reasons: BTreeSet::new(),
-                },
-                0,
-                1,
+                Batch::from_granules(granules(unit, AnalysisSplitGranularity::Package, context)),
             )
             .id
         })
@@ -1766,9 +1776,23 @@ fn promote_whole_context(
 struct Batch {
     granules: Vec<Granule>,
     reasons: BTreeSet<AnalysisSplitReason>,
+    /// Published chunk numbering.  Assigned after the initial partition and
+    /// kept for every batch that is not itself refined, so a retained sibling
+    /// still matches the profile and ledger row already stored for it.
+    batch_index: u64,
+    batch_count: u64,
 }
 
 impl Batch {
+    fn from_granules(granules: Vec<Granule>) -> Self {
+        Self {
+            granules,
+            reasons: BTreeSet::new(),
+            batch_index: 0,
+            batch_count: 1,
+        }
+    }
+
     /// Owned paths in repository order.  Granules are grouped by package root,
     /// whose order differs from path order for nested packages; workers
     /// validate every path list as sorted, so the batch always re-sorts.
@@ -1862,10 +1886,7 @@ fn partition(
 ) -> Vec<Batch> {
     let mut granules = granules(unit, boundary.granularity, context);
     if granules.is_empty() || !(boundary.output_splittable || boundary.input_splittable) {
-        return vec![Batch {
-            granules,
-            reasons: BTreeSet::new(),
-        }];
+        return vec![Batch::from_granules(granules)];
     }
     if byte_budget && boundary.stage != AnalysisStage::Syntax {
         granules.sort_by(|left, right| {
@@ -1899,10 +1920,7 @@ fn partition(
             if exceeds_bytes {
                 reasons.insert(AnalysisSplitReason::SourceByteBudget);
             }
-            batches.push(Batch {
-                granules: std::mem::take(&mut current),
-                reasons: BTreeSet::new(),
-            });
+            batches.push(Batch::from_granules(std::mem::take(&mut current)));
             current_files = 0;
             current_bytes = 0;
         }
@@ -1911,10 +1929,7 @@ fn partition(
         current.push(granule);
     }
     if !current.is_empty() {
-        batches.push(Batch {
-            granules: current,
-            reasons: BTreeSet::new(),
-        });
+        batches.push(Batch::from_granules(current));
     }
     if batches.len() > 1 {
         for batch in &mut batches {
@@ -1922,6 +1937,14 @@ fn partition(
         }
     }
     batches
+}
+
+fn assign_initial_batch_numbers(batches: &mut [Batch]) {
+    let count = batches.len() as u64;
+    for (index, batch) in batches.iter_mut().enumerate() {
+        batch.batch_index = index as u64;
+        batch.batch_count = count.max(1);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1937,7 +1960,10 @@ fn apply_refinements(
 ) {
     // An execution unit ID depends on the batch's ownership and loader scope
     // only, never on its position or the batch count, so the IDs are computed
-    // once and only the two halves of a refined batch are recomputed.
+    // once and only the two halves of a refined batch are recomputed.  The
+    // published chunk numbering of an unsplit sibling is kept: the runtime
+    // refuses a Split that would rewrite a retained profile's batch_index or
+    // batch_count.
     let id_of = |batch: &Batch| {
         build_execution_unit(
             unit,
@@ -1948,9 +1974,9 @@ fn apply_refinements(
             Batch {
                 granules: batch.granules.clone(),
                 reasons: batch.reasons.clone(),
+                batch_index: 0,
+                batch_count: 1,
             },
-            0,
-            1,
         )
         .id
     };
@@ -1999,14 +2025,28 @@ fn apply_refinements(
         reasons.insert(AnalysisSplitReason::Refined);
         let removed = batches.remove(position);
         ids.remove(position);
-        let (head, tail) = removed.granules.split_at(split_at);
+        let superseded_index = removed.batch_index;
+        let next_index = batches
+            .iter()
+            .map(|batch| batch.batch_index)
+            .chain(std::iter::once(superseded_index))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let replacement_count = removed.batch_count.max(next_index.saturating_add(1));
+        let mut granules = removed.granules;
+        let tail_granules = granules.split_off(split_at);
         let tail = Batch {
-            granules: tail.to_vec(),
+            granules: tail_granules,
             reasons: reasons.clone(),
+            batch_index: next_index,
+            batch_count: replacement_count,
         };
         let head = Batch {
-            granules: head.to_vec(),
+            granules,
             reasons,
+            batch_index: superseded_index,
+            batch_count: replacement_count,
         };
         ids.insert(position, id_of(&tail));
         batches.insert(position, tail);
@@ -2015,7 +2055,6 @@ fn apply_refinements(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_execution_unit(
     unit: &AnalysisUnit,
     boundary: &AnalysisStageBoundary,
@@ -2023,9 +2062,9 @@ fn build_execution_unit(
     context: &UnitContext,
     group: Option<&ContextGroup>,
     batch: Batch,
-    batch_index: u64,
-    batch_count: u64,
 ) -> AnalysisExecutionUnit {
+    let batch_index = batch.batch_index;
+    let batch_count = batch.batch_count;
     let owned_paths = batch.paths();
     let owned_roots = batch.package_roots();
     let cyclic_group = group.is_some_and(|group| group.cyclic && group.unit_ids.len() > 1);

@@ -2,7 +2,7 @@
 
 - Status: Implemented (plan, contract, and the shipped Go package loader)
 - Date: 2026-09-07
-- Issue: #465 (parent #464; consumers #463 Go bounded loader, #467 health range loading)
+- Issue: #465 (parent #464; consumers #463 Go bounded loader, #467 health range loading; follow-up #480 retained batch numbering)
 - Contract: depgraph-analysis-split-plan-v1 (`schemas/depgraph-analysis-split-plan-v1.schema.json`)
 - Request binding: the optional `split` object of a `depgraph-analysis-unit-v2` request
 - Worker capabilities: analysis-loader-scope-v1, analysis-go-package-loader-v1
@@ -211,10 +211,17 @@ The relationship to existing state is explicit in `AnalysisResplitPlan`:
   input proof.
 - `split_plan_id` changes; `previous_split_plan_id` names the plan it replaces.
 - `saved_results` classifies every execution unit of both plans as
-  `retained` (same ID, inputs, and checkpoint key; saved results stay valid),
+  `retained` (same ID, inputs, checkpoint key, and published
+  `batch_index`/`batch_count`; saved results stay valid),
   `superseded` (the refined unit; its saved results are discarded), or
   `replacement` (new units without saved results). Only the refined unit is
-  superseded. Later stages of the same logical unit keep their identity and
+  superseded. A sibling that is already a batch of the same stage keeps the
+  chunk numbering its profile and ledger row already carry; replacements
+  take a new index that does not collide with retained siblings, with a
+  `batch_count` large enough for the worker's `chunk_index < chunk_count`
+  check. The runtime applies a `Split` only when that numbering is unchanged
+  for every retained unit (otherwise recovery after `memory-limit` would be
+  deferred). Later stages of the same logical unit keep their identity and
   saved results because chunking does not enter their key; only their
   `prerequisite_ids` now name the replacements.
 - When the target cannot be split (`single_granule`, `adapter_boundary`, or
