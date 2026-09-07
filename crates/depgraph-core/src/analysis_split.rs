@@ -19,7 +19,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use depgraph_protocol::stable_id_from_value;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -52,6 +52,11 @@ pub const ANALYSIS_LOADER_SCOPE_WIDENED: &str = "widened";
 
 const MAX_EXECUTION_UNITS: usize = 1_000_000;
 const MAX_REFINEMENTS: usize = 100_000;
+/// Upper bound of any path list in the plan.  Every loader and reference path
+/// comes from the repository inventory, which is itself bounded to this many
+/// files, so the guard makes the published schema limit explicit rather than
+/// reachable.
+const MAX_SPLIT_PATHS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,11 +217,19 @@ pub enum AnalysisResplitTrigger {
     EstimateExceeded,
 }
 
+/// Why a refinement left its target unchanged.  Every refinement in a plan's
+/// history is either applied or reported here, so a plan always explains its
+/// own refinement list.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisUnsplittableReason {
+    /// The target owns a single granule of its stage; nothing is left to divide.
     SingleGranule,
+    /// The adapter stage is neither input nor output splittable.
     AdapterBoundary,
+    /// The target is not an execution unit of the plan built from this input,
+    /// typically a refinement carried over from a plan whose boundaries or
+    /// budget differed, or a target already replaced by an earlier refinement.
     UnknownExecutionUnit,
 }
 
@@ -1046,6 +1059,7 @@ pub fn plan_analysis_split(
     let group_by_unit = context_groups(&plan);
     let mut limitations = BTreeSet::from([AnalysisSplitLimitation::EstimatesAreHeuristic]);
     let mut unsplittable_refinements = Vec::new();
+    let mut matched_refinements = BTreeSet::new();
     let mut execution_units = Vec::new();
     // The scheduler consumes work adapter-major and stage-major; keep the
     // same order so the parallelism decision matches the admission order.
@@ -1071,7 +1085,7 @@ pub fn plan_analysis_split(
             let mut stage_ids = BTreeMap::<String, Vec<String>>::new();
             for unit in &units {
                 let group = group_by_unit.get(unit.id.as_str());
-                let context = UnitContext::build(&plan, unit, input, &mut limitations);
+                let context = UnitContext::build(&plan, unit, input, group, &mut limitations);
                 let mut batches = partition(unit, stage_boundary, &input.budget, &context);
                 apply_refinements(
                     unit,
@@ -1081,6 +1095,7 @@ pub fn plan_analysis_split(
                     group,
                     &mut batches,
                     &mut unsplittable_refinements,
+                    &mut matched_refinements,
                 );
                 let count = batches.len() as u64;
                 let mut ids = Vec::with_capacity(batches.len());
@@ -1114,6 +1129,25 @@ pub fn plan_analysis_split(
         execution_units.len() <= MAX_EXECUTION_UNITS,
         "analysis split plan exceeds its execution unit limit"
     );
+    ensure!(
+        execution_units.iter().all(|unit| {
+            unit.loader.paths.len() <= MAX_SPLIT_PATHS
+                && unit.loader.reference_paths.len() <= MAX_SPLIT_PATHS
+                && unit.loader.package_roots.len() <= MAX_SPLIT_PATHS
+        }),
+        "analysis split plan exceeds its loader path limit"
+    );
+    // A refinement that names no execution unit of this plan is still part of
+    // the history the plan was built from; report it instead of dropping it.
+    for (index, refinement) in input.refinements.iter().enumerate() {
+        if !matched_refinements.contains(&index) {
+            unsplittable_refinements.push(AnalysisUnsplittableRefinement {
+                execution_unit_id: refinement.execution_unit_id.clone(),
+                trigger: refinement.trigger,
+                reason: AnalysisUnsplittableReason::UnknownExecutionUnit,
+            });
+        }
+    }
     if !unsplittable_refinements.is_empty() {
         limitations.insert(AnalysisSplitLimitation::RefinementUnsplittable);
     }
@@ -1149,6 +1183,12 @@ pub fn plan_analysis_split(
 /// Re-plan one execution unit whose estimate was exceeded.  The discovery
 /// plan ID and every unit input fingerprint are unchanged; only the split
 /// plan ID and the execution units derived from the refined unit change.
+///
+/// The refinement always enters the returned plan's history.  When the target
+/// cannot be split the execution units are unchanged and every saved result
+/// is retained, but the returned plan still records the attempt in
+/// `unsplittable_refinements`, so a stored plan explains its own history and
+/// an executor does not retry the same refinement blindly.
 pub fn resplit_execution_unit(
     plan: &AnalysisPlan,
     current: &AnalysisSplitPlan,
@@ -1161,6 +1201,23 @@ pub fn resplit_execution_unit(
         canonical.plan_id == current.plan_id,
         "analysis re-split requires the discovery plan the split plan was built from"
     );
+    // The dispositions below compare execution unit IDs between the current
+    // plan and the refined plan. That comparison is only meaningful when the
+    // refined plan differs from the current one by the new refinement alone,
+    // so the caller's budget, boundaries, sizes, and contexts must reproduce
+    // the current plan first; otherwise unrelated units would be reported as
+    // superseded or replaced, or changed inputs as retained.
+    let baseline = plan_analysis_split(
+        &canonical,
+        &AnalysisSplitInput {
+            refinements: current.refinements.clone(),
+            ..input.clone()
+        },
+    )?;
+    ensure!(
+        baseline.split_plan_id == current.split_plan_id,
+        "analysis re-split input does not reproduce the current split plan"
+    );
     let refinement = AnalysisSplitRefinement {
         execution_unit_id: execution_unit_id.to_owned(),
         trigger,
@@ -1170,9 +1227,6 @@ pub fn resplit_execution_unit(
         .iter()
         .map(|unit| unit.id.clone())
         .collect::<BTreeSet<_>>();
-    if !previous_ids.contains(execution_unit_id) {
-        bail!("analysis re-split target is not an execution unit of the current split plan");
-    }
     let mut refinements = current.refinements.clone();
     refinements.push(refinement.clone());
     let next_input = AnalysisSplitInput {
@@ -1180,18 +1234,30 @@ pub fn resplit_execution_unit(
         ..input.clone()
     };
     let next = plan_analysis_split(&canonical, &next_input)?;
+    let next_ids = next
+        .execution_units
+        .iter()
+        .map(|unit| unit.id.clone())
+        .collect::<BTreeSet<_>>();
+    // An unknown target is reported by the planner like any other refinement
+    // that cannot be applied, so a stale ID from an already replaced plan is a
+    // structured outcome rather than an error.
     let unsplittable = next
         .unsplittable_refinements
         .iter()
         .find(|entry| entry.execution_unit_id == execution_unit_id)
         .map(|entry| entry.reason);
     if let Some(reason) = unsplittable {
+        ensure!(
+            next_ids == previous_ids,
+            "analysis re-split reported an unsplittable target but changed the execution units"
+        );
         let retained = previous_ids.iter().cloned().collect::<Vec<_>>();
         return Ok(AnalysisResplitPlan {
             contract_version: ANALYSIS_SPLIT_PLAN_CONTRACT_VERSION.to_owned(),
             plan_id: current.plan_id.clone(),
             previous_split_plan_id: current.split_plan_id.clone(),
-            split_plan_id: current.split_plan_id.clone(),
+            split_plan_id: next.split_plan_id.clone(),
             refinement,
             outcome: AnalysisResplitOutcome::Unsplittable,
             unsplittable_reason: Some(reason),
@@ -1205,14 +1271,9 @@ pub fn resplit_execution_unit(
                 })
                 .collect(),
             retained_execution_unit_ids: retained,
-            plan: current.clone(),
+            plan: next,
         });
     }
-    let next_ids = next
-        .execution_units
-        .iter()
-        .map(|unit| unit.id.clone())
-        .collect::<BTreeSet<_>>();
     let superseded = previous_ids
         .difference(&next_ids)
         .cloned()
@@ -1264,6 +1325,11 @@ pub fn resplit_execution_unit(
 struct UnitContext {
     context_paths: Vec<String>,
     reference_unit_ids: Vec<String>,
+    /// Sources of every other member of the unit's cyclic input group, and of
+    /// the executable units that own them.  A bounded loader that reads
+    /// declarations or bodies must load these together with the unit so the
+    /// cycle stays in one analysis context.
+    cycle_paths: Vec<String>,
     sizes: BTreeMap<String, u64>,
 }
 
@@ -1272,6 +1338,7 @@ impl UnitContext {
         plan: &AnalysisPlan,
         unit: &AnalysisUnit,
         input: &AnalysisSplitInput,
+        group: Option<&ContextGroup>,
         limitations: &mut BTreeSet<AnalysisSplitLimitation>,
     ) -> Self {
         let mut context_paths = input
@@ -1286,6 +1353,28 @@ impl UnitContext {
             .into_iter()
             .filter(|id| id != &unit.id)
             .collect::<Vec<_>>();
+        let mut cycle_paths = BTreeSet::new();
+        if let Some(group) = group.filter(|group| group.cyclic && group.unit_ids.len() > 1) {
+            let members = group
+                .unit_ids
+                .iter()
+                .filter_map(|id| plan.unit(id))
+                .filter(|member| member.adapter == unit.adapter)
+                .collect::<Vec<_>>();
+            for member in &members {
+                cycle_paths.extend(member.source_paths.iter().cloned());
+                if let Some(owner) = owning_executable(plan, unit.adapter, &member.unit_root) {
+                    cycle_paths.extend(owner.source_paths.iter().cloned());
+                }
+            }
+            // The loader scope is bounded by the worker context; a member the
+            // context does not include cannot be loaded and stays a reference.
+            let context = context_paths.iter().collect::<BTreeSet<_>>();
+            cycle_paths.retain(|path| context.contains(path));
+            for path in &unit.source_paths {
+                cycle_paths.remove(path);
+            }
+        }
         let mut sizes = BTreeMap::new();
         for path in &context_paths {
             match input.sizes.get(path) {
@@ -1301,6 +1390,7 @@ impl UnitContext {
         Self {
             context_paths,
             reference_unit_ids,
+            cycle_paths: cycle_paths.into_iter().collect(),
             sizes,
         }
     }
@@ -1321,11 +1411,17 @@ struct Batch {
 }
 
 impl Batch {
+    /// Owned paths in repository order.  Granules are grouped by package root,
+    /// whose order differs from path order for nested packages; workers
+    /// validate every path list as sorted, so the batch always re-sorts.
     fn paths(&self) -> Vec<String> {
-        self.granules
+        let mut paths = self
+            .granules
             .iter()
             .flat_map(|granule| granule.paths.iter().cloned())
-            .collect()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 
     fn package_roots(&self) -> Vec<String> {
@@ -1449,8 +1545,9 @@ fn apply_refinements(
     group: Option<&ContextGroup>,
     batches: &mut Vec<Batch>,
     unsplittable: &mut Vec<AnalysisUnsplittableRefinement>,
+    matched: &mut BTreeSet<usize>,
 ) {
-    for refinement in &input.refinements {
+    for (refinement_index, refinement) in input.refinements.iter().enumerate() {
         let count = batches.len() as u64;
         let position = batches.iter().enumerate().position(|(index, batch)| {
             build_execution_unit(
@@ -1471,6 +1568,7 @@ fn apply_refinements(
         let Some(position) = position else {
             continue;
         };
+        matched.insert(refinement_index);
         if !(boundary.output_splittable || boundary.input_splittable) {
             unsplittable.push(AnalysisUnsplittableRefinement {
                 execution_unit_id: refinement.execution_unit_id.clone(),
@@ -1537,6 +1635,13 @@ fn build_execution_unit(
 ) -> AnalysisExecutionUnit {
     let owned_paths = batch.paths();
     let owned_roots = batch.package_roots();
+    let cyclic_group = group.is_some_and(|group| group.cyclic && group.unit_ids.len() > 1);
+    // A cycle must stay in one analysis context. A whole-context loader
+    // already holds it; a bounded loader that reads declarations or bodies
+    // of its references is widened to the whole group instead of separating
+    // the members into different loader scopes.
+    let retains_cycle =
+        cyclic_group && boundary.reference_depth != AnalysisReferenceDepth::PathsOnly;
     let (loader_paths, loader_roots) = if boundary.loader_kind.loads_whole_context() {
         let mut roots = BTreeSet::from([unit.unit_root.clone()]);
         roots.extend(
@@ -1549,6 +1654,14 @@ fn build_execution_unit(
             context.context_paths.clone(),
             roots.into_iter().collect::<Vec<_>>(),
         )
+    } else if retains_cycle && !context.cycle_paths.is_empty() {
+        let mut paths = owned_paths.clone();
+        paths.extend(context.cycle_paths.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        let mut roots = owned_roots.iter().cloned().collect::<BTreeSet<_>>();
+        roots.extend(context.cycle_paths.iter().map(|path| package_root_of(path)));
+        (paths, roots.into_iter().collect::<Vec<_>>())
     } else {
         (owned_paths.clone(), owned_roots.clone())
     };
@@ -1560,7 +1673,6 @@ fn build_execution_unit(
         .cloned()
         .collect::<Vec<_>>();
     let input_split = loader_paths.len() < context.context_paths.len();
-    let cyclic_group = group.is_some_and(|group| group.cyclic && group.unit_ids.len() > 1);
 
     let owned_bytes = context.total(&owned_paths);
     let loader_bytes = context.total(&loader_paths);
@@ -1589,7 +1701,7 @@ fn build_execution_unit(
     } else if batch_count <= 1 {
         reasons.insert(AnalysisSplitReason::UnitFitsBudget);
     }
-    if cyclic_group && boundary.reference_depth != AnalysisReferenceDepth::PathsOnly {
+    if retains_cycle {
         reasons.insert(AnalysisSplitReason::CycleGroupRetained);
     }
     let split_kind = if batch_count <= 1 {

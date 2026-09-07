@@ -20,10 +20,11 @@ use depgraph_core::{
     analysis_plan::{AnalysisPlan, plan_analysis_units},
     analysis_split::{
         ANALYSIS_SPLIT_PLAN_CONTRACT_VERSION, AnalysisAdapterBoundary, AnalysisExecutionUnit,
-        AnalysisLoaderKind, AnalysisReferenceDepth, AnalysisResplitOutcome, AnalysisResplitTrigger,
-        AnalysisSavedResultDisposition, AnalysisSplitBudget, AnalysisSplitInput, AnalysisSplitKind,
-        AnalysisSplitLimitation, AnalysisSplitPlan, AnalysisSplitReason, AnalysisStage,
-        AnalysisUnsplittableReason, measure_source_sizes, plan_analysis_split,
+        AnalysisLoaderKind, AnalysisReferenceDepth, AnalysisResplitOutcome, AnalysisResplitPlan,
+        AnalysisResplitTrigger, AnalysisSavedResultDisposition, AnalysisSplitBudget,
+        AnalysisSplitInput, AnalysisSplitKind, AnalysisSplitLimitation, AnalysisSplitPlan,
+        AnalysisSplitReason, AnalysisSplitRefinement, AnalysisStage, AnalysisUnsplittableReason,
+        AnalysisUnsplittableRefinement, measure_source_sizes, plan_analysis_split,
         resplit_execution_unit, static_context_paths,
     },
 };
@@ -756,6 +757,110 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
         AnalysisStage::Semantic,
     );
     assert!(!web.ownership.cyclic_group);
+
+    // A bounded loader that reads declarations or bodies is widened to the
+    // whole cycle instead of separating its members into different loader
+    // scopes; ownership stays with each member.
+    let (bounded, _) = split(
+        &checkout,
+        &plan,
+        &budget,
+        vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ],
+    )?;
+    for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
+        let a = only(&bounded, &plan, "services/cycle-a", "go", stage);
+        let b = only(&bounded, &plan, "services/cycle-b", "go", stage);
+        for unit in [a, b] {
+            assert_eq!(unit.loader.kind, AnalysisLoaderKind::Package);
+            assert!(
+                unit.split_reasons
+                    .contains(&AnalysisSplitReason::CycleGroupRetained)
+            );
+            assert_eq!(
+                unit.loader.paths,
+                vec![
+                    "services/cycle-a/a.go".to_owned(),
+                    "services/cycle-b/b.go".to_owned()
+                ],
+                "{stage:?} loader holds the whole cycle"
+            );
+            assert_eq!(
+                unit.loader.package_roots,
+                vec!["services/cycle-a".to_owned(), "services/cycle-b".to_owned()]
+            );
+            assert!(unit.loader.reference_paths.is_empty());
+            assert!(!unit.loader.input_split);
+        }
+        assert_eq!(a.ownership.source_paths, vec!["services/cycle-a/a.go"]);
+        assert_eq!(b.ownership.source_paths, vec!["services/cycle-b/b.go"]);
+    }
+    // The syntax stage still parses its own files only.
+    let a_syntax = only(
+        &bounded,
+        &plan,
+        "services/cycle-a",
+        "go",
+        AnalysisStage::Syntax,
+    );
+    assert_eq!(a_syntax.loader.paths, vec!["services/cycle-a/a.go"]);
+    // A unit that merely depends on another package keeps its bounded scope.
+    let api = only(&bounded, &plan, "services/api", "go", AnalysisStage::Typed);
+    assert!(api.loader.input_split);
+    assert!(
+        api.loader
+            .reference_paths
+            .contains(&"services/shared/shared.go".to_owned())
+    );
+    Ok(())
+}
+
+#[test]
+fn path_lists_are_sorted_and_unique_as_workers_require() -> Result<()> {
+    let checkout = Checkout::new()?;
+    for (name, (_, split_plan)) in scenarios(&checkout)? {
+        for unit in &split_plan.execution_units {
+            for (field, paths) in [
+                ("ownership.source_paths", &unit.ownership.source_paths),
+                ("ownership.package_roots", &unit.ownership.package_roots),
+                ("loader.paths", &unit.loader.paths),
+                ("loader.package_roots", &unit.loader.package_roots),
+                ("loader.reference_paths", &unit.loader.reference_paths),
+            ] {
+                assert!(
+                    paths.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{name}: {field} of {} is not sorted and unique: {paths:?}",
+                    unit.id
+                );
+            }
+        }
+    }
+    // The module with a nested package is the case the worker rejects when
+    // package-grouped batches are not re-sorted.
+    let (config, budget) = budget(|_| {});
+    let plan = checkout.discover(&config)?;
+    let (split_plan, _) = split(
+        &checkout,
+        &plan,
+        &budget,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    let api = only(
+        &split_plan,
+        &plan,
+        "services/api",
+        "go",
+        AnalysisStage::Typed,
+    );
+    assert_eq!(
+        api.ownership.source_paths,
+        vec![
+            "services/api/handlers/handlers.go".to_owned(),
+            "services/api/main.go".to_owned()
+        ]
+    );
     Ok(())
 }
 
@@ -856,6 +961,42 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
             .with_refinements(resplit.plan.refinements.clone()),
     )?;
     assert_eq!(replayed.split_plan_id, resplit.split_plan_id);
+    // A second refinement is planned from the refined plan with the same
+    // input: the baseline is reproduced from the recorded history, not from
+    // the caller's refinement list.
+    let second_target = resplit.replacement_execution_unit_ids[0].clone();
+    let second = resplit_execution_unit(
+        &plan,
+        &resplit.plan,
+        &input,
+        &second_target,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(second.previous_split_plan_id, resplit.split_plan_id);
+    assert_eq!(second.plan.refinements.len(), 2);
+    // Input that does not reproduce the current plan is rejected instead of
+    // misclassifying unrelated saved results.
+    let mut other_config = config.clone();
+    other_config.scan.max_unit_source_files = 2;
+    let mismatched = AnalysisSplitInput::new(
+        AnalysisSplitBudget::from_config(&other_config),
+        input.boundaries.clone(),
+    )
+    .with_sizes(checkout.sizes(&plan)?);
+    let error = resplit_execution_unit(
+        &plan,
+        &current,
+        &mismatched,
+        &target.id,
+        AnalysisResplitTrigger::WorkerTimeout,
+    )
+    .expect_err("mismatched re-split input is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("does not reproduce the current split plan"),
+        "{error}"
+    );
     assert_eq!(
         serde_json::to_value(&replayed)?,
         serde_json::to_value(&resplit.plan)?
@@ -880,8 +1021,75 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
             .contains(&resplit.replacement_execution_unit_ids[1])
     );
 
-    // Adapter boundaries and single files cannot be split further; the plan
-    // and its identity are unchanged and every saved result is retained.
+    // Adapter boundaries and single files cannot be split further: the
+    // execution units are unchanged and every saved result is retained, while
+    // the returned plan records the attempt in its history so a stored plan
+    // explains itself and the attempt is not retried blindly.
+    let assert_unsplittable = |resplit: &AnalysisResplitPlan,
+                               target: &str,
+                               trigger: AnalysisResplitTrigger,
+                               reason: AnalysisUnsplittableReason|
+     -> Result<()> {
+        assert_eq!(resplit.outcome, AnalysisResplitOutcome::Unsplittable);
+        assert_eq!(resplit.unsplittable_reason, Some(reason));
+        assert_eq!(resplit.previous_split_plan_id, current.split_plan_id);
+        assert_ne!(resplit.split_plan_id, current.split_plan_id);
+        assert_eq!(resplit.split_plan_id, resplit.plan.split_plan_id);
+        assert!(resplit.superseded_execution_unit_ids.is_empty());
+        assert!(resplit.replacement_execution_unit_ids.is_empty());
+        assert_eq!(
+            resplit.retained_execution_unit_ids.len(),
+            current.execution_units.len()
+        );
+        assert!(
+            resplit
+                .saved_results
+                .iter()
+                .all(|saved| saved.disposition == AnalysisSavedResultDisposition::Retained)
+        );
+        assert_eq!(
+            serde_json::to_value(&resplit.plan.execution_units)?,
+            serde_json::to_value(&current.execution_units)?
+        );
+        assert_eq!(
+            resplit.plan.refinements,
+            vec![AnalysisSplitRefinement {
+                execution_unit_id: target.to_owned(),
+                trigger,
+            }]
+        );
+        assert_eq!(
+            resplit.plan.unsplittable_refinements,
+            vec![AnalysisUnsplittableRefinement {
+                execution_unit_id: target.to_owned(),
+                trigger,
+                reason,
+            }]
+        );
+        assert!(
+            resplit
+                .plan
+                .limitations
+                .contains(&AnalysisSplitLimitation::RefinementUnsplittable)
+        );
+        assert!(
+            !current
+                .limitations
+                .contains(&AnalysisSplitLimitation::RefinementUnsplittable)
+        );
+        // The recorded history reproduces the returned plan.
+        let replayed = plan_analysis_split(
+            &plan,
+            &input
+                .clone()
+                .with_refinements(resplit.plan.refinements.clone()),
+        )?;
+        assert_eq!(
+            serde_json::to_value(&replayed)?,
+            serde_json::to_value(&resplit.plan)?
+        );
+        Ok(())
+    };
     let boundary = resplit_execution_unit(
         &plan,
         &current,
@@ -889,20 +1097,12 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
         &big_typed,
         AnalysisResplitTrigger::WorkerMemory,
     )?;
-    assert_eq!(boundary.outcome, AnalysisResplitOutcome::Unsplittable);
-    assert_eq!(
-        boundary.unsplittable_reason,
-        Some(AnalysisUnsplittableReason::AdapterBoundary)
-    );
-    assert_eq!(boundary.split_plan_id, current.split_plan_id);
-    assert_eq!(
-        serde_json::to_value(&boundary.plan)?,
-        serde_json::to_value(&current)?
-    );
-    assert_eq!(
-        boundary.retained_execution_unit_ids.len(),
-        current.execution_units.len()
-    );
+    assert_unsplittable(
+        &boundary,
+        &big_typed,
+        AnalysisResplitTrigger::WorkerMemory,
+        AnalysisUnsplittableReason::AdapterBoundary,
+    )?;
     let single = only(
         &current,
         &plan,
@@ -919,20 +1119,137 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
         &single,
         AnalysisResplitTrigger::EstimateExceeded,
     )?;
+    assert_unsplittable(
+        &granule,
+        &single,
+        AnalysisResplitTrigger::EstimateExceeded,
+        AnalysisUnsplittableReason::SingleGranule,
+    )?;
+    // A target that is not an execution unit of the current plan, such as an
+    // ID from a plan that was already replaced, is a structured outcome rather
+    // than an error.
+    let missing = "analysis-execution-unit:missing";
+    let unknown = resplit_execution_unit(
+        &plan,
+        &current,
+        &input,
+        missing,
+        AnalysisResplitTrigger::OutputLimit,
+    )?;
+    assert_unsplittable(
+        &unknown,
+        missing,
+        AnalysisResplitTrigger::OutputLimit,
+        AnalysisUnsplittableReason::UnknownExecutionUnit,
+    )?;
+    let stale = resplit_execution_unit(
+        &plan,
+        &resplit.plan,
+        &input,
+        &target.id,
+        AnalysisResplitTrigger::WorkerTimeout,
+    )?;
+    assert_eq!(stale.outcome, AnalysisResplitOutcome::Unsplittable);
     assert_eq!(
-        granule.unsplittable_reason,
-        Some(AnalysisUnsplittableReason::SingleGranule)
+        stale.unsplittable_reason,
+        Some(AnalysisUnsplittableReason::UnknownExecutionUnit)
+    );
+    assert_eq!(stale.plan.refinements.len(), 2);
+    assert_eq!(
+        stale.plan.unsplittable_refinements,
+        vec![AnalysisUnsplittableRefinement {
+            execution_unit_id: target.id.clone(),
+            trigger: AnalysisResplitTrigger::WorkerTimeout,
+            reason: AnalysisUnsplittableReason::UnknownExecutionUnit,
+        }]
+    );
+    // An unsplittable attempt does not block a later re-split of another
+    // unit, whose dispositions are computed against the recorded plan.
+    let after_unsplittable = resplit_execution_unit(
+        &plan,
+        &boundary.plan,
+        &input,
+        &target.id,
+        AnalysisResplitTrigger::WorkerTimeout,
+    )?;
+    assert_eq!(after_unsplittable.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(
+        after_unsplittable.superseded_execution_unit_ids,
+        vec![target.id.clone()]
+    );
+    assert_eq!(after_unsplittable.plan.refinements.len(), 2);
+    assert_eq!(after_unsplittable.plan.unsplittable_refinements.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn refinement_history_carried_across_boundaries_is_reported_not_dropped() -> Result<()> {
+    let checkout = Checkout::new()?;
+    let (config, budget) = budget(|config| config.scan.max_unit_source_files = 2);
+    let plan = checkout.discover(&config)?;
+    let (whole_context, _) = split(
+        &checkout,
+        &plan,
+        &budget,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    let target = only(
+        &whole_context,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Typed,
+    )
+    .id
+    .clone();
+    let history = vec![AnalysisSplitRefinement {
+        execution_unit_id: target.clone(),
+        trigger: AnalysisResplitTrigger::WorkerMemory,
+    }];
+    // The same history under a boundary set that never produces the target
+    // ID is kept in the plan and reported as unknown.
+    let sizes = checkout.sizes(&plan)?;
+    let bounded_input = AnalysisSplitInput::new(
+        budget.clone(),
+        vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ],
+    )
+    .with_sizes(sizes.clone())
+    .with_refinements(history.clone());
+    let bounded = plan_analysis_split(&plan, &bounded_input)?;
+    assert!(bounded.execution_unit(&target).is_none());
+    assert_eq!(bounded.refinements, history);
+    assert_eq!(
+        bounded.unsplittable_refinements,
+        vec![AnalysisUnsplittableRefinement {
+            execution_unit_id: target.clone(),
+            trigger: AnalysisResplitTrigger::WorkerMemory,
+            reason: AnalysisUnsplittableReason::UnknownExecutionUnit,
+        }]
     );
     assert!(
-        resplit_execution_unit(
-            &plan,
-            &current,
-            &input,
-            "analysis-execution-unit:missing",
-            AnalysisResplitTrigger::OutputLimit
-        )
-        .is_err()
+        bounded
+            .limitations
+            .contains(&AnalysisSplitLimitation::RefinementUnsplittable)
     );
+    // The carried history is part of the identity but not of the execution
+    // units: the same input without it plans the same units.
+    let without_history = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput::new(
+            bounded_input.budget.clone(),
+            bounded_input.boundaries.clone(),
+        )
+        .with_sizes(sizes),
+    )?;
+    assert_ne!(without_history.split_plan_id, bounded.split_plan_id);
+    assert_eq!(
+        serde_json::to_value(&without_history.execution_units)?,
+        serde_json::to_value(&bounded.execution_units)?
+    );
+    assert!(without_history.unsplittable_refinements.is_empty());
     Ok(())
 }
 

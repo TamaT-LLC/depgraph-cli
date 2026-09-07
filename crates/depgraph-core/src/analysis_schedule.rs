@@ -1184,6 +1184,13 @@ mod tests {
                 )?;
             }
         }
+        // A nested package: its directory sorts after `file*.go` as a package
+        // root but before them as a path, which is the order workers check.
+        std::fs::create_dir(root.join("app/zed"))?;
+        std::fs::write(
+            root.join("app/zed/zed.go"),
+            "package zed\nconst Value = 1\n",
+        )?;
         std::fs::write(
             root.join("app/go.mod"),
             "module example.test/app\n\ngo 1.26\nrequire example.test/shared v0.0.0\nreplace example.test/shared => ../shared\n",

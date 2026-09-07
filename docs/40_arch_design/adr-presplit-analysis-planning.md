@@ -199,9 +199,21 @@ The relationship to existing state is explicit in `AnalysisResplitPlan`:
   saved results because chunking does not enter their key; only their
   `prerequisite_ids` now name the replacements.
 - When the target cannot be split (`single_granule`, `adapter_boundary`, or
-  `unknown_execution_unit`) the outcome is `unsplittable`, the previous plan is
-  returned unchanged, every result is `retained`, and the refinement is listed
-  in `unsplittable_refinements` with the `refinement_unsplittable` limitation.
+  `unknown_execution_unit`) the outcome is `unsplittable` and the execution
+  units are unchanged, so every result is `retained`. The refinement still
+  enters the returned plan's history: `refinements` carries it, it is listed
+  in `unsplittable_refinements` with the `refinement_unsplittable` limitation,
+  and `split_plan_id` changes accordingly. A stored plan therefore explains its
+  own history, and an executor does not retry the same refinement blindly.
+- Every refinement of a plan's history is either applied or reported. One that
+  names no execution unit of the plan built from the current input, for
+  example a target already replaced by an earlier refinement or a history
+  carried into a plan with different boundaries, is reported as
+  `unknown_execution_unit` rather than dropped. `resplit_execution_unit`
+  reports an unknown target the same way; only inputs that do not reproduce
+  the current plan (a different discovery plan, budget, boundaries, sizes, or
+  contexts) are rejected as errors, because the saved-result dispositions are
+  only meaningful against the plan they were computed from.
 
 Refinements live in the plan, not in `.depgraph.toml`. Changing a budget in
 the configuration changes the configuration fingerprint and therefore the

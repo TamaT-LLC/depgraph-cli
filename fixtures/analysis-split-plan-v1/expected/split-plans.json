@@ -650,7 +650,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:0cd2ce7130bb81996b6accb1aebd8249200769c31190a9e2c27c48ea3884f04b",
+        "id": "analysis-execution-unit:sha256:a8ec8782072fad2e036a1597f6f194397422d9d4e2499c5eafc4a9ed979803b2",
         "label": "go:go_module:services/api:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -663,8 +663,8 @@
           ],
           "cyclic_group": false,
           "source_paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -1060,7 +1060,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:2c0a4bdbd55cfc3a218bf7935bdaf5b1dc12a7304f2ce7f16b691db0011e40a5",
+        "id": "analysis-execution-unit:sha256:8b8f229db97c5d0a8471d864cfa42ec632ee89fcd26830d8ff37176ba2c66af8",
         "label": "go:go_module:services/api:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -1073,8 +1073,8 @@
           ],
           "cyclic_group": false,
           "source_paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -2424,7 +2424,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:0cd2ce7130bb81996b6accb1aebd8249200769c31190a9e2c27c48ea3884f04b",
+        "id": "analysis-execution-unit:sha256:a8ec8782072fad2e036a1597f6f194397422d9d4e2499c5eafc4a9ed979803b2",
         "label": "go:go_module:services/api:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -2437,8 +2437,8 @@
           ],
           "cyclic_group": false,
           "source_paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -2837,7 +2837,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:2c0a4bdbd55cfc3a218bf7935bdaf5b1dc12a7304f2ce7f16b691db0011e40a5",
+        "id": "analysis-execution-unit:sha256:8b8f229db97c5d0a8471d864cfa42ec632ee89fcd26830d8ff37176ba2c66af8",
         "label": "go:go_module:services/api:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -2850,8 +2850,8 @@
           ],
           "cyclic_group": false,
           "source_paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -3613,7 +3613,7 @@
         },
         {
           "index": 3,
-          "estimated_weight": 1284,
+          "estimated_weight": 1796,
           "execution_units": [
             "go:go_module:services/cycle-b:syntax:0/1",
             "go:go_module:services/cycle-a:typed:0/1"
@@ -3637,7 +3637,7 @@
         },
         {
           "index": 6,
-          "estimated_weight": 2825,
+          "estimated_weight": 4617,
           "execution_units": [
             "go:go_module:services/cycle-b:typed:0/1",
             "go:go_module:services/cycle-a:semantic:0/1"
@@ -3661,7 +3661,7 @@
         },
         {
           "index": 9,
-          "estimated_weight": 2572,
+          "estimated_weight": 3852,
           "execution_units": [
             "go:go_module:services/unrelated:semantic:0/1",
             "go:go_module:services/cycle-b:semantic:0/1"
@@ -4147,7 +4147,7 @@
         "prerequisites": []
       },
       {
-        "id": "analysis-execution-unit:sha256:19500b501ec10e819de8abe222c80cfa3812abe563102e1d618dbd5bf23f1566",
+        "id": "analysis-execution-unit:sha256:b5424185a01a9c70e800dbbd6d5d2e3f630df9ae6a2289e97bf4c3180a00b8bb",
         "label": "go:go_module:services/cycle-a:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -4171,33 +4171,33 @@
         "loader": {
           "kind": "package",
           "paths": [
-            "services/cycle-a/a.go"
-          ],
-          "package_roots": [
-            "services/cycle-a"
-          ],
-          "reference_depth": "declarations",
-          "reference_paths": [
+            "services/cycle-a/a.go",
             "services/cycle-b/b.go"
           ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [],
           "reference_units": [
             "go:go_workspace:.",
             "go:go_package:services/cycle-a",
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": false
         },
         "estimate": {
           "stage": "typed",
           "owned_file_count": 1,
           "owned_source_bytes": 256,
-          "loader_file_count": 1,
-          "loader_source_bytes": 256,
-          "reference_file_count": 1,
-          "reference_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 4,
-          "weight": 1027,
+          "weight": 1539,
           "over_budget": false
         },
         "budget": {
@@ -4214,7 +4214,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:cf11d970799be687cc2ecdc23ab0cfd8693e43f9090ca88bbfc13caaa652e873",
+        "id": "analysis-execution-unit:sha256:2558b76e28f6629b05f99f843d494c6365b47902185f7f11fb9d34efc2ebda00",
         "label": "go:go_module:services/api:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -4227,8 +4227,8 @@
           ],
           "cyclic_group": false,
           "source_paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -4238,8 +4238,8 @@
         "loader": {
           "kind": "package",
           "paths": [
-            "services/api/main.go",
-            "services/api/handlers/handlers.go"
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
           ],
           "package_roots": [
             "services/api",
@@ -4489,7 +4489,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:03c2d201ed4d1d32f0763596ee2f2f4f3de987ff905d176b009078fda1e4a8fc",
+        "id": "analysis-execution-unit:sha256:d5b3cc05b7c6d4ab4181ea72b4b18e0a284ada87149bc8faccdccb6ea1556398",
         "label": "go:go_module:services/cycle-b:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -4513,33 +4513,33 @@
         "loader": {
           "kind": "package",
           "paths": [
+            "services/cycle-a/a.go",
             "services/cycle-b/b.go"
           ],
           "package_roots": [
+            "services/cycle-a",
             "services/cycle-b"
           ],
           "reference_depth": "declarations",
-          "reference_paths": [
-            "services/cycle-a/a.go"
-          ],
+          "reference_paths": [],
           "reference_units": [
             "go:go_module:services/cycle-a",
             "go:go_workspace:.",
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": false
         },
         "estimate": {
           "stage": "typed",
           "owned_file_count": 1,
           "owned_source_bytes": 256,
-          "loader_file_count": 1,
-          "loader_source_bytes": 256,
-          "reference_file_count": 1,
-          "reference_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 4,
-          "weight": 1027,
+          "weight": 1539,
           "over_budget": false
         },
         "budget": {
@@ -4556,7 +4556,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:6aef4df6e4858398ef1786aeb8cf92b757f9bd4db15f9793b951dc7e8b6ac347",
+        "id": "analysis-execution-unit:sha256:756a3a4795ea06720204b2249bbc522b08e1d21da2481eeb3548548e4457f430",
         "label": "go:go_module:services/cycle-a:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -4580,33 +4580,33 @@
         "loader": {
           "kind": "package",
           "paths": [
-            "services/cycle-a/a.go"
-          ],
-          "package_roots": [
-            "services/cycle-a"
-          ],
-          "reference_depth": "declarations",
-          "reference_paths": [
+            "services/cycle-a/a.go",
             "services/cycle-b/b.go"
           ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [],
           "reference_units": [
             "go:go_workspace:.",
             "go:go_package:services/cycle-a",
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": false
         },
         "estimate": {
           "stage": "semantic",
           "owned_file_count": 1,
           "owned_source_bytes": 256,
-          "loader_file_count": 1,
-          "loader_source_bytes": 256,
-          "reference_file_count": 1,
-          "reference_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 4,
-          "weight": 1798,
+          "weight": 3078,
           "over_budget": false
         },
         "budget": {
@@ -4967,7 +4967,7 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:30919028a321cbff68682aa3094666a09e292aa95ee47932776cda349595139d",
+        "id": "analysis-execution-unit:sha256:f445debfb10da802b6e554bab452b57e70d191ea41ba6818f9307dd5b790bfaf",
         "label": "go:go_module:services/cycle-b:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
@@ -4991,33 +4991,33 @@
         "loader": {
           "kind": "package",
           "paths": [
+            "services/cycle-a/a.go",
             "services/cycle-b/b.go"
           ],
           "package_roots": [
+            "services/cycle-a",
             "services/cycle-b"
           ],
           "reference_depth": "declarations",
-          "reference_paths": [
-            "services/cycle-a/a.go"
-          ],
+          "reference_paths": [],
           "reference_units": [
             "go:go_module:services/cycle-a",
             "go:go_workspace:.",
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": false
         },
         "estimate": {
           "stage": "semantic",
           "owned_file_count": 1,
           "owned_source_bytes": 256,
-          "loader_file_count": 1,
-          "loader_source_bytes": 256,
-          "reference_file_count": 1,
-          "reference_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 4,
-          "weight": 1798,
+          "weight": 3078,
           "over_budget": false
         },
         "budget": {

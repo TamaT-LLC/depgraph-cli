@@ -524,8 +524,9 @@
       }
     },
     "pathList": {
+      "description": "Sorted, unique repository-relative paths. Bounded by the repository inventory limit of 1,000,000 files, which the planner enforces on every loader, reference, and package-root list.",
       "type": "array",
-      "maxItems": 100000,
+      "maxItems": 1000000,
       "uniqueItems": true,
       "items": {
         "$ref": "#/$defs/repositoryPath"
@@ -581,7 +582,7 @@
       ]
     },
     "resplitPlan": {
-      "description": "Result of re-planning one execution unit whose estimate was exceeded. The discovery plan_id and every logical unit input fingerprint are unchanged; only split_plan_id and the execution units derived from the refined unit change. An unsplittable outcome keeps the previous split plan and retains every saved result.",
+      "description": "Result of re-planning one execution unit whose estimate was exceeded. The discovery plan_id and every logical unit input fingerprint are unchanged; only split_plan_id and the execution units derived from the refined unit change. An unsplittable outcome keeps every execution unit and retains every saved result, while the returned plan still records the attempted refinement in its history (refinements, unsplittable_refinements, the refinement_unsplittable limitation, and therefore split_plan_id).",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -638,7 +639,7 @@
         },
         "saved_results": {
           "type": "array",
-          "maxItems": 1000000,
+          "maxItems": 2000000,
           "items": {
             "$ref": "#/$defs/savedResult"
           }
@@ -795,6 +796,7 @@
       }
     },
     "unsplittableReason": {
+      "description": "Why a refinement left its target unchanged: the target owns a single granule of its stage, the adapter stage is neither input nor output splittable, or the target is not an execution unit of the plan built from the current input (a stale ID or a history carried across boundaries).",
       "enum": [
         "single_granule",
         "adapter_boundary",
@@ -802,6 +804,7 @@
       ]
     },
     "unsplittableRefinement": {
+      "description": "A refinement of the plan's history that could not be applied. Every refinement is either applied or listed here, so the plan explains its own refinement list.",
       "type": "object",
       "additionalProperties": false,
       "required": [
