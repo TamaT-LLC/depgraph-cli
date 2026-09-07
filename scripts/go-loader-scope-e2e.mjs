@@ -61,7 +61,7 @@ const environment = {
 // Loader policy the package path declares on its profiles; identities, graph
 // payloads, evidence, and coverage must not depend on it.
 const LOADER_POLICY_PROPERTIES = new Set([
-  "analysis_loader_kind", "analysis_loader_mode", "analysis_scope", "go_packages_query",
+  "analysis_loader_kind", "analysis_loader_mode", "analysis_loader_scope", "analysis_scope", "go_packages_query",
   "go_call_graph_program_scope", "go_implements_scope", "go_loader_child_process_kind",
   "go_loader_child_process_target_compiled", "go_loader_dependency_snapshot_source",
   "go_loader_identity_key", "go_loader_program_scope", "go_loader_reference_fingerprint_definition",
@@ -379,7 +379,21 @@ function graph(store) {
     ).all(scanId).map((row) => JSON.parse(row.payload));
     assert.ok(profiles.length > 0, "completed scan has no persisted profiles");
     const nodes = raw("nodes", "raw_json");
-    const sites = raw("sites", "raw_json");
+    const overapproxCandidates = new Map();
+    const siteHash = createHash("sha256");
+    let siteCount = 0;
+    for (const row of database.prepare(
+      "SELECT raw_json AS payload FROM sites WHERE scan_id = ? ORDER BY id",
+    ).iterate(scanId)) {
+      const site = JSON.parse(row.payload);
+      if (Array.isArray(site.target_ids)) {
+        overapproxCandidates.set(site.id, site.target_ids);
+        site.target_ids = [];
+      }
+      siteHash.update(JSON.stringify(site));
+      siteHash.update("\n");
+      siteCount += 1;
+    }
     const exactEdges = createHash("sha256");
     const mayCallPairs = [];
     const mayCallIds = new Set();
@@ -448,13 +462,14 @@ function graph(store) {
         nodes: nodes.count,
         edges_exact: exactEdgeCount,
         may_call: mayCallPairs.length,
-        sites: sites.count,
+        sites: siteCount,
       },
       may_call_pairs: mayCallPairs,
+      overapprox_candidates: overapproxCandidates,
       payloads: {
         nodes: nodes.sha256,
         edges_exact: exactEdges.digest("hex"),
-        sites: sites.sha256,
+        sites: siteHash.digest("hex"),
         diagnostics: diagnostics.sha256,
         evidence: evidence.sha256,
         coverage: createHash("sha256").update(coverage).digest("hex"),
@@ -478,6 +493,13 @@ function assertSameCanonicalGraph(actual, expected, label) {
   const controlCalls = new Set(expected.may_call_pairs);
   for (const pair of actual.may_call_pairs) {
     assert.ok(controlCalls.has(pair), `${label}: package CHA may_call is not a subset of whole-program CHA`);
+  }
+  for (const [siteId, targets] of actual.overapprox_candidates) {
+    const control = new Set(expected.overapprox_candidates.get(siteId) ?? []);
+    assert.ok(control.size > 0, `${label}: overapprox site ${siteId} missing from the module-loader control`);
+    for (const target of targets) {
+      assert.ok(control.has(target), `${label}: overapprox site ${siteId} gained a candidate`);
+    }
   }
   const strip = (profile) => ({
     ...profile,
