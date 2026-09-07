@@ -10,6 +10,7 @@ members = [
   "crates/depgraph-rustc-wrapper",
   "crates/depgraph-store",
   "workers/rust",
+  "workspace-hack",
   "xtask",
 ]
 exclude = ["crates/depgraph-rustc-query"]
