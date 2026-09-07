@@ -146,7 +146,7 @@ pub struct HealthRangeFixture {
     pub store_path: PathBuf,
     pub scan_id: String,
     pub snapshot_id: String,
-    pub events: usize,
+    pub events: u64,
     pub edges: u64,
     pub sites: u64,
     pub shape: HealthRangeFixtureShape,
@@ -234,10 +234,17 @@ pub fn expected_unused_counts(shape: &HealthRangeFixtureShape) -> (usize, usize)
     (unused_files, unused_symbols)
 }
 
+/// Events per flushed chunk; the generator never holds more than one chunk.
+pub const EVENT_CHUNK: usize = 4096;
+
+/// Sequenced event stream; chunks are handed to `consume` as they fill so the
+/// over-limit shape (hundreds of thousands of events) never sits in memory.
 struct EventSink<'a> {
     scan_id: &'a str,
     seq: u64,
-    events: Vec<Value>,
+    pending: Vec<Value>,
+    consume: &'a mut dyn FnMut(Vec<Value>) -> Result<()>,
+    error: Option<anyhow::Error>,
     edges: u64,
     sites: u64,
     candidate_sites: u64,
@@ -252,7 +259,20 @@ impl EventSink<'_> {
         event["protocol_version"] = json!("1.0");
         event["adapter"] = json!("go");
         event["adapter_version"] = json!("0.5.4");
-        self.events.push(event);
+        self.pending.push(event);
+        if self.pending.len() >= EVENT_CHUNK {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.error.is_some() || self.pending.is_empty() {
+            return;
+        }
+        let chunk = std::mem::take(&mut self.pending);
+        if let Err(error) = (self.consume)(chunk) {
+            self.error = Some(error);
+        }
     }
 }
 
@@ -338,20 +358,31 @@ fn push_call(
         "evidence": evidence(&path, "call")}}));
 }
 
-/// The worker protocol events of `shape` (without ingesting them), plus the
-/// edge and site counts.
-pub fn events(
+/// Counts of one emitted stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmittedCounts {
+    pub events: u64,
+    pub edges: u64,
+    pub sites: u64,
+}
+
+/// Stream the worker protocol events of `shape` to `consume` in chunks of
+/// [`EVENT_CHUNK`] and return the event, edge, and site counts.
+pub fn emit(
     shape: &HealthRangeFixtureShape,
     scan_id: &str,
     root: &Path,
-) -> (Vec<Value>, u64, u64) {
+    consume: &mut dyn FnMut(Vec<Value>) -> Result<()>,
+) -> Result<EmittedCounts> {
     let profile_ids = (0..shape.profiles)
         .map(|k| id("profile", &format!("go-stage-{k}")))
         .collect::<Vec<_>>();
     let mut sink = EventSink {
         scan_id,
         seq: 0,
-        events: Vec::new(),
+        pending: Vec::new(),
+        consume,
+        error: None,
         edges: 0,
         sites: 0,
         candidate_sites: 0,
@@ -551,7 +582,25 @@ pub fn events(
     }
     sink.push(json!({"event": "scan_completed", "coverage": coverage_for(
         shape.profiles, site_count, candidate_sites, unresolved_sites)}));
-    (sink.events, sink.edges, sink.sites)
+    sink.flush();
+    if let Some(error) = sink.error {
+        return Err(error);
+    }
+    Ok(EmittedCounts {
+        events: sink.seq,
+        edges: sink.edges,
+        sites: sink.sites,
+    })
+}
+
+/// Collect the whole stream of `shape` in memory (small shapes only).
+pub fn events(shape: &HealthRangeFixtureShape, scan_id: &str, root: &Path) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    emit(shape, scan_id, root, &mut |chunk| {
+        all.extend(chunk);
+        Ok(())
+    })?;
+    Ok(all)
 }
 
 /// Generate the protocol stream of `shape` and ingest it into a fresh store
@@ -568,14 +617,12 @@ pub fn generate(dir: &Path, shape: &HealthRangeFixtureShape) -> Result<HealthRan
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(dir.join(format!("depgraph.sqlite{suffix}")));
     }
-    let (events, edges, sites) = events(shape, SCAN_ID, &root);
-
     let mut store = Store::open(&store_path)?;
     store.start_scan_with_revision(SCAN_ID, &root, false, Some("health-range-fixture"))?;
-    for chunk in events.chunks(4096) {
+    let counts = emit(shape, SCAN_ID, &root, &mut |chunk| {
         let refs = chunk.iter().collect::<Vec<_>>();
-        store.ingest_events(&refs)?;
-    }
+        store.ingest_events(&refs)
+    })?;
     store.finish_scan(SCAN_ID, "completed", None, true)?;
     let snapshot_id = store
         .current_snapshot_id()?
@@ -586,9 +633,9 @@ pub fn generate(dir: &Path, shape: &HealthRangeFixtureShape) -> Result<HealthRan
         store_path,
         scan_id: SCAN_ID.to_owned(),
         snapshot_id,
-        events: events.len(),
-        edges,
-        sites,
+        events: counts.events,
+        edges: counts.edges,
+        sites: counts.sites,
         shape: shape.clone(),
     })
 }

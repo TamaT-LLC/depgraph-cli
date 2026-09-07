@@ -21,8 +21,20 @@ pub fn analyze_unused_cancellable(
     snapshot: &GraphSnapshot,
     maximum_findings: usize,
     maximum_work: usize,
-    mut is_cancelled: impl FnMut() -> bool,
+    is_cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<HealthFinding>, HealthAnalysisError> {
+    analyze_unused_measured(snapshot, maximum_findings, maximum_work, is_cancelled)
+        .map(|(findings, _)| findings)
+}
+
+/// Whole-snapshot unused analysis that also reports the work steps it
+/// consumed; the control the ranged scheduler's evidence is compared against.
+pub fn analyze_unused_measured(
+    snapshot: &GraphSnapshot,
+    maximum_findings: usize,
+    maximum_work: usize,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(Vec<HealthFinding>, u64), HealthAnalysisError> {
     let mut budget = HealthAnalysisBudget::new(maximum_work);
     let (source, dynamic_site_ids) =
         GlobalSource::from_snapshot(snapshot, &mut budget, &mut is_cancelled)?;
@@ -36,14 +48,15 @@ pub fn analyze_unused_cancellable(
         &mut budget,
         &mut is_cancelled,
     )?;
-    analyze_subjects(
+    let findings = analyze_subjects(
         &global,
         &local,
         &snapshot.nodes,
         maximum_findings,
         &mut budget,
         &mut is_cancelled,
-    )
+    )?;
+    Ok((findings, budget.used() as u64))
 }
 
 fn analyze_subject<'a>(

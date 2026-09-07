@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -294,6 +294,10 @@ enum Task {
     Test,
     GoSemanticE2e,
     ResumableAnalysisE2e,
+    /// Generate the public over-limit health fixture, prove the whole-snapshot
+    /// path exhausts the single budget while the ranged path completes under
+    /// the same per-range limit, and check the CLI envelope on the store.
+    HealthRangeE2e,
     RustSemanticE2e,
     Package,
     CompilerPack {
@@ -922,6 +926,7 @@ fn main() -> Result<()> {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
         Task::ResumableAnalysisE2e => resumable_analysis_e2e(),
+        Task::HealthRangeE2e => health_range_e2e(),
         Task::RustSemanticE2e => {
             rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
@@ -1120,6 +1125,7 @@ fn test() -> Result<()> {
         .arg("test")
         .current_dir("workers/web"))?;
     resumable_analysis_e2e()?;
+    health_range_e2e()?;
     Ok(())
 }
 
@@ -1134,6 +1140,165 @@ fn resumable_analysis_e2e() -> Result<()> {
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
         .env("DEPGRAPH_BIN", cli))
+}
+
+/// Health range evidence (#467): the public over-limit fixture must exhaust
+/// the whole-snapshot budget and complete through the ranged path under the
+/// unchanged per-range limit, with identical unused findings; the CLI envelope
+/// on the same store must report the ranged execution.
+///
+/// Set `DEPGRAPH_HEALTH_RANGE_REPORT` to retain the combined report.
+fn health_range_e2e() -> Result<()> {
+    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let target_dir = workspace_root().join(cargo_target_dir());
+    let work_dir = target_dir.join("health-range-e2e");
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)
+            .with_context(|| format!("failed to clear {}", work_dir.display()))?;
+    }
+    fs::create_dir_all(&work_dir)?;
+    let fixture_dir = work_dir.join("fixture");
+    let store = fixture_dir.join("depgraph.sqlite");
+    let repo = fixture_dir.join("repo");
+    let runner = [
+        "run",
+        "--locked",
+        "-p",
+        "depgraph-core",
+        "--example",
+        "health_range_e2e",
+        "--",
+    ];
+    // Generation runs in its own process so the measured peak RSS of the
+    // ranged path does not include building the fixture.
+    let generate_report = work_dir.join("generate-report.json");
+    run(Command::new("cargo")
+        .args(runner)
+        .args(["--shape", "over-limit", "--generate-only", "--work-dir"])
+        .arg(&fixture_dir)
+        .arg("--report")
+        .arg(&generate_report)
+        .stdout(std::process::Stdio::null()))?;
+    let runner_report = work_dir.join("runner-report.json");
+    run(Command::new("cargo")
+        .args(runner)
+        .arg("--store")
+        .arg(&store)
+        .arg("--root")
+        .arg(&repo)
+        .arg("--report")
+        .arg(&runner_report)
+        .stdout(std::process::Stdio::null()))?;
+    let read_json = |path: &Path| -> Result<Value> {
+        Ok(serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("missing {}", path.display()))?,
+        )?)
+    };
+    let generated = read_json(&generate_report)?;
+    let mut runner = read_json(&runner_report)?;
+    runner["input"] = generated["input"].clone();
+    let expect = |pointer: &str, expected: Value| -> Result<()> {
+        let actual = runner
+            .pointer(pointer)
+            .with_context(|| format!("runner report lacks {pointer}"))?;
+        if *actual != expected {
+            bail!("health range e2e: {pointer} = {actual}, expected {expected}");
+        }
+        Ok(())
+    };
+    expect(
+        "/comparison/whole_snapshot_exceeds_single_budget",
+        json!(true),
+    )?;
+    expect("/comparison/unused_findings_equal", json!(true))?;
+    expect("/comparison/ranges_max_within_limit", json!(true))?;
+    expect("/comparison/every_range_completed", json!(true))?;
+    expect("/comparison/checkpoints_reused_on_resume", json!(true))?;
+    expect("/ranged/partial", json!(false))?;
+    let work_limit = runner["whole_snapshot_work_limit"]
+        .as_u64()
+        .context("runner report lacks whole_snapshot_work_limit")?;
+    let ranges_total = runner
+        .pointer("/ranged/execution/work/ranges_total")
+        .and_then(Value::as_u64)
+        .context("runner report lacks ranged work")?;
+    if ranges_total <= work_limit {
+        bail!(
+            "health range e2e: the fixture must exceed the single budget in ranges \
+             ({ranges_total} <= {work_limit})"
+        );
+    }
+    if runner
+        .pointer("/ranged/execution/work/range_limit")
+        .and_then(Value::as_u64)
+        != Some(work_limit)
+    {
+        bail!("health range e2e: the per-range limit must equal the unchanged single budget");
+    }
+
+    // The CLI on the generated store must report the same ranged execution.
+    let cli = target_dir.join("debug").join(executable_name("depgraph"));
+    let output = Command::new(&cli)
+        .current_dir(&repo)
+        .arg("--store")
+        .arg(&store)
+        .args(["health", "--json"])
+        .output()
+        .with_context(|| format!("failed to start {}", cli.display()))?;
+    if !output.status.success() {
+        bail!(
+            "depgraph health --json exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let envelope: Value = serde_json::from_slice(&output.stdout)
+        .context("depgraph health --json did not print a JSON envelope")?;
+    let data = &envelope["data"];
+    if data["execution"]["mode"] != json!("ranged") || data["partial"] != json!(false) {
+        bail!("depgraph health --json did not report a complete ranged execution: {data}");
+    }
+    if data["counts_by_kind"] != runner["ranged"]["findings"]["by_kind"] {
+        bail!(
+            "depgraph health --json counts {} differ from the runner's {}",
+            data["counts_by_kind"],
+            runner["ranged"]["findings"]["by_kind"]
+        );
+    }
+    if data["execution"]["ranges"]["reused"] != data["execution"]["ranges"]["total"] {
+        bail!("depgraph health --json did not reuse the runner's range checkpoints");
+    }
+
+    let report = json!({
+        "contract": "depgraph-health-range-e2e-v1",
+        "runner": runner,
+        "cli": {
+            "command": "depgraph --store <fixture> health --json",
+            "exit_code": output.status.code(),
+            "envelope": envelope,
+        },
+    });
+    let rendered = format!("{}\n", serde_json::to_string_pretty(&report)?);
+    let report_path = std::env::var_os("DEPGRAPH_HEALTH_RANGE_REPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| work_dir.join("report.json"));
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&report_path, rendered)
+        .with_context(|| format!("failed to write {}", report_path.display()))?;
+    println!(
+        "health-range-e2e: whole snapshot {} at limit {work_limit}; ranged completed {} ranges \
+         (max {} steps per range, {} total) with {} unused findings equal to the control; \
+         report {}",
+        runner["whole_snapshot"]["bounded"]["outcome"],
+        runner["ranged"]["execution"]["ranges"]["total"],
+        runner["ranged"]["execution"]["work"]["ranges_max"],
+        ranges_total,
+        runner["ranged"]["unused_findings"]["total"],
+        report_path.display()
+    );
+    Ok(())
 }
 
 fn package() -> Result<()> {
