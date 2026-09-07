@@ -91,11 +91,16 @@ jobs:
       # single work budget while the ranged path completes under the unchanged
       # per-range limit with identical findings (#467).
       - name: Verify ranged health completes where the whole-snapshot budget fails
+        id: health_range_e2e
         working-directory: .
         env:
           DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
         run: cargo xtask health-range-e2e
+      # The xtask writes the report before it raises a failed comparison, so
+      # the evidence is uploaded whenever the step ran (not when an earlier
+      # step already failed and skipped it).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: "!cancelled() && steps.health_range_e2e.outcome != 'skipped'"
         with:
           name: health-range-report
           path: ${{ runner.temp }}/depgraph-health-range-report.json
