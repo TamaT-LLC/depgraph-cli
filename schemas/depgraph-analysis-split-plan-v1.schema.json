@@ -97,6 +97,7 @@
       "required": [
         "adapter",
         "id",
+        "loader_scope",
         "stages"
       ],
       "properties": {
@@ -105,6 +106,10 @@
         },
         "id": {
           "$ref": "#/$defs/text"
+        },
+        "loader_scope": {
+          "description": "The worker advertised analysis-loader-scope-v1: it receives the split binding and its ownership is partitioned against the byte budgets. Without it the ownership is partitioned by file count alone, exactly as before this contract, so its requests keep their chunk identity.",
+          "type": "boolean"
         },
         "stages": {
           "type": "array",
@@ -413,7 +418,7 @@
       }
     },
     "loaderBinding": {
-      "description": "Loader target a worker receives inside the `split` object of a depgraph-analysis-unit-v2 request. `paths` must cover the request's `source_paths`; `reference_paths` is disjoint from `paths`; `input_split` is true exactly when reference-only inputs exist.",
+      "description": "Loader target a worker receives inside the `split` object of a depgraph-analysis-unit-v2 request. `paths` must cover the request's `source_paths`, and equal them for a syntax request whose parser reads exactly the owned files; `reference_paths` is disjoint from `paths`; `input_split` is true exactly when reference-only inputs exist.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -511,8 +516,9 @@
           "maximum": 64
         },
         "admitted_memory_bytes": {
+          "description": "max_worker_memory_bytes multiplied by effective_concurrency; zero for a plan without execution units.",
           "type": "integer",
-          "minimum": 1
+          "minimum": 0
         },
         "waves": {
           "type": "array",

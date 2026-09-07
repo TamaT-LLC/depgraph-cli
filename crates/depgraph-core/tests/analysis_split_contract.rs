@@ -17,8 +17,9 @@ use std::{
 use anyhow::{Context, Result};
 use depgraph_core::{
     Config,
-    analysis_plan::{AnalysisPlan, plan_analysis_units},
+    analysis_plan::{AnalysisAdapter, AnalysisPlan, plan_analysis_units},
     analysis_split::{
+        ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY, ANALYSIS_LOADER_SCOPE_CAPABILITY,
         ANALYSIS_SPLIT_PLAN_CONTRACT_VERSION, AnalysisAdapterBoundary, AnalysisExecutionUnit,
         AnalysisLoaderKind, AnalysisReferenceDepth, AnalysisResplitOutcome, AnalysisResplitPlan,
         AnalysisResplitTrigger, AnalysisSavedResultDisposition, AnalysisSplitBudget,
@@ -89,6 +90,15 @@ fn budget(configure: impl FnOnce(&mut Config)) -> (Config, AnalysisSplitBudget) 
     configure(&mut config);
     let budget = AnalysisSplitBudget::from_config(&config);
     (config, budget)
+}
+
+/// The shipped boundaries as workers that negotiated loader scope execute
+/// them: the same stages, partitioned against the byte budgets.
+fn negotiated_defaults() -> Vec<AnalysisAdapterBoundary> {
+    AnalysisAdapterBoundary::current_defaults()
+        .into_iter()
+        .map(|boundary| boundary.with_loader_scope(true))
+        .collect()
 }
 
 fn split(
@@ -547,8 +557,33 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         );
         assert!(!unit.loader.input_split);
     }
-    let syntax = units(
+    // The shipped worker has not negotiated loader scope, so its syntax
+    // stage keeps the file-count chunking it always had: eight files fit
+    // one chunk, and the plan reports that chunk over the byte budget.
+    let syntax = only(
         &module_split,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Syntax,
+    );
+    assert_eq!(syntax.split_kind, AnalysisSplitKind::Whole);
+    assert!(syntax.estimate.over_budget);
+    assert!(
+        syntax
+            .split_reasons
+            .contains(&AnalysisSplitReason::SourceByteBudget)
+    );
+    assert!(
+        module_split
+            .limitations
+            .contains(&AnalysisSplitLimitation::WholeContextLoaderRetained)
+    );
+    // The same module loader for a worker that negotiated loader scope is
+    // partitioned against the byte budget.
+    let (negotiated_split, _) = split(&checkout, &plan, &budget, negotiated_defaults())?;
+    let syntax = units(
+        &negotiated_split,
         &plan,
         "services/big",
         "go",
@@ -563,11 +598,6 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         unit.split_reasons
             .contains(&AnalysisSplitReason::SourceByteBudget)
     }));
-    assert!(
-        module_split
-            .limitations
-            .contains(&AnalysisSplitLimitation::WholeContextLoaderRetained)
-    );
 
     // A package-capable Go worker receives a declaration stage for the whole
     // package and body batches that reference those declarations.
@@ -869,12 +899,7 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
     let checkout = Checkout::new()?;
     let (config, budget) = budget(|_| {});
     let plan = checkout.discover(&config)?;
-    let (current, input) = split(
-        &checkout,
-        &plan,
-        &budget,
-        AnalysisAdapterBoundary::current_defaults(),
-    )?;
+    let (current, input) = split(&checkout, &plan, &budget, negotiated_defaults())?;
     let big_syntax = units(&current, &plan, "services/big", "go", AnalysisStage::Syntax);
     let target = big_syntax[0].clone();
     assert_eq!(target.ownership.source_paths.len(), 4);
@@ -1374,6 +1399,79 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
 }
 
 #[test]
+fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
+    // A Rust-only repository has no unit for a source-batch worker.
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"only-rust\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn value() -> u32 {\n    1\n}\n",
+    )?;
+    let config = Config::default();
+    let plan = plan_analysis_units(root, &config, None)?;
+    assert!(
+        plan.executable_units()
+            .iter()
+            .all(|unit| unit.adapter.as_str() == "rust")
+    );
+    let default_budget = AnalysisSplitBudget::from_config(&config);
+
+    let empty = depgraph_core::analysis_split::plan_default_split(root, &config, &plan)?;
+    assert!(empty.boundaries.is_empty());
+    assert!(empty.execution_units.is_empty());
+    assert!(empty.parallelism.waves.is_empty());
+    assert_eq!(
+        empty.parallelism.max_concurrent_units,
+        default_budget.max_concurrent_units
+    );
+    assert_eq!(empty.parallelism.effective_concurrency, 0);
+    assert_eq!(
+        empty.parallelism.admitted_memory_bytes, 0,
+        "no execution unit means no admitted worker"
+    );
+    let schema: Value = serde_json::from_str(SPLIT_PLAN_SCHEMA)?;
+    let validator = jsonschema::validator_for(&schema)?;
+    let errors = validator
+        .iter_errors(&serde_json::to_value(&empty)?)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // Declared boundaries without a unit to execute plan the same way.
+    let declared = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput::new(
+            default_budget.clone(),
+            AnalysisAdapterBoundary::current_defaults(),
+        ),
+    )?;
+    assert!(declared.execution_units.is_empty());
+    assert_eq!(declared.parallelism.effective_concurrency, 0);
+    assert_eq!(declared.parallelism.admitted_memory_bytes, 0);
+
+    // With one unit the bound is one worker, as documented.
+    let checkout = Checkout::new()?;
+    let (_, serial) = budget(|config| config.scan.max_concurrent_units = 1);
+    let (serial_split, _) = split(
+        &checkout,
+        &checkout.discover(&config)?,
+        &serial,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    assert_eq!(serial_split.parallelism.effective_concurrency, 1);
+    assert_eq!(
+        serial_split.parallelism.admitted_memory_bytes,
+        serial.max_worker_memory_bytes
+    );
+    Ok(())
+}
+
+#[test]
 fn measured_sizes_match_fixture_bytes_and_drive_byte_splits() -> Result<()> {
     let checkout = Checkout::new()?;
     let (config, _) = budget(|_| {});
@@ -1387,8 +1485,7 @@ fn measured_sizes_match_fixture_bytes_and_drive_byte_splits() -> Result<()> {
         config.scan.max_unit_source_bytes = 150;
         config.scan.max_context_source_bytes = 150;
     });
-    let input = AnalysisSplitInput::new(byte_budget, AnalysisAdapterBoundary::current_defaults())
-        .with_sizes(measured);
+    let input = AnalysisSplitInput::new(byte_budget, negotiated_defaults()).with_sizes(measured);
     let split_plan = plan_analysis_split(&plan, &input)?;
     let big_syntax = units(
         &split_plan,
@@ -1502,5 +1599,187 @@ fn split_plan_and_resplit_plan_satisfy_the_closed_schema() -> Result<()> {
         !resplit_validator.is_valid(&broken),
         "the re-split definition is closed"
     );
+    Ok(())
+}
+
+#[test]
+fn bounded_package_boundary_requires_the_loader_scope_capability() -> Result<()> {
+    let capabilities = |extra: &[&str]| {
+        [
+            "analysis-unit-v1",
+            "analysis-source-batch-v1",
+            "analysis-unit-typed-v1",
+        ]
+        .iter()
+        .chain(extra)
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>()
+    };
+    let select = |adapter: AnalysisAdapter, extra: &[&str]| {
+        AnalysisAdapterBoundary::for_capabilities(adapter, &capabilities(extra))
+            .expect("a source-batch worker has a boundary")
+    };
+
+    // The bounded package scope only reaches a worker through the `split`
+    // binding, which is sent after `analysis-loader-scope-v1` alone. A worker
+    // that advertises the package loader without it would be planned as
+    // bounded but execute whole modules, so it stays a module loader.
+    let package_only = select(
+        AnalysisAdapter::Go,
+        &[ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY],
+    );
+    assert_eq!(package_only.id, "go-module-loader-typed");
+    assert!(!package_only.loader_scope);
+    assert!(package_only.stages.iter().all(|stage| {
+        stage.stage == AnalysisStage::Syntax || stage.loader_kind == AnalysisLoaderKind::Module
+    }));
+    assert_eq!(
+        serde_json::to_value(&package_only)?,
+        serde_json::to_value(select(AnalysisAdapter::Go, &[]))?,
+        "the package-loader capability alone changes nothing"
+    );
+
+    let bounded = select(
+        AnalysisAdapter::Go,
+        &[
+            ANALYSIS_LOADER_SCOPE_CAPABILITY,
+            ANALYSIS_GO_PACKAGE_LOADER_CAPABILITY,
+        ],
+    );
+    assert_eq!(bounded.id, "go-package-loader");
+    assert!(bounded.loader_scope);
+    assert_eq!(
+        serde_json::to_value(&bounded)?,
+        serde_json::to_value(AnalysisAdapterBoundary::go_package_loader())?
+    );
+
+    // Loader scope alone keeps the module loader, now partitioned against
+    // the byte budgets and bound through `split`.
+    let negotiated = select(AnalysisAdapter::Go, &[ANALYSIS_LOADER_SCOPE_CAPABILITY]);
+    assert_eq!(negotiated.id, "go-module-loader-typed");
+    assert!(negotiated.loader_scope);
+    let web = select(AnalysisAdapter::Web, &[]);
+    assert_eq!(web.id, "web-project-loader");
+    assert!(!web.loader_scope);
+    assert!(select(AnalysisAdapter::Web, &[ANALYSIS_LOADER_SCOPE_CAPABILITY]).loader_scope);
+    assert!(
+        AnalysisAdapterBoundary::current_defaults()
+            .iter()
+            .all(|boundary| !boundary.loader_scope),
+        "the shipped workers have not negotiated loader scope"
+    );
+
+    // The planner refuses the inconsistent combination outright.
+    let checkout = Checkout::new()?;
+    let (config, budget) = budget(|_| {});
+    let plan = checkout.discover(&config)?;
+    let error = split(
+        &checkout,
+        &plan,
+        &budget,
+        vec![AnalysisAdapterBoundary::go_package_loader().with_loader_scope(false)],
+    )
+    .expect_err("a bounded loader without negotiated loader scope is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("bounds a loader without negotiated loader scope"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
+    let checkout = Checkout::new()?;
+    let (config, default_budget) = budget(|_| {});
+    let plan = checkout.discover(&config)?;
+    let big = unit_id(&plan, "services/big", "go");
+    let big_paths = plan.unit(&big).unwrap().source_paths.clone();
+    // The synthetic package owns 8 x 2 MiB, twice the default unit byte budget.
+    let owned_bytes = checkout
+        .sizes(&plan)?
+        .iter()
+        .filter(|(path, _)| big_paths.contains(path))
+        .map(|(_, size)| *size)
+        .sum::<u64>();
+    assert!(owned_bytes > default_budget.max_unit_source_bytes);
+
+    let (legacy, _) = split(
+        &checkout,
+        &plan,
+        &default_budget,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    let (negotiated, _) = split(&checkout, &plan, &default_budget, negotiated_defaults())?;
+    assert_eq!(legacy.plan_id, negotiated.plan_id);
+    assert_eq!(legacy.budget_fingerprint, negotiated.budget_fingerprint);
+    assert_ne!(legacy.split_plan_id, negotiated.split_plan_id);
+
+    // A worker that did not negotiate loader scope receives the file-count
+    // chunking it received before the split plan existed: eight files fit
+    // one chunk of the default 128-file budget. The plan still reports the
+    // chunk over the byte budget, which the boundary cannot split away.
+    let syntax = only(&legacy, &plan, "services/big", "go", AnalysisStage::Syntax);
+    assert_eq!(syntax.ownership.source_paths, big_paths);
+    assert_eq!(syntax.split_kind, AnalysisSplitKind::Whole);
+    assert!(syntax.estimate.over_budget);
+    assert_eq!(
+        syntax.split_reasons,
+        vec![
+            AnalysisSplitReason::SourceByteBudget,
+            AnalysisSplitReason::AdapterBoundaryUnsplittable,
+        ]
+    );
+    // The same worker with loader scope is partitioned against the byte
+    // budget; every other execution unit keeps its identity.
+    let bounded = units(
+        &negotiated,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Syntax,
+    );
+    assert_eq!(bounded.len(), 2);
+    assert!(bounded.iter().all(|unit| {
+        unit.split_kind == AnalysisSplitKind::InputBatch
+            && unit
+                .split_reasons
+                .contains(&AnalysisSplitReason::SourceByteBudget)
+    }));
+    let other_ids = |split_plan: &AnalysisSplitPlan| {
+        split_plan
+            .execution_units
+            .iter()
+            .filter(|unit| !(unit.unit_id == big && unit.stage == AnalysisStage::Syntax))
+            .map(|unit| unit.id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(other_ids(&legacy), other_ids(&negotiated));
+
+    // The file budget still partitions a worker without loader scope, in
+    // the order and grouping of the previous chunking.
+    let (_, file_budget) = budget(|config| config.scan.max_unit_source_files = 2);
+    let (legacy_files, _) = split(
+        &checkout,
+        &plan,
+        &file_budget,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    let chunks = units(
+        &legacy_files,
+        &plan,
+        "services/big",
+        "go",
+        AnalysisStage::Syntax,
+    );
+    assert_eq!(chunks.len(), 4);
+    for (chunk, expected) in chunks.iter().zip(big_paths.chunks(2)) {
+        assert_eq!(chunk.ownership.source_paths, expected);
+        assert_eq!(
+            chunk.split_reasons,
+            vec![AnalysisSplitReason::SourceFileBudget]
+        );
+    }
     Ok(())
 }

@@ -60,7 +60,7 @@ work item from the split plan instead of chunking by itself, and exposes the
 plan as `AnalysisSchedule::split_plan`. For a worker that did not negotiate
 loader scope, the request JSON, chunk identity, and path sets are unchanged
 from the previous chunking, so existing checkpoints and worker validation keep
-working.
+working; the boundary's `loader_scope` flag (below) is what keeps that true.
 
 ### Roots
 
@@ -119,14 +119,22 @@ must be at least `max_unit_source_bytes`.
 
 An `AnalysisAdapterBoundary` lists, per stage, the loader kind, reference
 depth, split granularity (`file` or `package`), and whether the worker can
-split output, split input, or stage bodies after a declaration stage. The
-shipped boundaries are:
+split output, split input, or stage bodies after a declaration stage. It also
+records in `loader_scope` whether the worker advertised
+`analysis-loader-scope-v1`. The shipped boundaries are:
 
 | Boundary | Selected when | Syntax | Typed | Semantic |
 | --- | --- | --- | --- | --- |
-| `go-module-loader(-typed)` | Go worker with `analysis-source-batch-v1` (and `analysis-unit-typed-v1`) | files, input split | module, unsplittable | module, unsplittable |
-| `go-package-loader` | Go worker also advertising `analysis-go-package-loader-v1` (#463 target) | files, input split | package, declaration references, input split | package, declaration references, staged bodies per file |
+| `go-module-loader(-typed)` | Go worker with `analysis-source-batch-v1` (and `analysis-unit-typed-v1`); also the fallback for a worker advertising `analysis-go-package-loader-v1` without `analysis-loader-scope-v1` | files, input split | module, unsplittable | module, unsplittable |
+| `go-package-loader` | Go worker advertising both `analysis-loader-scope-v1` and `analysis-go-package-loader-v1` (#463 target); `loader_scope` is always true | files, input split | package, declaration references, input split | package, declaration references, staged bodies per file |
 | `web-project-loader` | Web worker with `analysis-source-batch-v1` | files, input split | – | project, output split only |
+
+The bounded package scope reaches a worker only through the `split` binding,
+which is sent after `analysis-loader-scope-v1` alone. A worker that advertised
+the package loader without it would be planned as bounded but execute whole
+modules, so `for_capabilities` keeps the module loader for it, and the planner
+rejects any boundary that bounds a typed or semantic loader below the whole
+context while `loader_scope` is false.
 
 For each unit and stage the planner partitions the ownership scope by the
 stage's granularity until each batch fits the file and byte budgets, then
@@ -136,13 +144,24 @@ the rest. Partitioning happens only where the boundary allows a split; a
 stage that cannot be split stays one execution unit and reports
 `adapter_boundary_unsplittable` together with the budget it exceeds.
 
+The byte budget partitions only a boundary whose `loader_scope` is true. A
+worker that did not negotiate loader scope is partitioned by file count
+alone, exactly as the scheduler chunked before this record, so its requests,
+chunk identities, and checkpoints are unchanged. Its byte budget still enters
+the estimate: an owned batch above `max_unit_source_bytes` is reported
+`over_budget` with `source_byte_budget` and `adapter_boundary_unsplittable`,
+because that boundary offers no byte-bounded partition, and a refinement can
+still divide it. The shipped Go and Web workers have not negotiated loader
+scope, so `current_defaults()` and `scan --split-plan` describe them this way.
+
 The parallelism decision (`AnalysisParallelism`) is made in the same pass.
 Execution units are laid out in waves of at most `max_concurrent_units`,
 each unit no earlier than the wave after its prerequisites. The plan reports
 the effective concurrency the plan can actually use, the admitted worker
-memory bound (`max_worker_memory_bytes × effective_concurrency`), and the
-estimated weight per wave. The scheduler admits work in the same
-adapter-major, stage-major order the plan was built in.
+memory bound (`max_worker_memory_bytes × effective_concurrency`, zero for a
+plan without execution units), and the estimated weight per wave. The
+scheduler admits work in the same adapter-major, stage-major order the plan
+was built in.
 
 ### Dependencies, cycles, shared inputs, and a staged large package
 
@@ -246,11 +265,17 @@ with `analysis_split_plan_id`, `analysis_execution_unit_id`,
 The Go worker validates and echoes the binding now (`analysis_split.go`):
 `loader.paths` must cover `source_paths`, reference paths must be disjoint
 from loaded paths, `input_split` must agree with the presence of reference
-paths, and `whole` requires a single chunk. It still loads the complete module
-for typed and semantic stages and reports `widened` for a `package` request.
-It does not yet advertise `analysis-loader-scope-v1`; #463 turns that on
-together with `analysis-go-package-loader-v1` when `packages.Load` is bounded
-to the requested package roots. The Web worker is unchanged.
+paths, and `whole` requires a single chunk. A syntax request must bind a
+`files` loader whose `paths` equal `source_paths`: the parser reads exactly
+the owned files, so a wider loader scope could only be honoured by reading
+less than requested, and the worker rejects it instead of reporting `applied`
+for a scope it never read. The planner never produces such a binding, because
+a syntax boundary reads paths only and its loader scope is its ownership. The
+worker still loads the complete module for typed and semantic stages and
+reports `widened` for a `package` request. It does not yet advertise
+`analysis-loader-scope-v1`; #463 turns that on together with
+`analysis-go-package-loader-v1` when `packages.Load` is bounded to the
+requested package roots. The Web worker is unchanged.
 
 ### Re-analysis triggers
 
@@ -306,7 +331,9 @@ to the context it depends on.
   checkpoints are rerun on the first scan after the upgrade.
 - Worker protocol: the request stays `depgraph-analysis-unit-v2`; `split` is
   additive and negotiated. Profile properties are additive. Chunk IDs, path
-  sets, and field order are unchanged for existing workers.
+  sets, and field order are unchanged for existing workers: the byte budget
+  partitions only a worker that advertised `analysis-loader-scope-v1`, so a
+  unit above `scan.max_unit_source_bytes` keeps the file-count chunks it had.
 - Store and operation journal: no schema change. The unit ledger keeps
   `chunk_id`, `chunk_index`, and `chunk_count`; execution unit IDs are derived
   and not persisted by this record. Snapshot identity, checkpoint keys, and
@@ -335,14 +362,21 @@ loader or reference scope; the large single package is a staged split; the
 cycle group is kept in one context; a re-split supersedes only the refined
 unit and keeps the other saved results; loader scope and ownership scope are
 distinguishable; parallelism is decided before execution and respects
-prerequisites; measured sizes match fixture bytes and drive byte splits; and
-the split plan, re-split plan, and worker binding satisfy the closed schema.
-`analysis_schedule.rs` verifies that the binding is attached only after
-negotiation and leaves requests otherwise byte-identical. The Go worker tests
-in `analysis_split_test.go` cover strict decoding, rejection of an output-only
-split posing as an input split, and unchanged results and identities when the
-binding is echoed. `crates/depgraph-cli/tests/cli.rs` verifies
-`scan --split-plan` without workers or a Store.
+prerequisites; measured sizes match fixture bytes and drive byte splits; the
+bounded package boundary requires the loader-scope capability and a bounded
+boundary without it is rejected; a worker without loader scope keeps the
+file-count partition for the 16 MiB synthetic package while the negotiated
+worker is byte-split; a plan without execution units admits no worker memory;
+and the split plan, re-split plan, and worker binding satisfy the closed
+schema. `analysis_schedule.rs` verifies, with an owned source above the 8 MiB
+budget, that requests for a worker without loader scope are byte-identical to
+the previous chunking and that the binding is attached, and the byte budget
+applied, only after negotiation. The Go worker tests in
+`analysis_split_test.go` cover strict decoding, rejection of an output-only
+split posing as an input split, rejection of a syntax loader scope wider than
+`source_paths`, and unchanged results and identities when the binding is
+echoed. `crates/depgraph-cli/tests/cli.rs` verifies `scan --split-plan`
+without workers or a Store.
 
 ## Limitations
 

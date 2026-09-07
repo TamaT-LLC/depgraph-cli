@@ -19,9 +19,8 @@ use crate::{
         plan_analysis_units, source_path_belongs_to_adapter,
     },
     analysis_split::{
-        ANALYSIS_LOADER_SCOPE_CAPABILITY, AnalysisAdapterBoundary, AnalysisSplitBudget,
-        AnalysisSplitInput, AnalysisSplitPlan, AnalysisStage, measure_source_sizes,
-        plan_analysis_split,
+        AnalysisAdapterBoundary, AnalysisSplitBudget, AnalysisSplitInput, AnalysisSplitPlan,
+        AnalysisStage, measure_source_sizes, plan_analysis_split,
     },
     cache::{
         ScanCachePreparation, fingerprint_adapters, fingerprint_scan_inputs,
@@ -356,9 +355,9 @@ pub(crate) async fn prepare_analysis_schedule(
                     adapter,
                     spec,
                     units,
-                    capabilities,
                     batch_contexts,
                     execution_digest,
+                    ..
                 } = *schedule;
                 let split_plan = split_plan
                     .as_ref()
@@ -368,9 +367,10 @@ pub(crate) async fn prepare_analysis_schedule(
                     .iter()
                     .find(|boundary| boundary.adapter == analysis_adapter(adapter))
                     .expect("source batches require an adapter boundary");
-                let loader_scope = capabilities
-                    .iter()
-                    .any(|capability| capability == ANALYSIS_LOADER_SCOPE_CAPABILITY);
+                // The boundary selected from the worker's capabilities already
+                // records whether it negotiated loader scope; the binding and
+                // the byte-bounded partition follow the same decision.
+                let loader_scope = boundary.loader_scope;
                 for stage in boundary.stages() {
                     for (unit, batch_context) in units.iter().zip(&batch_contexts) {
                         let requests = source_batch_requests_for_stage(
@@ -454,6 +454,25 @@ fn split_plan_for_default_workers(
     plan: &AnalysisPlan,
     store_path: Option<&Path>,
 ) -> Result<(AnalysisSplitPlan, BTreeMap<String, SourceBatchContext>)> {
+    split_plan_for_boundaries(
+        root,
+        config,
+        plan,
+        store_path,
+        AnalysisAdapterBoundary::current_defaults(),
+    )
+}
+
+/// Build the split plan the scheduler would use for the given worker
+/// boundaries, with the worker context closure of every source-batch unit.
+#[cfg(test)]
+fn split_plan_for_boundaries(
+    root: &Path,
+    config: &crate::Config,
+    plan: &AnalysisPlan,
+    store_path: Option<&Path>,
+    boundaries: Vec<AnalysisAdapterBoundary>,
+) -> Result<(AnalysisSplitPlan, BTreeMap<String, SourceBatchContext>)> {
     let inventory = build_repository_file_inventory(root)?;
     let mut contexts = BTreeMap::new();
     let mut batch_contexts = BTreeMap::new();
@@ -469,7 +488,7 @@ fn split_plan_for_default_workers(
     }
     // Production only declares boundaries for adapters whose worker negotiated
     // source batches; mirror that with the adapters the plan actually contains.
-    let boundaries = AnalysisAdapterBoundary::current_defaults()
+    let boundaries = boundaries
         .into_iter()
         .filter(|boundary| adapters.contains(&boundary.adapter))
         .collect();
@@ -908,6 +927,7 @@ fn root_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis_split::ANALYSIS_LOADER_SCOPE_CAPABILITY;
     use serde_json::Value;
 
     #[test]
@@ -1195,57 +1215,184 @@ mod tests {
             root.join("app/go.mod"),
             "module example.test/app\n\ngo 1.26\nrequire example.test/shared v0.0.0\nreplace example.test/shared => ../shared\n",
         )?;
+        // One owned source above the default 8 MiB unit byte budget. A worker
+        // that negotiated loader scope is partitioned against that budget; a
+        // worker that did not must receive exactly the file-count chunks it
+        // received before the split plan existed.
         let mut config = crate::Config::default();
         config.scan.max_unit_source_files = 2;
+        std::fs::write(
+            root.join("app/blob.go"),
+            format!(
+                "package app\n\nconst Blob = \"{}\"\n",
+                "x".repeat(config.scan.max_unit_source_bytes as usize)
+            ),
+        )?;
         let plan = plan_analysis_units(root, &config, None)?;
         let app = plan
             .executable_units()
             .into_iter()
             .find(|unit| unit.unit_root == "app")
             .expect("app module");
-        let (split_plan, contexts) = split_plan_for_default_workers(root, &config, &plan, None)?;
+        assert_eq!(app.source_paths.len(), 5);
+        let capabilities = |loader_scope: bool| {
+            let mut capabilities = vec![
+                "analysis-unit-v1".to_owned(),
+                "analysis-source-batch-v1".to_owned(),
+                "analysis-unit-typed-v1".to_owned(),
+            ];
+            if loader_scope {
+                capabilities.push(ANALYSIS_LOADER_SCOPE_CAPABILITY.to_owned());
+            }
+            capabilities
+        };
+        let boundary_for = |loader_scope: bool| {
+            AnalysisAdapterBoundary::for_capabilities(
+                AnalysisAdapter::Go,
+                &capabilities(loader_scope),
+            )
+            .expect("source-batch Go worker has a boundary")
+        };
+        let legacy_boundary = boundary_for(false);
+        let negotiated_boundary = boundary_for(true);
+        assert!(!legacy_boundary.loader_scope);
+        assert!(negotiated_boundary.loader_scope);
+        assert_eq!(legacy_boundary.id, negotiated_boundary.id);
+        let (legacy_plan, contexts) =
+            split_plan_for_boundaries(root, &config, &plan, None, vec![legacy_boundary.clone()])?;
+        let (negotiated_plan, _) = split_plan_for_boundaries(
+            root,
+            &config,
+            &plan,
+            None,
+            vec![negotiated_boundary.clone()],
+        )?;
         assert_eq!(
-            split_plan.boundaries.len(),
+            legacy_plan.boundaries.len(),
             1,
             "only the Go adapter is present"
         );
+        let (legacy_default, _) = split_plan_for_default_workers(root, &config, &plan, None)?;
+        assert_eq!(
+            legacy_default.split_plan_id, legacy_plan.split_plan_id,
+            "the shipped defaults describe workers that have not negotiated loader scope"
+        );
+
+        // The chunking the scheduler performed before the split plan existed;
+        // requests for a worker without loader scope must stay byte-identical
+        // to it, so existing checkpoints and worker validation keep working.
+        let context = &contexts[&app.id];
+        let previous_requests = |stage: AnalysisStage| -> Vec<Value> {
+            let stage = stage.as_str();
+            let batch_size = if matches!(stage, "typed" | "semantic") {
+                app.source_paths.len().max(1)
+            } else {
+                config.scan.max_unit_source_files.max(1)
+            };
+            let chunks = app.source_paths.chunks(batch_size).collect::<Vec<_>>();
+            let count = chunks.len();
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, paths)| {
+                    let chunk_id = depgraph_protocol::stable_id_from_value(
+                        "analysis-chunk",
+                        &json!({"contract":SOURCE_BATCH_CONTRACT,"unit":app.id,"stage":stage,"paths":paths}),
+                    );
+                    let context_paths = if stage == "typed" {
+                        &app.source_paths
+                    } else {
+                        &context.source_context_paths
+                    };
+                    json!({
+                        "contract_version":SOURCE_BATCH_CONTRACT,"unit_id":app.id,"adapter":"go",
+                        "unit_root":app.unit_root,"source_paths":paths,"context_paths":context_paths,
+                        "auxiliary_paths":if index == 0 && stage == "syntax" { context.auxiliary_paths.clone() } else { Vec::new() },
+                        "context_fingerprint":context.context_fingerprint,"stage":stage,
+                        "chunk_id":chunk_id,"chunk_index":index,"chunk_count":count,
+                    })
+                })
+                .collect()
+        };
 
         for stage in [
             AnalysisStage::Syntax,
             AnalysisStage::Typed,
             AnalysisStage::Semantic,
         ] {
-            let legacy =
-                source_batch_requests_for_stage(&split_plan, app, stage, &contexts[&app.id], false);
-            let negotiated =
-                source_batch_requests_for_stage(&split_plan, app, stage, &contexts[&app.id], true);
-            assert_eq!(legacy.len(), negotiated.len());
-            for (legacy, negotiated) in legacy.iter().zip(&negotiated) {
+            let legacy = source_batch_requests_for_stage(
+                &legacy_plan,
+                app,
+                stage,
+                context,
+                legacy_boundary.loader_scope,
+            );
+            let previous = previous_requests(stage);
+            assert_eq!(
+                legacy.len(),
+                previous.len(),
+                "{stage:?} chunk count is unchanged"
+            );
+            for (legacy, previous) in legacy.iter().zip(&previous) {
                 assert!(legacy.get("split").is_none());
-                let mut stripped = negotiated.clone();
+                assert_eq!(
+                    serde_json::to_string(legacy)?,
+                    serde_json::to_string(previous)?,
+                    "{stage:?} request for a worker without loader scope is byte-identical"
+                );
+            }
+            if stage == AnalysisStage::Syntax {
+                assert_eq!(legacy.len(), 3, "five files in file-count chunks of two");
+                assert_eq!(
+                    legacy[0]["source_paths"],
+                    json!(["app/blob.go", "app/file0.go"]),
+                    "the byte budget does not re-chunk a worker without loader scope"
+                );
+                let over_budget = legacy_plan
+                    .execution_units_for(&app.id, stage)
+                    .into_iter()
+                    .filter(|unit| unit.estimate.over_budget)
+                    .count();
+                assert_eq!(over_budget, 1, "the plan still reports the oversized chunk");
+            }
+
+            let negotiated = source_batch_requests_for_stage(
+                &negotiated_plan,
+                app,
+                stage,
+                context,
+                negotiated_boundary.loader_scope,
+            );
+            for request in &negotiated {
+                let mut stripped = request.clone();
                 let split = stripped
                     .as_object_mut()
                     .unwrap()
                     .remove("split")
                     .expect("negotiated request carries the split binding");
-                assert_eq!(&stripped, legacy, "binding is purely additive");
+                assert_eq!(
+                    stripped.as_object().unwrap().keys().collect::<Vec<_>>(),
+                    previous[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+                    "binding is purely additive"
+                );
                 assert_eq!(split["contract_version"], "depgraph-analysis-split-plan-v1");
-                assert_eq!(split["split_plan_id"], split_plan.split_plan_id);
-                let execution_unit = split_plan
+                assert_eq!(split["split_plan_id"], negotiated_plan.split_plan_id);
+                let execution_unit = negotiated_plan
                     .execution_unit(split["execution_unit_id"].as_str().unwrap())
                     .expect("binding names an execution unit of the plan");
                 assert_eq!(
                     json!(execution_unit.ownership.source_paths),
-                    negotiated["source_paths"]
+                    request["source_paths"]
                 );
                 let loader_paths = split["loader"]["paths"].as_array().unwrap();
-                for owned in negotiated["source_paths"].as_array().unwrap() {
+                for owned in request["source_paths"].as_array().unwrap() {
                     assert!(loader_paths.contains(owned), "loader covers owned files");
                 }
                 // The chunk identity is the pre-existing formula, so checkpoint
-                // keys do not change when a worker starts negotiating scope.
+                // keys of unchanged chunks survive a worker starting to
+                // negotiate scope.
                 assert_eq!(
-                    negotiated["chunk_id"],
+                    request["chunk_id"],
                     json!(depgraph_protocol::stable_id_from_value(
                         "analysis-chunk",
                         &json!({
@@ -1260,7 +1407,20 @@ mod tests {
             let split = &negotiated[0]["split"];
             match stage {
                 AnalysisStage::Syntax => {
-                    assert_eq!(negotiated.len(), 2);
+                    // The oversized file is isolated by the byte budget; the
+                    // remaining four files keep the two-file chunks, so the
+                    // chunks differ from the legacy ones by content, not count.
+                    assert_eq!(negotiated.len(), 3);
+                    assert_eq!(negotiated[0]["source_paths"], json!(["app/blob.go"]));
+                    assert_eq!(
+                        negotiated[1]["source_paths"],
+                        json!(["app/file0.go", "app/file1.go"])
+                    );
+                    assert_eq!(
+                        negotiated[2]["source_paths"],
+                        json!(["app/file2.go", "app/zed/zed.go"])
+                    );
+                    assert_ne!(negotiated[0]["chunk_id"], legacy[0]["chunk_id"]);
                     assert_eq!(split["split_kind"], "input_batch");
                     assert_eq!(split["loader"]["kind"], "files");
                     assert_eq!(split["loader"]["input_split"], true);
