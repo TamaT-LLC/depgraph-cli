@@ -359,9 +359,14 @@ jobs:
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # The `rust` job already runs both module suites on ubuntu-24.04 with the
+      # same bubblewrap boundary, and every integration run requires that job
+      # to pass first. Only the macOS leg adds platform coverage here.
       - name: Build supervisor staging, redaction, timeout, cancellation, and descendant reap
+        if: runner.os != 'Linux'
         run: cargo test -p depgraph-core --lib --locked build::tests
       - name: Watcher daemon lifecycle, debounce, cancellation, and recovery
+        if: runner.os != 'Linux'
         run: cargo test -p depgraph-core --lib --locked daemon::tests
       - name: Report runner disk before the integration build
         shell: bash
