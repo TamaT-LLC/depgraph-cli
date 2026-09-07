@@ -41,6 +41,7 @@ pub use crate::service_health::{
     HealthAuditReadScope, HealthAuditRequest, HealthAuditResult, HealthCoverageOverview,
     HealthFindingGetRequest, HealthFindingsRequest, HealthFindingsResult, HealthHotspotsRequest,
     HealthHotspotsResult, HealthSummaryRequest, HealthSummaryResult, PinnedHealthSnapshot,
+    health_range_limits,
 };
 pub use crate::service_lifecycle::{DoctorRequest, DoctorResponse, ProfilePlanRequest};
 pub use crate::service_limits::{
@@ -48,7 +49,8 @@ pub use crate::service_limits::{
     MAX_GRAPH_PHASE_COVERAGE_ITEMS, MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
     MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_EVIDENCE_PER_FINDING,
     MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, MAX_HEALTH_MANIFEST_BYTES, MAX_HEALTH_MANIFESTS,
-    MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
+    MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
+    MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
     MAX_HEALTH_TOTAL_MANIFEST_BYTES, MAX_IMPACT_MATERIALIZED_PATH_STEPS,
     MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
 };

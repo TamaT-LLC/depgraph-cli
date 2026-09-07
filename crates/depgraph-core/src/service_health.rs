@@ -4,7 +4,10 @@ use std::{
     path::Path,
 };
 
-use depgraph_store::{GraphSnapshot, ScanRecord};
+use depgraph_store::{
+    CoverageRecord, GraphSnapshot, HealthInputIdentity, HealthInputSelector, HealthRangeLimits,
+    ScanRecord, Store,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -16,8 +19,15 @@ use crate::{
         HealthFinding, HealthFindingDetail, HotspotAnalysisError, HotspotLayerAvailability,
         HotspotWeights, ManifestIdentity, Severity,
         analyze_changed_code_with_boundary_ids_cancellable, analyze_dependencies_cancellable,
-        analyze_unused_cancellable, collection_digest, contract::collection_digest_with_policy,
-        finding_fingerprint, score_hotspots_cancellable,
+        analyze_unused_cancellable, collection_digest,
+        contract::collection_digest_with_policy,
+        finding_fingerprint,
+        range_checkpoint::HealthRangeCheckpointStore,
+        ranged::{
+            HealthRangeDiagnostics, RangeOrder, RangedHealthError, RangedUnusedOptions,
+            analyze_dependencies_ranged, analyze_unused_ranged, load_dependency_projection,
+        },
+        score_hotspots_cancellable,
     },
     impact::{
         GitChangedSet, is_resource_exhausted, map_changed_set_cancellable,
@@ -33,8 +43,9 @@ use crate::{
         MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_HEALTH_BLOCKERS_PER_FINDING,
         MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_EVIDENCE_PER_FINDING, MAX_HEALTH_FILTER_ITEMS,
         MAX_HEALTH_FINDINGS, MAX_HEALTH_MANIFEST_BYTES, MAX_HEALTH_MANIFESTS,
-        MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
-        MAX_HEALTH_TOTAL_MANIFEST_BYTES,
+        MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
+        MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING,
+        MAX_HEALTH_SUPPRESSIONS_PER_FINDING, MAX_HEALTH_TOTAL_MANIFEST_BYTES,
     },
 };
 
@@ -48,9 +59,26 @@ use crate::{
 
 const MAX_GIT_REF_BYTES: usize = 256;
 
+/// The unchanged per-phase / per-range health budget and the caps around it.
+///
+/// `per_range_work` is [`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`], the
+/// same constant that bounded the whole-snapshot path; the ranged path applies
+/// it to the planner, the snapshot-wide context, every range, the dependency
+/// projection, and dependency matching separately.
+#[must_use]
+pub const fn health_range_limits() -> HealthRangeLimits {
+    HealthRangeLimits {
+        per_range_work: MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS as u64,
+        max_ranges: MAX_HEALTH_RANGES,
+        planner_rows: MAX_HEALTH_PLANNER_ROWS,
+        max_resplit_depth: MAX_HEALTH_RANGE_RESPLIT_DEPTH,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HealthSummaryRequest {
     kinds: Option<Vec<FindingKind>>,
+    allow_partial: bool,
 }
 
 impl HealthSummaryRequest {
@@ -65,12 +93,29 @@ impl HealthSummaryRequest {
             kinds.sort_unstable();
             kinds.dedup();
         }
-        Ok(Self { kinds })
+        Ok(Self {
+            kinds,
+            allow_partial: false,
+        })
+    }
+
+    /// Opt into the partial view: when some health ranges failed after
+    /// re-splitting, return the findings of the completed ranges with an
+    /// `incomplete_coverage` blocker on every finding instead of failing.
+    #[must_use]
+    pub const fn with_allow_partial(mut self, allow_partial: bool) -> Self {
+        self.allow_partial = allow_partial;
+        self
     }
 
     #[must_use]
     pub fn kinds(&self) -> Option<&[FindingKind]> {
         self.kinds.as_deref()
+    }
+
+    #[must_use]
+    pub const fn allow_partial(&self) -> bool {
+        self.allow_partial
     }
 }
 
@@ -91,9 +136,22 @@ pub struct HealthSummaryResult {
     counts_by_kind: BTreeMap<String, u64>,
     counts_by_confidence: BTreeMap<String, u64>,
     coverage: HealthCoverageOverview,
+    diagnostics: HealthRangeDiagnostics,
 }
 
 impl HealthSummaryResult {
+    /// How the collection was executed: ranges, per-phase work, checkpoints.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &HealthRangeDiagnostics {
+        &self.diagnostics
+    }
+
+    /// `true` only for the opt-in partial view of an incomplete range set.
+    #[must_use]
+    pub const fn partial(&self) -> bool {
+        self.diagnostics.partial
+    }
+
     #[must_use]
     pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
         &self.snapshot_id
@@ -136,6 +194,7 @@ pub struct HealthFindingsRequest {
     severities: Vec<Severity>,
     confidences: Vec<Confidence>,
     limit: usize,
+    allow_partial: bool,
 }
 
 impl HealthFindingsRequest {
@@ -164,12 +223,25 @@ impl HealthFindingsRequest {
             severities,
             confidences,
             limit,
+            allow_partial: false,
         })
+    }
+
+    /// See [`HealthSummaryRequest::with_allow_partial`].
+    #[must_use]
+    pub const fn with_allow_partial(mut self, allow_partial: bool) -> Self {
+        self.allow_partial = allow_partial;
+        self
     }
 
     #[must_use]
     pub fn kinds(&self) -> &[FindingKind] {
         &self.kinds
+    }
+
+    #[must_use]
+    pub const fn allow_partial(&self) -> bool {
+        self.allow_partial
     }
 
     #[must_use]
@@ -195,9 +267,20 @@ pub struct HealthFindingsResult {
     collection_digest: String,
     manifest_digest: Option<String>,
     findings: Vec<HealthFinding>,
+    diagnostics: HealthRangeDiagnostics,
 }
 
 impl HealthFindingsResult {
+    #[must_use]
+    pub const fn diagnostics(&self) -> &HealthRangeDiagnostics {
+        &self.diagnostics
+    }
+
+    #[must_use]
+    pub const fn partial(&self) -> bool {
+        self.diagnostics.partial
+    }
+
     #[must_use]
     pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
         &self.snapshot_id
@@ -469,9 +552,11 @@ impl DepgraphService {
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<HealthSummaryResult> {
         let snapshot_id = snapshot_request.snapshot_id().clone();
-        let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
-        let collected =
-            collect_snapshot_scoped(&snapshot, self.config().canonical_root(), cancellation)?;
+        let collected = self.collect_snapshot_scoped_request(
+            snapshot_request,
+            request.allow_partial,
+            cancellation,
+        )?;
         let filtered = collected.findings.into_iter().filter(|finding| {
             request
                 .kinds
@@ -503,22 +588,24 @@ impl DepgraphService {
                 churn_commit_limit: None,
                 churn_path_filter: Vec::new(),
                 hotspot_weights: None,
+                partial_ranges: collected.diagnostics.partial_range_status(),
             },
             &ids,
         );
         Ok(HealthSummaryResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: collected.scan_id,
             collection_digest,
             manifest_digest: collected.manifest_digest,
             counts_by_kind,
             counts_by_confidence,
             coverage: HealthCoverageOverview {
-                completeness: snapshot.coverage.completeness,
-                files_skipped: snapshot.coverage.files_skipped,
-                unresolved: snapshot.coverage.unresolved,
-                candidates: snapshot.coverage.candidates,
+                completeness: collected.coverage.completeness,
+                files_skipped: collected.coverage.files_skipped,
+                unresolved: collected.coverage.unresolved,
+                candidates: collected.coverage.candidates,
             },
+            diagnostics: collected.diagnostics,
         })
     }
 
@@ -529,9 +616,11 @@ impl DepgraphService {
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<HealthFindingsResult> {
         let snapshot_id = snapshot_request.snapshot_id().clone();
-        let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
-        let collected =
-            collect_snapshot_scoped(&snapshot, self.config().canonical_root(), cancellation)?;
+        let collected = self.collect_snapshot_scoped_request(
+            snapshot_request,
+            request.allow_partial,
+            cancellation,
+        )?;
         let mut findings = collected.findings;
         findings.retain(|finding| {
             (request.kinds.is_empty() || request.kinds.contains(&finding.kind))
@@ -560,16 +649,90 @@ impl DepgraphService {
                 churn_commit_limit: None,
                 churn_path_filter: Vec::new(),
                 hotspot_weights: None,
+                partial_ranges: collected.diagnostics.partial_range_status(),
             },
             &ids,
         );
         Ok(HealthFindingsResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: collected.scan_id,
             collection_digest,
             manifest_digest: collected.manifest_digest,
             findings,
+            diagnostics: collected.diagnostics,
         })
+    }
+
+    /// Collect the snapshot-scoped findings of `snapshot_request`.
+    ///
+    /// Plain inputs (one scan layer, no overlays) are planned and analyzed in
+    /// bounded store ranges without materializing the graph; layered inputs
+    /// (build deltas, runtime sessions, semantic no-op overlays) keep the
+    /// whole-snapshot path so overlay semantics stay exactly as before.
+    fn collect_snapshot_scoped_request(
+        &self,
+        snapshot_request: &mut SnapshotReadRequest,
+        allow_partial: bool,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<SnapshotScopedCollection> {
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let limits = health_range_limits();
+        let root = self.config().canonical_root().to_path_buf();
+        let checkpoints = HealthRangeCheckpointStore::open(
+            self.config().store_path(),
+            MAX_HEALTH_RANGE_CHECKPOINT_BYTES,
+        )
+        .ok();
+        let snapshot_id = snapshot_request.snapshot_id().clone();
+        let cancellation_check = cancellation.clone();
+        // Identity, plan, and every range load share one read transaction so
+        // the plan digest can never describe a different store state than the
+        // rows it was cut from.
+        let collected = snapshot_request.store().interruptible_read(
+            move || cancellation_check.is_cancelled(),
+            |store| {
+                let identity = store.resolve_health_input(match snapshot_id.attempt_id() {
+                    Some(attempt_id) => HealthInputSelector::Attempt(attempt_id),
+                    None => HealthInputSelector::CompletedSnapshot(snapshot_id.as_str()),
+                })?;
+                if !identity.is_plain() {
+                    return Ok(Err(identity));
+                }
+                let collected = collect_ranged(
+                    store,
+                    &identity,
+                    &root,
+                    limits,
+                    allow_partial,
+                    checkpoints,
+                    cancellation,
+                );
+                // The projection is connection-scoped scratch space; a failure
+                // to drop it only costs memory until the connection closes.
+                let _ = store.release_health_range_projection();
+                Ok(Ok(collected))
+            },
+        );
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        match collected.map_err(DepgraphServiceError::store_operation)? {
+            Ok(collected) => collected,
+            // Layered inputs (build deltas, runtime sessions, semantic no-op
+            // overlays) keep the whole-snapshot path so overlay semantics stay
+            // exactly as before.
+            Err(identity) => {
+                let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
+                collect_snapshot_scoped(
+                    &snapshot,
+                    self.config().canonical_root(),
+                    HealthRangeDiagnostics::whole_snapshot(identity.layers, limits.per_range_work),
+                    cancellation,
+                )
+            }
+        }
     }
 
     pub fn health_finding_get(
@@ -755,6 +918,7 @@ impl DepgraphService {
                     churn_commit_limit: None,
                     churn_path_filter: Vec::new(),
                     hotspot_weights: None,
+                    partial_ranges: None,
                 },
                 &ids,
                 &scope.policy_config_digest,
@@ -822,6 +986,7 @@ impl DepgraphService {
                     churn_commit_limit: Some(request.churn_commit_limit),
                     churn_path_filter: request.churn_path_filter.clone(),
                     hotspot_weights: Some(request.weights.as_map()),
+                    partial_ranges: None,
                 },
                 &ids,
             ),
@@ -932,11 +1097,16 @@ fn evaluate_audit_boundary_ids_with_limit(
 struct SnapshotScopedCollection {
     findings: Vec<HealthFinding>,
     manifest_digest: Option<String>,
+    scan_id: String,
+    coverage: CoverageRecord,
+    diagnostics: HealthRangeDiagnostics,
 }
 
+/// Whole-snapshot collection (layered inputs and the legacy control path).
 fn collect_snapshot_scoped(
     snapshot: &GraphSnapshot,
     root: &Path,
+    diagnostics: HealthRangeDiagnostics,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<SnapshotScopedCollection> {
     if cancellation.is_cancelled() {
@@ -969,6 +1139,81 @@ fn collect_snapshot_scoped(
     Ok(SnapshotScopedCollection {
         findings: bound_findings(findings)?,
         manifest_digest: manifests_digest(&manifests),
+        scan_id: snapshot.scan.id.clone(),
+        coverage: snapshot.coverage.clone(),
+        diagnostics,
+    })
+}
+
+/// Ranged collection of a plain input inside one store read transaction.
+fn collect_ranged(
+    store: &Store,
+    identity: &HealthInputIdentity,
+    root: &Path,
+    limits: HealthRangeLimits,
+    allow_partial: bool,
+    checkpoints: Option<HealthRangeCheckpointStore>,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<SnapshotScopedCollection> {
+    let map_ranged_error = |error: RangedHealthError| match error {
+        RangedHealthError::Analysis(failure) => map_health_analysis_error(failure.error),
+        RangedHealthError::Store(_) if cancellation.is_cancelled() => {
+            DepgraphServiceError::Cancelled
+        }
+        RangedHealthError::Store(source) => DepgraphServiceError::store_operation(source),
+    };
+    let unused = analyze_unused_ranged(
+        store,
+        identity,
+        RangedUnusedOptions {
+            limits,
+            maximum_findings: MAX_HEALTH_FINDINGS,
+            allow_partial,
+            order: RangeOrder::Forward,
+            checkpoints,
+            progress: None,
+        },
+        || cancellation.is_cancelled(),
+    )
+    .map_err(map_ranged_error)?;
+    let mut findings = unused.findings;
+    let mut diagnostics = unused.diagnostics;
+
+    // Dependency findings read the trimmed projection (no evidence or
+    // diagnostics) under two more budgets: one for loading, one for matching.
+    let projection = load_dependency_projection(store, identity, &limits, &diagnostics, || {
+        cancellation.is_cancelled()
+    })
+    .map_err(map_ranged_error)?;
+    diagnostics.work.dependencies_load = projection.work_used;
+    let manifests = load_manifests(root, &projection.snapshot, cancellation)?;
+    let remaining = MAX_HEALTH_FINDINGS.saturating_sub(findings.len());
+    let (dependency_findings, dependency_work) =
+        analyze_dependencies_ranged(&projection.snapshot, &manifests, remaining, &limits, || {
+            cancellation.is_cancelled()
+        })
+        .map_err(map_health_analysis_error)?;
+    diagnostics.work.dependencies = dependency_work;
+    drop(projection);
+    if diagnostics.partial {
+        // Dependency findings are complete on their own, but the collection
+        // they join is not; mark them like the unused findings so nothing in
+        // a partial view reads as confirmed.
+        let mut partial = dependency_findings;
+        crate::health::ranged::mark_partial(&mut partial, &diagnostics);
+        findings.extend(partial);
+    } else {
+        findings.extend(dependency_findings);
+    }
+    findings.retain(|finding| finding.kind.is_snapshot_scoped());
+    findings.sort_by(|left, right| left.id.cmp(&right.id));
+    diagnostics.peak_rss_kib = crate::health::ranged::peak_rss_kib();
+    Ok(SnapshotScopedCollection {
+        findings: bound_findings(findings)?,
+        manifest_digest: manifests_digest(&manifests),
+        scan_id: unused.scan.id,
+        coverage: unused.coverage,
+        diagnostics,
     })
 }
 
