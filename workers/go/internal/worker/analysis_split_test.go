@@ -255,8 +255,10 @@ func TestAnalysisSplitBindingIsEchoedWithoutChangingResultsOrIdentity(t *testing
 		t.Fatalf("split binding changed the file ledger: %d vs %d", len(plain.Files), len(echoed.Files))
 	}
 
-	// A typed request bound to a package loader is honoured by loading the
-	// complete module, and the worker says so instead of claiming the bound.
+	// A typed request bound to a package loader runs the hybrid loader for the
+	// bound package roots and reports the bound as applied; a module binding is
+	// applied by the module-whole-program load. Both keep the typed stage
+	// complete.
 	typed := AnalysisUnitRequest{
 		ContractVersion:    AnalysisUnitContractVersion,
 		UnitID:             "analysis-unit:split-echo",
@@ -284,15 +286,25 @@ func TestAnalysisSplitBindingIsEchoedWithoutChangingResultsOrIdentity(t *testing
 			},
 		},
 	}
-	widened, err := ScanWithAnalysisUnit(root, "", typed)
+	bounded, err := ScanWithAnalysisUnit(root, "", typed)
 	if err != nil {
 		t.Fatalf("typed request with a package binding failed: %v", err)
 	}
-	if got := widened.Profile.Properties["analysis_loader_scope"]; got != AnalysisLoaderScopeWidened {
-		t.Fatalf("analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeWidened)
+	if bounded.Profile.Properties["go_packages_status"] != "loaded" {
+		t.Skipf("constrained Go environment unavailable: %+v", bounded.Diagnostics)
 	}
-	if got := widened.Profile.Properties["go_typed_stage_complete"]; got != "true" {
-		t.Fatalf("typed stage did not complete with the split binding present: %q", got)
+	for key, want := range map[string]string{
+		"analysis_loader_scope":           AnalysisLoaderScopeApplied,
+		"analysis_loader_mode":            "package",
+		"analysis_scope":                  "target_packages",
+		"go_loader_target_packages":       "1",
+		"go_loader_syntax_equals_targets": "true",
+		"go_loader_body_files":            "2",
+		"go_typed_stage_complete":         "true",
+	} {
+		if got := bounded.Profile.Properties[key]; got != want {
+			t.Fatalf("package-bound typed profile property %s = %q, want %q", key, got, want)
+		}
 	}
 	typed.Split.Loader.Kind = "module"
 	typed.Split.Loader.Paths = []string{"app/a.go", "app/b.go", "dep/dep.go"}
@@ -306,6 +318,15 @@ func TestAnalysisSplitBindingIsEchoedWithoutChangingResultsOrIdentity(t *testing
 	}
 	if got := applied.Profile.Properties["analysis_loader_scope"]; got != AnalysisLoaderScopeApplied {
 		t.Fatalf("analysis_loader_scope = %q, want %q", got, AnalysisLoaderScopeApplied)
+	}
+	if got := applied.Profile.Properties["analysis_scope"]; got != "full_module" {
+		t.Fatalf("module-bound typed analysis_scope = %q, want full_module", got)
+	}
+	if _, present := applied.Profile.Properties["analysis_loader_mode"]; present {
+		t.Fatal("module-bound typed request carried package loader evidence")
+	}
+	if applied.Profile.ID != bounded.Profile.ID {
+		t.Fatalf("loader binding changed the profile identity: %s vs %s", applied.Profile.ID, bounded.Profile.ID)
 	}
 }
 
