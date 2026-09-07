@@ -17,7 +17,7 @@
 // Run after `cargo xtask build`; no project code or package manager is run.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -238,9 +238,11 @@ ${names.map((name) => `\ttotal += ${name}.Run0(total)`).join("\n")}
 `);
 }
 function configure(root, options) {
+  const merged = { max_concurrent_units: 1, ...options };
   const lines = ["schema_version = 1", "[scan]"];
-  for (const [key, value] of Object.entries(options)) lines.push(`${key} = ${value}`);
+  for (const [key, value] of Object.entries(merged)) lines.push(`${key} = ${value}`);
   writeFileSync(path.join(root, ".depgraph.toml"), `${lines.join("\n")}\n`);
+  scanMemoryLimit = merged.max_worker_memory_bytes ?? (2 * 1024 * MIB);
 }
 // The real Go worker advertising only the module-loader capabilities, so the
 // core plans and requests exactly as it did before the package loader.
@@ -267,17 +269,32 @@ process.exit(result.status ?? 1);
   return wrapper;
 }
 // Every scan's Go units join the per-unit table before any assertion runs, so
-// a failed run still prints the evidence it was judged on.
+// a failed run still prints the evidence it was judged on. JSON is written to
+// a file rather than buffered in the node process: a 1,024-file SSA graph can
+// exceed tens of megabytes and would otherwise OOM the runner.
+let scanMemoryLimit = 2 * 1024 * MIB;
 function scan(name, root, store, worker) {
+  console.error(`go-loader-scope-e2e: start ${name}`);
+  const jsonPath = path.join(parent, `${name}.json`);
+  const out = openSync(jsonPath, "w");
   const start = performance.now();
   const result = spawnSync(cli, ["--store", store, "scan", root, "--json"], {
-    cwd: root, env: { ...environment, DEPGRAPH_GO_WORKER: worker }, encoding: "utf8", maxBuffer: 64 * MIB,
+    cwd: root,
+    env: {
+      ...environment,
+      DEPGRAPH_GO_WORKER: worker,
+      GOMEMLIMIT: String(scanMemoryLimit),
+    },
+    stdio: ["ignore", out, "inherit"],
   });
-  assert.ok(result.stdout, `${name}: scan produced no JSON: ${result.error ?? result.stderr}`);
-  const output = JSON.parse(result.stdout);
+  closeSync(out);
+  const stdout = readFileSync(jsonPath, "utf8");
+  assert.ok(stdout, `${name}: scan produced no JSON: ${result.error ?? result.status}`);
+  const output = JSON.parse(stdout);
   assert.equal(output.coverage.project_code_executed, false);
   const outcome = { name, output, exit_code: result.status, duration_ms: Math.round(performance.now() - start) };
   for (const unit of goUnits(outcome)) rows.push(unitRow(name, unit));
+  console.error(`go-loader-scope-e2e: end ${name} status=${output.status} exit=${result.status} ms=${outcome.duration_ms} units=${goUnits(outcome).length}`);
   return outcome;
 }
 const number = (unit, key) => (unit.loader?.[key] === undefined ? null : Number(unit.loader[key]));
