@@ -20,6 +20,12 @@ import (
 
 const goVTACallGraphEngine = "golang.org/x/tools/go/callgraph/vta@v0.48.0"
 
+// Heartbeat cadence for SSA candidate mapping. The Go APIs expose no
+// finer checkpoint inside packages.Load or ssa.Program.Build, so the
+// inactivity deadline can only be extended between inputs and while
+// mapping pending call sites onto repository symbols.
+const goSSAMappingProgressInterval = 64
+
 type goSSACallKey struct {
 	input       *goSSAInput
 	callerTypes *types.Package
@@ -59,6 +65,7 @@ func (e *goSemanticExtractor) emitSSACalls() {
 	}
 	defer e.recordSSAOutcome(outcome)
 	if len(e.pendingCalls) == 0 {
+		e.state.reportProgress("go_ssa_mapping", "completed", 0)
 		return
 	}
 
@@ -101,9 +108,14 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 			e.complete = false
 			e.addSSABuildDiagnostic(input, err)
+			releaseGoSSASyntaxAfterBuild(input, e)
 			reportInputCompleted()
 			continue
 		}
+		// SSA has copied the syntax it needs. Drop the loader's Syntax and
+		// TypesInfo before CHA and candidate mapping so a large package does
+		// not retain the typed AST beside the SSA program.
+		releaseGoSSASyntaxAfterBuild(input, e)
 		completeByInput[input] = build.complete
 		switch {
 		case build.scope == goSSAProgramScopePackage:
@@ -168,7 +180,12 @@ func (e *goSemanticExtractor) emitSSACalls() {
 		reportInputCompleted()
 	}
 
+	mapped := 0
 	for _, pending := range e.pendingCalls {
+		mapped++
+		if mapped == 1 || mapped%goSSAMappingProgressInterval == 0 {
+			e.state.reportProgress("go_ssa_mapping", "progress", mapped)
+		}
 		input := pending.context.typed.SSAInput
 		if input == nil || buildFailures[input] {
 			e.emitPendingUnresolved(pending)
@@ -253,12 +270,73 @@ func (e *goSemanticExtractor) emitSSACalls() {
 			}
 		}
 	}
+	e.state.reportProgress("go_ssa_mapping", "completed", mapped)
 
 	// The packages.Package graph is only needed while this pass runs. Dropping
 	// the roots here keeps a completed scan from retaining the full dependency
 	// syntax graph through its Result.
 	for _, input := range inputs {
 		input.Roots = nil
+	}
+}
+
+// releaseGoSSASyntaxAfterBuild drops the loader's Syntax and TypesInfo after
+// ssa.Program.Build. The SSA program keeps the function syntax it needs for
+// mapping; CHA and candidate mapping do not consult the typed AST. Clearing
+// the AST-retaining maps on the extractor context lets the garbage collector
+// reclaim the typed trees before call-graph construction on a large package.
+func releaseGoSSASyntaxAfterBuild(input *goSSAInput, extractor *goSemanticExtractor) {
+	if input == nil {
+		return
+	}
+	seen := map[*packages.Package]bool{}
+	var walk func(*packages.Package)
+	walk = func(pkg *packages.Package) {
+		if pkg == nil || seen[pkg] {
+			return
+		}
+		seen[pkg] = true
+		pkg.Syntax = nil
+		pkg.TypesInfo = nil
+		for _, imported := range pkg.Imports {
+			walk(imported)
+		}
+	}
+	for _, root := range input.Roots {
+		walk(root)
+	}
+	if extractor == nil {
+		return
+	}
+	for _, context := range extractor.contexts {
+		if context == nil || context.typed.SSAInput != input {
+			continue
+		}
+		context.typed.TypesInfo = nil
+		for i := range context.typed.Files {
+			context.typed.Files[i].Syntax = nil
+		}
+		for i := range context.files {
+			context.files[i].Syntax = nil
+		}
+		for i := range context.universeFiles {
+			context.universeFiles[i].Syntax = nil
+		}
+		context.parents = nil
+		context.owners = nil
+		context.instanceNodes = nil
+		context.callInitializers = nil
+		context.typeSpecNodes = nil
+	}
+	for i := range extractor.state.goPackages.TypedPackages {
+		pkg := &extractor.state.goPackages.TypedPackages[i]
+		if pkg.SSAInput != input {
+			continue
+		}
+		pkg.TypesInfo = nil
+		for j := range pkg.Files {
+			pkg.Files[j].Syntax = nil
+		}
 	}
 }
 
@@ -315,7 +393,7 @@ func (e *goSemanticExtractor) recordSSAPolicy() {
 	}
 	if e.state.analysisUnit != nil {
 		e.state.profile.Properties["go_typed_load_progress_granularity"] = "package-boundary-after-packages-load"
-		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build"
+		e.state.profile.Properties["go_ssa_progress_granularity"] = "input-boundary-after-program-build,mapping-every-64-sites"
 		e.state.profile.Properties["go_analysis_atomic_operations"] = "go_packages_load,ssa_program_build"
 	}
 }

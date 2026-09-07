@@ -84,8 +84,12 @@ func TestSyntheticAnalysisUnitCanonicalProjection(t *testing.T) {
 		t.Fatalf("reverse-order progress event count = %d, want %d", len(reverseProgress), len(progress))
 	}
 
-	// The semantic stage intentionally remains one full-module operation. It
+	// Without a split binding the semantic stage remains one full-module
+	// operation: this is the pre-#463 baseline a legacy request still gets. It
 	// shares the same fixture and context but never claims to be a source batch.
+	// Package-bounded requests are covered by analysis_split_scan_test.go and
+	// go_loader_scan_test.go; scripts/go-loader-scope-e2e.mjs measures both
+	// paths against each other at one reduced memory limit.
 	semanticRequest := fixture.request(fixture.sourcePaths, AnalysisUnitStageSemantic, "semantic", 0, 1, nil)
 	semanticProgress := make([]syntheticProgressEvent, 0)
 	started = time.Now()
@@ -109,6 +113,9 @@ func TestSyntheticAnalysisUnitCanonicalProjection(t *testing.T) {
 	}
 	if !hasSyntheticProgress(semanticProgress, "go_ssa") {
 		t.Fatal("semantic stage did not report go_ssa progress")
+	}
+	if !hasSyntheticProgress(semanticProgress, "go_ssa_mapping") {
+		t.Fatal("semantic stage did not report go_ssa_mapping progress")
 	}
 	if semantic.Profile.Properties["go_packages_status"] != "loaded" {
 		t.Fatalf("semantic stage did not retain typed package inventory: status=%q diagnostics=%+v", semantic.Profile.Properties["go_packages_status"], semantic.Diagnostics)

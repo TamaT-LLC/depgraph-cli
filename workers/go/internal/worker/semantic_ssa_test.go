@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"path/filepath"
@@ -991,5 +992,61 @@ func ssaTestRequireCandidateContract(t *testing.T, result Result, site Site, alg
 		if edge.ID != wantEdgeID {
 			t.Fatalf("candidate edge ID = %q, want %q", edge.ID, wantEdgeID)
 		}
+	}
+}
+
+func TestReleaseGoSSASyntaxAfterBuildDropsLoaderTrees(t *testing.T) {
+	fset := token.NewFileSet()
+	syntax, err := parser.ParseFile(fset, "pkg.go", "package pkg\nfunc F() {}\n", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{Defs: map[*ast.Ident]types.Object{}}
+	imported := &packages.Package{
+		ID: "imported", PkgPath: "example.com/imported",
+		Syntax: []*ast.File{syntax}, TypesInfo: info,
+	}
+	root := &packages.Package{
+		ID: "root", PkgPath: "example.com/root",
+		Syntax: []*ast.File{syntax}, TypesInfo: info,
+		Imports: map[string]*packages.Package{"example.com/imported": imported},
+	}
+	input := &goSSAInput{
+		ModulePath: "example.com/root", ModuleRelativeDir: ".",
+		Roots: []*packages.Package{root}, ProgramScope: goSSAProgramScopePackage,
+	}
+	typed := goTypedPackage{
+		ID: "root", PkgPath: "example.com/root",
+		TypesInfo: info, SSAInput: input,
+		Files: []goTypedFile{{Path: "pkg.go", Syntax: syntax}},
+	}
+	extractor := &goSemanticExtractor{
+		state: &scannerState{goPackages: goPackagesInventory{TypedPackages: []goTypedPackage{typed}}},
+		contexts: []*goSemanticPackage{{
+			typed:         typed,
+			files:         []goTypedFile{{Path: "pkg.go", Syntax: syntax}},
+			universeFiles: []goTypedFile{{Path: "pkg.go", Syntax: syntax}},
+			parents:       map[ast.Node]ast.Node{syntax: syntax},
+			owners:        map[ast.Node]string{syntax: "root"},
+		}},
+	}
+
+	releaseGoSSASyntaxAfterBuild(input, extractor)
+
+	if root.Syntax != nil || root.TypesInfo != nil {
+		t.Fatalf("root still holds syntax=%v typesInfo=%v", root.Syntax != nil, root.TypesInfo != nil)
+	}
+	if imported.Syntax != nil || imported.TypesInfo != nil {
+		t.Fatalf("imported still holds syntax=%v typesInfo=%v", imported.Syntax != nil, imported.TypesInfo != nil)
+	}
+	if extractor.contexts[0].typed.TypesInfo != nil || extractor.contexts[0].files[0].Syntax != nil {
+		t.Fatal("extractor context still holds TypesInfo or file syntax")
+	}
+	if extractor.contexts[0].parents != nil || extractor.contexts[0].owners != nil {
+		t.Fatal("extractor context still holds AST-retaining maps")
+	}
+	if extractor.state.goPackages.TypedPackages[0].TypesInfo != nil ||
+		extractor.state.goPackages.TypedPackages[0].Files[0].Syntax != nil {
+		t.Fatal("inventory typed package still holds TypesInfo or file syntax")
 	}
 }
