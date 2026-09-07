@@ -154,7 +154,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -224,7 +225,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -298,7 +300,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -362,7 +365,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -420,7 +424,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -484,7 +489,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -549,7 +555,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -622,7 +629,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -698,7 +706,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -764,7 +773,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -824,7 +834,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -891,7 +902,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -958,7 +970,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1031,7 +1044,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1107,7 +1121,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1173,7 +1188,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1233,7 +1249,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1300,7 +1317,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1367,7 +1385,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -1425,7 +1444,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -1491,7 +1511,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1552,7 +1573,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -1729,7 +1751,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -1799,7 +1822,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -1867,7 +1891,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -1935,7 +1960,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2003,7 +2029,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2071,7 +2098,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2135,7 +2163,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2193,7 +2222,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2257,7 +2287,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -2322,7 +2353,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2395,7 +2427,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2472,7 +2505,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2541,7 +2575,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2601,7 +2636,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2668,7 +2704,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -2735,7 +2772,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -2808,7 +2846,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -2885,7 +2924,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -2951,7 +2991,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3011,7 +3052,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3078,7 +3120,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3144,7 +3187,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3207,7 +3251,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3265,7 +3310,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3330,7 +3376,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3397,7 +3444,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3459,7 +3507,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -3481,6 +3530,2676 @@
           "max_source_files": 2,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
+        },
+        "prerequisites": [
+          "web:web_project:frontend/packages/shared-web:syntax:0/1"
+        ]
+      }
+    ]
+  },
+  "go-package-loader-bounded-budget": {
+    "budget": {
+      "max_concurrent_units": 2,
+      "max_unit_source_files": 128,
+      "max_unit_source_bytes": 5120,
+      "max_context_source_bytes": 5120,
+      "worker_timeout_seconds": 300,
+      "max_worker_memory_bytes": 2147483648,
+      "max_protocol_bytes": 268435456,
+      "max_stderr_bytes": 10485760,
+      "total_budget_seconds": null
+    },
+    "boundaries": [
+      "go-package-loader",
+      "web-project-loader"
+    ],
+    "limitations": [
+      "estimates_are_heuristic",
+      "whole_context_loader_retained"
+    ],
+    "parallelism": {
+      "max_concurrent_units": 2,
+      "effective_concurrency": 2,
+      "admitted_memory_bytes": 4294967296,
+      "waves": [
+        {
+          "index": 0,
+          "estimated_weight": 5379,
+          "execution_units": [
+            "go:go_module:services/cycle-a:syntax:0/1",
+            "go:go_module:services/api:syntax:0/1"
+          ]
+        },
+        {
+          "index": 1,
+          "estimated_weight": 4194306,
+          "execution_units": [
+            "go:go_module:services/big:syntax:0/8",
+            "go:go_module:services/big:syntax:1/8"
+          ]
+        },
+        {
+          "index": 2,
+          "estimated_weight": 4194306,
+          "execution_units": [
+            "go:go_module:services/big:syntax:2/8",
+            "go:go_module:services/big:syntax:3/8"
+          ]
+        },
+        {
+          "index": 3,
+          "estimated_weight": 4194306,
+          "execution_units": [
+            "go:go_module:services/big:syntax:4/8",
+            "go:go_module:services/big:syntax:5/8"
+          ]
+        },
+        {
+          "index": 4,
+          "estimated_weight": 4194306,
+          "execution_units": [
+            "go:go_module:services/big:syntax:6/8",
+            "go:go_module:services/big:syntax:7/8"
+          ]
+        },
+        {
+          "index": 5,
+          "estimated_weight": 2691,
+          "execution_units": [
+            "go:go_module:services/shared:syntax:0/1",
+            "go:go_module:services/unrelated:syntax:0/1"
+          ]
+        },
+        {
+          "index": 6,
+          "estimated_weight": 1796,
+          "execution_units": [
+            "go:go_module:services/cycle-b:syntax:0/1",
+            "go:go_module:services/cycle-a:typed:0/1"
+          ]
+        },
+        {
+          "index": 7,
+          "estimated_weight": 50349598,
+          "execution_units": [
+            "go:go_module:services/api:typed:0/1",
+            "go:go_module:services/big:typed:0/1"
+          ]
+        },
+        {
+          "index": 8,
+          "estimated_weight": 8073,
+          "execution_units": [
+            "go:go_module:services/shared:typed:0/1",
+            "go:go_module:services/unrelated:typed:0/1"
+          ]
+        },
+        {
+          "index": 9,
+          "estimated_weight": 4617,
+          "execution_units": [
+            "go:go_module:services/cycle-b:typed:0/1",
+            "go:go_module:services/cycle-a:semantic:0/1"
+          ]
+        },
+        {
+          "index": 10,
+          "estimated_weight": 27296274,
+          "execution_units": [
+            "go:go_module:services/api:semantic:0/1",
+            "go:go_module:services/big:semantic:0/8"
+          ]
+        },
+        {
+          "index": 11,
+          "estimated_weight": 54525964,
+          "execution_units": [
+            "go:go_module:services/big:semantic:1/8",
+            "go:go_module:services/big:semantic:2/8"
+          ]
+        },
+        {
+          "index": 12,
+          "estimated_weight": 54525964,
+          "execution_units": [
+            "go:go_module:services/big:semantic:3/8",
+            "go:go_module:services/big:semantic:4/8"
+          ]
+        },
+        {
+          "index": 13,
+          "estimated_weight": 54525964,
+          "execution_units": [
+            "go:go_module:services/big:semantic:5/8",
+            "go:go_module:services/big:semantic:6/8"
+          ]
+        },
+        {
+          "index": 14,
+          "estimated_weight": 27278354,
+          "execution_units": [
+            "go:go_module:services/big:semantic:7/8",
+            "go:go_module:services/shared:semantic:0/1"
+          ]
+        },
+        {
+          "index": 15,
+          "estimated_weight": 3852,
+          "execution_units": [
+            "go:go_module:services/unrelated:semantic:0/1",
+            "go:go_module:services/cycle-b:semantic:0/1"
+          ]
+        },
+        {
+          "index": 16,
+          "estimated_weight": 1004,
+          "execution_units": [
+            "web:web_project:frontend/apps/web:syntax:0/1",
+            "web:web_project:frontend/packages/shared-web:syntax:0/1"
+          ]
+        },
+        {
+          "index": 17,
+          "estimated_weight": 6624,
+          "execution_units": [
+            "web:web_project:frontend/apps/web:semantic:0/1",
+            "web:web_project:frontend/packages/shared-web:semantic:0/1"
+          ]
+        }
+      ]
+    },
+    "execution_units": [
+      {
+        "id": "analysis-execution-unit:sha256:df669333ae957abc06e941ff8bd17ae6d407fa4fb834c3048c45427f4c97ddce",
+        "label": "go:go_module:services/cycle-a:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-a",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-a/a.go"
+          ],
+          "package_roots": [
+            "services/cycle-a"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/cycle-a/a.go"
+          ],
+          "package_roots": [
+            "services/cycle-a"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/cycle-b/b.go"
+          ],
+          "reference_units": [
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_module:services/cycle-b",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 1,
+          "loader_source_bytes": 256,
+          "reference_file_count": 1,
+          "reference_source_bytes": 256,
+          "dependency_closure_units": 4,
+          "weight": 257,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:89bb63231be61b417b2b330db32f4c0fcf6c03d73da983bc0f96efd67a102175",
+        "label": "go:go_module:services/api:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/api",
+          "context_group": [
+            "go:go_module:services/api"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/api/handlers",
+            "go:go_package:services/api",
+            "go:go_package:services/shared",
+            "go:go_module:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 2,
+          "owned_source_bytes": 5120,
+          "loader_file_count": 2,
+          "loader_source_bytes": 5120,
+          "reference_file_count": 2,
+          "reference_source_bytes": 2560,
+          "dependency_closure_units": 6,
+          "weight": 5122,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:35c4a47a24674fc2ea7064a1e410cfa422e6048bbf653221db0279dc1ed90ca7",
+        "label": "go:go_module:services/big:syntax:0/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part0.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part0.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:92943ca91e3ee9999c75ecd2e74806b517682ebaac60ec1ea9e8791ae5b68d0f",
+        "label": "go:go_module:services/big:syntax:1/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part1.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part1.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:b49302ca2f261a74f6f63957a1f8f1e20a2bd23b2a7f1b5dd52cace76ca47f1c",
+        "label": "go:go_module:services/big:syntax:2/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part2.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part2.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:a28952f318e44e99051c3a9f329367587acc49cda66e79019e79b37bb45cbec7",
+        "label": "go:go_module:services/big:syntax:3/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part3.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part3.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:539f22f406c2221288422f523697590d91b415384f46dc2721e71c152d591241",
+        "label": "go:go_module:services/big:syntax:4/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part4.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part4.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:24eb1f7d6095a43461238882a72d2264243296de55a9e9b77149064f599006ce",
+        "label": "go:go_module:services/big:syntax:5/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part5.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part5.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:8a619eb509fa37926cd4f53eb8cff54048b2c88e0b1e8807c98d761cf820885c",
+        "label": "go:go_module:services/big:syntax:6/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part6.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part6.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:af0c0ccd4088dbca8edb36660f0aabc0458323dd2d872011392e600fed21d7c5",
+        "label": "go:go_module:services/big:syntax:7/8",
+        "split_kind": "input_batch",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 2097153,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:bc4f5a45c76edbaf77961edd1a20a50b403b2e7dda6aa9f615649b1fb936c780",
+        "label": "go:go_module:services/shared:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/shared",
+          "context_group": [
+            "go:go_module:services/shared"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 2,
+          "owned_source_bytes": 2560,
+          "loader_file_count": 2,
+          "loader_source_bytes": 2560,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 3,
+          "weight": 2562,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:71589a588d21df94fd86d5a74cd7738f50f0e11460b79b9e308eaba3cd113b67",
+        "label": "go:go_module:services/unrelated:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/unrelated",
+          "context_group": [
+            "go:go_module:services/unrelated"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/unrelated"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 128,
+          "loader_file_count": 1,
+          "loader_source_bytes": 128,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 1,
+          "weight": 129,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:779698c73c04c2a8c583799e46405485ec535edd8abf49868f6a6058b142ba6c",
+        "label": "go:go_module:services/cycle-b:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-b",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-b"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-b"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "services/cycle-a/a.go"
+          ],
+          "reference_units": [
+            "go:go_module:services/cycle-a",
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 1,
+          "loader_source_bytes": 256,
+          "reference_file_count": 1,
+          "reference_source_bytes": 256,
+          "dependency_closure_units": 4,
+          "weight": 257,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:71675ed17632acd371846f55bd7de74a3415839765c56e27cb59d3f17b5bd79e",
+        "label": "go:go_module:services/cycle-a:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "cycle_group_retained",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-a",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-a/a.go"
+          ],
+          "package_roots": [
+            "services/cycle-a"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/cycle-a/a.go",
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_module:services/cycle-b",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 4,
+          "weight": 1539,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/cycle-a:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:2558b76e28f6629b05f99f843d494c6365b47902185f7f11fb9d34efc2ebda00",
+        "label": "go:go_module:services/api:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/api",
+          "context_group": [
+            "go:go_module:services/api"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/api/handlers",
+            "go:go_package:services/api",
+            "go:go_package:services/shared",
+            "go:go_module:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": true,
+          "reference_closure_roots": [
+            "services/shared"
+          ]
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 2,
+          "owned_source_bytes": 5120,
+          "loader_file_count": 2,
+          "loader_source_bytes": 5120,
+          "reference_file_count": 2,
+          "reference_source_bytes": 2560,
+          "dependency_closure_units": 6,
+          "weight": 17926,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/api:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:326db7a6567260605143f61faeedb2e89b5be24624381df909005a69f691aac6",
+        "label": "go:go_module:services/big:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 8,
+          "owned_source_bytes": 16777216,
+          "loader_file_count": 8,
+          "loader_source_bytes": 16777216,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 2,
+          "weight": 50331672,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:syntax:0/8",
+          "go:go_module:services/big:syntax:1/8",
+          "go:go_module:services/big:syntax:2/8",
+          "go:go_module:services/big:syntax:3/8",
+          "go:go_module:services/big:syntax:4/8",
+          "go:go_module:services/big:syntax:5/8",
+          "go:go_module:services/big:syntax:6/8",
+          "go:go_module:services/big:syntax:7/8"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:023deb378ce72e4121a829da895984cb28ab3308894b44486332246d42713ac6",
+        "label": "go:go_module:services/shared:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/shared",
+          "context_group": [
+            "go:go_module:services/shared"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 2,
+          "owned_source_bytes": 2560,
+          "loader_file_count": 2,
+          "loader_source_bytes": 2560,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 3,
+          "weight": 7686,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/shared:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:4460e80f20ea228e352b7032a152abd574ebb3120bde6159899007e7a4f32182",
+        "label": "go:go_module:services/unrelated:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/unrelated",
+          "context_group": [
+            "go:go_module:services/unrelated"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/unrelated"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 1,
+          "owned_source_bytes": 128,
+          "loader_file_count": 1,
+          "loader_source_bytes": 128,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 1,
+          "weight": 387,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/unrelated:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:4d13bedf2b7cb876afe99d4179d8addf439df7d15dc07545acfe037a755b55b1",
+        "label": "go:go_module:services/cycle-b:typed:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "cycle_group_retained",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-b",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-b"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/cycle-a/a.go",
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_module:services/cycle-a",
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "typed",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 4,
+          "weight": 1539,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/cycle-b:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:59bffe42c9d8eb10751c5ebd0eaab126c871e249ad38e25b7e24fd81e216f874",
+        "label": "go:go_module:services/cycle-a:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "cycle_group_retained",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-a",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-a/a.go"
+          ],
+          "package_roots": [
+            "services/cycle-a"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/cycle-a/a.go",
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_module:services/cycle-b",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 4,
+          "weight": 3078,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/cycle-a:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:4bdb9d4765f9c072804bcbf9edd6858dd0fd8483ee05b255b232895c294f7378",
+        "label": "go:go_module:services/api:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "services/api",
+          "context_group": [
+            "go:go_module:services/api"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/api/handlers/handlers.go",
+            "services/api/main.go"
+          ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/api/handlers",
+            "go:go_package:services/api",
+            "go:go_package:services/shared",
+            "go:go_module:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": true,
+          "reference_closure_roots": [
+            "services/shared"
+          ]
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 2,
+          "owned_source_bytes": 5120,
+          "loader_file_count": 2,
+          "loader_source_bytes": 5120,
+          "reference_file_count": 2,
+          "reference_source_bytes": 2560,
+          "dependency_closure_units": 6,
+          "weight": 33292,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/api:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:f7d0376d5b52eb0ac00b971d0ee7b7e1314b4412ca470761cc9900604397be72",
+        "label": "go:go_module:services/big:semantic:0/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part0.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part0.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:9481ae08a4f423187c8bab0aa189239e666083cfebac56bb4c91be9a49b377e2",
+        "label": "go:go_module:services/big:semantic:1/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part1.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part1.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:52c823381a39809caba6d06f412bad2099c920e75c317023492ba3014eea052d",
+        "label": "go:go_module:services/big:semantic:2/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part2.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part2.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:92e2b25ae7b0f01871763c54594c8219443e4963ef057edb1bdeaf35a5c21977",
+        "label": "go:go_module:services/big:semantic:3/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part3.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part3.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:d97901d4246ff007f384e769aa538a4e34fc8986ce061aad607a1ce02d874831",
+        "label": "go:go_module:services/big:semantic:4/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part4.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part4.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part5.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:978d00b71e4bb7f3047672a387bb5bb9f94a2cbe312e2184895c272f4d4bc7cc",
+        "label": "go:go_module:services/big:semantic:5/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part5.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part5.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part6.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:4a47d6d5dffdeb4453f6850623ae6235df49acb6d5173d5ddb24488fb45e58dc",
+        "label": "go:go_module:services/big:semantic:6/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part6.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part6.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part7.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:89327ffe8a2a792be326ad58337cd6bef804753631af2f376ad4ea55e8a2952c",
+        "label": "go:go_module:services/big:semantic:7/8",
+        "split_kind": "staged_bodies",
+        "split_reasons": [
+          "source_byte_budget",
+          "context_byte_budget",
+          "adapter_boundary_unsplittable",
+          "staged_after_declarations"
+        ],
+        "ownership": {
+          "unit_root": "services/big",
+          "context_group": [
+            "go:go_module:services/big"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ]
+        },
+        "loader": {
+          "kind": "package",
+          "paths": [
+            "services/big/part7.go"
+          ],
+          "package_roots": [
+            "services/big"
+          ],
+          "reference_depth": "declarations",
+          "reference_paths": [
+            "services/big/part0.go",
+            "services/big/part1.go",
+            "services/big/part2.go",
+            "services/big/part3.go",
+            "services/big/part4.go",
+            "services/big/part5.go",
+            "services/big/part6.go"
+          ],
+          "reference_units": [
+            "go:go_package:services/big",
+            "go:go_workspace:."
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 2097152,
+          "loader_file_count": 1,
+          "loader_source_bytes": 2097152,
+          "reference_file_count": 7,
+          "reference_source_bytes": 14680064,
+          "dependency_closure_units": 2,
+          "weight": 27262982,
+          "over_budget": true
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/big:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:dec5d8b1c28d36a737ee70303a9c08b3afb3ceffaeb5ba4851d83f6463fd2eb4",
+        "label": "go:go_module:services/shared:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/shared",
+          "context_group": [
+            "go:go_module:services/shared"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/shared/shared.go",
+            "services/shared/util/util.go"
+          ],
+          "package_roots": [
+            "services/shared",
+            "services/shared/util"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/shared",
+            "go:go_workspace:.",
+            "go:go_package:services/shared/util"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 2,
+          "owned_source_bytes": 2560,
+          "loader_file_count": 2,
+          "loader_source_bytes": 2560,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 3,
+          "weight": 15372,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/shared:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:c93d2f118c94c6d0767623c856fa6f3e9fc2d6be3f221101d85e72804f6599d4",
+        "label": "go:go_module:services/unrelated:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/unrelated",
+          "context_group": [
+            "go:go_module:services/unrelated"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/unrelated/unrelated.go"
+          ],
+          "package_roots": [
+            "services/unrelated"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_package:services/unrelated"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 128,
+          "loader_file_count": 1,
+          "loader_source_bytes": 128,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 1,
+          "weight": 774,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/unrelated:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:b60f300ea8d14fb88a3d3b8840da22a77ad510bb2cf24da77161da678fcff11c",
+        "label": "go:go_module:services/cycle-b:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget",
+          "cycle_group_retained",
+          "whole_context_promoted"
+        ],
+        "ownership": {
+          "unit_root": "services/cycle-b",
+          "context_group": [
+            "go:go_module:services/cycle-a",
+            "go:go_module:services/cycle-b"
+          ],
+          "cyclic_group": true,
+          "source_paths": [
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-b"
+          ]
+        },
+        "loader": {
+          "kind": "module",
+          "paths": [
+            "services/cycle-a/a.go",
+            "services/cycle-b/b.go"
+          ],
+          "package_roots": [
+            "services/cycle-a",
+            "services/cycle-b"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "go:go_module:services/cycle-a",
+            "go:go_workspace:.",
+            "go:go_package:services/cycle-a",
+            "go:go_package:services/cycle-b"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 256,
+          "loader_file_count": 2,
+          "loader_source_bytes": 512,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 4,
+          "weight": 3078,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "go:go_module:services/cycle-b:typed:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:f3bee47f8bbc4b61db18864696c443eed9986ac8328067d3b53d39e912b2056b",
+        "label": "web:web_project:frontend/apps/web:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "frontend/apps/web",
+          "context_group": [
+            "web:web_project:frontend/apps/web"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "frontend/apps/web/src/index.ts",
+            "frontend/apps/web/src/pages.ts",
+            "frontend/apps/web/src/routes.ts"
+          ],
+          "package_roots": [
+            "frontend/apps/web/src"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "frontend/apps/web/src/index.ts",
+            "frontend/apps/web/src/pages.ts",
+            "frontend/apps/web/src/routes.ts"
+          ],
+          "package_roots": [
+            "frontend/apps/web/src"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "reference_units": [
+            "web:web_workspace:frontend",
+            "web:web_project:frontend/packages/shared-web"
+          ],
+          "input_split": true,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 3,
+          "owned_source_bytes": 900,
+          "loader_file_count": 3,
+          "loader_source_bytes": 900,
+          "reference_file_count": 1,
+          "reference_source_bytes": 100,
+          "dependency_closure_units": 2,
+          "weight": 903,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:8fa73531fdc12df6e107ba35c2c4953aa3f8b4313d4b5f86b09189676a2a2ded",
+        "label": "web:web_project:frontend/packages/shared-web:syntax:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "frontend/packages/shared-web",
+          "context_group": [
+            "web:web_project:frontend/packages/shared-web"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "package_roots": [
+            "frontend/packages/shared-web/src"
+          ]
+        },
+        "loader": {
+          "kind": "files",
+          "paths": [
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "package_roots": [
+            "frontend/packages/shared-web/src"
+          ],
+          "reference_depth": "paths_only",
+          "reference_paths": [],
+          "reference_units": [
+            "web:web_workspace:frontend"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "syntax",
+          "owned_file_count": 1,
+          "owned_source_bytes": 100,
+          "loader_file_count": 1,
+          "loader_source_bytes": 100,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 1,
+          "weight": 101,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": []
+      },
+      {
+        "id": "analysis-execution-unit:sha256:d0aaf47bb1bbd6fa8a3a1ef25fdd969a3c2defbbf52889f98dd095b08384b4f0",
+        "label": "web:web_project:frontend/apps/web:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "frontend/apps/web",
+          "context_group": [
+            "web:web_project:frontend/apps/web"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "frontend/apps/web/src/index.ts",
+            "frontend/apps/web/src/pages.ts",
+            "frontend/apps/web/src/routes.ts"
+          ],
+          "package_roots": [
+            "frontend/apps/web/src"
+          ]
+        },
+        "loader": {
+          "kind": "project",
+          "paths": [
+            "frontend/apps/web/src/index.ts",
+            "frontend/apps/web/src/pages.ts",
+            "frontend/apps/web/src/routes.ts",
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "package_roots": [
+            "frontend/apps/web",
+            "frontend/apps/web/src",
+            "frontend/packages/shared-web/src"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "web:web_workspace:frontend",
+            "web:web_project:frontend/packages/shared-web"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 3,
+          "owned_source_bytes": 900,
+          "loader_file_count": 4,
+          "loader_source_bytes": 1000,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 2,
+          "weight": 6018,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
+        },
+        "prerequisites": [
+          "web:web_project:frontend/apps/web:syntax:0/1"
+        ]
+      },
+      {
+        "id": "analysis-execution-unit:sha256:dae83cfd1b1ad0d28ca56af77a27d23afbcad491de7b1da1be26fe02ab4a5216",
+        "label": "web:web_project:frontend/packages/shared-web:semantic:0/1",
+        "split_kind": "whole",
+        "split_reasons": [
+          "unit_fits_budget"
+        ],
+        "ownership": {
+          "unit_root": "frontend/packages/shared-web",
+          "context_group": [
+            "web:web_project:frontend/packages/shared-web"
+          ],
+          "cyclic_group": false,
+          "source_paths": [
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "package_roots": [
+            "frontend/packages/shared-web/src"
+          ]
+        },
+        "loader": {
+          "kind": "project",
+          "paths": [
+            "frontend/packages/shared-web/src/index.ts"
+          ],
+          "package_roots": [
+            "frontend/packages/shared-web",
+            "frontend/packages/shared-web/src"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
+          "reference_units": [
+            "web:web_workspace:frontend"
+          ],
+          "input_split": false,
+          "reference_closure_roots": []
+        },
+        "estimate": {
+          "stage": "semantic",
+          "owned_file_count": 1,
+          "owned_source_bytes": 100,
+          "loader_file_count": 1,
+          "loader_source_bytes": 100,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
+          "dependency_closure_units": 1,
+          "weight": 606,
+          "over_budget": false
+        },
+        "budget": {
+          "worker_timeout_seconds": 300,
+          "max_worker_memory_bytes": 2147483648,
+          "max_protocol_bytes": 268435456,
+          "max_stderr_bytes": 10485760,
+          "max_source_files": 128,
+          "max_source_bytes": 5120,
+          "max_context_source_bytes": 5120
         },
         "prerequisites": [
           "web:web_project:frontend/packages/shared-web:syntax:0/1"
@@ -3547,7 +6266,7 @@
         },
         {
           "index": 4,
-          "estimated_weight": 50349598,
+          "estimated_weight": 50354718,
           "execution_units": [
             "go:go_module:services/api:typed:0/1",
             "go:go_module:services/big:typed:0/1"
@@ -3571,7 +6290,7 @@
         },
         {
           "index": 7,
-          "estimated_weight": 58753572,
+          "estimated_weight": 58766372,
           "execution_units": [
             "go:go_module:services/api:semantic:0/1",
             "go:go_module:services/big:semantic:0/2"
@@ -3651,7 +6370,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3721,7 +6441,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3791,7 +6512,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3861,7 +6583,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3925,7 +6648,8 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -3983,7 +6707,8 @@
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -4047,7 +6772,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -4073,12 +6799,13 @@
         "prerequisites": []
       },
       {
-        "id": "analysis-execution-unit:sha256:b5424185a01a9c70e800dbbd6d5d2e3f630df9ae6a2289e97bf4c3180a00b8bb",
+        "id": "analysis-execution-unit:sha256:71675ed17632acd371846f55bd7de74a3415839765c56e27cb59d3f17b5bd79e",
         "label": "go:go_module:services/cycle-a:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
           "unit_fits_budget",
-          "cycle_group_retained"
+          "cycle_group_retained",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/cycle-a",
@@ -4095,7 +6822,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/cycle-a/a.go",
             "services/cycle-b/b.go"
@@ -4104,7 +6831,7 @@
             "services/cycle-a",
             "services/cycle-b"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_workspace:.",
@@ -4112,7 +6839,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -4140,11 +6868,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:2558b76e28f6629b05f99f843d494c6365b47902185f7f11fb9d34efc2ebda00",
+        "id": "analysis-execution-unit:sha256:a8ec8782072fad2e036a1597f6f194397422d9d4e2499c5eafc4a9ed979803b2",
         "label": "go:go_module:services/api:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/api",
@@ -4162,20 +6891,21 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/api/handlers/handlers.go",
-            "services/api/main.go"
-          ],
-          "package_roots": [
-            "services/api",
-            "services/api/handlers"
-          ],
-          "reference_depth": "declarations",
-          "reference_paths": [
+            "services/api/main.go",
             "services/shared/shared.go",
             "services/shared/util/util.go"
           ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers",
+            "services/shared",
+            "services/shared/util"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
           "reference_units": [
             "go:go_package:services/api/handlers",
             "go:go_package:services/api",
@@ -4184,18 +6914,19 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": true
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
           "owned_file_count": 2,
           "owned_source_bytes": 5120,
-          "loader_file_count": 2,
-          "loader_source_bytes": 5120,
-          "reference_file_count": 2,
-          "reference_source_bytes": 2560,
+          "loader_file_count": 4,
+          "loader_source_bytes": 7680,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 6,
-          "weight": 17926,
+          "weight": 23046,
           "over_budget": false
         },
         "budget": {
@@ -4260,7 +6991,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -4289,11 +7021,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:8b8868b81000d4a310fa99f5d61680dde581011e962f46e72f26983d7cf33046",
+        "id": "analysis-execution-unit:sha256:023deb378ce72e4121a829da895984cb28ab3308894b44486332246d42713ac6",
         "label": "go:go_module:services/shared:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/shared",
@@ -4311,7 +7044,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/shared/shared.go",
             "services/shared/util/util.go"
@@ -4320,14 +7053,15 @@
             "services/shared",
             "services/shared/util"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_package:services/shared",
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -4355,11 +7089,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:a844e450c46e0a123e2c0c763618efcbb95b57c5433b1a6aa1508353dcfd3705",
+        "id": "analysis-execution-unit:sha256:4460e80f20ea228e352b7032a152abd574ebb3120bde6159899007e7a4f32182",
         "label": "go:go_module:services/unrelated:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/unrelated",
@@ -4375,19 +7110,20 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/unrelated/unrelated.go"
           ],
           "package_roots": [
             "services/unrelated"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -4415,12 +7151,13 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:d5b3cc05b7c6d4ab4181ea72b4b18e0a284ada87149bc8faccdccb6ea1556398",
+        "id": "analysis-execution-unit:sha256:4d13bedf2b7cb876afe99d4179d8addf439df7d15dc07545acfe037a755b55b1",
         "label": "go:go_module:services/cycle-b:typed:0/1",
         "split_kind": "whole",
         "split_reasons": [
           "unit_fits_budget",
-          "cycle_group_retained"
+          "cycle_group_retained",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/cycle-b",
@@ -4437,7 +7174,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/cycle-a/a.go",
             "services/cycle-b/b.go"
@@ -4446,7 +7183,7 @@
             "services/cycle-a",
             "services/cycle-b"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_module:services/cycle-a",
@@ -4454,7 +7191,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "typed",
@@ -4482,12 +7220,13 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:756a3a4795ea06720204b2249bbc522b08e1d21da2481eeb3548548e4457f430",
+        "id": "analysis-execution-unit:sha256:59bffe42c9d8eb10751c5ebd0eaab126c871e249ad38e25b7e24fd81e216f874",
         "label": "go:go_module:services/cycle-a:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
           "unit_fits_budget",
-          "cycle_group_retained"
+          "cycle_group_retained",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/cycle-a",
@@ -4504,7 +7243,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/cycle-a/a.go",
             "services/cycle-b/b.go"
@@ -4513,7 +7252,7 @@
             "services/cycle-a",
             "services/cycle-b"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_workspace:.",
@@ -4521,7 +7260,8 @@
             "go:go_module:services/cycle-b",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4549,11 +7289,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:4bdb9d4765f9c072804bcbf9edd6858dd0fd8483ee05b255b232895c294f7378",
+        "id": "analysis-execution-unit:sha256:8b8f229db97c5d0a8471d864cfa42ec632ee89fcd26830d8ff37176ba2c66af8",
         "label": "go:go_module:services/api:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/api",
@@ -4571,20 +7312,21 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/api/handlers/handlers.go",
-            "services/api/main.go"
-          ],
-          "package_roots": [
-            "services/api",
-            "services/api/handlers"
-          ],
-          "reference_depth": "declarations",
-          "reference_paths": [
+            "services/api/main.go",
             "services/shared/shared.go",
             "services/shared/util/util.go"
           ],
+          "package_roots": [
+            "services/api",
+            "services/api/handlers",
+            "services/shared",
+            "services/shared/util"
+          ],
+          "reference_depth": "bodies",
+          "reference_paths": [],
           "reference_units": [
             "go:go_package:services/api/handlers",
             "go:go_package:services/api",
@@ -4593,18 +7335,19 @@
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": true
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
           "owned_file_count": 2,
           "owned_source_bytes": 5120,
-          "loader_file_count": 2,
-          "loader_source_bytes": 5120,
-          "reference_file_count": 2,
-          "reference_source_bytes": 2560,
+          "loader_file_count": 4,
+          "loader_source_bytes": 7680,
+          "reference_file_count": 0,
+          "reference_source_bytes": 0,
           "dependency_closure_units": 6,
-          "weight": 33292,
+          "weight": 46092,
           "over_budget": false
         },
         "budget": {
@@ -4666,7 +7409,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4739,7 +7483,8 @@
             "go:go_package:services/big",
             "go:go_workspace:."
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4767,11 +7512,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:1e3a395b5286af6de4bb0330ae08b18fec4f47fec8aa37b09d2eea20a73a1d72",
+        "id": "analysis-execution-unit:sha256:dec5d8b1c28d36a737ee70303a9c08b3afb3ceffaeb5ba4851d83f6463fd2eb4",
         "label": "go:go_module:services/shared:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/shared",
@@ -4789,7 +7535,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/shared/shared.go",
             "services/shared/util/util.go"
@@ -4798,14 +7544,15 @@
             "services/shared",
             "services/shared/util"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_package:services/shared",
             "go:go_workspace:.",
             "go:go_package:services/shared/util"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4833,11 +7580,12 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:11236a1e4ceacd43f331aba056c885456cfddf442b4367581502e95ca8acf1d2",
+        "id": "analysis-execution-unit:sha256:c93d2f118c94c6d0767623c856fa6f3e9fc2d6be3f221101d85e72804f6599d4",
         "label": "go:go_module:services/unrelated:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
-          "unit_fits_budget"
+          "unit_fits_budget",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/unrelated",
@@ -4853,19 +7601,20 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/unrelated/unrelated.go"
           ],
           "package_roots": [
             "services/unrelated"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_package:services/unrelated"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4893,12 +7642,13 @@
         ]
       },
       {
-        "id": "analysis-execution-unit:sha256:f445debfb10da802b6e554bab452b57e70d191ea41ba6818f9307dd5b790bfaf",
+        "id": "analysis-execution-unit:sha256:b60f300ea8d14fb88a3d3b8840da22a77ad510bb2cf24da77161da678fcff11c",
         "label": "go:go_module:services/cycle-b:semantic:0/1",
         "split_kind": "whole",
         "split_reasons": [
           "unit_fits_budget",
-          "cycle_group_retained"
+          "cycle_group_retained",
+          "whole_context_promoted"
         ],
         "ownership": {
           "unit_root": "services/cycle-b",
@@ -4915,7 +7665,7 @@
           ]
         },
         "loader": {
-          "kind": "package",
+          "kind": "module",
           "paths": [
             "services/cycle-a/a.go",
             "services/cycle-b/b.go"
@@ -4924,7 +7674,7 @@
             "services/cycle-a",
             "services/cycle-b"
           ],
-          "reference_depth": "declarations",
+          "reference_depth": "bodies",
           "reference_paths": [],
           "reference_units": [
             "go:go_module:services/cycle-a",
@@ -4932,7 +7682,8 @@
             "go:go_package:services/cycle-a",
             "go:go_package:services/cycle-b"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -4999,7 +7750,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": true
+          "input_split": true,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -5057,7 +7809,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "syntax",
@@ -5123,7 +7876,8 @@
             "web:web_workspace:frontend",
             "web:web_project:frontend/packages/shared-web"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",
@@ -5184,7 +7938,8 @@
           "reference_units": [
             "web:web_workspace:frontend"
           ],
-          "input_split": false
+          "input_split": false,
+          "reference_closure_roots": []
         },
         "estimate": {
           "stage": "semantic",

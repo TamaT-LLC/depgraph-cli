@@ -210,6 +210,7 @@ fn projection(split_plan: &AnalysisSplitPlan, plan: &AnalysisPlan) -> Value {
                 "reference_paths": unit.loader.reference_paths,
                 "reference_units": unit.loader.reference_unit_ids.iter().map(|id| root_of(id)).collect::<Vec<_>>(),
                 "input_split": unit.loader.input_split,
+                "reference_closure_roots": unit.loader.reference_closure_roots,
             },
             "estimate": unit.estimate,
             "budget": unit.budget,
@@ -251,7 +252,17 @@ fn scenarios(
             AnalysisAdapterBoundary::web_project_loader(),
         ],
     )?;
-    scenarios.insert("go-package-loader-default-budget", (plan, staged));
+    scenarios.insert("go-package-loader-default-budget", (plan.clone(), staged));
+    let (bounded, _) = split(
+        checkout,
+        &plan,
+        &bounded_budget().1,
+        vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ],
+    )?;
+    scenarios.insert("go-package-loader-bounded-budget", (plan, bounded));
     Ok(scenarios)
 }
 
@@ -679,15 +690,47 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
             .unwrap()
             .source_paths
     );
-    // The multi-package api module becomes one typed execution unit that
-    // loads both of its packages; small packages share a loader.
+    // The multi-package api module fits the byte budgets, so its typed and
+    // semantic stages are promoted to the whole-module loader and keep the
+    // whole-program precision of that loader; the plan says so.
+    for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
+        let api = only(&staged_split, &plan, "services/api", "go", stage);
+        assert_eq!(api.split_kind, AnalysisSplitKind::Whole);
+        assert_eq!(api.loader.kind, AnalysisLoaderKind::Module);
+        assert_eq!(api.loader.reference_depth, AnalysisReferenceDepth::Bodies);
+        assert!(!api.loader.input_split);
+        assert!(!api.estimate.over_budget);
+        assert!(
+            api.split_reasons
+                .contains(&AnalysisSplitReason::WholeContextPromoted)
+        );
+        assert!(
+            api.split_reasons
+                .contains(&AnalysisSplitReason::UnitFitsBudget)
+        );
+        assert!(api.loader.reference_closure_roots.is_empty());
+    }
+    // Under a context budget the api module does not fit, its two small
+    // packages share one bounded typed loader, ordered dependencies first,
+    // and the shared module contributes declarations only.
+    let (bounded_split, _) = split(
+        &checkout,
+        &plan,
+        &bounded_budget().1,
+        vec![
+            AnalysisAdapterBoundary::go_package_loader(),
+            AnalysisAdapterBoundary::web_project_loader(),
+        ],
+    )?;
     let api_typed = only(
-        &staged_split,
+        &bounded_split,
         &plan,
         "services/api",
         "go",
         AnalysisStage::Typed,
     );
+    assert_eq!(api_typed.split_kind, AnalysisSplitKind::Whole);
+    assert_eq!(api_typed.loader.kind, AnalysisLoaderKind::Package);
     assert_eq!(
         api_typed.loader.package_roots,
         vec![
@@ -699,7 +742,28 @@ fn large_single_package_is_expressed_as_a_staged_split() -> Result<()> {
         api_typed.loader.input_split,
         "shared module sources are declarations, not loaded bodies"
     );
+    assert!(
+        !api_typed
+            .split_reasons
+            .contains(&AnalysisSplitReason::WholeContextPromoted)
+    );
+    assert!(!api_typed.estimate.over_budget);
+    assert_eq!(
+        api_typed.loader.reference_closure_roots,
+        vec!["services/shared".to_owned()],
+        "the api package imports shared; shared/util is a reference by name only"
+    );
     Ok(())
+}
+
+/// A byte budget the api module's whole context (api + shared, 7,680 bytes)
+/// does not fit while its owned sources (5,120 bytes) do: the api packages
+/// are loaded bounded, with the shared module as declarations.
+fn bounded_budget() -> (Config, AnalysisSplitBudget) {
+    budget(|config| {
+        config.scan.max_unit_source_bytes = 5_120;
+        config.scan.max_context_source_bytes = 5_120;
+    })
 }
 
 #[test]
@@ -790,11 +854,17 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
 
     // A bounded loader that reads declarations or bodies is widened to the
     // whole cycle instead of separating its members into different loader
-    // scopes; ownership stays with each member.
+    // scopes; ownership stays with each member.  The cycle members fit the
+    // default byte budgets and would be promoted to the module loader, so the
+    // bounded behaviour is observed under a context budget below the cycle.
+    let mut tight_config = Config::default();
+    tight_config.scan.max_unit_source_bytes = 256;
+    tight_config.scan.max_context_source_bytes = 256;
+    let tight_budget = AnalysisSplitBudget::from_config(&tight_config);
     let (bounded, _) = split(
         &checkout,
         &plan,
-        &budget,
+        &tight_budget,
         vec![
             AnalysisAdapterBoundary::go_package_loader(),
             AnalysisAdapterBoundary::web_project_loader(),
@@ -837,13 +907,21 @@ fn cycle_group_is_kept_in_one_analysis_context() -> Result<()> {
     );
     assert_eq!(a_syntax.loader.paths, vec!["services/cycle-a/a.go"]);
     // A unit that merely depends on another package keeps its bounded scope.
-    let api = only(&bounded, &plan, "services/api", "go", AnalysisStage::Typed);
-    assert!(api.loader.input_split);
-    assert!(
-        api.loader
-            .reference_paths
-            .contains(&"services/shared/shared.go".to_owned())
-    );
+    let api = units(&bounded, &plan, "services/api", "go", AnalysisStage::Typed);
+    assert!(!api.is_empty());
+    for unit in api {
+        assert!(unit.loader.input_split);
+        assert!(
+            unit.loader
+                .reference_paths
+                .contains(&"services/shared/shared.go".to_owned())
+        );
+        assert!(
+            !unit
+                .split_reasons
+                .contains(&AnalysisSplitReason::CycleGroupRetained)
+        );
+    }
     Ok(())
 }
 
@@ -891,6 +969,128 @@ fn path_lists_are_sorted_and_unique_as_workers_require() -> Result<()> {
             "services/api/main.go".to_owned()
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn promoted_whole_context_is_demoted_to_packages_by_a_memory_refinement() -> Result<()> {
+    let checkout = Checkout::new()?;
+    let (config, budget) = budget(|_| {});
+    let plan = checkout.discover(&config)?;
+    let boundaries = vec![
+        AnalysisAdapterBoundary::go_package_loader(),
+        AnalysisAdapterBoundary::web_project_loader(),
+    ];
+    let (current, input) = split(&checkout, &plan, &budget, boundaries)?;
+    let api_typed = only(&current, &plan, "services/api", "go", AnalysisStage::Typed).clone();
+    let api_semantic = only(
+        &current,
+        &plan,
+        "services/api",
+        "go",
+        AnalysisStage::Semantic,
+    )
+    .clone();
+    assert_eq!(api_typed.loader.kind, AnalysisLoaderKind::Module);
+    assert!(
+        api_typed
+            .split_reasons
+            .contains(&AnalysisSplitReason::WholeContextPromoted)
+    );
+    // The promoted typed unit is exactly the unit the module-loader boundary
+    // plans for a worker without the package loader: the same identity, so a
+    // saved result of either boundary is the same saved result.
+    let (module_plan, _) = split(&checkout, &plan, &budget, negotiated_defaults())?;
+    assert_eq!(
+        only(
+            &module_plan,
+            &plan,
+            "services/api",
+            "go",
+            AnalysisStage::Typed
+        )
+        .id,
+        api_typed.id
+    );
+
+    // The whole-module load exceeded the worker's memory: the refinement
+    // demotes both promotable stages of the unit to the bounded package
+    // loader, and nothing else in the plan changes.
+    let resplit = resplit_execution_unit(
+        &plan,
+        &current,
+        &input,
+        &api_typed.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(resplit.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(
+        resplit.superseded_execution_unit_ids,
+        vec![api_typed.id.clone(), api_semantic.id.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        resplit.retained_execution_unit_ids.len(),
+        current.execution_units.len() - 2
+    );
+    for stage in [AnalysisStage::Typed, AnalysisStage::Semantic] {
+        let replaced = units(&resplit.plan, &plan, "services/api", "go", stage);
+        assert!(!replaced.is_empty());
+        for unit in replaced {
+            assert!(resplit.replacement_execution_unit_ids.contains(&unit.id));
+            assert_eq!(unit.loader.kind, AnalysisLoaderKind::Package);
+            assert_eq!(
+                unit.loader.reference_depth,
+                AnalysisReferenceDepth::Declarations
+            );
+            assert!(unit.loader.input_split);
+            assert!(unit.split_reasons.contains(&AnalysisSplitReason::Refined));
+            assert!(
+                !unit
+                    .split_reasons
+                    .contains(&AnalysisSplitReason::WholeContextPromoted)
+            );
+            assert_eq!(
+                unit.loader.reference_closure_roots,
+                vec!["services/shared".to_owned()]
+            );
+        }
+    }
+    // The refinement is applied, not reported as unsplittable, and the plan
+    // reproduces from its history.
+    assert!(resplit.plan.unsplittable_refinements.is_empty());
+    let replay = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput {
+            refinements: resplit.plan.refinements.clone(),
+            ..input.clone()
+        },
+    )?;
+    assert_eq!(replay.split_plan_id, resplit.split_plan_id);
+    // A second memory failure of the demoted single-package typed unit has
+    // nothing left to divide and is reported as such.
+    let demoted_typed = only(
+        &resplit.plan,
+        &plan,
+        "services/api",
+        "go",
+        AnalysisStage::Typed,
+    );
+    let again = resplit_execution_unit(
+        &plan,
+        &resplit.plan,
+        &AnalysisSplitInput {
+            refinements: resplit.plan.refinements.clone(),
+            ..input.clone()
+        },
+        &demoted_typed.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(again.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(again.replacement_execution_unit_ids.len(), 2);
     Ok(())
 }
 

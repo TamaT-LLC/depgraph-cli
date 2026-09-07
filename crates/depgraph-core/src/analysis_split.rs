@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    analysis_plan::{AnalysisAdapter, AnalysisPlan, AnalysisUnit, input_dependency_ids},
+    analysis_plan::{
+        AnalysisAdapter, AnalysisDependencyKind, AnalysisDependencyResolution, AnalysisPlan,
+        AnalysisUnit, input_dependency_ids,
+    },
     config::Config,
 };
 
@@ -194,6 +197,11 @@ pub enum AnalysisSplitReason {
     CycleGroupRetained,
     StagedAfterDeclarations,
     Refined,
+    /// The whole logical unit fits the byte budgets, so a stage the boundary
+    /// could bound to packages loads the whole context instead and keeps the
+    /// whole-program precision of that loader.  A refinement of a promoted
+    /// unit falls back to the bounded boundary.
+    WholeContextPromoted,
 }
 
 impl AnalysisSplitReason {
@@ -207,6 +215,7 @@ impl AnalysisSplitReason {
             Self::CycleGroupRetained => "cycle_group_retained",
             Self::StagedAfterDeclarations => "staged_after_declarations",
             Self::Refined => "refined",
+            Self::WholeContextPromoted => "whole_context_promoted",
         }
     }
 }
@@ -661,6 +670,14 @@ pub struct AnalysisLoaderScope {
     /// True when `paths` is a strict subset of the unit's full source context,
     /// i.e. the split bounds the loader input rather than only the output.
     pub input_split: bool,
+    /// Package directories a bounded loader is expected to read for reference:
+    /// the transitive in-repository import closure of `package_roots`, as
+    /// resolved by static discovery, without the loaded roots themselves.  It
+    /// is the expected subset of `reference_paths`; the worker may still read
+    /// any reference path and reports a widened scope when it loads more than
+    /// `paths`.  Empty for a whole-context loader, which reads everything.
+    #[serde(default)]
+    pub reference_closure_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1120,6 +1137,7 @@ pub fn plan_analysis_split(
             .into_iter()
             .filter(|unit| unit.adapter == adapter)
             .collect::<Vec<_>>();
+        let import_graph = PackageImportGraph::build(&plan, adapter);
         // The unit context (dependency closure, cycle sources, sizes) does not
         // depend on the stage, so it is built once per unit and shared by
         // every stage of the boundary.
@@ -1129,16 +1147,26 @@ pub fn plan_analysis_split(
                 let group = group_by_unit.get(unit.id.as_str());
                 (
                     unit.id.as_str(),
-                    UnitContext::build(&plan, unit, input, group, &mut limitations),
+                    UnitContext::build(&plan, unit, input, group, &import_graph, &mut limitations),
                 )
             })
             .collect::<BTreeMap<_, _>>();
         let mut previous_stage_ids = BTreeMap::<String, Vec<String>>::new();
-        for stage_boundary in &boundary.stages {
+        for declared_boundary in &boundary.stages {
             let mut stage_ids = BTreeMap::<String, Vec<String>>::new();
             for unit in &units {
                 let group = group_by_unit.get(unit.id.as_str());
                 let context = &contexts[unit.id.as_str()];
+                let promotion = promote_whole_context(
+                    unit,
+                    boundary,
+                    declared_boundary,
+                    input,
+                    context,
+                    group,
+                    &mut matched_refinements,
+                );
+                let stage_boundary = promotion.boundary(declared_boundary);
                 let mut batches = partition(
                     unit,
                     stage_boundary,
@@ -1146,6 +1174,7 @@ pub fn plan_analysis_split(
                     &input.budget,
                     context,
                 );
+                promotion.annotate(&mut batches);
                 apply_refinements(
                     unit,
                     stage_boundary,
@@ -1381,7 +1410,111 @@ pub fn resplit_execution_unit(
     })
 }
 
-struct UnitContext {
+/// Static import graph between the package directories of one adapter,
+/// derived from the discovery plan's resolved source imports.  Discovery
+/// records every `import` of every source file, including files a build
+/// constraint would exclude, so the graph over-approximates what a loader
+/// reads: a closure computed from it is a conservative superset.
+struct PackageImportGraph {
+    /// Package root to the in-repository package roots its files import.
+    imports: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PackageImportGraph {
+    fn build(plan: &AnalysisPlan, adapter: AnalysisAdapter) -> Self {
+        let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
+        for unit in plan
+            .executable_units()
+            .into_iter()
+            .filter(|unit| unit.adapter == adapter)
+        {
+            for reference in &unit.dependency_references {
+                if reference.kind != AnalysisDependencyKind::SourceImport
+                    || reference.resolution != AnalysisDependencyResolution::Resolved
+                {
+                    continue;
+                }
+                let (Some(target), Some(evidence)) = (
+                    reference
+                        .target_unit_id
+                        .as_deref()
+                        .and_then(|id| plan.unit(id)),
+                    reference.evidence_path.as_deref(),
+                ) else {
+                    continue;
+                };
+                if target.adapter != adapter {
+                    continue;
+                }
+                let source = package_root_of(evidence);
+                if source != target.unit_root {
+                    imports
+                        .entry(source)
+                        .or_default()
+                        .insert(target.unit_root.clone());
+                }
+            }
+        }
+        Self { imports }
+    }
+
+    /// Transitive imports of `roots`, without the roots themselves.
+    fn closure(&self, roots: &[String]) -> BTreeSet<String> {
+        let loaded = roots.iter().cloned().collect::<BTreeSet<_>>();
+        let mut closure = BTreeSet::new();
+        let mut pending = roots.to_vec();
+        while let Some(root) = pending.pop() {
+            for target in self.imports.get(&root).into_iter().flatten() {
+                if !loaded.contains(target) && closure.insert(target.clone()) {
+                    pending.push(target.clone());
+                }
+            }
+        }
+        closure
+    }
+
+    /// Dependencies-first order of `roots`: a post-order walk of the import
+    /// edges between them, from the smallest root, so a package precedes every
+    /// package that imports it.  A cycle between roots keeps name order.
+    fn dependency_rank(&self, roots: &BTreeSet<String>) -> BTreeMap<String, usize> {
+        let mut rank = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        for start in roots {
+            if !visited.insert(start.clone()) {
+                continue;
+            }
+            let mut stack = vec![(start.clone(), Vec::<String>::new(), false)];
+            while let Some((root, mut targets, expanded)) = stack.pop() {
+                if !expanded {
+                    targets = self
+                        .imports
+                        .get(&root)
+                        .into_iter()
+                        .flatten()
+                        .filter(|target| roots.contains(*target))
+                        .cloned()
+                        .collect();
+                    targets.reverse();
+                }
+                match targets.pop() {
+                    Some(target) => {
+                        stack.push((root, targets, true));
+                        if visited.insert(target.clone()) {
+                            stack.push((target, Vec::new(), false));
+                        }
+                    }
+                    None => {
+                        let next = rank.len();
+                        rank.insert(root, next);
+                    }
+                }
+            }
+        }
+        rank
+    }
+}
+
+struct UnitContext<'a> {
     context_paths: Vec<String>,
     reference_unit_ids: Vec<String>,
     /// Sources of every other member of the unit's cyclic input group, and of
@@ -1390,14 +1523,18 @@ struct UnitContext {
     /// cycle stays in one analysis context.
     cycle_paths: Vec<String>,
     sizes: BTreeMap<String, u64>,
+    imports: &'a PackageImportGraph,
+    /// Dependencies-first rank of the unit's own package roots.
+    package_rank: BTreeMap<String, usize>,
 }
 
-impl UnitContext {
+impl<'a> UnitContext<'a> {
     fn build(
         plan: &AnalysisPlan,
         unit: &AnalysisUnit,
         input: &AnalysisSplitInput,
         group: Option<&ContextGroup>,
+        imports: &'a PackageImportGraph,
         limitations: &mut BTreeSet<AnalysisSplitLimitation>,
     ) -> Self {
         let mut context_paths = input
@@ -1446,11 +1583,19 @@ impl UnitContext {
                 }
             }
         }
+        let roots = unit
+            .source_paths
+            .iter()
+            .map(|path| package_root_of(path))
+            .collect::<BTreeSet<_>>();
+        let package_rank = imports.dependency_rank(&roots);
         Self {
             context_paths,
             reference_unit_ids,
             cycle_paths: cycle_paths.into_iter().collect(),
             sizes,
+            imports,
+            package_rank,
         }
     }
 
@@ -1460,6 +1605,120 @@ impl UnitContext {
 
     fn total(&self, paths: &[String]) -> u64 {
         paths.iter().map(|path| self.size(path)).sum()
+    }
+
+    /// Whether the whole logical unit, loaded as one context, stays within
+    /// the byte budgets: the owned sources one execution unit may emit and the
+    /// sources one loader context may hold.  The file-count budget partitions
+    /// output only and does not bound what a loader holds in memory.
+    fn fits_byte_budgets(&self, unit: &AnalysisUnit, budget: &AnalysisSplitBudget) -> bool {
+        self.total(&unit.source_paths) <= budget.max_unit_source_bytes
+            && self.total(&self.context_paths) <= budget.max_context_source_bytes
+    }
+}
+
+/// The decision to load a stage's whole context although its boundary could
+/// bound the loader to packages.
+struct Promotion {
+    boundary: Option<AnalysisStageBoundary>,
+    /// A refinement demoted a unit that would otherwise have been promoted.
+    demoted: bool,
+}
+
+impl Promotion {
+    fn boundary<'b>(&'b self, declared: &'b AnalysisStageBoundary) -> &'b AnalysisStageBoundary {
+        self.boundary.as_ref().unwrap_or(declared)
+    }
+
+    fn annotate(&self, batches: &mut [Batch]) {
+        let reason = if self.boundary.is_some() {
+            AnalysisSplitReason::WholeContextPromoted
+        } else if self.demoted {
+            AnalysisSplitReason::Refined
+        } else {
+            return;
+        };
+        for batch in batches {
+            batch.reasons.insert(reason);
+        }
+    }
+}
+
+/// The whole-context loader a bounded stage is promoted to: the same stage
+/// loading the complete module with bodies of everything, unsplittable, so
+/// the promoted unit is exactly what the module-loader boundary would run.
+fn promoted_boundary(declared: &AnalysisStageBoundary) -> AnalysisStageBoundary {
+    AnalysisStageBoundary {
+        stage: declared.stage,
+        loader_kind: AnalysisLoaderKind::Module,
+        reference_depth: AnalysisReferenceDepth::Bodies,
+        granularity: AnalysisSplitGranularity::Package,
+        output_splittable: false,
+        input_splittable: false,
+        staged_bodies: false,
+    }
+}
+
+/// Decide whether a stage the boundary could bound to packages loads the
+/// whole context instead.  A logical unit whose sources fit the byte budgets
+/// keeps the whole-program precision of the module loader, and its typed and
+/// semantic stages stay one execution unit each.  A recorded refinement of any
+/// promoted stage of the unit demotes every promotable stage to the bounded
+/// boundary: a whole-context load that exceeded its worker's memory or
+/// deadline once is not retried at the same size, and the heavier semantic
+/// stage is not tried whole after the typed stage already failed.
+fn promote_whole_context(
+    unit: &AnalysisUnit,
+    boundary: &AnalysisAdapterBoundary,
+    declared: &AnalysisStageBoundary,
+    input: &AnalysisSplitInput,
+    context: &UnitContext,
+    group: Option<&ContextGroup>,
+    matched: &mut BTreeSet<usize>,
+) -> Promotion {
+    let promotable = |stage: &AnalysisStageBoundary| {
+        boundary.loader_scope
+            && stage.stage != AnalysisStage::Syntax
+            && stage.input_splittable
+            && !stage.loader_kind.loads_whole_context()
+    };
+    if !promotable(declared) || !context.fits_byte_budgets(unit, &input.budget) {
+        return Promotion {
+            boundary: None,
+            demoted: false,
+        };
+    }
+    let promoted_ids = boundary
+        .stages
+        .iter()
+        .filter(|stage| promotable(stage))
+        .map(|stage| {
+            build_execution_unit(
+                unit,
+                &promoted_boundary(stage),
+                &input.budget,
+                context,
+                group,
+                Batch {
+                    granules: granules(unit, AnalysisSplitGranularity::Package, context),
+                    reasons: BTreeSet::new(),
+                },
+                0,
+                1,
+            )
+            .id
+        })
+        .collect::<BTreeSet<_>>();
+    let mut demoted = false;
+    for (index, refinement) in input.refinements.iter().enumerate() {
+        if promoted_ids.contains(&refinement.execution_unit_id) {
+            matched.insert(index);
+            demoted = true;
+        }
+    }
+    Promotion {
+        boundary: (!demoted).then(|| promoted_boundary(declared)),
+        demoted,
     }
 }
 
@@ -1547,6 +1806,13 @@ fn granules(
 /// before this contract, so its requests keep their chunk identity.  Its
 /// batches above the byte budget are still reported over budget by
 /// [`build_execution_unit`], and a refinement can still divide them.
+///
+/// The typed and semantic granules of a loader-scope worker are ordered
+/// dependencies first before they are packed, so a batch of small packages
+/// holds packages that reference each other, and every batch runs after the
+/// batches holding the packages it imports.  A bounded loader then finds the
+/// export data of its references already built by an earlier unit of the same
+/// scan.  The syntax stage keeps repository order: it reads no references.
 fn partition(
     unit: &AnalysisUnit,
     boundary: &AnalysisStageBoundary,
@@ -1554,12 +1820,27 @@ fn partition(
     budget: &AnalysisSplitBudget,
     context: &UnitContext,
 ) -> Vec<Batch> {
-    let granules = granules(unit, boundary.granularity, context);
+    let mut granules = granules(unit, boundary.granularity, context);
     if granules.is_empty() || !(boundary.output_splittable || boundary.input_splittable) {
         return vec![Batch {
             granules,
             reasons: BTreeSet::new(),
         }];
+    }
+    if byte_budget && boundary.stage != AnalysisStage::Syntax {
+        granules.sort_by(|left, right| {
+            let rank = |granule: &Granule| {
+                context
+                    .package_rank
+                    .get(&granule.package_root)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            };
+            rank(left)
+                .cmp(&rank(right))
+                .then_with(|| left.package_root.cmp(&right.package_root))
+                .then_with(|| left.paths.cmp(&right.paths))
+        });
     }
     let mut batches = Vec::<Batch>::new();
     let mut current = Vec::<Granule>::new();
@@ -1745,6 +2026,25 @@ fn build_execution_unit(
         .cloned()
         .collect::<Vec<_>>();
     let input_split = loader_paths.len() < context.context_paths.len();
+    // A bounded loader reads the transitive imports of what it loads; the rest
+    // of the context is known to the worker by name only.  A whole-context
+    // loader or a paths-only stage has no such expected subset.
+    let reference_closure_roots = if boundary.loader_kind.loads_whole_context()
+        || boundary.reference_depth == AnalysisReferenceDepth::PathsOnly
+    {
+        Vec::new()
+    } else {
+        let reference_roots = reference_paths
+            .iter()
+            .map(|path| package_root_of(path))
+            .collect::<BTreeSet<_>>();
+        context
+            .imports
+            .closure(&loader_roots)
+            .into_iter()
+            .filter(|root| reference_roots.contains(root))
+            .collect()
+    };
 
     let owned_bytes = context.total(&owned_paths);
     let loader_bytes = context.total(&loader_paths);
@@ -1833,6 +2133,7 @@ fn build_execution_unit(
             reference_paths,
             reference_unit_ids: context.reference_unit_ids.clone(),
             input_split,
+            reference_closure_roots,
         },
         estimate: AnalysisWorkEstimate {
             stage: boundary.stage,
