@@ -1,6 +1,6 @@
 # ADR: Pre-split analysis planning by dependency scope and work estimate
 
-- Status: Implemented (plan and contract); bounded loaders and executed re-splits are consumer work
+- Status: Implemented (plan, contract, and the shipped Go package loader)
 - Date: 2026-09-07
 - Issue: #465 (parent #464; consumers #463 Go bounded loader, #467 health range loading)
 - Contract: depgraph-analysis-split-plan-v1 (`schemas/depgraph-analysis-split-plan-v1.schema.json`)
@@ -271,11 +271,13 @@ the owned files, so a wider loader scope could only be honoured by reading
 less than requested, and the worker rejects it instead of reporting `applied`
 for a scope it never read. The planner never produces such a binding, because
 a syntax boundary reads paths only and its loader scope is its ownership. The
-worker still loads the complete module for typed and semantic stages and
-reports `widened` for a `package` request. It does not yet advertise
-`analysis-loader-scope-v1`; #463 turns that on together with
-`analysis-go-package-loader-v1` when `packages.Load` is bounded to the
-requested package roots. The Web worker is unchanged.
+shipped Go worker advertises `analysis-loader-scope-v1` together with
+`analysis-go-package-loader-v1` and honours the binding for typed and
+semantic stages: `analysis_loader_scope=applied`, targets type-checked from
+source, dependencies from export data, CHA only over the declared program
+scope. A worker that does not advertise those capabilities still loads the
+complete module and reports `widened` for a `package` request. The Web
+worker is unchanged.
 
 ### Re-analysis triggers
 

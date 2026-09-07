@@ -168,6 +168,28 @@ Legacy Go v1 requests retain their repository-wide syntax witness. Semantic
 reuse additionally requires the adapter's compiler and external-dependency
 proof; static unit planning alone cannot establish it.
 
+Package-bounded Go typed and semantic checkpoints add the worker-reported
+`go_reference_fingerprint` of the in-repo import closure the typed stage
+actually loaded. Core stores that digest in `UnitCheckpointKey.reference_digest`
+so the static `input_digest` can still equal the request's context
+fingerprint. Keys that omit the field serialize as they did before, so
+existing module-loader checkpoint files stay valid. Changing an in-repo
+dependency that a package imports therefore invalidates that package's typed
+and semantic checkpoints while leaving unrelated packages reusable.
+
+The Go dependency snapshot that feeds base and logical profile IDs is
+computed from the module-wide metadata listing (`go list` without types),
+not from the packages observed during a NeedDeps typed load. Every package
+chunk of a module therefore shares the same snapshot. The first scan after
+this snapshot-source change invalidates typed and semantic checkpoints once;
+syntax checkpoints are kept.
+
+`go_call_graph_program_scope` and `analysis_loader_mode` are not profile
+axes: a whole-module unit and package-bounded chunks of the same module
+join. Precision differs (`package-with-declaration-deps` vs whole-program);
+identities do not. Absence of `go_call_graph_program_scope` means
+whole-program, which keeps historical streams byte-identical.
+
 AnalysisPlan::invalidation_from reports Added, Removed, SourceChanged,
 ManifestChanged, ConfigChanged, ProfileChanged, AnalyzerChanged,
 DependencyChanged, and UnknownDependency reasons. Direct changes seed the

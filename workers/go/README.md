@@ -84,15 +84,18 @@ loader), `reference_paths` must be disjoint from loaded paths, and
 `analysis_execution_unit_id`, `analysis_split_kind`, `analysis_loader_kind`,
 `analysis_loader_input_split`, and `analysis_loader_scope` (`applied` when the
 worker loaded exactly the requested loader scope, `widened` when it loaded the
-complete module for a narrower `package` request). The worker does not yet
-advertise `analysis-loader-scope-v1`, so the core does not send `split` to it;
-a bounded `packages.Load` scope will advertise that capability together with
-`analysis-go-package-loader-v1`.
+complete module for a narrower `package` request). The worker advertises
+`analysis-loader-scope-v1` and `analysis-go-package-loader-v1`, so the core
+sends `split` and the hybrid loader in `go_loader.go` type-checks only the
+bound package roots from source (dependencies from export data). CHA runs
+only over that declared program scope; `go_call_graph_program_scope` is
+omitted on whole-program streams.
 
-Progress is reported at parsed-file, completed-package, and completed-SSA-input
-boundaries. A single `go/packages` load and a single SSA program build are
-atomic operations in the Go APIs, so no heartbeat is fabricated while either
-operation is running; profile properties record these granularity limits and
+Progress is reported at parsed-file, completed-package, completed-SSA-input,
+and SSA-mapping (every 64 pending call sites) boundaries. A single
+`go/packages` load and a single SSA program build remain atomic operations;
+after `ssa.Program.Build` the worker drops `Syntax` and `TypesInfo` before
+CHA and mapping. Profile properties record these granularity limits and
 incomplete loads retain explicit fallback diagnostics.
 
 The typed graph is the durable boundary used by the core for resumable

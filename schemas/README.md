@@ -26,7 +26,12 @@ The request-level projection a worker receives is the `split` object of a
 `crates/depgraph-core/src/analysis_split.rs` is the semantic authority; the
 public fixture under `fixtures/analysis-split-plan-v1` and
 `crates/depgraph-core/tests/analysis_split_contract.rs` are its evidence. See
-`docs/40_arch_design/adr-presplit-analysis-planning.md`.
+`docs/40_arch_design/adr-presplit-analysis-planning.md`. The shipped Go worker
+advertises `analysis-loader-scope-v1` and `analysis-go-package-loader-v1`;
+the request `split` object is the closed `$defs/splitBinding` and the worker
+echoes loader-scope and program-scope profile properties documented in
+`workers/go/README.md` and `docs/40_arch_design/analysis-unit-go-validation.md`.
+Absence of `go_call_graph_program_scope` means whole-program.
 
 `agent-dogfood-report-v1.schema.json` is the closed JSON Schema 2020-12
 contract for the packaged MCP real-Agent comparison. It binds the public
