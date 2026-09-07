@@ -5562,16 +5562,17 @@ mod tests {
             ci.replacen("      fail-fast: false", "      fail-fast: true", 1),
             ci.replacen("rustflags: -C linker-features=-lld", "rustflags: \"\"", 1),
             ci.replacen("RUSTFLAGS: ${{ matrix.rustflags }}", "RUSTFLAGS: \"\"", 1),
-            ci.replacen("CARGO_INCREMENTAL: \"0\"", "CARGO_INCREMENTAL: \"1\"", 1),
-            ci.replacen(
+            // The `rust` job pins the same three settings for compile speed
+            // without being policy-bound, so loosen every job at once: the
+            // first occurrence alone would only touch that unbound job.
+            ci.replace("CARGO_INCREMENTAL: \"0\"", "CARGO_INCREMENTAL: \"1\""),
+            ci.replace(
                 "CARGO_PROFILE_DEV_DEBUG: \"0\"",
                 "CARGO_PROFILE_DEV_DEBUG: \"1\"",
-                1,
             ),
-            ci.replacen(
+            ci.replace(
                 "CARGO_PROFILE_TEST_DEBUG: \"0\"",
                 "CARGO_PROFILE_TEST_DEBUG: \"1\"",
-                1,
             ),
             ci.replacen(
                 "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",

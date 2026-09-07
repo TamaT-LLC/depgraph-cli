@@ -16,6 +16,13 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-24.04
+    env:
+      # Test artifacts are never debugged on the runner; panic locations come
+      # from the panic message, not from DWARF. Dropping debuginfo shortens the
+      # test compile and shrinks the artifacts rust-cache saves and restores.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -26,7 +33,9 @@ jobs:
       - run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Keep separate from compiler-precise-hostile (different cargo profile / env).
+          # Keep separate from compiler-precise-hostile: that job saves a smaller,
+          # per-package artifact set, and a full-match restore of it here would
+          # never be re-saved with the clippy and workspace test artifacts.
           # rust-cache's key does not account for profile settings in the workspace
           # Cargo.toml (e.g. [profile.dev.package."*"]), only Cargo.lock and env/rustc
           # inputs. If that profile config changes, an unhashed key restores the old,
@@ -35,6 +44,11 @@ jobs:
           # saved back - every run after that pays the same full rebuild. Hashing
           # Cargo.toml here forces a new cache entry whenever the profile changes.
           key: rust-${{ hashFiles('Cargo.toml') }}
+          # Cache entries are scoped to the branch that saved them, and pull
+          # requests already restore main's entry through the key prefix. Saving
+          # one more ~700 MB copy per pull request only fills the repository's
+          # 10 GB cache quota and evicts the entries the other jobs depend on.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install the compiler-precise Linux namespace boundary
         run: |
           sudo apt-get update
@@ -70,6 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: resumable-analysis-${{ hashFiles('Cargo.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.33.0
@@ -151,6 +166,7 @@ jobs:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: compiler-precise-hostile-${{ hashFiles('Cargo.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.decide.outputs.run == 'true'
         with:
@@ -237,6 +253,7 @@ jobs:
           # so it has no effect on the benchmark numbers gated below.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: benchmark-${{ hashFiles('Cargo.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -305,6 +322,7 @@ jobs:
           # The gates below run for 30+ minutes; keep the dependency artifacts
           # when a gate fails so the rerun does not start from a cold cache.
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -778,6 +796,7 @@ jobs:
         with:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: windows-smoke-${{ hashFiles('Cargo.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
