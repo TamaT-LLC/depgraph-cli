@@ -10,9 +10,8 @@ import (
 )
 
 // openReferenceFile opens a confined path from a trusted root descriptor.
-// Every intermediate directory and the final component are opened with
-// openat(2) and O_NOFOLLOW so a swapped parent symlink cannot escape the
-// scan root.
+// The root and every subsequent component are opened with O_NOFOLLOW so a
+// swapped scan-root or parent symlink cannot escape the scan root.
 func openReferenceFile(root, path string) (*os.File, error) {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
@@ -34,7 +33,7 @@ func openReferenceFile(root, path string) (*os.File, error) {
 	if len(components) == 0 {
 		return nil, os.ErrInvalid
 	}
-	dirfd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	dirfd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
