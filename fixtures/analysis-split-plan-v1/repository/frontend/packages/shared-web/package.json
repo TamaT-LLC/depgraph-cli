@@ -1,0 +1,5 @@
+{
+  "name": "shared-web",
+  "private": true,
+  "main": "src/index.ts"
+}
