@@ -678,27 +678,28 @@ impl DepgraphService {
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        let identity = resolve_health_input(snapshot_request, cancellation)?;
         let limits = health_range_limits();
-        if !identity.is_plain() {
-            let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
-            return collect_snapshot_scoped(
-                &snapshot,
-                self.config().canonical_root(),
-                HealthRangeDiagnostics::whole_snapshot(identity.layers, limits.per_range_work),
-                cancellation,
-            );
-        }
         let root = self.config().canonical_root().to_path_buf();
         let checkpoints = HealthRangeCheckpointStore::open(
             self.config().store_path(),
             MAX_HEALTH_RANGE_CHECKPOINT_BYTES,
         )
         .ok();
+        let snapshot_id = snapshot_request.snapshot_id().clone();
         let cancellation_check = cancellation.clone();
+        // Identity, plan, and every range load share one read transaction so
+        // the plan digest can never describe a different store state than the
+        // rows it was cut from.
         let collected = snapshot_request.store().interruptible_read(
             move || cancellation_check.is_cancelled(),
             |store| {
+                let identity = store.resolve_health_input(match snapshot_id.attempt_id() {
+                    Some(attempt_id) => HealthInputSelector::Attempt(attempt_id),
+                    None => HealthInputSelector::CompletedSnapshot(snapshot_id.as_str()),
+                })?;
+                if !identity.is_plain() {
+                    return Ok(Err(identity));
+                }
                 let collected = collect_ranged(
                     store,
                     &identity,
@@ -711,13 +712,27 @@ impl DepgraphService {
                 // The projection is connection-scoped scratch space; a failure
                 // to drop it only costs memory until the connection closes.
                 let _ = store.release_health_range_projection();
-                Ok(collected)
+                Ok(Ok(collected))
             },
         );
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        collected.map_err(DepgraphServiceError::store_operation)?
+        match collected.map_err(DepgraphServiceError::store_operation)? {
+            Ok(collected) => collected,
+            // Layered inputs (build deltas, runtime sessions, semantic no-op
+            // overlays) keep the whole-snapshot path so overlay semantics stay
+            // exactly as before.
+            Err(identity) => {
+                let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
+                collect_snapshot_scoped(
+                    &snapshot,
+                    self.config().canonical_root(),
+                    HealthRangeDiagnostics::whole_snapshot(identity.layers, limits.per_range_work),
+                    cancellation,
+                )
+            }
+        }
     }
 
     pub fn health_finding_get(
@@ -1085,27 +1100,6 @@ struct SnapshotScopedCollection {
     scan_id: String,
     coverage: CoverageRecord,
     diagnostics: HealthRangeDiagnostics,
-}
-
-fn resolve_health_input(
-    snapshot_request: &mut SnapshotReadRequest,
-    cancellation: &CancellationToken,
-) -> DepgraphServiceResult<HealthInputIdentity> {
-    let snapshot_id = snapshot_request.snapshot_id().clone();
-    let cancellation_check = cancellation.clone();
-    let resolved = snapshot_request.store().interruptible_read(
-        move || cancellation_check.is_cancelled(),
-        |store| {
-            store.resolve_health_input(match snapshot_id.attempt_id() {
-                Some(attempt_id) => HealthInputSelector::Attempt(attempt_id),
-                None => HealthInputSelector::CompletedSnapshot(snapshot_id.as_str()),
-            })
-        },
-    );
-    if cancellation.is_cancelled() {
-        return Err(DepgraphServiceError::Cancelled);
-    }
-    resolved.map_err(DepgraphServiceError::store_operation)
 }
 
 /// Whole-snapshot collection (layered inputs and the legacy control path).
