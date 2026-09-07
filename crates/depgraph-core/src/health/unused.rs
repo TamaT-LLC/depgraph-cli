@@ -745,6 +745,38 @@ impl<'a> GlobalSource<'a> {
     }
 }
 
+impl<'a> GlobalSource<'a> {
+    /// Use the snapshot-wide projection the store loads for ranged analysis.
+    ///
+    /// The projection already restricts edges to those targeting Go module
+    /// nodes and sites to `candidates`, so nothing is charged here; the
+    /// store charged one step per row when it materialized them.
+    pub(crate) fn from_health_input(input: &'a depgraph_store::HealthGlobalInput) -> Self {
+        Self {
+            scan_status: input.scan.status.as_str(),
+            coverage_reasons: input.coverage.reasons.as_slice(),
+            profiles: input.profiles.as_slice(),
+            matrix_entries: input.profile_matrix.entries.as_slice(),
+            subject_languages: input
+                .subject_languages
+                .iter()
+                .map(Option::as_deref)
+                .collect(),
+            go_module_nodes: input.go_module_nodes.iter().collect(),
+            edges: input.go_package_edges.as_slice(),
+            sites: input.go_candidate_sites.as_slice(),
+            targetless_candidate: input.targetless_sites.candidate,
+            targetless_unresolved: input.targetless_sites.unresolved,
+            targetless_dynamic: input.targetless_sites.dynamic,
+            coverage_omitted_paths: input
+                .coverage_omitted_paths
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+}
+
 impl<'a> GlobalIndex<'a> {
     pub(crate) fn build(
         source: &GlobalSource<'a>,
@@ -1043,10 +1075,6 @@ impl<'a> GlobalIndex<'a> {
             coverage_omitted_paths: source.coverage_omitted_paths.iter().copied().collect(),
             analysis_coverage_incomplete,
         })
-    }
-
-    pub(crate) const fn analysis_coverage_incomplete(&self) -> bool {
-        self.analysis_coverage_incomplete
     }
 }
 

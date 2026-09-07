@@ -23,10 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CoverageRecord, EdgeRecord, GraphSnapshot, NodeRecord, ProfileMatrixRecord, ProfileRecord,
-    ScanRecord, SiteRecord, Store, incremental,
-    profile_matrix::refresh_profile_matrix,
-    read::{load_profiles, load_staging_coverage},
-    snapshot::load_completed_snapshot_record,
+    ScanRecord, SiteRecord, Store, incremental, profile_matrix::refresh_profile_matrix,
+    read::load_profiles, snapshot::load_completed_snapshot_record,
 };
 
 /// Contract version of [`HealthRangePlan`] and of the digests derived from it.
@@ -357,6 +355,71 @@ fn load_scan_record(connection: &Connection, scan_id: &str) -> Result<ScanRecord
         )
         .optional()?
         .with_context(|| format!("scan {scan_id} was not found"))
+}
+
+/// The coverage record a whole-snapshot load derives (`read::observed_coverage`),
+/// computed from SQL counts instead of materialized sites.
+fn observed_coverage_sql(
+    connection: &Connection,
+    scan_id: &str,
+    project_code_executed: bool,
+) -> Result<CoverageRecord> {
+    let stored = connection
+        .query_row(
+            "SELECT json FROM coverage WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str::<CoverageRecord>(&raw))
+        .transpose()?;
+    let had_final_coverage = stored.is_some();
+    let mut coverage = stored.unwrap_or_else(|| CoverageRecord {
+        reasons: vec!["final worker coverage unavailable".to_owned()],
+        ..CoverageRecord::default()
+    });
+    (
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+    ) = connection.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(resolution_status='resolved'), 0),
+                COALESCE(SUM(resolution_status='candidates'), 0),
+                COALESCE(SUM(resolution_status='external'), 0),
+                COALESCE(SUM(resolution_status='unresolved'), 0)
+           FROM sites WHERE scan_id=?1",
+        [scan_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let (profiles, files, skipped): (u64, u64, u64) = connection.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM profiles WHERE scan_id=?1),
+            (SELECT COUNT(*) FROM file_coverage WHERE scan_id=?1),
+            (SELECT COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0)
+               FROM file_coverage WHERE scan_id=?1)",
+        [scan_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    coverage.profiles = profiles;
+    coverage.files_discovered = files;
+    coverage.files_skipped = skipped;
+    coverage.files_analyzed = files.saturating_sub(skipped);
+    coverage.project_code_executed |= project_code_executed;
+    if !had_final_coverage {
+        coverage.completeness.clear();
+    }
+    Ok(coverage)
 }
 
 fn analysis_plan_identity(
@@ -1089,7 +1152,7 @@ impl Store {
         for _ in &profiles {
             work.charge()?;
         }
-        let coverage = load_staging_coverage(connection, scan_id)?;
+        let coverage = observed_coverage_sql(connection, scan_id, scan.project_code_executed)?;
         work.charge()?;
         let mut profile_snapshot = GraphSnapshot {
             scan: scan.clone(),
@@ -1292,26 +1355,37 @@ impl Store {
             work.budget,
             &mut subjects,
         )?;
+        // Non-subject node ids (modules, packages) can sort inside the
+        // interval; only edges and sites that target a subject are part of the
+        // range, exactly as the planner counted them.
         let mut inbound_edges = Vec::new();
         query_edges_charged(
             connection,
             &format!(
-                "SELECT {EDGE_COLUMNS} FROM edges
-                  WHERE scan_id=?1 AND target BETWEEN ?2 AND ?3
-                  ORDER BY id"
+                "SELECT {EDGE_COLUMNS} FROM edges AS edge
+                  WHERE edge.scan_id=?1 AND edge.target BETWEEN ?2 AND ?3
+                    AND EXISTS (SELECT 1 FROM nodes AS subject
+                                 WHERE subject.scan_id=edge.scan_id AND subject.id=edge.target
+                                   AND subject.kind IN {SUBJECT_KINDS_SQL})
+                  ORDER BY edge.id"
             ),
             &[&scan_id, &lo, &hi],
             work.budget,
             &mut inbound_edges,
         )?;
+        let range_site_ids = format!(
+            "SELECT DISTINCT projection.site_id FROM {SITE_TARGETS_TABLE} AS projection
+              WHERE projection.target_id BETWEEN ?2 AND ?3
+                AND EXISTS (SELECT 1 FROM nodes AS subject
+                             WHERE subject.scan_id=?1 AND subject.id=projection.target_id
+                               AND subject.kind IN {SUBJECT_KINDS_SQL})"
+        );
         let mut inbound_sites = Vec::new();
         query_sites_charged(
             connection,
             &format!(
                 "SELECT {SITE_COLUMNS} FROM sites AS site
-                  WHERE site.scan_id=?1 AND site.id IN (
-                        SELECT DISTINCT site_id FROM {SITE_TARGETS_TABLE}
-                         WHERE target_id BETWEEN ?2 AND ?3)
+                  WHERE site.scan_id=?1 AND site.id IN ({range_site_ids})
                   ORDER BY site.id"
             ),
             &[&scan_id, &lo, &hi],
@@ -1322,9 +1396,7 @@ impl Store {
         let mut statement = connection.prepare(&format!(
             "SELECT DISTINCT item.owner_id FROM evidence AS item
               WHERE item.scan_id=?1 AND item.owner_type='site'
-                AND item.owner_id IN (
-                    SELECT DISTINCT site_id FROM {SITE_TARGETS_TABLE}
-                     WHERE target_id BETWEEN ?2 AND ?3)
+                AND item.owner_id IN ({range_site_ids})
                 AND json_extract(item.raw_json, '$.properties.occurrence_kind')='dynamic_import'
               ORDER BY item.owner_id"
         ))?;
@@ -1350,18 +1422,21 @@ impl Store {
     /// no evidence, diagnostics, file coverage, or adapter logs.
     pub fn load_health_dependency_input(
         &self,
-        plan: &HealthRangePlan,
+        identity: &HealthInputIdentity,
         budget: &mut dyn HealthWorkBudget,
     ) -> Result<(GraphSnapshot, u64)> {
+        if !identity.is_plain() {
+            bail!("health dependency input can only be loaded for a plain scan input");
+        }
         let connection = &self.connection;
-        let scan_id = plan.identity.base_scan_id.as_str();
+        let scan_id = identity.base_scan_id.as_str();
         let mut work = WorkCounter::new(budget);
         let scan = load_scan_record(connection, scan_id)?;
         let profiles = load_profiles(connection, scan_id)?;
         for _ in &profiles {
             work.charge()?;
         }
-        let coverage = load_staging_coverage(connection, scan_id)?;
+        let coverage = observed_coverage_sql(connection, scan_id, scan.project_code_executed)?;
         let mut nodes = Vec::new();
         query_nodes_charged(
             connection,

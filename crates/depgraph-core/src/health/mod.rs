@@ -3,6 +3,8 @@ mod budget;
 pub mod contract;
 pub mod dependency;
 pub mod hotspot;
+pub mod range_checkpoint;
+pub mod ranged;
 pub mod surface;
 pub mod unused;
 
