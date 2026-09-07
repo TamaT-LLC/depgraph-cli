@@ -746,6 +746,15 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     )
     .await?;
     let analysis_plan = schedule.plan;
+    if let Some(split_plan) = &schedule.split_plan {
+        tracing::debug!(
+            split_plan_id = %split_plan.split_plan_id,
+            execution_units = split_plan.execution_units.len(),
+            waves = split_plan.parallelism.waves.len(),
+            effective_concurrency = split_plan.parallelism.effective_concurrency,
+            "analysis split plan decided before worker admission"
+        );
+    }
     let analysis_input_proof = schedule.input_proof;
     let ledger_records = analysis_ledger_records(&scan_id, &schedule.work, analysis_plan.as_ref());
     let unit_count = schedule.work.len();
