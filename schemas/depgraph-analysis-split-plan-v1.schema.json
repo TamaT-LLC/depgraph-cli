@@ -418,7 +418,7 @@
       }
     },
     "loaderBinding": {
-      "description": "Loader target a worker receives inside the `split` object of a depgraph-analysis-unit-v2 request. `paths` must cover the request's `source_paths`; `reference_paths` is disjoint from `paths`; `input_split` is true exactly when reference-only inputs exist.",
+      "description": "Loader target a worker receives inside the `split` object of a depgraph-analysis-unit-v2 request. `paths` must cover the request's `source_paths`, and equal them for a syntax request whose parser reads exactly the owned files; `reference_paths` is disjoint from `paths`; `input_split` is true exactly when reference-only inputs exist.",
       "type": "object",
       "additionalProperties": false,
       "required": [
