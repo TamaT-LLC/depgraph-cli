@@ -451,6 +451,199 @@ func New(side int) Shape { return Square{Side: side} }
 	})
 }
 
+// TestGoLoaderScopeTable drives the loader over every fixture shape with one
+// table: which variants become targets, which in-repo packages become
+// references (and from which source), and which scope errors fail closed.
+func TestGoLoaderScopeTable(t *testing.T) {
+	fixtures := map[string]func(*testing.T) string{
+		"basic":    goLoaderBasicFixture,
+		"identity": goLoaderIdentityFixture,
+		"cycle":    goLoaderTestCycleFixture,
+	}
+	cases := []struct {
+		name            string
+		fixture         string
+		module          string
+		targets         []goLoaderTargetSpec
+		wantTargets     []string
+		wantInRepo      map[string]string // reference ID -> source
+		wantFingerprint int               // in-repo packages in the reference fingerprint
+		wantCode        string            // first diagnostic code when the load fails closed
+	}{
+		{
+			name: "library with both test variants", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "use"}},
+			wantTargets: []string{
+				goLoaderBasicModule + "/use",
+				goLoaderBasicModule + "/use [" + goLoaderBasicModule + "/use.test]",
+				goLoaderBasicModule + "/use_test [" + goLoaderBasicModule + "/use.test]",
+			},
+			wantInRepo: map[string]string{goLoaderBasicModule + "/shape": goLoaderReferenceExport}, wantFingerprint: 1,
+		},
+		{
+			// Indirect in-repo dependencies (shape via use) are references too:
+			// they are in the program and in the fingerprint closure.
+			name: "main package imports the library from export data", fixture: "basic", module: ".",
+			targets:     []goLoaderTargetSpec{{Dir: "cmd/app", PkgPath: goLoaderBasicModule + "/cmd/app"}},
+			wantTargets: []string{goLoaderBasicModule + "/cmd/app"},
+			wantInRepo:  map[string]string{goLoaderBasicModule + "/use": goLoaderReferenceExport, goLoaderBasicModule + "/shape": goLoaderReferenceExport}, wantFingerprint: 2,
+		},
+		{
+			name: "two packages in one scope reference each other in process", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "use"}, {Dir: "shape"}},
+			wantTargets: []string{
+				goLoaderBasicModule + "/shape",
+				goLoaderBasicModule + "/use",
+				goLoaderBasicModule + "/use [" + goLoaderBasicModule + "/use.test]",
+				goLoaderBasicModule + "/use_test [" + goLoaderBasicModule + "/use.test]",
+			},
+			wantInRepo: map[string]string{}, wantFingerprint: 0,
+		},
+		{
+			name: "leaf package has no in-repo references", fixture: "basic", module: ".",
+			targets:     []goLoaderTargetSpec{{Dir: "shape"}},
+			wantTargets: []string{goLoaderBasicModule + "/shape"},
+			wantInRepo:  map[string]string{}, wantFingerprint: 0,
+		},
+		{
+			name: "local replace and same-path module resolve by directory", fixture: "identity", module: "app",
+			targets:     []goLoaderTargetSpec{{Dir: "app/use"}},
+			wantTargets: []string{"example.com/app/use", "example.com/app/use_test [example.com/app/use.test]"},
+			wantInRepo:  map[string]string{"example.com/dep/shape": goLoaderReferenceExport, "example.com/twin/lib": goLoaderReferenceExport}, wantFingerprint: 2,
+		},
+		{
+			name: "same-path twin a is its own scope", fixture: "identity", module: "twins/a",
+			targets: []goLoaderTargetSpec{{Dir: "twins/a/lib"}}, wantTargets: []string{"example.com/twin/lib"}, wantInRepo: map[string]string{},
+		},
+		{
+			name: "same-path twin b is its own scope", fixture: "identity", module: "twins/b",
+			targets: []goLoaderTargetSpec{{Dir: "twins/b/lib"}}, wantTargets: []string{"example.com/twin/lib"}, wantInRepo: map[string]string{},
+		},
+		{
+			name: "test-induced recompile falls back to source declarations", fixture: "cycle", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "p"}},
+			wantTargets: []string{
+				"example.com/cycle/p",
+				"example.com/cycle/p [example.com/cycle/p.test]",
+				"example.com/cycle/p_test [example.com/cycle/p.test]",
+			},
+			wantInRepo: map[string]string{"example.com/cycle/q [example.com/cycle/p.test]": goLoaderReferenceSource}, wantFingerprint: 1,
+		},
+		{
+			// "q [p.test]" is never a listing root, so like the module-whole-program
+			// typed set it is not a target even when q is; it stays a
+			// declaration-only source reference of p's external test.
+			name: "cycle members in one scope keep the recompiled variant as a reference", fixture: "cycle", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "p"}, {Dir: "q"}},
+			wantTargets: []string{
+				"example.com/cycle/p",
+				"example.com/cycle/q",
+				"example.com/cycle/p [example.com/cycle/p.test]",
+				"example.com/cycle/p_test [example.com/cycle/p.test]",
+			},
+			wantInRepo: map[string]string{"example.com/cycle/q [example.com/cycle/p.test]": goLoaderReferenceSource}, wantFingerprint: 1,
+		},
+		{
+			name: "missing target directory fails closed", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "nope"}}, wantCode: "go_loader_target_missing",
+		},
+		{
+			name: "target outside the scope module fails closed", fixture: "identity", module: "app",
+			targets: []goLoaderTargetSpec{{Dir: "dep/shape"}}, wantCode: "go_loader_scope_invalid",
+		},
+		{
+			name: "absolute target directory fails closed", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "/use"}}, wantCode: "go_loader_scope_invalid",
+		},
+		{
+			name: "duplicate target directory fails closed", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "use"}, {Dir: "./use"}}, wantCode: "go_loader_scope_invalid",
+		},
+		{
+			name: "package path mismatch fails closed", fixture: "basic", module: ".",
+			targets: []goLoaderTargetSpec{{Dir: "use", PkgPath: goLoaderBasicModule + "/other"}}, wantCode: "go_loader_target_mismatch",
+		},
+		{
+			name: "empty scope fails closed", fixture: "basic", module: ".", wantCode: "go_loader_scope_invalid",
+		},
+	}
+	roots := map[string]string{}
+	sessions := map[string]*goLoaderSession{}
+	moduleSets := map[string][]Module{}
+	for name, fixture := range fixtures {
+		roots[name] = fixture(t)
+		moduleSets[name] = goLoaderTestModules(t, roots[name])
+		sessions[name] = goLoaderTestSession(t, roots[name], "")
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modules := moduleSets[tc.fixture]
+			result := sessions[tc.fixture].loadPackageScope(goLoaderScope{
+				Module: goLoaderTestModule(t, modules, tc.module), Modules: modules, Targets: tc.targets,
+			}, nil)
+			if tc.wantCode != "" {
+				if result.Status != "fallback" || len(result.TypedPackages) != 0 || result.SSAInput != nil {
+					t.Fatalf("status = %q typed = %d, want a closed fallback", result.Status, len(result.TypedPackages))
+				}
+				if len(result.Diagnostics) == 0 || result.Diagnostics[0].Code != tc.wantCode {
+					t.Fatalf("diagnostics = %s, want first code %s", goLoaderDiagnosticSummary(result.Diagnostics), tc.wantCode)
+				}
+				return
+			}
+			if result.Status != "loaded" {
+				t.Fatalf("status = %q:\n%s", result.Status, goLoaderDiagnosticSummary(result.Diagnostics))
+			}
+			if got := goLoaderTargetIDs(result); strings.Join(got, "|") != strings.Join(tc.wantTargets, "|") {
+				t.Fatalf("targets = %v, want %v", got, tc.wantTargets)
+			}
+			gotInRepo := map[string]string{}
+			for _, reference := range result.References {
+				if reference.Origin == goLoaderOriginInRepo {
+					gotInRepo[reference.ID] = reference.Source
+				}
+			}
+			if len(gotInRepo) != len(tc.wantInRepo) {
+				t.Fatalf("in-repo references = %v, want %v", gotInRepo, tc.wantInRepo)
+			}
+			for id, source := range tc.wantInRepo {
+				if gotInRepo[id] != source {
+					t.Fatalf("in-repo reference %s source = %q, want %q (all %v)", id, gotInRepo[id], source, gotInRepo)
+				}
+			}
+			if len(result.ReferencePackages) != len(tc.wantInRepo) || result.ReferenceFingerprint.PackageCount != tc.wantFingerprint {
+				t.Fatalf("reference packages = %d fingerprint packages = %d, want %d/%d", len(result.ReferencePackages), result.ReferenceFingerprint.PackageCount, len(tc.wantInRepo), tc.wantFingerprint)
+			}
+			metrics := result.Metrics
+			if metrics.TargetPackages != len(tc.wantTargets) || metrics.SyntaxPackages != metrics.TargetPackages {
+				t.Fatalf("only targets may carry syntax: %+v", metrics)
+			}
+			if metrics.LoadedPackages < metrics.SyntaxPackages {
+				t.Fatalf("program graph is smaller than its targets: %+v", metrics)
+			}
+			wantChildProcesses := 2
+			if metrics.LoadedPackages == metrics.SyntaxPackages {
+				// A scope without any dependency skips the export load entirely.
+				wantChildProcesses = 1
+			}
+			if metrics.ChildProcesses != wantChildProcesses {
+				t.Fatalf("child processes = %d, want %d: %+v", metrics.ChildProcesses, wantChildProcesses, metrics)
+			}
+			// One identity, one universe: every import of every target resolves
+			// to the same *packages.Package for the same ID across the program.
+			byID := map[string]*packages.Package{}
+			packages.Visit(result.Targets, nil, func(pkg *packages.Package) {
+				if existing, seen := byID[pkg.ID]; seen && existing != pkg {
+					t.Fatalf("package %q appears as two distinct universes in one program", pkg.ID)
+				}
+				byID[pkg.ID] = pkg
+			})
+			if result.SSAInput == nil || result.SSAInput.ProgramScope != goSSAProgramScopePackage {
+				t.Fatalf("SSA input = %+v", result.SSAInput)
+			}
+		})
+	}
+}
+
 func TestGoLoaderPreservesIdentityAcrossLocalReplaceAndSameNameModules(t *testing.T) {
 	root := goLoaderIdentityFixture(t)
 	modules := goLoaderTestModules(t, root)
