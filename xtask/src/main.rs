@@ -8490,4 +8490,29 @@ jobs:
         write_go_loader_scope_fallback_report(None)?;
         Ok(())
     }
+
+    #[test]
+    fn issue_482_keeps_the_private_trial_as_a_required_epic_closer() {
+        let validation = include_str!("../../docs/40_arch_design/resumable-analysis-validation.md");
+        assert!(
+            !validation.contains("Not a closer blocker"),
+            "the original trial target must stay a required #464 closer"
+        );
+        assert!(
+            validation.contains("### Required private-trial closer (pending)"),
+            "the private-trial gate heading must remain"
+        );
+        assert!(
+            validation.contains("Public fixtures are necessary and not sufficient"),
+            "public fixtures must not be recorded as sufficient to close #464"
+        );
+        assert!(
+            validation.contains("cargo run -p depgraph-core --example health_range_e2e --"),
+            "the private health-range command must stay wired to the --store/--root example"
+        );
+        assert!(
+            !validation.contains("cargo xtask health-range-e2e -- --store"),
+            "the public health-range xtask does not take --store"
+        );
+    }
 }

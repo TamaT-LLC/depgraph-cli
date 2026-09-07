@@ -4,7 +4,7 @@
 - Date: 2026-08-26
 - Decision ID: `PROJ-ARC-001-ADR-009`
 - Issue: `PROJ-ARC-004` / #423
-- Amendments: #440; non-unused confidence guard (2026-09-03)
+- Amendments: #440; non-unused confidence guard (2026-09-03); #467 bounded ranges; #482 private-trial closer for #464
 - Contract: `depgraph-health-finding-v1`
 
 ## Context
@@ -289,6 +289,15 @@ equal a complete collection's digest. The flag is distinct from the `attempt:`
 partial-result envelope (`depgraph-partial-result-v1`), which describes
 unanalysed scan units; both can be present at once. Once the missing ranges
 complete, the findings converge to the complete result.
+
+Epic #464 therefore treats scan completion and health-range completion as
+separate closers. `data.partial_ranges: false` on `--scan-id attempt:<id>`
+or with `--allow-partial` does not complete the epic. Ordinary health of a
+fresh `status: "completed"` scan, with no `--scan-id` and no
+`--allow-partial`, is required on the original trial target; public
+over-limit fixtures are necessary and not sufficient. See
+[resumable-analysis-validation.md](resumable-analysis-validation.md)
+("Required private-trial closer") and issue #482.
 
 `execution` is reported on the CLI JSON envelopes of `health`, `health list`,
 and `cleanup`, and on `health_summary_get` / `health_findings_list`:
@@ -604,3 +613,4 @@ findings remain `indeterminate` with
   (ranged health fixture and measurements)
 - Issue #423
 - Issue #467 (bounded range execution)
+- Issue #482 (private-trial scan and health remain required for epic #464)
