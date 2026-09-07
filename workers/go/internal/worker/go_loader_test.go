@@ -955,7 +955,7 @@ func TestGoLoaderBuildCacheIsConfinedAndSharedAcrossSessions(t *testing.T) {
 func TestGoLoaderPropertiesExposeEvidenceForCore(t *testing.T) {
 	root := goLoaderBasicFixture(t)
 	modules := goLoaderTestModules(t, root)
-	inventory := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "use"}}, WorkFile{}, nil, "", nil)
+	inventory := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "use"}}, nil, WorkFile{}, nil, "", nil)
 	if inventory.Status != "loaded" || inventory.Loader == nil {
 		t.Fatalf("inventory = %+v", inventory)
 	}
@@ -1034,7 +1034,7 @@ func TestGoLoaderDependencySnapshotIsSharedByEveryChunkOfAModule(t *testing.T) {
 
 	chunks := map[string]goPackagesInventory{}
 	for _, dir := range []string{"use", "shape", "cmd/app"} {
-		inventory := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: dir}}, WorkFile{}, nil, "", nil)
+		inventory := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: dir}}, nil, WorkFile{}, nil, "", nil)
 		if inventory.Status != "loaded" {
 			t.Fatalf("chunk %s status = %q: %s", dir, inventory.Status, goLoaderDiagnosticSummary(inventory.Diagnostics))
 		}
@@ -1083,8 +1083,8 @@ func TestGoLoaderDependencySnapshotIsSharedByEveryChunkOfAModule(t *testing.T) {
 	// identically, exactly like the whole-program path.
 	goLoaderMakeWritable(t, filepath.Join(cacheRoot, "example.com", "extdep@v1.0.0"))
 	writeTestFile(t, filepath.Join(cacheRoot, "example.com", "extdep@v1.0.0", "text", "text.go"), "package text\n\nimport \"strings\"\n\nfunc Upper(value string) string { return strings.ToUpper(value) + \"!\" }\n")
-	changedUse := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "use"}}, WorkFile{}, nil, "", nil)
-	changedShape := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "shape"}}, WorkFile{}, nil, "", nil)
+	changedUse := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "use"}}, nil, WorkFile{}, nil, "", nil)
+	changedShape := loadGoPackagesInventoryPackageScope(root, modules, []goLoaderTargetSpec{{Dir: "shape"}}, nil, WorkFile{}, nil, "", nil)
 	if changedUse.DependencySnapshot.Fingerprint == whole.DependencySnapshot.Fingerprint || changedUse.DependencySnapshot.Fingerprint != changedShape.DependencySnapshot.Fingerprint {
 		t.Fatalf("external source change was not observed uniformly: before=%s use=%s shape=%s", whole.DependencySnapshot.Fingerprint, changedUse.DependencySnapshot.Fingerprint, changedShape.DependencySnapshot.Fingerprint)
 	}

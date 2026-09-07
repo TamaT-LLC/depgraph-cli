@@ -21,16 +21,17 @@ type goLoaderReport struct {
 	References           []goLoaderReference
 }
 
-func loadGoPackagesInventoryPackageScope(root string, modules []Module, targets []goLoaderTargetSpec, work WorkFile, tags []string, buildCacheDir string, progress AnalysisProgressFunc) goPackagesInventory {
-	return loadGoPackagesInventoryPackageScopeWith(root, modules, targets, work, tags, buildCacheDir, packages.Load, goPackagesLoadTimeout, progress)
+func loadGoPackagesInventoryPackageScope(root string, modules []Module, targets []goLoaderTargetSpec, bodyPaths map[string]bool, work WorkFile, tags []string, buildCacheDir string, progress AnalysisProgressFunc) goPackagesInventory {
+	return loadGoPackagesInventoryPackageScopeWith(root, modules, targets, bodyPaths, work, tags, buildCacheDir, packages.Load, goPackagesLoadTimeout, progress)
 }
 
 // loadGoPackagesInventoryPackageScopeWith runs the hybrid loader for the
 // target packages of exactly one discovered module and adapts the outcome to
 // the goPackagesInventory contract consumed by the scanner. The dependency
 // snapshot is computed from the module-wide metadata listing so every chunk of
-// the module derives the same base profile identity.
-func loadGoPackagesInventoryPackageScopeWith(root string, modules []Module, targets []goLoaderTargetSpec, work WorkFile, tags []string, buildCacheDir string, loader goPackagesLoadFunc, timeout time.Duration, progress AnalysisProgressFunc) (inventory goPackagesInventory) {
+// the module derives the same base profile identity. A non-nil bodyPaths set
+// stages the bodies: only the listed target files keep function bodies.
+func loadGoPackagesInventoryPackageScopeWith(root string, modules []Module, targets []goLoaderTargetSpec, bodyPaths map[string]bool, work WorkFile, tags []string, buildCacheDir string, loader goPackagesLoadFunc, timeout time.Duration, progress AnalysisProgressFunc) (inventory goPackagesInventory) {
 	inventory = goPackagesInventory{Status: "fallback", Fallback: true}
 	dependencySnapshot := newGoDependencySnapshotBuilder(root, modules, work)
 	defer func() {
@@ -137,7 +138,7 @@ func loadGoPackagesInventoryPackageScopeWith(root string, modules []Module, targ
 	dependencySnapshot.setModuleCache(session.environment.ModuleCache)
 
 	result := session.loadPackageScope(goLoaderScope{
-		Module: *module, Modules: modules, Targets: targets, Tags: tags, Work: goWork,
+		Module: *module, Modules: modules, Targets: targets, Tags: tags, Work: goWork, BodyPaths: bodyPaths,
 	}, progress)
 	for _, diagnostic := range result.Diagnostics {
 		inventory.Diagnostics = append(inventory.Diagnostics, diagnostic)
@@ -212,6 +213,8 @@ func goLoaderProperties(report *goLoaderReport) map[string]string {
 		"go_loader_target_packages":                  strconv.Itoa(metrics.TargetPackages),
 		"go_loader_target_files":                     strconv.Itoa(metrics.TargetFiles),
 		"go_loader_target_bytes":                     strconv.FormatInt(metrics.TargetBytes, 10),
+		"go_loader_body_files":                       strconv.Itoa(metrics.BodyFiles),
+		"go_loader_declaration_only_files":           strconv.Itoa(metrics.StrippedFiles),
 		"go_loader_loaded_packages":                  strconv.Itoa(metrics.LoadedPackages),
 		"go_loader_syntax_packages":                  strconv.Itoa(metrics.SyntaxPackages),
 		"go_loader_parsed_files":                     strconv.Itoa(metrics.ParsedFiles),

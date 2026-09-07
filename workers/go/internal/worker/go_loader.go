@@ -104,6 +104,12 @@ type goLoaderScope struct {
 	// Listing optionally supplies a module-wide metadata listing computed by a
 	// previous step in the same session so it is not recomputed.
 	Listing []*packages.Package
+	// BodyPaths, when non-nil, stages the bodies of the target packages: only
+	// the listed repository-relative files keep their function bodies for the
+	// type-check and the SSA build, every other target file contributes its
+	// declarations only. Generic functions, methods of generic types, and init
+	// functions keep their bodies because go/types requires them.
+	BodyPaths map[string]bool
 }
 
 type goLoaderReference struct {
@@ -132,10 +138,14 @@ type goReferencePackage struct {
 }
 
 type goLoaderMetrics struct {
-	Mode                goLoaderMode
-	TargetPackages      int
-	TargetFiles         int
-	TargetBytes         int64
+	Mode           goLoaderMode
+	TargetPackages int
+	TargetFiles    int
+	TargetBytes    int64
+	// BodyFiles counts the target files whose function bodies were
+	// type-checked; it equals TargetFiles unless the bodies were staged.
+	BodyFiles           int
+	StrippedFiles       int
 	LoadedPackages      int
 	SyntaxPackages      int
 	ParsedFiles         int
@@ -690,6 +700,8 @@ func (r *goLoaderRun) checkVariant(variant *packages.Package, ignoreBodies bool)
 	files := make([]*ast.File, 0, len(variant.CompiledGoFiles))
 	var packageErrors []packages.Error
 	var bytesRead int64
+	stripped := map[string]bool{}
+	bodyFiles := 0
 	for _, file := range variant.CompiledGoFiles {
 		confined, ok := confinedMetadataFile(root, file)
 		if !ok {
@@ -718,6 +730,12 @@ func (r *goLoaderRun) checkVariant(variant *packages.Package, ignoreBodies bool)
 				packageErrors = append(packageErrors, packages.Error{Pos: "-", Msg: err.Error(), Kind: packages.ParseError})
 			}
 		}
+		if !ignoreBodies && r.scope.BodyPaths != nil && !r.scope.BodyPaths[cleanSlash(relativePath(root, confined))] {
+			stripFunctionBodies(syntax)
+			stripped[confined] = true
+		} else if !ignoreBodies {
+			bodyFiles++
+		}
 		files = append(files, syntax)
 	}
 	r.result.Metrics.ParsedFiles += len(files)
@@ -725,6 +743,8 @@ func (r *goLoaderRun) checkVariant(variant *packages.Package, ignoreBodies bool)
 		r.result.Metrics.TargetPackages++
 		r.result.Metrics.TargetFiles += len(files)
 		r.result.Metrics.TargetBytes += bytesRead
+		r.result.Metrics.BodyFiles += bodyFiles
+		r.result.Metrics.StrippedFiles += len(stripped)
 	}
 
 	imports := map[string]*packages.Package{}
@@ -735,7 +755,13 @@ func (r *goLoaderRun) checkVariant(variant *packages.Package, ignoreBodies bool)
 		Sizes:            r.sizes,
 		Error: func(err error) {
 			if typeErr, ok := err.(types.Error); ok {
-				packageErrors = append(packageErrors, packages.Error{Pos: typeErr.Fset.Position(typeErr.Pos).String(), Msg: typeErr.Msg, Kind: packages.TypeError})
+				position := typeErr.Fset.Position(typeErr.Pos)
+				if stripped[position.Filename] && isUnusedImportMessage(typeErr.Msg) {
+					// The import was used by a body this chunk does not own;
+					// the owning chunk type-checks it with the body present.
+					return
+				}
+				packageErrors = append(packageErrors, packages.Error{Pos: position.String(), Msg: typeErr.Msg, Kind: packages.TypeError})
 				return
 			}
 			packageErrors = append(packageErrors, packages.Error{Pos: "-", Msg: err.Error(), Kind: packages.TypeError})
@@ -783,6 +809,49 @@ func (r *goLoaderRun) checkVariant(variant *packages.Package, ignoreBodies bool)
 	}
 	r.checked[variant.ID] = out
 	return out, nil
+}
+
+// stripFunctionBodies turns the function declarations of one target file into
+// body-less declarations so go/types checks the signatures only and go/ssa
+// treats the functions as external. Bodies that go/types insists on stay:
+// generic functions ("generic function is missing function body"), init
+// functions ("func init must have a body"), and methods of generic types whose
+// instantiation the SSA builder must be able to synthesise.
+func stripFunctionBodies(file *ast.File) {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		if function.Type.TypeParams != nil && len(function.Type.TypeParams.List) > 0 {
+			continue
+		}
+		if function.Recv == nil && function.Name != nil && function.Name.Name == "init" {
+			continue
+		}
+		if function.Recv != nil && receiverIsGeneric(function.Recv) {
+			continue
+		}
+		function.Body = nil
+	}
+}
+
+func receiverIsGeneric(receiver *ast.FieldList) bool {
+	generic := false
+	for _, field := range receiver.List {
+		ast.Inspect(field.Type, func(node ast.Node) bool {
+			switch node.(type) {
+			case *ast.IndexExpr, *ast.IndexListExpr:
+				generic = true
+			}
+			return !generic
+		})
+	}
+	return generic
+}
+
+func isUnusedImportMessage(message string) bool {
+	return strings.HasPrefix(message, "\"") && strings.HasSuffix(message, "and not used") && strings.Contains(message, "imported")
 }
 
 // admittedExternalFile admits a dependency source file that lives outside the
