@@ -511,8 +511,9 @@
           "maximum": 64
         },
         "admitted_memory_bytes": {
+          "description": "max_worker_memory_bytes multiplied by effective_concurrency; zero for a plan without execution units.",
           "type": "integer",
-          "minimum": 1
+          "minimum": 0
         },
         "waves": {
           "type": "array",

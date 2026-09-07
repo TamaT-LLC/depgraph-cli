@@ -1374,6 +1374,79 @@ fn parallelism_is_decided_before_execution_and_respects_prerequisites() -> Resul
 }
 
 #[test]
+fn plan_without_execution_units_admits_no_worker_memory() -> Result<()> {
+    // A Rust-only repository has no unit for a source-batch worker.
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"only-rust\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn value() -> u32 {\n    1\n}\n",
+    )?;
+    let config = Config::default();
+    let plan = plan_analysis_units(root, &config, None)?;
+    assert!(
+        plan.executable_units()
+            .iter()
+            .all(|unit| unit.adapter.as_str() == "rust")
+    );
+    let default_budget = AnalysisSplitBudget::from_config(&config);
+
+    let empty = depgraph_core::analysis_split::plan_default_split(root, &config, &plan)?;
+    assert!(empty.boundaries.is_empty());
+    assert!(empty.execution_units.is_empty());
+    assert!(empty.parallelism.waves.is_empty());
+    assert_eq!(
+        empty.parallelism.max_concurrent_units,
+        default_budget.max_concurrent_units
+    );
+    assert_eq!(empty.parallelism.effective_concurrency, 0);
+    assert_eq!(
+        empty.parallelism.admitted_memory_bytes, 0,
+        "no execution unit means no admitted worker"
+    );
+    let schema: Value = serde_json::from_str(SPLIT_PLAN_SCHEMA)?;
+    let validator = jsonschema::validator_for(&schema)?;
+    let errors = validator
+        .iter_errors(&serde_json::to_value(&empty)?)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // Declared boundaries without a unit to execute plan the same way.
+    let declared = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput::new(
+            default_budget.clone(),
+            AnalysisAdapterBoundary::current_defaults(),
+        ),
+    )?;
+    assert!(declared.execution_units.is_empty());
+    assert_eq!(declared.parallelism.effective_concurrency, 0);
+    assert_eq!(declared.parallelism.admitted_memory_bytes, 0);
+
+    // With one unit the bound is one worker, as documented.
+    let checkout = Checkout::new()?;
+    let (_, serial) = budget(|config| config.scan.max_concurrent_units = 1);
+    let (serial_split, _) = split(
+        &checkout,
+        &checkout.discover(&config)?,
+        &serial,
+        AnalysisAdapterBoundary::current_defaults(),
+    )?;
+    assert_eq!(serial_split.parallelism.effective_concurrency, 1);
+    assert_eq!(
+        serial_split.parallelism.admitted_memory_bytes,
+        serial.max_worker_memory_bytes
+    );
+    Ok(())
+}
+
+#[test]
 fn measured_sizes_match_fixture_bytes_and_drive_byte_splits() -> Result<()> {
     let checkout = Checkout::new()?;
     let (config, _) = budget(|_| {});

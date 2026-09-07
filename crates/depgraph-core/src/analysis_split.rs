@@ -1855,12 +1855,11 @@ fn decide_parallelism(
         .max()
         .unwrap_or(0)
         .min(limit) as u64;
+    // A plan without execution units admits no worker and therefore no memory.
     AnalysisParallelism {
         max_concurrent_units: budget.max_concurrent_units,
         effective_concurrency: effective,
-        admitted_memory_bytes: budget
-            .max_worker_memory_bytes
-            .saturating_mul(effective.max(1)),
+        admitted_memory_bytes: budget.max_worker_memory_bytes.saturating_mul(effective),
         waves,
     }
 }
