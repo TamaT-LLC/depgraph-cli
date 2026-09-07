@@ -310,7 +310,21 @@ func scan(root string, inventory *repositoryInventory, analysisUnit *AnalysisUni
 	return scanWithProgress(root, inventory, analysisUnit, nil)
 }
 
+// scanOptions selects worker-internal loader behaviour that the analysis-unit
+// request contract does not carry yet. The zero value keeps the historical
+// module-whole-program path; package mode runs the hybrid loader of
+// go_loader.go for the listed target package directories.
+type scanOptions struct {
+	loaderMode    goLoaderMode
+	loaderTargets []goLoaderTargetSpec
+	buildCacheDir string
+}
+
 func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
+	return scanWithOptions(root, inventory, analysisUnit, progress, scanOptions{})
+}
+
+func scanWithOptions(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest, progress AnalysisProgressFunc, options scanOptions) (Result, error) {
 	if analysisUnit != nil {
 		normalized := analysisUnit.normalized()
 		analysisUnit = &normalized
@@ -504,9 +518,12 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax && progress != nil {
 			progress("go_typed_load", "progress", 0)
 		}
-		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax {
+		switch {
+		case options.loaderMode == goLoaderModePackage:
+			goPackages = loadGoPackagesInventoryPackageScope(absRoot, modules, options.loaderTargets, goPackagesWork, configuredTags, options.buildCacheDir, progress)
+		case analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax:
 			goPackages = loadGoPackagesInventoryForModulesProgress(absRoot, loadModules, modules, goPackagesWork, configuredTags, progress)
-		} else {
+		default:
 			goPackages = loadGoPackagesInventoryForModules(absRoot, loadModules, modules, goPackagesWork, configuredTags)
 		}
 		if analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax && progress != nil {
@@ -552,9 +569,12 @@ func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit 
 		profileProperties["analysis_chunk_index"] = strconv.Itoa(analysisUnit.ChunkIndex)
 		profileProperties["analysis_chunk_count"] = strconv.Itoa(analysisUnit.ChunkCount)
 		profileProperties["analysis_context_fingerprint"] = analysisUnit.ContextFingerprint
-		if analysisUnit.Stage == AnalysisUnitStageSyntax {
+		switch {
+		case analysisUnit.Stage == AnalysisUnitStageSyntax:
 			profileProperties["analysis_scope"] = "source_batch"
-		} else {
+		case options.loaderMode == goLoaderModePackage:
+			profileProperties["analysis_scope"] = "target_packages"
+		default:
 			profileProperties["analysis_scope"] = "full_module"
 		}
 		// The typed boundary is advertised on typed streams (and echoed on a
