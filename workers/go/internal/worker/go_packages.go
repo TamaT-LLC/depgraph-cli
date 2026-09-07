@@ -789,6 +789,9 @@ func constrainedGoEnvironment(root, pathValue string) (goCommandEnvironment, err
 		"GOVCS=*:off",
 		"GOTOOLCHAIN=local",
 	}
+	if value := os.Getenv("GOMEMLIMIT"); isDecimalByteLimit(value) {
+		environment = append(environment, "GOMEMLIMIT="+value)
+	}
 	if value := os.Getenv("PATHEXT"); value != "" {
 		environment = append(environment, "PATHEXT="+value)
 	}
@@ -833,6 +836,21 @@ func safePathEnvironmentValue(root, key string) string {
 		return ""
 	}
 	return clean
+}
+
+// isDecimalByteLimit reports whether value is a GOMEMLIMIT Core would set:
+// a non-empty string of decimal digits. Size suffixes and empty values are
+// rejected so a hostile host environment cannot inject flags into `go list`.
+func isDecimalByteLimit(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func safePathListEnvironmentValues(root, key string) []string {

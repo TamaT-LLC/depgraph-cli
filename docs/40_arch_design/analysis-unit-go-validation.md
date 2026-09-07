@@ -163,6 +163,10 @@ SSA is built with `ssautil.Packages` over that declared program
 RTA/VTA require bodies on every dependency and are not attempted. After
 `ssa.Program.Build` the worker drops `Syntax` and `TypesInfo` before CHA and
 mapping, and reports `go_ssa_mapping` progress every 64 pending call sites.
+The core sets `GOMEMLIMIT` to `scan.max_worker_memory_bytes` on every Go
+worker so the runtime GCs inside the same budget the 250 ms RSS watch
+enforces; the hybrid loader forwards a decimal-byte `GOMEMLIMIT` to `go
+list` children.
 
 ### Completeness and identity
 

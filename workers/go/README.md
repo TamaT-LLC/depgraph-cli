@@ -95,7 +95,9 @@ Progress is reported at parsed-file, completed-package, completed-SSA-input,
 and SSA-mapping (every 64 pending call sites) boundaries. A single
 `go/packages` load and a single SSA program build remain atomic operations;
 after `ssa.Program.Build` the worker drops `Syntax` and `TypesInfo` before
-CHA and mapping. Profile properties record these granularity limits and
+CHA and mapping. The core sets `GOMEMLIMIT` to the per-unit worker memory
+budget so a typed or SSA load cannot allocate past that budget between RSS
+samples. Profile properties record these granularity limits and
 incomplete loads retain explicit fallback diagnostics.
 
 The typed graph is the durable boundary used by the core for resumable

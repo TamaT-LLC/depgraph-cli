@@ -1746,6 +1746,12 @@ where
         .env("GOFLAGS", "-mod=readonly")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
+    if spec.adapter == AdapterKind::Go {
+        // Soft cap the Go heap at the same budget the 250ms RSS watch enforces.
+        // A typed/SSA load can otherwise allocate many gigabytes between ticks
+        // and OOM the host before the worker-memory re-split can fire.
+        command.env("GOMEMLIMIT", config.max_worker_memory_bytes.to_string());
+    }
     if spec.adapter == AdapterKind::Rust
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
     {
