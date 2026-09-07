@@ -1080,18 +1080,31 @@ pub fn plan_analysis_split(
             .into_iter()
             .filter(|unit| unit.adapter == adapter)
             .collect::<Vec<_>>();
+        // The unit context (dependency closure, cycle sources, sizes) does not
+        // depend on the stage, so it is built once per unit and shared by
+        // every stage of the boundary.
+        let contexts = units
+            .iter()
+            .map(|unit| {
+                let group = group_by_unit.get(unit.id.as_str());
+                (
+                    unit.id.as_str(),
+                    UnitContext::build(&plan, unit, input, group, &mut limitations),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut previous_stage_ids = BTreeMap::<String, Vec<String>>::new();
         for stage_boundary in &boundary.stages {
             let mut stage_ids = BTreeMap::<String, Vec<String>>::new();
             for unit in &units {
                 let group = group_by_unit.get(unit.id.as_str());
-                let context = UnitContext::build(&plan, unit, input, group, &mut limitations);
-                let mut batches = partition(unit, stage_boundary, &input.budget, &context);
+                let context = &contexts[unit.id.as_str()];
+                let mut batches = partition(unit, stage_boundary, &input.budget, context);
                 apply_refinements(
                     unit,
                     stage_boundary,
                     input,
-                    &context,
+                    context,
                     group,
                     &mut batches,
                     &mut unsplittable_refinements,
@@ -1104,7 +1117,7 @@ pub fn plan_analysis_split(
                         unit,
                         stage_boundary,
                         &input.budget,
-                        &context,
+                        context,
                         group,
                         batch,
                         index as u64,
