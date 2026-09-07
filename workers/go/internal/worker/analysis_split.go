@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -68,7 +69,8 @@ var analysisReferenceDepths = map[string]struct{}{
 }
 
 // Validate checks the binding against the request it is attached to. Every
-// owned source path must be inside the loader scope, reference paths must be
+// owned source path must be inside the loader scope, a syntax request's
+// `files` loader must name exactly the owned paths, reference paths must be
 // disjoint from loaded paths, and `input_split` must agree with the presence
 // of reference-only inputs so an output-only split cannot pose as a bounded
 // loader.
@@ -121,6 +123,17 @@ func (binding AnalysisSplitBinding) Validate(request AnalysisUnitRequest) error 
 			return fmt.Errorf("analysis unit request source path %q is not included in split.loader.paths", sourcePath)
 		}
 	}
+	// The syntax stage parses exactly the owned files. A binding that asks it
+	// to load more than source_paths would be honoured by loading less than
+	// requested, which the contract forbids, so it is rejected up front.
+	if request.Stage == AnalysisUnitStageSyntax {
+		if loader.Kind != "files" {
+			return fmt.Errorf("analysis unit request syntax split loader kind %q is not files", loader.Kind)
+		}
+		if !slices.Equal(loader.Paths, request.SourcePaths) {
+			return fmt.Errorf("analysis unit request syntax split.loader.paths must equal source_paths")
+		}
+	}
 	if loader.InputSplit != (len(loader.ReferencePaths) > 0) {
 		return fmt.Errorf("analysis unit request split input_split does not match its reference paths")
 	}
@@ -151,18 +164,18 @@ func validateRequestRootList(field string, values []string) error {
 }
 
 // loaderScopeOutcome reports how this worker's actual loading relates to the
-// requested loader scope. Syntax requests parse exactly the requested files.
-// Typed and semantic requests still load the complete module, so a narrower
-// `package` or `files` request is honoured by loading more, never less.
+// requested loader scope. A syntax request is only valid when its `files`
+// loader names exactly `source_paths`, which is what the parser reads, so its
+// scope is applied. Typed and semantic requests still load the complete
+// module, so a narrower `package` or `files` request is honoured by loading
+// more, never less.
 func (request AnalysisUnitRequest) loaderScopeOutcome() string {
 	if request.Split == nil {
 		return ""
 	}
 	switch request.Stage {
 	case AnalysisUnitStageSyntax:
-		if request.Split.Loader.Kind == "files" {
-			return AnalysisLoaderScopeApplied
-		}
+		return AnalysisLoaderScopeApplied
 	default:
 		if request.Split.Loader.Kind == "module" || request.Split.Loader.Kind == "repository" {
 			return AnalysisLoaderScopeApplied

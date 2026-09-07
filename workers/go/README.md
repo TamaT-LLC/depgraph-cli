@@ -76,9 +76,11 @@ the existing syntax/semantic behavior.
 A request may carry the optional `split` object of the
 `depgraph-analysis-split-plan-v1` contract (see
 `docs/40_arch_design/adr-presplit-analysis-planning.md`). The worker validates
-it strictly: `loader.paths` must cover `source_paths`, `reference_paths` must be
-disjoint from loaded paths, and `input_split` must agree with the presence of
-reference-only inputs. It echoes `analysis_split_plan_id`,
+it strictly: `loader.paths` must cover `source_paths` (and, for a syntax
+request whose parser reads exactly the owned files, equal them with a `files`
+loader), `reference_paths` must be disjoint from loaded paths, and
+`input_split` must agree with the presence of reference-only inputs. It echoes
+`analysis_split_plan_id`,
 `analysis_execution_unit_id`, `analysis_split_kind`, `analysis_loader_kind`,
 `analysis_loader_input_split`, and `analysis_loader_scope` (`applied` when the
 worker loaded exactly the requested loader scope, `widened` when it loaded the
