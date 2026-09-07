@@ -176,6 +176,18 @@ func (request AnalysisUnitRequest) stagedBodies() bool {
 	return request.packageScoped() && request.Stage == AnalysisUnitStageSemantic && request.Split.SplitKind == "staged_bodies"
 }
 
+// declarationStage reports whether this typed request is the declaration
+// stage of a package-scoped plan. Such a request type-checks the declarations
+// of its target packages with every function body stripped: the typed
+// checkpoint then holds the package's types, signatures, and implements
+// relations, while the body-derived value references and calls are emitted by
+// the semantic units that own the files. Types and bodies of a large package
+// are never held together, and no body is type-checked by two units of the
+// same scan.
+func (request AnalysisUnitRequest) declarationStage() bool {
+	return request.packageScoped() && request.Stage == AnalysisUnitStageTyped
+}
+
 // scanOptions maps the negotiated split binding onto the loader selection. A
 // `package` binding on a typed or semantic request selects the hybrid loader
 // for the bound package roots; every other binding, a legacy request, and an
@@ -192,7 +204,10 @@ func (request AnalysisUnitRequest) scanOptions(buildCacheDir string) scanOptions
 	for _, root := range request.Split.Loader.PackageRoots {
 		options.loaderTargets = append(options.loaderTargets, goLoaderTargetSpec{Dir: root})
 	}
-	if request.stagedBodies() {
+	switch {
+	case request.declarationStage():
+		options.bodyPaths = map[string]bool{}
+	case request.stagedBodies():
 		options.bodyPaths = make(map[string]bool, len(request.SourcePaths))
 		for _, sourcePath := range request.SourcePaths {
 			options.bodyPaths[sourcePath] = true

@@ -57,8 +57,21 @@ func TestPackageLoaderBindingRelaxesTypedChunking(t *testing.T) {
 		t.Fatalf("package-bound typed chunk was rejected: %v", err)
 	}
 	options := request.scanOptions("")
-	if options.loaderMode != goLoaderModePackage || len(options.loaderTargets) != 1 || options.loaderTargets[0].Dir != "use" || options.bodyPaths != nil {
+	if options.loaderMode != goLoaderModePackage || len(options.loaderTargets) != 1 || options.loaderTargets[0].Dir != "use" {
 		t.Fatalf("scanOptions = %+v", options)
+	}
+	// The package-bound typed stage is the declaration stage: every body of
+	// the target package is stripped, so the typed checkpoint never holds
+	// types and bodies together and the semantic units own every body.
+	if options.bodyPaths == nil || len(options.bodyPaths) != 0 {
+		t.Fatalf("typed declaration stage bodyPaths = %v, want an empty set", options.bodyPaths)
+	}
+	semanticWhole := request
+	semanticWhole.Stage = AnalysisUnitStageSemantic
+	semanticWhole.ChunkIndex, semanticWhole.ChunkCount = 0, 1
+	semanticWhole.Split.SplitKind = "whole"
+	if options := semanticWhole.scanOptions(""); options.bodyPaths != nil {
+		t.Fatalf("whole package-bound semantic chunk staged bodies: %+v", options)
 	}
 
 	unbound := request
