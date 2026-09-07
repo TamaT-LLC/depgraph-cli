@@ -189,7 +189,7 @@ func TestGoSSAVTAConstructionAndSelectionFailClosed(t *testing.T) {
 	rtaIndex.sites[key] = true
 	pending := goSemanticPendingCall{context: &goSemanticPackage{typed: goTypedPackage{Name: "main"}}}
 	algorithm, reason, fallback, _ := (*goSemanticExtractor)(nil).selectGoSSAIndex(
-		pending, key, true, newGoSSAGraphIndex(), rtaIndex, true, newGoSSAGraphIndex(),
+		pending, key, goSSAProgramScopeWholeProgram, true, newGoSSAGraphIndex(), rtaIndex, true, newGoSSAGraphIndex(),
 		"vta_construction_failed_fallback",
 	)
 	if algorithm != "rta" || reason != "main_or_test_program" || fallback != "vta_construction_failed_fallback" {
@@ -197,11 +197,20 @@ func TestGoSSAVTAConstructionAndSelectionFailClosed(t *testing.T) {
 	}
 	evidence := goSSACandidateEvidence(goSemanticPendingCall{evidence: []Evidence{{
 		Kind: "semantic", Properties: map[string]any{"dispatch": "interface"},
-	}}}, algorithm, reason, fallback, 2, true)
+	}}}, algorithm, reason, fallback, goSSAProgramScopeWholeProgram, 2, true)
 	if len(evidence) != 1 || evidence[0].Properties["requested_algorithm"] != "vta" ||
 		evidence[0].Properties["algorithm"] != "rta" || evidence[0].Properties["fallback_reason"] != fallback ||
-		evidence[0].Properties["candidate_count"] != 2 {
+		evidence[0].Properties["candidate_count"] != 2 || evidence[0].Properties["program_scope"] != "whole-program" {
 		t.Fatalf("VTA fallback evidence is incomplete: %+v", evidence)
+	}
+	// A declared package scope never selects RTA, even for a main package
+	// with a reachable RTA site and even when VTA was requested.
+	algorithm, reason, fallback, _ = (*goSemanticExtractor)(nil).selectGoSSAIndex(
+		pending, key, goSSAProgramScopePackage, false, newGoSSAGraphIndex(), rtaIndex, true, newGoSSAGraphIndex(),
+		"vta_package_scope_fallback",
+	)
+	if algorithm != "cha" || reason != "package_scope_declaration_deps" || fallback != "vta_package_scope_fallback" {
+		t.Fatalf("package-scope selection = (%q, %q, %q), want CHA with declared scope", algorithm, reason, fallback)
 	}
 	state := &scannerState{profile: Profile{Properties: map[string]string{}}}
 	extractor := &goSemanticExtractor{state: state}
@@ -921,9 +930,15 @@ func ssaTestRequireCandidateContract(t *testing.T, result Result, site Site, alg
 	if got, _ := primary.Properties["fallback_reason"].(string); got != wantFallback {
 		t.Fatalf("candidate fallback reason = %q, want %q: %+v", got, wantFallback, primary)
 	}
+	// Unit scans key site identities on the stage-level logical profile so
+	// every chunk of a stage shares them; legacy scans use the profile itself.
+	identityProfileID := site.ProfileID
+	if logical := result.Profile.Properties["analysis_logical_profile_id"]; logical != "" {
+		identityProfileID = logical
+	}
 	wantSiteID := semanticCanonicalValueID("site", map[string]any{
 		"condition": site.Condition, "kind": "call", "path": primary.Path,
-		"profile_id": site.ProfileID, "source": site.Source,
+		"profile_id": identityProfileID, "source": site.Source,
 		"span": map[string]any{
 			"start_line": primary.StartLine, "start_column": primary.StartColumn,
 			"end_line": primary.EndLine, "end_column": primary.EndColumn,
