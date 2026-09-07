@@ -294,6 +294,11 @@ enum Task {
     Test,
     GoSemanticE2e,
     ResumableAnalysisE2e,
+    /// Generate the public fan-out and 1,024-file Go fixtures, prove the
+    /// module-loader control fails at a reduced per-unit memory limit while
+    /// the package-bounded path completes under the same limit with the same
+    /// canonical graph, and print the per-unit loader table.
+    GoLoaderScopeE2e,
     /// Generate the public over-limit health fixture, prove the whole-snapshot
     /// path exhausts the single budget while the ranged path completes under
     /// the same per-range limit, and check the CLI envelope on the store.
@@ -926,6 +931,7 @@ fn main() -> Result<()> {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
         }
         Task::ResumableAnalysisE2e => resumable_analysis_e2e(),
+        Task::GoLoaderScopeE2e => go_loader_scope_e2e(),
         Task::HealthRangeE2e => health_range_e2e(),
         Task::RustSemanticE2e => {
             rust_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
@@ -1125,6 +1131,7 @@ fn test() -> Result<()> {
         .arg("test")
         .current_dir("workers/web"))?;
     resumable_analysis_e2e()?;
+    go_loader_scope_e2e()?;
     health_range_e2e()?;
     Ok(())
 }
@@ -1140,6 +1147,65 @@ fn resumable_analysis_e2e() -> Result<()> {
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
         .env("DEPGRAPH_BIN", cli))
+}
+
+/// Go loader-scope evidence (#463): the module-loader control must fail the
+/// 1,024-file package at the reduced per-unit memory limit while the
+/// package-bounded path completes under the unchanged limit with the same
+/// canonical graph, replays every staged batch on resume, and never
+/// type-checks a body twice within a stage.
+///
+/// Set `DEPGRAPH_GO_LOADER_SCOPE_REPORT` to retain the per-unit report.
+fn go_loader_scope_e2e() -> Result<()> {
+    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    build_non_rust_workers()?;
+    let target_dir = cargo_target_dir();
+    let cli = workspace_root()
+        .join(target_dir)
+        .join("debug")
+        .join(executable_name("depgraph"));
+    let report_path = std::env::var_os("DEPGRAPH_GO_LOADER_SCOPE_REPORT").map(PathBuf::from);
+    if let Some(parent) = report_path.as_ref().and_then(|path| path.parent()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut command = Command::new("node");
+    command
+        .arg("scripts/go-loader-scope-e2e.mjs")
+        .env("DEPGRAPH_BIN", cli);
+    if let Some(ref report_path) = report_path {
+        command.env("DEPGRAPH_GO_LOADER_SCOPE_REPORT", report_path);
+    }
+    let result = run(&mut command);
+    if result.is_err() {
+        write_go_loader_scope_fallback_report(report_path.as_deref())?;
+    }
+    result
+}
+
+/// Keep a CI artifact when the node runner dies before its `finally` block
+/// writes the per-unit table.
+fn write_go_loader_scope_fallback_report(report_path: Option<&Path>) -> Result<()> {
+    let Some(report_path) = report_path else {
+        return Ok(());
+    };
+    if report_path.exists() {
+        return Ok(());
+    }
+    let report = json!({
+        "contract_version": "depgraph-go-loader-scope-e2e-v1",
+        "passed": false,
+        "failure": "go-loader-scope-e2e runner produced no report",
+        "units": [],
+    });
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        report_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )
+    .with_context(|| format!("failed to write {}", report_path.display()))?;
+    Ok(())
 }
 
 /// Health range evidence (#467): the public over-limit fixture must exhaust
@@ -5395,6 +5461,7 @@ mod tests {
         verify_pinned_rust_sysroot_digest, verify_release_checksum_name, verify_release_tag_values,
         verify_rust_backend, verify_stable_release_source_guard, verify_web_semantic_attestation,
         web_semantic_from_handshake, without_windows_verbatim_prefix, workspace_root,
+        write_go_loader_scope_fallback_report,
     };
 
     fn post_publish_evidence_fixture(
@@ -8395,6 +8462,32 @@ jobs:
         let silent = HealthRangeStep::run(std::process::Command::new("true"), Some(&missing))?;
         let failure = silent.failure().expect("a missing report is a failure");
         assert!(failure.contains("no readable report"), "{failure}");
+        Ok(())
+    }
+
+    #[test]
+    fn go_loader_scope_gate_writes_a_report_when_the_runner_leaves_none() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = temp
+            .path()
+            .join("nested")
+            .join("go-loader-scope-report.json");
+        write_go_loader_scope_fallback_report(Some(&missing))?;
+        let report: Value = serde_json::from_slice(&fs::read(&missing)?)?;
+        assert_eq!(
+            report["contract_version"],
+            json!("depgraph-go-loader-scope-e2e-v1")
+        );
+        assert_eq!(report["passed"], json!(false));
+        assert!(
+            report["failure"]
+                .as_str()
+                .is_some_and(|failure| failure.contains("produced no report"))
+        );
+        write_go_loader_scope_fallback_report(Some(&missing))?;
+        let again: Value = serde_json::from_slice(&fs::read(&missing)?)?;
+        assert_eq!(again, report);
+        write_go_loader_scope_fallback_report(None)?;
         Ok(())
     }
 }
