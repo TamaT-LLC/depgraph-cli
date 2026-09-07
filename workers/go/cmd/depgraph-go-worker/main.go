@@ -91,7 +91,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	var result worker.Result
 	if analysisUnit != nil {
-		result, err = worker.ScanWithAnalysisUnitProgress(absRoot, inventoryPath, *analysisUnit, func(phase, status string, items int) {
+		// The scan-scoped Go build cache is a process input from the core; it
+		// is validated by the loader (absolute, outside the scan root) and
+		// only consulted by package-scoped typed/semantic requests.
+		options := worker.AnalysisUnitScanOptions{BuildCacheDir: os.Getenv("DEPGRAPH_GO_BUILD_CACHE")}
+		result, err = worker.ScanWithAnalysisUnitOptions(absRoot, inventoryPath, *analysisUnit, options, func(phase, status string, items int) {
 			fmt.Fprintf(stderr, "depgraph-progress phase=%s status=%s items=%d\n", phase, status, items)
 		})
 	} else if inventoryPath == "" {

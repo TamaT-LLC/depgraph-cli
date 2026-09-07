@@ -291,6 +291,24 @@ func ScanWithAnalysisUnit(root string, inventoryFile string, request AnalysisUni
 // progress callback for the core scheduler's bounded idle deadline. Progress
 // is emitted only at parser, typed-load, and SSA work boundaries.
 func ScanWithAnalysisUnitProgress(root string, inventoryFile string, request AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
+	return ScanWithAnalysisUnitOptions(root, inventoryFile, request, AnalysisUnitScanOptions{}, progress)
+}
+
+// AnalysisUnitScanOptions carries process-level inputs the core supplies
+// outside the request contract.
+type AnalysisUnitScanOptions struct {
+	// BuildCacheDir is the scan-scoped Go build cache shared by every
+	// package-scoped unit of one scan (DEPGRAPH_GO_BUILD_CACHE). It must be an
+	// absolute directory outside the scan root; empty keeps the historical
+	// invocation-private cache.
+	BuildCacheDir string
+}
+
+// ScanWithAnalysisUnitOptions is ScanWithAnalysisUnitProgress with the
+// process-level options. The request's split binding selects the loader: a
+// `package` binding on a typed or semantic request runs the hybrid loader for
+// the bound package roots, everything else keeps the module-whole-program path.
+func ScanWithAnalysisUnitOptions(root string, inventoryFile string, request AnalysisUnitRequest, scanOptions AnalysisUnitScanOptions, progress AnalysisProgressFunc) (Result, error) {
 	if err := request.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -303,21 +321,25 @@ func ScanWithAnalysisUnitProgress(root string, inventoryFile string, request Ana
 			return Result{}, err
 		}
 	}
-	return scanWithProgress(root, inventory, &request, progress)
+	return scanWithOptions(root, inventory, &request, progress, request.scanOptions(scanOptions.BuildCacheDir))
 }
 
 func scan(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest) (Result, error) {
 	return scanWithProgress(root, inventory, analysisUnit, nil)
 }
 
-// scanOptions selects worker-internal loader behaviour that the analysis-unit
-// request contract does not carry yet. The zero value keeps the historical
-// module-whole-program path; package mode runs the hybrid loader of
-// go_loader.go for the listed target package directories.
+// scanOptions selects the worker-internal loader behaviour derived from the
+// request's split binding and the process environment. The zero value keeps
+// the historical module-whole-program path; package mode runs the hybrid
+// loader of go_loader.go for the listed target package directories.
 type scanOptions struct {
 	loaderMode    goLoaderMode
 	loaderTargets []goLoaderTargetSpec
 	buildCacheDir string
+	// bodyPaths, when non-nil, lists the repository-relative target files
+	// whose function bodies are type-checked and built into SSA; every other
+	// target file contributes declarations only (staged bodies).
+	bodyPaths map[string]bool
 }
 
 func scanWithProgress(root string, inventory *repositoryInventory, analysisUnit *AnalysisUnitRequest, progress AnalysisProgressFunc) (Result, error) {
@@ -520,7 +542,7 @@ func scanWithOptions(root string, inventory *repositoryInventory, analysisUnit *
 		}
 		switch {
 		case options.loaderMode == goLoaderModePackage:
-			goPackages = loadGoPackagesInventoryPackageScope(absRoot, modules, options.loaderTargets, goPackagesWork, configuredTags, options.buildCacheDir, progress)
+			goPackages = loadGoPackagesInventoryPackageScope(absRoot, modules, options.loaderTargets, options.bodyPaths, goPackagesWork, configuredTags, options.buildCacheDir, progress)
 		case analysisUnit != nil && analysisUnit.Stage != AnalysisUnitStageSyntax:
 			goPackages = loadGoPackagesInventoryForModulesProgress(absRoot, loadModules, modules, goPackagesWork, configuredTags, progress)
 		default:
@@ -585,7 +607,7 @@ func scanWithOptions(root string, inventory *repositoryInventory, analysisUnit *
 			(analysisUnit.Stage == AnalysisUnitStageTyped || analysisUnit.Stage == AnalysisUnitStageSemantic) {
 			profileProperties["go_typed_stage_complete"] = "false"
 		}
-		for key, value := range analysisUnit.splitProfileProperties() {
+		for key, value := range analysisUnit.splitProfileProperties(analysisUnit.loaderScopeOutcome(options.loaderMode, goPackages)) {
 			profileProperties[key] = value
 		}
 	}
