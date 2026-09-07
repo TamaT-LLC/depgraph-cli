@@ -17,16 +17,18 @@ const (
 	AnalysisUnitTypedCapability = "analysis-unit-typed-v1"
 )
 
-// AnalysisUnitCapabilities is kept in the order required by the worker
-// handshake. The source-batch capability remains available to older cores,
-// the typed capability opts a v2 scheduler into the typed checkpoint
-// boundary, and the loader-scope pair lets a pre-split planner bind typed and
-// semantic requests to the package-scoped hybrid loader of go_loader.go.
+// AnalysisUnitCapabilities is kept in the strictly ascending order the core
+// handshake parser requires; an unsorted list is rejected as a whole and the
+// core falls back to the repository-wide worker. The source-batch capability
+// remains available to older cores, the typed capability opts a v2 scheduler
+// into the typed checkpoint boundary, and the loader-scope pair lets a
+// pre-split planner bind typed and semantic requests to the package-scoped
+// hybrid loader of go_loader.go.
 var AnalysisUnitCapabilities = []string{
+	AnalysisGoPackageLoaderCapability,
+	AnalysisLoaderScopeCapability,
 	AnalysisUnitCapability,
 	AnalysisUnitTypedCapability,
-	AnalysisLoaderScopeCapability,
-	AnalysisGoPackageLoaderCapability,
 }
 
 type Condition struct {

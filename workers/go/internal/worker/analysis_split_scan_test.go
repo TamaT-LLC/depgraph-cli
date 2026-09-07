@@ -10,13 +10,24 @@ import (
 
 func TestAnalysisUnitCapabilitiesAdvertiseThePackageLoader(t *testing.T) {
 	want := []string{
+		AnalysisGoPackageLoaderCapability,
+		AnalysisLoaderScopeCapability,
 		AnalysisUnitCapability,
 		AnalysisUnitTypedCapability,
-		AnalysisLoaderScopeCapability,
-		AnalysisGoPackageLoaderCapability,
 	}
 	if !reflect.DeepEqual(AnalysisUnitCapabilities, want) {
 		t.Fatalf("AnalysisUnitCapabilities = %v, want %v", AnalysisUnitCapabilities, want)
+	}
+	// The core handshake parser rejects the whole list unless it is strictly
+	// ascending, which would silently demote every scan to the repository
+	// worker.
+	if !sort.StringsAreSorted(AnalysisUnitCapabilities) {
+		t.Fatalf("AnalysisUnitCapabilities = %v are not sorted", AnalysisUnitCapabilities)
+	}
+	for index := 1; index < len(AnalysisUnitCapabilities); index++ {
+		if AnalysisUnitCapabilities[index-1] == AnalysisUnitCapabilities[index] {
+			t.Fatalf("AnalysisUnitCapabilities repeat %q", AnalysisUnitCapabilities[index])
+		}
 	}
 }
 
