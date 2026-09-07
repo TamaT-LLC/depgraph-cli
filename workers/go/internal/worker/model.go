@@ -19,11 +19,14 @@ const (
 
 // AnalysisUnitCapabilities is kept in the order required by the worker
 // handshake. The source-batch capability remains available to older cores,
-// while the typed capability opts a v2 scheduler into the typed checkpoint
-// boundary.
+// the typed capability opts a v2 scheduler into the typed checkpoint
+// boundary, and the loader-scope pair lets a pre-split planner bind typed and
+// semantic requests to the package-scoped hybrid loader of go_loader.go.
 var AnalysisUnitCapabilities = []string{
 	AnalysisUnitCapability,
 	AnalysisUnitTypedCapability,
+	AnalysisLoaderScopeCapability,
+	AnalysisGoPackageLoaderCapability,
 }
 
 type Condition struct {
