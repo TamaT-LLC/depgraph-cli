@@ -11,6 +11,23 @@ fingerprints used for conservative invalidation. The core planner remains the
 semantic authority for cross-field identity, path, and graph checks; workers
 must verify effective inputs before reusing a semantic checkpoint.
 
+`depgraph-analysis-split-plan-v1.schema.json` is the closed pre-split planning
+contract built on top of a discovery plan. It describes, before any worker
+starts, every execution unit's ownership scope (files whose results it may
+emit), loader scope (files its compiler or loader actually reads, with
+`input_split` distinguishing a bounded loader from an output-only batch),
+reference-only inputs and their depth, per-stage work estimate, individual
+budget, split reasons, prerequisites, the parallelism decision (waves), the
+budget and adapter boundaries the plan was derived from, the ordered
+refinement history, and the re-split result (`AnalysisResplitPlan`) that maps
+saved execution-unit results to `retained`, `superseded`, or `replacement`.
+The request-level projection a worker receives is the `split` object of a
+`depgraph-analysis-unit-v2` request (`$defs/splitBinding`). The core planner in
+`crates/depgraph-core/src/analysis_split.rs` is the semantic authority; the
+public fixture under `fixtures/analysis-split-plan-v1` and
+`crates/depgraph-core/tests/analysis_split_contract.rs` are its evidence. See
+`docs/40_arch_design/adr-presplit-analysis-planning.md`.
+
 `agent-dogfood-report-v1.schema.json` is the closed JSON Schema 2020-12
 contract for the packaged MCP real-Agent comparison. It binds the public
 release and compiler-pack digests, fixed repository commits and snapshots,
