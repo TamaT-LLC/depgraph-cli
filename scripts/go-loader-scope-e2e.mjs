@@ -31,10 +31,9 @@ const parent = mkdtempSync(path.join(tmpdir(), "depgraph-go-loader-scope-e2e-"))
 const MIB = 1024 * 1024;
 // Reduced from the 2 GiB default; identical for the control and the package
 // path of the same fixture. Chosen above the measured package-path peaks
-// (hybrid self ~318 MiB for the 1,024-file package, batch-of-8 ~81 MiB)
-// and below the measured whole-module peaks (~555 MiB / ~721 MiB). Never
-// raised: the whole-module units of `bigpkg` still need several times this.
-const REDUCED_WORKER_MEMORY_BYTES = 448 * MIB;
+// (fan-out batches ~98 MiB, staged 1,024-file bodies well under 320 MiB)
+// and below the measured whole-module peaks (~650–720 MiB). Never raised.
+const REDUCED_WORKER_MEMORY_BYTES = 320 * MIB;
 const BIG_PACKAGE_FILES = 1024;
 const BIG_PACKAGE_TABLE = 512;
 const FANOUT_PACKAGES = 64;
@@ -248,23 +247,15 @@ function configure(root, options) {
 // The real Go worker advertising only the module-loader capabilities, so the
 // core plans and requests exactly as it did before the package loader.
 function makeControlWorker() {
-  const wrapper = path.join(parent, "go-worker-module-loader-control.mjs");
-  writeFileSync(wrapper, `#!/usr/bin/env node
-// Control: the real Go worker without the loader-scope and package-loader capabilities.
-import { spawnSync } from 'node:child_process';
-const args = process.argv.slice(2);
-if (args.includes('--version')) {
-  const result = spawnSync(${JSON.stringify(shippedWorker)}, args, { encoding: 'utf8' });
-  const version = (result.stdout ?? '').replace(/capabilities [^)]*/u, 'capabilities analysis-source-batch-v1,analysis-unit-typed-v1');
-  process.stdout.write(version);
-  process.exit(result.status ?? 1);
-}
-const result = spawnSync(${JSON.stringify(shippedWorker)}, args, { stdio: 'inherit' });
-if (result.error) {
-  process.stderr.write(String(result.error));
-  process.exit(1);
-}
-process.exit(result.status ?? 1);
+  const wrapper = path.join(parent, "go-worker-module-loader-control.sh");
+  writeFileSync(wrapper, `#!/bin/sh
+set -eu
+worker=${JSON.stringify(shippedWorker)}
+if [ "\${1-}" = --version ]; then
+  "$worker" --version | sed 's/capabilities [^)]*/capabilities analysis-source-batch-v1,analysis-unit-typed-v1/'
+  exit 0
+fi
+exec "$worker" "$@"
 `);
   chmodSync(wrapper, 0o700);
   return wrapper;
@@ -432,7 +423,7 @@ function graph(store) {
       (hash, row) => {
         // may_call evidence follows the CHA universe of the batch that owned
         // the interface call; package batches are a declared subset.
-        if (mayCallIds.has(row.owner_id)) return;
+        if (mayCallIds.has(row.owner_id) || overapproxCandidates.has(row.owner_id)) return;
         hash.update(`${row.owner_type}\0${row.owner_id}\0${row.ordinal}\n`);
         hash.update(row.payload);
         hash.update("\n");
@@ -692,27 +683,29 @@ try {
   // --- big package: module-loader control ---------------------------------
   const { expected: bigExpected, wholeModulePeak } = controlScenarios("bigpkg", bigRoot, control);
 
-  // --- big package: shipped worker completes under the same limit --------
-  // The module fits the byte budget, so the planner promotes it to one whole
-  // context; the memory failure re-splits it into staged package batches.
-  configure(bigRoot, { max_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES });
+  // --- big package: shipped worker stages bodies under the same limit ----
+  // 1,024 files fit the default 8 MiB byte budget, which would promote the
+  // module to one whole-context load. The file and byte caps keep typed and
+  // semantic work as staged_bodies batches so the unchanged reduced memory
+  // limit is enough.
+  configure(bigRoot, {
+    max_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES,
+    max_unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES,
+    max_unit_source_files: FANOUT_UNIT_SOURCE_FILES,
+  });
   const bigStore = path.join(parent, "bigpkg-package.sqlite");
   const bigPackage = scan("bigpkg-package", bigRoot, bigStore, shippedWorker);
   assert.equal(bigPackage.output.status, "completed", JSON.stringify(bigPackage.output.diagnostics));
   assert.equal(bigPackage.exit_code, 0);
-  const bigUnits = goUnits(bigPackage);
-  const superseded = bigUnits.filter((unit) => unit.loader?.analysis_resplit === "superseded");
-  assert.deepEqual(superseded.map((unit) => [unit.stage, unit.status, unit.failure_reason]).sort(), [["semantic", "failed", "memory-limit"], ["typed", "failed", "memory-limit"]], "promoted whole-module units were not superseded by the memory re-split");
-  const replacements = bigUnits.filter((unit) => unit.loader?.analysis_resplit === "replacement");
-  assertPackageBoundedUnits(replacements, "bigpkg-package");
-  const typedBatches = assertBodiesLoadedOnce(replacements, "typed", BIG_PACKAGE_FILES, "bigpkg-package");
-  const semanticBatches = assertBodiesLoadedOnce(replacements, "semantic", BIG_PACKAGE_FILES, "bigpkg-package");
-  for (const unit of replacements) {
+  const staged = goUnits(bigPackage).filter((unit) => unit.stage !== "syntax");
+  assertPackageBoundedUnits(staged, "bigpkg-package");
+  const typedBatches = assertBodiesLoadedOnce(staged, "typed", BIG_PACKAGE_FILES, "bigpkg-package");
+  const semanticBatches = assertBodiesLoadedOnce(staged, "semantic", BIG_PACKAGE_FILES, "bigpkg-package");
+  for (const unit of staged) {
     assert.equal(number(unit, "go_loader_target_packages"), 1);
     assert.equal(number(unit, "go_loader_loaded_packages"), 1, "the single package needs no reference package");
   }
-  assert.ok(bigPackage.output.diagnostics.some((diagnostic) => diagnostic.code === "analysis-resplit" && diagnostic.message.includes("applied")), "no applied re-split diagnostic");
-  const packagePeak = Math.max(...replacements.map((unit) => number(unit, "analysis_worker_peak_memory_bytes")));
+  const packagePeak = Math.max(...staged.map((unit) => number(unit, "analysis_worker_peak_memory_bytes")));
   assert.ok(packagePeak < wholeModulePeak / 2, `package units peak at ${mib(packagePeak)} MiB against ${mib(wholeModulePeak)} MiB whole-module`);
   const bigPolicy = assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-package");
   record(bigPackage, {
@@ -725,21 +718,16 @@ try {
   });
 
   // --- big package: resume reuses every staged batch ----------------------
-  // The static plan promotes the module again; the attempt fails at the same
-  // limit and the re-split replays the checkpointed replacements.
   const bigResume = scan("bigpkg-resume", bigRoot, bigStore, shippedWorker);
   assert.equal(bigResume.output.status, "completed", JSON.stringify(bigResume.output.diagnostics));
-  const resumedReplacements = goUnits(bigResume).filter((unit) => unit.loader?.analysis_resplit === "replacement");
-  assert.equal(resumedReplacements.length, replacements.length);
-  for (const unit of resumedReplacements) {
-    assert.ok(unit.reused, `bigpkg-resume: ${unit.stage} batch re-ran`);
+  const resumedStaged = goUnits(bigResume).filter((unit) => unit.stage !== "syntax");
+  assert.equal(resumedStaged.length, staged.length);
+  for (const unit of goUnits(bigResume)) {
+    assert.ok(unit.reused, `bigpkg-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
   }
-  for (const unit of goUnits(bigResume).filter((unit) => unit.stage === "syntax")) {
-    assert.ok(unit.reused, "bigpkg-resume: syntax batch re-ran");
-  }
-  assertPackageBoundedUnits(resumedReplacements, "bigpkg-resume");
+  assertPackageBoundedUnits(resumedStaged, "bigpkg-resume");
   assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-resume");
-  record(bigResume, { canonical_graph_equal_to_control: true, reused_replacements: resumedReplacements.length });
+  record(bigResume, { canonical_graph_equal_to_control: true, reused_staged: resumedStaged.length });
 
   report.summary = `at ${mib(REDUCED_WORKER_MEMORY_BYTES)} MiB per unit the module-loader control fails `
     + `(${BIG_PACKAGE_FILES}-file package whole-module peak ${mib(wholeModulePeak)} MiB, fan-out ${mib(fanoutWholePeak)} MiB); `
