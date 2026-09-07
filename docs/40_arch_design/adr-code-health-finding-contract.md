@@ -262,23 +262,29 @@ identically in every range layout. Layered inputs keep the whole-snapshot path
 (`execution.mode = "whole_snapshot"`) so overlay semantics stay exactly as
 before.
 
-Per-range results are checkpoints, not contract state. The checkpoint key is
-the plan digest, the range's first and last subject IDs, the shared-context
-digest, the analyzer version, and the finding-contract version; a foreign or
-stale key is a miss, an unwritable checkpoint directory degrades to no
-checkpoints, and reuse never changes a finding, fingerprint, or collection
-digest. Resume therefore reuses completed ranges and recomputes the rest.
+Per-range results are checkpoints, not contract state. They live next to the
+store in `.depgraph/health-range-checkpoints-v1/<sha256(store file name)>/`,
+one JSON file per range, each bounded by `MAX_HEALTH_RANGE_CHECKPOINT_BYTES`
+(64 MiB) with the directory pruned oldest-first beyond 4,096 files or eight
+times that size; the store schema is unchanged. The checkpoint key is the plan
+digest, the range's first and last subject IDs, the shared-context digest, the
+analyzer version, and the finding-contract version; a foreign or stale key is a
+miss, an unwritable checkpoint directory degrades to no checkpoints, and reuse
+never changes a finding, fingerprint, or collection digest. Resume therefore
+reuses completed ranges and recomputes the rest.
 
 Ranges that fail after the maximum re-split depth, or ranges left unanalysed by
 cancellation, make the collection fail closed with `RESOURCE_EXHAUSTED` /
 `CANCELLED`. The opt-in partial view (`--allow-partial`,
 `allow_partial_ranges`) returns the findings of the completed ranges instead:
 every finding carries an `incomplete-coverage` blocker naming the unanalysed
-range count, confidence is `indeterminate`, `partial` is `true`, and the
-collection identity gains `partial_ranges` (`ranges:<done>/<total>
-failed:<n> interrupted:<n>`) so the digest can never equal a complete
-collection's digest. Once the missing ranges complete, the findings converge to
-the complete result.
+range count, confidence is `indeterminate`, the result's `partial_ranges`
+flag is `true`, and the collection identity gains `partial_ranges`
+(`ranges:<done>/<total> failed:<n> interrupted:<n>`) so the digest can never
+equal a complete collection's digest. The flag is distinct from the `attempt:`
+partial-result envelope (`depgraph-partial-result-v1`), which describes
+unanalysed scan units; both can be present at once. Once the missing ranges
+complete, the findings converge to the complete result.
 
 `execution` is reported on the CLI JSON envelopes of `health`, `health list`,
 and `cleanup`, and on `health_summary_get` / `health_findings_list`:

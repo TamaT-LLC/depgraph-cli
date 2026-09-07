@@ -1214,7 +1214,7 @@ fn health_range_e2e() -> Result<()> {
     expect("/comparison/ranges_max_within_limit", json!(true))?;
     expect("/comparison/every_range_completed", json!(true))?;
     expect("/comparison/checkpoints_reused_on_resume", json!(true))?;
-    expect("/ranged/partial", json!(false))?;
+    expect("/ranged/partial_ranges", json!(false))?;
     let work_limit = runner["whole_snapshot_work_limit"]
         .as_u64()
         .context("runner report lacks whole_snapshot_work_limit")?;
@@ -1255,7 +1255,7 @@ fn health_range_e2e() -> Result<()> {
     let envelope: Value = serde_json::from_slice(&output.stdout)
         .context("depgraph health --json did not print a JSON envelope")?;
     let data = &envelope["data"];
-    if data["execution"]["mode"] != json!("ranged") || data["partial"] != json!(false) {
+    if data["execution"]["mode"] != json!("ranged") || data["partial_ranges"] != json!(false) {
         bail!("depgraph health --json did not report a complete ranged execution: {data}");
     }
     if data["counts_by_kind"] != runner["ranged"]["findings"]["by_kind"] {

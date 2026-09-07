@@ -68,7 +68,9 @@ pub struct CliHealthSummaryView<'a> {
     pub coverage: &'a depgraph_core::service::HealthCoverageOverview,
     /// `true` only with `--allow-partial` when some health ranges did not
     /// complete; every finding then carries an incomplete_coverage blocker.
-    pub partial: bool,
+    /// Distinct from the envelope's `partial` object, which describes an
+    /// `attempt:` input whose scan units are incomplete.
+    pub partial_ranges: bool,
     /// Range plan, per-phase work, checkpoint reuse, and peak memory.
     pub execution: &'a depgraph_core::health::ranged::HealthRangeDiagnostics,
 }
@@ -89,7 +91,7 @@ pub struct CliHealthListView<'a> {
     pub scan_id: &'a str,
     pub collection_digest: &'a str,
     pub findings: &'a [HealthFinding],
-    pub partial: bool,
+    pub partial_ranges: bool,
     pub execution: &'a depgraph_core::health::ranged::HealthRangeDiagnostics,
 }
 

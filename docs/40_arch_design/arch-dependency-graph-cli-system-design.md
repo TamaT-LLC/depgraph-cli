@@ -2020,7 +2020,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
   plain入力（単一scan層）は`Store::resolve_health_input`と`Store::health_range_plan`が集計値だけで対象IDをrangeへ切り、range毎の読み込み・index構築・解析を従来どおりの1,000,000 step budgetで実行し、超過rangeは中央値で最大4回再分割する。
   cross-range参照は対象rangeへinbound row全部を読み込むことで保証し、profile / condition / evidence / missing-profile / coverage / layer意味論はsnapshot全体で共有するcontextから同一に付与する。層のある入力（build delta / runtime session / semantic no-op）はwhole-snapshot経路を維持する。
   range結果はplan digest・range境界・context digest・analyzer/contract versionで鍵付けしたcheckpointとして保存し、中断後の再実行は完了rangeを再利用する。未解析rangeが残る場合はfail closedし、`--allow-partial` / `allow_partial_ranges`のopt-in partial viewだけが完了range分を`incomplete-coverage` blocker付き`indeterminate`で返し、collection digestは完全結果と一致しない。
-  CLI/MCPは`execution`（mode / ranges / work / checkpoints）と`partial`を出力する。公開synthetic fixture（`cargo xtask health-range-e2e`）でwhole-snapshot経路が`resource_exhausted`となる一方、ranged経路が4 range（最大433,340 step）で同一findingを完了することをCIで記録する。
+  CLI/MCPは`execution`（mode / ranges / work / checkpoints）と`partial_ranges`を出力する。公開synthetic fixture（`cargo xtask health-range-e2e`）でwhole-snapshot経路が`resource_exhausted`となる一方、ranged経路が4 range（最大433,340 step）で同一findingを完了することをCIで記録する。
 - 2026-09-03: unused-code以外のfindingを`probable`上限に統一した。
   `confirmed`は、適用対象profileすべてで未使用と証明できたfindingだけに限定する。
   health analyzerを`1.0.3`へ更新し、旧analyzerのsnapshotとのaudit比較は`incomparable-contract`でfail closedする。

@@ -149,7 +149,7 @@ checkout on 2026-09-07 with a debug build:
 | --- | --- | ---: | ---: |
 | Whole snapshot, unchanged 1,000,000 budget | `resource_exhausted` | > 1,000,000 | 1,739,456 KiB after load and control |
 | Whole snapshot, unbounded control | completed, 72 unused findings | 1,861,274 | (same process) |
-| Ranged service path, production limits | completed, 72 identical findings, `partial: false` | planner 122,246; context 38,190; 4 ranges totalling 1,349,052 with a maximum of 433,340; dependency load 333,016; dependency matching 764,315 | 487,188 KiB |
+| Ranged service path, production limits | completed, 72 identical findings, `partial_ranges: false` | planner 122,246; context 38,190; 4 ranges totalling 1,349,052 with a maximum of 433,340; dependency load 333,016; dependency matching 764,315 | 487,188 KiB |
 | Ranged, second request in the same process | 4 of 4 ranges reused from checkpoints | 0 range steps | 494,080 KiB |
 | `depgraph health --json` on the same store | `execution.mode = ranged`, 4 of 4 ranges reused, counts equal | — | 510,040 KiB |
 

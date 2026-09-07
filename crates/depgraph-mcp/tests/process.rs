@@ -7308,8 +7308,8 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
             &cli_findings["data"],
         ),
     ] {
-        assert_eq!(mcp_result["partial"], json!(false), "{mcp_result}");
-        assert_eq!(cli_data["partial"], json!(false), "{cli_data}");
+        assert_eq!(mcp_result["partial_ranges"], json!(false), "{mcp_result}");
+        assert_eq!(cli_data["partial_ranges"], json!(false), "{cli_data}");
         assert_eq!(mcp_result["execution"]["mode"], json!("ranged"));
         for pointer in [
             "/mode",
@@ -7490,7 +7490,7 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
             "{tool}"
         );
         assert_eq!(
-            opted_in["structuredContent"]["result"]["partial"],
+            opted_in["structuredContent"]["result"]["partial_ranges"],
             json!(false),
             "{tool}"
         );

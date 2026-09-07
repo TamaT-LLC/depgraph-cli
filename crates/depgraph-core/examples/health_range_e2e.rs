@@ -225,7 +225,7 @@ fn run(options: &Options) -> Result<Value> {
     report["ranged"] = json!({
         "outcome": "completed",
         "elapsed_ms": ranged_ms,
-        "partial": findings.partial(),
+        "partial_ranges": findings.partial(),
         "collection_digest": findings.collection_digest(),
         "findings": counts(findings.findings()),
         "unused_findings": counts(&ranged_unused),

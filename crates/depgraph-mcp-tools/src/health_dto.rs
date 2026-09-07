@@ -893,8 +893,9 @@ pub struct AgentHealthSummary {
     /// `true` only for the opt-in `allow_partial_ranges` view of an
     /// incomplete range set; every finding then carries an
     /// `incomplete_coverage` blocker and the digest differs from a complete
-    /// collection.
-    partial: bool,
+    /// collection. Distinct from the partial-attempt (`attempt:`) contract,
+    /// which describes unanalysed scan units rather than health ranges.
+    partial_ranges: bool,
     execution: AgentHealthExecution,
 }
 
@@ -908,7 +909,7 @@ impl AgentHealthSummary {
         files_skipped: u64,
         unresolved: u64,
         candidates: u64,
-        partial: bool,
+        partial_ranges: bool,
         execution: AgentHealthExecution,
     ) -> Result<Self, ContractBuildError> {
         Ok(Self {
@@ -924,7 +925,7 @@ impl AgentHealthSummary {
                 unresolved,
                 candidates,
             },
-            partial,
+            partial_ranges,
             execution,
         })
     }
@@ -935,8 +936,8 @@ impl AgentHealthSummary {
     }
 
     #[must_use]
-    pub const fn partial(&self) -> bool {
-        self.partial
+    pub const fn partial_ranges(&self) -> bool {
+        self.partial_ranges
     }
 
     #[must_use]
@@ -952,7 +953,7 @@ struct AgentHealthSummaryWire {
     counts_by_kind: Vec<AgentHealthNamedCount>,
     counts_by_confidence: Vec<AgentHealthNamedCount>,
     coverage: AgentHealthCoverage,
-    partial: bool,
+    partial_ranges: bool,
     execution: AgentHealthExecution,
 }
 
@@ -967,7 +968,7 @@ impl<'de> Deserialize<'de> for AgentHealthSummary {
             counts_by_kind: wire.counts_by_kind,
             counts_by_confidence: wire.counts_by_confidence,
             coverage: wire.coverage,
-            partial: wire.partial,
+            partial_ranges: wire.partial_ranges,
             execution: wire.execution,
         })
     }
@@ -1025,7 +1026,7 @@ pub struct AgentHealthFindingsPage {
     /// `true` only for the opt-in `allow_partial_ranges` view of an
     /// incomplete range set; every listed finding then carries an
     /// `incomplete_coverage` blocker and is indeterminate.
-    partial: bool,
+    partial_ranges: bool,
     execution: AgentHealthExecution,
 }
 
@@ -1033,13 +1034,13 @@ impl AgentHealthFindingsPage {
     pub fn try_new(
         collection_digest: &str,
         findings: Page<AgentHealthFinding>,
-        partial: bool,
+        partial_ranges: bool,
         execution: AgentHealthExecution,
     ) -> Result<Self, ContractBuildError> {
         Ok(Self {
             collection_digest: parse_id(collection_digest)?,
             findings,
-            partial,
+            partial_ranges,
             execution,
         })
     }
@@ -1055,8 +1056,8 @@ impl AgentHealthFindingsPage {
     }
 
     #[must_use]
-    pub const fn partial(&self) -> bool {
-        self.partial
+    pub const fn partial_ranges(&self) -> bool {
+        self.partial_ranges
     }
 
     #[must_use]
@@ -1070,7 +1071,7 @@ impl AgentHealthFindingsPage {
 struct AgentHealthFindingsPageWire {
     collection_digest: AgentId,
     findings: Page<AgentHealthFinding>,
-    partial: bool,
+    partial_ranges: bool,
     execution: AgentHealthExecution,
 }
 
@@ -1083,7 +1084,7 @@ impl<'de> Deserialize<'de> for AgentHealthFindingsPage {
         Ok(Self {
             collection_digest: wire.collection_digest,
             findings: wire.findings,
-            partial: wire.partial,
+            partial_ranges: wire.partial_ranges,
             execution: wire.execution,
         })
     }
