@@ -118,6 +118,75 @@ for debugging. The optional `DEPGRAPH_RESUMABLE_GO_ONLY=1` isolates the Go
 boundary; CI runs both adapters and uploads the report as the
 `resumable-analysis-report` artifact.
 
+## Ranged health collection
+
+`cargo xtask health-range-e2e` is the evidence gate for the health side of
+#467: snapshot-scoped health no longer loads the whole `GraphSnapshot` for a
+plain input but plans bounded store ranges, analyzes each range under the
+unchanged per-range budget, and reuses per-range checkpoints. The same Go CI
+job runs it after the resumable fixture and uploads the report as the
+`health-range-report` artifact, keeping the eight-job identity.
+
+The fixture is public and synthetic. `crates/depgraph-core/tests/support/health_range_fixture.rs`
+generates a Go-shaped worker protocol stream (`go` adapter, `depgraph-protocol`
+v1 events) for a configurable shape and ingests it through the public
+`Store::start_scan_with_revision` / `ingest_events` / `finish_scan` API, so the
+store contains the same rows a real scan would write. Node IDs sort by package,
+file, and symbol; the `caller_after_callee` option places every caller in a
+later package than its callee, so the only usage of a subject always sits in a
+later range. Other options add a mutual import cycle, a second module owning
+the same package path (a `candidates` site), a heuristic dynamic import site,
+an unanalysed analysis unit in the coverage ledger, and a hub symbol called
+from every other symbol. Fixture generation streams events in 4,096-event
+chunks; it never holds the stream in memory.
+
+The over-limit shape (64 packages × 8 files × 8 symbols, 24 equivalent Go
+stage profiles, every symbol called from the next package) produced 333,554
+events, 219,456 edges, 108,864 sites, and a 655 MiB store. Measured in this
+checkout on 2026-09-07 with a debug build:
+
+| Path | Outcome | Work steps | Peak RSS |
+| --- | --- | ---: | ---: |
+| Whole snapshot, unchanged 1,000,000 budget | `resource_exhausted` | > 1,000,000 | 1,739,456 KiB after load and control |
+| Whole snapshot, unbounded control | completed, 72 unused findings | 1,861,274 | (same process) |
+| Ranged service path, production limits | completed, 72 identical findings, `partial: false` | planner 122,246; context 38,190; 4 ranges totalling 1,349,052 with a maximum of 433,340; dependency load 333,016; dependency matching 764,315 | 487,188 KiB |
+| Ranged, second request in the same process | 4 of 4 ranges reused from checkpoints | 0 range steps | 494,080 KiB |
+| `depgraph health --json` on the same store | `execution.mode = ranged`, 4 of 4 ranges reused, counts equal | — | 510,040 KiB |
+
+Fixture generation ran in a separate process (140 seconds, 4,983,400 KiB peak
+because scan promotion still validates the canonical snapshot in memory), so
+the ranged measurements exclude it. The whole-snapshot load alone took 18
+seconds. Elapsed times and RSS are observations of this development build, not
+product limits; the xtask asserts the contract facts only: the whole-snapshot
+path exhausts the single budget, every range completes within the unchanged
+per-range limit, the unused findings are identical, the second request reuses
+every checkpoint, and the CLI envelope reports the same ranged execution.
+
+`crates/depgraph-core/tests/health_range.rs` covers the remaining acceptance
+items on smaller shapes with the same generator: the planner reads aggregates
+only and is deterministic; the planner, global context, and range loaders each
+charge their own budget and fail closed at `MAX_HEALTH_PLANNER_ROWS` /
+`MAX_HEALTH_RANGES`; a symbol used only from a later range is not reported in
+either sort order; ranged findings equal whole-snapshot findings on every public
+shape (cycle, same-path modules, dynamic import, incomplete unit, later-range
+callers); incomplete analysis units keep every ranged finding unconfirmed;
+range-order permutations, and interruption after each range followed by resume,
+produce byte-identical findings; foreign or stale checkpoints are misses and an
+unwritable checkpoint directory degrades to no checkpoints; an overrunning
+range is re-split and a hub subject that cannot fit fails closed unless the
+partial view is requested; the partial view is opt-in and never shares a digest
+with a complete collection; plan estimates bound the measured range work; and
+the diagnostics serialize with a stable shape. `crates/depgraph-mcp/tests/process.rs`
+checks that `health_summary_get` / `health_findings_list` report the same
+`execution` accounting as the CLI, accept `allow_partial_ranges`, and reject a
+non-boolean value.
+
+The item of #467 that refers to the original private test repository cannot be
+verified from this public checkout; the maintainer must run
+`cargo run -p depgraph-core --example health_range_e2e -- --store <store> --root <repo> --report <file>`
+against that store. The report of a `--store` run contains counts, work,
+timings, and digests only.
+
 ## Acceptance matrix
 
 The matrix maps the six issue contracts to checks run in this checkout on
@@ -141,6 +210,7 @@ and retains its integration report separately from these local measurements.
 | #465 | Pre-split planning contract: explainable execution units, budget- and boundary-driven scope and parallelism before execution, dependency/cycle/shared-input retention, staged large package, re-split dispositions, and the worker loader binding | `cargo test -p depgraph-core --test analysis_split_contract` (11 tests over `fixtures/analysis-split-plan-v1`, golden `expected/split-plans.json`); `cargo test -p depgraph-core loader_scope_binding_is_attached_only_after_negotiation_and_keeps_requests_stable`; `cd workers/go && go test ./internal/worker -run 'TestAnalysisSplit|TestReadAnalysisUnitRequestAcceptsSplit'`; `cargo test -p depgraph-cli --test cli scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store` | Passed locally on 2026-09-07; see [the pre-split planning ADR](adr-presplit-analysis-planning.md) |
 | #466 | Atomic checkpoint publication, failure/cancel retention, resource limits, and Store/journal compatibility | `cargo test -p depgraph-core incomplete_semantics_remain_readable_but_are_not_reused`; `cargo test -p depgraph-core typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa`; `cargo test -p depgraph-store analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger`; `cargo test -p depgraph-store analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors` | Passed in the pinned full Rust gate, including fake-clock aggregate-budget behavior, atomic ledger/checkpoint, input-proof snapshot identity, and metadata-only terminal summary regressions |
 | #467 | Cross-unit `deps`, `dependents`, `why`, and `impact`, exact stored provenance, partial selection, and conservative unused confidence | `cargo xtask resumable-analysis-e2e`; query assertions are in `scripts/resumable-analysis-query-assertions.mjs`; `cargo test -p depgraph-core incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles`; `cargo test -p depgraph-core health::unused::tests::issue_467` | Passed: all four partial queries with exact stored provenance, unchanged current completed snapshot, canonical graph equality, 8 partial unused-file findings with no confirmed confidence, and equivalent-stage health work/provenance regressions |
+| #467 (health split) | Range planning without the full `GraphSnapshot`, per-range budgets with saved results and resume, cross-range usage, preserved profile/condition/evidence/missing-profile/coverage/layer semantics, unconfirmed findings while ranges are missing, identical findings for normal / reordered / interrupted runs, and a public over-limit fixture | `cargo xtask health-range-e2e`; `cargo test -p depgraph-core --test health_range` (17 tests); `cargo test -p depgraph-mcp --test process issue_423_health_tools_are_read_only_redacted_and_match_cli_parity` | Passed: the whole-snapshot control is `resource_exhausted` at the unchanged 1,000,000 budget while the ranged path completes 4 ranges (maximum 433,340 steps) with identical findings and full checkpoint reuse; see "Ranged health collection". The original private repository item needs the maintainer's run of the `--store` evidence runner |
 
 The measured public fixture produced 13 profiles, 54 nodes, 111 edges, and
 162 evidence records. Its baseline scan took 8.637 seconds, the split scan

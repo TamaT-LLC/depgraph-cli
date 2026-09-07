@@ -153,6 +153,9 @@ continues by stable ID and no automatic rewrite is performed.
 - input identity: snapshot ID (audit uses the before/after pair), optional
   manifest digest, changed OID, churn window, and hotspot weights
 - audit's pinned policy configuration digest
+- `partial_ranges`, present only in the opt-in partial view of a ranged
+  collection (see "Bounded range execution"); complete collections omit it,
+  so their digests are unchanged
 
 ### Baseline transitions
 
@@ -219,6 +222,82 @@ Rejected alternatives for promotion:
 - treat `candidates` / `unresolved` as proof of use or as proof of unused
 - skip coverage omission because a later profile looks complete
 - promote on heuristic or overapprox edges alone
+
+### Bounded range execution
+
+Snapshot-scoped collection (`health`, `health list`, `cleanup`,
+`health_summary_get`, `health_findings_list`, and `health show` through the
+same collection) no longer materializes the whole `GraphSnapshot` for a plain
+input. A plain input is one completed scan layer, including `attempt:`
+selectors on a staging scan, with no build delta, runtime session, or semantic
+no-op overlay. Issue #467 fixes the following behaviour.
+
+Planning reads aggregates only. `Store::resolve_health_input` fixes the input
+identity (snapshot, base scan, layers, staging fingerprint, analysis plan) and
+`Store::health_range_plan` cuts the sorted subject IDs (files, symbols, types)
+into ranges whose estimated load, index, and analysis work fits the unchanged
+per-phase budget of 1,000,000 steps (`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`).
+The planner itself is bounded by `MAX_HEALTH_PLANNER_ROWS` (4,000,000 rows) and
+`MAX_HEALTH_RANGES` (256); exceeding either is `RESOURCE_EXHAUSTED`, never a
+partial plan. The plan digest binds identity, limits, statistics, and range
+boundaries.
+
+Execution charges four independent budgets of the same size: the snapshot-wide
+context (profiles, profile matrix, coverage, coverage-omitted paths, Go
+package/module usage, targetless-site flags, ledger units), each range (its
+subjects, every inbound edge and site of those subjects regardless of the
+source range, and the analysis), the dependency projection load, and dependency
+matching. A range that overruns its budget is split at the median subject ID
+and retried up to `MAX_HEALTH_RANGE_RESPLIT_DEPTH` (4) times; the split is
+deterministic so an interrupted and a fresh run converge on the same boundaries.
+The per-range budget is not raised to make a graph pass.
+
+Cross-range references are correct by construction: usage is decided from the
+subject's inbound rows, which are loaded with the subject range, so a target
+whose only caller sits in a later range is never reported unused. Profile
+applicability, condition groups, evidence references, missing-profile blockers,
+coverage completeness and reasons, and dynamic-loading, candidate, and
+unresolved blockers come from the shared context and therefore attach
+identically in every range layout. Layered inputs keep the whole-snapshot path
+(`execution.mode = "whole_snapshot"`) so overlay semantics stay exactly as
+before.
+
+Per-range results are checkpoints, not contract state. The checkpoint key is
+the plan digest, the range's first and last subject IDs, the shared-context
+digest, the analyzer version, and the finding-contract version; a foreign or
+stale key is a miss, an unwritable checkpoint directory degrades to no
+checkpoints, and reuse never changes a finding, fingerprint, or collection
+digest. Resume therefore reuses completed ranges and recomputes the rest.
+
+Ranges that fail after the maximum re-split depth, or ranges left unanalysed by
+cancellation, make the collection fail closed with `RESOURCE_EXHAUSTED` /
+`CANCELLED`. The opt-in partial view (`--allow-partial`,
+`allow_partial_ranges`) returns the findings of the completed ranges instead:
+every finding carries an `incomplete-coverage` blocker naming the unanalysed
+range count, confidence is `indeterminate`, `partial` is `true`, and the
+collection identity gains `partial_ranges` (`ranges:<done>/<total>
+failed:<n> interrupted:<n>`) so the digest can never equal a complete
+collection's digest. Once the missing ranges complete, the findings converge to
+the complete result.
+
+`execution` is reported on the CLI JSON envelopes of `health`, `health list`,
+and `cleanup`, and on `health_summary_get` / `health_findings_list`:
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | `ranged` or `whole_snapshot` |
+| `ranges` | `total`, `completed`, `reused`, `resplit`, `failed`, `interrupted` |
+| `work` | `planner`, `global_context`, `ranges_total`, `ranges_max`, `range_limit`, `dependencies_load`, `dependencies` |
+| `checkpoints` | `enabled`, `written`, `reused`, `write_failures` |
+
+The CLI envelope additionally carries `plan_digest`, `layers`, and
+`peak_rss_kib` (Linux `VmHWM`, when readable); these process-level observations
+are not part of the MCP contract. Findings are byte-identical for a normal run,
+a run with ranges processed in any order, and an interrupted run resumed from
+checkpoints; the public over-limit fixture in
+[Resumable analysis integration validation](resumable-analysis-validation.md)
+records the whole-snapshot `RESOURCE_EXHAUSTED` control next to the completed
+ranged run.
 
 ### Suppression
 
@@ -429,6 +508,10 @@ discards the partial counts, records `churn-unavailable`, and uses churn `0`.
 | `depgraph audit --changed <GIT_REF>` | `health_audit` | `health_audit_get` |
 | `depgraph hotspots` | `health_hotspots` | `health_hotspots_list` |
 
+`depgraph health`, `depgraph health list`, and `depgraph cleanup` accept
+`--allow-partial`; `health_summary_get` and `health_findings_list` accept
+`allow_partial_ranges`. Both default to the fail-closed complete collection.
+
 Exit codes stay on the existing 0–4 contract:
 
 | Code | Health meaning |
@@ -507,4 +590,7 @@ findings remain `indeterminate` with
 
 - [Semantic Dependency Graph CLI system design](arch-dependency-graph-cli-system-design.md)
 - [MCP Agent Tools](arch-mcp-agent-tools.md)
+- [Resumable analysis integration validation](resumable-analysis-validation.md)
+  (ranged health fixture and measurements)
 - Issue #423
+- Issue #467 (bounded range execution)

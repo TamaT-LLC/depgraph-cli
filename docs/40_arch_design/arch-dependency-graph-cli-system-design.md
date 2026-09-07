@@ -1368,10 +1368,10 @@ depgraph snapshot list [--json]
 depgraph snapshot show <NAME|STABLE_ID|current> [--json]
 depgraph diff <FROM> <TO> [--json] [--kind KIND] [--profile ID] [--phase PHASE] [--status STATUS]
 depgraph export --format json|dot|mermaid|graphml [--phase PHASE] [--profile ID] [--session ID] [--environment NAME]
-depgraph health [--kind KIND] [--json]
-depgraph health list [--kind KIND] [--severity SEVERITY] [--confidence CONFIDENCE] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
+depgraph health [--kind KIND] [--allow-partial] [--json]
+depgraph health list [--kind KIND] [--severity SEVERITY] [--confidence CONFIDENCE] [--allow-partial] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 depgraph health show <FINDING_ID> [--json]
-depgraph cleanup --kind KIND [--severity SEVERITY] [--confidence CONFIDENCE] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
+depgraph cleanup --kind KIND [--severity SEVERITY] [--confidence CONFIDENCE] [--allow-partial] [--baseline FILE] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 depgraph audit --changed <GIT_REF> [--base-snapshot SELECTOR] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 depgraph hotspots [--churn-commit-limit N] [--weight-fan-in N] [--weight-fan-out N] [--weight-reverse-impact N] [--weight-git-churn N] [--weight-runtime N] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 ```
@@ -2016,6 +2016,11 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-09-07: Issue #467としてsnapshot-scoped health（`health` / `health list` / `cleanup` / `health_summary_get` / `health_findings_list`）の読み込み・集計をStore range単位へ事前分割した。
+  plain入力（単一scan層）は`Store::resolve_health_input`と`Store::health_range_plan`が集計値だけで対象IDをrangeへ切り、range毎の読み込み・index構築・解析を従来どおりの1,000,000 step budgetで実行し、超過rangeは中央値で最大4回再分割する。
+  cross-range参照は対象rangeへinbound row全部を読み込むことで保証し、profile / condition / evidence / missing-profile / coverage / layer意味論はsnapshot全体で共有するcontextから同一に付与する。層のある入力（build delta / runtime session / semantic no-op）はwhole-snapshot経路を維持する。
+  range結果はplan digest・range境界・context digest・analyzer/contract versionで鍵付けしたcheckpointとして保存し、中断後の再実行は完了rangeを再利用する。未解析rangeが残る場合はfail closedし、`--allow-partial` / `allow_partial_ranges`のopt-in partial viewだけが完了range分を`incomplete-coverage` blocker付き`indeterminate`で返し、collection digestは完全結果と一致しない。
+  CLI/MCPは`execution`（mode / ranges / work / checkpoints）と`partial`を出力する。公開synthetic fixture（`cargo xtask health-range-e2e`）でwhole-snapshot経路が`resource_exhausted`となる一方、ranged経路が4 range（最大433,340 step）で同一findingを完了することをCIで記録する。
 - 2026-09-03: unused-code以外のfindingを`probable`上限に統一した。
   `confirmed`は、適用対象profileすべてで未使用と証明できたfindingだけに限定する。
   health analyzerを`1.0.3`へ更新し、旧analyzerのsnapshotとのaudit比較は`incomparable-contract`でfail closedする。
