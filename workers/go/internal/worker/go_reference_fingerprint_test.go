@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -27,6 +28,27 @@ func referenceFingerprintWithInRepoDep(t *testing.T) goReferenceFingerprint {
 		Imports: map[string]*packages.Package{"example.com/app/dep": dep},
 	}
 	return computeGoReferenceFingerprint(root, []Module{module}, []*packages.Package{target}, nil)
+}
+
+func TestSupportedUnixMustGenerateReferenceFingerprint(t *testing.T) {
+	supported := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if referenceOpenNoFollowAvailable() != supported {
+		t.Fatalf("GOOS=%s: no-follow available=%v, want %v", runtime.GOOS, referenceOpenNoFollowAvailable(), supported)
+	}
+	if !supported {
+		return
+	}
+	fp := referenceFingerprintWithInRepoDep(t)
+	if fp.Fingerprint == "" || fp.PackageCount != 1 || fp.FileCount != 1 {
+		t.Fatalf("supported GOOS %s omitted a reference fingerprint: %+v", runtime.GOOS, fp)
+	}
+	if slices.Contains(fp.Reasons, "reference-file-nofollow-unavailable") {
+		t.Fatalf("supported GOOS %s reported nofollow unavailable: %v", runtime.GOOS, fp.Reasons)
+	}
+	properties := goLoaderProperties(&goLoaderReport{ReferenceFingerprint: fp})
+	if properties["go_reference_fingerprint"] != fp.Fingerprint {
+		t.Fatalf("loader properties omitted the fingerprint: %v", properties)
+	}
 }
 
 func TestOpenReferenceFileOpensRegularFile(t *testing.T) {

@@ -172,10 +172,12 @@ Package-bounded Go typed and semantic checkpoints add the worker-reported
 `go_reference_fingerprint` of the in-repo import closure the typed stage
 actually loaded. Core stores that digest in `UnitCheckpointKey.reference_digest`
 so the static `input_digest` can still equal the request's context
-fingerprint. Keys that omit the field serialize as they did before, so
-existing module-loader checkpoint files stay valid. Changing an in-repo
-dependency that a package imports therefore invalidates that package's typed
-and semantic checkpoints while leaving unrelated packages reusable.
+fingerprint. Linux and macOS produce that fingerprint with the same
+`openat`/`O_NOFOLLOW` walk; other platforms omit it and Core leaves
+`reference_digest` unbound. Keys that omit the field serialize as they did
+before, so existing module-loader checkpoint files stay valid. Changing an
+in-repo dependency that a package imports therefore invalidates that package's
+typed and semantic checkpoints while leaving unrelated packages reusable.
 
 The Go dependency snapshot that feeds base and logical profile IDs is
 computed from the module-wide metadata listing (`go list` without types),

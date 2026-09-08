@@ -10,9 +10,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func referenceOpenNoFollowAvailable() bool { return true }
+
 // openReferenceFile opens a confined path from a trusted root descriptor.
 // The root and every subsequent component are opened with O_NOFOLLOW so a
 // swapped scan-root or parent symlink cannot escape the scan root.
+//
+// Linux and Darwin both expose openat(2) with O_NOFOLLOW. The syscall
+// package only exports Openat on Linux, so this shared walk uses
+// golang.org/x/sys/unix on both GOOS values and produces the same
+// go_reference_fingerprint bytes for the same confined listing.
 func openReferenceFile(root, path string) (*os.File, error) {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {

@@ -58,6 +58,7 @@
 
 ## 更新履歴
 
+- 2026-09-07: Issue #479としてmacOSでも`openat`/`O_NOFOLLOW`で`go_reference_fingerprint`を生成し、package semantic checkpointをLinuxと同じ契約で再利用できるようにした
 - 2026-09-07: Issue #464として事前分割の統合完了条件を[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md)の acceptance matrix と「Epic #464 pre-split integration」節へ記録。公開合成 fixture が個別上限を上げずに scan と health を完了することを子 Issue #465/#463/#467 の evidence gate で照合し、非公開試験対象は maintainer follow-up とする
 - 2026-09-07: Issue #463としてGo typed/SSAの読み込みをpackage単位へ事前分割し（hybrid loader、宣言されたCHA program scope、scan-scoped GOCACHE、`go_reference_fingerprint`をcheckpoint keyへ、SSA後のSyntax/TypesInfo解放）、[Go analysis-unit validation](../40_arch_design/analysis-unit-go-validation.md)と[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md)の公開64×8 / 1,024-file evidence gateを追加
 - 2026-09-07: Issue #467としてsnapshot-scoped healthの読み込み・集計をStore range単位へ事前分割し（`GraphSnapshot`全体を構築しないplanner、range別budget・checkpoint・resume、cross-range参照、opt-in partial view）、`PROJ-ARC-001-ADR-009`の「Bounded range execution」節、MCP `execution`/`partial_ranges`/`allow_partial_ranges`、[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md)のranged health fixture計測を追加

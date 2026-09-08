@@ -115,6 +115,14 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      # syscall.Openat is Linux-only; Darwin shares the openat(O_NOFOLLOW) walk
+      # via golang.org/x/sys/unix. Compile that GOOS here so a stub that
+      # returns reference-file-nofollow-unavailable cannot land unnoticed.
+      - name: Cross-compile the reference fingerprint walk for Darwin and Windows
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-darwin-arm64.test" ./internal/worker
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-windows-amd64.test" ./internal/worker
 
   web:
     runs-on: ubuntu-24.04
