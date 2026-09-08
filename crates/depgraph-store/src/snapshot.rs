@@ -15,8 +15,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use depgraph_protocol::stable_id_from_value;
+use depgraph_protocol::{canonical_json, stable_id_from_value};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -1225,39 +1226,89 @@ pub(crate) fn completed_snapshot_identity(
     profile_ids.sort();
     profile_ids.dedup();
     let analysis_digest = analysis_proof_digest(connection, scan_id)?;
-    let mut identity = json!({
-        "schema": if runtime_session_ids.is_empty() {
-            if analysis_digest.is_some() {
-                "completed-snapshot-v3-analysis"
-            } else {
-                "completed-snapshot-v1"
-            }
-        } else if analysis_digest.is_some() {
-            "completed-snapshot-v4-analysis-runtime"
-        } else {
-            "completed-snapshot-v2"
-        },
-        "parent_snapshot_id": parent_snapshot_id,
-        "source_revision": source_revision,
-        "profile_ids": profile_ids,
-        "graph": {
-            "profiles": snapshot.profiles,
-            "nodes": snapshot.nodes,
-            "sites": snapshot.sites,
-            "edges": snapshot.edges,
-            "evidence": snapshot.evidence,
-            "diagnostics": snapshot.diagnostics,
-            "file_coverage": snapshot.file_coverage,
-            "coverage": snapshot.coverage,
-        },
-    });
-    if let Some(analysis_digest) = analysis_digest {
-        identity["analysis_proof_digest"] = json!(analysis_digest);
+    let snapshot_id = hash_snapshot_identity(
+        &snapshot,
+        &profile_ids,
+        analysis_digest.as_deref(),
+        runtime_session_ids,
+        parent_snapshot_id,
+        source_revision,
+    )?;
+    Ok((snapshot_id, profile_ids))
+}
+
+/// Hash the existing canonical JSON contract one record at a time. Constructing
+/// a Value for the whole graph, sorting its copy, and then serializing it keeps
+/// several full graph representations alive during completion.
+fn hash_snapshot_identity(
+    snapshot: &GraphSnapshot,
+    profile_ids: &[String],
+    analysis_digest: Option<&str>,
+    runtime_session_ids: &[String],
+    parent_snapshot_id: Option<&str>,
+    source_revision: Option<&str>,
+) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(b"{");
+    if let Some(digest) = analysis_digest {
+        hash.update(b"\"analysis_proof_digest\":");
+        hash_identity_value(&mut hash, &digest)?;
+        hash.update(b",");
     }
+    // Both object levels use the lexicographic field order of canonical_json.
+    hash.update(b"\"graph\":{\"coverage\":");
+    hash_identity_value(&mut hash, &snapshot.coverage)?;
+    hash.update(b",\"diagnostics\":");
+    hash_identity_array(&mut hash, &snapshot.diagnostics)?;
+    hash.update(b",\"edges\":");
+    hash_identity_array(&mut hash, &snapshot.edges)?;
+    hash.update(b",\"evidence\":");
+    hash_identity_array(&mut hash, &snapshot.evidence)?;
+    hash.update(b",\"file_coverage\":");
+    hash_identity_array(&mut hash, &snapshot.file_coverage)?;
+    hash.update(b",\"nodes\":");
+    hash_identity_array(&mut hash, &snapshot.nodes)?;
+    hash.update(b",\"profiles\":");
+    hash_identity_array(&mut hash, &snapshot.profiles)?;
+    hash.update(b",\"sites\":");
+    hash_identity_array(&mut hash, &snapshot.sites)?;
+    hash.update(b"},\"parent_snapshot_id\":");
+    hash_identity_value(&mut hash, &parent_snapshot_id)?;
+    hash.update(b",\"profile_ids\":");
+    hash_identity_array(&mut hash, profile_ids)?;
     if !runtime_session_ids.is_empty() {
-        identity["runtime_session_ids"] = json!(runtime_session_ids);
+        hash.update(b",\"runtime_session_ids\":");
+        hash_identity_array(&mut hash, runtime_session_ids)?;
     }
-    Ok((stable_id_from_value("snapshot", &identity), profile_ids))
+    hash.update(b",\"schema\":");
+    let schema = match (runtime_session_ids.is_empty(), analysis_digest.is_some()) {
+        (true, false) => "completed-snapshot-v1",
+        (true, true) => "completed-snapshot-v3-analysis",
+        (false, false) => "completed-snapshot-v2",
+        (false, true) => "completed-snapshot-v4-analysis-runtime",
+    };
+    hash_identity_value(&mut hash, &schema)?;
+    hash.update(b",\"source_revision\":");
+    hash_identity_value(&mut hash, &source_revision)?;
+    hash.update(b"}");
+    Ok(format!("snapshot:sha256:{:x}", hash.finalize()))
+}
+
+fn hash_identity_value(hash: &mut Sha256, value: &impl Serialize) -> Result<()> {
+    hash.update(canonical_json(&serde_json::to_value(value)?).as_bytes());
+    Ok(())
+}
+
+fn hash_identity_array<T: Serialize>(hash: &mut Sha256, values: &[T]) -> Result<()> {
+    hash.update(b"[");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            hash.update(b",");
+        }
+        hash_identity_value(hash, value)?;
+    }
+    hash.update(b"]");
+    Ok(())
 }
 
 pub(crate) fn create_completed_snapshot(
@@ -1501,4 +1552,79 @@ pub(crate) fn backfill_completed_snapshots(connection: &Connection) -> Result<()
         promote_completed_snapshot(connection, &snapshot_id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::Store;
+    use serde_json::Value;
+    use std::path::Path;
+
+    #[test]
+    fn streamed_snapshot_identity_preserves_every_legacy_schema() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("scan-golden", Path::new("/fixture"), false)?;
+        let mut events =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson")
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+        events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+        for event in events {
+            store.ingest_event(&event)?;
+        }
+        let mut snapshot = store.load_snapshot("scan-golden")?;
+        snapshot.nodes[0].properties = json!({
+            "z": [null, {"雪": "\n\"\\", "a": -3.25}, true], "a": false
+        });
+        let profiles = snapshot
+            .profiles
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>();
+        for analysis in [None, Some("analysis:proof")] {
+            for runtime in [vec![], vec!["runtime:z".into(), "runtime:a".into()]] {
+                for parent in [None, Some("snapshot:parent")] {
+                    for revision in [None, Some("revision\n雪")] {
+                        let schema = match (runtime.is_empty(), analysis.is_some()) {
+                            (true, false) => "completed-snapshot-v1",
+                            (true, true) => "completed-snapshot-v3-analysis",
+                            (false, false) => "completed-snapshot-v2",
+                            (false, true) => "completed-snapshot-v4-analysis-runtime",
+                        };
+                        let mut legacy = json!({
+                            "schema": schema,
+                            "parent_snapshot_id": parent,
+                            "source_revision": revision,
+                            "profile_ids": profiles,
+                            "graph": {
+                                "profiles": snapshot.profiles,
+                                "nodes": snapshot.nodes,
+                                "sites": snapshot.sites,
+                                "edges": snapshot.edges,
+                                "evidence": snapshot.evidence,
+                                "diagnostics": snapshot.diagnostics,
+                                "file_coverage": snapshot.file_coverage,
+                                "coverage": snapshot.coverage,
+                            },
+                        });
+                        if let Some(analysis) = analysis {
+                            legacy["analysis_proof_digest"] = json!(analysis);
+                        }
+                        if !runtime.is_empty() {
+                            legacy["runtime_session_ids"] = json!(runtime);
+                        }
+                        assert_eq!(
+                            hash_snapshot_identity(
+                                &snapshot, &profiles, analysis, &runtime, parent, revision
+                            )?,
+                            stable_id_from_value("snapshot", &legacy)
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
