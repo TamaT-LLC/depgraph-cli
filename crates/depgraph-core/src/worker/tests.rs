@@ -7830,3 +7830,24 @@ async fn normal_worker_exit_reaps_pipe_holding_descendants() -> Result<()> {
     assert!(output.error.unwrap().contains("incomplete protocol stream"));
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn protocol_validation_does_not_starve_another_workers_pipe_reader() -> Result<()> {
+    let (release, wait) = std::sync::mpsc::channel();
+    let (writer, reader) = tokio::io::duplex(64);
+    drop(writer);
+    let reader = tokio::spawn(read_capped(reader, 64));
+    let validation = run_protocol_validation(move || wait.recv_timeout(Duration::from_secs(1)));
+    let drain = async move {
+        let mut errors = Vec::new();
+        let result = finish_reader(reader, "stderr", &mut errors).await?;
+        release.send(())?;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(result, (Vec::new(), false));
+        Ok::<_, anyhow::Error>(())
+    };
+    let (validation, drain) = tokio::join!(validation, drain);
+    drain?;
+    validation??;
+    Ok(())
+}

@@ -1891,39 +1891,52 @@ where
         errors.len() - previous_error_count,
     ));
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    // Parsing and contract validation can process a large bounded stream.
+    // Keep that synchronous work off the async executor so another worker's
+    // pipe reader and deadline can still run while this output is validated.
+    let validation_root = root.to_path_buf();
+    let validation_scan_id = scan_id.to_owned();
+    let delta_request = delta_request.cloned();
+    let max_line_bytes = config.max_protocol_line_bytes;
+    let expected_version = spec.expected_version.clone();
+    let release_attested = spec.release_attested;
+    let adapter = spec.adapter;
     let (events, delta, parsed_error, parsed_failure_kind, parsed_security_violation) =
-        if let Some(request) = delta_request {
-            let parsed = parse_delta_events(
-                &stdout_bytes,
-                request,
-                config.max_protocol_line_bytes,
-                spec.expected_version.as_deref(),
-            );
-            (
-                Vec::new(),
-                parsed.delta,
-                parsed.error,
-                parsed.failure_kind,
-                parsed.security_violation,
-            )
-        } else {
-            let parsed = parse_events_preserving_prefix(
-                &stdout_bytes,
-                scan_id,
-                spec.adapter.name(),
-                root,
-                config.max_protocol_line_bytes,
-                spec.expected_version.as_deref(),
-                Some(spec.release_attested),
-            );
-            (
-                parsed.events,
-                None,
-                parsed.error,
-                parsed.failure_kind,
-                parsed.security_violation,
-            )
-        };
+        run_protocol_validation(move || {
+            if let Some(request) = delta_request.as_ref() {
+                let parsed = parse_delta_events(
+                    &stdout_bytes,
+                    request,
+                    max_line_bytes,
+                    expected_version.as_deref(),
+                );
+                (
+                    Vec::new(),
+                    parsed.delta,
+                    parsed.error,
+                    parsed.failure_kind,
+                    parsed.security_violation,
+                )
+            } else {
+                let parsed = parse_events_preserving_prefix(
+                    &stdout_bytes,
+                    &validation_scan_id,
+                    adapter.name(),
+                    &validation_root,
+                    max_line_bytes,
+                    expected_version.as_deref(),
+                    Some(release_attested),
+                );
+                (
+                    parsed.events,
+                    None,
+                    parsed.error,
+                    parsed.failure_kind,
+                    parsed.security_violation,
+                )
+            }
+        })
+        .await?;
     if stdout_truncated {
         errors.push(format!(
             "{} protocol output exceeded {} bytes",
@@ -1955,6 +1968,16 @@ where
         security_violation,
         peak_memory_bytes: process_guard.peak_memory_bytes(),
     })
+}
+
+async fn run_protocol_validation<F, T>(validation: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(validation)
+        .await
+        .context("worker protocol validation task failed")
 }
 
 pub(crate) async fn read_capped(
