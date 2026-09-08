@@ -105,6 +105,10 @@ export interface TypeScriptStaticConfig {
 }
 
 export interface TypeScriptAnalysisOptions {
+  /** Assigned static framework configs; retained for framework collectors only. */
+  frameworkConfigPaths?: ReadonlySet<string>;
+  /** Bounded export names needed by framework entrypoints without import sites. */
+  moduleExportPaths?: readonly (readonly string[])[];
   /** Source files whose AST/semantic DTOs may be returned to the scanner. */
   sourcePaths?: ReadonlySet<string>;
   /**
@@ -133,6 +137,7 @@ export interface TypeOnlyDependencyRange {
 
 export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
   readonly semanticSourceFiles = new Map<string, SourceFile>();
+  readonly frameworkConfigSourceFiles = new Map<string, SourceFile>();
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
   readonly importTypeModuleSpans = new Map<string, Array<{ startOffset: number; endOffset: number }>>();
   readonly moduleCallSpans = new Map<string, TypeScriptModuleCallValidationSpan[]>();
@@ -831,6 +836,7 @@ async function analyzeTypeScriptProjectInner(
           throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
         }
         sourceFiles.set(relativePath, sourceFile);
+        if (options.frameworkConfigPaths?.has(relativePath)) result.frameworkConfigSourceFiles.set(relativePath, sourceFile);
         if (options.sourcePaths === undefined || options.sourcePaths.has(relativePath)) {
           result.semanticSourceFiles.set(relativePath, sourceFile);
         }
@@ -960,7 +966,7 @@ async function analyzeTypeScriptProjectInner(
             result.definitionGraph,
             result.definitionGraph.typeCheckerQueries,
             result,
-            options.sourcePaths === undefined ? {} : { sourcePaths: options.sourcePaths },
+            options,
           );
           progress.complete("typescript_dependency_graph", {
             dependency_sites: result.dependencyGraph.sites.length,

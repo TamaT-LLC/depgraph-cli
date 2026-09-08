@@ -1396,6 +1396,7 @@ ORDER BY id COLLATE BINARY
 
         let sites = load_site_validation_records(&self.connection, scan_id)?;
         let edges = load_edge_validation_records(&self.connection, scan_id)?;
+        let mut site_counts_by_profile = BTreeMap::<&str, [u64; 5]>::new();
         let mut edges_by_site = BTreeMap::<&str, Vec<&EdgeValidationRecord>>::new();
         for edge in &edges {
             if let Some(site_id) = &edge.site_id {
@@ -1403,6 +1404,16 @@ ORDER BY id COLLATE BINARY
             }
         }
         for site in &sites {
+            let counts = site_counts_by_profile.entry(&site.profile_id).or_default();
+            counts[0] += 1;
+            let status_index = match site.resolution_status.as_str() {
+                "resolved" => 1,
+                "candidates" => 2,
+                "external" => 3,
+                "unresolved" => 4,
+                status => bail!("site {} has unknown resolution status {status}", site.id),
+            };
+            counts[status_index] += 1;
             let expected = site
                 .target_ids
                 .iter()
@@ -1552,17 +1563,13 @@ ORDER BY id COLLATE BINARY
             max_profile_unsupported_syntax =
                 max_profile_unsupported_syntax.max(profile.unsupported_syntax);
             profile_executed_project_code |= profile.project_code_executed;
-            let (total, resolved, candidates, external, unresolved):
-                (i64, i64, i64, i64, i64) = self.connection.query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
-                   FROM sites WHERE scan_id=?1 AND profile_id=?2",
-                params![scan_id, profile_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )?;
+            // These records were already read and validated above. Re-querying
+            // the site table here scans every site once per logical profile,
+            // making completion I/O grow with profiles multiplied by sites.
+            let [total, resolved, candidates, external, unresolved] = site_counts_by_profile
+                .get(profile_id.as_str())
+                .copied()
+                .unwrap_or_default();
             let reported = (
                 profile.dependency_sites,
                 profile.resolved,
@@ -1570,13 +1577,7 @@ ORDER BY id COLLATE BINARY
                 profile.external,
                 profile.unresolved,
             );
-            let observed = (
-                total as u64,
-                resolved as u64,
-                candidates as u64,
-                external as u64,
-                unresolved as u64,
-            );
+            let observed = (total, resolved, candidates, external, unresolved);
             if reported != observed {
                 bail!(
                     "profile {profile_id} coverage site counts {reported:?} do not match stored counts {observed:?}"
@@ -5712,6 +5713,56 @@ mod tests {
                 .finish_scan("scan-1", "completed", None, true)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_validation_work_scales_with_sites_not_profile_site_product() -> Result<()> {
+        fn validation_work(profile_count: usize) -> Result<usize> {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let mut store = Store::open_in_memory()?;
+            store.start_scan("scan-golden", Path::new("/fixture"), false)?;
+            let fixture =
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
+            for index in 0..profile_count {
+                let scoped = fixture
+                    .replace("web:production:server", &format!("profile-{index}"))
+                    .replace("sha256:", &format!("sha256:{index}:"))
+                    .replace("diagnostic:golden", &format!("diagnostic:{index}"))
+                    .replace("src/", &format!("project-{index}/src/"));
+                let mut events = scoped
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+                for event in events {
+                    if event["event"] != "scan_started" {
+                        store.ingest_event(&event)?;
+                    }
+                }
+            }
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            store.connection.progress_handler(
+                100,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let result = store.validate_scan("scan-golden");
+            store.connection.progress_handler(0, None::<fn() -> bool>);
+            result?;
+            Ok(steps.load(Ordering::Relaxed))
+        }
+        let small = validation_work(64)?;
+        let large = validation_work(512)?;
+        // Eight times the graph should not cause 64 times the SQL work.
+        // VM instructions make this independent of machine speed and I/O.
+        assert!(large <= small * 12 + 100, "small={small}, large={large}");
         Ok(())
     }
 

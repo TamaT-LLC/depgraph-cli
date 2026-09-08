@@ -1675,11 +1675,17 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("MCP tool contract mismatch", manifest));
 
         let mut manifest = baseline.clone();
-        manifest.mcp_server.operation_contract_version = "depgraph-operation-v2".to_owned();
+        manifest
+            .mcp_server
+            .operation_contract_version
+            .push_str("-mismatch");
         cases.push(("MCP operation contract mismatch", manifest));
 
         let mut manifest = baseline.clone();
-        manifest.operation_runner.operation_contract_version = "depgraph-operation-v2".to_owned();
+        manifest
+            .operation_runner
+            .operation_contract_version
+            .push_str("-mismatch");
         cases.push(("operation runner contract mismatch", manifest));
 
         let mut manifest = baseline.clone();

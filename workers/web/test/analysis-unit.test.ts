@@ -83,6 +83,50 @@ test("root workspace manifests stay bounded ancestors of nested analysis units",
   }
 });
 
+test("assigned TanStack configuration retains virtual routes without native dependency ownership", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const source = "apps/router/src/routes/__root.tsx";
+  const config = "apps/router/vite.config.ts";
+  const request = parseAnalysisUnitRequest({
+    contract_version: "depgraph-analysis-unit-v2", unit_id: "web:router", adapter: "web",
+    unit_root: "apps/router", source_paths: [source], context_paths: [source],
+    auxiliary_paths: ["apps/router/package.json", config, "package.json"],
+    stage: "semantic", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 2,
+    context_fingerprint: "c".repeat(64),
+  });
+  const files = await walkFiles(root);
+  const model = await scan(root, files, [], undefined, request);
+  const virtual = model.nodes.find((node) => node.kind === "route" && node.properties.route_kind === "tanstack-virtual-route");
+  assert.ok(virtual);
+  const registration = model.sites.find((site) => site.target_ids.includes(virtual.id) && site.kind === "route_entry");
+  assert.ok(registration?.evidence.some((item) => item.path === config));
+  assert.equal(model.sites.some((site) => site.evidence.some((item) => item.path === config
+    && item.extractor === "typescript-native-typechecker")), false);
+  const sibling = await scan(root, files, [], undefined, parseAnalysisUnitRequest({
+    ...request, chunk_id: "chunk-1", chunk_index: 1, auxiliary_paths: [],
+  }));
+  assert.equal(sibling.nodes.some((node) => node.properties.route_kind === "tanstack-virtual-route"), false);
+});
+
+test("an isolated Astro endpoint obtains its own export proof without another import site", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const source = "apps/astro-app/src/pages/api/status.ts";
+  const request = parseAnalysisUnitRequest({
+    contract_version: "depgraph-analysis-unit-v2", unit_id: "web:astro", adapter: "web",
+    unit_root: "apps/astro-app", source_paths: [source], context_paths: [source],
+    auxiliary_paths: ["apps/astro-app/package.json", "package.json"],
+    stage: "semantic", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+    context_fingerprint: "c".repeat(64),
+  });
+  const model = await scan(root, await walkFiles(root), [], undefined, request);
+  const handler = model.sites.find((site) => site.kind === "handled_by");
+  assert.equal(handler?.specifier, "GET");
+  assert.equal(handler?.resolution_status, "resolved");
+  assert.equal(handler?.precision, "exact");
+  assert.ok(model.nodes.some((node) => node.kind === "symbol" && node.display_name === "GET"
+    && handler?.target_ids.includes(node.id)));
+});
+
 test("framework analysis profiles declare exactly their projected completeness ledger", async () => {
   const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
   const files = await walkFiles(root);

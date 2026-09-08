@@ -43,7 +43,7 @@ import type { PackageRecord } from "./workspace";
 
 const ASTRO_EXTRACTOR = "astro-static-adapter";
 const ASTRO_COMPILER_VERSION = "4.0.0";
-const ASTRO_HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ALL"] as const;
+export const ASTRO_HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ALL"] as const;
 const ASTRO_COMPONENT_EXTENSIONS = new Set([".astro", ".md", ".mdx", ".html"]);
 const ASTRO_SCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
 const ASTRO_ASSET_EXTENSIONS = new Set([

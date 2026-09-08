@@ -21,7 +21,7 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
-import { collectAstroSemanticDelta } from "./astro-semantic";
+import { ASTRO_HTTP_METHODS, collectAstroSemanticDelta } from "./astro-semantic";
 import { collectNextSemanticDelta } from "./next-semantic";
 import { collectTanStackRouterSemanticDelta } from "./tanstack-router-semantic";
 import { collectTanStackStartSemanticDelta } from "./tanstack-start-semantic";
@@ -2354,6 +2354,12 @@ function projectAnalysisUnitFrameworkSemantic(
   return projectAnalysisUnitFrameworkSemanticStage(model, ownedFrameworks, nodes, sites, edges);
 }
 
+function astroEndpointExportPaths(entries: readonly RouteEntry[]): readonly (readonly string[])[] {
+  return entries.some((entry) => entry.framework === "astro" && entry.entryKind === "endpoint")
+    ? ASTRO_HTTP_METHODS.map((method) => [method])
+    : [];
+}
+
 function projectAnalysisUnitModel(
   model: ScanModel,
   request: AnalysisUnitRequest,
@@ -2809,6 +2815,9 @@ export async function scan(
   const analysisContextPaths = analysisUnit === null ? null : new Set(analysisUnit.context_paths);
   const analysisSourcePaths = analysisUnit === null ? null : new Set(analysisUnit.source_paths);
   const analysisAuxiliaryPaths = analysisUnit === null ? null : new Set(analysisUnit.auxiliary_paths);
+  const frameworkConfigPaths = new Set(analysisUnit?.stage === "semantic"
+    ? analysisUnit.auxiliary_paths.filter((relative) => /(?:^|\/)(?:vite|tanstack|router)\.config\.(?:js|jsx|ts|tsx|mjs|cjs)$/u.test(relative))
+    : []);
   const discoveredSourceFiles = allFiles
     .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)));
   const requestedSourceFiles = analysisUnit === null
@@ -2840,7 +2849,8 @@ export async function scan(
   const compilerFiles = sourceFiles.filter((file) => {
     if (!TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) return false;
     if (analysisContextPaths === null) return true;
-    return analysisContextPaths.has(normalizeRelative(path.relative(root, file)));
+    const relative = normalizeRelative(path.relative(root, file));
+    return analysisContextPaths.has(relative) || frameworkConfigPaths.has(relative);
   });
   const scanFiles = analysisUnit === null
     ? sourceFiles
@@ -2966,7 +2976,7 @@ export async function scan(
       root,
       workspace,
       compilerSources,
-      new Set(analysisUnit.source_paths),
+      new Set([...analysisUnit.source_paths, ...frameworkConfigPaths]),
       resolver,
       precompilerExtractions,
       progress,
@@ -2985,11 +2995,15 @@ export async function scan(
     compilerSources,
     resolver.typeScriptStaticConfig(typeScriptPathRequests),
     progress,
-    analysisUnit === null ? {} : {
-      sourcePaths: new Set(analysisUnit.source_paths),
-      astPaths: astSelection!.paths,
-      astSelectionTruncated: astSelection!.truncated,
-      stage: analysisUnit.stage,
+    {
+      moduleExportPaths: astroEndpointExportPaths(outputRouteEntries),
+      frameworkConfigPaths,
+      ...(analysisUnit === null ? {} : {
+        sourcePaths: new Set(analysisUnit.source_paths),
+        astPaths: astSelection!.paths,
+        astSelectionTruncated: astSelection!.truncated,
+        stage: analysisUnit.stage,
+      }),
     },
   );
   if (analysisUnit !== null) {
@@ -3357,7 +3371,7 @@ export async function scan(
         const result = collectTanStackRouterSemanticDelta({
           entries: tanstackRouterEntries,
           sources: compilerSources,
-          sourceFiles: nativeTypeScript.semanticSourceFiles,
+          sourceFiles: new Map([...nativeTypeScript.semanticSourceFiles, ...nativeTypeScript.frameworkConfigSourceFiles]),
           definitions: nativeTypeScript.definitionGraph,
           definitionNode: (key) => graph.typeScriptDefinitionNode(key),
           fileNode: (relativePath) => graph.fileNodeByRelativePath(relativePath),

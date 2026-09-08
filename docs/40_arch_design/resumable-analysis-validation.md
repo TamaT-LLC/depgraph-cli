@@ -299,6 +299,16 @@ An incomplete framework ledger prevents semantic-complete coverage and keeps
 its diagnostic reason. Nested units accept repository-root workspace manifests
 while rejecting sibling manifests and traversal paths. The worker, core, and
 packager agree on the `analysis-source-batch-v1` capability.
+Astro endpoint batches explicitly request the bounded set of HTTP method
+export proofs, so exact handler resolution does not depend on imports in
+another unit.
+Assigned TanStack configuration ASTs remain available to the virtual route
+collector within the existing AST budget, without adding native dependency
+occurrences from auxiliary files or emitting their routes in sibling batches.
+
+Completion validation aggregates site status counts in its existing site pass
+instead of rescanning every site for each profile. A public synthetic test
+checks SQLite work growth as the profile and site counts increase.
 
 Canonical exports retain logical profiles and graph counts. Per-execution
 counters stay in validated worker/checkpoint streams, so the integration gate
