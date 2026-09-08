@@ -389,8 +389,9 @@ retained is reported as `whole_context_loader_retained`. The planner cannot
 know that a worker widened its loader scope until the worker reports it. The
 re-split contract fixes identities and dispositions; automatic re-split
 execution, bounded Go loading, and health range loading are the consumers'
-work. Parent #464 stays open until the original trial target completes scan
-and health on unchanged per-unit limits; public synthetic fixtures in
+work. Parent #464 stays open until the original trial target completes a
+fresh scan, ordinary health, and same-input resume on unchanged per-unit
+limits; public synthetic fixtures in
 [resumable-analysis-validation.md](resumable-analysis-validation.md) are
 necessary and not sufficient.
 

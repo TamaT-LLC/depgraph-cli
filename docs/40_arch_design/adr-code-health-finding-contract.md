@@ -290,12 +290,13 @@ partial-result envelope (`depgraph-partial-result-v1`), which describes
 unanalysed scan units; both can be present at once. Once the missing ranges
 complete, the findings converge to the complete result.
 
-Epic #464 therefore treats scan completion and health-range completion as
-separate closers. `data.partial_ranges: false` on `--scan-id attempt:<id>`
-or with `--allow-partial` does not complete the epic. Ordinary health of a
-fresh `status: "completed"` scan, with no `--scan-id` and no
-`--allow-partial`, is required on the original trial target; public
-over-limit fixtures are necessary and not sufficient. See
+Epic #464 therefore treats scan completion, ordinary health-range
+completion, and same-input resume as separate required closers.
+`data.partial_ranges: false` on `--scan-id attempt:<id>` or with
+`--allow-partial` does not complete the epic. Ordinary health of a fresh
+`status: "completed"` scan, with no `--scan-id` and no `--allow-partial`,
+plus resume on a separate store, is required on the original trial target;
+public over-limit fixtures are necessary and not sufficient. See
 [resumable-analysis-validation.md](resumable-analysis-validation.md)
 ("Required private-trial closer") and issue #482.
 

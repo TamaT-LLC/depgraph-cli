@@ -206,8 +206,8 @@ replays every staged batch. CI uploads the per-unit table as
 
 The original trial tree is not in CI and is a **required closer for epic
 #464**, not an optional follow-up. Public fixtures are necessary and not
-sufficient. A maintainer who can reach that tree must complete the scan and
-health checklist in
+sufficient. A maintainer who can reach that tree must complete the required scan,
+ordinary health, and same-input resume checklist in
 [resumable-analysis-validation.md](resumable-analysis-validation.md)
 ("Required private-trial closer") and comment on #464 before the epic
 closes. The Go half of a cold scan is:
@@ -216,9 +216,9 @@ closes. The Go half of a cold scan is:
 depgraph --store /tmp/trial.sqlite scan /path/to/repository --no-cache --json
 ```
 
-Accept only top-level `"status": "completed"`. Capture only aggregate
-numbers (unit count, max unit peak RSS from the ledger, completeness). Do
-not publish private paths or measurements. Resume and ordinary health
+Accept only top-level `"status": "completed"`. Keep unit count, peak RSS,
+completeness, and other measurements in the private record. Do not publish
+private paths, digests, or measurements. Resume and ordinary health
 commands live in the same validation section; `cargo xtask
 go-loader-scope-e2e` does not take `--store` / `--root`.
 

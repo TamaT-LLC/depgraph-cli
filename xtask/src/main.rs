@@ -8514,5 +8514,17 @@ jobs:
             !validation.contains("cargo xtask health-range-e2e -- --store"),
             "the public health-range xtask does not take --store"
         );
+        assert!(
+            validation.contains("Same-input interrupt/resume on a **separate** store"),
+            "same-input resume must stay a required closer"
+        );
+        assert!(
+            validation.contains("Digests fingerprint path and symbol identities"),
+            "collection digests must stay in the private record"
+        );
+        assert!(
+            !validation.contains("finding counts, work, digests). Keep the tree"),
+            "public comments must not list digests as publishable aggregates"
+        );
     }
 }

@@ -11,8 +11,8 @@ The acceptance matrix in
 the passing pinned local gate, public integration fixture, and separate
 benchmark measurements. CI verification is required before merge. Public
 fixture evidence is necessary and not sufficient for parent #464: the
-original trial target must complete scan and health before that epic
-closes.
+original trial target must complete a fresh scan, ordinary health, and
+same-input resume before that epic closes.
 
 ## Context
 

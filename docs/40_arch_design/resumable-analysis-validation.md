@@ -210,10 +210,11 @@ Child issues #465 (planning contract, PR #472 / #474), #463 (Go package
 loader, PR #477), and #467 (ranged health, PR #475) are merged on `main`.
 Public synthetic fixtures are **necessary and not sufficient**. Closing the
 parent requires those children, the 2026-09-07 public reopen items, **and**
-a maintainer comment on #464 that the original trial target completed scan
-and health. Do not close #464 while that private run is unverified, `partial`,
-or `ResourceExhausted`. Issue #482 restored this gate after PR #478 had
-recorded the private item as out of band.
+a maintainer comment on #464 that the original trial target completed a
+fresh scan, ordinary health of that completed snapshot, and same-input
+resume with checkpoint reuse. Do not close #464 while that private run is
+unverified, `partial`, or `ResourceExhausted`. Issue #482 restored this
+gate after PR #478 had recorded the private item as out of band.
 
 ### Public fixture evidence (necessary)
 
@@ -251,25 +252,30 @@ comments on that issue that the checklist below passed on one named
 splits who executes the check; it does not drop the check. Public fixtures
 prove the same contracts on synthetic input; they are not a substitute.
 
-Scan completion and health-range completion are separate:
+Scan completion, ordinary health, and same-input resume are separate
+**required** closers. The optional `--store`/`--root` health-range example
+is extra evidence, not a substitute:
 
-| Check | What it proves | What it does not prove |
-| --- | --- | --- |
-| `depgraph scan --no-cache --json` with top-level `"status": "completed"` | Fresh analysis of the full tree finished | Health collection |
-| `depgraph health --json` with no `--scan-id` and no `--allow-partial`, `data.partial_ranges == false`, `data.execution.ranges.completed == data.execution.ranges.total`, `data.execution.ranges.failed == 0`, and no envelope `partial` object | Ordinary health of that **completed** snapshot finished every range | That a partial `attempt:` scan would also complete |
-| `--scan-id attempt:<id>` health, or `--allow-partial` | Explicit partial-result inspection | Epic scan and health completion |
-| `data.partial_ranges: false` alone | No missing health ranges **on the selected snapshot** | Scan completion, if the selected snapshot is a partial attempt |
+| Check | Required? | What it proves | What it does not prove |
+| --- | --- | --- | --- |
+| `depgraph scan --no-cache --json` with top-level `"status": "completed"` | Yes | Fresh analysis of the full tree finished | Health collection or resume |
+| `depgraph health --json` with no `--scan-id` and no `--allow-partial`, `data.partial_ranges == false`, `data.execution.ranges.completed == data.execution.ranges.total`, `data.execution.ranges.failed == 0`, and no envelope `partial` object | Yes | Ordinary health of that **completed** snapshot finished every range | That a partial `attempt:` scan would also complete |
+| Same-input interrupt/resume on a **separate** store (no `--no-cache`): resumed scan `"status": "completed"` with checkpoint reuse, then ordinary health matching the cold-store run | Yes (#482: re-run the same input and confirm reuse) | Valid analysis and health results are reused and stay consistent | Fresh cold-scan completion, if this store was started with `--no-cache` |
+| `--scan-id attempt:<id>` health, or `--allow-partial` | No | Explicit partial-result inspection | Epic scan and health completion |
+| `data.partial_ranges: false` alone | No | No missing health ranges **on the selected snapshot** | Scan completion, if the selected snapshot is a partial attempt |
+| `cargo run -p depgraph-core --example health_range_e2e -- --store/--root/--report` | No | Bounded vs unbounded health-range work on an existing completed store | Steps 1–3 |
 
 Do not treat success as: shrinking the tree, omitting required references,
 raising per-unit limits, `--allow-partial`, or health against `--scan-id
 attempt:<id>`.
 
 **Public comment on #464** may include only: `depgraph-cli` commit SHA, host
-OS, that shipped per-unit limits were unchanged, pass/fail of each checklist
-item, and aggregate counts that do not identify the tree (unit count,
-completeness, finding counts, work, digests). Keep the tree's name, paths,
-sources, configuration, and detailed measurements in a **private**
-verification record.
+OS, that shipped per-unit limits were unchanged, pass/fail of each required
+checklist item, and a private-record id. Keep the tree's name, paths,
+sources, configuration, unit counts, RSS, finding counts, work,
+`collection_digest`, and other digests in that **private** verification
+record. Digests fingerprint path and symbol identities, so they must not
+appear on the public issue.
 
 **Implementation blockers.** #479 (macOS `go_reference_fingerprint`) is on
 `main` as of `75ce9e1`. #480 (memory-limit re-split of an already-batched
@@ -301,19 +307,21 @@ depgraph --store /tmp/trial.sqlite scan /path/to/repository --no-cache --json
 #    and data.execution.ranges.failed == 0.
 depgraph --store /tmp/trial.sqlite health --json
 
-# 3. Same-input reuse on a separate store (do not pass --no-cache).
+# 3. Required same-input resume on a separate store (do not pass --no-cache).
 #    First invocation writes unit checkpoints. Interrupt, then resume.
 #    Resume scan must be "status": "completed" with reused checkpoints
 #    (cache_events outcome "hit" / reason "validated" for completed units).
-#    Then ordinary health as in (2) on the resume store; findings and
-#    collection_digest must match the cold-store health of the same input.
+#    Then ordinary health as in (2) on the resume store. Compare findings
+#    and collection_digest privately against the cold-store health; do not
+#    publish those values.
 depgraph --store /tmp/trial-resume.sqlite scan /path/to/repository --json
 # interrupt, then:
 depgraph --store /tmp/trial-resume.sqlite scan /path/to/repository --json
 depgraph --store /tmp/trial-resume.sqlite health --json
 
-# 4. Optional ranged-health evidence runner (counts, work, timings, digests
-#    only). Requires --store and --root. Not a substitute for (1)+(2).
+# 4. Optional ranged-health evidence runner. Requires --store and --root.
+#    Not a closer and not a substitute for (1)+(2)+(3). Keep the report
+#    (counts, work, timings, digests) in the private record.
 #    cargo xtask health-range-e2e runs the public synthetic fixture only.
 cargo run -p depgraph-core --example health_range_e2e -- \
     --store /tmp/trial.sqlite --root /path/to/repository \
@@ -336,7 +344,7 @@ Shipped per-unit limits unchanged. Tree identity omitted.
 - [ ] ordinary health (no --scan-id, no --allow-partial):
       data.partial_ranges=false, ranges.completed=ranges.total, ranges.failed=0,
       envelope.partial absent
-- [ ] resume store: scan completed with checkpoint reuse; health matches
+- [ ] required resume store: scan completed with checkpoint reuse; health matches
 - [ ] private record id: <id>
 ```
 
@@ -366,7 +374,7 @@ and retains its integration report separately from these local measurements.
 | #462 | Web project batches preserve compiler context, semantic targets, diagnostics, and canonical graph behavior | `cd workers/web && pnpm test`; `analysis-unit.test.ts` (`semantic source batches keep context targets while bounding dependency traversal`, `semantic source batches retain ambient declarations in the full compiler context`, `source batch size and order preserve one canonical graph`); `analysis-unit-issues.test.ts` (`batch semantic issue counts describe emitted diagnostics while context failures stay incomplete`); `DEPGRAPH_WEB_BENCHMARK=1 pnpm exec tsx --test test/analysis-unit-benchmark.test.ts` | Full Web suite, quality, and 1,024-file semantic benchmark passed; canonical joins also pass failed-chunk permutation and shared-external membership regressions |
 | #463 | Remaining pre-split: lightweight listing then bounded loader and budget; package units that do not re-load the module; staged bodies for a large single package; cross-unit types, calls, and cycles with declared CHA completeness; public fixture where the whole-module path fails the same per-unit memory limit the package path completes | `cargo xtask go-loader-scope-e2e`; Go `TestSyntheticAnalysisUnitCanonicalProjection`, `TestGoLoader*`, `TestAnalysisSplit*`, `TestReleaseGoSSASyntaxAfterBuildDropsLoaderTrees`; Core `go_package_execution_units_join_into_one_logical_profile`, `go_semantic_batches_join_their_call_graph_outcome`, `package_semantic_checkpoints_bind_the_typed_reference_fingerprint`, `reference_digest_extends_the_key`; store `v2_typed_rows_may_partition_the_owned_sources` | Public package-bounded hybrid loader, declared CHA program scope, shared scan GOCACHE, reference fingerprint in `UnitCheckpointKey.reference_digest`, syntax drop after SSA, mapping progress, and the public 64-by-8 / 1,024-file evidence gate. The original trial tree is a required #464 closer, not a #463 residual; see [Go validation](analysis-unit-go-validation.md) and "Required private-trial closer". |
 | #464 | Repository-first planning, unit scheduling, interruption/restart, invalidation, and public fixture evidence | `cargo xtask resumable-analysis-e2e` (calls `scripts/resumable-analysis-e2e.mjs`) | Passed: 13 baseline units, 22 split units, and all 22 reused after process restart; interruption and invalidation checks also passed |
-| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. Public fixtures are necessary and not sufficient: the original trial target must complete scan and health before the epic closes. | Public: `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. Private: "Required private-trial closer". | Public passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Private scan+health: **required, pending**. |
+| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. Public fixtures are necessary and not sufficient: the original trial target must complete a fresh scan, ordinary health, and same-input resume before the epic closes. | Public: `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. Private: "Required private-trial closer". | Public passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Private scan + ordinary health + resume: **required, pending**. |
 | #465 | Pre-split planning contract: explainable execution units, budget- and boundary-driven scope and parallelism before execution, dependency/cycle/shared-input retention, staged large package, re-split dispositions, the worker loader binding, and the review follow-ups (loader-scope capability required for the bounded package boundary, file-count-only partition and byte-identical requests for workers without loader scope, zero admitted memory for an empty plan, exact syntax loader scope in the Go worker) | `cargo test -p depgraph-core --test analysis_split_contract` (16 tests over `fixtures/analysis-split-plan-v1`, golden `expected/split-plans.json`); `cargo test -p depgraph-core loader_scope_binding_is_attached_only_after_negotiation_and_keeps_requests_stable`; `cd workers/go && go test ./internal/worker -run TestAnalysisSplit`; `cd workers/go && go test ./internal/worker -run TestReadAnalysisUnitRequestAcceptsSplit`; `cargo test -p depgraph-cli --test cli scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store` | Passed locally on 2026-09-07; see [the pre-split planning ADR](adr-presplit-analysis-planning.md) |
 | #466 | Atomic checkpoint publication, failure/cancel retention, resource limits, and Store/journal compatibility | `cargo test -p depgraph-core incomplete_semantics_remain_readable_but_are_not_reused`; `cargo test -p depgraph-core typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa`; `cargo test -p depgraph-store analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger`; `cargo test -p depgraph-store analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors` | Passed in the pinned full Rust gate, including fake-clock aggregate-budget behavior, atomic ledger/checkpoint, input-proof snapshot identity, and metadata-only terminal summary regressions |
 | #467 | Cross-unit `deps`, `dependents`, `why`, and `impact`, exact stored provenance, partial selection, and conservative unused confidence | `cargo xtask resumable-analysis-e2e`; query assertions are in `scripts/resumable-analysis-query-assertions.mjs`; `cargo test -p depgraph-core incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles`; `cargo test -p depgraph-core health::unused::tests::issue_467` | Passed: all four partial queries with exact stored provenance, unchanged current completed snapshot, canonical graph equality, 8 partial unused-file findings with no confirmed confidence, and equivalent-stage health work/provenance regressions |
