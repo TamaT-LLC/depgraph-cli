@@ -4685,7 +4685,10 @@ fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_clo
             "snapshot":snapshot_id
         }),
     );
-    assert_eq!(named["structuredContent"]["result"]["name"], "baseline");
+    assert_eq!(
+        named["structuredContent"]["result"]["name"], "baseline",
+        "{named}"
+    );
     assert_eq!(
         named["structuredContent"]["result"]["snapshot"]["snapshot_id"],
         snapshot_id
