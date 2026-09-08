@@ -5,12 +5,12 @@ use depgraph_protocol::{
     Evidence, EvidenceKind, Phase, Precision, ResolutionStatus, ValidatedProtocol,
     validate_build_ndjson,
 };
-use depgraph_store::{GraphSnapshot, Store, canonical_effective_input_id};
+use depgraph_store::{GraphSnapshot, ProfileRecord, Store, canonical_effective_input_id};
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
 use crate::{
-    BuildAudit, BuildOutcomeKind, WebBuildObservation,
+    BuildAudit, BuildOutcomeKind, WebBuildAdapter, WebBuildObservation,
     worker::{
         copy_safe_environment, locate_web_build_runtime, process_argument_path,
         resolve_safe_executable,
@@ -345,6 +345,53 @@ pub fn validate_framework_build_evidence_contract(protocol: &ValidatedProtocol) 
     Ok(())
 }
 
+fn web_build_parent_profile(
+    profiles: &[ProfileRecord],
+    adapter: WebBuildAdapter,
+) -> Result<&ProfileRecord> {
+    let mut parents = profiles
+        .iter()
+        .filter(|profile| {
+            matches!(
+                profile.language.as_str(),
+                "web" | "typescript" | "javascript"
+            ) && profile
+                .properties
+                .get("profile_phase")
+                .and_then(serde_json::Value::as_str)
+                != Some("build")
+        })
+        .filter(|profile| {
+            if profile
+                .properties
+                .get("analysis_unit_contract")
+                .and_then(Value::as_str)
+                != Some("depgraph-analysis-unit-v2")
+            {
+                return true;
+            }
+            // Syntax and unrelated logical units are not parents of this
+            // framework observation. Retain ambiguity rejection when more
+            // than one matching semantic profile remains.
+            profile
+                .properties
+                .get("analysis_stage")
+                .and_then(Value::as_str)
+                == Some("semantic")
+                && profile
+                    .features
+                    .iter()
+                    .any(|feature| feature == adapter.key())
+        })
+        .collect::<Vec<_>>();
+    parents.sort_by(|left, right| left.id.cmp(&right.id));
+    match parents.as_slice() {
+        [parent] => Ok(*parent),
+        [] => bail!("Web build observation has no compatible safe parent profile"),
+        _ => bail!("Web build observation has multiple compatible safe parent profiles"),
+    }
+}
+
 /// Converts a validated Web observation with a release-attested runtime. The
 /// converter runs after project code has exited and receives only the safe
 /// base graph, redacted observation, and supervisor provenance.
@@ -363,26 +410,7 @@ pub async fn web_build_protocol_ndjson(
         .validated_output_digest
         .as_deref()
         .context("completed Web build has no validated output digest")?;
-    let mut parents = snapshot
-        .profiles
-        .iter()
-        .filter(|profile| {
-            matches!(
-                profile.language.as_str(),
-                "web" | "typescript" | "javascript"
-            ) && profile
-                .properties
-                .get("profile_phase")
-                .and_then(serde_json::Value::as_str)
-                != Some("build")
-        })
-        .collect::<Vec<_>>();
-    parents.sort_by(|left, right| left.id.cmp(&right.id));
-    let parent = match parents.as_slice() {
-        [parent] => *parent,
-        [] => bail!("Web build observation has no compatible safe parent profile"),
-        _ => bail!("Web build observation has multiple compatible safe parent profiles"),
-    };
+    let parent = web_build_parent_profile(&snapshot.profiles, observation.adapter)?;
     let input = serde_json::to_vec(&json!({
         "adapter": observation.adapter.key(),
         "root": ".",
@@ -458,6 +486,51 @@ mod tests {
     use depgraph_protocol::Profile;
     use serde_json::json;
     use std::{collections::BTreeMap, io::Cursor};
+
+    #[test]
+    fn web_build_parent_selects_the_matching_semantic_unit_and_rejects_ambiguity() -> Result<()> {
+        let make_profile = |id: &str, stage: &str, framework: &str| -> Result<ProfileRecord> {
+            Ok(serde_json::from_value(json!({
+                "id": id, "language": "web", "features": [framework], "environment": {},
+                "properties": {"analysis_unit_contract": "depgraph-analysis-unit-v2", "analysis_stage": stage}
+            }))?)
+        };
+        let mut profiles = vec![
+            make_profile("next-syntax", "syntax", "next")?,
+            make_profile("astro-semantic", "semantic", "astro")?,
+            make_profile("next-semantic", "semantic", "next")?,
+        ];
+        assert_eq!(
+            web_build_parent_profile(&profiles, WebBuildAdapter::Next)?.id,
+            "next-semantic"
+        );
+        assert_eq!(
+            web_build_parent_profile(&profiles, WebBuildAdapter::Astro)?.id,
+            "astro-semantic"
+        );
+        assert!(web_build_parent_profile(&profiles, WebBuildAdapter::TanstackRouter).is_err());
+        profiles.push(make_profile("other-next-semantic", "semantic", "next")?);
+        assert!(
+            web_build_parent_profile(&profiles, WebBuildAdapter::Next)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple")
+        );
+        profiles[3].properties["profile_phase"] = json!("build");
+        assert_eq!(
+            web_build_parent_profile(&profiles, WebBuildAdapter::Next)?.id,
+            "next-semantic"
+        );
+        profiles.retain(|profile| profile.id != "next-semantic");
+        assert!(web_build_parent_profile(&profiles, WebBuildAdapter::Next).is_err());
+        let mut legacy = make_profile("legacy", "", "")?;
+        legacy.properties = json!({});
+        assert_eq!(
+            web_build_parent_profile(&[legacy], WebBuildAdapter::Next)?.id,
+            "legacy"
+        );
+        Ok(())
+    }
 
     #[test]
     fn core_rejects_unauthorized_build_stream_before_store_mutation() {

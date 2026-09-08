@@ -307,6 +307,9 @@ semantic batch, including batches without a file route.
 Assigned TanStack configuration ASTs remain available to the virtual route
 collector within the existing AST budget, without adding native dependency
 occurrences from auxiliary files or emitting their routes in sibling batches.
+Build observations select the matching framework semantic profile among v2
+logical units; syntax and unrelated framework profiles are excluded, while
+multiple matching semantic parents still reject the observation.
 
 Completion validation aggregates site status counts in its existing site pass
 instead of rescanning every site for each profile. A public synthetic test
