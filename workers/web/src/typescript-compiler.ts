@@ -205,11 +205,14 @@ export type TypeScriptProjectFailureReason =
 
 export class TypeScriptProjectError extends Error {
   readonly reason: TypeScriptProjectFailureReason;
+  readonly exitCode: number;
 
   constructor(reason: TypeScriptProjectFailureReason, message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "TypeScriptProjectError";
     this.reason = reason;
+    // The supervisor reserves 124 for an adapter's internal time budget.
+    this.exitCode = reason === "compiler_timeout" ? 124 : 3;
   }
 }
 

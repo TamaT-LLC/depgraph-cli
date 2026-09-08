@@ -7386,6 +7386,45 @@ async fn verified_web_release_worker_receives_the_typescript_release_gate() -> R
     Ok(())
 }
 
+#[tokio::test]
+async fn adapter_internal_timeout_exit_is_retryable_but_other_exits_are_not() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let program = resolve_safe_executable("node", root.path())?;
+    for (code, expected) in [
+        (124, WorkerFailureKind::Timeout),
+        (3, WorkerFailureKind::NonzeroExit),
+    ] {
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Web,
+            artifact_path: program.clone(),
+            program: program.clone().into_os_string(),
+            leading_args: vec![
+                "-e".into(),
+                format!("process.exit({code})").into(),
+                "--".into(),
+            ],
+            display: "internal-timeout-fixture".into(),
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            root.path(),
+            "internal-timeout",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(execution.failure_kind, Some(expected));
+        assert!(execution.error.is_some());
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn worker_memory_budget_terminates_a_live_process_without_waiting_for_timeout() -> Result<()>

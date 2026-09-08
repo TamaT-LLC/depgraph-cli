@@ -1827,7 +1827,13 @@ where
     match wait_result {
         WaitResult::Process(Ok(Ok(status))) if !status.success() => {
             errors.push(format!("{} exited with {status}", spec.display));
-            failure_kinds.push(WorkerFailureKind::NonzeroExit);
+            // Adapters use 124 when an internal operation exhausts its time
+            // budget, so the scheduler can retry a smaller analysis unit.
+            failure_kinds.push(if status.code() == Some(124) {
+                WorkerFailureKind::Timeout
+            } else {
+                WorkerFailureKind::NonzeroExit
+            });
         }
         WaitResult::Process(Ok(Ok(_))) => {}
         WaitResult::Process(Ok(Err(error))) => {

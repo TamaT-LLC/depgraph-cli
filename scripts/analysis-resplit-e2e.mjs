@@ -46,6 +46,7 @@ const at = args.indexOf('--analysis-unit');
 if (at >= 0) {
   const request = JSON.parse(readFileSync(args[at + 1], 'utf8'));
   if (existsSync(${JSON.stringify(inject)}) && request.stage !== 'syntax' && (request.source_paths.length > 1 || readFileSync(${JSON.stringify(inject)}, 'utf8') === 'unsplittable')) {
+    if (readFileSync(${JSON.stringify(inject)}, 'utf8') === 'internal-timeout') process.exit(124);
     if (['output', 'unsplittable'].includes(readFileSync(${JSON.stringify(inject)}, 'utf8'))) {
       // Keep a real, valid prefix: recovery must not double-count graph or
       // file coverage already ingested before the output limit was reached.
@@ -141,6 +142,11 @@ try {
   const outputLimited = scan(outputStore);
   assert.ok(outputLimited.diagnostics.some(d => d.code === "analysis-resplit" && d.message.includes("output_limit") && d.message.includes("applied")));
   assert.deepEqual(graph(outputStore, outputLimited.scan_id), expected, "output-limit refinement changed graph, evidence or coverage");
+  writeFileSync(inject, "internal-timeout");
+  const timeoutStore = path.join(parent, "internal-timeout.sqlite");
+  const timeoutLimited = scan(timeoutStore);
+  assert.ok(timeoutLimited.diagnostics.some(d => d.code === "analysis-resplit" && d.message.includes("worker_timeout") && d.message.includes("applied")));
+  assert.deepEqual(graph(timeoutStore, timeoutLimited.scan_id), expected, "internal-timeout refinement changed graph, evidence or coverage");
   // If no finer batch is possible, retain the failed leaf's valid prefix as
   // partial evidence, without publishing a completed snapshot or confirmed unused findings.
   writeFileSync(inject, "unsplittable");

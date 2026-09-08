@@ -340,6 +340,10 @@ parallelism decision bounds concurrently admitted units and therefore the
 admitted worker memory. Estimates influence order and admission only; they
 never relax a limit.
 
+Worker exit code `124` reports an adapter-internal time budget exhaustion.
+The supervisor classifies it as `timeout`, allowing the same bounded re-split
+path as a supervisor deadline. Other nonzero exits remain ordinary failures.
+
 ### Partial results and snapshot publication
 
 Partial-result selection with `attempt:<scan_id>` and completed-snapshot

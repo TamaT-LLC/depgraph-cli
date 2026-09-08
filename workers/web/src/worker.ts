@@ -424,7 +424,7 @@ async function main(): Promise<void> {
     } else {
       process.stderr.write(`depgraph-web-worker: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
     }
-    process.exitCode = 3;
+    process.exitCode = error instanceof TypeScriptProjectError ? error.exitCode : 3;
   }
 }
 

@@ -211,6 +211,7 @@ test("native compiler internal timeout fails closed and reaps the child", {
     (error: unknown) => (
       error instanceof TypeScriptProjectError
       && error.reason === "compiler_timeout"
+      && error.exitCode === 124
     ),
   );
   await assertCompilerReaped(marker);
