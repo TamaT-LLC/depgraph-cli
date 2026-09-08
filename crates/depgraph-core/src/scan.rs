@@ -1145,6 +1145,21 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         .map(|(record, _)| record)
         .collect::<Vec<_>>();
     let analysis_coverage = store.finalize_analysis_unit_ledger(&scan_id, &terminal_ledger)?;
+    if analysis_coverage
+        .reasons
+        .iter()
+        .any(|reason| reason == "analysis-unit-unknown-dependency")
+    {
+        store.mark_semantic_coverage_incomplete(&scan_id, "analysis-unit-unknown-dependency")?;
+        add_core_diagnostic(
+            store,
+            &scan_id,
+            "warning",
+            "analysis-unit-unknown-dependency",
+            "analysis completed with unresolved dependency context; semantic coverage is not complete",
+            "analysis-unit-unknown-dependency",
+        )?;
+    }
     if !analysis_coverage.complete {
         let reason = analysis_coverage
             .reasons

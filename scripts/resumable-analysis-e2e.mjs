@@ -537,6 +537,34 @@ try {
   const web_reexecution = verifyWebConfigAndArtifactReexecution(expected);
   configure(1, 2);
   const invalidation = verifySelectiveInvalidation(splitStore, expected);
+  // A missing dependency is a semantic limitation, even when every worker
+  // completed. Preserve the limitation in normal snapshot health and reuse.
+  if (includeWeb) {
+    write("frontend/apps/web/src/unknown.ts", 'import "missing-external-package";\nexport const unusedUnknown = 1;\n');
+    const unknownStore = path.join(parent, "unknown.sqlite");
+    const unknown = scan(unknownStore).output;
+    assert.equal(unknown.analysis_coverage.complete, true);
+    assert.equal(unknown.analysis_coverage.unanalysed_units, 0);
+    assert.ok(unknown.coverage.reasons.includes("analysis-unit-unknown-dependency"));
+    assert.ok(!unknown.coverage.completeness.includes("semantic-complete"));
+    const health = run(unknownStore, ["health", "--json"]).data;
+    assert.equal(health.partial_ranges, false);
+    assert.ok(Object.values(health.counts_by_confidence).some(count => count > 0), "unknown fixture must retain findings for review");
+    assert.equal(health.counts_by_confidence.confirmed ?? 0, 0);
+    const findingPage = run(unknownStore, ["health", "list", "--json"]);
+    assert.equal(findingPage.complete, true);
+    const findings = findingPage.items;
+    assert.equal(run(unknownStore, ["health", "--json"]).data.collection_digest, health.collection_digest);
+    const repeat = scan(unknownStore).output;
+    assert.ok(repeat.analysis.units.some(unit => unit.stage === "syntax" && unit.reused));
+    assert.ok(repeat.coverage.reasons.includes("analysis-unit-unknown-dependency"));
+    const repeatHealth = run(unknownStore, ["health", "--json"]).data;
+    assert.deepEqual(repeatHealth.counts_by_confidence, health.counts_by_confidence);
+    const repeatPage = run(unknownStore, ["health", "list", "--json"]);
+    assert.equal(repeatPage.complete, true);
+    assert.deepEqual(repeatPage.items, findings);
+    assert.equal(run(unknownStore, ["health", "--json"]).data.collection_digest, repeatHealth.collection_digest);
+  }
   const report = {
     contract_version: "depgraph-resumable-e2e-v1",
     adapters: includeWeb ? ["go", "web"] : ["go"],

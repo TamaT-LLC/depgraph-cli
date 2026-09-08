@@ -2927,10 +2927,31 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn mark_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
+        self.mark_coverage_limit(scan_id, reason, false)
+    }
+
+    /// Preserve execution and syntax coverage while recording that unresolved
+    /// dependency context prevents a repository-wide semantic guarantee.
+    pub fn mark_semantic_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
+        self.mark_coverage_limit(scan_id, reason, true)
+    }
+
+    fn mark_coverage_limit(
+        &mut self,
+        scan_id: &str,
+        reason: &str,
+        semantic_only: bool,
+    ) -> Result<()> {
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
         let mut coverage = read::load_staging_coverage(&tx, scan_id)?;
-        coverage.completeness.clear();
+        if semantic_only {
+            coverage
+                .completeness
+                .retain(|level| level != "semantic-complete");
+        } else {
+            coverage.completeness.clear();
+        }
         coverage.reasons.push(reason.to_owned());
         coverage.reasons.sort();
         coverage.reasons.dedup();

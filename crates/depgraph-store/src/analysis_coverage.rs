@@ -74,10 +74,10 @@ pub fn aggregate_analysis_coverage(
             "depgraph-analysis-unit-v1" => join_v1(rows, &stages, &mut reasons),
             "depgraph-analysis-unit-v2" => join_v2(rows, &stages, &mut reasons),
             // Repository-wide legacy workers have no stage pair.  Their
-            // established scan validation remains the source of truth, but a
-            // ledger row with an unknown dependency is still conservative.
+            // established scan validation remains the source of truth.
+            // Dependency certainty is accounted for separately below.
             _ if stages == BTreeSet::from(["repository"]) => {
-                rows.len() == 1 && rows[0].status == "completed" && !rows[0].unknown_dependencies
+                rows.len() == 1 && rows[0].status == "completed"
             }
             _ => {
                 reasons.insert("analysis-unit-unknown-contract".to_owned());
@@ -86,7 +86,11 @@ pub fn aggregate_analysis_coverage(
         };
         if joined {
             completed_units += 1;
-            semantic_complete_units += 1;
+            if rows.iter().any(|row| row.unknown_dependencies) {
+                reasons.insert("analysis-unit-unknown-dependency".to_owned());
+            } else {
+                semantic_complete_units += 1;
+            }
         } else {
             unanalysed_units += 1;
         }
@@ -145,8 +149,6 @@ fn join_v1(
         return false;
     }
     same_context(syntax, semantic, reasons)
-        && !syntax.unknown_dependencies
-        && !semantic.unknown_dependencies
 }
 
 fn join_v2(
@@ -194,14 +196,6 @@ fn join_v2(
         reasons.insert("analysis-unit-stage-incomplete".to_owned());
         return false;
     }
-    if syntax.iter().any(|row| row.unknown_dependencies)
-        || semantic.iter().any(|row| row.unknown_dependencies)
-        || typed_rows.iter().any(|row| row.unknown_dependencies)
-    {
-        reasons.insert("analysis-unit-unknown-dependency".to_owned());
-        return false;
-    }
-
     let owned_sources = union_paths(&syntax, |row| &row.source_paths);
     let declared_context = union_paths(&syntax, |row| &row.context_paths);
     // Context includes dependency sources which the unit must resolve but
@@ -517,7 +511,7 @@ fn v2_ledger_joined(records: &[AnalysisUnitLedgerRecord], unit_id: &str, unit_ro
                 && record.unit_root == unit_root
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
+    if rows.is_empty() || rows.iter().any(|row| row.unknown_dependencies) {
         return false;
     }
     let stages = rows
@@ -592,7 +586,7 @@ fn ledger_joined(
                 && record.unit_root == unit_root
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
+    if rows.is_empty() || rows.iter().any(|row| row.unknown_dependencies) {
         return false;
     }
     let stages = rows
@@ -808,7 +802,10 @@ mod tests {
             None,
             &[syntax_a, syntax_b, semantic],
         );
-        assert!(!unknown.complete);
+        assert!(unknown.complete);
+        assert_eq!(unknown.completed_units, 1);
+        assert_eq!(unknown.unanalysed_units, 0);
+        assert_eq!(unknown.semantic_complete_units, 0);
         assert!(
             unknown
                 .reasons
@@ -1029,10 +1026,49 @@ mod tests {
         assert!(without_ledger.contains("syntax-complete"));
         assert!(!without_ledger.contains("semantic-complete"));
 
+        let mut unknown_rows = rows.clone();
+        unknown_rows[0].unknown_dependencies = true;
+        let unknown = aggregate_completeness(&profiles, Some(&unknown_rows))?.unwrap();
+        assert!(unknown.contains("syntax-complete"));
+        assert!(!unknown.contains("semantic-complete"));
+        assert_eq!(semantic_complete_units(&profiles, Some(&unknown_rows)), 0);
+
         let mut failed_rows = rows;
         failed_rows[1].status = "failed".into();
         let failed = aggregate_completeness(&profiles, Some(&failed_rows))?.unwrap();
         assert!(!failed.contains("semantic-complete"));
+        Ok(())
+    }
+
+    #[test]
+    fn v1_unknown_dependency_completes_execution_without_semantic_guarantee() -> Result<()> {
+        let profiles = [profile("syntax"), profile("semantic")];
+        let mut rows = [
+            unit_row("syntax", "", 0, 1, &["app/a.go", "app/b.go"]),
+            unit_row("semantic", "", 0, 1, &["app/a.go", "app/b.go"]),
+        ];
+        for row in &mut rows {
+            row.contract_version = "depgraph-analysis-unit-v1".into();
+            row.chunk_index = None;
+            row.chunk_count = None;
+            row.unknown_dependencies = true;
+        }
+        let summary = aggregate_analysis_coverage("depgraph-analysis-unit-v1", None, None, &rows);
+        assert!(summary.complete);
+        assert_eq!(summary.semantic_complete_units, 0);
+        assert!(
+            summary
+                .reasons
+                .contains(&"analysis-unit-unknown-dependency".into())
+        );
+        let levels = aggregate_completeness(&profiles, Some(&rows))?.unwrap();
+        assert!(levels.contains("syntax-complete"));
+        assert!(!levels.contains("semantic-complete"));
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 0);
+        rows[1].status = "queued".into();
+        assert!(
+            !aggregate_analysis_coverage("depgraph-analysis-unit-v1", None, None, &rows).complete
+        );
         Ok(())
     }
 

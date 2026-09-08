@@ -96,7 +96,9 @@ fn analyze_subject<'a>(
     if index.analysis_coverage_incomplete {
         blockers.push(FindingBlocker {
             kind: BlockerKind::IncompleteCoverage,
-            detail: "one or more analysis units or dependency ranges were not analysed".to_owned(),
+            detail:
+                "one or more analysis units lack complete execution or resolved dependency context"
+                    .to_owned(),
         });
     }
     let is_go_subject = node
