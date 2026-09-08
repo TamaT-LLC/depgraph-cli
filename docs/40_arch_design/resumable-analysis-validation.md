@@ -280,9 +280,8 @@ appear on the public issue.
 
 **Implementation blockers.** #479 (macOS `go_reference_fingerprint`) is on
 `main` as of `75ce9e1`. #480 (memory-limit re-split of an already-batched
-unit stays `deferred`) is a separate scan bug: a private run that ends in
-`analysis re-split deferred` is not a closer. If #480 is still open, wait
-for it or record that this run never hit that path.
+unit) is on `main` as of `3fa35b0`. A private run that still ends in
+`analysis re-split deferred` is not a closer.
 
 `--no-cache` disables the unit checkpoint store (`ScanCacheMode::Disabled`),
 so a cold-scan check and a resume check cannot share one command line.

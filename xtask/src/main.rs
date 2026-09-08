@@ -8514,17 +8514,52 @@ jobs:
             !validation.contains("cargo xtask health-range-e2e -- --store"),
             "the public health-range xtask does not take --store"
         );
+
+        let required_column =
+            |row: &str| -> String { row.split('|').nth(2).unwrap_or("").trim().to_owned() };
+        let mut saw_resume = false;
+        let mut saw_optional_range_example = false;
+        for line in validation.lines() {
+            if line.contains("Same-input interrupt/resume") {
+                saw_resume = true;
+                let required = required_column(line);
+                assert!(
+                    required.starts_with("Yes"),
+                    "resume row Required? must be Yes, got {required:?}"
+                );
+            }
+            if line.contains("example health_range_e2e -- --store/--root/--report") {
+                saw_optional_range_example = true;
+                let required = required_column(line);
+                assert!(
+                    required.starts_with("No"),
+                    "the --store/--root health-range example must stay optional, got {required:?}"
+                );
+            }
+        }
+        assert!(saw_resume, "the closer table must include the resume row");
         assert!(
-            validation.contains("Same-input interrupt/resume on a **separate** store"),
-            "same-input resume must stay a required closer"
+            saw_optional_range_example,
+            "the closer table must keep the optional --store/--root example as Not required"
+        );
+
+        let public_comment = validation
+            .split("**Public comment on #464**")
+            .nth(1)
+            .and_then(|rest| rest.split("**Implementation blockers.**").next())
+            .expect("public comment section");
+        let (allowlist, private) = public_comment
+            .split_once("Keep the tree")
+            .expect("allowlist vs private record");
+        assert!(
+            !allowlist.to_ascii_lowercase().contains("digest"),
+            "public allowlist must not include digests: {allowlist}"
         );
         assert!(
-            validation.contains("Digests fingerprint path and symbol identities"),
-            "collection digests must stay in the private record"
-        );
-        assert!(
-            !validation.contains("finding counts, work, digests). Keep the tree"),
-            "public comments must not list digests as publishable aggregates"
+            private.contains("`collection_digest`")
+                && private.contains("must not")
+                && private.contains("appear on the public issue"),
+            "digests must be confined to the private record"
         );
     }
 }
