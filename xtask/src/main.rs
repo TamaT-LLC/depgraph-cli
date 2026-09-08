@@ -8507,8 +8507,12 @@ jobs:
             "the original trial target must stay a required #464 closer"
         );
         assert!(
-            validation.contains("### Required private-trial closer (pending)"),
+            validation.contains("### Required private-trial closer"),
             "the private-trial gate heading must remain"
+        );
+        assert!(
+            validation.contains("must remain pending until every required check below has passed"),
+            "issue verdicts must stay pending until the required private checks pass"
         );
         assert!(
             validation.contains("Public fixtures are necessary and not sufficient"),
