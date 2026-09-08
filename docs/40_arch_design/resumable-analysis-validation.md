@@ -285,6 +285,12 @@ retained syntax/typed checkpoints, completed replacement execution, and equal
 graph, evidence, and coverage against a run without injected failures.
 Semantic results produced before all typed references are bound remain
 ineligible for checkpoint reuse and are replayed conservatively.
+The memory gate records which unit checkpoints exist before resuming and
+requires every valid checkpoint to be reused. If typed refinement left
+semantic work without a reference binding, that work must execute once after
+the typed stage recovers; a further scan must then reuse every unit. A
+typed-only failure fixture exercises this boundary and compares graph,
+evidence and coverage through both repeats.
 Applied refinements are stored atomically as disposable planning hints beside
 the unit checkpoints. The cache key binds the original split plan, input
 contents, root and unit execution witnesses. A new process rebuilds the plan

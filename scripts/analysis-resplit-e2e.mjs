@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
+import { assertValidCheckpointReuse, checkpointedUnitIds } from "./analysis-checkpoint-assertions.mjs";
 
 const workspace = path.resolve(import.meta.dirname, "..");
 const cli = process.env.DEPGRAPH_BIN ?? path.join(workspace, "target/debug/depgraph");
@@ -45,7 +46,9 @@ const args = process.argv.slice(2);
 const at = args.indexOf('--analysis-unit');
 if (at >= 0) {
   const request = JSON.parse(readFileSync(args[at + 1], 'utf8'));
-  if (existsSync(${JSON.stringify(inject)}) && request.stage !== 'syntax' && (request.source_paths.length > 1 || readFileSync(${JSON.stringify(inject)}, 'utf8') === 'unsplittable')) {
+  if (existsSync(${JSON.stringify(inject)}) && request.stage !== 'syntax'
+      && (readFileSync(${JSON.stringify(inject)}, 'utf8') !== 'typed-only' || request.stage === 'typed')
+      && (request.source_paths.length > 1 || readFileSync(${JSON.stringify(inject)}, 'utf8') === 'unsplittable')) {
     if (readFileSync(${JSON.stringify(inject)}, 'utf8') === 'internal-timeout') process.exit(124);
     if (['output', 'unsplittable'].includes(readFileSync(${JSON.stringify(inject)}, 'utf8'))) {
       // Keep a real, valid prefix: recovery must not double-count graph or
@@ -139,6 +142,26 @@ try {
   assert.deepEqual(graph(store, repeated.scan_id), expected);
   const repeatedActive = repeated.analysis.units.filter(unit => unit.loader?.analysis_resplit !== "superseded");
   assert.ok(repeatedActive.every(unit => unit.reused), "restored refinement did not reuse every completed unit");
+  // A typed-only failure leaves completed semantic work without a complete
+  // reference binding. Do not turn that work into a reusable checkpoint.
+  const typedOnlyRoot = path.join(parent, "typed-only-repository");
+  mkdirSync(typedOnlyRoot);
+  for (const file of ["go.mod", ...Array.from({ length: 5 }, (_, i) => `f${i}.go`)]) {
+    writeFileSync(path.join(typedOnlyRoot, file), readFileSync(path.join(root, file)));
+  }
+  writeFileSync(path.join(typedOnlyRoot, ".depgraph.toml"), readFileSync(path.join(root, ".depgraph.toml"), "utf8").replace("max_unit_source_bytes = 1000", "max_unit_source_bytes = 240"));
+  const typedOnlyStore = path.join(parent, "typed-only.sqlite");
+  writeFileSync(inject, "typed-only");
+  const typedOnly = scan(typedOnlyStore, typedOnlyRoot);
+  const typedCheckpoints = checkpointedUnitIds(typedOnlyStore);
+  const typedGraph = graph(typedOnlyStore, typedOnly.scan_id);
+  rmSync(inject);
+  const typedRepeat = scan(typedOnlyStore, typedOnlyRoot);
+  assert.ok(assertValidCheckpointReuse(typedOnly, typedRepeat, typedCheckpoints) > 0, "unbound semantic work did not re-run");
+  assert.deepEqual(graph(typedOnlyStore, typedRepeat.scan_id), typedGraph);
+  const typedStable = scan(typedOnlyStore, typedOnlyRoot);
+  assert.ok(typedStable.analysis.units.every(unit => unit.reused), "recovered semantic checkpoints were not reused");
+  assert.deepEqual(graph(typedOnlyStore, typedStable.scan_id), typedGraph);
   writeFileSync(inject, "output");
   const outputStore = path.join(parent, "output-limit.sqlite");
   const outputLimited = scan(outputStore);

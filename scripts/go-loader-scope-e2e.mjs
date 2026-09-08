@@ -23,6 +23,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
+import { assertValidCheckpointReuse, checkpointedUnitIds } from "./analysis-checkpoint-assertions.mjs";
 
 const workspace = path.resolve(import.meta.dirname, "..");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
@@ -694,15 +695,20 @@ try {
     whole_module_peak_bytes: fanoutWholePeak,
   });
 
-  // --- fan-out: resume replays every typed and semantic batch -------------
+  // --- fan-out: reuse every valid checkpoint, then any recovered semantics -
+  const fanoutCheckpoints = checkpointedUnitIds(fanoutStore);
   const fanoutResume = scan("fanout-resume", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutResume.output.status, "completed");
-  for (const unit of activeGoUnits(fanoutResume)) {
-    assert.ok(unit.reused, `fanout-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
-  }
+  const fanoutSemanticReplays = assertValidCheckpointReuse(fanoutPackage.output, fanoutResume.output, fanoutCheckpoints);
   assertPackageBoundedUnits(activeGoUnits(fanoutResume).filter((unit) => unit.stage !== "syntax"), "fanout-resume");
   assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-resume");
-  record(fanoutResume, { canonical_graph_equal_to_control: true });
+  record(fanoutResume, { canonical_graph_equal_to_control: true, semantic_replays_after_typed_refinement: fanoutSemanticReplays });
+  if (fanoutSemanticReplays) {
+    const stable = scan("fanout-stable-resume", fanoutRoot, fanoutStore, shippedWorker);
+    assert.ok(activeGoUnits(stable).every((unit) => unit.reused), "stable fan-out checkpoint re-ran");
+    assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-stable-resume");
+    record(stable, { canonical_graph_equal_to_control: true });
+  }
 
   // --- big package: module-loader control ---------------------------------
   const { expected: bigExpected, wholeModulePeak } = controlScenarios("bigpkg", bigRoot, control);
@@ -741,17 +747,22 @@ try {
     whole_module_peak_bytes: wholeModulePeak,
   });
 
-  // --- big package: resume reuses every staged batch ----------------------
+  // --- big package: reuse valid staged batches and recovered semantics ----
+  const bigCheckpoints = checkpointedUnitIds(bigStore);
   const bigResume = scan("bigpkg-resume", bigRoot, bigStore, shippedWorker);
   assert.equal(bigResume.output.status, "completed", JSON.stringify(bigResume.output.diagnostics));
   const resumedStaged = activeGoUnits(bigResume).filter((unit) => unit.stage !== "syntax");
   assert.equal(resumedStaged.length, staged.length);
-  for (const unit of activeGoUnits(bigResume)) {
-    assert.ok(unit.reused, `bigpkg-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
-  }
+  const bigSemanticReplays = assertValidCheckpointReuse(bigPackage.output, bigResume.output, bigCheckpoints);
   assertPackageBoundedUnits(resumedStaged, "bigpkg-resume");
   assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-resume");
-  record(bigResume, { canonical_graph_equal_to_control: true, reused_staged: resumedStaged.length });
+  record(bigResume, { canonical_graph_equal_to_control: true, reused_staged: resumedStaged.filter((unit) => unit.reused).length, semantic_replays_after_typed_refinement: bigSemanticReplays });
+  if (bigSemanticReplays) {
+    const stable = scan("bigpkg-stable-resume", bigRoot, bigStore, shippedWorker);
+    assert.ok(activeGoUnits(stable).every((unit) => unit.reused), "stable big-package checkpoint re-ran");
+    assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-stable-resume");
+    record(stable, { canonical_graph_equal_to_control: true });
+  }
 
   report.summary = `at ${mib(REDUCED_WORKER_MEMORY_BYTES)} MiB per unit the module-loader control fails `
     + `(${BIG_PACKAGE_FILES}-file package whole-module peak ${mib(wholeModulePeak)} MiB, fan-out ${mib(fanoutWholePeak)} MiB); `
