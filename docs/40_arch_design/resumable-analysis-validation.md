@@ -302,6 +302,8 @@ packager agree on the `analysis-source-batch-v1` capability.
 Astro endpoint batches explicitly request the bounded set of HTTP method
 export proofs, so exact handler resolution does not depend on imports in
 another unit.
+The scheduler assigns static TanStack configuration witnesses to the first
+semantic batch, including batches without a file route.
 Assigned TanStack configuration ASTs remain available to the virtual route
 collector within the existing AST budget, without adding native dependency
 occurrences from auxiliary files or emitting their routes in sibling batches.

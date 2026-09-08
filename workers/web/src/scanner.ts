@@ -2354,6 +2354,17 @@ function projectAnalysisUnitFrameworkSemantic(
   return projectAnalysisUnitFrameworkSemanticStage(model, ownedFrameworks, nodes, sites, edges);
 }
 
+function tanStackRouterConfigPaths(root: string, workspace: Workspace, unit: AnalysisUnitRequest | null): Set<string> {
+  if (unit?.stage !== "semantic") return new Set();
+  return new Set(unit.auxiliary_paths.filter((relative) => {
+    if (!/(?:^|\/)(?:vite|tanstack|router)\.config\.(?:js|jsx|ts|tsx|mjs|cjs)$/u.test(relative)) return false;
+    const dependencies = owningPackage(workspace, path.resolve(root, relative)).dependencies;
+    const router = ["@tanstack/react-router", "@tanstack/router-core"].some((name) => dependencies.has(name));
+    const start = ["@tanstack/start", "@tanstack/react-start"].some((name) => dependencies.has(name));
+    return router && !start;
+  }));
+}
+
 function astroEndpointExportPaths(entries: readonly RouteEntry[]): readonly (readonly string[])[] {
   return entries.some((entry) => entry.framework === "astro" && entry.entryKind === "endpoint")
     ? ASTRO_HTTP_METHODS.map((method) => [method])
@@ -2815,9 +2826,7 @@ export async function scan(
   const analysisContextPaths = analysisUnit === null ? null : new Set(analysisUnit.context_paths);
   const analysisSourcePaths = analysisUnit === null ? null : new Set(analysisUnit.source_paths);
   const analysisAuxiliaryPaths = analysisUnit === null ? null : new Set(analysisUnit.auxiliary_paths);
-  const frameworkConfigPaths = new Set(analysisUnit?.stage === "semantic"
-    ? analysisUnit.auxiliary_paths.filter((relative) => /(?:^|\/)(?:vite|tanstack|router)\.config\.(?:js|jsx|ts|tsx|mjs|cjs)$/u.test(relative))
-    : []);
+  const frameworkConfigPaths = tanStackRouterConfigPaths(root, workspace, analysisUnit);
   const discoveredSourceFiles = allFiles
     .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)));
   const requestedSourceFiles = analysisUnit === null
@@ -3364,12 +3373,13 @@ export async function scan(
     }
   }
   const tanstackRouterEntries = outputRouteEntries.filter((entry) => entry.framework === "tanstack-router");
-  if (tanstackRouterEntries.length > 0) {
+  if (tanstackRouterEntries.length > 0 || frameworkConfigPaths.size > 0) {
     frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
       try {
         const result = collectTanStackRouterSemanticDelta({
           entries: tanstackRouterEntries,
+          configurationPaths: frameworkConfigPaths,
           sources: compilerSources,
           sourceFiles: new Map([...nativeTypeScript.semanticSourceFiles, ...nativeTypeScript.frameworkConfigSourceFiles]),
           definitions: nativeTypeScript.definitionGraph,

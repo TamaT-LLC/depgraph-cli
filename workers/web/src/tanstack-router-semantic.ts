@@ -101,6 +101,8 @@ interface SemanticRoute {
 }
 
 export interface TanStackRouterSemanticInput {
+  /** Assigned configuration can own virtual routes without an owned file route. */
+  configurationPaths?: ReadonlySet<string>;
   entries: readonly RouteEntry[];
   sources: ReadonlyMap<string, string>;
   sourceFiles: ReadonlyMap<string, SourceFile>;
@@ -376,7 +378,10 @@ export function collectTanStackRouterSemanticDelta(
   const framework: TanStackRouteFramework = input.entries.some((entry) => entry.framework === "tanstack-start")
     ? "tanstack-start"
     : "tanstack-router";
-  const packageScope = new Set(input.entries.map((entry) => input.ownerForPath(entry.relativeFile).locator));
+  const packageScope = new Set([
+    ...input.entries.map((entry) => entry.relativeFile),
+    ...input.configurationPaths ?? [],
+  ].map((relativePath) => input.ownerForPath(relativePath).locator));
   const inPackageScope = (relativePath: string): boolean => packageScope.has(input.ownerForPath(relativePath).locator);
   const semanticEvidence = (
     relativePath: string,

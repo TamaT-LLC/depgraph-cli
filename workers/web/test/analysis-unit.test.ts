@@ -85,7 +85,7 @@ test("root workspace manifests stay bounded ancestors of nested analysis units",
 
 test("assigned TanStack configuration retains virtual routes without native dependency ownership", async () => {
   const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
-  const source = "apps/router/src/routes/__root.tsx";
+  const source = "apps/router/depgraph-build.mjs";
   const config = "apps/router/vite.config.ts";
   const request = parseAnalysisUnitRequest({
     contract_version: "depgraph-analysis-unit-v2", unit_id: "web:router", adapter: "web",
@@ -98,6 +98,7 @@ test("assigned TanStack configuration retains virtual routes without native depe
   const model = await scan(root, files, [], undefined, request);
   const virtual = model.nodes.find((node) => node.kind === "route" && node.properties.route_kind === "tanstack-virtual-route");
   assert.ok(virtual);
+  assert.equal(virtual.properties.route_pattern, "/router/virtual");
   const registration = model.sites.find((site) => site.target_ids.includes(virtual.id) && site.kind === "route_entry");
   assert.ok(registration?.evidence.some((item) => item.path === config));
   assert.equal(model.sites.some((site) => site.evidence.some((item) => item.path === config

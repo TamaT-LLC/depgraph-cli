@@ -697,7 +697,11 @@ fn prepare_source_batch_context(
                     || (path.as_str() == "go.work" && unit.unit_root == ".")
             } else {
                 plan.units.iter().any(|candidate| {
-                    candidate.adapter == unit.adapter && candidate.manifest_paths.contains(path)
+                    candidate.adapter == unit.adapter
+                        && (candidate.manifest_paths.contains(path)
+                            || (unit.adapter == AnalysisAdapter::Web
+                                && is_web_route_config_path(path)
+                                && candidate.config_paths.contains(path)))
                 })
             };
             relevant
@@ -714,10 +718,49 @@ fn prepare_source_batch_context(
     })
 }
 
+fn is_web_route_config_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            ["vite", "tanstack", "router"].iter().any(|kind| {
+                ["js", "jsx", "ts", "tsx", "mjs", "cjs"]
+                    .iter()
+                    .any(|extension| name == format!("{kind}.config.{extension}"))
+            })
+        })
+}
+
+fn source_batch_auxiliary_paths(
+    adapter: AnalysisAdapter,
+    stage: AnalysisStage,
+    index: u64,
+    context: &SourceBatchContext,
+) -> Vec<String> {
+    if index != 0 {
+        return Vec::new();
+    }
+    if stage == AnalysisStage::Syntax {
+        return context.auxiliary_paths.clone();
+    }
+    if adapter != AnalysisAdapter::Web || stage != AnalysisStage::Semantic {
+        return Vec::new();
+    }
+    // Static virtual-route declarations belong to semantic output. Assign
+    // their already-fingerprinted config witnesses to the first semantic
+    // batch as well; other auxiliary dependencies remain syntax-owned.
+    context
+        .auxiliary_paths
+        .iter()
+        .filter(|path| is_web_route_config_path(path))
+        .cloned()
+        .collect()
+}
+
 /// Turn the execution units the split plan decided for one logical unit and
-/// stage into v2 worker requests.  Chunk identity, path sets, and field
-/// order are unchanged for workers that did not negotiate loader scope, so
-/// existing checkpoints and worker validation keep working.  A worker that
+/// stage into v2 worker requests. Source ownership and chunk identity stay
+/// stable; Web configuration witnesses are assigned to their emitting stage.
+/// A worker that
 /// advertises `analysis-loader-scope-v1` additionally receives the `split`
 /// binding with the loader target it must honour or reject.
 fn source_batch_requests_for_stage(
@@ -751,7 +794,7 @@ fn source_batch_requests_for_stage(
             let mut request = json!({
                 "contract_version":SOURCE_BATCH_CONTRACT,"unit_id":unit.id,"adapter":unit.adapter.as_str(),
                 "unit_root":unit.unit_root,"source_paths":paths,"context_paths":context_paths,
-                "auxiliary_paths":if index == 0 && stage == AnalysisStage::Syntax { context.auxiliary_paths.clone() } else { Vec::new() },
+                "auxiliary_paths":source_batch_auxiliary_paths(unit.adapter, stage, index, context),
                 "context_fingerprint":context.context_fingerprint,"stage":stage_name,
                 "chunk_id":chunk_id,"chunk_index":index,"chunk_count":execution_unit.batch_count,
             });
@@ -1058,6 +1101,55 @@ mod tests {
     use super::*;
     use crate::analysis_split::ANALYSIS_LOADER_SCOPE_CAPABILITY;
     use serde_json::Value;
+
+    #[test]
+    fn web_semantic_first_batch_owns_static_route_configuration() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"router-fixture","dependencies":{"@tanstack/react-router":"1.0.0"}}"#,
+        )?;
+        std::fs::write(
+            root.join("vite.config.ts"),
+            "export default { virtualRouteConfig: { type: 'root' } };\n",
+        )?;
+        std::fs::write(root.join("tsconfig.json"), "{}")?;
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(root.join(name), "export const value = 1;\n")?;
+        }
+        let mut config = crate::Config::default();
+        config.scan.max_unit_source_files = 1;
+        let plan = plan_analysis_units(root, &config, None)?;
+        let unit = plan
+            .executable_units()
+            .into_iter()
+            .find(|unit| unit.adapter == AnalysisAdapter::Web)
+            .unwrap();
+        let syntax = source_batch_requests(root, &config, &plan, unit, "syntax", None)?;
+        let semantic = source_batch_requests(root, &config, &plan, unit, "semantic", None)?;
+        assert!(
+            syntax[0]["auxiliary_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("vite.config.ts"))
+        );
+        assert!(semantic.len() > 1, "fixture must exercise sibling batches");
+        assert_eq!(semantic[0]["auxiliary_paths"], json!(["vite.config.ts"]));
+        assert!(
+            semantic
+                .iter()
+                .skip(1)
+                .all(|request| request["auxiliary_paths"] == json!([]))
+        );
+        assert!(semantic.iter().all(|request| {
+            !request["source_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("vite.config.ts"))
+        }));
+        Ok(())
+    }
 
     #[test]
     fn source_batches_partition_syntax_and_keep_go_semantics_in_one_context() -> Result<()> {
