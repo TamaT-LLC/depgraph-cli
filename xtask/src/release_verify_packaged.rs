@@ -3020,17 +3020,33 @@ fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> R
         .filter(|value| prefixed_lowercase_sha256(value, "snapshot:sha256:"))
         .context("packaged watcher omitted its valid completed snapshot ID")?
         .to_owned();
+    let units = attempt["analysis"]["units"]
+        .as_array()
+        .context("packaged watcher omitted analysis-unit results")?;
+    let stages = units
+        .iter()
+        .filter_map(|unit| unit["stage"].as_str())
+        .collect::<BTreeSet<_>>();
     if completed["schema_version"] != depgraph_core::DAEMON_STATUS_SCHEMA_VERSION
         || attempt["status"] != "completed"
         || attempt["attempt_id"].as_str().is_none_or(str::is_empty)
         || attempt["scan_id"].as_str().is_none_or(str::is_empty)
         || completed_snapshot_id == base_snapshot_id
         || attempt.get("invalidation_plan").is_some()
-        || attempt["invalidation_summary"]["schema_version"] != "incremental-plan-v2"
-        || attempt["invalidation_summary"]["mode"] != "scoped_replacement"
-        || attempt["invalidation_summary"]["affected_profile_count"]
-            .as_u64()
-            .is_none_or(|count| count == 0)
+        || attempt.get("invalidation_summary").is_some()
+        || attempt["analysis_coverage"]["contract_version"] != "depgraph-analysis-unit-v2"
+        || attempt["analysis_coverage"]["complete"] != true
+        || attempt["analysis_coverage"]["expected_units"] != 1
+        || attempt["analysis_coverage"]["completed_units"] != 1
+        || attempt["analysis_coverage"]["semantic_complete_units"] != 1
+        || ["failed_units", "unanalysed_units", "cancelled_units"]
+            .iter()
+            .any(|field| attempt["analysis_coverage"][*field] != 0)
+        || units.len() != 2
+        || stages != BTreeSet::from(["syntax", "semantic"])
+        || units
+            .iter()
+            .any(|unit| unit["adapter"] != "web" || unit["status"] != "completed")
     {
         bail!("packaged incremental watcher returned an invalid completed attempt: {completed}");
     }
