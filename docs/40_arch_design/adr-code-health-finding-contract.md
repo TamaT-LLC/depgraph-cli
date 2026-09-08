@@ -256,6 +256,16 @@ and retried up to `MAX_HEALTH_RANGE_RESPLIT_DEPTH` (4) times; the split is
 deterministic so an interrupted and a fresh run converge on the same boundaries.
 The per-range budget is not raised to make a graph pass.
 
+Dependency loading selects the references that can match a declaration before
+materializing edges. It reads node metadata and manifest sites, resolves the
+requested Go module paths, and loads usage edges by matching target or import
+site. Matching uses exact package names and slash-delimited Go module prefixes.
+An iterative traversal retains every structural ancestor needed to determine
+the usage owner's manifest scope, including ambiguous parents and cycles.
+Distinct manifest paths and content hashes remain available for discovery and
+drift checks. Loading and matching still have independent, unchanged budgets;
+an oversized relevant graph fails without publishing a partial dependency result.
+
 Cross-range references are correct by construction: usage is decided from the
 subject's inbound rows, which are loaded with the subject range, so a target
 whose only caller sits in a later range is never reported unused. Profile

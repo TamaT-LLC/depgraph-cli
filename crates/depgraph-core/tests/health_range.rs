@@ -476,7 +476,9 @@ fn dependency_projection_budget_failure_keeps_the_ranged_diagnostics() -> Result
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     assert!(projection.work_used > 1);
-    assert_eq!(projection.snapshot.edges.len() as u64, fixture.edges);
+    // This fixture has no dependency declarations, so none of its call edges
+    // can contribute to dependency findings.
+    assert!(projection.snapshot.edges.is_empty());
     Ok(())
 }
 

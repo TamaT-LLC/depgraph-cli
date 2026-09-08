@@ -613,14 +613,14 @@ pub fn mark_partial(findings: &mut [HealthFinding], diagnostics: &HealthRangeDia
     }
 }
 
-/// The trimmed projection the dependency analyzer reads (nodes, edges, sites,
-/// profiles, coverage), loaded under its own budget.
+/// Declaration usage, structural ownership, and manifest observations loaded
+/// under the dependency phase's unchanged budget.
 pub struct RangedDependencyProjection {
     pub snapshot: GraphSnapshot,
     pub work_used: u64,
 }
 
-/// Load the dependency projection of a plain input under one range budget.
+/// Load the lossless dependency projection of a plain input under one range budget.
 ///
 /// `diagnostics` is the ranged execution state so far (the unused phase that
 /// preceded this load); a budget failure reports it unchanged so the failure
@@ -638,10 +638,10 @@ pub fn load_dependency_projection(
         ),
         is_cancelled: &mut is_cancelled,
     };
-    match store.load_health_dependency_input(identity, &mut budget) {
-        Ok((snapshot, work_used)) => Ok(RangedDependencyProjection {
+    match super::dependency_projection::load(store, identity, &mut budget) {
+        Ok(snapshot) => Ok(RangedDependencyProjection {
             snapshot,
-            work_used,
+            work_used: budget.inner.used() as u64,
         }),
         Err(error) => Err(match analysis_error(&error) {
             Some(error) => RangedHealthError::Analysis(Box::new(RangedHealthFailure {

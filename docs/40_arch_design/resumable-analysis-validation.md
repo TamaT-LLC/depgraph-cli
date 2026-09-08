@@ -193,6 +193,15 @@ checks that a plain snapshot is collected in ranges with one `scan` layer while
 a runtime-session child reports `mode: whole_snapshot`, the `runtime_sessions`
 and `scan` layers, and zero ranges.
 
+Dependency projection tests compare complete findings with the full-graph
+analyzer across Rust, Go, and Web cases. They cover Go subpackages and local
+replacement aliases, nested and ambiguous ownership, unknown parents,
+structural cycles, a 20,000-node ownership chain, duplicate findings, and
+manifest hash conflicts. A separate public fixture adds 2,000 unrelated call
+sites and edges: the full analyzer exhausts a 500-step budget, while projection
+loading and matching each complete within that same budget and retain the
+identical unused-dependency and test-only-dependency findings.
+
 The item of #467 that refers to the original private test repository cannot be
 verified from this public checkout; the maintainer must run
 `cargo run -p depgraph-core --example health_range_e2e -- --store <store> --root <repo> --report <file>`

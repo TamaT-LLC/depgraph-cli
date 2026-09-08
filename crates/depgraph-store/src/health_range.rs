@@ -1544,6 +1544,25 @@ impl Store {
         identity: &HealthInputIdentity,
         budget: &mut dyn HealthWorkBudget,
     ) -> Result<(GraphSnapshot, u64)> {
+        self.load_health_dependency_rows(identity, budget, true)
+    }
+
+    /// Load nodes and dependency declaration sites before selecting the usage
+    /// edges needed by the dependency analyzer. No edge is materialized here.
+    pub fn load_health_dependency_metadata(
+        &self,
+        identity: &HealthInputIdentity,
+        budget: &mut dyn HealthWorkBudget,
+    ) -> Result<(GraphSnapshot, u64)> {
+        self.load_health_dependency_rows(identity, budget, false)
+    }
+
+    fn load_health_dependency_rows(
+        &self,
+        identity: &HealthInputIdentity,
+        budget: &mut dyn HealthWorkBudget,
+        full: bool,
+    ) -> Result<(GraphSnapshot, u64)> {
         if !identity.is_plain() {
             bail!("health dependency input can only be loaded for a plain scan input");
         }
@@ -1565,21 +1584,29 @@ impl Store {
             &mut nodes,
         )?;
         let mut sites = Vec::new();
+        let site_filter = if full {
+            ""
+        } else {
+            " AND kind IN ('cargo_dependency', 'module_requirement', 'package_dependency',
+                          'package_peer_dependency', 'package_optional_dependency')"
+        };
         query_sites_charged(
             connection,
-            &format!("SELECT {SITE_COLUMNS} FROM sites WHERE scan_id=?1 ORDER BY id"),
+            &format!("SELECT {SITE_COLUMNS} FROM sites WHERE scan_id=?1{site_filter} ORDER BY id"),
             &[&scan_id],
             &mut work,
             &mut sites,
         )?;
         let mut edges = Vec::new();
-        query_edges_charged(
-            connection,
-            &format!("SELECT {EDGE_COLUMNS} FROM edges WHERE scan_id=?1 ORDER BY id"),
-            &[&scan_id],
-            &mut work,
-            &mut edges,
-        )?;
+        if full {
+            query_edges_charged(
+                connection,
+                &format!("SELECT {EDGE_COLUMNS} FROM edges WHERE scan_id=?1 ORDER BY id"),
+                &[&scan_id],
+                &mut work,
+                &mut edges,
+            )?;
+        }
         let work_used = work.used;
         Ok((
             GraphSnapshot {
@@ -1597,6 +1624,88 @@ impl Store {
             },
             work_used,
         ))
+    }
+
+    /// Import sites whose specifiers can contribute requested Go module usage.
+    /// Exact keys include non-Go declarations because a Go usage may still
+    /// satisfy an unscoped dependency declaration in a mixed-language graph.
+    pub fn load_health_dependency_import_sites(
+        &self,
+        identity: &HealthInputIdentity,
+        exact: &BTreeSet<String>,
+        modules: &BTreeSet<String>,
+        budget: &mut dyn HealthWorkBudget,
+    ) -> Result<Vec<SiteRecord>> {
+        if !identity.is_plain() {
+            bail!("health dependency imports require a plain scan input");
+        }
+        let mut sites = Vec::new();
+        if exact.is_empty() && modules.is_empty() {
+            return Ok(sites);
+        }
+        let exact_json = serde_json::to_string(exact)?;
+        let modules_json = serde_json::to_string(modules)?;
+        query_sites_charged(
+            &self.connection,
+            &format!(
+                "SELECT {SITE_COLUMNS} FROM sites
+                  WHERE scan_id=?1 AND kind IN ('import', 'side_effect_import')
+                    AND (specifier IN (SELECT value FROM json_each(?2))
+                         OR EXISTS (SELECT 1 FROM json_each(?3) AS module
+                                     WHERE substr(CAST(specifier AS BLOB), 1, length(CAST(module.value AS BLOB))+1)
+                                           =CAST(module.value || '/' AS BLOB)))
+                  ORDER BY id"
+            ),
+            &[&identity.base_scan_id, &exact_json, &modules_json],
+            budget,
+            &mut sites,
+        )?;
+        Ok(sites)
+    }
+
+    /// Read a bounded batch of usage edges by target (or Go alias site), or
+    /// structural parents by child. Callers maintain the traversal frontier;
+    /// the indexed queries never load unrelated edge records.
+    pub fn load_health_dependency_edges(
+        &self,
+        identity: &HealthInputIdentity,
+        ids: &[String],
+        by_site: bool,
+        structural: bool,
+        budget: &mut dyn HealthWorkBudget,
+    ) -> Result<Vec<EdgeRecord>> {
+        if !identity.is_plain() || ids.len() > SQL_BATCH_SIZE || (by_site && structural) {
+            bail!("invalid health dependency edge batch");
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let column = if by_site { "site_id" } else { "target" };
+        let index = if by_site {
+            "edges_scan_site"
+        } else {
+            "edges_scan_target"
+        };
+        let kinds = if structural {
+            "kind IN ('contains', 'declares')"
+        } else {
+            "kind NOT IN ('depends_on', 'build_depends_on', 'contains', 'declares')"
+        };
+        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&identity.base_scan_id];
+        parameters.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let mut edges = Vec::new();
+        query_edges_charged(
+            &self.connection,
+            &format!(
+                "SELECT {EDGE_COLUMNS} FROM edges INDEXED BY {index} WHERE scan_id=? AND {kinds}
+                   AND {column} IN ({}) ORDER BY id",
+                placeholders(ids.len())
+            ),
+            &parameters,
+            budget,
+            &mut edges,
+        )?;
+        Ok(edges)
     }
 
     /// Drop the temporary site-target projection created by range planning.

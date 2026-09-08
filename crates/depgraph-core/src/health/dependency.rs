@@ -9,7 +9,7 @@ use super::{
 };
 use super::{HealthAnalysisError, budget::HealthAnalysisBudget};
 
-const MANIFEST_SITE_KINDS: &[&str] = &[
+pub(super) const MANIFEST_SITE_KINDS: &[&str] = &[
     "cargo_dependency",
     "module_requirement",
     "package_dependency",
@@ -691,7 +691,7 @@ fn go_requirement_usage_paths(
     Ok(paths.into_iter().collect())
 }
 
-fn is_go_module_path(path: &str) -> bool {
+pub(super) fn is_go_module_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('.')
         && !path.starts_with('/')
@@ -757,7 +757,7 @@ fn is_production_declaration(site: &SiteRecord) -> bool {
         && site.condition.get("kind").and_then(|value| value.as_str()) != Some("dev")
 }
 
-fn package_name(node: &NodeRecord) -> Option<String> {
+pub(super) fn package_name(node: &NodeRecord) -> Option<String> {
     if is_go_node(node) {
         // Go package declarations use a short package_name (for example
         // "http"), while go.mod requirements and import usage are keyed by
@@ -799,7 +799,7 @@ fn manifest_path_for(node: &NodeRecord, site_kind: &str) -> String {
     }
 }
 
-fn canonical_manifest_scope(path: &str) -> Option<String> {
+pub(super) fn canonical_manifest_scope(path: &str) -> Option<String> {
     let path = path.strip_prefix("./").unwrap_or(path);
     if path.is_empty()
         || path.starts_with('/')
@@ -952,6 +952,173 @@ mod tests {
 
     use super::*;
     use crate::health::{BlockerKind, Confidence};
+
+    /// Run every dependency scenario through the SQL projection as well as
+    /// the full graph, comparing the complete finding payloads.
+    fn analyze_dependencies(
+        snapshot: &GraphSnapshot,
+        manifests: &[ManifestIdentity],
+    ) -> Vec<HealthFinding> {
+        let expected = super::analyze_dependencies(snapshot, manifests);
+        let projected = project_snapshot(snapshot, 1_000_000);
+        assert_eq!(
+            manifest_paths_cancellable(snapshot, usize::MAX, || false).unwrap(),
+            manifest_paths_cancellable(&projected, usize::MAX, || false).unwrap(),
+        );
+        assert_eq!(expected, super::analyze_dependencies(&projected, manifests));
+        expected
+    }
+
+    fn project_snapshot(snapshot: &GraphSnapshot, maximum_work: u64) -> GraphSnapshot {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = depgraph_store::Store::open(temporary.path().join("graph.sqlite")).unwrap();
+        store
+            .start_scan(&snapshot.scan.id, temporary.path(), false)
+            .unwrap();
+        let mut seq = 0_u64;
+        for (event, key, records) in [
+            (
+                "profile_declared",
+                "profile",
+                serde_json::to_value(&snapshot.profiles).unwrap(),
+            ),
+            (
+                "node_upsert",
+                "node",
+                serde_json::to_value(&snapshot.nodes).unwrap(),
+            ),
+            (
+                "dependency_site",
+                "site",
+                serde_json::to_value(&snapshot.sites).unwrap(),
+            ),
+            (
+                "edge_upsert",
+                "edge",
+                serde_json::to_value(&snapshot.edges).unwrap(),
+            ),
+        ] {
+            for record in records.as_array().unwrap() {
+                seq += 1;
+                let mut payload = json!({
+                    "event": event, "protocol_version": "1.0", "scan_id": snapshot.scan.id,
+                    "adapter": "dependency-fixture", "adapter_version": "1.0", "seq": seq,
+                });
+                payload[key] = record.clone();
+                store.ingest_event(&payload).unwrap();
+            }
+        }
+        for profile in &snapshot.profiles {
+            if let Some(coverage) = &profile.coverage {
+                seq += 1;
+                store.ingest_event(&json!({
+                    "event": "profile_completed", "protocol_version": "1.0", "scan_id": snapshot.scan.id,
+                    "adapter": "dependency-fixture", "adapter_version": "1.0", "seq": seq,
+                    "profile_id": profile.id, "coverage": coverage,
+                })).unwrap();
+            }
+        }
+        // Analyzer unit cases intentionally include incomplete/malformed
+        // graph references. Exercise the plain attempt loader without
+        // pretending those inputs satisfy completed-snapshot validation.
+        let identity = store
+            .resolve_health_input(depgraph_store::HealthInputSelector::Attempt(
+                &snapshot.scan.id,
+            ))
+            .unwrap();
+        let mut budget = depgraph_store::CountingHealthWorkBudget::new(maximum_work);
+        crate::health::dependency_projection::load(&store, &identity, &mut budget).unwrap()
+    }
+
+    #[test]
+    fn dependency_projection_ignores_unrelated_graph_work_without_changing_findings() {
+        let mut snapshot = graph(
+            vec![
+                package("root", "app", "Cargo.toml"),
+                package("pkg:used", "used", "Cargo.toml"),
+                package("pkg:unused", "unused", "Cargo.toml"),
+                file("owner", "tests/test.rs"),
+                file("noise", "src/noise.rs"),
+            ],
+            vec![
+                dep_site("used", "root", "used"),
+                dep_site("unused", "root", "unused"),
+            ],
+            vec![usage_edge("owner", "pkg:used")],
+        );
+        for index in 0..2_000 {
+            let mut site = dep_site(&format!("noise:{index}"), "noise", "irrelevant");
+            site.kind = "call".to_owned();
+            site.target_ids = vec!["noise".to_owned()];
+            let mut edge = usage_edge("noise", "noise");
+            edge.id = format!("noise:{index}");
+            edge.site_id = Some(site.id.clone());
+            snapshot.sites.push(site);
+            snapshot.edges.push(edge);
+        }
+        let manifests = vec![ManifestIdentity {
+            path: "Cargo.toml".to_owned(),
+            digest: "fixed".to_owned(),
+            declared: BTreeSet::from(["used".to_owned(), "unused".to_owned()]),
+            drifted: false,
+        }];
+        let expected = super::analyze_dependencies(&snapshot, &manifests);
+        assert!(
+            expected
+                .iter()
+                .any(|finding| finding.kind == FindingKind::TestOnlyDependency)
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|finding| finding.kind == FindingKind::UnusedDependency)
+        );
+        assert_eq!(
+            analyze_dependencies_cancellable(&snapshot, &manifests, 100, 500, || false),
+            Err(HealthAnalysisError::ResourceExhausted)
+        );
+        let projected = project_snapshot(&snapshot, 500);
+        assert_eq!(projected.edges.len(), 1);
+        assert_eq!(projected.sites.len(), 2);
+        assert_eq!(
+            expected,
+            analyze_dependencies_cancellable(&projected, &manifests, 100, 500, || false).unwrap()
+        );
+    }
+
+    #[test]
+    fn dependency_projection_preserves_manifest_paths_and_conflicting_hashes() {
+        let mut nodes = Vec::new();
+        for (id, hash) in [
+            ("first", "sha256:a"),
+            ("duplicate", "sha256:a"),
+            ("conflict", "sha256:b"),
+        ] {
+            let mut node = file(id, "nested/go.mod");
+            node.properties["manifest_path"] = json!("nested/go.mod");
+            node.properties["content_hash"] = json!(hash);
+            // content_hash takes precedence over content_digest in drift checks.
+            node.properties["content_digest"] = json!("sha256:ignored");
+            nodes.push(node);
+        }
+        let mut discovered = file("discovered", "other/source.go");
+        discovered.properties["manifest_path"] = json!("other/go.mod");
+        nodes.push(discovered);
+        let snapshot = graph(nodes, Vec::new(), Vec::new());
+        let projected = project_snapshot(&snapshot, 500);
+        assert_eq!(projected.nodes.len(), 3);
+        assert_eq!(
+            manifest_paths_cancellable(&projected, 500, || false).unwrap(),
+            BTreeSet::from(["nested/go.mod".to_owned(), "other/go.mod".to_owned()])
+        );
+        let hashes: BTreeSet<_> = projected
+            .nodes
+            .iter()
+            .filter(|node| node.properties["path"] == "nested/go.mod")
+            .map(|node| node.properties["content_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(hashes, BTreeSet::from(["sha256:a", "sha256:b"]));
+    }
 
     fn empty_scan() -> ScanRecord {
         ScanRecord {
