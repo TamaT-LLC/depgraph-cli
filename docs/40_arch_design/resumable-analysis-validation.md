@@ -400,3 +400,10 @@ The integration fixture complements these focused checks:
 
 Worker unit tests and the existing Rust workspace, Go race/vet, Web quality,
 protocol/schema, and release compatibility gates remain part of validation.
+
+The fixed release query still returns no rows and remains identical across
+checkout-equivalent scans. Its pinned native digests must be regenerated when
+the canonical analysis graph changes. The manual CI input
+`extra_native_packages` adds Linux ARM64 and Intel macOS package validation to
+the regular Linux x64, Apple Silicon macOS, and Windows checks; it does not
+publish release artifacts or skip any compatibility assertion.

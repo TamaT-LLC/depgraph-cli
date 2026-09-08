@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      extra_native_packages:
+        description: Verify Linux ARM64 and Intel macOS release packages as well
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -1370,3 +1375,43 @@ jobs:
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e
       - run: cargo xtask rust-semantic-e2e
+
+  extra-native-package:
+    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
+      - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'workflow_dispatch' }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.1
+          cache-dependency-path: workers/go/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.0
+          standalone: false
+      - name: Verify the additional native release package
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask package

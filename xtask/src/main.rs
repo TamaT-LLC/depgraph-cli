@@ -212,9 +212,9 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:b48c42ce3b8b8b1223ff83265b7d5549b38357df63134f4774443e9109c4d93c",
-        query_result_digest: "bounded-query-result:sha256:994d092cbaf879f6c6faa0550c68faa2f534f93dbd6ece60bfa12509da4c17fa",
-        query_output_sha256: "36bbc8df8104205d479ed659007310d4b007aa2c1ae3bb6ca13440bdd79ec739",
+        query_plan_digest: "bounded-query-plan:sha256:1c5e2f8ec9d8dbc02df553a3ac1ab6d43e837b99fad53a2e86bea307c2a15ca3",
+        query_result_digest: "bounded-query-result:sha256:19925403e94395996991eb785cbd8f0bc71eb3167ed75737c01ff3d35181ea53",
+        query_output_sha256: "3383aa72ca33dbad8c716571be17ce344323380de6c81430a64efd1d25053c26",
         profile_plan_digest: "profile-selection-plan:sha256:10f4c03150c9626bb7e96d0fc7975d38d0c0a831b1de1c8f9d407efd30551a9c",
         profile_plan_output_sha256: "b9763738ac03eea4826ba3a7d25d8be0a4c1c85a74d46e392706fbc393f8baec",
     },
