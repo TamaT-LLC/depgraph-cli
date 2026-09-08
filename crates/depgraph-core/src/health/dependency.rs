@@ -699,7 +699,7 @@ pub(super) fn is_go_module_path(path: &str) -> bool {
         && !path.contains(':')
 }
 
-fn is_go_node(node: &NodeRecord) -> bool {
+pub(super) fn is_go_node(node: &NodeRecord) -> bool {
     node.properties
         .get("language")
         .and_then(serde_json::Value::as_str)
@@ -1047,10 +1047,14 @@ mod tests {
             vec![usage_edge("owner", "pkg:used")],
         );
         for index in 0..2_000 {
-            let mut site = dep_site(&format!("noise:{index}"), "noise", "irrelevant");
+            let node_id = format!("noise-node:{index}");
+            let mut node = file(&node_id, &format!("src/noise-{index}.rs"));
+            node.properties["content_hash"] = json!(format!("sha256:noise-{index}"));
+            snapshot.nodes.push(node);
+            let mut site = dep_site(&format!("noise:{index}"), &node_id, "irrelevant");
             site.kind = "call".to_owned();
-            site.target_ids = vec!["noise".to_owned()];
-            let mut edge = usage_edge("noise", "noise");
+            site.target_ids = vec![node_id.clone()];
+            let mut edge = usage_edge(&node_id, &node_id);
             edge.id = format!("noise:{index}");
             edge.site_id = Some(site.id.clone());
             snapshot.sites.push(site);
@@ -1118,6 +1122,122 @@ mod tests {
             .map(|node| node.properties["content_hash"].as_str().unwrap())
             .collect();
         assert_eq!(hashes, BTreeSet::from(["sha256:a", "sha256:b"]));
+    }
+
+    #[test]
+    fn dependency_projection_preserves_package_precedence_and_literal_prefixes() {
+        for (properties, specifier, alias, used) in [
+            (
+                json!({"language":"go", "import_path":"example.test/used/sub", "name":"wrong"}),
+                "example.test/used",
+                false,
+                true,
+            ),
+            (
+                json!({"ecosystem":"go", "import_path":42, "package_path":"example.test/used/sub", "name":"wrong"}),
+                "example.test/used",
+                false,
+                true,
+            ),
+            (
+                json!({"language":"go", "package_path":{}, "module_path":"example.test/used/sub"}),
+                "example.test/used",
+                false,
+                true,
+            ),
+            (json!({"name":42, "package":"used"}), "used", false, true),
+            (
+                json!({"name":{}, "package":false, "package_name":17, "module_path":"used"}),
+                "used",
+                false,
+                true,
+            ),
+            (
+                json!({"name":"wrong", "package":"used"}),
+                "used",
+                false,
+                false,
+            ),
+            (
+                json!({"language":"go", "import_path":"wrong", "package_path":"example.test/used/sub"}),
+                "example.test/used",
+                false,
+                false,
+            ),
+            (
+                json!({"language":"go", "package_path":"example.test/used-other/sub"}),
+                "example.test/used",
+                false,
+                false,
+            ),
+            (
+                json!({"language":"go", "package_path":"example.test/u_%é\u{0}x/sub"}),
+                "example.test/u_%é\u{0}x",
+                false,
+                true,
+            ),
+            (
+                json!({"language":"go", "package_path":"example.test/replacement/sub"}),
+                "example.test/u_%é\u{0}x",
+                true,
+                true,
+            ),
+        ] {
+            let mut target = file("target", "src/target.go");
+            target.kind = "symbol".to_owned();
+            target.properties = properties;
+            let go = is_go_node(&target);
+            let (language, manifest, kind) = if go {
+                ("go", "go.mod", "module_requirement")
+            } else {
+                ("rust", "Cargo.toml", "cargo_dependency")
+            };
+            let mut sites = vec![ecosystem_site(
+                "declaration",
+                "app",
+                kind,
+                "profile",
+                specifier,
+                "target",
+                json!({}),
+            )];
+            let mut edge = ecosystem_usage_edge("usage", "owner", "target", "profile");
+            if alias {
+                sites.push(ecosystem_site(
+                    "alias",
+                    "owner",
+                    "import",
+                    "profile",
+                    &format!("{specifier}/sub"),
+                    "target",
+                    json!({}),
+                ));
+                edge.site_id = Some("alias".to_owned());
+            }
+            let snapshot = ecosystem_graph(
+                ecosystem_profile("profile", language),
+                vec![
+                    ecosystem_package("app", "example.test/app", manifest, language),
+                    ecosystem_file_with_manifest("owner", "src/main.go", language, manifest),
+                    target,
+                ],
+                sites,
+                vec![edge],
+            );
+            let findings = analyze_dependencies(
+                &snapshot,
+                &[ManifestIdentity {
+                    path: manifest.to_owned(),
+                    digest: "fixed".to_owned(),
+                    declared: BTreeSet::from([specifier.to_owned()]),
+                    drifted: false,
+                }],
+            );
+            assert_eq!(findings.is_empty(), used);
+            if !used {
+                assert_eq!(findings[0].kind, FindingKind::UnusedDependency);
+            }
+        }
     }
 
     fn empty_scan() -> ScanRecord {

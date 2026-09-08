@@ -26,8 +26,8 @@ use depgraph_core::{
     },
     service::{
         DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-        DepgraphServiceLimits, HealthFindingsRequest, HealthSummaryRequest, MAX_HEALTH_FINDINGS,
-        SnapshotLocator, health_range_limits,
+        DepgraphServiceLimits, HealthFindingGetRequest, HealthFindingsRequest,
+        HealthSummaryRequest, MAX_HEALTH_FINDINGS, SnapshotLocator, health_range_limits,
     },
 };
 use depgraph_store::{
@@ -1106,6 +1106,96 @@ fn service(fixture: &HealthRangeFixture) -> Result<DepgraphService> {
         DepgraphCapabilitySet::read_only(),
         DepgraphServiceLimits::default(),
     )?))
+}
+
+#[test]
+fn service_summarizes_more_than_one_response_of_findings_and_gets_ids_past_the_first_page()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let fixture = generate(
+        temporary.path(),
+        &HealthRangeFixtureShape {
+            packages: 2,
+            files: 1,
+            symbols: MAX_HEALTH_FINDINGS / 2 + 100,
+            profiles: 1,
+            cross_percent: 1,
+            ..HealthRangeFixtureShape::small()
+        },
+    )?;
+    let store = open(&fixture)?;
+    let snapshot = store.load_completed_snapshot(&fixture.snapshot_id)?;
+    let mut control = analyze_unused_cancellable(&snapshot, usize::MAX, usize::MAX, || false)?;
+    control.sort_by(|left, right| left.id.cmp(&right.id));
+    assert!(control.len() > MAX_HEALTH_FINDINGS);
+
+    let service = service(&fixture)?;
+    let cancellation = CancellationToken::new();
+    let mut request =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let summary = service.health_summary(
+        &mut request,
+        &HealthSummaryRequest::try_new(None)?,
+        &cancellation,
+    )?;
+    assert_eq!(
+        summary.counts_by_kind().values().sum::<u64>(),
+        control.len() as u64
+    );
+    assert_eq!(
+        summary.counts_by_confidence().values().sum::<u64>(),
+        control.len() as u64
+    );
+    assert!(!summary.partial());
+    assert!(
+        summary.diagnostics().ranges.resplit > 0,
+        "the unchanged per-range finding cap must split the range"
+    );
+    let identity = depgraph_core::health::CollectionIdentity {
+        snapshot_ids: vec![fixture.snapshot_id.clone()],
+        manifest_digest: summary.manifest_digest().map(str::to_owned),
+        changed_oid: None,
+        changed_set_digest: None,
+        churn_start_oid: None,
+        churn_commit_limit: None,
+        churn_path_filter: Vec::new(),
+        hotspot_weights: None,
+        partial_ranges: None,
+    };
+    assert_eq!(
+        summary.collection_digest(),
+        depgraph_core::health::collection_digest(
+            &identity,
+            &control
+                .iter()
+                .map(|finding| finding.id.clone())
+                .collect::<Vec<_>>()
+        )
+    );
+    let page = service.health_findings(
+        &mut request,
+        &HealthFindingsRequest::try_new(Vec::new(), Vec::new(), Vec::new(), MAX_HEALTH_FINDINGS)?,
+        &cancellation,
+    )?;
+    assert_eq!(page.findings(), &control[..MAX_HEALTH_FINDINGS]);
+    let last = control.last().unwrap();
+    let detail = service.health_finding_get(
+        &mut request,
+        &HealthFindingGetRequest::try_new(&last.id)?,
+        &cancellation,
+    )?;
+    assert_eq!(&detail.finding, last);
+    let reused = service.health_summary(
+        &mut request,
+        &HealthSummaryRequest::try_new(None)?,
+        &cancellation,
+    )?;
+    assert_eq!(reused.collection_digest(), summary.collection_digest());
+    assert_eq!(
+        reused.diagnostics().ranges.reused,
+        reused.diagnostics().ranges.total
+    );
+    Ok(())
 }
 
 #[test]

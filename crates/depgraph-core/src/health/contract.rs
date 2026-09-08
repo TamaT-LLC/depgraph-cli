@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use depgraph_protocol::{canonical_json, stable_id_from_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use super::hotspot::HotspotFindingScores;
 
@@ -486,6 +487,44 @@ pub fn collection_digest(identity: &CollectionIdentity, finding_ids: &[String]) 
         "collection:sha256:{}",
         hex_digest(&canonical_json(&payload))
     )
+}
+
+/// Canonical collection digest for an already sorted, unique ID stream.
+/// It writes the same bytes as `collection_digest` without retaining all IDs
+/// or constructing another complete JSON array.
+pub(crate) struct CollectionDigestBuilder {
+    digest: Sha256,
+    first: bool,
+    input: String,
+}
+
+impl CollectionDigestBuilder {
+    pub(crate) fn new(identity: &CollectionIdentity) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"{\"contract\":");
+        digest.update(canonical_json(&json!(HEALTH_FINDING_CONTRACT_VERSION)));
+        digest.update(b",\"finding_ids\":[");
+        Self {
+            digest,
+            first: true,
+            input: canonical_json(&json!(identity)),
+        }
+    }
+
+    pub(crate) fn push(&mut self, id: &str) {
+        if !self.first {
+            self.digest.update(b",");
+        }
+        self.first = false;
+        self.digest.update(canonical_json(&json!(id)));
+    }
+
+    pub(crate) fn finish(mut self) -> String {
+        self.digest.update(b"],\"input\":");
+        self.digest.update(self.input);
+        self.digest.update(b"}");
+        format!("collection:sha256:{}", hex::encode(self.digest.finalize()))
+    }
 }
 
 /// Compute an audit collection digest while binding the scope's pinned

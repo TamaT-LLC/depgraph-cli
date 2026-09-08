@@ -202,6 +202,22 @@ sites and edges: the full analyzer exhausts a 500-step budget, while projection
 loading and matching each complete within that same budget and retain the
 identical unused-dependency and test-only-dependency findings.
 
+Dependency loading also projects node ownership in SQL, retaining package
+nodes and the ancestors needed by dependency sources and targets. Unrelated
+symbol bodies do not consume the dependency loader's row budget. The public
+projection tests preserve nested ownership and conservative ambiguity handling.
+
+The ranged service streams finding bodies into a bounded response selector.
+The 10,000-finding limit still applies to each range and list response; summary
+counts and collection digests cover every completed range. Compact IDs are
+sorted through temporary files with at most 16 input files per merge, and a
+duplicate ID fails the collection even when its kind is filtered out. A detail
+request can retrieve an ID beyond the first list page. The public large-result
+test compares counts, the digest, the first page, and a later ID against the
+whole-graph oracle and verifies checkpoint reuse. Unit tests cover multiple
+merge passes, escaped IDs, corruption, cancellation cleanup, and partial-result
+confidence filtering with bounded retained pages.
+
 The item of #467 that refers to the original private test repository cannot be
 verified from this public checkout; the maintainer must run
 `cargo run -p depgraph-core --example health_range_e2e -- --store <store> --root <repo> --report <file>`

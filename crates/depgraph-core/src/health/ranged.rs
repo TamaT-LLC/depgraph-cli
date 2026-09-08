@@ -366,7 +366,45 @@ pub fn analyze_unused_ranged(
     store: &Store,
     identity: &HealthInputIdentity,
     options: RangedUnusedOptions<'_>,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<RangedUnusedOutcome, RangedHealthError> {
+    let maximum_findings = options.maximum_findings;
+    let mut findings = Vec::new();
+    let mut outcome = analyze_unused_ranged_to(store, identity, options, is_cancelled, |batch| {
+        findings.extend(batch);
+        Ok(())
+    })?;
+    findings.sort_by(|left, right| left.id.cmp(&right.id));
+    let error = if findings.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        Some(HealthAnalysisError::Integrity)
+    } else if findings.len() > maximum_findings {
+        Some(HealthAnalysisError::ResourceExhausted)
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        return Err(RangedHealthError::Analysis(Box::new(RangedHealthFailure {
+            error,
+            diagnostics: outcome.diagnostics,
+        })));
+    }
+    if outcome.diagnostics.partial {
+        mark_partial(&mut findings, &outcome.diagnostics);
+    }
+    outcome.findings = findings;
+    Ok(outcome)
+}
+
+/// Consume each completed range before loading the next. The consumer must
+/// reject duplicate IDs and apply the final partial status before publishing.
+/// `maximum_findings` still bounds every analyzed range; the returned findings
+/// are empty because their ownership has transferred to the sink.
+pub(crate) fn analyze_unused_ranged_to(
+    store: &Store,
+    identity: &HealthInputIdentity,
+    options: RangedUnusedOptions<'_>,
     mut is_cancelled: impl FnMut() -> bool,
+    mut sink: impl FnMut(Vec<HealthFinding>) -> anyhow::Result<()>,
 ) -> Result<RangedUnusedOutcome, RangedHealthError> {
     let RangedUnusedOptions {
         limits,
@@ -442,7 +480,6 @@ pub fn analyze_unused_ranged(
         .map(|range| (range, 0_u8))
         .collect::<VecDeque<_>>();
     let mut next_index = plan.ranges.len() as u32;
-    let mut completed = Vec::<RangeRun>::new();
     let mut stop = None::<HealthAnalysisError>;
     while let Some((range, depth)) = queue.pop_front() {
         if is_cancelled() {
@@ -476,11 +513,7 @@ pub fn analyze_unused_ranged(
                     reused: true,
                 });
             }
-            completed.push(RangeRun {
-                findings: payload.findings,
-                subjects_analyzed: payload.subjects_analyzed,
-                work_used: payload.work_used,
-            });
+            sink(payload.findings).map_err(RangedHealthError::Store)?;
             continue;
         }
         let step = run_range(
@@ -517,7 +550,7 @@ pub fn analyze_unused_ranged(
                         reused: false,
                     });
                 }
-                completed.push(run);
+                sink(run.findings).map_err(RangedHealthError::Store)?;
             }
             RangeStep::Overrun => {
                 let halves = if depth < limits.max_resplit_depth
@@ -555,20 +588,6 @@ pub fn analyze_unused_ranged(
         }
     }
 
-    // Phase 3: merge. Ranges are disjoint id intervals, so a duplicate finding
-    // id is an integrity failure rather than something to dedupe silently.
-    let mut findings = Vec::new();
-    for run in completed {
-        findings.extend(run.findings);
-    }
-    findings.sort_by(|left, right| left.id.cmp(&right.id));
-    if findings.windows(2).any(|pair| pair[0].id == pair[1].id) {
-        return Err(fail(HealthAnalysisError::Integrity, diagnostics));
-    }
-    if findings.len() > maximum_findings {
-        return Err(fail(HealthAnalysisError::ResourceExhausted, diagnostics));
-    }
-
     let incomplete = diagnostics.ranges.failed + diagnostics.ranges.interrupted;
     if incomplete > 0 {
         let error = stop.unwrap_or(HealthAnalysisError::ResourceExhausted);
@@ -576,11 +595,10 @@ pub fn analyze_unused_ranged(
             return Err(fail(error, diagnostics));
         }
         diagnostics.partial = true;
-        mark_partial(&mut findings, &diagnostics);
     }
     diagnostics.peak_rss_kib = peak_rss_kib();
     Ok(RangedUnusedOutcome {
-        findings,
+        findings: Vec::new(),
         diagnostics,
         scan: global_input.scan,
         coverage: global_input.coverage,
