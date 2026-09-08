@@ -91,6 +91,7 @@ const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSE_PATHS: [&str; 2] = ["LICENSE-APACHE", "LICENSE-MIT"];
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "analysis-source-batch-v1",
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
     "framework-semantic-graph-v1",

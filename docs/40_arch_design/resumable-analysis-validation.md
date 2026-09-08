@@ -292,6 +292,20 @@ Its result must match a fresh scan after the edit. Go's no-follow, loader,
 fingerprint, and race tests run in the regular Linux CI job and the macOS
 leg of full CI. These public regressions supplement the original-target completion requirement above.
 
+The Web integration fixture also checks projects with several frameworks.
+Each source-batch profile declares only the frameworks in its projected
+completeness ledger; TypeChecker counters exclude framework-specific records.
+An incomplete framework ledger prevents semantic-complete coverage and keeps
+its diagnostic reason. Nested units accept repository-root workspace manifests
+while rejecting sibling manifests and traversal paths. The worker, core, and
+packager agree on the `analysis-source-batch-v1` capability.
+
+Canonical exports retain logical profiles and graph counts. Per-execution
+counters stay in validated worker/checkpoint streams, so the integration gate
+checks graph evidence, profile memberships, coverage, and diagnostics rather
+than requiring those counters on canonical profiles. It also compares exports
+from independent checkouts.
+
 ## Acceptance matrix
 
 The matrix maps the six child issues (#459, #462, #463, #465, #466, #467)

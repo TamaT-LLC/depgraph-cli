@@ -68,7 +68,7 @@ function isAnalysisAuxiliaryPath(relativePath: string): boolean {
 
 function isAncestorWorkspaceManifest(relativePath: string, unitRoot: string): boolean {
   const directory = path.posix.dirname(relativePath.replaceAll("\\", "/"));
-  if (unitRoot === "." || !(unitRoot === directory || unitRoot.startsWith(`${directory}/`))) return false;
+  if (unitRoot === "." || path.posix.relative(directory, unitRoot).split("/").includes("..")) return false;
   const basename = path.basename(relativePath);
   return basename === "package.json" || basename === "pnpm-workspace.yaml" || basename === "pnpm-workspace.yml";
 }

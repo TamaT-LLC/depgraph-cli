@@ -3417,7 +3417,15 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .context("packaged Web semantic export has no graph")?;
     let profile = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile["language"] == "web"
+                    && profile["properties"]["analysis_stage"] == "semantic"
+                    && profile["features"]
+                        .as_array()
+                        .is_some_and(|features| features.iter().any(|feature| feature == "next"))
+            })
+        })
         .context("packaged Web semantic export has no Web profile")?;
     let properties = &profile["properties"];
     for (property, expected) in [
@@ -3435,7 +3443,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             "typescript_semantic_graph_emission",
             "definition-import-type-call-graph-v2",
         ),
-        ("typescript_semantic_issue_count", "0"),
+        ("analysis_unit_contract", "depgraph-analysis-unit-v2"),
         ("typescript_release_gate", "release-gate-verified"),
     ] {
         if properties[property] != expected {
@@ -3836,30 +3844,32 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 );
             }
         }
-        if kind == "web_import" && primary["properties"]["module_specifier"] == "node:fs" {
+        if kind == "web_import" && primary["properties"]["module_specifier"] == "node:fs/promises" {
             saw_node_builtin = true;
             let target = target_ids
                 .first()
                 .and_then(|target| nodes_by_id.get(target))
-                .context("packaged Web node:fs site target node is missing")?;
+                .context("packaged Web node:fs/promises site target node is missing")?;
             if kind != "web_import"
-                || site["specifier"] != "node:fs"
+                || site["specifier"] != "node:fs/promises"
                 || type_only != Some(false)
                 || status != "external"
                 || precision != "exact"
                 || target_ids.len() != 1
                 || !site["reason"].is_null()
                 || target["kind"] != "external_system"
-                || target["locator"] != "external://typescript/node%3Afs"
-                || target["display_name"] != "node:fs"
+                || target["locator"] != "external://typescript/node%3Afs%2Fpromises"
+                || target["display_name"] != "node:fs/promises"
                 || target["properties"]["canonical_identity"]
                     != json!({
                         "language": "typescript",
                         "compiler_version": "7.0.2",
-                        "locator": "node:fs",
+                        "locator": "node:fs/promises",
                     })
             {
-                bail!("packaged Web node:fs import lost its exact canonical builtin identity");
+                bail!(
+                    "packaged Web node:fs/promises import lost its exact canonical builtin identity"
+                );
             }
         }
         let expected_edge_kind = match kind {
@@ -3929,7 +3939,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .context("packaged Web external site target node is missing")?;
             if target["kind"] != "external_system"
                 || target["properties"]["language"] != "typescript"
-                || target["properties"]["profile_id"] != site["profile_id"]
+                || !(target["properties"]["profile_id"] == site["profile_id"]
+                    || target["properties"]["profile_ids"]
+                        .as_array()
+                        .is_some_and(|profiles| profiles.contains(&site["profile_id"])))
                 || target["properties"]["compiler_version"] != "7.0.2"
                 || target["properties"]["external"] != true
                 || target["properties"]["workspace"] == true
@@ -3943,7 +3956,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .context("packaged Web unresolved site target node is missing")?;
             if target["kind"] != "unknown_target"
                 || target["properties"]["language"] != "web"
-                || target["properties"]["profile_id"] != site["profile_id"]
+                || !(target["properties"]["profile_id"] == site["profile_id"]
+                    || target["properties"]["profile_ids"]
+                        .as_array()
+                        .is_some_and(|profiles| profiles.contains(&site["profile_id"])))
             {
                 bail!("packaged Web unresolved site {site_id} has an invalid unknown sentinel");
             }
@@ -4022,7 +4038,9 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         bail!("packaged Web semantic sites did not cover both type-only and runtime occurrences");
     }
     if !saw_node_builtin {
-        bail!("packaged Web semantic sites omitted the node:fs builtin acceptance fixture");
+        bail!(
+            "packaged Web semantic sites omitted the node:fs/promises builtin acceptance fixture"
+        );
     }
     if !saw_empty_import || !saw_empty_reexport {
         bail!("packaged Web semantic sites omitted empty import/re-export acceptance fixtures");
@@ -4048,11 +4066,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             semantic_call_site_count,
         ),
     ] {
-        let declared = properties[property]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared != Some(actual) {
-            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        // Raw execution counters are checked before canonical ingestion.
+        // Logical exports omit them and derive totals from graph records.
+        if properties.get(property).is_some() || actual == 0 {
+            bail!(
+                "packaged canonical Web profile retained {property} or omitted its graph records ({actual})"
+            );
         }
     }
 
@@ -4193,11 +4212,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             all_framework_edges.len(),
         ),
     ] {
-        let declared = properties[property]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared != Some(actual) || actual == 0 {
-            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        // Raw execution counters are checked before canonical ingestion.
+        // Logical exports omit them and derive totals from graph records.
+        if properties.get(property).is_some() || actual == 0 {
+            bail!(
+                "packaged canonical Web profile retained {property} or omitted its graph records ({actual})"
+            );
         }
     }
     let framework_kinds: BTreeSet<_> = framework_edges
@@ -5198,10 +5218,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     if profile["properties"]["web_framework_completeness_capability"]
         != "framework-semantic-completeness-v1"
         || profile["properties"]["web_framework_completeness_status"] != "incomplete"
-        || profile["properties"]["web_framework_completeness_issue_count"]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok())
-            != Some(framework_issue_count)
+        || profile["properties"]
+            .get("web_framework_completeness_issue_count")
+            .is_some()
+        || framework_issue_count == 0
         || framework_ledger.len() != framework_features.len()
         || framework_ledger.iter().any(|entry| {
             entry["status"] != "incomplete" || entry["reasons"].as_array().is_none_or(Vec::is_empty)
@@ -5486,7 +5506,12 @@ fn verify_packaged_web_semantic_complete(
         .context("packaged pure TypeScript semantic-complete export has no graph")?;
     let profile = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile["language"] == "web"
+                    && profile["properties"]["analysis_stage"] == "semantic"
+            })
+        })
         .context("packaged pure TypeScript semantic-complete export has no Web profile")?;
     let properties = &profile["properties"];
     if !profile["features"].as_array().is_some_and(Vec::is_empty)
@@ -5499,13 +5524,19 @@ fn verify_packaged_web_semantic_complete(
         || properties["typescript_definition_graph_status"] != "ready"
         || properties["typescript_semantic_graph_emission"]
             != "definition-import-type-call-graph-v2"
-        || properties["typescript_semantic_diagnostics"] != "0"
-        || properties["typescript_emitted_semantic_diagnostics"] != "0"
-        || properties["typescript_semantic_issue_count"] != "0"
+        || properties["analysis_unit_contract"] != "depgraph-analysis-unit-v2"
+        || graph["diagnostics"].as_array().is_none_or(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic["properties"]["typescript_semantic_scaffold"] == true
+                    || diagnostic["properties"]["typescript_dependency_issue"] == true
+            })
+        })
         || properties["web_framework_completeness_capability"]
             != "framework-semantic-completeness-v1"
         || properties["web_framework_completeness_status"] != "not-detected"
-        || properties["web_framework_completeness_issue_count"] != "0"
+        || properties
+            .get("web_framework_completeness_issue_count")
+            .is_some()
         || properties["web_framework_completeness_ledger"] != "[]"
         || properties["project_code_executed"] != "false"
     {

@@ -255,6 +255,7 @@ const RUST_SYSROOT_COMPONENT_SHA256: &str =
 const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION;
 const RUNTIME_COLLECTOR_ARTIFACT: &str = "depgraph-runtime-collector.mjs";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "analysis-source-batch-v1",
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
     "framework-semantic-graph-v1",
@@ -7821,7 +7822,7 @@ jobs:
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.5.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
+            "depgraph-web-worker 0.5.0 (protocol 1.0; typescript 7.0.2; capabilities analysis-source-batch-v1,astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;

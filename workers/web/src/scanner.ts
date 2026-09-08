@@ -2163,6 +2163,7 @@ function analysisUnitSemanticComplete(
   request: AnalysisUnitRequest,
   coverageStats: AnalysisUnitCoverageStatistics,
   semanticDiagnostics: readonly Diagnostic[],
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): boolean {
   const blockers = [
     request.stage !== "semantic",
@@ -2171,6 +2172,7 @@ function analysisUnitSemanticComplete(
     coverageStats.counts.unresolved > 0,
     !analysisUnitNativeSemanticComplete(model),
     semanticDiagnostics.length > 0,
+    frameworkSemantic.completionStatus === "incomplete",
   ];
   return !blockers.some(Boolean);
 }
@@ -2196,16 +2198,20 @@ function projectAnalysisUnitTypeScriptSummary(
   return {
     ...model.typeScriptProject,
     semanticNodes: nodes.filter((node) => node.kind === "symbol" || node.kind === "type").length,
-    // Relation coverage includes definition and dependency edges. The
-    // emitted semantic stream exposes both, and the profile count must
-    // describe that same stream after unit projection.
-    semanticRelations: edges.filter((edge) => edge.phase === "semantic").length,
-    semanticSites: sites.filter((site) => analysisUnitSemanticEvidence(site.evidence)).length,
-    semanticCallSites: sites.filter((site) => site.kind === "call" && analysisUnitSemanticEvidence(site.evidence)).length,
+    // Match the primary TypeChecker evidence counted by the protocol gate;
+    // framework relations carry their own independent semantic counters.
+    semanticRelations: edges.filter((edge) => analysisUnitTypeScriptEvidence(edge.evidence)).length,
+    semanticSites: sites.filter((site) => analysisUnitTypeScriptEvidence(site.evidence)).length,
+    semanticCallSites: sites.filter((site) => site.kind === "call" && analysisUnitTypeScriptEvidence(site.evidence)).length,
     // The wire counter attests emitted issue records. Context-only issues
     // still prevent completion above, but are owned by another batch.
     semanticIssues: diagnostics.filter(analysisUnitHasTypeScriptIssue).length,
   };
+}
+
+function analysisUnitTypeScriptEvidence(evidence: readonly Evidence[]): boolean {
+  const primary = evidence[0];
+  return primary?.kind === "semantic" && primary.extractor === "typescript-native-typechecker";
 }
 
 function projectAnalysisUnitSemantics(
@@ -2216,6 +2222,7 @@ function projectAnalysisUnitSemantics(
   edges: readonly GraphEdge[],
   diagnostics: readonly Diagnostic[],
   coverageStats: AnalysisUnitCoverageStatistics,
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): {
   syntaxComplete: boolean;
   semanticComplete: boolean;
@@ -2232,7 +2239,7 @@ function projectAnalysisUnitSemantics(
   const typeScriptProject = projectAnalysisUnitTypeScriptSummary(model, request, nodes, sites, edges, diagnostics);
   return {
     syntaxComplete,
-    semanticComplete: analysisUnitSemanticComplete(model, request, coverageStats, semanticDiagnostics),
+    semanticComplete: analysisUnitSemanticComplete(model, request, coverageStats, semanticDiagnostics, frameworkSemantic),
     typeScriptProject,
   };
 }
@@ -2251,11 +2258,15 @@ function analysisUnitCompletenessReasons(
   counts: AnalysisUnitCoverageStatistics["counts"],
   unsupportedSyntax: number,
   skipped: number,
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): string[] {
   const reasons: string[] = [];
   appendAnalysisUnitCompletenessReason(reasons, counts.unresolved > 0, "unresolved_dependency_sites");
   appendAnalysisUnitCompletenessReason(reasons, unsupportedSyntax > 0, "unsupported_syntax");
   appendAnalysisUnitCompletenessReason(reasons, skipped > 0, "skipped_sites");
+  appendAnalysisUnitCompletenessReason(
+    reasons, frameworkSemantic.completionStatus === "incomplete", "framework_semantic_incomplete",
+  );
   appendAnalysisUnitCompletenessReason(
     reasons,
     request.stage === "semantic" && model.typeScriptProject.definitionGraphStatus === "failed",
@@ -2351,6 +2362,9 @@ function projectAnalysisUnitModel(
   const records = projectAnalysisUnitRecords(model, request);
   const diagnostics = projectAnalysisUnitDiagnostics(model, request, records.ownedPaths);
   const { files, coverageStats } = projectAnalysisUnitFiles(model, records.ownedPaths, records.sites);
+  const frameworkSemantic = projectAnalysisUnitFrameworkSemantic(
+    model, request, ownedFrameworks, records.nodes, records.sites, records.edges,
+  );
   const semantic = projectAnalysisUnitSemantics(
     model,
     request,
@@ -2359,10 +2373,12 @@ function projectAnalysisUnitModel(
     records.edges,
     diagnostics,
     coverageStats,
+    frameworkSemantic,
   );
   const { counts, unsupportedSyntax, skipped } = coverageStats;
   return {
     ...model,
+    detectedFrameworks: frameworkSemantic.completionLedger.map((entry) => entry.framework),
     nodes: records.nodes,
     sites: records.sites,
     edges: records.edges,
@@ -2374,17 +2390,10 @@ function projectAnalysisUnitModel(
         ...(semantic.syntaxComplete ? ["syntax-complete"] : []),
         ...(semantic.semanticComplete ? ["semantic-complete"] : []),
       ],
-      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped),
+      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
     },
     typeScriptProject: semantic.typeScriptProject,
-    frameworkSemantic: projectAnalysisUnitFrameworkSemantic(
-      model,
-      request,
-      ownedFrameworks,
-      records.nodes,
-      records.sites,
-      records.edges,
-    ),
+    frameworkSemantic,
   };
 }
 

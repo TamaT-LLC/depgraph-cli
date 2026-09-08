@@ -7151,7 +7151,8 @@ fn web_release_handshake_covers_the_semantic_compatibility_unit() -> Result<()> 
 
     for mismatch in [
         handshake.replace(TYPESCRIPT_COMPILER_VERSION, "9.9.9"),
-        handshake.replace("capabilities astro", "unknown astro"),
+        handshake.replace("analysis-source-batch-v1,", ""),
+        handshake.replace("capabilities ", "unknown "),
         handshake.replace(
             "astro-component-render-hydration-v1,framework-semantic-completeness-v1",
             "framework-semantic-completeness-v1,astro-component-render-hydration-v1",

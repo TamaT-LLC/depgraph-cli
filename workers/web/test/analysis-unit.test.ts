@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
   analysisUnitLogicalProfileId,
@@ -10,6 +11,7 @@ import {
   validateAnalysisUnitForRoot,
 } from "../src/analysis-unit";
 import { scan } from "../src/scanner";
+import { walkFiles } from "../src/fs";
 import type { ProgressReporter } from "../src/progress";
 import { BASE_PROFILE_ID } from "../src/types";
 
@@ -65,6 +67,49 @@ function progressRecorder(): { reporter: ProgressReporter; events: Array<{ statu
     },
   };
 }
+
+test("root workspace manifests stay bounded ancestors of nested analysis units", () => {
+  const request = {
+    contract_version: "depgraph-analysis-unit-v2",
+    unit_id: "web:nested", adapter: "web", unit_root: "apps/web",
+    source_paths: ["apps/web/index.ts"], context_paths: ["apps/web/index.ts"],
+    auxiliary_paths: ["package.json", "pnpm-workspace.yaml"],
+    stage: "syntax", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+    context_fingerprint: "a".repeat(64),
+  };
+  assert.deepEqual(parseAnalysisUnitRequest(request).auxiliary_paths, request.auxiliary_paths);
+  for (const auxiliary of ["apps/other/package.json", "tsconfig.json", "../package.json"]) {
+    assert.throws(() => parseAnalysisUnitRequest({ ...request, auxiliary_paths: [auxiliary] }));
+  }
+});
+
+test("framework analysis profiles declare exactly their projected completeness ledger", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const files = await walkFiles(root);
+  for (const stage of ["syntax", "semantic"] as const) {
+    const request = parseAnalysisUnitRequest({
+      contract_version: "depgraph-analysis-unit-v2",
+      unit_id: "web:next", adapter: "web", unit_root: "apps/next-app",
+      source_paths: ["apps/next-app/src/pages/about.tsx"],
+      context_paths: ["apps/next-app/src/pages/about.tsx"],
+      auxiliary_paths: ["apps/next-app/package.json", "package.json"],
+      stage, chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+      context_fingerprint: "b".repeat(64),
+    });
+    const model = await scan(root, files, [], undefined, request);
+    assert.deepEqual(model.detectedFrameworks, model.frameworkSemantic.completionLedger.map((entry) => entry.framework));
+    assert.deepEqual(model.detectedFrameworks, stage === "syntax" ? [] : ["next"]);
+    const primaryTypeChecker = (record: { evidence: readonly { kind: string; extractor: string }[] }): boolean => (
+      record.evidence[0]?.kind === "semantic" && record.evidence[0]?.extractor === "typescript-native-typechecker"
+    );
+    assert.equal(model.typeScriptProject.semanticRelations, model.edges.filter(primaryTypeChecker).length);
+    assert.equal(model.typeScriptProject.semanticSites, model.sites.filter(primaryTypeChecker).length);
+    if (model.frameworkSemantic.completionStatus === "incomplete") {
+      assert.ok(model.coverage.reasons.includes("framework_semantic_incomplete"));
+      assert.ok(!model.coverage.completeness.includes("semantic-complete"));
+    }
+  }
+});
 
 test("analysis-unit profiles differ by chunk while logical stage identity stays stable", () => {
   const common = {
