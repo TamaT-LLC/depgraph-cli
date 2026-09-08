@@ -8490,4 +8490,76 @@ jobs:
         write_go_loader_scope_fallback_report(None)?;
         Ok(())
     }
+
+    #[test]
+    fn issue_482_keeps_the_private_trial_as_a_required_epic_closer() {
+        let validation = include_str!("../../docs/40_arch_design/resumable-analysis-validation.md");
+        assert!(
+            !validation.contains("Not a closer blocker"),
+            "the original trial target must stay a required #464 closer"
+        );
+        assert!(
+            validation.contains("### Required private-trial closer (pending)"),
+            "the private-trial gate heading must remain"
+        );
+        assert!(
+            validation.contains("Public fixtures are necessary and not sufficient"),
+            "public fixtures must not be recorded as sufficient to close #464"
+        );
+        assert!(
+            validation.contains("cargo run -p depgraph-core --example health_range_e2e --"),
+            "the private health-range command must stay wired to the --store/--root example"
+        );
+        assert!(
+            !validation.contains("cargo xtask health-range-e2e -- --store"),
+            "the public health-range xtask does not take --store"
+        );
+
+        let required_column =
+            |row: &str| -> String { row.split('|').nth(2).unwrap_or("").trim().to_owned() };
+        let mut saw_resume = false;
+        let mut saw_optional_range_example = false;
+        for line in validation.lines() {
+            if line.contains("Same-input interrupt/resume") {
+                saw_resume = true;
+                let required = required_column(line);
+                assert!(
+                    required.starts_with("Yes"),
+                    "resume row Required? must be Yes, got {required:?}"
+                );
+            }
+            if line.contains("example health_range_e2e -- --store/--root/--report") {
+                saw_optional_range_example = true;
+                let required = required_column(line);
+                assert!(
+                    required.starts_with("No"),
+                    "the --store/--root health-range example must stay optional, got {required:?}"
+                );
+            }
+        }
+        assert!(saw_resume, "the closer table must include the resume row");
+        assert!(
+            saw_optional_range_example,
+            "the closer table must keep the optional --store/--root example as Not required"
+        );
+
+        let public_comment = validation
+            .split("**Public comment on #464**")
+            .nth(1)
+            .and_then(|rest| rest.split("**Implementation blockers.**").next())
+            .expect("public comment section");
+        let (allowlist, private) = public_comment
+            .split_once("Keep the tree")
+            .expect("allowlist vs private record");
+        assert!(
+            !allowlist.to_ascii_lowercase().contains("digest"),
+            "public allowlist must not include digests: {allowlist}"
+        );
+        assert!(
+            private.contains("`collection_digest`")
+                && private.contains("must not")
+                && private.contains("appear on the public issue"),
+            "digests must be confined to the private record"
+        );
+    }
 }

@@ -2,12 +2,15 @@
 
 - Status: Implemented
 - Date: 2026-09-06
-- Related issues: #459, #462, #463, #464, #465, #466, #467
+- Related issues: #459, #462, #463, #464, #465, #466, #467, #482
 
 The acceptance matrix in
 [resumable-analysis-validation.md](resumable-analysis-validation.md) records
 the passing pinned local gate, public integration fixture, and separate
-benchmark measurements. CI verification is required before merge.
+benchmark measurements. CI verification is required before merge. Public
+fixture evidence is necessary and not sufficient for parent #464: the
+original trial target must complete a fresh scan, ordinary health, and
+same-input resume before that epic closes.
 
 ## Decision
 

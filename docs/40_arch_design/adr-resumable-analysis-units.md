@@ -2,14 +2,17 @@
 
 - Status: Implemented
 - Date: 2026-09-06
-- Issue: #465
+- Issue: #465 (parent #464)
 - Contract: depgraph-analysis-plan-v1
 - Worker capabilities: analysis-source-batch-v1 (v2), analysis-unit-v1 (legacy Go v1)
 
 The acceptance matrix in
 [resumable-analysis-validation.md](resumable-analysis-validation.md) records
 the passing pinned local gate, public integration fixture, and separate
-benchmark measurements. CI verification is required before merge.
+benchmark measurements. CI verification is required before merge. Public
+fixture evidence is necessary and not sufficient for parent #464: the
+original trial target must complete a fresh scan, ordinary health, and
+same-input resume before that epic closes.
 
 ## Context
 
