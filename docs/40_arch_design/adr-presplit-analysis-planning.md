@@ -2,7 +2,7 @@
 
 - Status: Implemented (plan, contract, and the shipped Go package loader)
 - Date: 2026-09-07
-- Issue: #465 (parent #464; consumers #463 Go bounded loader, #467 health range loading; follow-up #480 retained batch numbering)
+- Issue: #465 (parent #464; consumers #463 Go bounded loader, #467 health range loading; follow-up #480 retained batch numbering; closer alignment #482)
 - Contract: depgraph-analysis-split-plan-v1 (`schemas/depgraph-analysis-split-plan-v1.schema.json`)
 - Request binding: the optional `split` object of a `depgraph-analysis-unit-v2` request
 - Worker capabilities: analysis-loader-scope-v1, analysis-go-package-loader-v1
@@ -421,7 +421,11 @@ retained is reported as `whole_context_loader_retained`. The planner cannot
 know that a worker widened its loader scope until the worker reports it. The
 re-split contract fixes identities and dispositions; automatic re-split
 execution, bounded Go loading, and health range loading are the consumers'
-work.
+work. Parent #464 stays open until the original trial target completes a
+fresh scan, ordinary health, and same-input resume on unchanged per-unit
+limits; public synthetic fixtures in
+[resumable-analysis-validation.md](resumable-analysis-validation.md) are
+necessary and not sufficient.
 
 ## Rejected alternatives
 
