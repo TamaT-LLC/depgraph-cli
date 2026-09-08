@@ -910,6 +910,66 @@ mod tests {
         );
     }
 
+    /// A re-split of one pre-split batch keeps the retained sibling's
+    /// published `(index, count)` and gives replacements a new index.  The
+    /// mixed counts still join when the rows partition the owned sources.
+    #[test]
+    fn v2_typed_rows_may_mix_chunk_counts_after_a_resplit() {
+        let mut syntax = unit_row(
+            "syntax",
+            "syntax",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        let mut typed_retained = unit_row("typed", "typed-c", 1, 2, &["app/c.go"]);
+        let mut typed_head = unit_row("typed", "typed-a", 0, 3, &["app/a.go"]);
+        let mut typed_tail = unit_row("typed", "typed-b", 2, 3, &["app/b.go"]);
+        let mut semantic = unit_row(
+            "semantic",
+            "semantic",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        let context = vec![
+            "app/a.go".to_owned(),
+            "app/b.go".to_owned(),
+            "app/c.go".to_owned(),
+        ];
+        for row in [
+            &mut syntax,
+            &mut typed_retained,
+            &mut typed_head,
+            &mut typed_tail,
+            &mut semantic,
+        ] {
+            row.context_paths = context.clone();
+        }
+        let rows = vec![syntax, typed_head, typed_retained, typed_tail, semantic];
+        let summary = |rows: &[AnalysisUnitLedgerRecord]| {
+            aggregate_analysis_coverage(
+                "depgraph-analysis-unit-v2",
+                Some("plan"),
+                Some("input"),
+                rows,
+            )
+        };
+        let joined = summary(&rows);
+        assert!(joined.complete, "{:?}", joined.reasons);
+        assert_eq!(joined.semantic_complete_units, 1);
+
+        let mut missing_replacement = rows.clone();
+        missing_replacement.remove(3);
+        let missing_replacement = summary(&missing_replacement);
+        assert!(!missing_replacement.complete);
+        assert!(
+            missing_replacement
+                .reasons
+                .contains(&"analysis-unit-chunk-count-mismatch".into())
+        );
+    }
+
     #[test]
     fn v2_rejects_context_mismatch_and_same_unit_contract_mixing() {
         let syntax = unit_row("syntax", "a", 0, 1, &["app/a.go", "app/b.go"]);
