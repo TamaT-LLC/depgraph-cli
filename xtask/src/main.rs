@@ -196,9 +196,9 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:cc99b9e933804d1dfffc6b0e97a3a04c01aa0fecbb36e85a43f03f009fcd33aa",
-        query_result_digest: "bounded-query-result:sha256:6717de358653baad6f4f4e2abf86e91822e68fcb54dbe2900dc1f30c37b38c26",
-        query_output_sha256: "42b960a16f9842d8040f17866c928c5128e96fa9662006e3eb54625e23b162a0",
+        query_plan_digest: "bounded-query-plan:sha256:3d4cfe783ec41d0442e93c577e12fadff50095607da90db651ec3e7f11d823de",
+        query_result_digest: "bounded-query-result:sha256:2bf8e36f02afbe60f037991bffe58410cbb44c5671f5a8436c33b78102d0cb67",
+        query_output_sha256: "ce90db9c2d21cdaabeab40fa7b1c8bc69c6236f40ca3915835f3e1906a578727",
         profile_plan_digest: "profile-selection-plan:sha256:70125b85631b7b4be67a98ca951369c8f9b443180aabdd6858f9e78707692a8b",
         profile_plan_output_sha256: "e5b8343b56b4227920873c1106454dff28f866117f23f05990e6796f9137c20b",
     },

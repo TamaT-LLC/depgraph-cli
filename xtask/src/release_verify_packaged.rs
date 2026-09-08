@@ -5710,33 +5710,79 @@ fn verify_packaged_web_framework_profile(
     let graph = exported["graph"]
         .as_object()
         .context("packaged Web framework-complete export has no graph")?;
-    let profile = graph["profiles"]
+    let profiles = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
-        .context("packaged Web framework-complete export has no Web profile")?;
-    if profile["features"].as_array().is_none_or(|features| {
-        features
-            != &expected_frameworks
-                .iter()
-                .map(|framework| Value::String((*framework).to_owned()))
-                .collect::<Vec<_>>()
+        .context("packaged Web framework-complete export has no profiles")?;
+    let mut observed_frameworks = BTreeSet::new();
+    for profile in profiles.iter().filter(|profile| {
+        profile["language"] == "web" && profile["properties"]["analysis_stage"] == "semantic"
     }) {
-        bail!("packaged Web framework fixture lost detected framework order: {profile}");
+        let observed = verify_packaged_web_framework_ledger(profile, expected_frameworks)?;
+        observed_frameworks.extend(observed);
     }
+    if observed_frameworks != expected_frameworks.iter().copied().collect::<BTreeSet<_>>() {
+        bail!("packaged Web framework profiles lost a required framework: {observed_frameworks:?}");
+    }
+    if !semantic_complete
+        && !graph["sites"].as_array().is_some_and(|sites| {
+            sites.iter().any(|site| {
+                site["resolution_status"] == "unresolved"
+                    && site["reason"] == "function_value_dispatch"
+            })
+        })
+    {
+        bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
+    }
+    for &framework in expected_frameworks {
+        verify_packaged_web_framework_query(executable, store, graph, framework)?;
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_framework_ledger<'a>(
+    profile: &'a Value,
+    expected_frameworks: &[&str],
+) -> Result<Vec<&'a str>> {
     let properties = &profile["properties"];
     let ledger: Vec<Value> = serde_json::from_str(
         properties["web_framework_completeness_ledger"]
             .as_str()
             .context("packaged Web framework fixture omitted its completeness ledger")?,
     )?;
+    let features = profile["features"]
+        .as_array()
+        .context("packaged Web framework profile omitted its features")?;
+    let observed = features
+        .iter()
+        .map(|feature| {
+            feature
+                .as_str()
+                .context("packaged Web framework feature is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if profile["features"].as_array().is_none_or(|features| {
+        features
+            != &ledger
+                .iter()
+                .map(|entry| entry["framework"].clone())
+                .collect::<Vec<_>>()
+    }) || observed.windows(2).any(|pair| pair[0] >= pair[1])
+        || observed
+            .iter()
+            .any(|framework| !expected_frameworks.contains(framework))
+    {
+        bail!("packaged Web framework fixture lost detected framework order: {profile}");
+    }
     if properties["web_framework_completeness_capability"] != "framework-semantic-completeness-v1"
-        || properties["web_framework_completeness_status"] != "complete"
-        || properties["web_framework_completeness_issue_count"] != "0"
-        || ledger.len() != expected_frameworks.len()
+        || properties["analysis_unit_contract"] != "depgraph-analysis-unit-v2"
+        || (ledger.is_empty() && properties["web_framework_completeness_status"] != "not-detected")
+        || (!ledger.is_empty()
+            && (properties["web_framework_completeness_status"] != "complete"
+                || properties["web_framework_completeness_issue_count"] != "0"))
     {
         bail!("packaged Web framework fixture lost its complete capability ledger: {profile}");
     }
-    for (entry, &framework) in ledger.iter().zip(expected_frameworks) {
+    for (entry, &framework) in ledger.iter().zip(&observed) {
         let specific = match framework {
             "astro" => "astro-component-render-hydration-v1",
             "next" => "next-route-component-boundary-v1",
@@ -5767,20 +5813,7 @@ fn verify_packaged_web_framework_profile(
             bail!("packaged Web framework ledger entry is incomplete: {entry}");
         }
     }
-    if !semantic_complete
-        && !graph["sites"].as_array().is_some_and(|sites| {
-            sites.iter().any(|site| {
-                site["resolution_status"] == "unresolved"
-                    && site["reason"] == "function_value_dispatch"
-            })
-        })
-    {
-        bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
-    }
-    for &framework in expected_frameworks {
-        verify_packaged_web_framework_query(executable, store, graph, framework)?;
-    }
-    Ok(())
+    Ok(observed)
 }
 
 fn verify_packaged_web_framework_query(
@@ -7006,6 +7039,42 @@ fn verify_packaged_web_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framework_unit_ledger_requires_matching_features_and_complete_capabilities() -> Result<()> {
+        let capabilities = serde_json::json!([
+            "astro-component-render-hydration-v1",
+            "framework-semantic-graph-v1",
+            "typescript-definition-import-type-call-graph-v2"
+        ]);
+        let mut ledger = serde_json::json!([{
+            "framework": "astro", "status": "complete", "reasons": [],
+            "required_capabilities": capabilities, "emitted_capabilities": capabilities
+        }]);
+        let mut profile = serde_json::json!({
+            "features": ["astro"],
+            "properties": {
+                "analysis_unit_contract": "depgraph-analysis-unit-v2",
+                "web_framework_completeness_capability": "framework-semantic-completeness-v1",
+                "web_framework_completeness_status": "complete",
+                "web_framework_completeness_issue_count": "0",
+                "web_framework_completeness_ledger": ledger.to_string()
+            }
+        });
+        assert_eq!(
+            verify_packaged_web_framework_ledger(&profile, &["astro", "next"])?,
+            ["astro"]
+        );
+        assert!(verify_packaged_web_framework_ledger(&profile, &["next"]).is_err());
+        profile["features"] = serde_json::json!([]);
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        profile["features"] = serde_json::json!(["astro"]);
+        ledger[0]["emitted_capabilities"] = serde_json::json!(["framework-semantic-graph-v1"]);
+        profile["properties"]["web_framework_completeness_ledger"] =
+            Value::String(ledger.to_string());
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

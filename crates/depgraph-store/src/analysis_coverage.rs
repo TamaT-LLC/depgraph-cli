@@ -642,7 +642,12 @@ fn profile_axes(profile: &ProfileRecord) -> serde_json::Value {
         "toolchain": profile.toolchain,
         "command": profile.command,
         "target": profile.target,
-        "features": profile.features,
+        // Web features describe the framework facts emitted by this stage.
+        // Syntax intentionally has no semantic framework ledger; its empty
+        // feature list is not a different selected configuration. The base
+        // profile and selection properties above still bind that identity.
+        // Go features are build tags and must remain a configuration axis.
+        "features": if profile.language == "web" { &[] as &[String] } else { &profile.features },
         "environment": profile.environment,
         "source_revision": profile.source_revision,
         "properties": properties,
@@ -1005,6 +1010,45 @@ mod tests {
                 .reasons
                 .contains(&"analysis-unit-contract-mismatch".into())
         );
+    }
+
+    #[test]
+    fn v2_web_stage_framework_observations_do_not_split_configuration_axes() -> Result<()> {
+        let mut profiles = [v2_profile("syntax"), v2_profile("semantic")];
+        let mut rows = [
+            unit_row("syntax", "syntax", 0, 1, &["app/a.go", "app/b.go"]),
+            unit_row("semantic", "semantic", 0, 1, &["app/a.go", "app/b.go"]),
+        ];
+        for profile in &mut profiles {
+            profile.language = "web".into();
+        }
+        for row in &mut rows {
+            row.adapter = "web".into();
+        }
+        profiles[1].features = vec!["astro".into()];
+        assert!(
+            aggregate_completeness(&profiles, Some(&rows))?
+                .unwrap()
+                .contains("semantic-complete")
+        );
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 1);
+        assert!(profiles[0].features.is_empty());
+        assert_eq!(profiles[1].features, ["astro"]);
+
+        let mut changed_base = profiles.clone();
+        changed_base[1].properties["analysis_base_profile_id"] = json!("different-configuration");
+        assert!(
+            !aggregate_completeness(&changed_base, Some(&rows))?
+                .unwrap()
+                .contains("semantic-complete")
+        );
+        let mut changed_selection = profiles.clone();
+        changed_selection[1].properties["profile_selection_input_digest"] =
+            json!("different-selection");
+        assert_eq!(semantic_complete_units(&changed_selection, Some(&rows)), 0);
+        rows[1].unknown_dependencies = true;
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 0);
+        Ok(())
     }
 
     #[test]
