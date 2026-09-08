@@ -285,6 +285,14 @@ retained syntax/typed checkpoints, completed replacement execution, and equal
 graph, evidence, and coverage against a run without injected failures.
 Semantic results produced before all typed references are bound remain
 ineligible for checkpoint reuse and are replayed conservatively.
+Applied refinements are stored atomically as disposable planning hints beside
+the unit checkpoints. The cache key binds the original split plan, input
+contents, root and unit execution witnesses. A new process rebuilds the plan
+from those refinements before dispatch; malformed or stale hints fall back to
+the original plan, and `--no-cache` neither reads nor writes them. Restoring a
+plan does not bypass unit input, protocol or reference validation. The restart
+fixture removes the injected failure before resuming, so reuse must work even
+when the original larger units would now succeed.
 
 A separate two-package fixture verifies that an unchanged second scan reuses
 both semantic units and that editing the referenced package invalidates them.

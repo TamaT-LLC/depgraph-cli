@@ -120,6 +120,9 @@ try {
   assert.ok(kept.some(unit => unit.stage === "typed"), "successful sibling was not persisted");
   assert.ok(interrupted.diagnostics.filter(d => d.code === "analysis-resplit" && d.message.includes("applied")).length >= 2);
   rmSync(pause);
+  // The next process must restore the refined plan even when the original
+  // larger unit would now succeed. Re-triggering the failure is not resume.
+  rmSync(inject);
   const resumed = scan(store);
   const active = resumed.analysis.units.filter(unit => unit.loader?.analysis_resplit !== "superseded");
   assert.ok(active.every(unit => unit.status === "completed"), "unexecuted replacements counted as complete");
@@ -129,14 +132,13 @@ try {
   for (const sibling of kept.filter(unit => unit.stage !== "semantic")) {
     assert.ok(active.some(unit => unit.unit_id === sibling.unit_id && unit.reused), `sibling ${sibling.unit_id} was not reused`);
   }
-  assert.ok(resumed.diagnostics.filter(d => d.code === "analysis-resplit" && d.message.includes("applied")).length >= 2);
+  assert.ok(!resumed.diagnostics.some(d => d.code === "analysis-resplit"));
   assert.ok(!resumed.diagnostics.some(d => d.code === "analysis-resplit" && d.message.includes("deferred")));
   assert.deepEqual(graph(store, resumed.scan_id), expected, "refinement/restart changed graph, evidence or coverage");
   const repeated = scan(store);
   assert.deepEqual(graph(store, repeated.scan_id), expected);
   const repeatedActive = repeated.analysis.units.filter(unit => unit.loader?.analysis_resplit !== "superseded");
-  assert.ok(repeatedActive.filter(unit => unit.stage !== "semantic").every(unit => unit.reused));
-  assert.ok(repeatedActive.some(unit => unit.stage === "semantic" && unit.reused));
+  assert.ok(repeatedActive.every(unit => unit.reused), "restored refinement did not reuse every completed unit");
   writeFileSync(inject, "output");
   const outputStore = path.join(parent, "output-limit.sqlite");
   const outputLimited = scan(outputStore);

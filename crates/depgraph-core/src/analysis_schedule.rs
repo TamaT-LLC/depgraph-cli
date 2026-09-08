@@ -12,7 +12,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    analysis_checkpoint::UnitCheckpointKey,
+    analysis_checkpoint::{UnitCheckpointKey, UnitCheckpointStore},
     analysis_execution::{AnalysisExecutionContext, AnalysisInputValidation, AnalysisWorkItem},
     analysis_plan::{
         AnalysisAdapter, AnalysisPlan, AnalysisUnit, AnalysisUnitKind, path_belongs_to_adapter,
@@ -71,6 +71,7 @@ struct SourceBatchSchedule<'a> {
 pub(crate) struct AnalysisResplitContext {
     pub split_input: AnalysisSplitInput,
     adapters: Vec<ResplitAdapter>,
+    refinement_cache: Option<(UnitCheckpointStore, String)>,
 }
 
 struct ResplitAdapter {
@@ -82,6 +83,14 @@ struct ResplitAdapter {
 }
 
 impl AnalysisResplitContext {
+    pub(crate) fn remember_refinements(&self, plan: &AnalysisSplitPlan) {
+        if let Some((cache, key)) = &self.refinement_cache
+            && let Err(error) = cache.write_refinements(key, &plan.refinements)
+        {
+            tracing::warn!(%error, "analysis refinements could not be cached");
+        }
+    }
+
     /// Work items for the execution units in `only`, in the order the refined
     /// split plan and the worker stages define, built exactly like the
     /// original schedule so their chunk identity and checkpoint keys agree.
@@ -441,7 +450,7 @@ pub(crate) async fn prepare_analysis_schedule(
     // source-batch adapter at once, before any worker starts. The decision is
     // a pure function of the discovery plan, budgets, boundaries, sizes, and
     // the worker context closure; it never reads file contents.
-    let (split_plan, split_input) = {
+    let (mut split_plan, split_input) = {
         let mut boundaries = Vec::new();
         let mut contexts = BTreeMap::new();
         for entry in &scheduled {
@@ -523,10 +532,68 @@ pub(crate) async fn prepare_analysis_schedule(
             }
         }
     }
-    let resplit = split_input.map(|split_input| AnalysisResplitContext {
+    let mut resplit = split_input.map(|split_input| AnalysisResplitContext {
         split_input,
         adapters: resplit_adapters,
+        refinement_cache: None,
     });
+    if context.cache_mode == ScanCacheMode::Enabled
+        && let (Some(path), Some(proof), Some(plan), Some(current), Some(resplit)) = (
+            store_path,
+            input_proof.as_ref(),
+            plan.as_ref(),
+            split_plan.as_mut(),
+            resplit.as_mut(),
+        )
+        && resplit
+            .adapters
+            .iter()
+            .all(|adapter| adapter.execution_digest.is_some())
+    {
+        // Bind hints to the original deterministic plan, all input contents,
+        // worker/toolchain identities and the root. A changed witness starts
+        // from the original plan; stale hints cannot change unit ownership.
+        let key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!({
+                "contract": "depgraph-analysis-refinements-v1",
+                "plan": current.split_plan_id,
+                "input": proof.expected_content_digest,
+                "root": root_digest(context.root),
+                "units": work.iter().map(|item| &item.checkpoint_key).collect::<Vec<_>>(),
+            }))?)
+        );
+        if let Ok(cache) = UnitCheckpointStore::open(path, context.config.scan.max_protocol_bytes) {
+            if let Ok(Some(refinements)) = cache.read_refinements(&key) {
+                let mut input = resplit.split_input.clone();
+                input.refinements = refinements;
+                if let Ok(restored) = plan_analysis_split(plan, &input)
+                    && restored.unsplittable_refinements.is_empty()
+                {
+                    let ids = restored
+                        .execution_units
+                        .iter()
+                        .map(|unit| unit.id.clone())
+                        .collect();
+                    let replacements = resplit.work_items(context, plan, &restored, &ids);
+                    let mut ready_work = Vec::new();
+                    for (id, item) in execution_unit_ids.drain(..).zip(work.drain(..)) {
+                        if id.is_none() {
+                            ready_work.push(item);
+                        }
+                    }
+                    execution_unit_ids.extend(ready_work.iter().map(|_| None));
+                    work.extend(ready_work);
+                    for (id, item) in replacements {
+                        execution_unit_ids.push(Some(id));
+                        work.push(item);
+                    }
+                    *current = restored;
+                }
+            }
+            resplit.refinement_cache = Some((cache, key));
+        }
+    }
     Ok(AnalysisSchedule {
         plan,
         split_plan,
@@ -1997,6 +2064,7 @@ mod tests {
             attested_rust_sysroot: None,
         };
         let resplit = AnalysisResplitContext {
+            refinement_cache: None,
             split_input,
             adapters: vec![ResplitAdapter {
                 adapter: AdapterKind::Go,
@@ -2265,6 +2333,7 @@ mod tests {
         assert!(outcome.retained_execution_unit_ids.contains(&sibling_id));
 
         let resplit = AnalysisResplitContext {
+            refinement_cache: None,
             split_input,
             adapters: vec![ResplitAdapter {
                 adapter: AdapterKind::Go,

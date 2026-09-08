@@ -1048,6 +1048,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 );
             }
             *current = resplit_plan.plan;
+            resplit.remember_refinements(current);
             let retained_typed = retained_typed_reference_fingerprints(
                 &analysis,
                 &execution_unit_ids,
