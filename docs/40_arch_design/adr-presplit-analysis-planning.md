@@ -219,7 +219,10 @@ The relationship to existing state is explicit in `AnalysisResplitPlan`:
   chunk numbering its profile and ledger row already carry; replacements
   take a new index that does not collide with retained siblings, with a
   `batch_count` large enough for the worker's `chunk_index < chunk_count`
-  check. The runtime applies a `Split` only when that numbering is unchanged
+  check. Coverage still requires a uniform `0..count` set when every row of
+  a stage shares one `chunk_count`; after a re-split the retained sibling
+  keeps its published count and completeness is the source-path partition.
+  The runtime applies a `Split` only when that numbering is unchanged
   for every retained unit (otherwise recovery after `memory-limit` would be
   deferred). Later stages of the same logical unit keep their identity and
   saved results because chunking does not enter their key; only their

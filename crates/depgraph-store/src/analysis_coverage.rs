@@ -271,42 +271,50 @@ fn valid_chunks(rows: &[&AnalysisUnitLedgerRecord], reasons: &mut BTreeSet<Strin
         reasons.insert("analysis-unit-missing-stage".to_owned());
         return false;
     }
-    let Some(expected) = rows[0].chunk_count else {
-        reasons.insert("analysis-unit-chunk-metadata".to_owned());
-        return false;
-    };
-    if expected == 0 || rows.len() != expected as usize {
-        reasons.insert("analysis-unit-chunk-count-mismatch".to_owned());
-        return false;
-    }
     let mut indices = BTreeSet::new();
     let mut ids = BTreeSet::new();
+    let mut counts = BTreeSet::new();
     for row in rows {
-        // A manifest-only project can legitimately produce one empty batch:
-        // there are no source paths to list, while the worker still records
-        // the unit and its context fingerprint.  Keep the exception narrow
-        // so an empty context cannot make a multi-batch or otherwise scoped
-        // result look complete.
-        let empty_manifest_batch =
-            expected == 1 && row.source_paths.is_empty() && row.context_paths.is_empty();
-        if row.chunk_count != Some(expected)
-            || row.chunk_index.is_none()
-            || row.chunk_id.is_empty()
-            || (!empty_manifest_batch && row.context_paths.is_empty())
-        {
+        let Some(count) = row.chunk_count else {
+            reasons.insert("analysis-unit-chunk-metadata".to_owned());
+            return false;
+        };
+        let Some(index) = row.chunk_index else {
+            reasons.insert("analysis-unit-chunk-metadata".to_owned());
+            return false;
+        };
+        if count == 0 || index >= count || row.chunk_id.is_empty() {
             reasons.insert("analysis-unit-chunk-metadata".to_owned());
             return false;
         }
-        if !indices.insert(row.chunk_index.unwrap_or_default())
-            || !ids.insert(row.chunk_id.as_str())
-        {
+        let empty_manifest_batch = rows.len() == 1
+            && count == 1
+            && row.source_paths.is_empty()
+            && row.context_paths.is_empty();
+        if !empty_manifest_batch && row.context_paths.is_empty() {
+            reasons.insert("analysis-unit-chunk-metadata".to_owned());
+            return false;
+        }
+        if !indices.insert(index) || !ids.insert(row.chunk_id.as_str()) {
             reasons.insert("analysis-unit-duplicate-chunk".to_owned());
             return false;
         }
+        counts.insert(count);
     }
-    if indices != (0..expected).collect::<BTreeSet<_>>() {
-        reasons.insert("analysis-unit-chunk-index-gap".to_owned());
-        return false;
+    // A static partition publishes one chunk_count for every row and must
+    // occupy 0..count exactly.  A memory-limit re-split keeps the published
+    // numbering of retained siblings and gives replacements a new index, so
+    // the stage can mix counts; source-path partition in `join_v2` is then
+    // the completeness check.
+    if let Some(expected) = counts.iter().copied().next().filter(|_| counts.len() == 1) {
+        if rows.len() != expected as usize {
+            reasons.insert("analysis-unit-chunk-count-mismatch".to_owned());
+            return false;
+        }
+        if indices != (0..expected).collect::<BTreeSet<_>>() {
+            reasons.insert("analysis-unit-chunk-index-gap".to_owned());
+            return false;
+        }
     }
     true
 }
@@ -872,6 +880,66 @@ mod tests {
             missing_row
                 .reasons
                 .contains(&"analysis-unit-chunk-count-mismatch".into())
+        );
+    }
+
+    /// A re-split of one pre-split batch keeps the retained sibling's
+    /// published `(index, count)` and gives replacements a new index.  The
+    /// mixed counts still join when the rows partition the owned sources.
+    #[test]
+    fn v2_typed_rows_may_mix_chunk_counts_after_a_resplit() {
+        let mut syntax = unit_row(
+            "syntax",
+            "syntax",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        let mut typed_retained = unit_row("typed", "typed-c", 1, 2, &["app/c.go"]);
+        let mut typed_head = unit_row("typed", "typed-a", 0, 3, &["app/a.go"]);
+        let mut typed_tail = unit_row("typed", "typed-b", 2, 3, &["app/b.go"]);
+        let mut semantic = unit_row(
+            "semantic",
+            "semantic",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        let context = vec![
+            "app/a.go".to_owned(),
+            "app/b.go".to_owned(),
+            "app/c.go".to_owned(),
+        ];
+        for row in [
+            &mut syntax,
+            &mut typed_retained,
+            &mut typed_head,
+            &mut typed_tail,
+            &mut semantic,
+        ] {
+            row.context_paths = context.clone();
+        }
+        let rows = vec![syntax, typed_head, typed_retained, typed_tail, semantic];
+        let summary = |rows: &[AnalysisUnitLedgerRecord]| {
+            aggregate_analysis_coverage(
+                "depgraph-analysis-unit-v2",
+                Some("plan"),
+                Some("input"),
+                rows,
+            )
+        };
+        let joined = summary(&rows);
+        assert!(joined.complete, "{:?}", joined.reasons);
+        assert_eq!(joined.semantic_complete_units, 1);
+
+        let mut missing_replacement = rows.clone();
+        missing_replacement.remove(3);
+        let missing_replacement = summary(&missing_replacement);
+        assert!(!missing_replacement.complete);
+        assert!(
+            missing_replacement
+                .reasons
+                .contains(&"analysis-unit-context-scope-mismatch".into())
         );
     }
 
