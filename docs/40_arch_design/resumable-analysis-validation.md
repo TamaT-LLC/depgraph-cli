@@ -317,6 +317,15 @@ establish aggregate semantic completeness. Different base profiles, selected
 inputs, and unknown dependencies still prevent that join; Go build tags remain
 part of the configuration identity.
 
+Compiler timeouts dispose the IPC request queue before reaping the compiler.
+The worker flushes its failure frames and stderr before exiting with code 124,
+so pending replies and upstream partial-frame timers cannot replace the timeout
+outcome or prevent resource resplitting. A synthetic compiler holds an open
+snapshot and floods filesystem callbacks to exercise this shutdown path.
+The package-loader memory gate retains superseded attempts in its report but
+checks the completed replacement units against the original memory limit and
+requires complete durable analysis coverage before comparing their graphs.
+
 Completion validation aggregates site status counts in its existing site pass
 instead of rescanning every site for each profile. A public synthetic test
 checks SQLite work growth as the profile and site counts increase.

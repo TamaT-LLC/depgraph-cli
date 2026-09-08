@@ -513,6 +513,22 @@ function assertSameCanonicalGraph(actual, expected, label) {
 function goUnits(outcome) {
   return (outcome.output.analysis?.units ?? []).filter((unit) => unit.adapter === "go");
 }
+function activeGoUnits(outcome) {
+  const coverage = outcome.output.analysis_coverage;
+  assert.equal(coverage?.complete, true, "package scan has incomplete analysis coverage");
+  for (const key of ["failed_units", "unanalysed_units", "cancelled_units"]) {
+    assert.equal(coverage[key], 0, `package scan has ${key}`);
+  }
+  const units = goUnits(outcome);
+  const active = units.filter((unit) => unit.loader?.analysis_resplit !== "superseded");
+  for (const unit of units.filter((unit) => unit.loader?.analysis_resplit === "superseded")) {
+    assert.equal(unit.status, "failed", "superseded attempt must retain its failure");
+    assert.ok(active.some((replacement) => replacement.stage === unit.stage
+      && replacement.loader?.analysis_resplit === "replacement"
+      && replacement.status === "completed"), "superseded attempt has no completed replacement stage");
+  }
+  return active;
+}
 // The control has no split binding, so the worker reports no loader scope
 // and no loader metrics: the pre-#463 module path, byte for byte.
 function assertModuleLoaderControl(outcome, label) {
@@ -655,7 +671,7 @@ try {
   const fanoutStore = path.join(parent, "fanout-package.sqlite");
   const fanoutPackage = scan("fanout-package", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutPackage.output.status, "completed", JSON.stringify(fanoutPackage.output.diagnostics));
-  const fanoutBounded = goUnits(fanoutPackage).filter((unit) => unit.stage !== "syntax");
+  const fanoutBounded = activeGoUnits(fanoutPackage).filter((unit) => unit.stage !== "syntax");
   assertPackageBoundedUnits(fanoutBounded, "fanout-package");
   const fanoutTypedBatches = fanoutBounded.filter((unit) => unit.stage === "typed");
   assert.ok(fanoutTypedBatches.length > 1, "fan-out typed stage was not batched by package");
@@ -681,10 +697,10 @@ try {
   // --- fan-out: resume replays every typed and semantic batch -------------
   const fanoutResume = scan("fanout-resume", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutResume.output.status, "completed");
-  for (const unit of goUnits(fanoutResume)) {
+  for (const unit of activeGoUnits(fanoutResume)) {
     assert.ok(unit.reused, `fanout-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
   }
-  assertPackageBoundedUnits(goUnits(fanoutResume).filter((unit) => unit.stage !== "syntax"), "fanout-resume");
+  assertPackageBoundedUnits(activeGoUnits(fanoutResume).filter((unit) => unit.stage !== "syntax"), "fanout-resume");
   assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-resume");
   record(fanoutResume, { canonical_graph_equal_to_control: true });
 
@@ -705,7 +721,7 @@ try {
   const bigPackage = scan("bigpkg-package", bigRoot, bigStore, shippedWorker);
   assert.equal(bigPackage.output.status, "completed", JSON.stringify(bigPackage.output.diagnostics));
   assert.equal(bigPackage.exit_code, 0);
-  const staged = goUnits(bigPackage).filter((unit) => unit.stage !== "syntax");
+  const staged = activeGoUnits(bigPackage).filter((unit) => unit.stage !== "syntax");
   assertPackageBoundedUnits(staged, "bigpkg-package");
   const typedBatches = assertBodiesLoadedOnce(staged, "typed", BIG_PACKAGE_FILES, "bigpkg-package");
   const semanticBatches = assertBodiesLoadedOnce(staged, "semantic", BIG_PACKAGE_FILES, "bigpkg-package");
@@ -728,9 +744,9 @@ try {
   // --- big package: resume reuses every staged batch ----------------------
   const bigResume = scan("bigpkg-resume", bigRoot, bigStore, shippedWorker);
   assert.equal(bigResume.output.status, "completed", JSON.stringify(bigResume.output.diagnostics));
-  const resumedStaged = goUnits(bigResume).filter((unit) => unit.stage !== "syntax");
+  const resumedStaged = activeGoUnits(bigResume).filter((unit) => unit.stage !== "syntax");
   assert.equal(resumedStaged.length, staged.length);
-  for (const unit of goUnits(bigResume)) {
+  for (const unit of activeGoUnits(bigResume)) {
     assert.ok(unit.reused, `bigpkg-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
   }
   assertPackageBoundedUnits(resumedStaged, "bigpkg-resume");

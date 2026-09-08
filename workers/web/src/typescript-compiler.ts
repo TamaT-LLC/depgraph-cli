@@ -186,12 +186,14 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
 interface CompilerConnection {
   onError(listener: (error: Error) => void): { dispose(): void };
   onClose(listener: () => void): { dispose(): void };
+  dispose(): void;
 }
 
 interface CompilerClientInternals {
   client?: {
     process?: ChildProcess;
     connection?: CompilerConnection;
+    close?(): Promise<void>;
   };
 }
 
@@ -514,7 +516,14 @@ async function closeCompiler(
 ): Promise<void> {
   const child = retainedChild;
   if (force) {
-    child?.kill("SIGKILL");
+    // Reject pending requests and discard queued VFS callbacks while the
+    // transport is still alive. Killing first leaves JSON-RPC replies racing
+    // writes to a destroyed pipe, which can replace the timeout exit code.
+    const client = (api as unknown as CompilerClientInternals).client;
+    client?.connection?.dispose();
+    // Let rejected operations unwind their snapshot finalizers before close
+    // resets the client's connected state; otherwise cleanup can reconnect.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     let closeTimer: NodeJS.Timeout | undefined;
     await Promise.race([
       api.close().catch(() => undefined),
@@ -523,12 +532,18 @@ async function closeCompiler(
       }),
     ]);
     if (closeTimer) clearTimeout(closeTimer);
+    await client?.close?.().catch(() => undefined);
     if (child && !(await waitForExit(child, 1_000))) {
       child.kill("SIGKILL");
       if (!(await waitForExit(child, 1_000))) {
         throw new CompilerProtocolError("TypeScript native compiler could not be reaped after forced close");
       }
     }
+    // The disposed reader no longer drains stdout. Release any unread pipe
+    // data after reaping so failed analysis cannot keep the worker alive.
+    child?.stdin?.destroy();
+    child?.stdout?.destroy();
+    child?.stderr?.destroy();
     return;
   }
 
@@ -1081,6 +1096,10 @@ export async function exerciseTypeScriptCompilerLifecycleForTest(
   const errorListeners = new Set<(error: Error) => void>();
   const closeListeners = new Set<() => void>();
   const connection: CompilerConnection = {
+    dispose: () => {
+      errorListeners.clear();
+      closeListeners.clear();
+    },
     onError: (listener) => {
       errorListeners.add(listener);
       return { dispose: () => { errorListeners.delete(listener); } };

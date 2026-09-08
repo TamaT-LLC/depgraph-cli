@@ -21,6 +21,7 @@ import {
   WEB_SEMANTIC_RELEASE_CAPABILITIES,
 } from "./framework-semantic";
 import { StderrProgressReporter } from "./progress";
+import { exitWorkerAfterFlushing } from "./worker-exit";
 import { scan } from "./scanner";
 import {
   TYPESCRIPT_COMPILER_PROFILE_PROPERTIES,
@@ -421,6 +422,7 @@ async function main(): Promise<void> {
     } else if (error instanceof TypeScriptProjectError && root !== null) {
       await writeEvents(failureEventsFor(root, options.scanId, error, analysisUnit)).catch(() => undefined);
       process.stderr.write(`depgraph-web-worker: ${error.message}\n`);
+      await exitWorkerAfterFlushing(error.exitCode);
     } else {
       process.stderr.write(`depgraph-web-worker: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
     }

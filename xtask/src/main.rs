@@ -188,9 +188,9 @@ struct TargetNativeSmokeExpectation {
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:55eaac2a5f6be85d707ebf402c31995e073641b34bf4627984e68cca7c7a7a3e",
-        query_result_digest: "bounded-query-result:sha256:20c747c06fa2cad26fcf6b559e3288aaaf4cc95cb65b6f74cdabfcdffd892246",
-        query_output_sha256: "6cbe86c5b11e4a4ac94ac20ceea35d0bcfed7488650000e7d1058681969aff9b",
+        query_plan_digest: "bounded-query-plan:sha256:baa6f35c85fc19f6c138f3c930e4e9e7a938153263ecda62cbd35de087ee9e7c",
+        query_result_digest: "bounded-query-result:sha256:2ce5b4849d3255709cc8ea5efbabfd75c34330706e44d8a74cbf0415390a4caa",
+        query_output_sha256: "af78adc4696f9d645840233d85d06a6a7729007306329180658ef928bc1ffc84",
         profile_plan_digest: "profile-selection-plan:sha256:2d6ae1975930464929de3dba67f62f2290f6aaa10c549d909a1cfcf4eb717b61",
         profile_plan_output_sha256: "12bc417acd93327d558c62744a688d7b704dc4d43e3ca7cd7ada2b6f4f4691af",
     },

@@ -5778,7 +5778,9 @@ fn verify_packaged_web_framework_ledger<'a>(
         || (ledger.is_empty() && properties["web_framework_completeness_status"] != "not-detected")
         || (!ledger.is_empty()
             && (properties["web_framework_completeness_status"] != "complete"
-                || properties["web_framework_completeness_issue_count"] != "0"))
+                || properties
+                    .get("web_framework_completeness_issue_count")
+                    .is_some_and(|count| count != "0")))
     {
         bail!("packaged Web framework fixture lost its complete capability ledger: {profile}");
     }
@@ -7065,6 +7067,17 @@ mod tests {
             verify_packaged_web_framework_ledger(&profile, &["astro", "next"])?,
             ["astro"]
         );
+        profile["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("web_framework_completeness_issue_count");
+        assert_eq!(
+            verify_packaged_web_framework_ledger(&profile, &["astro"])?,
+            ["astro"]
+        );
+        profile["properties"]["web_framework_completeness_issue_count"] = serde_json::json!("1");
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        profile["properties"]["web_framework_completeness_issue_count"] = serde_json::json!("0");
         assert!(verify_packaged_web_framework_ledger(&profile, &["next"]).is_err());
         profile["features"] = serde_json::json!([]);
         assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());

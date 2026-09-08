@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import {
   analyzeTypeScriptProject,
   analyzeTypeScriptProjectWithRuntimeForTest,
@@ -214,5 +216,75 @@ test("native compiler internal timeout fails closed and reaps the child", {
       && error.exitCode === 124
     ),
   );
+  await assertCompilerReaped(marker);
+});
+
+test("compiler timeout stops queued filesystem replies before terminating IPC", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const { runtime, marker } = await fakeCompilerRuntime(context, `
+    const path = require("node:path");
+    let input = Buffer.alloc(0);
+    let id = 0;
+    function send(message) {
+      const json = JSON.stringify(message);
+      process.stdout.write("Content-Length: " + Buffer.byteLength(json) + "\\r\\n\\r\\n" + json);
+    }
+    process.stdin.on("data", (chunk) => {
+      input = Buffer.concat([input, chunk]);
+      for (;;) {
+        const boundary = input.indexOf("\\r\\n\\r\\n");
+        if (boundary < 0) return;
+        const length = Number(/Content-Length: (\\d+)/i.exec(input.subarray(0, boundary).toString())[1]);
+        if (input.length < boundary + 4 + length) return;
+        const message = JSON.parse(input.subarray(boundary + 4, boundary + 4 + length).toString());
+        input = input.subarray(boundary + 4 + length);
+        if (message.method === "initialize") {
+          send({ jsonrpc: "2.0", id: message.id, result: {
+            useCaseSensitiveFileNames: true, currentDirectory: path.parse(process.execPath).root
+          } });
+        } else if (message.method === "updateSnapshot") {
+          const config = message.params.openProjects[0];
+          send({ jsonrpc: "2.0", id: message.id, result: { snapshot: "active-snapshot", projects: [{
+            id: "project", configFileName: config, compilerOptions: {},
+            rootFiles: [path.join(path.dirname(config), "index.ts")]
+          }] } });
+          pump();
+        }
+      }
+    });
+    function pump() {
+      const frames = Array.from({ length: 128 }, () => {
+        const message = JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "readFile", params: ["/missing.ts"] });
+        return "Content-Length: " + Buffer.byteLength(message) + "\\r\\n\\r\\n" + message;
+      }).join("");
+      process.stdout.write(frames, () => setImmediate(pump));
+    }
+  `, 1_500);
+  const payload = "x".repeat(256 * 1024);
+  const program = `
+    import { analyzeTypeScriptProjectWithRuntimeForTest, TypeScriptProjectError }
+      from ${JSON.stringify(new URL("../src/typescript-compiler.ts", import.meta.url).href)};
+    import { exitWorkerAfterFlushing }
+      from ${JSON.stringify(new URL("../src/worker-exit.ts", import.meta.url).href)};
+    try {
+      await analyzeTypeScriptProjectWithRuntimeForTest(new Map([["index.ts", "export const value = 1;\\n"]]), ${JSON.stringify(runtime)});
+      throw new Error("compiler timeout was not detected");
+    } catch (error) {
+      if (!(error instanceof TypeScriptProjectError) || error.reason !== "compiler_timeout") throw error;
+      process.stdout.write(JSON.stringify({ reason: error.reason, payload: "x".repeat(256 * 1024) }) + "\\n");
+      process.stderr.write("compiler timeout classified\\n");
+      await exitWorkerAfterFlushing(error.exitCode);
+    }
+  `;
+  await assert.rejects(promisify(execFile)(process.execPath, [
+    "--import", import.meta.resolve("tsx"), "--input-type=module", "--eval", program,
+  ], { timeout: 10_000, maxBuffer: 1024 * 1024 }), (error: unknown) => {
+    const failure = error as { code?: number; stdout?: string; stderr?: string };
+    assert.equal(failure.code, 124);
+    assert.deepEqual(JSON.parse(failure.stdout ?? ""), { reason: "compiler_timeout", payload });
+    assert.equal(failure.stderr, "compiler timeout classified\n");
+    return true;
+  });
   await assertCompilerReaped(marker);
 });
