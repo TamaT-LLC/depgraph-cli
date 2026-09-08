@@ -5273,7 +5273,19 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         let exact_edge = dependency_edges
             .iter()
             .copied()
-            .find(|edge| edge["kind"] == edge_kind && edge["resolution_status"] == "resolved")
+            .find(|edge| {
+                // `why` chooses one deterministic shortest path, not every
+                // parallel edge. Select a unique endpoint pair so the exact
+                // edge is required consistently by all three query APIs.
+                edge["kind"] == edge_kind
+                    && edge["resolution_status"] == "resolved"
+                    && edge["source"] != edge["target"]
+                    && !edges.iter().any(|other| {
+                        other["id"] != edge["id"]
+                            && other["source"] == edge["source"]
+                            && other["target"] == edge["target"]
+                    })
+            })
             .with_context(|| {
                 format!("packaged Web graph has no exact {label} edge for query verification")
             })?;
