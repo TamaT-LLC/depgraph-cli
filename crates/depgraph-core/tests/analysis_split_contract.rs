@@ -1122,6 +1122,277 @@ fn promoted_whole_context_is_demoted_to_packages_by_a_memory_refinement() -> Res
     Ok(())
 }
 
+/// One Go package of independent files, used as the public synthetic fixture
+/// for a pre-split that already has more than one batch.
+fn go_package_files(names: &[&str]) -> Result<(tempfile::TempDir, PathBuf)> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    fs::write(root.join("go.mod"), "module example.test/app\n\ngo 1.26\n")?;
+    for name in names {
+        let ident = name.trim_end_matches(".go");
+        fs::write(
+            root.join(name),
+            format!("package app\n\nfunc {ident}() {{}}\n"),
+        )?;
+    }
+    Ok((directory, root))
+}
+
+fn synthetic_file_sizes(paths: &[&str], bytes: u64) -> BTreeMap<String, u64> {
+    paths
+        .iter()
+        .map(|path| ((*path).to_owned(), bytes))
+        .collect()
+}
+
+/// The scan runtime refuses a `Split` when a retained sibling's published
+/// `batch_index` / `batch_count` would change: those values are already on
+/// the sibling's profile and ledger row.
+fn runtime_would_apply(current: &AnalysisSplitPlan, resplit: &AnalysisResplitPlan) -> bool {
+    resplit.outcome == AnalysisResplitOutcome::Split
+        && resplit.retained_chunk_numbering_unchanged(current)
+}
+
+#[test]
+fn resplit_of_a_pre_split_batch_keeps_retained_chunk_numbering() -> Result<()> {
+    // Issue #480: 1 package, 3 files, already 2 typed batches. Re-splitting
+    // the 2-file batch must not renumber the 1-file sibling, or recovery
+    // after memory-limit is deferred.
+    let (_directory, root) = go_package_files(&["a.go", "b.go", "c.go"])?;
+    let (config, budget) = budget(|config| {
+        config.scan.max_unit_source_files = 2;
+        config.scan.max_unit_source_bytes = 2100;
+        config.scan.max_context_source_bytes = 64_000;
+    });
+    let plan = plan_analysis_units(&root, &config, None)?;
+    let input = AnalysisSplitInput::new(
+        budget.clone(),
+        vec![AnalysisAdapterBoundary::go_package_loader()],
+    )
+    .with_sizes(synthetic_file_sizes(&["a.go", "b.go", "c.go"], 1_000));
+    let current = plan_analysis_split(&plan, &input)?;
+    assert_eq!(current.plan_id, plan.plan_id);
+    let app = plan
+        .executable_units()
+        .into_iter()
+        .find(|unit| unit.adapter == AnalysisAdapter::Go)
+        .expect("one Go package");
+    let typed = current.execution_units_for(&app.id, AnalysisStage::Typed);
+    assert_eq!(
+        typed
+            .iter()
+            .map(|unit| (
+                unit.batch_index,
+                unit.batch_count,
+                unit.ownership.source_paths.len()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 2, 2), (1, 2, 1)],
+        "typed is pre-split into a 2-file batch and a 1-file sibling"
+    );
+    let target = typed[0].clone();
+    let sibling = typed[1].clone();
+    let memory_limit = target.budget.max_worker_memory_bytes;
+
+    let resplit = resplit_execution_unit(
+        &plan,
+        &current,
+        &input,
+        &target.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(resplit.outcome, AnalysisResplitOutcome::Split);
+    assert_eq!(resplit.plan_id, plan.plan_id);
+    assert_eq!(
+        resplit.superseded_execution_unit_ids,
+        vec![target.id.clone()]
+    );
+    assert_eq!(resplit.replacement_execution_unit_ids.len(), 2);
+    assert!(resplit.retained_execution_unit_ids.contains(&sibling.id));
+    let after_sibling = resplit.plan.execution_unit(&sibling.id).unwrap();
+    assert_eq!(
+        (after_sibling.batch_index, after_sibling.batch_count),
+        (sibling.batch_index, sibling.batch_count),
+        "retained sibling keeps the chunk numbering its profile already carries"
+    );
+    assert!(
+        runtime_would_apply(&current, &resplit),
+        "memory-limit recovery must apply, not defer, when a sibling is retained"
+    );
+    let disposition = |id: &str| {
+        resplit
+            .saved_results
+            .iter()
+            .find(|entry| entry.execution_unit_id == id)
+            .map(|entry| entry.disposition)
+    };
+    assert_eq!(
+        disposition(&sibling.id),
+        Some(AnalysisSavedResultDisposition::Retained)
+    );
+    assert_eq!(
+        disposition(&target.id),
+        Some(AnalysisSavedResultDisposition::Superseded)
+    );
+    for id in &resplit.replacement_execution_unit_ids {
+        assert_eq!(
+            disposition(id),
+            Some(AnalysisSavedResultDisposition::Replacement),
+            "unexecuted replacements are not treated as saved successes"
+        );
+        let replacement = resplit.plan.execution_unit(id).unwrap();
+        assert_eq!(replacement.budget.max_worker_memory_bytes, memory_limit);
+        assert_eq!(
+            replacement.budget.max_source_bytes,
+            budget.max_unit_source_bytes
+        );
+        assert!(
+            replacement.batch_index < replacement.batch_count,
+            "replacement chunk_index must stay valid for the worker"
+        );
+        assert!(
+            replacement
+                .split_reasons
+                .contains(&AnalysisSplitReason::Refined)
+        );
+    }
+
+    // Resume: the recorded history reproduces the refined plan, including
+    // the retained sibling's published numbering.
+    let resumed = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput {
+            refinements: resplit.plan.refinements.clone(),
+            ..input.clone()
+        },
+    )?;
+    assert_eq!(resumed.split_plan_id, resplit.split_plan_id);
+    assert_eq!(
+        (
+            resumed.execution_unit(&sibling.id).unwrap().batch_index,
+            resumed.execution_unit(&sibling.id).unwrap().batch_count
+        ),
+        (sibling.batch_index, sibling.batch_count)
+    );
+    Ok(())
+}
+
+#[test]
+fn chained_resplit_of_a_pre_split_batch_keeps_successful_siblings() -> Result<()> {
+    // Four files so the first replacement is still splittable: the original
+    // 3-file batch splits into 2+1, then that 2-file replacement splits
+    // again, while the 1-file sibling stays retained throughout.
+    let (_directory, root) = go_package_files(&["a.go", "b.go", "c.go", "d.go"])?;
+    let (config, budget) = budget(|config| {
+        config.scan.max_unit_source_files = 3;
+        config.scan.max_unit_source_bytes = 3_100;
+        config.scan.max_context_source_bytes = 64_000;
+    });
+    let plan = plan_analysis_units(&root, &config, None)?;
+    let input = AnalysisSplitInput::new(
+        budget.clone(),
+        vec![AnalysisAdapterBoundary::go_package_loader()],
+    )
+    .with_sizes(synthetic_file_sizes(
+        &["a.go", "b.go", "c.go", "d.go"],
+        1_000,
+    ));
+    let current = plan_analysis_split(&plan, &input)?;
+    let app = plan
+        .executable_units()
+        .into_iter()
+        .find(|unit| unit.adapter == AnalysisAdapter::Go)
+        .expect("one Go package");
+    let typed = current.execution_units_for(&app.id, AnalysisStage::Typed);
+    assert_eq!(
+        typed
+            .iter()
+            .map(|unit| (
+                unit.batch_index,
+                unit.batch_count,
+                unit.ownership.source_paths.len()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 2, 3), (1, 2, 1)]
+    );
+    let sibling = typed[1].clone();
+    let first = resplit_execution_unit(
+        &plan,
+        &current,
+        &input,
+        &typed[0].id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(first.outcome, AnalysisResplitOutcome::Split);
+    assert!(runtime_would_apply(&current, &first));
+    assert_eq!(
+        (
+            first.plan.execution_unit(&sibling.id).unwrap().batch_index,
+            first.plan.execution_unit(&sibling.id).unwrap().batch_count
+        ),
+        (sibling.batch_index, sibling.batch_count)
+    );
+    let splittable = first
+        .replacement_execution_unit_ids
+        .iter()
+        .map(|id| first.plan.execution_unit(id).unwrap())
+        .find(|unit| unit.ownership.source_paths.len() >= 2)
+        .expect("first replacement still has two files");
+    let second_input = AnalysisSplitInput {
+        refinements: first.plan.refinements.clone(),
+        ..input.clone()
+    };
+    let second = resplit_execution_unit(
+        &plan,
+        &first.plan,
+        &second_input,
+        &splittable.id,
+        AnalysisResplitTrigger::WorkerMemory,
+    )?;
+    assert_eq!(second.outcome, AnalysisResplitOutcome::Split);
+    assert!(runtime_would_apply(&first.plan, &second));
+    assert!(second.retained_execution_unit_ids.contains(&sibling.id));
+    assert_eq!(
+        (
+            second.plan.execution_unit(&sibling.id).unwrap().batch_index,
+            second.plan.execution_unit(&sibling.id).unwrap().batch_count
+        ),
+        (sibling.batch_index, sibling.batch_count)
+    );
+    assert_eq!(
+        second
+            .saved_results
+            .iter()
+            .find(|entry| entry.execution_unit_id == sibling.id)
+            .map(|entry| entry.disposition),
+        Some(AnalysisSavedResultDisposition::Retained)
+    );
+    for id in &second.replacement_execution_unit_ids {
+        let replacement = second.plan.execution_unit(id).unwrap();
+        assert_eq!(
+            replacement.budget.max_worker_memory_bytes,
+            budget.max_worker_memory_bytes
+        );
+        assert_eq!(
+            second
+                .saved_results
+                .iter()
+                .find(|entry| entry.execution_unit_id == *id)
+                .map(|entry| entry.disposition),
+            Some(AnalysisSavedResultDisposition::Replacement)
+        );
+    }
+    let resumed = plan_analysis_split(
+        &plan,
+        &AnalysisSplitInput {
+            refinements: second.plan.refinements.clone(),
+            ..input
+        },
+    )?;
+    assert_eq!(resumed.split_plan_id, second.split_plan_id);
+    Ok(())
+}
+
 #[test]
 fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> Result<()> {
     let checkout = Checkout::new()?;
@@ -1155,6 +1426,7 @@ fn resplit_supersedes_only_the_refined_unit_and_keeps_other_saved_results() -> R
         resplit.retained_execution_unit_ids.len(),
         current.execution_units.len() - 1
     );
+    assert!(resplit.retained_chunk_numbering_unchanged(&current));
     assert!(resplit.retained_execution_unit_ids.contains(&big_typed));
     let disposition = |id: &str| {
         resplit

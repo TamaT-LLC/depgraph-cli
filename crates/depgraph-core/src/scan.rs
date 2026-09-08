@@ -901,20 +901,14 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 .collect::<Vec<_>>();
             // Only a failed attempt is withdrawn: an ingested result is never
             // removed, and retained siblings must keep their chunk numbering
-            // because their profiles already carry it.
+            // because their profiles already carry it. The planner stamps that
+            // numbering at the initial partition and keeps it for every batch
+            // that is not itself refined.
             let withdrawable = superseded.len() == resplit_plan.superseded_execution_unit_ids.len()
                 && superseded
                     .iter()
                     .all(|index| analysis.units[*index].status == "failed")
-                && resplit_plan.retained_execution_unit_ids.iter().all(|id| {
-                    current
-                        .execution_unit(id)
-                        .zip(resplit_plan.plan.execution_unit(id))
-                        .is_some_and(|(before, after)| {
-                            before.batch_index == after.batch_index
-                                && before.batch_count == after.batch_count
-                        })
-                });
+                && resplit_plan.retained_chunk_numbering_unchanged(current);
             let applied = resplit_plan.outcome == AnalysisResplitOutcome::Split && withdrawable;
             let disposition = match (resplit_plan.outcome, withdrawable) {
                 (AnalysisResplitOutcome::Split, true) => "applied",

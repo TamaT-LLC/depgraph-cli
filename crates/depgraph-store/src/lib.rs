@@ -7835,6 +7835,84 @@ mod tests {
     }
 
     #[test]
+    fn resplit_of_one_pre_split_batch_keeps_retained_chunk_and_coverage_joins() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("resplit-scan", Path::new("."), false)?;
+        let row = |stage: &str, chunk: &str, index: u64, count: u64, paths: &[&str]| {
+            AnalysisUnitLedgerRecord {
+                scan_id: "resplit-scan".into(),
+                contract_version: "depgraph-analysis-unit-v2".into(),
+                unit_id: "unit".into(),
+                adapter: "go".into(),
+                unit_root: "app".into(),
+                stage: stage.into(),
+                chunk_id: chunk.into(),
+                chunk_index: Some(index),
+                chunk_count: Some(count),
+                status: "queued".into(),
+                reused: false,
+                source_paths: paths.iter().map(|path| (*path).into()).collect(),
+                context_paths: vec!["app/a.go".into(), "app/b.go".into(), "app/c.go".into()],
+                auxiliary_paths: Vec::new(),
+                context_fingerprint: Some("context".into()),
+                input_fingerprint: Some("input".into()),
+                dependency_ids: Vec::new(),
+                unknown_dependencies: false,
+                error: None,
+            }
+        };
+        let syntax = row(
+            "syntax",
+            "syntax",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        let typed_ab = row("typed", "typed-ab", 0, 2, &["app/a.go", "app/b.go"]);
+        let typed_c = row("typed", "typed-c", 1, 2, &["app/c.go"]);
+        let semantic = row(
+            "semantic",
+            "semantic",
+            0,
+            1,
+            &["app/a.go", "app/b.go", "app/c.go"],
+        );
+        store.initialize_analysis_unit_ledger(
+            "resplit-scan",
+            "depgraph-analysis-unit-v2",
+            Some("plan"),
+            Some("input"),
+            &[
+                syntax.clone(),
+                typed_ab.clone(),
+                typed_c.clone(),
+                semantic.clone(),
+            ],
+        )?;
+        let typed_a = row("typed", "typed-a", 0, 3, &["app/a.go"]);
+        let typed_b = row("typed", "typed-b", 2, 3, &["app/b.go"]);
+        store.resplit_analysis_unit_ledger(
+            "resplit-scan",
+            std::slice::from_ref(&typed_ab),
+            &[typed_a.clone(), typed_b.clone()],
+        )?;
+        let mut terminal = vec![syntax, typed_a, typed_c, typed_b, semantic];
+        for row in &mut terminal {
+            row.status = "completed".into();
+        }
+        let summary = store.finalize_analysis_unit_ledger("resplit-scan", &terminal)?;
+        assert!(summary.complete, "{:?}", summary.reasons);
+        let retained = store
+            .analysis_units("resplit-scan")?
+            .into_iter()
+            .find(|row| row.chunk_id == "typed-c")
+            .expect("retained sibling");
+        assert_eq!(retained.chunk_index, Some(1));
+        assert_eq!(retained.chunk_count, Some(2));
+        Ok(())
+    }
+
+    #[test]
     fn analysis_coverage_separates_terminal_execution_from_semantic_precision() -> Result<()> {
         let mut store = Store::open_in_memory()?;
         store.start_scan("semantic-scan", Path::new("/tmp/project"), false)?;
