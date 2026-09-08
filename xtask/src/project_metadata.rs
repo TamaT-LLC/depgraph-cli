@@ -261,7 +261,8 @@ pub(crate) fn verify_workflow_policy_text(
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
-                || workflow.matches("\n      fail-fast: false\n").count() != 1
+                || !workflow_job_block(workflow, "integration")?.contains("\n      fail-fast: false\n")
+                || !extra_native_package_is_manual_and_bounded(workflow)?
                 || workflow
                     .matches("rustflags: -C linker-features=-lld")
                     .count()
@@ -485,6 +486,14 @@ fn job_env_entries(job: &str) -> Result<Vec<&str>> {
         environment.push(code.trim());
     }
     Ok(environment)
+}
+
+fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
+    let job = workflow_job_block(workflow, "extra-native-package")?;
+    Ok(job.contains("\n    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages\n")
+        && job.contains("\n      fail-fast: false\n")
+        && job_pins_intermediate_state_bound(workflow, "extra-native-package")?
+        && workflow.contains("      extra_native_packages:\n        description: Verify Linux ARM64 and Intel macOS release packages as well\n        type: boolean\n        default: false\n"))
 }
 
 /// The integration job builds the debug graph and then the release package on
@@ -2702,7 +2711,10 @@ fn quoted_assignment(source: &str, name: &str) -> Option<String> {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{integration_job_pins_resource_policy, job_pins_intermediate_state_bound};
+    use super::{
+        extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
+        job_pins_intermediate_state_bound, workflow_job_block,
+    };
 
     /// The three jobs that build twice on one runner without reclaiming
     /// `target/` in between.
@@ -2731,6 +2743,30 @@ mod tests {
     }
 
     #[test]
+    fn extra_native_packages_require_explicit_manual_input_and_resource_bounds() {
+        let ci = checked_in_ci_workflow();
+        assert!(extra_native_package_is_manual_and_bounded(&ci).unwrap());
+        for drift in [
+            ci.replace(" && inputs.extra_native_packages", ""),
+            ci.replacen("        default: false", "        default: true", 1),
+            ci.replace(
+                "      CARGO_INCREMENTAL: \"0\"",
+                "      CARGO_INCREMENTAL: \"1\"",
+            ),
+        ] {
+            assert!(!extra_native_package_is_manual_and_bounded(&drift).unwrap());
+        }
+        let integration = workflow_job_block(&ci, "integration").unwrap();
+        let changed = integration.replacen("fail-fast: false", "fail-fast: true", 1);
+        let drift = ci.replace(integration, &changed);
+        assert!(
+            !workflow_job_block(&drift, "integration")
+                .unwrap()
+                .contains("\n      fail-fast: false\n")
+        );
+    }
+
+    #[test]
     fn integration_resource_policy_accepts_the_checked_in_workflow() {
         let ci = checked_in_ci_workflow();
         assert!(integration_job_pins_resource_policy(&ci).expect("integration job is extractable"));
@@ -2743,7 +2779,13 @@ mod tests {
             "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
         assert_eq!(ci.matches(cache_key).count(), 1);
         let cache_on_failure = "          cache-on-failure: true\n";
-        assert_eq!(ci.matches(cache_on_failure).count(), 1);
+        assert_eq!(
+            workflow_job_block(&ci, "integration")
+                .unwrap()
+                .matches(cache_on_failure)
+                .count(),
+            1
+        );
         let target_size_report =
             "          du -sh target 2>/dev/null || echo \"target directory is absent\"\n";
         for drift in [
