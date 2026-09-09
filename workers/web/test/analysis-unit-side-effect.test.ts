@@ -49,6 +49,18 @@ test("a long side-effect import chain retains full compiler context without exha
   assert.ok(transferred < 512);
   assert.ok(!model.diagnostics.some((diagnostic) => diagnostic.code === "web.typescript_ast_selection_truncated"));
   assert.ok(model.sites.some((site) => site.kind === "side_effect_import" || site.kind === "web_import"));
+
+  const syntax = await scan(root, files, [], undefined, { ...request, stage: "syntax" });
+  assert.equal(syntax.typeScriptProject.rootFiles, 128, "syntax must not rebuild the transitive compiler context");
+  assert.ok(syntax.coverage.completeness.includes("syntax-complete"));
+  assert.equal(syntax.coverage.unresolved, 0, "inventory resolution still sees targets outside the parser batch");
+  assert.ok(!syntax.coverage.completeness.includes("semantic-complete"));
+  const target = syntax.nodes.find((node) => node.kind === "file" && node.properties.path === names[128]);
+  const semanticTarget = model.nodes.find((node) => node.kind === "file" && node.properties.path === names[128]);
+  assert.ok(target && semanticTarget);
+  assert.equal(target.properties.content_hash, semanticTarget.properties.content_hash);
+  assert.equal(target.properties.analysis_hash, semanticTarget.properties.analysis_hash);
+  assert.ok(!syntax.files.some((file) => file.path === names[128]), "a target witness does not acquire file coverage");
 });
 
 test("a file witness is upgraded when a named reexport subsequently needs its declaration closure", async (context) => {
@@ -63,6 +75,19 @@ test("a file witness is upgraded when a named reexport subsequently needs its de
   const answer = model.nodes.find((node) => node.kind === "symbol" && node.properties.source_path === "src/c.ts");
   assert.ok(answer);
   assert.ok(model.sites.some((site) => site.target_ids.includes(answer.id)));
+});
+
+test("a syntax batch retains native parse errors without importing context type errors", async (context) => {
+  const { root, files, request } = await fixture(context, new Map([
+    ["src/entry.ts", 'import type { Shared } from "./shared"; export const broken = ;\n'],
+    ["src/shared.ts", 'export type Shared = string; export const wrong: number = "wrong";\n'],
+  ]), ["src/entry.ts"]);
+  const model = await scan(root, files, [], undefined, { ...request, stage: "syntax" });
+  assert.equal(model.typeScriptProject.rootFiles, 1);
+  assert.ok(model.coverage.files_skipped > 0 || model.coverage.unsupported_syntax > 0);
+  assert.ok(!model.coverage.completeness.includes("syntax-complete"));
+  assert.ok(model.diagnostics.some((diagnostic) => diagnostic.path === "src/entry.ts"));
+  assert.ok(!model.diagnostics.some((diagnostic) => diagnostic.code.includes("semantic_scaffold")));
 });
 
 test("global declarations and context errors survive side-effect-only AST witnesses", async (context) => {

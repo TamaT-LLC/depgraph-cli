@@ -767,6 +767,10 @@ async function analyzeTypeScriptProjectInner(
       moduleDetection: "force",
       moduleResolution: "bundler",
       noEmit: true,
+      // Syntax units only need the native parser for their owned sources.
+      // Import resolution and project-wide diagnostics belong to semantic
+      // units, which still load the complete isolated compiler context.
+      ...(options.stage === "syntax" ? { noResolve: true } : {}),
       paths: Object.fromEntries(Object.entries(staticConfig.paths).map(([pattern, replacements]) => [
         pattern,
         replacements.map((replacement) => replacement.startsWith(".") ? replacement : `./${replacement}`),
@@ -1017,11 +1021,11 @@ async function analyzeTypeScriptProjectInner(
         + result.dependencyGraph.typeCheckerQueries
         + dependencyValidationQueryBudget.value;
       progress.start("typescript_semantic_diagnostics", { source_files: sources.size });
-      const diagnostics = [
+      const diagnostics = (options.stage === "syntax" ? [] : [
         ...await project.program.getProgramDiagnostics(),
         ...await project.program.getGlobalDiagnostics(),
         ...await project.program.getSemanticDiagnostics(),
-      ].map((diagnostic) => semanticDiagnostic(
+      ]).map((diagnostic) => semanticDiagnostic(
         diagnostic,
         sources,
         virtualToRelative,

@@ -1846,6 +1846,29 @@ function hydrateAnalysisFileWitnesses(nodes: Iterable<GraphNode>, sources: Reado
   }
 }
 
+async function readAnalysisFileWitnesses(
+  root: string,
+  nodes: Iterable<GraphNode>,
+  sources: Map<string, string>,
+): Promise<void> {
+  // A syntax batch reads its own bodies only. Direct import targets still
+  // need the same content identity as their owning batch, but no target AST,
+  // transitive import closure, or file coverage is needed for this witness.
+  const paths = [...nodes]
+    .filter((node) => node.kind === "file")
+    .map((node) => node.properties.path)
+    .filter((value): value is string => typeof value === "string"
+      && TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(value).toLowerCase())
+      && !sources.has(value));
+  for (let offset = 0; offset < paths.length; offset += SOURCE_READ_CONCURRENCY) {
+    const batch = paths.slice(offset, offset + SOURCE_READ_CONCURRENCY);
+    const contents = await readUtf8Batch(root, batch.map((relative) => path.join(root, relative)));
+    contents.forEach((source, index) => {
+      if (source !== null) sources.set(batch[index]!, source);
+    });
+  }
+}
+
 type AnalysisUnitSiteCounts = {
   expected: number;
   produced: number;
@@ -2900,11 +2923,12 @@ export async function scan(
   const sourceCache = new Map<string, string | null>();
   const compilerSources = new Map<string, string>();
   const astroSources = new Map<string, string>();
+  const compilerScopePaths = analysisUnit?.stage === "syntax" ? analysisSourcePaths : analysisContextPaths;
   const compilerFiles = sourceFiles.filter((file) => {
     if (!TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) return false;
-    if (analysisContextPaths === null) return true;
+    if (compilerScopePaths === null) return true;
     const relative = normalizeRelative(path.relative(root, file));
-    return analysisContextPaths.has(relative) || frameworkConfigPaths.has(relative);
+    return compilerScopePaths.has(relative) || frameworkConfigPaths.has(relative);
   });
   const scanFiles = analysisUnit === null
     ? sourceFiles
@@ -2965,6 +2989,8 @@ export async function scan(
         for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
           typeScriptPathRequests.push({ sourceFile: absolute, specifier });
         }
+        extractedFiles += 1;
+        if (analysisUnit.stage === "syntax") continue;
         for (const dependency of extraction.dependencies) {
           const resolution = await resolver.resolve(dependency, absolute, owningPackage(workspace, file));
           for (const target of resolution.targets) {
@@ -2975,7 +3001,6 @@ export async function scan(
             pending.push(targetRelative);
           }
         }
-        extractedFiles += 1;
       }
       pending.sort(compareUtf8);
       progress.checkpoint("source_read", {
@@ -3648,6 +3673,9 @@ export async function scan(
     });
   }
 
+  if (analysisUnit?.stage === "syntax") {
+    await readAnalysisFileWitnesses(root, graph.nodes.values(), compilerSources);
+  }
   if (analysisUnit !== null) hydrateAnalysisFileWitnesses(graph.nodes.values(), compilerSources);
   const files = [...graph.files.values()].sort((left, right) => compareUtf8(left.path, right.path));
   const sites = [...graph.sites.values()].sort(compareById);
