@@ -97,7 +97,10 @@ impl Default for ScanConfig {
             worker_timeout_seconds: 300,
             max_worker_memory_bytes: 2 * 1024 * 1024 * 1024,
             max_concurrent_units: 2,
-            max_unit_source_files: 128,
+            // Loading a compiler context dominates tiny source batches. Start
+            // with enough files to amortize it; worker memory/output limits
+            // and resumable re-splitting still bound expensive batches.
+            max_unit_source_files: 2048,
             max_unit_source_bytes: 8 * 1024 * 1024,
             max_context_source_bytes: 64 * 1024 * 1024,
             total_budget_seconds: None,

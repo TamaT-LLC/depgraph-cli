@@ -2294,7 +2294,7 @@ fn workers_without_loader_scope_keep_the_file_count_partition() -> Result<()> {
 
     // A worker that did not negotiate loader scope receives the file-count
     // chunking it received before the split plan existed: eight files fit
-    // one chunk of the default 128-file budget. The plan still reports the
+    // one chunk of the default file budget. The plan still reports the
     // chunk over the byte budget, which the boundary cannot split away.
     let syntax = only(&legacy, &plan, "services/big", "go", AnalysisStage::Syntax);
     assert_eq!(syntax.ownership.source_paths, big_paths);
