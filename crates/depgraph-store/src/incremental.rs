@@ -678,6 +678,38 @@ fn ensure_legacy_delta_base(connection: &Connection, snapshot_id: &str) -> Resul
     Ok(())
 }
 
+/// Semantic no-op overlays inherit execution evidence from the immutable
+/// parent, just as they inherit its graph. Keep the original scan ID and input
+/// fingerprints: no worker executed those units for the overlay's new bytes.
+pub(super) fn analysis_evidence_scan(connection: &Connection, scan_id: &str) -> Result<String> {
+    let mut current = scan_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        let parent = connection
+            .query_row(
+                "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+                [&current],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(parent) = parent else { break };
+        if !scan_is_semantic_noop_overlay(connection, &current)? {
+            break;
+        }
+        if !visited.insert(current.clone()) {
+            bail!("semantic no-op analysis evidence parent cycle detected");
+        }
+        let record = load_completed_snapshot_record(connection, &parent)?
+            .context("semantic no-op analysis evidence parent is unavailable")?;
+        if record.source_kind != "scan" {
+            bail!("semantic no-op analysis evidence requires a scan parent");
+        }
+        current = record.scan_id;
+    }
+    Ok(current)
+}
+
 fn load_delta_base_graph(connection: &Connection, snapshot_id: &str) -> Result<DeltaBaseGraph> {
     ensure_legacy_delta_base(connection, snapshot_id)?;
     let mut current = snapshot_id.to_owned();
@@ -724,13 +756,26 @@ fn semantic_noop_delta_base(
     snapshot_id: &str,
     path: &str,
 ) -> Result<Option<DeltaBaseGraph>> {
-    if snapshot_uses_analysis_units(connection, snapshot_id)? {
-        return Ok(None);
-    }
     let record = load_completed_snapshot_record(connection, snapshot_id)?
         .with_context(|| format!("completed delta base snapshot {snapshot_id} was not found"))?;
     if record.source_kind != "scan" {
         return Ok(None);
+    }
+    if snapshot_uses_analysis_units(connection, snapshot_id)? {
+        let evidence_scan = analysis_evidence_scan(connection, &record.scan_id)?;
+        // Missing or unfinished execution evidence must use the scheduler.
+        // General graph deltas remain forbidden even when this proof exists.
+        let eligible: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM analysis_scan_metadata WHERE scan_id=?1)
+                 AND EXISTS(SELECT 1 FROM analysis_unit_ledger WHERE scan_id=?1)
+                 AND NOT EXISTS(SELECT 1 FROM analysis_unit_ledger
+                                WHERE scan_id=?1 AND status != 'completed')",
+            [&evidence_scan],
+            |row| row.get(0),
+        )?;
+        if !eligible {
+            return Ok(None);
+        }
     }
     let Some(node) = load_effective_file_node(connection, snapshot_id, path)? else {
         return Ok(None);
@@ -2651,6 +2696,86 @@ mod tests {
             store.load_completed_snapshot(&base_id).unwrap(),
             base_snapshot
         );
+    }
+
+    #[test]
+    fn semantic_noop_analysis_overlays_retain_original_execution_evidence() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        let scan_id = "analysis-noop-base";
+        let (events, ids) = stable_graph_events(scan_id);
+        store.start_scan(scan_id, Path::new("/fixture"), false)?;
+        let records: Vec<_> = ["syntax", "semantic"]
+            .into_iter()
+            .map(|stage| super::super::AnalysisUnitLedgerRecord {
+                scan_id: scan_id.into(),
+                contract_version: "depgraph-analysis-unit-v1".into(),
+                unit_id: "web-unit".into(),
+                adapter: "web".into(),
+                unit_root: ".".into(),
+                stage: stage.into(),
+                chunk_id: String::new(),
+                chunk_index: None,
+                chunk_count: None,
+                status: "completed".into(),
+                reused: false,
+                source_paths: vec!["src/index.ts".into()],
+                context_paths: vec!["src/index.ts".into()],
+                auxiliary_paths: Vec::new(),
+                context_fingerprint: Some("original-context".into()),
+                input_fingerprint: Some("original-input".into()),
+                dependency_ids: Vec::new(),
+                unknown_dependencies: false,
+                error: None,
+            })
+            .collect();
+        store.initialize_analysis_unit_ledger(
+            scan_id,
+            "depgraph-analysis-unit-v1",
+            Some("plan"),
+            Some("input"),
+            &records,
+        )?;
+        store.ingest_events(&events.iter().collect::<Vec<_>>())?;
+        store.finish_scan(scan_id, "completed", None, true)?;
+        let base_id = store.current_snapshot_id()?.unwrap();
+        let base_graph = store.load_completed_snapshot(&base_id)?;
+        let records = store.analysis_units(scan_id)?;
+        let coverage = store.analysis_coverage(scan_id)?;
+        assert!(coverage.as_ref().is_some_and(|summary| summary.complete));
+        let mut parent = base_id;
+        for index in 1..=2 {
+            let overlay = format!("analysis-noop-{index}");
+            let projection = store
+                .semantic_noop_delta_base(&parent, "src/index.ts")?
+                .unwrap();
+            let delta = validated_node_delta(
+                &overlay,
+                &projection,
+                &ids.source,
+                &format!("sha256:{}", (index + 1).to_string().repeat(64)),
+            );
+            parent = store.commit_semantic_noop_delta(
+                &overlay,
+                Path::new("/fixture"),
+                false,
+                &parent,
+                None,
+                &health_provenance(),
+                &delta,
+                "",
+                false,
+            )?;
+            assert_eq!(store.analysis_units(&overlay)?, records);
+            assert_eq!(store.analysis_coverage(&overlay)?, coverage);
+            assert!(store.completed_snapshot_uses_analysis_units(&parent)?);
+            assert!(store.delta_base_graph(&parent).is_err());
+            assert!(store.verify_snapshot_integrity(&parent)?.valid);
+            let graph = store.load_completed_snapshot(&parent)?;
+            assert_eq!(graph.sites, base_graph.sites);
+            assert_eq!(graph.edges, base_graph.edges);
+            assert_eq!(graph.coverage, base_graph.coverage);
+        }
+        Ok(())
     }
 
     #[test]

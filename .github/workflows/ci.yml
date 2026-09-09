@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      benchmark_only:
+        description: Run the benchmark and its Rust, Go, and Web prerequisite checks
+        type: boolean
+        default: false
       extra_native_packages:
         description: Verify Linux ARM64 and Intel macOS release packages as well
         type: boolean
@@ -15,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}-${{ inputs.extra_native_packages || false }}
+  group: ci-${{ github.ref }}-${{ inputs.extra_native_packages || false }}-${{ inputs.benchmark_only || false }}
   cancel-in-progress: true
 
 jobs:
@@ -213,6 +217,7 @@ jobs:
           if-no-files-found: error
 
   compiler-precise-hostile:
+    if: ${{ !inputs.benchmark_only }}
     runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
@@ -331,6 +336,7 @@ jobs:
       DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: "5"
       DEPGRAPH_BENCH_REPORT: "dist/benchmark-report.json"
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
+      DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -362,11 +368,12 @@ jobs:
           path: |
             dist/benchmark-report.json
             dist/cache-hit-benchmark-report.json
+            dist/benchmark-diagnostics/
           if-no-files-found: error
 
   integration:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     strategy:
       # Preserve the successful platform evidence when the other matrix leg
       # fails so a transient/native failure cannot erase its diagnostics.
@@ -884,7 +891,7 @@ jobs:
 
   windows-smoke:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     runs-on: windows-2025
     env:
       # This job builds debug then release on one runner without reclaiming
@@ -1377,7 +1384,7 @@ jobs:
       - run: cargo xtask rust-semantic-e2e
 
   extra-native-package:
-    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages
+    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages && !inputs.benchmark_only
     strategy:
       fail-fast: false
       matrix:

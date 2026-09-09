@@ -2787,7 +2787,12 @@ ORDER BY id COLLATE BINARY
     }
 
     /// Read deterministic unit evidence for an analysis attempt.
+    /// A proven semantic no-op inherits its parent's evidence, retaining the
+    /// original execution scan IDs and fingerprints rather than claiming that
+    /// the overlay executed workers or produced new checkpoint inputs.
     pub fn analysis_units(&self, scan_id: &str) -> Result<Vec<AnalysisUnitLedgerRecord>> {
+        let evidence_scan = incremental::analysis_evidence_scan(&self.connection, scan_id)?;
+        let scan_id = evidence_scan.as_str();
         let mut statement = self.connection.prepare(
             "SELECT scan_id, contract_version, unit_id, adapter, unit_root, stage,
                     chunk_id, chunk_index, chunk_count, status, reused,
@@ -2881,7 +2886,11 @@ ORDER BY id COLLATE BINARY
     }
 
     /// Return the immutable scan-level analysis completeness projection.
+    /// For a semantic no-op this describes the inherited execution evidence;
+    /// its input digest remains the original analysis input identity.
     pub fn analysis_coverage(&self, scan_id: &str) -> Result<Option<AnalysisCoverageSummary>> {
+        let evidence_scan = incremental::analysis_evidence_scan(&self.connection, scan_id)?;
+        let scan_id = evidence_scan.as_str();
         let metadata = self
             .connection
             .query_row(
