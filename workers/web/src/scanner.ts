@@ -2476,6 +2476,7 @@ async function localTypeScriptVersion(workspace: Workspace): Promise<LocalTypeSc
 
 interface TypeScriptAstSelection {
   paths: Set<string>;
+  definitionPaths: Set<string>;
   contextTargetFiles: number;
   truncated: boolean;
 }
@@ -2483,7 +2484,8 @@ interface TypeScriptAstSelection {
 interface TypeScriptAstSelectionState {
   selected: Set<string>;
   pending: string[];
-  queued: Set<string>;
+  expandDependencies: Set<string>;
+  expanded: Set<string>;
   truncated: boolean;
 }
 
@@ -2502,18 +2504,37 @@ function compilerPathsByPackage(
   return pathsByPackage;
 }
 
+function upgradeTypeScriptAstPath(
+  relativePath: string,
+  state: TypeScriptAstSelectionState,
+  expandDependencies: boolean,
+): void {
+  // A file first admitted only as a side-effect import witness may later
+  // be needed for a named binding. Upgrade it and traverse its declarations.
+  if (expandDependencies && !state.expandDependencies.has(relativePath)) {
+    state.expandDependencies.add(relativePath);
+    state.pending.push(relativePath);
+  }
+}
+
 function enqueueTypeScriptAstPath(
   relativePath: string,
   compilerSources: ReadonlyMap<string, string>,
   state: TypeScriptAstSelectionState,
+  expandDependencies = true,
 ): void {
-  if (!compilerSources.has(relativePath) || state.selected.has(relativePath) || state.queued.has(relativePath)) return;
-  if (state.selected.size + state.pending.length >= MAX_TYPESCRIPT_AST_SOURCE_FILES) {
+  if (!compilerSources.has(relativePath)) return;
+  if (state.selected.has(relativePath)) {
+    upgradeTypeScriptAstPath(relativePath, state, expandDependencies);
+    return;
+  }
+  if (state.selected.size >= MAX_TYPESCRIPT_AST_SOURCE_FILES) {
     state.truncated = true;
     return;
   }
+  state.selected.add(relativePath);
+  if (expandDependencies) state.expandDependencies.add(relativePath);
   state.pending.push(relativePath);
-  state.queued.add(relativePath);
 }
 
 function typeScriptAstExtraction(
@@ -2543,18 +2564,20 @@ function enqueueTypeScriptResolutionTarget(
   compilerSources: ReadonlyMap<string, string>,
   target: ResolvedTarget,
   state: TypeScriptAstSelectionState,
+  expandDependencies: boolean,
 ): void {
   if (target.kind === "file") {
     enqueueTypeScriptAstPath(
       normalizeRelative(path.relative(root, target.absolutePath)),
       compilerSources,
       state,
+      expandDependencies,
     );
     return;
   }
   if (target.kind === "workspace_package") {
     for (const candidate of pathsByPackage.get(target.package.id) ?? []) {
-      enqueueTypeScriptAstPath(candidate, compilerSources, state);
+      enqueueTypeScriptAstPath(candidate, compilerSources, state, expandDependencies);
     }
   }
 }
@@ -2572,20 +2595,49 @@ async function enqueueTypeScriptAstDependencies(
   const absolutePath = path.join(root, ...relativePath.split("/"));
   const owner = owningPackage(workspace, absolutePath);
   const extraction = typeScriptAstExtraction(root, relativePath, compilerSources, extractionCache);
-  const resolutions = await Promise.all(extraction.dependencies.map((dependency) => (
-    resolver.resolve(dependency, absolutePath, owner)
-  )));
-  for (const resolution of resolutions) {
+  const resolutions = await Promise.all(extraction.dependencies.map(async (dependency) => ({
+    resolution: await resolver.resolve(dependency, absolutePath, owner),
+    expandDependencies: dependency.kind !== "side_effect_import",
+  })));
+  for (const { resolution, expandDependencies } of resolutions) {
     for (const target of resolution.targets) {
-      enqueueTypeScriptResolutionTarget(root, pathsByPackage, compilerSources, target, state);
+      enqueueTypeScriptResolutionTarget(root, pathsByPackage, compilerSources, target, state, expandDependencies);
     }
   }
 }
 
+function needsGlobalTypeScriptAst(relativePath: string, source: string): boolean {
+  // moduleDetection=force isolates ordinary source declarations. Ambient
+  // declarations and possible global/prototype augmentation still need ASTs
+  // even through a side-effect-only import chain. Escapes are conservative:
+  // they can spell a global identifier without its literal source spelling.
+  return /\.d\.[cm]?ts$/iu.test(relativePath)
+    || /\b(?:declare|globalThis|global|window|self|prototype)\b|\\/u.test(source);
+}
+
+async function expandTypeScriptAstSelection(
+  root: string,
+  workspace: Workspace,
+  compilerSources: ReadonlyMap<string, string>,
+  pathsByPackage: ReadonlyMap<string, readonly string[]>,
+  resolver: ModuleResolver,
+  extractionCache: Map<string, ReturnType<typeof extractDependencies>>,
+  state: TypeScriptAstSelectionState,
+): Promise<void> {
+  while (state.pending.length > 0) {
+    const relativePath = state.pending.shift()!;
+    if (!state.expandDependencies.has(relativePath) || state.expanded.has(relativePath)) continue;
+    state.expanded.add(relativePath);
+    await enqueueTypeScriptAstDependencies(
+      root, workspace, compilerSources, pathsByPackage, resolver, extractionCache, relativePath, state,
+    );
+  }
+}
+
 /**
- * Select owned ASTs plus the local declaration files needed to resolve their
- * imports. The native Program still receives every context source, while the
- * scanner only asks the async API for this bounded closure.
+ * Select owned ASTs, binding declarations, and direct side-effect file
+ * witnesses. The native Program still receives every context source, while
+ * the scanner only transfers this bounded set through the async API.
  */
 async function selectTypeScriptAstPaths(
   root: string,
@@ -2604,7 +2656,8 @@ const requested = [...ownedPaths]
  const state: TypeScriptAstSelectionState = {
    selected: new Set<string>(),
    pending: [],
-   queued: new Set<string>(),
+   expandDependencies: new Set<string>(),
+   expanded: new Set<string>(),
    truncated: false,
  };
  for (const relativePath of requested) enqueueTypeScriptAstPath(relativePath, compilerSources, state);
@@ -2615,27 +2668,19 @@ const requested = [...ownedPaths]
    // bounded AST selection admits the unit's output first; the native Program
    // still keeps the complete context in its VFS.
    for (const relativePath of [...compilerSources.keys()]
-     .filter((candidate) => candidate.toLowerCase().endsWith(".d.ts"))
+     .filter((candidate) => needsGlobalTypeScriptAst(candidate, compilerSources.get(candidate)!))
      .sort(compareUtf8)) {
     enqueueTypeScriptAstPath(relativePath, compilerSources, state);
    }
- }
- while (state.pending.length > 0) {
-   const relativePath = state.pending.shift()!;
-   if (state.selected.has(relativePath)) continue;
-   state.selected.add(relativePath);
-   if (!includeDependencyClosure) continue;
-   await enqueueTypeScriptAstDependencies(
+   await expandTypeScriptAstSelection(
      root,
      workspace,
      compilerSources,
      pathsByPackage,
      resolver,
      extractionCache,
-     relativePath,
      state,
    );
-   if (state.truncated && state.selected.size >= MAX_TYPESCRIPT_AST_SOURCE_FILES) break;
  }
  const contextTargetFiles = [...state.selected].filter((relativePath) => !ownedPaths.has(relativePath)).length;
  progress.complete("typescript_ast_selection", {
@@ -2645,7 +2690,7 @@ const requested = [...ownedPaths]
    context_target_files: contextTargetFiles,
    selection_truncated: state.truncated,
  });
- return { paths: state.selected, contextTargetFiles, truncated: state.truncated };
+ return { paths: state.selected, definitionPaths: state.expandDependencies, contextTargetFiles, truncated: state.truncated };
 }
 
 export async function scan(
@@ -3010,6 +3055,7 @@ export async function scan(
       ...(analysisUnit === null ? {} : {
         sourcePaths: new Set(analysisUnit.source_paths),
         astPaths: astSelection!.paths,
+        definitionPaths: astSelection!.definitionPaths,
         astSelectionTruncated: astSelection!.truncated,
         stage: analysisUnit.stage,
       }),

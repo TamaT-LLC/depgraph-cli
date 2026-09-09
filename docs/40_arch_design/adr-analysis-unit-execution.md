@@ -39,6 +39,11 @@ The scheduler derives every batch from the pre-split plan before any worker star
 Go workers also advertising `analysis-unit-typed-v1` receive a separate `typed` stage between them.
 Each later stage waits until all preceding chunks of its own unit have been saved and ingested; other units can proceed concurrently.
 Web stages use source batches; TypeScript retains the project context while AST transfer and dependency extraction select the current batch.
+Side-effect imports retain direct file-target AST witnesses without recursively
+collecting unused declarations. A later named reference upgrades a witness to
+the declaration closure. Ambient/global declaration candidates remain selected,
+and the native compiler still checks every context source, including syntax and
+type errors in sources outside the transferred declaration batch.
 Go syntax parses selected files. Typed and semantic requests that carry a
 `split` binding with `loader.kind=package` use the hybrid loader: only the
 named package roots are parsed and type-checked with bodies, and in-repo

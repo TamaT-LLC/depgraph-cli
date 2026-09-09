@@ -118,6 +118,8 @@ export interface TypeScriptAnalysisOptions {
    * DTOs against the same TypeChecker.
    */
   astPaths?: ReadonlySet<string>;
+  /** ASTs needed for declarations; other retained ASTs only attest file targets. */
+  definitionPaths?: ReadonlySet<string>;
   /** A bounded AST selection could not include every required context target. */
   astSelectionTruncated?: boolean;
   /** Syntax units defer semantic graph extraction to their semantic stage. */
@@ -952,18 +954,30 @@ async function analyzeTypeScriptProjectInner(
             sourceFile,
             syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
           }));
-        progress.start("typescript_definition_graph", { source_files: semanticSources.length });
+        const definitionSources = options.definitionPaths === undefined
+          ? semanticSources
+          : semanticSources.filter((source) => options.definitionPaths!.has(source.relativePath));
+        progress.start("typescript_definition_graph", { source_files: definitionSources.length });
         result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
           project.checker,
-          semanticSources,
+          definitionSources,
         );
+        const definitionSourcePaths = new Set(definitionSources.map((source) => source.relativePath));
+        if ([...syntacticallyInvalidPaths].some((relativePath) => !definitionSourcePaths.has(relativePath))) {
+          result.definitionGraph.issues.push({
+            code: "typescript_semantic_syntax_invalid",
+            message: "Compiler context outside the declaration batch contains syntactic diagnostics",
+            relativePath: null,
+            fatal: false,
+          });
+        }
         progress.complete("typescript_definition_graph", {
           definitions: result.definitionGraph.definitions.length,
-          source_files: semanticSources.length,
+          source_files: definitionSources.length,
         });
         if (!result.definitionGraph.issues.some((issue) => issue.fatal)) {
-          // Keep the full project source list for canonical definition and
-          // export identity, but traverse dependency/call occurrences only
+          // Keep every retained AST for file-target attestation and canonical
+          // export lookup, but traverse dependency/call occurrences only
           // for this batch. The TypeChecker still resolves each occurrence
           // against the same Program, so imports, re-exports and calls into a
           // context-only file retain their targets without retaining a second
