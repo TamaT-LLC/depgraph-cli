@@ -256,8 +256,8 @@ pub(crate) fn verify_workflow_policy_text(
                 || !workflow.contains("\n  workflow_dispatch:")
                 || ![
                     "\n  benchmark:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
-                    "\n  integration:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
-                    "\n  windows-smoke:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
+                    "\n  integration:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
+                    "\n  windows-smoke:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
@@ -488,12 +488,26 @@ fn job_env_entries(job: &str) -> Result<Vec<&str>> {
     Ok(environment)
 }
 
+const BENCHMARK_ONLY_INPUT: &str = concat!(
+    "      benchmark_only:\n",
+    "        description: Run the benchmark and its Rust, Go, and Web prerequisite checks\n",
+    "        type: boolean\n",
+    "        default: false\n",
+);
+const EXTRA_NATIVE_PACKAGES_INPUT: &str = concat!(
+    "      extra_native_packages:\n",
+    "        description: Verify Linux ARM64 and Intel macOS release packages as well\n",
+    "        type: boolean\n",
+    "        default: false\n",
+);
+
 fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
     let job = workflow_job_block(workflow, "extra-native-package")?;
-    Ok(job.contains("\n    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages\n")
+    Ok(job.contains("\n    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages && !inputs.benchmark_only\n")
         && job.contains("\n      fail-fast: false\n")
         && job_pins_intermediate_state_bound(workflow, "extra-native-package")?
-        && workflow.contains("      extra_native_packages:\n        description: Verify Linux ARM64 and Intel macOS release packages as well\n        type: boolean\n        default: false\n"))
+        && workflow.contains(EXTRA_NATIVE_PACKAGES_INPUT)
+        && workflow.contains(BENCHMARK_ONLY_INPUT))
 }
 
 /// The integration job builds the debug graph and then the release package on
@@ -2712,6 +2726,7 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
+        BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT,
         extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
         job_pins_intermediate_state_bound, workflow_job_block,
     };
@@ -2743,12 +2758,28 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_workflows_satisfy_the_action_security_policy() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask lives directly under the workspace root");
+        super::verify_github_actions_security(root).unwrap();
+    }
+
+    #[test]
     fn extra_native_packages_require_explicit_manual_input_and_resource_bounds() {
         let ci = checked_in_ci_workflow();
         assert!(extra_native_package_is_manual_and_bounded(&ci).unwrap());
         for drift in [
             ci.replace(" && inputs.extra_native_packages", ""),
-            ci.replacen("        default: false", "        default: true", 1),
+            ci.replace(" && !inputs.benchmark_only", ""),
+            ci.replace(
+                EXTRA_NATIVE_PACKAGES_INPUT,
+                &EXTRA_NATIVE_PACKAGES_INPUT.replace("default: false", "default: true"),
+            ),
+            ci.replace(
+                BENCHMARK_ONLY_INPUT,
+                &BENCHMARK_ONLY_INPUT.replace("default: false", "default: true"),
+            ),
             ci.replace(
                 "      CARGO_INCREMENTAL: \"0\"",
                 "      CARGO_INCREMENTAL: \"1\"",
