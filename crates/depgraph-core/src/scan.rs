@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Instant,
 };
 
@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::{
     analysis_execution::{
-        AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisWorkItem,
-        TypedReferenceFingerprint, execute_analysis_units,
+        AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisInputValidation,
+        AnalysisWorkItem, TypedReferenceFingerprint, execute_analysis_units,
         execute_analysis_units_with_retained_typed,
     },
     analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
@@ -892,15 +892,31 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
             }
         }
     };
+    let reuse_validation_ms = AtomicU64::new(0);
+    let reuse_validation_count = AtomicU64::new(0);
+    let checkpoint_validation_ms = AtomicU64::new(0);
+    let checkpoint_validation_count = AtomicU64::new(0);
     let validate = |item: &AnalysisWorkItem, validation| {
-        validate_work_inputs(
+        let started = profiling.then(Instant::now);
+        let valid = validate_work_inputs(
             &execution_context,
             item,
             checkpoint_store_path.as_deref(),
             &profile_plan.plan_id,
             analysis_input_proof.as_deref(),
             validation,
-        )
+        );
+        if let Some(started) = started {
+            let (duration, count) = match validation {
+                AnalysisInputValidation::Reuse => (&reuse_validation_ms, &reuse_validation_count),
+                AnalysisInputValidation::CheckpointWrite => {
+                    (&checkpoint_validation_ms, &checkpoint_validation_count)
+                }
+            };
+            duration.fetch_add(elapsed_ms(started), Ordering::Relaxed);
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        valid
     };
     let mut analysis = execute_analysis_units(
         store,
@@ -1185,6 +1201,28 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         return Ok(outcome);
     }
     if profiling {
+        // These validations run inside core_worker_execution. Report them as
+        // nested phases so repeated input proofs can be distinguished from
+        // worker runtime without changing the existing aggregate's meaning.
+        for (phase, duration, count) in [
+            (
+                "core_unit_reuse_validation",
+                &reuse_validation_ms,
+                &reuse_validation_count,
+            ),
+            (
+                "core_unit_checkpoint_validation",
+                &checkpoint_validation_ms,
+                &checkpoint_validation_count,
+            ),
+        ] {
+            performance_phases.push(ScanPhasePerformance {
+                phase: phase.into(),
+                duration_ms: duration.load(Ordering::Relaxed),
+                items: count.load(Ordering::Relaxed),
+                bytes: 0,
+            });
+        }
         performance_phases.push(ScanPhasePerformance {
             phase: "core_scan_setup".into(),
             duration_ms: setup_ms,

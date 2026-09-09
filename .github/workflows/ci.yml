@@ -337,6 +337,7 @@ jobs:
       DEPGRAPH_BENCH_REPORT: "dist/benchmark-report.json"
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
       DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
+      DEPGRAPH_SCAN_PROFILE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
