@@ -8,7 +8,7 @@
 //! sibling modules (e.g. `cache`) call across module boundaries are
 //! `pub(crate)`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -630,37 +630,10 @@ pub(crate) struct SiteValidationRecord {
     pub(crate) target_ids: Vec<String>,
 }
 
-pub(crate) fn load_site_validation_records(
-    connection: &Connection,
-    scan_id: &str,
-) -> Result<Vec<SiteValidationRecord>> {
-    let mut statement = connection.prepare(
-        "SELECT id, source, profile_id, resolution_status, precision, target_ids_json
-         FROM sites WHERE scan_id=?1 ORDER BY id",
-    )?;
-    statement
-        .query_map([scan_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?
-        .map(|row| {
-            let (id, source, profile_id, resolution_status, precision, target_ids) = row?;
-            Ok(SiteValidationRecord {
-                id,
-                source,
-                profile_id,
-                resolution_status,
-                precision,
-                target_ids: serde_json::from_str(&target_ids)?,
-            })
-        })
-        .collect()
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidationTargetKind {
+    ExternalSystem,
+    UnknownTarget,
 }
 
 pub(crate) struct EdgeValidationRecord {
@@ -671,30 +644,92 @@ pub(crate) struct EdgeValidationRecord {
     pub(crate) profile_id: String,
     pub(crate) resolution_status: String,
     pub(crate) precision: String,
+    pub(crate) target_kind: Option<ValidationTargetKind>,
 }
 
-pub(crate) fn load_edge_validation_records(
+/// Merge ordered site and edge cursors, retaining only the current site's
+/// targets and edges. Both tables are decoded completely, including legacy
+/// edges without a site and dangling site references ignored by this check.
+pub(crate) fn visit_site_validation_groups(
     connection: &Connection,
     scan_id: &str,
-) -> Result<Vec<EdgeValidationRecord>> {
-    let mut statement = connection.prepare(
-        "SELECT id, site_id, source, target, profile_id, resolution_status, precision
-         FROM edges WHERE scan_id=?1 ORDER BY id",
+    mut visit: impl FnMut(SiteValidationRecord, &[EdgeValidationRecord]) -> Result<()>,
+) -> Result<()> {
+    // Only sentinel kinds participate in the resolution classification
+    // check. Avoid looking up a full node row for every edge target.
+    let mut sentinel_kinds = HashMap::new();
+    let mut sentinel_statement = connection.prepare(
+        "SELECT id, kind FROM nodes
+         WHERE scan_id=?1 AND kind IN ('external_system', 'unknown_target')",
     )?;
-    statement
-        .query_map([scan_id], |row| {
-            Ok(EdgeValidationRecord {
-                id: row.get(0)?,
-                site_id: row.get(1)?,
-                source: row.get(2)?,
-                target: row.get(3)?,
-                profile_id: row.get(4)?,
-                resolution_status: row.get(5)?,
-                precision: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut sentinels = sentinel_statement.query([scan_id])?;
+    while let Some(row) = sentinels.next()? {
+        let kind = match row.get::<_, String>(1)?.as_str() {
+            "external_system" => ValidationTargetKind::ExternalSystem,
+            "unknown_target" => ValidationTargetKind::UnknownTarget,
+            _ => continue,
+        };
+        // A BLOB node ID cannot equal a decoded TEXT edge target in SQLite.
+        // Keep raw TEXT bytes so unrelated malformed IDs are not decoded by
+        // this check; the ordinary node reader remains responsible for them.
+        if let rusqlite::types::ValueRef::Text(id) = row.get_ref(0)? {
+            sentinel_kinds.insert(id.to_vec(), kind);
+        }
+    }
+    drop(sentinels);
+    drop(sentinel_statement);
+    let mut site_statement = connection.prepare(
+        "SELECT id, source, profile_id, resolution_status, precision, target_ids_json
+         FROM sites WHERE scan_id=?1 ORDER BY id",
+    )?;
+    let mut edge_statement = connection.prepare(
+        "SELECT id, site_id, source, target, profile_id, resolution_status, precision
+         FROM edges WHERE scan_id=?1 ORDER BY site_id, id",
+    )?;
+    let mut edges = edge_statement.query_map([scan_id], |row| {
+        let target: String = row.get(3)?;
+        Ok(EdgeValidationRecord {
+            id: row.get(0)?,
+            site_id: row.get(1)?,
+            source: row.get(2)?,
+            target_kind: sentinel_kinds.get(target.as_bytes()).copied(),
+            target,
+            profile_id: row.get(4)?,
+            resolution_status: row.get(5)?,
+            precision: row.get(6)?,
+        })
+    })?;
+    let mut next_edge = edges.next().transpose()?;
+    let mut sites = site_statement.query([scan_id])?;
+    while let Some(row) = sites.next()? {
+        let target_ids: String = row.get(5)?;
+        let site = SiteValidationRecord {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            profile_id: row.get(2)?,
+            resolution_status: row.get(3)?,
+            precision: row.get(4)?,
+            target_ids: serde_json::from_str(&target_ids)?,
+        };
+        let mut site_edges = Vec::new();
+        while next_edge
+            .as_ref()
+            .is_some_and(|edge| edge.site_id.as_deref() <= Some(site.id.as_str()))
+        {
+            let edge = next_edge.take().expect("the next edge was just checked");
+            if edge.site_id.as_deref() == Some(site.id.as_str()) {
+                site_edges.push(edge);
+            }
+            next_edge = edges.next().transpose()?;
+        }
+        visit(site, &site_edges)?;
+    }
+    // The lookahead has already been decoded. Decode every remaining edge
+    // too, even when its site does not exist or the scan has no sites.
+    for edge in edges {
+        edge?;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<EdgeRecord>> {

@@ -1519,14 +1519,16 @@ fn create_completed_snapshot_inner(
     source: SnapshotSource<'_>,
     promote_scan: bool,
 ) -> Result<(String, bool)> {
-    let (snapshot_id, profile_ids) = completed_snapshot_identity(
-        connection,
-        source.scan_id,
-        source.build_attempt_id,
-        source.runtime_session_ids,
-        source.parent_snapshot_id,
-        source.source_revision,
-    )?;
+    let (snapshot_id, profile_ids) = crate::profiling::run("store-snapshot-identity", || {
+        completed_snapshot_identity(
+            connection,
+            source.scan_id,
+            source.build_attempt_id,
+            source.runtime_session_ids,
+            source.parent_snapshot_id,
+            source.source_revision,
+        )
+    })?;
     let profile_set_json = serde_json::to_string(&profile_ids)?;
     let runtime_session_set_json = serde_json::to_string(source.runtime_session_ids)?;
     // A fresh full-scan identity has already loaded and canonically validated
@@ -1579,10 +1581,12 @@ fn create_completed_snapshot_inner(
         && stored.scan_id == source.scan_id
         && stored.build_attempt_id.as_deref() == source.build_attempt_id;
     let seal_verified_at = if completed_snapshot_seal_table_exists(connection)? {
-        if !reuse_identity {
-            validate_completed_snapshot_for_seal(connection, &snapshot_id)?;
-        }
-        persist_validated_snapshot_seal(connection, &snapshot_id)?
+        crate::profiling::run("store-snapshot-seal", || {
+            if !reuse_identity {
+                validate_completed_snapshot_for_seal(connection, &snapshot_id)?;
+            }
+            persist_validated_snapshot_seal(connection, &snapshot_id)
+        })?
     } else {
         None
     };

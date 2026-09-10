@@ -60,7 +60,8 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 // inside the measured interval. Measure live Rust heap rather than process RSS
 // to avoid allocator retention, SQLite's C heap, and platform sampling noise.
 #[test]
-fn snapshot_identity_streams_records_without_holding_the_whole_graph() -> anyhow::Result<()> {
+fn scan_validation_and_identity_stream_records_without_holding_the_whole_graph()
+-> anyhow::Result<()> {
     const NODES: usize = 2_048;
     const PAYLOAD_BYTES: usize = 8_192;
     let mut store = Store::open_in_memory()?;
@@ -124,7 +125,18 @@ fn snapshot_identity_streams_records_without_holding_the_whole_graph() -> anyhow
     profile_completed["coverage"] = completed["coverage"].clone();
     store.ingest_event(&profile_completed)?;
     store.ingest_event(&completed)?;
-    let validated = store.validate_scan_for_completion("identity-memory")?;
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    MEASURING.store(true, Ordering::Relaxed);
+    let validated = store.validate_scan_for_completion("identity-memory");
+    MEASURING.store(false, Ordering::Relaxed);
+    let validation_peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+    let validated = validated?;
+    eprintln!("scan validation peak additional Rust heap: {validation_peak} bytes");
+    assert!(
+        validation_peak < 256 * 1024,
+        "validation allocated {validation_peak} bytes"
+    );
     let baseline = LIVE.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
     MEASURING.store(true, Ordering::Relaxed);
@@ -140,8 +152,8 @@ fn snapshot_identity_streams_records_without_holding_the_whole_graph() -> anyhow
     );
     // Each node/site/edge/evidence payload domain contains at least 16 MiB. Identity and
     // completion may retain one decoded record and its canonical JSON, but
-    // must not materialize those payloads together. Validation runs before
-    // measurement because it intentionally retains compact topology records.
+    // must not materialize those payloads together. Validation has a separate
+    // budget so its site and edge working set cannot hide in this baseline.
     let limit = 1024 * 1024;
     eprintln!(
         "snapshot identity peak additional Rust heap: {additional_peak} bytes (limit {limit})"

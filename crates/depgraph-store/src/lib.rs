@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet},
     path::Path,
 };
 
@@ -18,11 +18,13 @@ mod health_range;
 mod impact_cache;
 mod incremental;
 mod profile_matrix;
+mod profiling;
 mod read;
 mod records;
 mod runtime;
 mod schema;
 mod snapshot;
+mod validation;
 
 pub use analysis_coverage::aggregate_analysis_coverage;
 use build::{
@@ -61,10 +63,9 @@ pub use profile_matrix::{
     refresh_profile_matrix_view,
 };
 use read::{
-    EdgeValidationRecord, load_adapter_logs, load_diagnostics, load_edge_validation_records,
-    load_edges, load_evidence, load_file_coverage, load_nodes, load_profiles,
-    load_scan_attempt_summary, load_scan_topology, load_site_validation_records, load_sites,
-    merge_coverage, observed_coverage, topology_from_snapshot,
+    load_adapter_logs, load_diagnostics, load_edges, load_evidence, load_file_coverage, load_nodes,
+    load_profiles, load_scan_attempt_summary, load_scan_topology, load_sites, merge_coverage,
+    observed_coverage, topology_from_snapshot,
 };
 pub use records::*;
 pub use runtime::{
@@ -1349,117 +1350,14 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn validate_scan(&self, scan_id: &str) -> Result<()> {
-        let missing_nodes: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM edges e
-             LEFT JOIN nodes src ON src.scan_id = e.scan_id AND src.id = e.source
-             LEFT JOIN nodes dst ON dst.scan_id = e.scan_id AND dst.id = e.target
-             WHERE e.scan_id = ?1 AND (src.id IS NULL OR dst.id IS NULL)",
-            [scan_id],
-            |row| row.get(0),
-        )?;
-        if missing_nodes > 0 {
-            bail!("scan {scan_id} has {missing_nodes} edges with missing endpoint nodes");
-        }
-
-        let (site_count, resolved, candidates, external, unresolved): (i64, i64, i64, i64, i64) =
-            self.connection.query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
-                 FROM sites WHERE scan_id = ?1",
-                [scan_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )?;
-        if site_count != resolved + candidates + external + unresolved {
-            bail!("coverage invariant failed for scan {scan_id}");
-        }
-
-        let invalid_sentinels: i64 = self.connection.query_row(
-            "SELECT COUNT(*)
-               FROM sites s
-               JOIN edges e ON e.scan_id=s.scan_id AND e.site_id=s.id
-               JOIN nodes n ON n.scan_id=e.scan_id AND n.id=e.target
-              WHERE s.scan_id=?1
-                AND ((s.resolution_status='resolved' AND n.kind IN ('external_system','unknown_target'))
-                  OR (s.resolution_status='external' AND n.kind!='external_system')
-                  OR (s.resolution_status='unresolved' AND n.kind!='unknown_target'))",
-            [scan_id],
-            |row| row.get(0),
-        )?;
-        if invalid_sentinels > 0 {
-            bail!(
-                "scan {scan_id} has {invalid_sentinels} invalid resolution target classifications"
-            );
-        }
-
-        let sites = load_site_validation_records(&self.connection, scan_id)?;
-        let edges = load_edge_validation_records(&self.connection, scan_id)?;
-        let mut site_counts_by_profile = BTreeMap::<&str, [u64; 5]>::new();
-        let mut edges_by_site = BTreeMap::<&str, Vec<&EdgeValidationRecord>>::new();
-        for edge in &edges {
-            if let Some(site_id) = &edge.site_id {
-                edges_by_site.entry(site_id).or_default().push(edge);
-            }
-        }
-        for site in &sites {
-            let counts = site_counts_by_profile.entry(&site.profile_id).or_default();
-            counts[0] += 1;
-            let status_index = match site.resolution_status.as_str() {
-                "resolved" => 1,
-                "candidates" => 2,
-                "external" => 3,
-                "unresolved" => 4,
-                status => bail!("site {} has unknown resolution status {status}", site.id),
-            };
-            counts[status_index] += 1;
-            let expected = site
-                .target_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            if expected.len() != site.target_ids.len() {
-                bail!("site {} contains duplicate target IDs", site.id);
-            }
-            let site_edges = edges_by_site
-                .get(site.id.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            match site.resolution_status.as_str() {
-                "resolved" | "external" | "unresolved"
-                    if expected.len() == 1 && site_edges.len() == 1 => {}
-                "candidates" if !expected.is_empty() && site_edges.len() == expected.len() => {}
-                "resolved" | "candidates" | "external" | "unresolved" => bail!(
-                    "site {} violates {} cardinality: {} targets, {} edges",
-                    site.id,
-                    site.resolution_status,
-                    expected.len(),
-                    site_edges.len()
-                ),
-                status => bail!("site {} has unknown resolution status {status}", site.id),
-            }
-            let observed = site_edges
-                .iter()
-                .map(|edge| edge.target.as_str())
-                .collect::<BTreeSet<_>>();
-            if expected != observed || site_edges.len() != expected.len() {
-                bail!("site {} target IDs do not match its edge targets", site.id);
-            }
-            for edge in site_edges {
-                if edge.source != site.source
-                    || edge.profile_id != site.profile_id
-                    || edge.resolution_status != site.resolution_status
-                    || edge.precision != site.precision
-                {
-                    bail!(
-                        "site {} and edge {} disagree on contract fields",
-                        site.id,
-                        edge.id
-                    );
-                }
-            }
-        }
+        let validation::ScanValidationCounts {
+            sites: site_count,
+            resolved,
+            candidates,
+            external,
+            unresolved,
+            sites_by_profile: site_counts_by_profile,
+        } = validation::validate_scan_graph(&self.connection, scan_id)?;
 
         let coverage_json = self
             .connection
@@ -3999,6 +3897,7 @@ mod tests {
         validate_runtime_import_operation_ownership_schema_and_rows,
         validate_scan_operation_staging_schema_and_rows, validate_store_foreign_keys,
     };
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::sync::{
         Arc,
