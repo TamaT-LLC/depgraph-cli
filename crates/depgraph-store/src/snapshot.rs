@@ -1245,15 +1245,12 @@ pub(crate) fn completed_snapshot_identity(
                 .with_context(|| format!("parent completed snapshot {parent_id} was not found"))
         })
         .transpose()?;
-    if !layered
-        && !connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM evidence
-                            WHERE scan_id=?1 AND kind IN ('build', 'runtime'))",
-            [scan_id],
-            |row| row.get::<_, bool>(0),
-        )?
-    {
-        return streamed_scan_identity(connection, scan_id, parent_snapshot_id, source_revision);
+    if !layered {
+        match streamed_scan_identity(connection, scan_id, parent_snapshot_id, source_revision) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if error.is::<ObservedScanIdentity>() => {}
+            Err(error) => return Err(error),
+        }
     }
     let mut snapshot = if layered {
         if let Some(parent_id) = parent_snapshot_id {
@@ -1308,6 +1305,7 @@ pub(crate) fn completed_snapshot_identity(
 /// A static scan needs only profiles and diagnostics together in memory.
 /// Build evidence can also become profile-axis diagnostic evidence regardless
 /// of its owner, so observed scans retain the existing reconstruction path.
+/// Detect observations during hashing to avoid a separate full evidence read.
 fn streamed_scan_identity(
     connection: &Connection,
     scan_id: &str,
@@ -1361,6 +1359,12 @@ fn streamed_scan_identity(
             }
             IdentityArray::Evidence => hash_identity_records(hash, |emit| {
                 visit_evidence(connection, scan_id, |evidence| {
+                    // Check before pruning: even evidence absent from the
+                    // final identity must select the reconstruction path.
+                    // The caller discards this partial hash and starts over.
+                    if matches!(evidence.kind.as_str(), "build" | "runtime") {
+                        return Err(ObservedScanIdentity.into());
+                    }
                     // Decode even discarded evidence, just as the full load
                     // does, so corrupt JSON cannot disappear through pruning.
                     if evidence.owner_type != "diagnostic"
@@ -1384,6 +1388,12 @@ fn streamed_scan_identity(
     )?;
     Ok((snapshot_id, profile_ids))
 }
+
+/// Internal control flow, caught only by the unlayered identity dispatcher.
+/// Storage and decoding failures must propagate rather than trigger a retry.
+#[derive(Debug, thiserror::Error)]
+#[error("observed evidence requires full snapshot reconstruction")]
+struct ObservedScanIdentity;
 
 enum IdentityArray {
     Edges,
@@ -1963,7 +1973,7 @@ mod identity_tests {
         let actual =
             completed_snapshot_identity(&store.connection, scan_id, None, &[], parent, revision)?;
         assert_eq!(actual, (expected, profiles));
-        assert_eq!(WORK.get(), [graph_loads, 1, 0]);
+        assert_eq!(WORK.get(), [graph_loads, graph_loads + 1, 0]);
         Ok(view)
     }
 
@@ -2047,10 +2057,20 @@ mod identity_tests {
     {
         for (owner, kind) in [
             ("profile", "source"),
+            ("profile", "semantic"),
+            ("profile", "BUILD"),
             ("profile", "build"),
             ("profile", "runtime"),
             ("site", "build"),
             ("site", "runtime"),
+            ("edge", "build"),
+            ("edge", "runtime"),
+            ("node", "build"),
+            ("node", "runtime"),
+            ("diagnostic", "build"),
+            ("diagnostic", "runtime"),
+            ("unknown-owner", "build"),
+            ("unknown-owner", "runtime"),
         ] {
             let mut store = Store::open_in_memory()?;
             stage_fixture(&mut store, "diagnostics")?;
@@ -2113,7 +2133,7 @@ mod identity_tests {
                 "diagnostics",
                 None,
                 None,
-                usize::from(kind != "source"),
+                usize::from(matches!(kind, "build" | "runtime")),
             )?;
             assert!(!view.evidence.iter().any(|e| e.owner_id == "orphan"));
             assert!(
@@ -2128,6 +2148,49 @@ mod identity_tests {
                     .any(|e| e.owner_id == "diagnostic:golden" && e.ordinal == 7)
             );
             assert_eq!(view.diagnostics.last().unwrap().ordinal, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scan_ignores_observations_in_other_scans() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "static")?;
+        stage_fixture(&mut store, "observed")?;
+        store.connection.execute(
+            "UPDATE evidence SET kind='build' WHERE scan_id='observed'",
+            [],
+        )?;
+        assert_scan_identity_matches_view(&store, "static", None, None, 0)?;
+        assert_scan_identity_matches_view(&store, "observed", None, None, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn observed_identity_fallback_preserves_errors_before_and_after_detection() -> Result<()> {
+        for corrupt_owner in ["a-corrupt", "z-corrupt"] {
+            let mut store = Store::open_in_memory()?;
+            stage_fixture(&mut store, "corrupt")?;
+            for (owner, kind, raw) in [
+                ("m-observed", "build", "{}"),
+                (corrupt_owner, "source", "{"),
+            ] {
+                store.connection.execute(
+                    "INSERT INTO evidence
+                     SELECT scan_id,?1,owner_id,ordinal,?2,extractor,extractor_version,path,
+                            start_line,start_column,end_line,end_column,?3
+                       FROM evidence WHERE scan_id='corrupt' AND owner_type='edge' LIMIT 1",
+                    params![owner, kind, raw],
+                )?;
+            }
+            WORK.set([0; 3]);
+            let error = store.prospective_scan_snapshot_id("corrupt").unwrap_err();
+            assert!(error.is::<serde_json::Error>(), "{error:#}");
+            assert_eq!(
+                WORK.get(),
+                [usize::from(corrupt_owner == "z-corrupt"), 1, 0],
+                "decoding errors must propagate; only observed evidence triggers a retry"
+            );
         }
         Ok(())
     }
