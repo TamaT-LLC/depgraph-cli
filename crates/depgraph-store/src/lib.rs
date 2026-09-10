@@ -74,11 +74,11 @@ pub use runtime::{
 use schema::{table_exists, table_has_column};
 use snapshot::{
     SnapshotSource, backfill_completed_snapshot_seals, backfill_completed_snapshot_seals_v1,
-    backfill_completed_snapshots, completed_snapshot_identity, create_completed_snapshot,
+    backfill_completed_snapshots, completed_snapshot_identity,
+    create_and_maybe_promote_scan_snapshot, create_completed_snapshot,
     load_base_snapshot_from_connection, load_completed_snapshot_from_connection,
     load_completed_snapshot_profiles_from_connection, load_completed_snapshot_record,
-    persist_completed_snapshot_seal, promote_completed_snapshot,
-    promote_completed_snapshot_if_current_parent, verify_completed_snapshot_seal,
+    persist_completed_snapshot_seal, promote_completed_snapshot, verify_completed_snapshot_seal,
     verify_completed_snapshot_seal_v1,
 };
 
@@ -2308,14 +2308,14 @@ ORDER BY id COLLATE BINARY
             "UPDATE scans SET status = ?2, completed_at = ?3, error = ?4 WHERE id = ?1",
             params![scan_id, status, completed_at, error],
         )?;
-        let completed_snapshot_id = if status == "completed" {
+        let (completed_snapshot_id, promoted) = if status == "completed" {
             let (parent_snapshot_id, source_revision): (Option<String>, Option<String>) = tx
                 .query_row(
                     "SELECT parent_snapshot_id, source_revision FROM scans WHERE id=?1",
                     [scan_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-            Some(create_completed_snapshot(
+            let (snapshot_id, promoted) = create_and_maybe_promote_scan_snapshot(
                 &tx,
                 SnapshotSource {
                     source_kind: "scan",
@@ -2328,32 +2328,18 @@ ORDER BY id COLLATE BINARY
                     source_revision: source_revision.as_deref(),
                     created_at: &completed_at,
                 },
-            )?)
+                promote,
+            )?;
+            (Some(snapshot_id), promoted)
         } else {
-            None
+            (None, false)
         };
-        let mut promoted = false;
-        if promote {
-            let snapshot_id = completed_snapshot_id
-                .as_deref()
-                .context("completed scan did not create a snapshot")?;
-            let expected_parent = tx.query_row(
-                "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+        if promoted {
+            tx.execute(
+                "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
                 [scan_id],
-                |row| row.get::<_, Option<String>>(0),
             )?;
-            promoted = promote_completed_snapshot_if_current_parent(
-                &tx,
-                snapshot_id,
-                expected_parent.as_deref(),
-            )?;
-            if promoted {
-                tx.execute(
-                    "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
-                     ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
-                    [scan_id],
-                )?;
-            }
         }
         if !matches!(status, "completed" | "cancelled") {
             tx.execute(

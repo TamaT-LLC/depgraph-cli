@@ -474,6 +474,19 @@ pub(crate) fn load_profiles(connection: &Connection, scan_id: &str) -> Result<Ve
 }
 
 pub(crate) fn load_nodes(connection: &Connection, scan_id: &str) -> Result<Vec<NodeRecord>> {
+    let mut records = Vec::new();
+    visit_nodes(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_nodes(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(NodeRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, kind, locator, display_name, properties_json FROM nodes
          WHERE scan_id=?1 ORDER BY id",
@@ -498,7 +511,7 @@ pub(crate) fn load_nodes(connection: &Connection, scan_id: &str) -> Result<Vec<N
             properties: serde_json::from_str(&properties)?,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_scan_topology(connection: &Connection, scan_id: &str) -> Result<GraphTopology> {
@@ -547,6 +560,19 @@ pub(crate) fn topology_from_snapshot(snapshot: GraphSnapshot) -> GraphTopology {
 }
 
 pub(crate) fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<SiteRecord>> {
+    let mut records = Vec::new();
+    visit_sites(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_sites(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(SiteRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, source, kind, specifier, profile_id, resolution_status, precision,
                 condition_json, target_ids_json, reason
@@ -592,7 +618,7 @@ pub(crate) fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<S
             reason,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) struct SiteValidationRecord {
@@ -672,6 +698,19 @@ pub(crate) fn load_edge_validation_records(
 }
 
 pub(crate) fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<EdgeRecord>> {
+    let mut records = Vec::new();
+    visit_edges(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_edges(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(EdgeRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, site_id, source, target, kind, phase, environment, profile_id,
                 resolution_status, precision, condition_json, generated
@@ -723,10 +762,23 @@ pub(crate) fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<E
             generated,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_evidence(connection: &Connection, scan_id: &str) -> Result<Vec<EvidenceRecord>> {
+    let mut records = Vec::new();
+    visit_evidence(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_evidence(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(EvidenceRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT owner_type, owner_id, ordinal, kind, extractor, extractor_version, path,
                 start_line, start_column, end_line, end_column, raw_json
@@ -786,7 +838,7 @@ pub(crate) fn load_evidence(connection: &Connection, scan_id: &str) -> Result<Ve
                 .unwrap_or_else(|| json!({})),
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_diagnostics(
@@ -837,11 +889,24 @@ pub(crate) fn load_file_coverage(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<Vec<FileCoverageRecord>> {
+    let mut records = Vec::new();
+    visit_file_coverage(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_file_coverage(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(FileCoverageRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT adapter, path, discovered_sites, emitted_sites, skipped_sites, skipped, reason
            FROM file_coverage WHERE scan_id=?1 ORDER BY adapter, path",
     )?;
-    let rows = statement.query_map([scan_id], |row| {
+    let mut rows = statement.query_map([scan_id], |row| {
         Ok(FileCoverageRecord {
             adapter: row.get(0)?,
             path: row.get(1)?,
@@ -852,26 +917,37 @@ pub(crate) fn load_file_coverage(
             reason: row.get(6)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    rows.try_for_each(|row| visit(row?))
 }
 
 pub(crate) fn load_adapter_logs(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<Vec<AdapterLogRecord>> {
+    let mut records = Vec::new();
+    visit_adapter_logs(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_adapter_logs(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(AdapterLogRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT adapter, stderr, truncated FROM adapter_logs WHERE scan_id=?1 ORDER BY adapter",
     )?;
-    let rows = statement.query_map([scan_id], |row| {
+    let mut rows = statement.query_map([scan_id], |row| {
         Ok(AdapterLogRecord {
             adapter: row.get(0)?,
             stderr: row.get(1)?,
             truncated: row.get(2)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    rows.try_for_each(|row| visit(row?))
 }
 
 /// Refresh staging coverage from normalized counters without reconstructing

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use depgraph_protocol::{Condition, stable_id_from_value};
 use serde::{Deserialize, Serialize};
@@ -123,29 +123,29 @@ impl PhaseCoverageBuilder {
 }
 
 #[derive(Default)]
-struct EntryBuilder {
+struct EntryBuilder<'a> {
     effective_input_id: String,
     language: String,
     profile_ids: BTreeSet<String>,
     parent_profile_ids: BTreeSet<String>,
     phases: BTreeSet<String>,
-    conditions: Vec<Value>,
+    conditions: Vec<&'a Value>,
     phase_coverage: BTreeMap<String, PhaseCoverageBuilder>,
     selection_reasons: BTreeSet<String>,
     axis_conflicts: Vec<ProfileAxisConflictRecord>,
 }
 
 #[derive(Default)]
-struct CorrelationBuilder {
+struct CorrelationBuilder<'a> {
     effective_profile_id: String,
-    source: String,
-    kind: String,
-    specifier: String,
-    conditions: BTreeMap<String, Vec<Value>>,
-    targets: BTreeMap<String, BTreeSet<String>>,
-    resolutions: BTreeMap<String, BTreeSet<String>>,
-    site_ids: BTreeMap<String, BTreeSet<String>>,
-    edge_ids: BTreeMap<String, BTreeSet<String>>,
+    source: &'a str,
+    kind: &'a str,
+    specifier: &'a str,
+    conditions: BTreeMap<&'static str, Vec<&'a Value>>,
+    targets: BTreeMap<&'static str, BTreeSet<&'a str>>,
+    resolutions: BTreeMap<&'static str, BTreeSet<&'a str>>,
+    site_ids: BTreeMap<&'static str, BTreeSet<&'a str>>,
+    edge_ids: BTreeMap<&'static str, BTreeSet<&'a str>>,
 }
 
 pub fn declared_parent_profile_id(profile: &ProfileRecord) -> Option<&str> {
@@ -191,13 +191,36 @@ fn valid_effective_input_id(value: &str) -> bool {
 }
 
 pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot, canonicalize_diagnostics: bool) {
-    snapshot.diagnostics.retain(|diagnostic| {
-        diagnostic
-            .properties
-            .get("profile_matrix_schema")
-            .and_then(Value::as_str)
-            != Some(PROFILE_MATRIX_SCHEMA_VERSION)
+    refresh_profile_matrix_inner(snapshot, canonicalize_diagnostics, true);
+}
+
+// Snapshot identity includes derived diagnostics/evidence, but not the matrix
+// view itself. Without build/runtime site observations there can be no target
+// conflicts, so only profile-axis diagnostics need to be reconstructed.
+// Observed graphs keep the complete correlation path and its existing output.
+pub(crate) fn refresh_profile_matrix_for_identity(snapshot: &mut GraphSnapshot) {
+    let has_observed_sites = snapshot.evidence.iter().any(|evidence| {
+        evidence.owner_type == "site" && matches!(evidence.kind.as_str(), "build" | "runtime")
     });
+    refresh_profile_matrix_inner(snapshot, false, has_observed_sites);
+}
+
+pub(crate) fn is_profile_matrix_diagnostic(diagnostic: &DiagnosticRecord) -> bool {
+    diagnostic
+        .properties
+        .get("profile_matrix_schema")
+        .and_then(Value::as_str)
+        == Some(PROFILE_MATRIX_SCHEMA_VERSION)
+}
+
+fn refresh_profile_matrix_inner(
+    snapshot: &mut GraphSnapshot,
+    canonicalize_diagnostics: bool,
+    include_graph: bool,
+) {
+    snapshot
+        .diagnostics
+        .retain(|diagnostic| !is_profile_matrix_diagnostic(diagnostic));
     let retained_diagnostic_ids = snapshot
         .diagnostics
         .iter()
@@ -216,7 +239,8 @@ pub(crate) fn refresh_profile_matrix(snapshot: &mut GraphSnapshot, canonicalize_
         .unwrap_or(-1)
         .saturating_add(1);
 
-    let matrix = build_profile_matrix(snapshot);
+    snapshot.profile_matrix = ProfileMatrixRecord::default();
+    let matrix = build_profile_matrix(snapshot, include_graph);
     append_matrix_diagnostics(snapshot, &matrix);
     snapshot.profile_matrix = matrix;
     if canonicalize_diagnostics {
@@ -250,7 +274,22 @@ pub fn refresh_profile_matrix_view(snapshot: &mut GraphSnapshot) {
     refresh_profile_matrix(snapshot, true);
 }
 
-fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
+fn build_profile_matrix(snapshot: &GraphSnapshot, include_graph: bool) -> ProfileMatrixRecord {
+    let sites = if include_graph {
+        snapshot.sites.as_slice()
+    } else {
+        &[]
+    };
+    let edges = if include_graph {
+        snapshot.edges.as_slice()
+    } else {
+        &[]
+    };
+    let evidence_records = if include_graph {
+        snapshot.evidence.as_slice()
+    } else {
+        &[]
+    };
     let profiles = snapshot
         .profiles
         .iter()
@@ -265,6 +304,11 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
         profile_effective.insert(profile.id.clone(), effective_input_id);
     }
 
+    let effective_profile_ids = profile_effective
+        .values()
+        .map(|id| (id.as_str(), effective_profile_id(id)))
+        .collect::<BTreeMap<_, _>>();
+    let mut condition_cache = ConditionCache::default();
     let mut entries = BTreeMap::<String, EntryBuilder>::new();
     let mut global_phase = BTreeMap::<String, PhaseCoverageBuilder>::new();
     for profile in &snapshot.profiles {
@@ -311,7 +355,7 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
                 .insert("direct-effective-input".to_owned());
         }
         for phase in profile_phases(profile) {
-            entry.phases.insert(phase.clone());
+            entry.phases.insert(phase.to_owned());
             entry
                 .phase_coverage
                 .entry(phase.clone())
@@ -343,96 +387,91 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
         }
     }
 
-    let evidence_phase = snapshot
-        .evidence
+    let evidence_phase = evidence_records
         .iter()
-        .filter(|evidence| matches!(evidence.owner_type.as_str(), "site" | "edge"))
-        .fold(
-            BTreeMap::<(String, String), (i64, String)>::new(),
-            |mut map, evidence| {
-                let phase = evidence_kind_phase(&evidence.kind).to_owned();
-                let key = (evidence.owner_type.clone(), evidence.owner_id.clone());
-                if map
-                    .get(&key)
-                    .is_none_or(|(ordinal, _)| evidence.ordinal < *ordinal)
-                {
-                    map.insert(key, (evidence.ordinal, phase));
-                }
-                map
-            },
-        );
+        .filter(|evidence| evidence.owner_type == "site")
+        .fold(BTreeMap::<&str, (i64, &str)>::new(), |mut map, evidence| {
+            let phase = evidence_kind_phase(&evidence.kind);
+            let key = evidence.owner_id.as_str();
+            if map
+                .get(&key)
+                .is_none_or(|(ordinal, _)| evidence.ordinal < *ordinal)
+            {
+                map.insert(key, (evidence.ordinal, phase));
+            }
+            map
+        });
 
     let mut correlations = BTreeMap::<String, CorrelationBuilder>::new();
-    let mut site_correlations = BTreeMap::<String, String>::new();
-    for site in &snapshot.sites {
+    let mut site_correlations = BTreeMap::<&str, String>::new();
+    for site in sites {
         let phase = evidence_phase
-            .get(&("site".to_owned(), site.id.clone()))
-            .map(|(_, phase)| phase.as_str())
-            .unwrap_or("static")
-            .to_owned();
+            .get(site.id.as_str())
+            .map(|(_, phase)| *phase)
+            .unwrap_or("static");
         let Some(effective_input_id) = profile_effective.get(&site.profile_id) else {
             continue;
         };
-        let effective_profile_id = effective_profile_id(effective_input_id);
+        let effective_profile_id = &effective_profile_ids[effective_input_id.as_str()];
         let key = correlation_key(
-            &effective_profile_id,
+            effective_profile_id,
             &site.source,
             &site.kind,
             site.specifier.as_deref().unwrap_or_default(),
         );
-        site_correlations.insert(site.id.clone(), key.clone());
+        site_correlations.insert(site.id.as_str(), key.clone());
         let correlation = correlations
             .entry(key)
             .or_insert_with(|| CorrelationBuilder {
                 effective_profile_id: effective_profile_id.clone(),
-                source: site.source.clone(),
-                kind: site.kind.clone(),
-                specifier: site.specifier.clone().unwrap_or_default(),
+                source: site.source.as_str(),
+                kind: site.kind.as_str(),
+                specifier: site.specifier.as_deref().unwrap_or_default(),
                 ..CorrelationBuilder::default()
             });
         correlation
             .conditions
-            .entry(phase.clone())
+            .entry(phase)
             .or_default()
-            .push(canonical_condition(&site.condition));
+            .push(&site.condition);
         correlation
             .targets
-            .entry(phase.clone())
+            .entry(phase)
             .or_default()
-            .extend(site.target_ids.iter().cloned());
+            .extend(site.target_ids.iter().map(String::as_str));
         correlation
             .resolutions
-            .entry(phase.clone())
+            .entry(phase)
             .or_default()
-            .insert(site.resolution_status.clone());
+            .insert(site.resolution_status.as_str());
         correlation
             .site_ids
-            .entry(phase.clone())
+            .entry(phase)
             .or_default()
-            .insert(site.id.clone());
+            .insert(site.id.as_str());
         if let Some(entry) = entries.get_mut(effective_input_id) {
-            entry.phases.insert(phase.clone());
-            entry.conditions.push(site.condition.clone());
-            let coverage = entry.phase_coverage.entry(phase.clone()).or_default();
+            entry.phases.insert(phase.to_owned());
+            entry.conditions.push(&site.condition);
+            let coverage = entry.phase_coverage.entry(phase.to_owned()).or_default();
             coverage.profile_ids.insert(site.profile_id.clone());
             coverage.add_site(site);
         }
-        let coverage = global_phase.entry(phase).or_default();
+        let coverage = global_phase.entry(phase.to_owned()).or_default();
         coverage.profile_ids.insert(site.profile_id.clone());
         coverage.add_site(site);
     }
 
-    for edge in &snapshot.edges {
-        let phase = canonical_phase(&edge.phase).to_owned();
+    for edge in edges {
+        let phase = canonical_phase(&edge.phase);
         if let Some(effective_input_id) = profile_effective.get(&edge.profile_id) {
             if let Some(entry) = entries.get_mut(effective_input_id) {
-                entry.phases.insert(phase.clone());
-                entry.conditions.push(edge.condition.clone());
-                let coverage = entry.phase_coverage.entry(phase.clone()).or_default();
+                entry.phases.insert(phase.to_owned());
+                entry.conditions.push(&edge.condition);
+                let coverage = entry.phase_coverage.entry(phase.to_owned()).or_default();
                 coverage.profile_ids.insert(edge.profile_id.clone());
                 coverage.edges = coverage.edges.saturating_add(1);
             }
-            let coverage = global_phase.entry(phase.clone()).or_default();
+            let coverage = global_phase.entry(phase.to_owned()).or_default();
             coverage.profile_ids.insert(edge.profile_id.clone());
             coverage.edges = coverage.edges.saturating_add(1);
         }
@@ -444,51 +483,54 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
                 .edge_ids
                 .entry(phase)
                 .or_default()
-                .insert(edge.id.clone());
+                .insert(edge.id.as_str());
         }
     }
 
-    let owner_profiles = snapshot
-        .sites
+    drop(evidence_phase);
+    drop(site_correlations);
+
+    let owner_profiles = sites
         .iter()
         .map(|site| (("site", site.id.as_str()), site.profile_id.as_str()))
         .chain(
-            snapshot
-                .edges
+            edges
                 .iter()
                 .map(|edge| (("edge", edge.id.as_str()), edge.profile_id.as_str())),
         )
         .collect::<BTreeMap<_, _>>();
-    for evidence in &snapshot.evidence {
+    for evidence in evidence_records {
         let Some(profile_id) =
             owner_profiles.get(&(evidence.owner_type.as_str(), evidence.owner_id.as_str()))
         else {
             continue;
         };
-        let phase = evidence_kind_phase(&evidence.kind).to_owned();
+        let phase = evidence_kind_phase(&evidence.kind);
         if let Some(effective_input_id) = profile_effective.get(*profile_id)
             && let Some(entry) = entries.get_mut(effective_input_id)
         {
-            let coverage = entry.phase_coverage.entry(phase.clone()).or_default();
+            let coverage = entry.phase_coverage.entry(phase.to_owned()).or_default();
             coverage.profile_ids.insert((*profile_id).to_owned());
             coverage.evidence = coverage.evidence.saturating_add(1);
         }
-        let coverage = global_phase.entry(phase).or_default();
+        let coverage = global_phase.entry(phase.to_owned()).or_default();
         coverage.profile_ids.insert((*profile_id).to_owned());
         coverage.evidence = coverage.evidence.saturating_add(1);
     }
 
+    drop(owner_profiles);
+
     let mut correlation_records = correlations
         .into_values()
-        .map(finish_correlation)
+        .map(|builder| finish_correlation(builder, &mut condition_cache))
         .collect::<Vec<_>>();
     correlation_records.sort_by(|left, right| left.id.cmp(&right.id));
     let correlations_by_entry = correlation_records.iter().fold(
-        BTreeMap::<String, Vec<Value>>::new(),
+        BTreeMap::<&str, Vec<&Value>>::new(),
         |mut map, correlation| {
-            map.entry(correlation.effective_profile_id.clone())
+            map.entry(correlation.effective_profile_id.as_str())
                 .or_default()
-                .push(correlation.condition_union.clone());
+                .push(&correlation.condition_union);
             map
         },
     );
@@ -500,9 +542,8 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
             let mut axis_conflicts = entry.axis_conflicts;
             axis_conflicts.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
             let conditions = correlations_by_entry
-                .get(&id)
-                .cloned()
-                .unwrap_or(entry.conditions);
+                .get(id.as_str())
+                .unwrap_or(&entry.conditions);
             ProfileMatrixEntryRecord {
                 id,
                 effective_input_id: entry.effective_input_id,
@@ -510,7 +551,7 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
                 profile_ids: entry.profile_ids.into_iter().collect(),
                 parent_profile_ids: entry.parent_profile_ids.into_iter().collect(),
                 phases: entry.phases.into_iter().collect(),
-                condition_union: condition_union(&conditions),
+                condition_union: condition_cache.union(conditions.iter().copied()),
                 phase_coverage: entry
                     .phase_coverage
                     .into_iter()
@@ -544,11 +585,19 @@ fn build_profile_matrix(snapshot: &GraphSnapshot) -> ProfileMatrixRecord {
     }
 }
 
-fn finish_correlation(builder: CorrelationBuilder) -> ProfileCorrelationRecord {
+fn finish_correlation(
+    builder: CorrelationBuilder<'_>,
+    condition_cache: &mut ConditionCache,
+) -> ProfileCorrelationRecord {
     let conditions_by_phase = builder
         .conditions
         .iter()
-        .map(|(phase, conditions)| (phase.clone(), condition_union(conditions)))
+        .map(|(phase, conditions)| {
+            (
+                (*phase).to_owned(),
+                condition_cache.union(conditions.iter().copied()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let predicted_phase = if builder.targets.contains_key("semantic") {
         Some("semantic")
@@ -613,9 +662,9 @@ fn finish_correlation(builder: CorrelationBuilder) -> ProfileCorrelationRecord {
     }
     let id = correlation_key(
         &builder.effective_profile_id,
-        &builder.source,
-        &builder.kind,
-        &builder.specifier,
+        builder.source,
+        builder.kind,
+        builder.specifier,
     );
     let diagnostic_id = (status == "conflict").then(|| {
         stable_id_from_value(
@@ -626,33 +675,51 @@ fn finish_correlation(builder: CorrelationBuilder) -> ProfileCorrelationRecord {
     ProfileCorrelationRecord {
         id,
         effective_profile_id: builder.effective_profile_id,
-        source: builder.source,
-        kind: builder.kind,
-        specifier: builder.specifier,
+        source: builder.source.to_owned(),
+        kind: builder.kind.to_owned(),
+        specifier: builder.specifier.to_owned(),
         status,
-        condition_union: condition_union(
-            &conditions_by_phase.values().cloned().collect::<Vec<_>>(),
-        ),
+        condition_union: condition_cache.union(conditions_by_phase.values()),
         conditions_by_phase,
         targets_by_phase: builder
             .targets
             .into_iter()
-            .map(|(phase, values)| (phase, values.into_iter().collect()))
+            .map(|(phase, values)| {
+                (
+                    phase.to_owned(),
+                    values.into_iter().map(str::to_owned).collect(),
+                )
+            })
             .collect(),
         resolutions_by_phase: builder
             .resolutions
             .into_iter()
-            .map(|(phase, values)| (phase, values.into_iter().collect()))
+            .map(|(phase, values)| {
+                (
+                    phase.to_owned(),
+                    values.into_iter().map(str::to_owned).collect(),
+                )
+            })
             .collect(),
         site_ids_by_phase: builder
             .site_ids
             .into_iter()
-            .map(|(phase, values)| (phase, values.into_iter().collect()))
+            .map(|(phase, values)| {
+                (
+                    phase.to_owned(),
+                    values.into_iter().map(str::to_owned).collect(),
+                )
+            })
             .collect(),
         edge_ids_by_phase: builder
             .edge_ids
             .into_iter()
-            .map(|(phase, values)| (phase, values.into_iter().collect()))
+            .map(|(phase, values)| {
+                (
+                    phase.to_owned(),
+                    values.into_iter().map(str::to_owned).collect(),
+                )
+            })
             .collect(),
         difference_reasons: differences.into_iter().collect(),
         diagnostic_id,
@@ -922,28 +989,60 @@ fn correlation_key(
     )
 }
 
-fn canonical_condition(value: &Value) -> Value {
-    serde_json::from_value::<Condition>(value.clone())
-        .map(|condition| {
-            serde_json::to_value(condition.canonicalize()).unwrap_or_else(|_| value.clone())
-        })
-        .unwrap_or_else(|_| value.clone())
+// Keep repeated conditions compact without retaining an unbounded second copy
+// of graphs whose conditions are all distinct. Keys preserve JSON field order,
+// which is part of the existing condition sorting contract.
+#[derive(Default)]
+struct ConditionCache {
+    canonical: HashMap<String, Option<Condition>>,
 }
 
-fn condition_union(values: &[Value]) -> Value {
-    let mut conditions = values
-        .iter()
-        .filter_map(|value| serde_json::from_value::<Condition>(value.clone()).ok())
-        .map(|condition| condition.canonicalize())
-        .collect::<Vec<_>>();
-    conditions.sort_by_key(|condition| serde_json::to_string(condition).unwrap_or_default());
-    conditions.dedup();
-    let union = match conditions.len() {
-        0 => Condition::default(),
-        1 => conditions.pop().unwrap_or_default(),
-        _ => Condition::Any { conditions }.canonicalize(),
-    };
-    serde_json::to_value(union).unwrap_or_else(|_| json!({"op":"all","conditions":[]}))
+impl ConditionCache {
+    fn canonicalize(&mut self, value: &Value) -> Option<Condition> {
+        let key = serde_json::to_string(value).unwrap_or_default();
+        if let Some(condition) = self.canonical.get(&key) {
+            return condition.clone();
+        }
+        let condition = serde_json::from_value::<Condition>(value.clone())
+            .ok()
+            .map(Condition::canonicalize);
+        if self.canonical.len() < 1_024 && key.len() <= 4_096 {
+            self.canonical.insert(key, condition.clone());
+        }
+        condition
+    }
+
+    fn union<'a>(&mut self, values: impl IntoIterator<Item = &'a Value>) -> Value {
+        let mut conditions = BTreeMap::new();
+        for value in values {
+            // A true operand determines the union. Avoid parsing, cloning and
+            // retaining millions of identical unconditional expressions.
+            if value.get("op").and_then(Value::as_str) == Some("all")
+                && value
+                    .get("conditions")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            {
+                return json!({"op":"all","conditions":[]});
+            }
+            let Some(condition) = self.canonicalize(value) else {
+                continue;
+            };
+            if matches!(&condition, Condition::All { conditions } if conditions.is_empty()) {
+                return json!({"op":"all","conditions":[]});
+            }
+            let key = serde_json::to_string(&condition).unwrap_or_default();
+            conditions.entry(key).or_insert(condition);
+        }
+        let mut conditions = conditions.into_values().collect::<Vec<_>>();
+        conditions.dedup();
+        let union = match conditions.len() {
+            0 => Condition::default(),
+            1 => conditions.pop().unwrap_or_default(),
+            _ => Condition::Any { conditions }.canonicalize(),
+        };
+        serde_json::to_value(union).unwrap_or_else(|_| json!({"op":"all","conditions":[]}))
+    }
 }
 
 pub fn correlation_for_edge<'a>(
@@ -986,6 +1085,85 @@ pub fn phase_coverage_for_effective_profile(
 mod tests {
     use super::*;
     use crate::{CoverageRecord, ScanRecord};
+
+    // Freeze the original normalization contract independently of the cache,
+    // early true exit and borrowed aggregation used by the production path.
+    fn legacy_union(values: &[Value]) -> Value {
+        let mut conditions = values
+            .iter()
+            .filter_map(|value| serde_json::from_value::<Condition>(value.clone()).ok())
+            .map(Condition::canonicalize)
+            .collect::<Vec<_>>();
+        conditions.sort_by_key(|condition| serde_json::to_string(condition).unwrap());
+        conditions.dedup();
+        let union = match conditions.len() {
+            0 => Condition::default(),
+            1 => conditions.pop().unwrap(),
+            _ => Condition::Any { conditions }.canonicalize(),
+        };
+        serde_json::to_value(union).unwrap()
+    }
+
+    #[test]
+    fn condition_unions_preserve_legacy_bytes_and_site_normalization() {
+        let cases = vec![
+            json!({"op":"all","conditions":[]}),
+            json!({"op":"any","conditions":[]}),
+            json!({"op":"eq","key":"mode","value":"test"}),
+            json!({"op":"in","key":"mode","values":["test"]}),
+            json!({"op":"in","key":"mode","values":["b","a","b"]}),
+            json!({"op":"defined","key":"mode"}),
+            json!({"op":"not","condition":{"op":"not","condition":{
+                "op":"eq","key":"mode","value":"test"
+            }}}),
+            json!({"op":"all","conditions":[
+                {"op":"all","conditions":[]},
+                {"op":"defined","key":"mode"}
+            ]}),
+            json!({"op":"any","conditions":[
+                {"op":"any","conditions":[]},
+                {"op":"defined","key":"mode"}
+            ]}),
+            json!({"op":"any","conditions":[
+                {"op":"defined","key":"mode"},
+                {"op":"all","conditions":[]}
+            ]}),
+            json!({"op":"all","conditions":[],"extra":true}),
+            json!({"op":"all","conditions":"invalid"}),
+            json!({"op":"unknown"}),
+            Value::Null,
+            serde_json::from_str(r#"{"op":"eq","key":"object","value":{"a":1,"b":2}}"#).unwrap(),
+            serde_json::from_str(r#"{"op":"eq","key":"object","value":{"b":2,"a":1}}"#).unwrap(),
+        ];
+        let mut cache = ConditionCache::default();
+        assert_eq!(cache.union(std::iter::empty()), legacy_union(&[]));
+        for left in &cases {
+            for right in &cases {
+                for extra in &cases {
+                    let values = vec![left.clone(), right.clone(), left.clone(), extra.clone()];
+                    let expected = serde_json::to_string(&legacy_union(&values)).unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&cache.union(&values)).unwrap(),
+                        expected
+                    );
+                    let normalized_sites = values
+                        .iter()
+                        .map(|value| {
+                            serde_json::from_value::<Condition>(value.clone())
+                                .map(|condition| {
+                                    serde_json::to_value(condition.canonicalize()).unwrap()
+                                })
+                                .unwrap_or_else(|_| value.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        serde_json::to_string(&legacy_union(&normalized_sites)).unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn base_refresh_preserves_diagnostic_emission_order_and_ordinals() {
