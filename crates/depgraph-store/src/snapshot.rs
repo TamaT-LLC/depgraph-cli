@@ -229,6 +229,18 @@ impl SnapshotSealHasher {
         domain: &str,
         suffix: &str,
     ) -> Result<()> {
+        crate::profiling::run(&format!("store-snapshot-seal-{domain}"), || {
+            self.write_query_rows(connection, snapshot_id, domain, suffix)
+        })
+    }
+
+    fn write_query_rows(
+        &mut self,
+        connection: &Connection,
+        snapshot_id: &str,
+        domain: &str,
+        suffix: &str,
+    ) -> Result<()> {
         self.write_bytes(domain.as_bytes());
         let sql = format!("{SNAPSHOT_SEAL_CLOSURE_CTE}{suffix}");
         let mut statement = connection.prepare(&sql)?;

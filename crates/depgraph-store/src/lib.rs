@@ -14,6 +14,7 @@ mod analysis_coverage;
 mod build;
 mod cache;
 mod diff;
+mod foreign_keys;
 mod health_range;
 mod impact_cache;
 mod incremental;
