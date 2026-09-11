@@ -4,7 +4,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::AnalysisDependencyCoverage;
+use crate::{AnalysisDependencyCoverage, table_exists};
 
 /// Retain only adapter-level unknown dependency flags, charging each row and
 /// never loading source paths or other potentially large ledger payloads.
@@ -14,6 +14,16 @@ pub(crate) fn load_analysis_dependency_coverage(
     scan_id: &str,
     mut charge: impl FnMut() -> Result<()>,
 ) -> Result<Option<AnalysisDependencyCoverage>> {
+    // Historical Store migrations validate snapshots before the analysis
+    // tables are created. Their absence cannot provide dependency scope.
+    charge()?;
+    if !table_exists(connection, "analysis_scan_metadata")? {
+        return Ok(None);
+    }
+    charge()?;
+    if !table_exists(connection, "analysis_unit_ledger")? {
+        return Ok(None);
+    }
     charge()?;
     let metadata = connection
         .query_row(
@@ -91,7 +101,7 @@ mod tests {
             Ok(())
         })?
         .unwrap();
-        assert_eq!(work, 4);
+        assert_eq!(work, 6);
         assert_eq!(
             coverage.unknown_dependencies,
             std::collections::BTreeMap::from([("go".into(), false), ("web".into(), true),])
@@ -107,6 +117,8 @@ mod tests {
     #[test]
     fn dependency_scope_rejects_missing_incomplete_or_unfamiliar_proof() -> Result<()> {
         for mutation in [
+            "DROP TABLE analysis_scan_metadata",
+            "DROP TABLE analysis_unit_ledger",
             "DELETE FROM analysis_scan_metadata",
             "DELETE FROM analysis_unit_ledger",
             "UPDATE analysis_scan_metadata SET plan_id=NULL",
