@@ -984,6 +984,8 @@ pub(crate) fn merge_build_delta(
     delta: BuildGraphDelta,
     _attempt_id: &str,
 ) -> Result<()> {
+    // Base ledger scope does not attest to evidence added by an overlay.
+    snapshot.analysis_dependency_coverage = None;
     for profile in delta.profiles {
         if let Some(existing) = snapshot
             .profiles

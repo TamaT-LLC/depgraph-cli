@@ -173,6 +173,128 @@ fn resolve_health_input_of_a_completed_scan_is_one_plain_layer() -> Result<()> {
 }
 
 #[test]
+fn dependency_scope_matches_whole_snapshot_across_ranges_and_binds_cache_digest() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let shape = HealthRangeFixtureShape::small().with_caller_after_callee(true);
+    let control = generate(&temporary.path().join("control"), &shape)?;
+    let expected = whole_snapshot_findings(&control)?;
+    let fixture =
+        fixture::generate_with_setup(&temporary.path().join("scoped"), &shape, |store| {
+            // A syntax-only Web profile gives the mixed scan the same
+            // aggregate completeness as a real unknown-dependency scan.
+            let profile_id = fixture::id("profile", "web-syntax");
+            let web_coverage = depgraph_store::CoverageRecord {
+                profiles: 1,
+                completeness: vec!["syntax-complete".into()],
+                ..Default::default()
+            };
+            for event in [
+                serde_json::json!({"event": "profile_declared", "profile": {
+                    "id": profile_id, "language": "web", "features": [],
+                    "environment": {}, "properties": {}}}),
+                serde_json::json!({"event": "profile_completed", "profile_id": profile_id,
+                    "coverage": web_coverage}),
+                serde_json::json!({"event": "scan_completed", "coverage": web_coverage}),
+            ] {
+                let mut event = event;
+                event["scan_id"] = serde_json::json!(fixture::SCAN_ID);
+                event["adapter"] = serde_json::json!("web");
+                store.ingest_event(&event)?;
+            }
+            let rows = ["go", "web"]
+                .into_iter()
+                .flat_map(|adapter| {
+                    ["syntax", "semantic"].into_iter().map(move |stage| {
+                        depgraph_store::AnalysisUnitLedgerRecord {
+                            scan_id: fixture::SCAN_ID.into(),
+                            contract_version: "depgraph-analysis-unit-v1".into(),
+                            unit_id: adapter.into(),
+                            adapter: adapter.into(),
+                            unit_root: format!("/{adapter}"),
+                            stage: stage.into(),
+                            chunk_id: String::new(),
+                            chunk_index: None,
+                            chunk_count: None,
+                            status: "completed".into(),
+                            reused: false,
+                            source_paths: vec![format!("{adapter}/source")],
+                            context_paths: vec![format!("{adapter}/source")],
+                            auxiliary_paths: Vec::new(),
+                            context_fingerprint: Some(format!("context:{adapter}")),
+                            input_fingerprint: Some(format!("input:{adapter}")),
+                            dependency_ids: Vec::new(),
+                            unknown_dependencies: adapter == "web",
+                            error: None,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            store.initialize_analysis_unit_ledger(
+                fixture::SCAN_ID,
+                "depgraph-analysis-unit-v1",
+                Some("plan:scope"),
+                Some("input:scope"),
+                &rows,
+            )?;
+            let coverage = store.finalize_analysis_unit_ledger(fixture::SCAN_ID, &rows)?;
+            assert!(coverage.complete);
+            for reason in coverage.reasons {
+                store.mark_semantic_coverage_incomplete(fixture::SCAN_ID, &reason)?;
+            }
+            Ok(())
+        })?;
+    let store = open(&fixture)?;
+    let plan = plan_for(&store, &fixture, SMALL_RANGE_BUDGET)?;
+    assert!(plan.ranges.len() > 1);
+    let mut budget = CountingHealthWorkBudget::new(u64::MAX);
+    let global = store.load_health_global_context(&plan, &mut budget)?;
+    let snapshot = store.load_completed_snapshot(&fixture.snapshot_id)?;
+    assert!(
+        snapshot
+            .coverage
+            .reasons
+            .contains(&"analysis-unit-unknown-dependency".into())
+    );
+    let proof = global
+        .analysis_dependency_coverage
+        .as_ref()
+        .expect("ledger scope");
+    assert_eq!(
+        proof.unknown_dependencies,
+        BTreeMap::from([("go".into(), false), ("web".into(), true)])
+    );
+    assert_eq!(
+        global.analysis_dependency_coverage,
+        snapshot.analysis_dependency_coverage
+    );
+    let mut changed = global.clone();
+    changed
+        .analysis_dependency_coverage
+        .as_mut()
+        .unwrap()
+        .unknown_dependencies
+        .insert("go".into(), true);
+    assert_ne!(global.digest(), changed.digest());
+    changed.analysis_dependency_coverage = None;
+    assert_ne!(global.digest(), changed.digest());
+
+    let whole = whole_snapshot_findings(&fixture)?;
+    assert_eq!(
+        whole, expected,
+        "Web uncertainty must not change Go findings or blockers"
+    );
+    for order in [RangeOrder::Forward, RangeOrder::Reverse] {
+        let outcome = ranged(&store, &fixture, SMALL_RANGE_BUDGET, order, false, None)?;
+        assert_eq!(outcome.findings, whole);
+        assert_eq!(
+            outcome.diagnostics.ranges.completed,
+            outcome.diagnostics.ranges.total
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn health_range_plan_uses_aggregates_only_and_is_deterministic() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let fixture = generate(temporary.path(), &HealthRangeFixtureShape::small())?;

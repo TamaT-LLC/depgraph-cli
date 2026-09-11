@@ -611,6 +611,14 @@ pub fn events(shape: &HealthRangeFixtureShape, scan_id: &str, root: &Path) -> Re
 /// Generate the protocol stream of `shape` and ingest it into a fresh store
 /// under `dir` (`repo/` root with a `go.mod`, `depgraph.sqlite` store).
 pub fn generate(dir: &Path, shape: &HealthRangeFixtureShape) -> Result<HealthRangeFixture> {
+    generate_with_setup(dir, shape, |_| Ok(()))
+}
+
+pub fn generate_with_setup(
+    dir: &Path,
+    shape: &HealthRangeFixtureShape,
+    setup: impl FnOnce(&mut Store) -> Result<()>,
+) -> Result<HealthRangeFixture> {
     fs::create_dir_all(dir)?;
     let root = dir.join("repo");
     fs::create_dir_all(&root)?;
@@ -628,6 +636,7 @@ pub fn generate(dir: &Path, shape: &HealthRangeFixtureShape) -> Result<HealthRan
         let refs = chunk.iter().collect::<Vec<_>>();
         store.ingest_events(&refs)
     })?;
+    setup(&mut store)?;
     store.finish_scan(SCAN_ID, "completed", None, true)?;
     let snapshot_id = store
         .current_snapshot_id()?

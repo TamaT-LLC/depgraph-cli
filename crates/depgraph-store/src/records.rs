@@ -528,6 +528,14 @@ pub(crate) struct BuildGraphDelta {
     pub(crate) coverage: CoverageRecord,
 }
 
+/// Adapter dependency scope derived from completed analysis ledger rows.
+/// An absent adapter is unproven; `false` certifies only that the adapter has
+/// no unknown dependencies. Execution and profile completeness remain separate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisDependencyCoverage {
+    pub unknown_dependencies: std::collections::BTreeMap<String, bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphSnapshot {
     /// Scan metadata, including optional schema-18 health provenance used to
@@ -543,6 +551,10 @@ pub struct GraphSnapshot {
     pub adapter_logs: Vec<AdapterLogRecord>,
     pub coverage: CoverageRecord,
     pub profile_matrix: ProfileMatrixRecord,
+    /// Derived view metadata, excluded from graph identity. The source ledger
+    /// is bound by the existing analysis proof digest and snapshot seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_dependency_coverage: Option<AnalysisDependencyCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

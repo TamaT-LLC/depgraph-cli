@@ -1483,6 +1483,8 @@ pub(super) fn merge_runtime_sessions(
     snapshot: &mut GraphSnapshot,
     runtime_session_ids: &[String],
 ) -> Result<()> {
+    // Base ledger scope does not attest to evidence added by an overlay.
+    snapshot.analysis_dependency_coverage = None;
     let canonical = runtime_session_ids
         .iter()
         .cloned()
@@ -2066,6 +2068,7 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
             profile_matrix: super::super::ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         };
         let context = runtime_context_for_edge(&snapshot, &edge);
         assert_eq!(context.session_ids, ["session:a", "session:b"]);

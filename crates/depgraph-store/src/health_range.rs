@@ -252,6 +252,8 @@ pub struct HealthGlobalInput {
     pub profiles: Vec<ProfileRecord>,
     pub profile_matrix: ProfileMatrixRecord,
     pub coverage: CoverageRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_dependency_coverage: Option<crate::AnalysisDependencyCoverage>,
     /// `file_coverage` paths that were skipped or unsupported.
     pub coverage_omitted_paths: Vec<String>,
     /// Distinct `language` values of subject nodes; `None` marks subjects
@@ -274,6 +276,7 @@ impl HealthGlobalInput {
     #[must_use]
     pub fn digest(&self) -> String {
         let payload = json!({
+            "analysis_dependency_coverage": self.analysis_dependency_coverage,
             "coverage": self.coverage,
             "coverage_omitted_paths": self.coverage_omitted_paths,
             "go_candidate_sites": self.go_candidate_sites,
@@ -1350,6 +1353,7 @@ impl Store {
             adapter_logs: Vec::new(),
             coverage: coverage.clone(),
             profile_matrix: ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         };
         // Matrix entries (ids, languages, member profile ids) are a function of
         // the profile records alone; sites and edges only contribute phase
@@ -1494,6 +1498,15 @@ impl Store {
             });
         }
         drop(rows);
+        let analysis_dependency_coverage = if plan.identity.is_plain() {
+            super::analysis_dependency_coverage::load_analysis_dependency_coverage(
+                connection,
+                scan_id,
+                || work.charge(),
+            )?
+        } else {
+            None
+        };
         let work_used = work.used;
         Ok(HealthGlobalInput {
             scan,
@@ -1508,6 +1521,7 @@ impl Store {
             targetless_sites,
             ledger_incomplete_units,
             ledger_incomplete_unit_count,
+            analysis_dependency_coverage,
             work_used,
         })
     }
@@ -1686,6 +1700,7 @@ impl Store {
                 adapter_logs: Vec::new(),
                 coverage,
                 profile_matrix: ProfileMatrixRecord::default(),
+                analysis_dependency_coverage: None,
             },
             work_used,
         ))

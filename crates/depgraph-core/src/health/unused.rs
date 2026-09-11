@@ -93,7 +93,7 @@ fn analyze_subject<'a>(
     collect_edge_blockers(&incoming_usage, &mut blockers, budget, is_cancelled)?;
     collect_site_blockers(index, local, &node.id, &mut blockers, budget, is_cancelled)?;
     collect_coverage_blockers(index, node, &mut blockers, budget, is_cancelled)?;
-    if index.analysis_coverage_incomplete {
+    if index.analysis_coverage.blocks(node) {
         blockers.push(FindingBlocker {
             kind: BlockerKind::IncompleteCoverage,
             detail:
@@ -378,7 +378,7 @@ pub(crate) struct GlobalIndex<'a> {
     targetless_unresolved: bool,
     targetless_dynamic: bool,
     coverage_omitted_paths: HashSet<&'a str>,
-    analysis_coverage_incomplete: bool,
+    analysis_coverage: AnalysisCoverageScope<'a>,
 }
 
 /// The inbound side of one set of subjects: the whole snapshot for the
@@ -415,6 +415,7 @@ pub(crate) struct LocalIndex<'a> {
 pub(crate) struct GlobalSource<'a> {
     pub(crate) scan_status: &'a str,
     pub(crate) coverage_reasons: &'a [String],
+    pub(crate) analysis_dependency_coverage: Option<&'a depgraph_store::AnalysisDependencyCoverage>,
     pub(crate) profiles: &'a [depgraph_store::ProfileRecord],
     pub(crate) matrix_entries: &'a [depgraph_store::ProfileMatrixEntryRecord],
     /// Distinct `language` values of subject nodes; `None` marks subjects
@@ -427,6 +428,65 @@ pub(crate) struct GlobalSource<'a> {
     pub(crate) targetless_unresolved: bool,
     pub(crate) targetless_dynamic: bool,
     pub(crate) coverage_omitted_paths: Vec<&'a str>,
+}
+
+/// Unknown dependency targets can belong to any unit of the same adapter.
+/// All other execution failures remain repository-wide blockers.
+enum AnalysisCoverageScope<'a> {
+    Complete,
+    Incomplete,
+    UnknownDependencies(&'a depgraph_store::AnalysisDependencyCoverage),
+}
+
+impl<'a> AnalysisCoverageScope<'a> {
+    fn from_source(source: &GlobalSource<'a>) -> Self {
+        if source.scan_status != "completed"
+            || source.coverage_reasons.iter().any(|reason| {
+                (reason.starts_with("analysis-unit-")
+                    && reason != "analysis-unit-unknown-dependency")
+                    || reason == "analysis-input-changed-during-scan"
+            })
+        {
+            return Self::Incomplete;
+        }
+        if let Some(coverage) = source.analysis_dependency_coverage
+            && coverage.unknown_dependencies.len() <= 3
+            && coverage
+                .unknown_dependencies
+                .values()
+                .any(|unknown| *unknown)
+            && coverage
+                .unknown_dependencies
+                .keys()
+                .all(|adapter| matches!(adapter.as_str(), "go" | "rust" | "web"))
+        {
+            return Self::UnknownDependencies(coverage);
+        }
+        if source
+            .coverage_reasons
+            .iter()
+            .any(|reason| reason == "analysis-unit-unknown-dependency")
+        {
+            Self::Incomplete
+        } else {
+            Self::Complete
+        }
+    }
+
+    fn blocks(&self, node: &NodeRecord) -> bool {
+        match self {
+            Self::Complete => false,
+            Self::Incomplete => true,
+            Self::UnknownDependencies(coverage) => node
+                .properties
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+                .map(health_language_family)
+                .and_then(|adapter| coverage.unknown_dependencies.get(adapter))
+                .copied()
+                .unwrap_or(true),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -744,6 +804,7 @@ impl<'a> GlobalSource<'a> {
             Self {
                 scan_status: snapshot.scan.status.as_str(),
                 coverage_reasons: snapshot.coverage.reasons.as_slice(),
+                analysis_dependency_coverage: snapshot.analysis_dependency_coverage.as_ref(),
                 profiles: snapshot.profiles.as_slice(),
                 matrix_entries: snapshot.profile_matrix.entries.as_slice(),
                 subject_languages: subject_languages.into_iter().collect(),
@@ -770,6 +831,7 @@ impl<'a> GlobalSource<'a> {
         Self {
             scan_status: input.scan.status.as_str(),
             coverage_reasons: input.coverage.reasons.as_slice(),
+            analysis_dependency_coverage: input.analysis_dependency_coverage.as_ref(),
             profiles: input.profiles.as_slice(),
             matrix_entries: input.profile_matrix.entries.as_slice(),
             subject_languages: input
@@ -1064,11 +1126,6 @@ impl<'a> GlobalIndex<'a> {
                 }
             }
         }
-        let analysis_coverage_incomplete = source.scan_status != "completed"
-            || source.coverage_reasons.iter().any(|reason| {
-                reason.starts_with("analysis-unit-")
-                    || reason == "analysis-input-changed-during-scan"
-            });
         Ok(Self {
             profiles_by_id,
             go_profile_representatives,
@@ -1088,7 +1145,7 @@ impl<'a> GlobalIndex<'a> {
             targetless_unresolved: source.targetless_unresolved,
             targetless_dynamic: source.targetless_dynamic,
             coverage_omitted_paths: source.coverage_omitted_paths.iter().copied().collect(),
-            analysis_coverage_incomplete,
+            analysis_coverage: AnalysisCoverageScope::from_source(source),
         })
     }
 }
@@ -2273,7 +2330,146 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: coverage(true),
             profile_matrix: matrix,
+            analysis_dependency_coverage: None,
         }
+    }
+
+    #[test]
+    fn unknown_dependencies_only_block_attested_adapter_and_keep_other_guards() {
+        let mut graph = snapshot(
+            vec![profile("go", "go", true), profile("web", "web", true)],
+            vec![
+                node("go:unused", "file", "go", "unused.go", json!({})),
+                node("go:used", "file", "go", "used.go", json!({})),
+                node("web:a", "file", "typescript", "a/unused.ts", json!({})),
+                node("web:b", "file", "javascript", "b/unused.js", json!({})),
+                node("unknown", "file", "data", "unknown", json!({})),
+                node(
+                    "go:generated",
+                    "file",
+                    "go",
+                    "generated.go",
+                    json!({"generated": true}),
+                ),
+            ],
+            vec![edge("call", "go:unused", "go:used", "imports", "go")],
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        graph
+            .coverage
+            .reasons
+            .push("analysis-unit-unknown-dependency".into());
+        graph.analysis_dependency_coverage = Some(depgraph_store::AnalysisDependencyCoverage {
+            unknown_dependencies: BTreeMap::from([("go".into(), false), ("web".into(), true)]),
+        });
+        let findings = analyze_unused(&graph);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.subject_id == "go:used")
+        );
+        for finding in &findings {
+            let expected = if finding.subject_id == "go:unused" {
+                Confidence::Confirmed
+            } else {
+                Confidence::Indeterminate
+            };
+            assert_eq!(finding.confidence, expected, "{}", finding.subject_id);
+        }
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.subject_id == "go:unused")
+        );
+
+        // A different profile's use must still prevent an unused finding.
+        graph.profiles.push(profile("go:test", "go", true));
+        graph.edges.push(edge(
+            "test-use",
+            "go:used",
+            "go:unused",
+            "imports",
+            "go:test",
+        ));
+        assert!(
+            !analyze_unused(&graph)
+                .iter()
+                .any(|finding| finding.subject_id == "go:unused")
+        );
+    }
+
+    #[test]
+    fn dependency_scope_requires_proof_and_does_not_override_execution_failures() {
+        let mut graph = snapshot(
+            vec![profile("go", "go", true)],
+            vec![node("unused", "file", "go", "unused.go", json!({}))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        graph
+            .coverage
+            .reasons
+            .push("analysis-unit-unknown-dependency".into());
+        for proof in [
+            None,
+            Some(BTreeMap::new()),
+            Some(BTreeMap::from([("go".into(), false)])),
+            Some(BTreeMap::from([("web".into(), true)])),
+            Some(BTreeMap::from([
+                ("go".into(), false),
+                ("future".into(), true),
+            ])),
+        ] {
+            graph.analysis_dependency_coverage =
+                proof.map(
+                    |unknown_dependencies| depgraph_store::AnalysisDependencyCoverage {
+                        unknown_dependencies,
+                    },
+                );
+            assert_eq!(
+                analyze_unused(&graph)[0].confidence,
+                Confidence::Indeterminate
+            );
+        }
+        graph.analysis_dependency_coverage = Some(depgraph_store::AnalysisDependencyCoverage {
+            unknown_dependencies: BTreeMap::from([("go".into(), false), ("web".into(), true)]),
+        });
+        for reason in [
+            "analysis-unit-unanalysed",
+            "analysis-unit-failed",
+            "analysis-unit-context-mismatch",
+            "analysis-input-changed-during-scan",
+        ] {
+            graph.coverage.reasons.push(reason.into());
+            assert_eq!(
+                analyze_unused(&graph)[0].confidence,
+                Confidence::Indeterminate,
+                "{reason}"
+            );
+            graph.coverage.reasons.pop();
+        }
+        for status in ["running", "failed", "cancelled", "partial"] {
+            graph.scan.status = status.into();
+            assert_eq!(
+                analyze_unused(&graph)[0].confidence,
+                Confidence::Indeterminate,
+                "{status}"
+            );
+        }
+        graph.scan.status = "completed".into();
+        graph.nodes[0]
+            .properties
+            .as_object_mut()
+            .unwrap()
+            .remove("language");
+        assert_eq!(
+            analyze_unused(&graph)[0].confidence,
+            Confidence::Indeterminate
+        );
     }
 
     #[test]

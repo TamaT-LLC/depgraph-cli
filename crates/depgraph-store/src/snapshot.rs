@@ -989,6 +989,12 @@ fn load_base_snapshot(
         adapter_logs,
         coverage,
         profile_matrix: ProfileMatrixRecord::default(),
+        analysis_dependency_coverage:
+            super::analysis_dependency_coverage::load_analysis_dependency_coverage(
+                connection,
+                scan_id,
+                || Ok(()),
+            )?,
     };
     match purpose {
         SnapshotPurpose::View => refresh_profile_matrix(&mut snapshot, false),
@@ -1210,6 +1216,7 @@ fn apply_semantic_noop_overlay(snapshot: &mut GraphSnapshot, overlay: GraphSnaps
             snapshot.adapter_logs.push(log);
         }
     }
+    snapshot.analysis_dependency_coverage = None;
     snapshot.scan = overlay.scan;
     snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot
@@ -1324,6 +1331,7 @@ fn streamed_scan_identity(
         adapter_logs: Vec::new(),
         coverage: load_staging_coverage(connection, scan_id)?,
         profile_matrix: ProfileMatrixRecord::default(),
+        analysis_dependency_coverage: None,
     };
     // Match the evidence pruning performed before derived diagnostics are
     // rebuilt. A stale derived diagnostic ID must not retain its old evidence
@@ -1851,6 +1859,53 @@ mod identity_tests {
             event["scan_id"] = json!(scan_id);
             store.ingest_event(&event)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn derived_dependency_scope_preserves_identity_and_is_cleared_by_overlays() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "scope")?;
+        let mut view = load_base_snapshot_from_connection(&store.connection, "scope")?;
+        let profile_ids = view
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let expected = hash_snapshot_identity(&view, &profile_ids, None, &[], None, None)?;
+        let scope = Some(crate::AnalysisDependencyCoverage {
+            unknown_dependencies: std::collections::BTreeMap::from([
+                ("go".into(), false),
+                ("web".into(), true),
+            ]),
+        });
+        view.analysis_dependency_coverage = scope.clone();
+        assert_eq!(
+            hash_snapshot_identity(&view, &profile_ids, None, &[], None, None)?,
+            expected
+        );
+        // Deserialization of older snapshots must preserve the fallback.
+        let mut legacy = serde_json::to_value(&view)?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("analysis_dependency_coverage");
+        assert!(
+            serde_json::from_value::<GraphSnapshot>(legacy)?
+                .analysis_dependency_coverage
+                .is_none()
+        );
+
+        let mut overlay = view.clone();
+        overlay.nodes.truncate(1);
+        apply_semantic_noop_overlay(&mut view, overlay)?;
+        assert!(view.analysis_dependency_coverage.is_none());
+        view.analysis_dependency_coverage = scope.clone();
+        merge_build_delta(&mut view, BuildGraphDelta::default(), "build")?;
+        assert!(view.analysis_dependency_coverage.is_none());
+        view.analysis_dependency_coverage = scope;
+        runtime::merge_runtime_sessions(&store.connection, &mut view, &[])?;
+        assert!(view.analysis_dependency_coverage.is_none());
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use super::hotspot::HotspotFindingScores;
 
 pub const HEALTH_FINDING_CONTRACT_VERSION: &str = "depgraph-health-finding-v1";
-pub const HEALTH_ANALYZER_VERSION: &str = "1.0.3";
+pub const HEALTH_ANALYZER_VERSION: &str = "1.0.4";
 pub const BASIS_POINTS_MAX: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

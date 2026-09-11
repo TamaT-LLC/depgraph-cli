@@ -140,8 +140,9 @@ meaningful fingerprint change. Changing hotspot weights changes the finding ID
 and collection digest as well as the fingerprint; this is intentional
 fail-closed provenance, rather than an in-place baseline change. Issue #440
 bumped the analyzer version to `1.0.2`. The subsequent non-unused confidence
-guard fix bumps it again to `1.0.3`; operators that want a clean baseline may
-regenerate fingerprints, while retaining old records is safe because matching
+guard fix used `1.0.3`, and adapter-scoped dependency coverage uses `1.0.4`.
+Operators that want a clean baseline may regenerate fingerprints, while
+retaining old records is safe because matching
 continues by stable ID and no automatic rewrite is performed.
 
 ### Collection digest
@@ -198,6 +199,22 @@ Judgement uses the union of every applicable profile in the snapshot.
 A finding stays at `probable` when usage is absent and every hard blocker is
 absent, but completeness is only `syntax-complete`. Any hard blocker forces
 `indeterminate`.
+
+Unknown analysis dependencies block every subject of the affected adapter,
+including subjects in other packages and health ranges. A completed v1/v2
+ledger with plan/input identities may prove that another adapter has no
+unknown dependencies. Only then may that adapter avoid this particular
+`incomplete-coverage` blocker. Missing ledger proof, unfamiliar adapters,
+unattested subject languages, and layered snapshots retain the conservative
+blocker. Failed or incomplete execution and changed scan inputs still block
+all subjects. Profile, public-surface, precision, and other blockers continue
+to apply independently.
+
+Both whole-snapshot and ranged health use the same derived adapter projection.
+The projection does not change the graph snapshot identity: its source ledger
+is already bound by the analysis proof digest and storage seal. It is included
+in the health global-context digest, and analyzer version 1.0.4 invalidates
+older health checkpoints.
 
 Hotspot findings are rankings rather than proof of unusedness. They are capped
 at `probable` even when all five score layers are available; a hard blocker can

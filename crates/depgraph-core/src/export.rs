@@ -615,6 +615,7 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
             profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         };
         assert_eq!(
             export(&snapshot, ExportFormat::Dot)?,

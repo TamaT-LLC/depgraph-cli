@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod analysis_coverage;
+mod analysis_dependency_coverage;
 mod build;
 mod cache;
 mod diff;
