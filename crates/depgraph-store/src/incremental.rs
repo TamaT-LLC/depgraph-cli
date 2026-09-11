@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    AdapterLogRecord, ScanHealthProvenance, Store, bind_scan_health_provenance_in_transaction,
-    completed_snapshot_identity, ensure_scan_staging, ingest_event_in_transaction, insert_node,
-    load_completed_snapshot_record, promote_completed_snapshot, required_str, upsert_edge_row,
-    upsert_site_row, validate_scan_health_provenance,
+    AdapterLogRecord, ScanHealthProvenance, Store,
+    analysis_dependency_coverage::load_analysis_dependency_coverage,
+    bind_scan_health_provenance_in_transaction, completed_snapshot_identity, ensure_scan_staging,
+    ingest_event_in_transaction, insert_node, load_completed_snapshot_record,
+    promote_completed_snapshot, required_str, upsert_edge_row, upsert_site_row,
+    validate_scan_health_provenance,
 };
 
 const MAX_SCOPE_VALUES: usize = 100_000;
@@ -116,6 +118,8 @@ impl Store {
     /// synthetic, internally consistent coverage ledger. Its digest is bound
     /// to the exact current snapshot ID, while the eventual store transaction
     /// separately proves that the projected node still matches that snapshot.
+    /// Analysis-unit snapshots require supported, matching, completed Web-only
+    /// execution evidence; missing or unfamiliar proof returns no projection.
     pub fn semantic_noop_delta_base(
         &self,
         snapshot_id: &str,
@@ -763,17 +767,17 @@ fn semantic_noop_delta_base(
     }
     if snapshot_uses_analysis_units(connection, snapshot_id)? {
         let evidence_scan = analysis_evidence_scan(connection, &record.scan_id)?;
-        // Missing, unfinished, or non-Web execution evidence must use the
-        // scheduler: semantic no-op requests are handled by the Web worker.
+        // Share the bounded contract proof with dependency coverage so unknown
+        // or inconsistent evidence cannot bypass the scheduler. Semantic no-op
+        // requests are handled only by the Web worker.
         // General graph deltas remain forbidden even when this proof exists.
-        let eligible: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM analysis_scan_metadata WHERE scan_id=?1)
-                 AND EXISTS(SELECT 1 FROM analysis_unit_ledger WHERE scan_id=?1)
-                 AND NOT EXISTS(SELECT 1 FROM analysis_unit_ledger
-                                WHERE scan_id=?1 AND (status != 'completed' OR adapter != 'web'))",
-            [&evidence_scan],
-            |row| row.get(0),
-        )?;
+        let eligible = load_analysis_dependency_coverage(connection, &evidence_scan, || Ok(()))?
+            .is_some_and(|coverage| {
+                coverage
+                    .unknown_dependencies
+                    .keys()
+                    .all(|adapter| adapter == "web")
+            });
         if !eligible {
             return Ok(None);
         }
@@ -2699,17 +2703,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn semantic_noop_analysis_overlays_retain_original_execution_evidence() -> Result<()> {
+    fn completed_analysis_noop_fixture(
+        scan_id: &str,
+        contract: &str,
+    ) -> Result<(Store, String, StableGraphIds)> {
         let mut store = Store::open_in_memory()?;
-        let scan_id = "analysis-noop-base";
         let (events, ids) = stable_graph_events(scan_id);
         store.start_scan(scan_id, Path::new("/fixture"), false)?;
         let records: Vec<_> = ["syntax", "semantic"]
             .into_iter()
             .map(|stage| super::super::AnalysisUnitLedgerRecord {
                 scan_id: scan_id.into(),
-                contract_version: "depgraph-analysis-unit-v1".into(),
+                contract_version: contract.into(),
                 unit_id: "web-unit".into(),
                 adapter: "web".into(),
                 unit_root: ".".into(),
@@ -2731,7 +2736,7 @@ mod tests {
             .collect();
         store.initialize_analysis_unit_ledger(
             scan_id,
-            "depgraph-analysis-unit-v1",
+            contract,
             Some("plan"),
             Some("input"),
             &records,
@@ -2739,6 +2744,84 @@ mod tests {
         store.ingest_events(&events.iter().collect::<Vec<_>>())?;
         store.finish_scan(scan_id, "completed", None, true)?;
         let base_id = store.current_snapshot_id()?.unwrap();
+        Ok((store, base_id, ids))
+    }
+
+    #[test]
+    fn semantic_noop_rejects_unknown_or_inconsistent_analysis_contracts() -> Result<()> {
+        for contract in ["depgraph-analysis-unit-v1", "depgraph-analysis-unit-v2"] {
+            for unknown in [true, false] {
+                let (mut store, base_id, ids) =
+                    completed_analysis_noop_fixture("contract-base", contract)?;
+                let projection = store
+                    .semantic_noop_delta_base(&base_id, "src/index.ts")?
+                    .context("supported Web analysis contract must remain eligible")?;
+                let delta = validated_node_delta(
+                    "rejected-contract-noop",
+                    &projection,
+                    &ids.source,
+                    &format!("sha256:{}", "2".repeat(64)),
+                );
+                if unknown {
+                    store.connection.execute_batch(
+                        "UPDATE analysis_scan_metadata SET contract_version='future';
+                         UPDATE analysis_unit_ledger SET contract_version='future';",
+                    )?;
+                } else {
+                    let other = if contract == "depgraph-analysis-unit-v1" {
+                        "depgraph-analysis-unit-v2"
+                    } else {
+                        "depgraph-analysis-unit-v1"
+                    };
+                    store.connection.execute(
+                        "UPDATE analysis_unit_ledger SET contract_version=?1 WHERE stage='semantic'",
+                        [other],
+                    )?;
+                }
+                assert!(
+                    store
+                        .semantic_noop_delta_base(&base_id, "src/index.ts")?
+                        .is_none(),
+                    "unsupported analysis proof accepted: contract={contract}, unknown={unknown}"
+                );
+                let error = store
+                    .commit_semantic_noop_delta(
+                        "rejected-contract-noop",
+                        Path::new("/fixture"),
+                        false,
+                        &base_id,
+                        None,
+                        &health_provenance(),
+                        &delta,
+                        "",
+                        false,
+                    )
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("semantic no-op base file is unavailable")
+                );
+                assert_eq!(
+                    store.current_snapshot_id()?.as_deref(),
+                    Some(base_id.as_str())
+                );
+                let staged: i64 = store.connection.query_row(
+                    "SELECT count(*) FROM scans WHERE id='rejected-contract-noop'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(staged, 0, "rejected proof left a staging scan");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_noop_analysis_overlays_retain_original_execution_evidence() -> Result<()> {
+        let scan_id = "analysis-noop-base";
+        let (mut store, base_id, ids) =
+            completed_analysis_noop_fixture(scan_id, "depgraph-analysis-unit-v1")?;
         let base_graph = store.load_completed_snapshot(&base_id)?;
         let records = store.analysis_units(scan_id)?;
         let coverage = store.analysis_coverage(scan_id)?;
