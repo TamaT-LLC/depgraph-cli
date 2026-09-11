@@ -169,12 +169,13 @@ pub(crate) struct PreparedScan {
 // it before re-splitting can conflict with a replacement's narrower profile.
 // Spill one prefix at a time so failed units do not accumulate in memory.
 struct DeferredAnalysisFailure {
+    sequence: u64,
     events: tempfile::NamedTempFile,
     output: WorkerOutput,
 }
 
 impl DeferredAnalysisFailure {
-    fn stage(mut output: WorkerOutput) -> Result<Self> {
+    fn stage(sequence: u64, mut output: WorkerOutput) -> Result<Self> {
         let events = tempfile::NamedTempFile::new()?;
         {
             let mut writer = BufWriter::new(events.as_file());
@@ -182,13 +183,49 @@ impl DeferredAnalysisFailure {
             writer.flush()?;
         }
         output.events = Vec::new();
-        Ok(Self { events, output })
+        Ok(Self {
+            sequence,
+            events,
+            output,
+        })
     }
 
     fn restore(mut self) -> Result<WorkerOutput> {
         self.events.as_file_mut().rewind()?;
         self.output.events = serde_json::from_reader(BufReader::new(self.events.as_file()))?;
         Ok(self.output)
+    }
+}
+
+fn restore_deferred_analysis_failures<T>(
+    execution: Result<T>,
+    deferred: &std::sync::Mutex<BTreeMap<String, DeferredAnalysisFailure>>,
+    mut consume: impl FnMut(&str, WorkerOutput) -> Result<bool>,
+) -> Result<T> {
+    // The executor can fail before returning progress, including after a
+    // replacement has staged more output. Drain every unsuperseded prefix in
+    // ingestion order without keeping more than one event stream in memory.
+    let mut pending = std::mem::take(&mut *lock_failures(deferred))
+        .into_iter()
+        .collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|(_, failure)| failure.sequence);
+    let mut restore_error = None;
+    for (unit_id, failure) in pending {
+        if let Err(error) = failure
+            .restore()
+            .and_then(|output| consume(&unit_id, output))
+            .with_context(|| format!("restore partial analysis result for {unit_id}"))
+            && restore_error.is_none()
+        {
+            restore_error = Some(error);
+        }
+    }
+    match (execution, restore_error) {
+        (Err(error), Some(restore_error)) => Err(error.context(format!(
+            "partial analysis restoration also failed: {restore_error:#}"
+        ))),
+        (Ok(_), Some(error)) => Err(error),
+        (execution, None) => execution,
     }
 }
 
@@ -822,6 +859,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     let unit_failures = std::sync::Mutex::new(BTreeMap::<String, ScanFailure>::new());
     let deferred_failures =
         std::sync::Mutex::new(BTreeMap::<String, DeferredAnalysisFailure>::new());
+    let deferred_sequence = AtomicU64::new(0);
     let defer_resource_prefixes = AtomicBool::new(resplit_context.is_some());
     let mut consume = |store: &mut Store, unit_id: &str, output: WorkerOutput| -> Result<bool> {
         let ingest_started = Instant::now();
@@ -852,8 +890,13 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 .error
                 .clone()
                 .unwrap_or_else(|| "worker resource limit".to_owned());
-            lock_failures(&deferred_failures)
-                .insert(unit_id.to_owned(), DeferredAnalysisFailure::stage(output)?);
+            lock_failures(&deferred_failures).insert(
+                unit_id.to_owned(),
+                DeferredAnalysisFailure::stage(
+                    deferred_sequence.fetch_add(1, Ordering::Relaxed),
+                    output,
+                )?,
+            );
             Err(anyhow::anyhow!(
                 "{} worker failed: {detail}",
                 adapter.name()
@@ -918,193 +961,194 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         }
         valid
     };
-    let mut analysis = execute_analysis_units(
-        store,
-        &execution_context,
-        schedule.work,
-        &mut consume,
-        &validate,
-    )
-    .await?;
-    // A unit whose worker exceeded its memory, time, or output limit is re-planned at
-    // the next finer boundary of the same discovery plan; its replacements
-    // run in the same attempt and its failure is withdrawn.  The superseded
-    // attempt stays visible in the progress ledger as a failed unit.
     let mut superseded_indices = BTreeSet::new();
-    if let (Some(plan), Some(current), Some(resplit)) = (
-        analysis_plan.as_ref(),
-        split_plan.as_mut(),
-        resplit_context.as_ref(),
-    ) {
-        let mut attempted = BTreeSet::new();
-        while !cancellation.is_cancelled() {
-            let Some((execution_unit_id, trigger)) =
-                analysis
-                    .units
+    let execution = async {
+        let mut analysis = execute_analysis_units(
+            store,
+            &execution_context,
+            schedule.work,
+            &mut consume,
+            &validate,
+        )
+        .await?;
+        // A unit whose worker exceeded its memory, time, or output limit is re-planned at
+        // the next finer boundary of the same discovery plan; its replacements
+        // run in the same attempt and its failure is withdrawn.  The superseded
+        // attempt stays visible in the progress ledger as a failed unit.
+        if let (Some(plan), Some(current), Some(resplit)) = (
+            analysis_plan.as_ref(),
+            split_plan.as_mut(),
+            resplit_context.as_ref(),
+        ) {
+            let mut attempted = BTreeSet::new();
+            while !cancellation.is_cancelled() {
+                let Some((execution_unit_id, trigger)) =
+                    analysis
+                        .units
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, progress)| {
+                            if superseded_indices.contains(&index)
+                                || progress.status != "failed"
+                                || lock_failures(&unit_failures)
+                                    .get(&progress.unit_id)
+                                    .is_some_and(|failure| failure.security_violation)
+                            {
+                                return None;
+                            }
+                            let trigger = match progress.failure_reason.as_deref()? {
+                                "memory-limit" => AnalysisResplitTrigger::WorkerMemory,
+                                "timeout" => AnalysisResplitTrigger::WorkerTimeout,
+                                "output-limit" => AnalysisResplitTrigger::OutputLimit,
+                                _ => return None,
+                            };
+                            let id = execution_unit_ids.get(index)?.clone()?;
+                            (!attempted.contains(&id)).then_some((id, trigger))
+                        })
+                else {
+                    break;
+                };
+                attempted.insert(execution_unit_id.clone());
+                let resplit_plan = resplit_execution_unit(
+                    plan,
+                    current,
+                    &resplit.split_input,
+                    &execution_unit_id,
+                    trigger,
+                )?;
+                let superseded = execution_unit_ids
                     .iter()
                     .enumerate()
-                    .find_map(|(index, progress)| {
-                        if superseded_indices.contains(&index)
-                            || progress.status != "failed"
-                            || lock_failures(&unit_failures)
-                                .get(&progress.unit_id)
-                                .is_some_and(|failure| failure.security_violation)
-                        {
-                            return None;
-                        }
-                        let trigger = match progress.failure_reason.as_deref()? {
-                            "memory-limit" => AnalysisResplitTrigger::WorkerMemory,
-                            "timeout" => AnalysisResplitTrigger::WorkerTimeout,
-                            "output-limit" => AnalysisResplitTrigger::OutputLimit,
-                            _ => return None,
-                        };
-                        let id = execution_unit_ids.get(index)?.clone()?;
-                        (!attempted.contains(&id)).then_some((id, trigger))
+                    .filter(|(_, id)| {
+                        id.as_ref()
+                            .is_some_and(|id| resplit_plan.superseded_execution_unit_ids.contains(id))
                     })
-            else {
-                break;
-            };
-            attempted.insert(execution_unit_id.clone());
-            let resplit_plan = resplit_execution_unit(
-                plan,
-                current,
-                &resplit.split_input,
-                &execution_unit_id,
-                trigger,
-            )?;
-            let superseded = execution_unit_ids
-                .iter()
-                .enumerate()
-                .filter(|(_, id)| {
-                    id.as_ref()
-                        .is_some_and(|id| resplit_plan.superseded_execution_unit_ids.contains(id))
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            // Only a failed attempt is withdrawn: an ingested result is never
-            // removed, and retained siblings must keep their chunk numbering
-            // because their profiles already carry it. The planner stamps that
-            // numbering at the initial partition and keeps it for every batch
-            // that is not itself refined.
-            let withdrawable = superseded.len() == resplit_plan.superseded_execution_unit_ids.len()
-                && superseded.iter().all(|index| {
-                    let unit = &analysis.units[*index];
-                    unit.status == "failed"
-                        && !lock_failures(&unit_failures)
-                            .get(&unit.unit_id)
-                            .is_some_and(|failure| failure.security_violation)
-                })
-                && resplit_plan.retained_chunk_numbering_unchanged(current);
-            let applied = resplit_plan.outcome == AnalysisResplitOutcome::Split && withdrawable;
-            let disposition = match (resplit_plan.outcome, withdrawable) {
-                (AnalysisResplitOutcome::Split, true) => "applied",
-                (AnalysisResplitOutcome::Split, false) => "deferred",
-                (AnalysisResplitOutcome::Unsplittable, _) => "unsplittable",
-            };
-            let message = format!(
-                "analysis re-split {disposition}: execution unit {execution_unit_id} ({}) {} -> {}{}; superseded {}, replacements {}",
-                trigger.as_str(),
-                resplit_plan.previous_split_plan_id,
-                resplit_plan.split_plan_id,
-                resplit_plan
-                    .unsplittable_reason
-                    .map(|reason| format!(" ({})", reason.as_str()))
-                    .unwrap_or_default(),
-                resplit_plan.superseded_execution_unit_ids.len(),
-                resplit_plan.replacement_execution_unit_ids.len(),
-            );
-            tracing::info!(%message);
-            add_core_diagnostic(
-                store,
-                &scan_id,
-                "info",
-                "analysis-resplit",
-                &message,
-                &format!("{}:{}", resplit_plan.split_plan_id, execution_unit_id),
-            )?;
-            if !applied {
-                continue;
-            }
-            let replacement_ids = resplit_plan
-                .replacement_execution_unit_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let (replacement_execution_ids, replacement_work): (Vec<_>, Vec<_>) = resplit
-                .work_items(
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                // Only a failed attempt is withdrawn: an ingested result is never
+                // removed, and retained siblings must keep their chunk numbering
+                // because their profiles already carry it. The planner stamps that
+                // numbering at the initial partition and keeps it for every batch
+                // that is not itself refined.
+                let withdrawable = superseded.len() == resplit_plan.superseded_execution_unit_ids.len()
+                    && superseded.iter().all(|index| {
+                        let unit = &analysis.units[*index];
+                        unit.status == "failed"
+                            && !lock_failures(&unit_failures)
+                                .get(&unit.unit_id)
+                                .is_some_and(|failure| failure.security_violation)
+                    })
+                    && resplit_plan.retained_chunk_numbering_unchanged(current);
+                let applied = resplit_plan.outcome == AnalysisResplitOutcome::Split && withdrawable;
+                let disposition = match (resplit_plan.outcome, withdrawable) {
+                    (AnalysisResplitOutcome::Split, true) => "applied",
+                    (AnalysisResplitOutcome::Split, false) => "deferred",
+                    (AnalysisResplitOutcome::Unsplittable, _) => "unsplittable",
+                };
+                let message = format!(
+                    "analysis re-split {disposition}: execution unit {execution_unit_id} ({}) {} -> {}{}; superseded {}, replacements {}",
+                    trigger.as_str(),
+                    resplit_plan.previous_split_plan_id,
+                    resplit_plan.split_plan_id,
+                    resplit_plan
+                        .unsplittable_reason
+                        .map(|reason| format!(" ({})", reason.as_str()))
+                        .unwrap_or_default(),
+                    resplit_plan.superseded_execution_unit_ids.len(),
+                    resplit_plan.replacement_execution_unit_ids.len(),
+                );
+                tracing::info!(%message);
+                add_core_diagnostic(
+                    store,
+                    &scan_id,
+                    "info",
+                    "analysis-resplit",
+                    &message,
+                    &format!("{}:{}", resplit_plan.split_plan_id, execution_unit_id),
+                )?;
+                if !applied {
+                    continue;
+                }
+                let replacement_ids = resplit_plan
+                    .replacement_execution_unit_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let (replacement_execution_ids, replacement_work): (Vec<_>, Vec<_>) = resplit
+                    .work_items(
+                        &execution_context,
+                        plan,
+                        &resplit_plan.plan,
+                        &replacement_ids,
+                    )
+                    .into_iter()
+                    .unzip();
+                let replacement_records =
+                    analysis_ledger_records(&scan_id, &replacement_work, Some(plan));
+                let superseded_records = superseded
+                    .iter()
+                    .map(|index| ledger_records[*index].clone())
+                    .collect::<Vec<_>>();
+                store.resplit_analysis_unit_ledger(
+                    &scan_id,
+                    &superseded_records,
+                    &replacement_records,
+                )?;
+                for index in superseded {
+                    superseded_indices.insert(index);
+                    let unit_id = &analysis.units[index].unit_id;
+                    lock_failures(&deferred_failures).remove(unit_id);
+                    lock_failures(&unit_failures).remove(unit_id);
+                    lock_failures(&analysis_unit_failures).remove(unit_id);
+                    let loader = &mut analysis.units[index].loader;
+                    loader.insert("analysis_resplit".to_owned(), "superseded".to_owned());
+                    loader.insert(
+                        "analysis_resplit_split_plan_id".to_owned(),
+                        resplit_plan.split_plan_id.clone(),
+                    );
+                }
+                *current = resplit_plan.plan;
+                resplit.remember_refinements(current);
+                let retained_typed = retained_typed_reference_fingerprints(
+                    &analysis,
+                    &execution_unit_ids,
+                    current,
+                    &resplit_plan.retained_execution_unit_ids,
+                );
+                let replacement_progress = execute_analysis_units_with_retained_typed(
+                    store,
                     &execution_context,
-                    plan,
-                    &resplit_plan.plan,
-                    &replacement_ids,
+                    replacement_work,
+                    &mut consume,
+                    &validate,
+                    &retained_typed,
                 )
-                .into_iter()
-                .unzip();
-            let replacement_records =
-                analysis_ledger_records(&scan_id, &replacement_work, Some(plan));
-            let superseded_records = superseded
-                .iter()
-                .map(|index| ledger_records[*index].clone())
-                .collect::<Vec<_>>();
-            store.resplit_analysis_unit_ledger(
-                &scan_id,
-                &superseded_records,
-                &replacement_records,
-            )?;
-            for index in superseded {
-                superseded_indices.insert(index);
-                let unit_id = &analysis.units[index].unit_id;
-                lock_failures(&deferred_failures).remove(unit_id);
-                lock_failures(&unit_failures).remove(unit_id);
-                lock_failures(&analysis_unit_failures).remove(unit_id);
-                let loader = &mut analysis.units[index].loader;
-                loader.insert("analysis_resplit".to_owned(), "superseded".to_owned());
-                loader.insert(
-                    "analysis_resplit_split_plan_id".to_owned(),
-                    resplit_plan.split_plan_id.clone(),
-                );
-            }
-            *current = resplit_plan.plan;
-            resplit.remember_refinements(current);
-            let retained_typed = retained_typed_reference_fingerprints(
-                &analysis,
-                &execution_unit_ids,
-                current,
-                &resplit_plan.retained_execution_unit_ids,
-            );
-            let replacement_progress = execute_analysis_units_with_retained_typed(
-                store,
-                &execution_context,
-                replacement_work,
-                &mut consume,
-                &validate,
-                &retained_typed,
-            )
-            .await?;
-            ledger_records.extend(replacement_records);
-            execution_unit_ids.extend(replacement_execution_ids.into_iter().map(Some));
-            for mut unit in replacement_progress.units {
-                unit.loader
-                    .insert("analysis_resplit".to_owned(), "replacement".to_owned());
-                unit.loader.insert(
-                    "analysis_resplit_split_plan_id".to_owned(),
-                    current.split_plan_id.clone(),
-                );
-                analysis.units.push(unit);
-            }
-            if replacement_progress.stop_reason.is_some() {
-                analysis.stop_reason = replacement_progress.stop_reason;
+                .await?;
+                ledger_records.extend(replacement_records);
+                execution_unit_ids.extend(replacement_execution_ids.into_iter().map(Some));
+                for mut unit in replacement_progress.units {
+                    unit.loader
+                        .insert("analysis_resplit".to_owned(), "replacement".to_owned());
+                    unit.loader.insert(
+                        "analysis_resplit_split_plan_id".to_owned(),
+                        current.split_plan_id.clone(),
+                    );
+                    analysis.units.push(unit);
+                }
+                if replacement_progress.stop_reason.is_some() {
+                    analysis.stop_reason = replacement_progress.stop_reason;
+                }
             }
         }
+        Ok(analysis)
     }
-    // Only prefixes that were not superseded remain useful partial results.
-    // Restore in execution order, one file at a time, including on cancellation.
+    .await;
+    // Restore before propagating execution errors, including cancellation.
     defer_resource_prefixes.store(false, Ordering::Relaxed);
-    for unit in &analysis.units {
-        let deferred = lock_failures(&deferred_failures).remove(&unit.unit_id);
-        if let Some(deferred) = deferred {
-            consume(store, &unit.unit_id, deferred.restore()?)?;
-        }
-    }
+    let analysis =
+        restore_deferred_analysis_failures(execution, &deferred_failures, |unit_id, output| {
+            consume(store, unit_id, output)
+        })?;
     failures.extend(
         unit_failures
             .into_inner()
@@ -3798,6 +3842,132 @@ mod tests {
 
         coverage.reasons.push("rust-hir-backend-failure".into());
         assert!(violates_strict_policy(&coverage, &config));
+    }
+
+    fn deferred_prefix(
+        root: &Path,
+        sequence: u64,
+        node_id: &str,
+    ) -> Result<DeferredAnalysisFailure> {
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":"partial-scan",
+                "adapter":"go","adapter_version":"0.1.0","seq":seq
+            })
+        };
+        let mut started = common("scan_started", 1);
+        started["root"] = json!(root);
+        started["project_code_executed"] = json!(false);
+        started["safe_mode"] = json!(true);
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"go:test","language":"go","features":[],"environment":{},"properties":{}
+        });
+        let mut node = common("node_upsert", 3);
+        node["node"] = json!({
+            "id":node_id,"kind":"file","locator":format!("file://{node_id}.go"),"properties":{}
+        });
+        DeferredAnalysisFailure::stage(
+            sequence,
+            WorkerOutput {
+                adapter: AdapterKind::Go,
+                events: vec![started, profile, node],
+                stderr: String::new(),
+                stderr_truncated: false,
+                error: Some("worker resource limit".to_owned()),
+                failure_kind: Some(WorkerFailureKind::MemoryLimit),
+                security_violation: false,
+                peak_memory_bytes: None,
+            },
+        )
+    }
+
+    #[test]
+    fn deferred_prefixes_survive_execution_errors_in_ingestion_order() -> Result<()> {
+        for execution_failed in [false, true] {
+            let root = tempfile::tempdir()?;
+            let mut store = Store::open_in_memory()?;
+            store.start_scan("partial-scan", root.path(), false)?;
+            let deferred = std::sync::Mutex::new(BTreeMap::from([
+                ("z-first".into(), deferred_prefix(root.path(), 0, "first")?),
+                (
+                    "m-superseded".into(),
+                    deferred_prefix(root.path(), 1, "superseded")?,
+                ),
+                (
+                    "a-replacement".into(),
+                    deferred_prefix(root.path(), 2, "last")?,
+                ),
+            ]));
+            lock_failures(&deferred).remove("m-superseded");
+            let execution = if execution_failed {
+                Err(anyhow::anyhow!("replacement inventory failed"))
+            } else {
+                Ok(42)
+            };
+            let mut restored = Vec::new();
+            let mut upserts = BTreeMap::new();
+            let result = restore_deferred_analysis_failures(execution, &deferred, |id, output| {
+                restored.push(id.to_owned());
+                let error = ingest_worker_output(
+                    &mut store,
+                    "partial-scan",
+                    output,
+                    Some(&mut upserts),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("worker resource limit"));
+                Ok(false)
+            });
+            if execution_failed {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "replacement inventory failed"
+                );
+            } else {
+                assert_eq!(result?, 42);
+            }
+            assert_eq!(restored, ["z-first", "a-replacement"]);
+            assert!(lock_failures(&deferred).is_empty());
+            let nodes = store
+                .load_snapshot("partial-scan")?
+                .nodes
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>();
+            assert_eq!(nodes, ["first", "last"]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_prefix_restore_failure_does_not_discard_later_prefixes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let corrupt = deferred_prefix(root.path(), 0, "corrupt")?;
+        corrupt.events.as_file().set_len(0)?;
+        let deferred = std::sync::Mutex::new(BTreeMap::from([
+            ("corrupt".into(), corrupt),
+            ("kept".into(), deferred_prefix(root.path(), 1, "kept")?),
+        ]));
+        let mut restored = Vec::new();
+        let error = restore_deferred_analysis_failures::<()>(
+            Err(anyhow::anyhow!("ledger update failed")),
+            &deferred,
+            |id, output| {
+                restored.push((id.to_owned(), output.events[2]["node"]["id"].clone()));
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("ledger update failed"));
+        assert!(detail.contains("restore partial analysis result for corrupt"));
+        assert_eq!(restored, [("kept".to_owned(), json!("kept"))]);
+        assert!(lock_failures(&deferred).is_empty());
+        Ok(())
     }
 
     #[test]
