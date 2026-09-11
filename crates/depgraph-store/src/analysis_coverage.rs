@@ -74,10 +74,10 @@ pub fn aggregate_analysis_coverage(
             "depgraph-analysis-unit-v1" => join_v1(rows, &stages, &mut reasons),
             "depgraph-analysis-unit-v2" => join_v2(rows, &stages, &mut reasons),
             // Repository-wide legacy workers have no stage pair.  Their
-            // established scan validation remains the source of truth, but a
-            // ledger row with an unknown dependency is still conservative.
+            // established scan validation remains the source of truth.
+            // Dependency certainty is accounted for separately below.
             _ if stages == BTreeSet::from(["repository"]) => {
-                rows.len() == 1 && rows[0].status == "completed" && !rows[0].unknown_dependencies
+                rows.len() == 1 && rows[0].status == "completed"
             }
             _ => {
                 reasons.insert("analysis-unit-unknown-contract".to_owned());
@@ -86,7 +86,11 @@ pub fn aggregate_analysis_coverage(
         };
         if joined {
             completed_units += 1;
-            semantic_complete_units += 1;
+            if rows.iter().any(|row| row.unknown_dependencies) {
+                reasons.insert("analysis-unit-unknown-dependency".to_owned());
+            } else {
+                semantic_complete_units += 1;
+            }
         } else {
             unanalysed_units += 1;
         }
@@ -145,8 +149,6 @@ fn join_v1(
         return false;
     }
     same_context(syntax, semantic, reasons)
-        && !syntax.unknown_dependencies
-        && !semantic.unknown_dependencies
 }
 
 fn join_v2(
@@ -194,14 +196,6 @@ fn join_v2(
         reasons.insert("analysis-unit-stage-incomplete".to_owned());
         return false;
     }
-    if syntax.iter().any(|row| row.unknown_dependencies)
-        || semantic.iter().any(|row| row.unknown_dependencies)
-        || typed_rows.iter().any(|row| row.unknown_dependencies)
-    {
-        reasons.insert("analysis-unit-unknown-dependency".to_owned());
-        return false;
-    }
-
     let owned_sources = union_paths(&syntax, |row| &row.source_paths);
     let declared_context = union_paths(&syntax, |row| &row.context_paths);
     // Context includes dependency sources which the unit must resolve but
@@ -271,50 +265,45 @@ fn valid_chunks(rows: &[&AnalysisUnitLedgerRecord], reasons: &mut BTreeSet<Strin
         reasons.insert("analysis-unit-missing-stage".to_owned());
         return false;
     }
+    // Retained batches keep their creation-generation count. The newest
+    // refinement owns the highest count; its active slots must still form
+    // one complete, unique partition. A count alone never proves completion.
+    let Some(expected) = rows.iter().filter_map(|row| row.chunk_count).max() else {
+        reasons.insert("analysis-unit-chunk-metadata".to_owned());
+        return false;
+    };
+    if expected == 0 || rows.len() != expected as usize {
+        reasons.insert("analysis-unit-chunk-count-mismatch".to_owned());
+        return false;
+    }
     let mut indices = BTreeSet::new();
     let mut ids = BTreeSet::new();
-    let mut counts = BTreeSet::new();
     for row in rows {
-        let Some(count) = row.chunk_count else {
-            reasons.insert("analysis-unit-chunk-metadata".to_owned());
-            return false;
-        };
-        let Some(index) = row.chunk_index else {
-            reasons.insert("analysis-unit-chunk-metadata".to_owned());
-            return false;
-        };
-        if count == 0 || index >= count || row.chunk_id.is_empty() {
-            reasons.insert("analysis-unit-chunk-metadata".to_owned());
-            return false;
-        }
-        let empty_manifest_batch = rows.len() == 1
-            && count == 1
-            && row.source_paths.is_empty()
-            && row.context_paths.is_empty();
-        if !empty_manifest_batch && row.context_paths.is_empty() {
+        // A manifest-only project can legitimately produce one empty batch:
+        // there are no source paths to list, while the worker still records
+        // the unit and its context fingerprint.  Keep the exception narrow
+        // so an empty context cannot make a multi-batch or otherwise scoped
+        // result look complete.
+        let empty_manifest_batch =
+            expected == 1 && row.source_paths.is_empty() && row.context_paths.is_empty();
+        if !row.chunk_count.is_some_and(|count| {
+            count > 0 && count <= expected && row.chunk_index.is_some_and(|index| index < count)
+        }) || row.chunk_id.is_empty()
+            || (!empty_manifest_batch && row.context_paths.is_empty())
+        {
             reasons.insert("analysis-unit-chunk-metadata".to_owned());
             return false;
         }
-        if !indices.insert(index) || !ids.insert(row.chunk_id.as_str()) {
+        if !indices.insert(row.chunk_index.unwrap_or_default())
+            || !ids.insert(row.chunk_id.as_str())
+        {
             reasons.insert("analysis-unit-duplicate-chunk".to_owned());
             return false;
         }
-        counts.insert(count);
     }
-    // A static partition publishes one chunk_count for every row and must
-    // occupy 0..count exactly.  A memory-limit re-split keeps the published
-    // numbering of retained siblings and gives replacements a new index, so
-    // the stage can mix counts; source-path partition in `join_v2` is then
-    // the completeness check.
-    if let Some(expected) = counts.iter().copied().next().filter(|_| counts.len() == 1) {
-        if rows.len() != expected as usize {
-            reasons.insert("analysis-unit-chunk-count-mismatch".to_owned());
-            return false;
-        }
-        if indices != (0..expected).collect::<BTreeSet<_>>() {
-            reasons.insert("analysis-unit-chunk-index-gap".to_owned());
-            return false;
-        }
+    if indices != (0..expected).collect::<BTreeSet<_>>() {
+        reasons.insert("analysis-unit-chunk-index-gap".to_owned());
+        return false;
     }
     true
 }
@@ -522,7 +511,7 @@ fn v2_ledger_joined(records: &[AnalysisUnitLedgerRecord], unit_id: &str, unit_ro
                 && record.unit_root == unit_root
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
+    if rows.is_empty() || rows.iter().any(|row| row.unknown_dependencies) {
         return false;
     }
     let stages = rows
@@ -597,7 +586,7 @@ fn ledger_joined(
                 && record.unit_root == unit_root
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
+    if rows.is_empty() || rows.iter().any(|row| row.unknown_dependencies) {
         return false;
     }
     let stages = rows
@@ -653,7 +642,12 @@ fn profile_axes(profile: &ProfileRecord) -> serde_json::Value {
         "toolchain": profile.toolchain,
         "command": profile.command,
         "target": profile.target,
-        "features": profile.features,
+        // Web features describe the framework facts emitted by this stage.
+        // Syntax intentionally has no semantic framework ledger; its empty
+        // feature list is not a different selected configuration. The base
+        // profile and selection properties above still bind that identity.
+        // Go features are build tags and must remain a configuration axis.
+        "features": if profile.language == "web" { &[] as &[String] } else { &profile.features },
         "environment": profile.environment,
         "source_revision": profile.source_revision,
         "properties": properties,
@@ -747,6 +741,38 @@ mod tests {
     }
 
     #[test]
+    fn refined_chunks_keep_generation_counts_but_require_every_active_slot() {
+        let mut rows = vec![
+            unit_row("typed", "first-child", 0, 4, &["app/a.go"]),
+            unit_row("typed", "retained", 1, 2, &["app/b.go"]),
+            unit_row("typed", "previous-child", 2, 3, &["app/c.go"]),
+            unit_row("typed", "second-child", 3, 4, &["app/d.go"]),
+        ];
+        let valid = |rows: &[AnalysisUnitLedgerRecord]| {
+            valid_chunks(&rows.iter().collect::<Vec<_>>(), &mut BTreeSet::new())
+        };
+        assert!(valid(&rows));
+        rows.rotate_left(1);
+        assert!(
+            valid(&rows),
+            "retained generation may be the first ledger row"
+        );
+        rows.rotate_right(1);
+        for index in 0..rows.len() {
+            let mut missing = rows.clone();
+            missing.remove(index);
+            assert!(!valid(&missing), "missing slot {index} accepted");
+        }
+        rows[3].chunk_index = Some(2);
+        assert!(!valid(&rows), "duplicate slot accepted");
+        rows[3].chunk_index = Some(3);
+        rows[3].chunk_count = Some(3);
+        assert!(!valid(&rows), "slot beyond its generation count accepted");
+        rows[3].chunk_count = None;
+        assert!(!valid(&rows), "missing generation count accepted");
+    }
+
+    #[test]
     fn v2_requires_all_syntax_chunks_and_one_semantic_context() {
         let mut syntax_a = unit_row("syntax", "a", 0, 2, &["app/a.go"]);
         let syntax_b = unit_row("syntax", "b", 1, 2, &["app/b.go"]);
@@ -781,7 +807,10 @@ mod tests {
             None,
             &[syntax_a, syntax_b, semantic],
         );
-        assert!(!unknown.complete);
+        assert!(unknown.complete);
+        assert_eq!(unknown.completed_units, 1);
+        assert_eq!(unknown.unanalysed_units, 0);
+        assert_eq!(unknown.semantic_complete_units, 0);
         assert!(
             unknown
                 .reasons
@@ -939,7 +968,7 @@ mod tests {
         assert!(
             missing_replacement
                 .reasons
-                .contains(&"analysis-unit-context-scope-mismatch".into())
+                .contains(&"analysis-unit-chunk-count-mismatch".into())
         );
     }
 
@@ -984,6 +1013,45 @@ mod tests {
     }
 
     #[test]
+    fn v2_web_stage_framework_observations_do_not_split_configuration_axes() -> Result<()> {
+        let mut profiles = [v2_profile("syntax"), v2_profile("semantic")];
+        let mut rows = [
+            unit_row("syntax", "syntax", 0, 1, &["app/a.go", "app/b.go"]),
+            unit_row("semantic", "semantic", 0, 1, &["app/a.go", "app/b.go"]),
+        ];
+        for profile in &mut profiles {
+            profile.language = "web".into();
+        }
+        for row in &mut rows {
+            row.adapter = "web".into();
+        }
+        profiles[1].features = vec!["astro".into()];
+        assert!(
+            aggregate_completeness(&profiles, Some(&rows))?
+                .unwrap()
+                .contains("semantic-complete")
+        );
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 1);
+        assert!(profiles[0].features.is_empty());
+        assert_eq!(profiles[1].features, ["astro"]);
+
+        let mut changed_base = profiles.clone();
+        changed_base[1].properties["analysis_base_profile_id"] = json!("different-configuration");
+        assert!(
+            !aggregate_completeness(&changed_base, Some(&rows))?
+                .unwrap()
+                .contains("semantic-complete")
+        );
+        let mut changed_selection = profiles.clone();
+        changed_selection[1].properties["profile_selection_input_digest"] =
+            json!("different-selection");
+        assert_eq!(semantic_complete_units(&changed_selection, Some(&rows)), 0);
+        rows[1].unknown_dependencies = true;
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 0);
+        Ok(())
+    }
+
+    #[test]
     fn v2_profile_join_requires_the_durable_chunk_ledger() -> Result<()> {
         let profiles = [v2_profile("syntax"), v2_profile("semantic")];
         let rows = [
@@ -1002,10 +1070,49 @@ mod tests {
         assert!(without_ledger.contains("syntax-complete"));
         assert!(!without_ledger.contains("semantic-complete"));
 
+        let mut unknown_rows = rows.clone();
+        unknown_rows[0].unknown_dependencies = true;
+        let unknown = aggregate_completeness(&profiles, Some(&unknown_rows))?.unwrap();
+        assert!(unknown.contains("syntax-complete"));
+        assert!(!unknown.contains("semantic-complete"));
+        assert_eq!(semantic_complete_units(&profiles, Some(&unknown_rows)), 0);
+
         let mut failed_rows = rows;
         failed_rows[1].status = "failed".into();
         let failed = aggregate_completeness(&profiles, Some(&failed_rows))?.unwrap();
         assert!(!failed.contains("semantic-complete"));
+        Ok(())
+    }
+
+    #[test]
+    fn v1_unknown_dependency_completes_execution_without_semantic_guarantee() -> Result<()> {
+        let profiles = [profile("syntax"), profile("semantic")];
+        let mut rows = [
+            unit_row("syntax", "", 0, 1, &["app/a.go", "app/b.go"]),
+            unit_row("semantic", "", 0, 1, &["app/a.go", "app/b.go"]),
+        ];
+        for row in &mut rows {
+            row.contract_version = "depgraph-analysis-unit-v1".into();
+            row.chunk_index = None;
+            row.chunk_count = None;
+            row.unknown_dependencies = true;
+        }
+        let summary = aggregate_analysis_coverage("depgraph-analysis-unit-v1", None, None, &rows);
+        assert!(summary.complete);
+        assert_eq!(summary.semantic_complete_units, 0);
+        assert!(
+            summary
+                .reasons
+                .contains(&"analysis-unit-unknown-dependency".into())
+        );
+        let levels = aggregate_completeness(&profiles, Some(&rows))?.unwrap();
+        assert!(levels.contains("syntax-complete"));
+        assert!(!levels.contains("semantic-complete"));
+        assert_eq!(semantic_complete_units(&profiles, Some(&rows)), 0);
+        rows[1].status = "queued".into();
+        assert!(
+            !aggregate_analysis_coverage("depgraph-analysis-unit-v1", None, None, &rows).complete
+        );
         Ok(())
     }
 

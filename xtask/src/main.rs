@@ -188,41 +188,41 @@ struct TargetNativeSmokeExpectation {
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:55eaac2a5f6be85d707ebf402c31995e073641b34bf4627984e68cca7c7a7a3e",
-        query_result_digest: "bounded-query-result:sha256:20c747c06fa2cad26fcf6b559e3288aaaf4cc95cb65b6f74cdabfcdffd892246",
-        query_output_sha256: "6cbe86c5b11e4a4ac94ac20ceea35d0bcfed7488650000e7d1058681969aff9b",
+        query_plan_digest: "bounded-query-plan:sha256:baa6f35c85fc19f6c138f3c930e4e9e7a938153263ecda62cbd35de087ee9e7c",
+        query_result_digest: "bounded-query-result:sha256:2ce5b4849d3255709cc8ea5efbabfd75c34330706e44d8a74cbf0415390a4caa",
+        query_output_sha256: "af78adc4696f9d645840233d85d06a6a7729007306329180658ef928bc1ffc84",
         profile_plan_digest: "profile-selection-plan:sha256:2d6ae1975930464929de3dba67f62f2290f6aaa10c549d909a1cfcf4eb717b61",
         profile_plan_output_sha256: "12bc417acd93327d558c62744a688d7b704dc4d43e3ca7cd7ada2b6f4f4691af",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:cc99b9e933804d1dfffc6b0e97a3a04c01aa0fecbb36e85a43f03f009fcd33aa",
-        query_result_digest: "bounded-query-result:sha256:6717de358653baad6f4f4e2abf86e91822e68fcb54dbe2900dc1f30c37b38c26",
-        query_output_sha256: "42b960a16f9842d8040f17866c928c5128e96fa9662006e3eb54625e23b162a0",
+        query_plan_digest: "bounded-query-plan:sha256:3d4cfe783ec41d0442e93c577e12fadff50095607da90db651ec3e7f11d823de",
+        query_result_digest: "bounded-query-result:sha256:2bf8e36f02afbe60f037991bffe58410cbb44c5671f5a8436c33b78102d0cb67",
+        query_output_sha256: "ce90db9c2d21cdaabeab40fa7b1c8bc69c6236f40ca3915835f3e1906a578727",
         profile_plan_digest: "profile-selection-plan:sha256:70125b85631b7b4be67a98ca951369c8f9b443180aabdd6858f9e78707692a8b",
         profile_plan_output_sha256: "e5b8343b56b4227920873c1106454dff28f866117f23f05990e6796f9137c20b",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:32e7bf4742fcfb3d871587f05271cdf9cc1e4a031fcddb8b87ef67119fd95062",
-        query_result_digest: "bounded-query-result:sha256:35edbd747a75de3dc132b80e3ff8a3a6c1278389b3421a452342023cb97cbdc0",
-        query_output_sha256: "e52109b441a013705f351eda737ad50724f3d46a1d31f63b06dfd0b1712be45f",
+        query_plan_digest: "bounded-query-plan:sha256:b09445b65a05debafff6dedc7ec6366e5b54c0d37fabb19e2ec00164437eb0dd",
+        query_result_digest: "bounded-query-result:sha256:3a646e3af63b833a74179aebbcdddcb3871b7be256fc24f00b0a58b588fa22ad",
+        query_output_sha256: "78038e7c36cb5216454ba4939a0fc83b7efcbac3b417a53c39e7eac1218acf07",
         profile_plan_digest: "profile-selection-plan:sha256:8f62b9ef2cd022b8a25146045fb23e7e5982be77b63bacc23d7a570acbd30056",
         profile_plan_output_sha256: "d16c8902cd70289261004985a649a2ab73efa6fda9bf3fe7c0fe218dc35da2e8",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:b48c42ce3b8b8b1223ff83265b7d5549b38357df63134f4774443e9109c4d93c",
-        query_result_digest: "bounded-query-result:sha256:994d092cbaf879f6c6faa0550c68faa2f534f93dbd6ece60bfa12509da4c17fa",
-        query_output_sha256: "36bbc8df8104205d479ed659007310d4b007aa2c1ae3bb6ca13440bdd79ec739",
+        query_plan_digest: "bounded-query-plan:sha256:1c5e2f8ec9d8dbc02df553a3ac1ab6d43e837b99fad53a2e86bea307c2a15ca3",
+        query_result_digest: "bounded-query-result:sha256:19925403e94395996991eb785cbd8f0bc71eb3167ed75737c01ff3d35181ea53",
+        query_output_sha256: "3383aa72ca33dbad8c716571be17ce344323380de6c81430a64efd1d25053c26",
         profile_plan_digest: "profile-selection-plan:sha256:10f4c03150c9626bb7e96d0fc7975d38d0c0a831b1de1c8f9d407efd30551a9c",
         profile_plan_output_sha256: "b9763738ac03eea4826ba3a7d25d8be0a4c1c85a74d46e392706fbc393f8baec",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:70afd8054abde350419f914bcb444b3c1c481b24680ed4e1fd9aa857f4c61bc6",
-        query_result_digest: "bounded-query-result:sha256:de6ac0a07a773b30f5c74f6f06e53076bc5657dfe46be153844d4d8359f86d3f",
-        query_output_sha256: "2788552b6737c2e501e221ce7e61a6dcd6656e15464d723fd9d6b74f799fe16d",
+        query_plan_digest: "bounded-query-plan:sha256:e08d93ecca00db7c4a05db1f2786cdbbc26f621b760f5182b71faccd1d9e08f1",
+        query_result_digest: "bounded-query-result:sha256:fa0e3d1315d5fa7cedcdc9e8a05017fe4838ecc9e7899b2aa0f3cb4d373bc5ba",
+        query_output_sha256: "28c7aac814ae2a6e66889239494c710cf1660f0d361e5dd0ddd67cc3e936c79d",
         profile_plan_digest: "profile-selection-plan:sha256:7264907427af6b7c80911a1fb1e3e4d67d446b5feaff21b426b83521a2f4714c",
         profile_plan_output_sha256: "7379fe0698d3c49b14a1b3a26dbad1ad873a0eb5c93599d49bf31f6024d09a82",
     },
@@ -255,6 +255,7 @@ const RUST_SYSROOT_COMPONENT_SHA256: &str =
 const RUNTIME_COLLECTOR_CONTRACT_VERSION: &str = depgraph_core::RUNTIME_COLLECTOR_CONTRACT_VERSION;
 const RUNTIME_COLLECTOR_ARTIFACT: &str = "depgraph-runtime-collector.mjs";
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "analysis-source-batch-v1",
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
     "framework-semantic-graph-v1",
@@ -1146,7 +1147,14 @@ fn resumable_analysis_e2e() -> Result<()> {
         .join(executable_name("depgraph"));
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
-        .env("DEPGRAPH_BIN", cli))
+        .env("DEPGRAPH_BIN", &cli))?;
+    // The fault-injection wrapper and interruption signals require POSIX.
+    if cfg!(unix) {
+        run(Command::new("node")
+            .arg("scripts/analysis-resplit-e2e.mjs")
+            .env("DEPGRAPH_BIN", &cli))?;
+    }
+    Ok(())
 }
 
 /// Go loader-scope evidence (#463): the module-loader control must fail the
@@ -7814,7 +7822,7 @@ jobs:
     #[test]
     fn web_worker_handshake_captures_the_release_semantic_compatibility_unit() -> Result<()> {
         let parsed = parse_worker_handshake(
-            "depgraph-web-worker 0.5.0 (protocol 1.0; typescript 7.0.2; capabilities astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
+            "depgraph-web-worker 0.5.0 (protocol 1.0; typescript 7.0.2; capabilities analysis-source-batch-v1,astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)",
         )
         .expect("valid Web worker handshake");
         let semantic = web_semantic_from_handshake(&parsed)?;
@@ -8499,8 +8507,12 @@ jobs:
             "the original trial target must stay a required #464 closer"
         );
         assert!(
-            validation.contains("### Required private-trial closer (pending)"),
+            validation.contains("### Required private-trial closer"),
             "the private-trial gate heading must remain"
+        );
+        assert!(
+            validation.contains("must remain pending until every required check below has passed"),
+            "issue verdicts must stay pending until the required private checks pass"
         );
         assert!(
             validation.contains("Public fixtures are necessary and not sufficient"),

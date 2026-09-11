@@ -50,6 +50,7 @@ fn incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_p
             "analysis-unit-failed",
             "analysis-unit-cancelled",
             "analysis-unit-context-mismatch",
+            "analysis-unit-unknown-dependency",
             "analysis-input-changed-during-scan",
         ] {
             let mut incomplete = snapshot.clone();

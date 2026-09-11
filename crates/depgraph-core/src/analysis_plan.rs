@@ -20,6 +20,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{config::Config, repository_inventory::build_repository_file_inventory};
 
+#[cfg(test)]
+mod import_tests;
+mod web_imports;
+mod web_resolution;
+
 pub const ANALYSIS_PLAN_CONTRACT_VERSION: &str = "depgraph-analysis-plan-v1";
 pub const ANALYSIS_UNIT_WORKER_CONTRACT_VERSION: &str = "depgraph-analysis-unit-v1";
 pub const REPOSITORY_ROOT: &str = ".";
@@ -2473,6 +2478,8 @@ fn add_static_source_imports(
     references: &mut BTreeMap<String, Vec<AnalysisDependencyReference>>,
     context: &SourceImportPlanContext<'_>,
 ) -> Result<()> {
+    let web_inputs = web_resolution::WebInputs::discover(root, files, units, context.web)?;
+    let mut used_configs = BTreeMap::<String, BTreeSet<String>>::new();
     for (path, kind) in files {
         if !kind.is_source() {
             continue;
@@ -2480,6 +2487,16 @@ fn add_static_source_imports(
         let Some(adapter) = kind.adapter() else {
             continue;
         };
+        let Some(owner) = most_specific_executable(path, adapter, units) else {
+            continue;
+        };
+        let owner_id = owner.id.clone();
+        if adapter == AnalysisAdapter::Web {
+            used_configs
+                .entry(owner_id.clone())
+                .or_default()
+                .extend(web_inputs.config_sources(path).cloned());
+        }
         let imports = match adapter {
             AnalysisAdapter::Go => extract_go_imports(root, path)?,
             AnalysisAdapter::Web => extract_web_imports(root, path)?,
@@ -2488,10 +2505,6 @@ fn add_static_source_imports(
         if imports.is_empty() {
             continue;
         }
-        let Some(owner) = most_specific_executable(path, adapter, units) else {
-            continue;
-        };
-        let owner_id = owner.id.clone();
         let go_resolution = GoImportResolutionContext {
             replacements: (adapter == AnalysisAdapter::Go)
                 .then(|| context.go_replacements.get(&owner_id))
@@ -2502,9 +2515,14 @@ fn add_static_source_imports(
             source_unit_id: &owner_id,
         };
         for specifier in imports {
-            let (target, resolution) = if adapter == AnalysisAdapter::Web
-                && !specifier.starts_with(['.', '/'])
-            {
+            let alias = (adapter == AnalysisAdapter::Web && !specifier.starts_with(['.', '/']))
+                .then(|| web_inputs.resolve_alias(path, &specifier, files, units))
+                .flatten();
+            let (target, resolution) = if let Some(alias) = alias {
+                alias
+            } else if adapter == AnalysisAdapter::Web && web_imports::node_builtin(&specifier) {
+                (None, AnalysisDependencyResolution::External)
+            } else if adapter == AnalysisAdapter::Web && !specifier.starts_with(['.', '/']) {
                 let package = web_import_package_name(&specifier);
                 let scope = context
                     .web
@@ -2520,15 +2538,23 @@ fn add_static_source_imports(
                     Some([id]) => (Some(id.clone()), AnalysisDependencyResolution::Resolved),
                     Some(_) => (None, AnalysisDependencyResolution::Unknown),
                     None => {
-                        let declared = references
-                            .get(&owner_id)
-                            .into_iter()
-                            .flatten()
-                            .find(|reference| reference.specifier == package);
+                        let types = if let Some(scoped) = package.strip_prefix('@') {
+                            format!("@types/{}", scoped.replace('/', "__"))
+                        } else {
+                            format!("@types/{package}")
+                        };
+                        let declared =
+                            references
+                                .get(&owner_id)
+                                .into_iter()
+                                .flatten()
+                                .find(|reference| {
+                                    reference.specifier == package || reference.specifier == types
+                                });
                         (
                             None,
-                            if specifier.starts_with("node:")
-                                || specifier.contains("://")
+                            if specifier.contains("://")
+                                || web_inputs.external(&owner.unit_root, package)
                                 || declared.is_some_and(|reference| {
                                     reference.resolution == AnalysisDependencyResolution::External
                                 })
@@ -2560,6 +2586,11 @@ fn add_static_source_imports(
                     resolution,
                     evidence_path: Some(path.clone()),
                 });
+        }
+    }
+    for unit in units {
+        if let Some(paths) = used_configs.remove(&unit.id) {
+            unit.config_paths.extend(paths);
         }
     }
     Ok(())
@@ -2629,34 +2660,13 @@ fn extract_go_imports(root: &Path, path: &str) -> Result<Vec<String>> {
 }
 
 fn extract_web_imports(root: &Path, path: &str) -> Result<Vec<String>> {
-    let text = String::from_utf8_lossy(&read_bounded(root, path, MAX_MANIFEST_BYTES)?).into_owned();
-    let mut imports = Vec::new();
-    for line in text.lines() {
-        for marker in ["from", "import", "require(", "dynamic("] {
-            let mut rest = line;
-            while let Some(index) = rest.find(marker) {
-                rest = &rest[index + marker.len()..];
-                let Some(value) = quoted_value(rest) else {
-                    break;
-                };
-                if imports.len() < MAX_IMPORTS_PER_FILE {
-                    imports.push(value);
-                }
-                let Some(end) = rest.find(['"', '\'']) else {
-                    break;
-                };
-                let quote = rest.as_bytes()[end] as char;
-                let tail = &rest[end + 1..];
-                let Some(close) = tail.find(quote) else {
-                    break;
-                };
-                rest = &tail[close + 1..];
-            }
-        }
+    // Plain Markdown is still an owned source, but fenced documentation is
+    // not an executable JavaScript module. MDX keeps its real ESM imports.
+    if path.ends_with(".md") {
+        return Ok(Vec::new());
     }
-    imports.sort();
-    imports.dedup();
-    Ok(imports)
+    let bytes = read_bounded(root, path, MAX_MANIFEST_BYTES)?;
+    web_imports::extract(&String::from_utf8_lossy(&bytes))
 }
 
 fn web_import_package_name(specifier: &str) -> &str {
@@ -2703,7 +2713,7 @@ fn resolve_source_import(
             }
             None => {}
         }
-        let modules = units
+        let candidates = units
             .iter()
             .filter(|unit| unit.adapter == adapter && unit.kind == AnalysisUnitKind::GoModule)
             .filter(|target| {
@@ -2719,6 +2729,22 @@ fn resolve_source_import(
                 specifier == unit.locator || specifier.starts_with(&(unit.locator.clone() + "/"))
             })
             .collect::<Vec<_>>();
+        // Module paths form namespaces: example.test/app/tools must win over
+        // example.test/app for an import under the more specific path. Equal
+        // module names in independent checkouts do not make self-imports
+        // ambiguous; go/packages uses the importing module's own directory.
+        let longest = candidates.iter().map(|unit| unit.locator.len()).max();
+        let mut modules = candidates
+            .into_iter()
+            .filter(|unit| Some(unit.locator.len()) == longest)
+            .collect::<Vec<_>>();
+        if let Some(source) = modules
+            .iter()
+            .find(|unit| unit.id == go_resolution.source_unit_id)
+            .copied()
+        {
+            modules = vec![source];
+        }
         if modules.len() > 1 {
             return (None, AnalysisDependencyResolution::Unknown);
         }
@@ -2901,6 +2927,7 @@ fn finalize_units(
         unit.manifest_paths.dedup();
         unit.source_paths.sort();
         unit.source_paths.dedup();
+        let discovered_config_paths = std::mem::take(&mut unit.config_paths);
         unit.config_paths = if unit.is_executable() {
             all_config_paths
                 .iter()
@@ -2917,6 +2944,9 @@ fn finalize_units(
         } else {
             Vec::new()
         };
+        unit.config_paths.extend(discovered_config_paths);
+        unit.config_paths.sort();
+        unit.config_paths.dedup();
         unit.profile_scope = profile_scope(unit, &input.profile_ids)?;
         unit.source_fingerprint = fingerprint_paths(digests, &unit.source_paths);
         unit.manifest_fingerprint = fingerprint_paths(digests, &unit.manifest_paths);

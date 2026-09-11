@@ -2,7 +2,7 @@
   "go-package-loader-bounded-budget": {
     "budget": {
       "max_concurrent_units": 2,
-      "max_unit_source_files": 128,
+      "max_unit_source_files": 2048,
       "max_unit_source_bytes": 5120,
       "max_context_source_bytes": 5120,
       "worker_timeout_seconds": 300,
@@ -261,7 +261,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -332,7 +332,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -402,7 +402,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -472,7 +472,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -542,7 +542,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -612,7 +612,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -682,7 +682,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -752,7 +752,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -822,7 +822,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -892,7 +892,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -957,7 +957,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1016,7 +1016,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1081,7 +1081,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1148,7 +1148,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1223,7 +1223,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1296,7 +1296,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1376,7 +1376,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1456,7 +1456,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1536,7 +1536,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1616,7 +1616,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1696,7 +1696,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1776,7 +1776,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1856,7 +1856,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1931,7 +1931,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -1993,7 +1993,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2062,7 +2062,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2131,7 +2131,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2206,7 +2206,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2279,7 +2279,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2359,7 +2359,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2439,7 +2439,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2519,7 +2519,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2599,7 +2599,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2679,7 +2679,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2759,7 +2759,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2839,7 +2839,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2914,7 +2914,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -2976,7 +2976,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3045,7 +3045,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3113,7 +3113,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3172,7 +3172,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3239,7 +3239,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3301,7 +3301,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 5120,
           "max_context_source_bytes": 5120
         },
@@ -3314,7 +3314,7 @@
   "go-package-loader-default-budget": {
     "budget": {
       "max_concurrent_units": 2,
-      "max_unit_source_files": 128,
+      "max_unit_source_files": 2048,
       "max_unit_source_bytes": 8388608,
       "max_context_source_bytes": 67108864,
       "worker_timeout_seconds": 300,
@@ -3501,7 +3501,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3572,7 +3572,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3643,7 +3643,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3714,7 +3714,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3779,7 +3779,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3838,7 +3838,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3903,7 +3903,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -3970,7 +3970,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4045,7 +4045,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4119,7 +4119,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4194,7 +4194,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4263,7 +4263,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4325,7 +4325,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4394,7 +4394,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4463,7 +4463,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4538,7 +4538,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4612,7 +4612,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4687,7 +4687,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4756,7 +4756,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4818,7 +4818,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4887,7 +4887,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -4955,7 +4955,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5014,7 +5014,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5081,7 +5081,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5143,7 +5143,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5156,7 +5156,7 @@
   "module-loader-workers-default-budget": {
     "budget": {
       "max_concurrent_units": 2,
-      "max_unit_source_files": 128,
+      "max_unit_source_files": 2048,
       "max_unit_source_bytes": 8388608,
       "max_context_source_bytes": 67108864,
       "worker_timeout_seconds": 300,
@@ -5328,7 +5328,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5399,7 +5399,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5474,7 +5474,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5539,7 +5539,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5598,7 +5598,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5663,7 +5663,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5729,7 +5729,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5803,7 +5803,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5880,7 +5880,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -5947,7 +5947,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6008,7 +6008,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6076,7 +6076,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6144,7 +6144,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6218,7 +6218,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6295,7 +6295,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6362,7 +6362,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6423,7 +6423,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6491,7 +6491,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6559,7 +6559,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6618,7 +6618,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6685,7 +6685,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },
@@ -6747,7 +6747,7 @@
           "max_worker_memory_bytes": 2147483648,
           "max_protocol_bytes": 268435456,
           "max_stderr_bytes": 10485760,
-          "max_source_files": 128,
+          "max_source_files": 2048,
           "max_source_bytes": 8388608,
           "max_context_source_bytes": 67108864
         },

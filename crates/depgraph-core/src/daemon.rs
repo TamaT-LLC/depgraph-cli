@@ -851,10 +851,13 @@ impl DaemonScanRunner for RepositoryScanRunner {
                 .map(|profiles| profile_records_profile_plan_id(profiles))
                 .transpose()?
                 .flatten();
-            let mut force_full_scan = base_uses_analysis_units
-                || base_profile_plan_id.as_deref() != Some(current_profile_plan_id.as_str());
+            let profile_plan_changed =
+                base_profile_plan_id.as_deref() != Some(current_profile_plan_id.as_str());
+            let mut force_full_scan = base_uses_analysis_units || profile_plan_changed;
             if let (Some(base_snapshot_id), Some(path)) = (
-                base_snapshot_id.as_deref().filter(|_| !force_full_scan),
+                base_snapshot_id
+                    .as_deref()
+                    .filter(|_| !profile_plan_changed),
                 semantic_noop_change_path(&request.changes),
             ) {
                 let base_projection_started = Instant::now();
@@ -930,6 +933,8 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                     stderr_truncated,
                                 ) {
                                     Ok(completed_snapshot_id) => {
+                                        let analysis_coverage =
+                                            store.analysis_coverage(&scan_id)?;
                                         return Ok(DaemonScanOutcome {
                                             scan_id: Some(scan_id),
                                             status: "completed".to_owned(),
@@ -938,7 +943,7 @@ impl DaemonScanRunner for RepositoryScanRunner {
                                             invalidation_plan: Some(plan),
                                             invalidation_error: None,
                                             analysis: None,
-                                            analysis_coverage: None,
+                                            analysis_coverage,
                                             incremental_trace: Some(DaemonIncrementalTrace {
                                                 schema_version:
                                                     DAEMON_INCREMENTAL_TRACE_SCHEMA_VERSION
@@ -2264,19 +2269,59 @@ mod tests {
         store_path: &Path,
         analysis: bool,
     ) -> Result<String> {
+        seed_incremental_store_with_analysis_adapters(
+            root,
+            store_path,
+            if analysis { &["web"] } else { &[] },
+        )
+    }
+
+    fn seed_incremental_store_with_analysis_adapters(
+        root: &Path,
+        store_path: &Path,
+        adapters: &[&str],
+    ) -> Result<String> {
         let mut store = open_store(store_path)?;
         let profile_plan_id = plan_repository_profiles(root, &Config::default(), None)?
             .plan
             .plan_id;
         let scan_id = "incremental-base";
         store.start_scan(scan_id, root, false)?;
-        if analysis {
+        if !adapters.is_empty() {
+            let records: Vec<_> = adapters
+                .iter()
+                .flat_map(|adapter| {
+                    ["syntax", "semantic"].into_iter().map(move |stage| {
+                        depgraph_store::AnalysisUnitLedgerRecord {
+                            scan_id: scan_id.into(),
+                            contract_version: "depgraph-analysis-unit-v2".into(),
+                            unit_id: format!("fixture-{adapter}"),
+                            adapter: (*adapter).into(),
+                            unit_root: ".".into(),
+                            stage: stage.into(),
+                            chunk_id: String::new(),
+                            chunk_index: None,
+                            chunk_count: None,
+                            status: "completed".into(),
+                            reused: false,
+                            source_paths: vec!["src/index.ts".into(), "src/lib.ts".into()],
+                            context_paths: vec!["src/index.ts".into(), "src/lib.ts".into()],
+                            auxiliary_paths: Vec::new(),
+                            context_fingerprint: Some("context".into()),
+                            input_fingerprint: Some("input".into()),
+                            dependency_ids: Vec::new(),
+                            unknown_dependencies: false,
+                            error: None,
+                        }
+                    })
+                })
+                .collect();
             store.initialize_analysis_unit_ledger(
                 scan_id,
                 "depgraph-analysis-unit-v2",
                 Some("plan"),
                 Some("input"),
-                &[],
+                &records,
             )?;
         }
         let common = |event: &str, seq: u64| {
@@ -2950,6 +2995,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analysis_unit_semantic_noop_preserves_coverage_without_scheduling() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store_path = root.path().join("graph.db");
+        let base = seed_incremental_store_with_analysis(root.path(), &store_path, true)?;
+        let store = open_store(&store_path)?;
+        let expected = store.analysis_coverage("incremental-base")?;
+        let records = store.analysis_units("incremental-base")?;
+        drop(store);
+        let worker = Arc::new(SuccessfulIncrementalWorker::default());
+        let runner = RepositoryScanRunner::new(
+            root.path().to_path_buf(),
+            store_path.clone(),
+            Config::default(),
+            false,
+        )
+        .with_incremental_worker(worker.clone());
+        let outcome = runner
+            .run(
+                DaemonScanRequest {
+                    attempt_id: "analysis-noop".into(),
+                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    started_at: timestamp(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.base_snapshot_id.as_deref(), Some(base.as_str()));
+        assert_eq!(outcome.analysis_coverage, expected);
+        assert!(outcome.analysis.is_none());
+        assert_eq!(outcome.incremental_trace.unwrap().mode, "semantic_noop");
+        assert_eq!(worker.requests.lock().unwrap().len(), 1);
+        let store = open_store(&store_path)?;
+        assert_eq!(
+            store.analysis_units(outcome.scan_id.as_deref().unwrap())?,
+            records
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_analysis_units_skip_web_semantic_noop_and_use_the_scheduler() -> Result<()> {
+        for adapter in ["go", "rust"] {
+            let root = tempfile::tempdir()?;
+            let store_path = root.path().join("graph.db");
+            let base = seed_incremental_store_with_analysis_adapters(
+                root.path(),
+                &store_path,
+                &["web", adapter],
+            )?;
+            assert!(
+                open_store(&store_path)?
+                    .semantic_noop_delta_base(&base, "src/index.ts")?
+                    .is_none(),
+                "{adapter} analysis proof was accepted by the Web-only Store projection"
+            );
+            let worker = Arc::new(SuccessfulIncrementalWorker::default());
+            let runner = RepositoryScanRunner::new(
+                root.path().to_path_buf(),
+                store_path.clone(),
+                Config::default(),
+                false,
+            )
+            .with_incremental_worker(worker.clone());
+            let outcome = runner
+                .run(
+                    DaemonScanRequest {
+                        attempt_id: format!("mixed-{adapter}-noop"),
+                        changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                        started_at: timestamp(),
+                    },
+                    CancellationToken::new(),
+                )
+                .await?;
+            assert_eq!(outcome.status, "completed");
+            assert_eq!(outcome.base_snapshot_id.as_deref(), Some(base.as_str()));
+            assert!(worker.requests.lock().unwrap().is_empty());
+            assert!(
+                outcome.analysis.is_some(),
+                "shared executor was skipped for {adapter}"
+            );
+            assert!(outcome.incremental_trace.is_none());
+            let completed = outcome
+                .completed_snapshot_id
+                .context("replacement snapshot")?;
+            assert_ne!(completed, base);
+            assert_eq!(
+                open_store(&store_path)?.current_snapshot_id()?,
+                Some(completed)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn analysis_unit_snapshot_uses_resumable_scheduler_without_legacy_delta() -> Result<()> {
         struct RejectLegacyDelta;
         impl IncrementalWorkerExecutor for RejectLegacyDelta {
@@ -2977,7 +3117,10 @@ mod tests {
             .run(
                 DaemonScanRequest {
                     attempt_id: "analysis-replay".into(),
-                    changes: vec![IncrementalFileChange::modified("src/index.ts")],
+                    changes: vec![
+                        IncrementalFileChange::modified("src/index.ts"),
+                        IncrementalFileChange::modified("src/lib.ts"),
+                    ],
                     started_at: timestamp(),
                 },
                 CancellationToken::new(),

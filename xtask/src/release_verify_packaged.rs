@@ -1675,11 +1675,17 @@ fn verify_release_static_prelaunch_fails_closed(extracted: &Path) -> Result<()> 
         cases.push(("MCP tool contract mismatch", manifest));
 
         let mut manifest = baseline.clone();
-        manifest.mcp_server.operation_contract_version = "depgraph-operation-v2".to_owned();
+        manifest
+            .mcp_server
+            .operation_contract_version
+            .push_str("-mismatch");
         cases.push(("MCP operation contract mismatch", manifest));
 
         let mut manifest = baseline.clone();
-        manifest.operation_runner.operation_contract_version = "depgraph-operation-v2".to_owned();
+        manifest
+            .operation_runner
+            .operation_contract_version
+            .push_str("-mismatch");
         cases.push(("operation runner contract mismatch", manifest));
 
         let mut manifest = baseline.clone();
@@ -3014,17 +3020,33 @@ fn verify_packaged_watcher(executable: &Path, store: &Path, fixture: &Path) -> R
         .filter(|value| prefixed_lowercase_sha256(value, "snapshot:sha256:"))
         .context("packaged watcher omitted its valid completed snapshot ID")?
         .to_owned();
+    let units = attempt["analysis"]["units"]
+        .as_array()
+        .context("packaged watcher omitted analysis-unit results")?;
+    let stages = units
+        .iter()
+        .filter_map(|unit| unit["stage"].as_str())
+        .collect::<BTreeSet<_>>();
     if completed["schema_version"] != depgraph_core::DAEMON_STATUS_SCHEMA_VERSION
         || attempt["status"] != "completed"
         || attempt["attempt_id"].as_str().is_none_or(str::is_empty)
         || attempt["scan_id"].as_str().is_none_or(str::is_empty)
         || completed_snapshot_id == base_snapshot_id
         || attempt.get("invalidation_plan").is_some()
-        || attempt["invalidation_summary"]["schema_version"] != "incremental-plan-v2"
-        || attempt["invalidation_summary"]["mode"] != "scoped_replacement"
-        || attempt["invalidation_summary"]["affected_profile_count"]
-            .as_u64()
-            .is_none_or(|count| count == 0)
+        || attempt.get("invalidation_summary").is_some()
+        || attempt["analysis_coverage"]["contract_version"] != "depgraph-analysis-unit-v2"
+        || attempt["analysis_coverage"]["complete"] != true
+        || attempt["analysis_coverage"]["expected_units"] != 1
+        || attempt["analysis_coverage"]["completed_units"] != 1
+        || attempt["analysis_coverage"]["semantic_complete_units"] != 1
+        || ["failed_units", "unanalysed_units", "cancelled_units"]
+            .iter()
+            .any(|field| attempt["analysis_coverage"][*field] != 0)
+        || units.len() != 2
+        || stages != BTreeSet::from(["syntax", "semantic"])
+        || units
+            .iter()
+            .any(|unit| unit["adapter"] != "web" || unit["status"] != "completed")
     {
         bail!("packaged incremental watcher returned an invalid completed attempt: {completed}");
     }
@@ -3417,7 +3439,15 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         .context("packaged Web semantic export has no graph")?;
     let profile = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile["language"] == "web"
+                    && profile["properties"]["analysis_stage"] == "semantic"
+                    && profile["features"]
+                        .as_array()
+                        .is_some_and(|features| features.iter().any(|feature| feature == "next"))
+            })
+        })
         .context("packaged Web semantic export has no Web profile")?;
     let properties = &profile["properties"];
     for (property, expected) in [
@@ -3435,7 +3465,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             "typescript_semantic_graph_emission",
             "definition-import-type-call-graph-v2",
         ),
-        ("typescript_semantic_issue_count", "0"),
+        ("analysis_unit_contract", "depgraph-analysis-unit-v2"),
         ("typescript_release_gate", "release-gate-verified"),
     ] {
         if properties[property] != expected {
@@ -3836,30 +3866,32 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 );
             }
         }
-        if kind == "web_import" && primary["properties"]["module_specifier"] == "node:fs" {
+        if kind == "web_import" && primary["properties"]["module_specifier"] == "node:fs/promises" {
             saw_node_builtin = true;
             let target = target_ids
                 .first()
                 .and_then(|target| nodes_by_id.get(target))
-                .context("packaged Web node:fs site target node is missing")?;
+                .context("packaged Web node:fs/promises site target node is missing")?;
             if kind != "web_import"
-                || site["specifier"] != "node:fs"
+                || site["specifier"] != "node:fs/promises"
                 || type_only != Some(false)
                 || status != "external"
                 || precision != "exact"
                 || target_ids.len() != 1
                 || !site["reason"].is_null()
                 || target["kind"] != "external_system"
-                || target["locator"] != "external://typescript/node%3Afs"
-                || target["display_name"] != "node:fs"
+                || target["locator"] != "external://typescript/node%3Afs%2Fpromises"
+                || target["display_name"] != "node:fs/promises"
                 || target["properties"]["canonical_identity"]
                     != json!({
                         "language": "typescript",
                         "compiler_version": "7.0.2",
-                        "locator": "node:fs",
+                        "locator": "node:fs/promises",
                     })
             {
-                bail!("packaged Web node:fs import lost its exact canonical builtin identity");
+                bail!(
+                    "packaged Web node:fs/promises import lost its exact canonical builtin identity"
+                );
             }
         }
         let expected_edge_kind = match kind {
@@ -3929,7 +3961,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .context("packaged Web external site target node is missing")?;
             if target["kind"] != "external_system"
                 || target["properties"]["language"] != "typescript"
-                || target["properties"]["profile_id"] != site["profile_id"]
+                || !(target["properties"]["profile_id"] == site["profile_id"]
+                    || target["properties"]["profile_ids"]
+                        .as_array()
+                        .is_some_and(|profiles| profiles.contains(&site["profile_id"])))
                 || target["properties"]["compiler_version"] != "7.0.2"
                 || target["properties"]["external"] != true
                 || target["properties"]["workspace"] == true
@@ -3943,7 +3978,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
                 .context("packaged Web unresolved site target node is missing")?;
             if target["kind"] != "unknown_target"
                 || target["properties"]["language"] != "web"
-                || target["properties"]["profile_id"] != site["profile_id"]
+                || !(target["properties"]["profile_id"] == site["profile_id"]
+                    || target["properties"]["profile_ids"]
+                        .as_array()
+                        .is_some_and(|profiles| profiles.contains(&site["profile_id"])))
             {
                 bail!("packaged Web unresolved site {site_id} has an invalid unknown sentinel");
             }
@@ -4022,7 +4060,9 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         bail!("packaged Web semantic sites did not cover both type-only and runtime occurrences");
     }
     if !saw_node_builtin {
-        bail!("packaged Web semantic sites omitted the node:fs builtin acceptance fixture");
+        bail!(
+            "packaged Web semantic sites omitted the node:fs/promises builtin acceptance fixture"
+        );
     }
     if !saw_empty_import || !saw_empty_reexport {
         bail!("packaged Web semantic sites omitted empty import/re-export acceptance fixtures");
@@ -4048,11 +4088,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             semantic_call_site_count,
         ),
     ] {
-        let declared = properties[property]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared != Some(actual) {
-            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        // Raw execution counters are checked before canonical ingestion.
+        // Logical exports omit them and derive totals from graph records.
+        if properties.get(property).is_some() || actual == 0 {
+            bail!(
+                "packaged canonical Web profile retained {property} or omitted its graph records ({actual})"
+            );
         }
     }
 
@@ -4193,11 +4234,12 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             all_framework_edges.len(),
         ),
     ] {
-        let declared = properties[property]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared != Some(actual) || actual == 0 {
-            bail!("packaged Web profile reports {property}={declared:?}, observed {actual}");
+        // Raw execution counters are checked before canonical ingestion.
+        // Logical exports omit them and derive totals from graph records.
+        if properties.get(property).is_some() || actual == 0 {
+            bail!(
+                "packaged canonical Web profile retained {property} or omitted its graph records ({actual})"
+            );
         }
     }
     let framework_kinds: BTreeSet<_> = framework_edges
@@ -5198,10 +5240,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     if profile["properties"]["web_framework_completeness_capability"]
         != "framework-semantic-completeness-v1"
         || profile["properties"]["web_framework_completeness_status"] != "incomplete"
-        || profile["properties"]["web_framework_completeness_issue_count"]
-            .as_str()
-            .and_then(|value| value.parse::<usize>().ok())
-            != Some(framework_issue_count)
+        || profile["properties"]
+            .get("web_framework_completeness_issue_count")
+            .is_some()
+        || framework_issue_count == 0
         || framework_ledger.len() != framework_features.len()
         || framework_ledger.iter().any(|entry| {
             entry["status"] != "incomplete" || entry["reasons"].as_array().is_none_or(Vec::is_empty)
@@ -5247,7 +5289,19 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
         let exact_edge = dependency_edges
             .iter()
             .copied()
-            .find(|edge| edge["kind"] == edge_kind && edge["resolution_status"] == "resolved")
+            .find(|edge| {
+                // `why` chooses one deterministic shortest path, not every
+                // parallel edge. Select a unique endpoint pair so the exact
+                // edge is required consistently by all three query APIs.
+                edge["kind"] == edge_kind
+                    && edge["resolution_status"] == "resolved"
+                    && edge["source"] != edge["target"]
+                    && !edges.iter().any(|other| {
+                        other["id"] != edge["id"]
+                            && other["source"] == edge["source"]
+                            && other["target"] == edge["target"]
+                    })
+            })
             .with_context(|| {
                 format!("packaged Web graph has no exact {label} edge for query verification")
             })?;
@@ -5486,7 +5540,12 @@ fn verify_packaged_web_semantic_complete(
         .context("packaged pure TypeScript semantic-complete export has no graph")?;
     let profile = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile["language"] == "web"
+                    && profile["properties"]["analysis_stage"] == "semantic"
+            })
+        })
         .context("packaged pure TypeScript semantic-complete export has no Web profile")?;
     let properties = &profile["properties"];
     if !profile["features"].as_array().is_some_and(Vec::is_empty)
@@ -5499,13 +5558,19 @@ fn verify_packaged_web_semantic_complete(
         || properties["typescript_definition_graph_status"] != "ready"
         || properties["typescript_semantic_graph_emission"]
             != "definition-import-type-call-graph-v2"
-        || properties["typescript_semantic_diagnostics"] != "0"
-        || properties["typescript_emitted_semantic_diagnostics"] != "0"
-        || properties["typescript_semantic_issue_count"] != "0"
+        || properties["analysis_unit_contract"] != "depgraph-analysis-unit-v2"
+        || graph["diagnostics"].as_array().is_none_or(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic["properties"]["typescript_semantic_scaffold"] == true
+                    || diagnostic["properties"]["typescript_dependency_issue"] == true
+            })
+        })
         || properties["web_framework_completeness_capability"]
             != "framework-semantic-completeness-v1"
         || properties["web_framework_completeness_status"] != "not-detected"
-        || properties["web_framework_completeness_issue_count"] != "0"
+        || properties
+            .get("web_framework_completeness_issue_count")
+            .is_some()
         || properties["web_framework_completeness_ledger"] != "[]"
         || properties["project_code_executed"] != "false"
     {
@@ -5645,33 +5710,81 @@ fn verify_packaged_web_framework_profile(
     let graph = exported["graph"]
         .as_object()
         .context("packaged Web framework-complete export has no graph")?;
-    let profile = graph["profiles"]
+    let profiles = graph["profiles"]
         .as_array()
-        .and_then(|profiles| profiles.iter().find(|profile| profile["language"] == "web"))
-        .context("packaged Web framework-complete export has no Web profile")?;
-    if profile["features"].as_array().is_none_or(|features| {
-        features
-            != &expected_frameworks
-                .iter()
-                .map(|framework| Value::String((*framework).to_owned()))
-                .collect::<Vec<_>>()
+        .context("packaged Web framework-complete export has no profiles")?;
+    let mut observed_frameworks = BTreeSet::new();
+    for profile in profiles.iter().filter(|profile| {
+        profile["language"] == "web" && profile["properties"]["analysis_stage"] == "semantic"
     }) {
-        bail!("packaged Web framework fixture lost detected framework order: {profile}");
+        let observed = verify_packaged_web_framework_ledger(profile, expected_frameworks)?;
+        observed_frameworks.extend(observed);
     }
+    if observed_frameworks != expected_frameworks.iter().copied().collect::<BTreeSet<_>>() {
+        bail!("packaged Web framework profiles lost a required framework: {observed_frameworks:?}");
+    }
+    if !semantic_complete
+        && !graph["sites"].as_array().is_some_and(|sites| {
+            sites.iter().any(|site| {
+                site["resolution_status"] == "unresolved"
+                    && site["reason"] == "function_value_dispatch"
+            })
+        })
+    {
+        bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
+    }
+    for &framework in expected_frameworks {
+        verify_packaged_web_framework_query(executable, store, graph, framework)?;
+    }
+    Ok(())
+}
+
+fn verify_packaged_web_framework_ledger<'a>(
+    profile: &'a Value,
+    expected_frameworks: &[&str],
+) -> Result<Vec<&'a str>> {
     let properties = &profile["properties"];
     let ledger: Vec<Value> = serde_json::from_str(
         properties["web_framework_completeness_ledger"]
             .as_str()
             .context("packaged Web framework fixture omitted its completeness ledger")?,
     )?;
+    let features = profile["features"]
+        .as_array()
+        .context("packaged Web framework profile omitted its features")?;
+    let observed = features
+        .iter()
+        .map(|feature| {
+            feature
+                .as_str()
+                .context("packaged Web framework feature is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if profile["features"].as_array().is_none_or(|features| {
+        features
+            != &ledger
+                .iter()
+                .map(|entry| entry["framework"].clone())
+                .collect::<Vec<_>>()
+    }) || observed.windows(2).any(|pair| pair[0] >= pair[1])
+        || observed
+            .iter()
+            .any(|framework| !expected_frameworks.contains(framework))
+    {
+        bail!("packaged Web framework fixture lost detected framework order: {profile}");
+    }
     if properties["web_framework_completeness_capability"] != "framework-semantic-completeness-v1"
-        || properties["web_framework_completeness_status"] != "complete"
-        || properties["web_framework_completeness_issue_count"] != "0"
-        || ledger.len() != expected_frameworks.len()
+        || properties["analysis_unit_contract"] != "depgraph-analysis-unit-v2"
+        || (ledger.is_empty() && properties["web_framework_completeness_status"] != "not-detected")
+        || (!ledger.is_empty()
+            && (properties["web_framework_completeness_status"] != "complete"
+                || properties
+                    .get("web_framework_completeness_issue_count")
+                    .is_some_and(|count| count != "0")))
     {
         bail!("packaged Web framework fixture lost its complete capability ledger: {profile}");
     }
-    for (entry, &framework) in ledger.iter().zip(expected_frameworks) {
+    for (entry, &framework) in ledger.iter().zip(&observed) {
         let specific = match framework {
             "astro" => "astro-component-render-hydration-v1",
             "next" => "next-route-component-boundary-v1",
@@ -5702,20 +5815,7 @@ fn verify_packaged_web_framework_profile(
             bail!("packaged Web framework ledger entry is incomplete: {entry}");
         }
     }
-    if !semantic_complete
-        && !graph["sites"].as_array().is_some_and(|sites| {
-            sites.iter().any(|site| {
-                site["resolution_status"] == "unresolved"
-                    && site["reason"] == "function_value_dispatch"
-            })
-        })
-    {
-        bail!("packaged Web framework fixture lost its bounded dynamic-call reason");
-    }
-    for &framework in expected_frameworks {
-        verify_packaged_web_framework_query(executable, store, graph, framework)?;
-    }
-    Ok(())
+    Ok(observed)
 }
 
 fn verify_packaged_web_framework_query(
@@ -6941,6 +7041,53 @@ fn verify_packaged_web_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framework_unit_ledger_requires_matching_features_and_complete_capabilities() -> Result<()> {
+        let capabilities = serde_json::json!([
+            "astro-component-render-hydration-v1",
+            "framework-semantic-graph-v1",
+            "typescript-definition-import-type-call-graph-v2"
+        ]);
+        let mut ledger = serde_json::json!([{
+            "framework": "astro", "status": "complete", "reasons": [],
+            "required_capabilities": capabilities, "emitted_capabilities": capabilities
+        }]);
+        let mut profile = serde_json::json!({
+            "features": ["astro"],
+            "properties": {
+                "analysis_unit_contract": "depgraph-analysis-unit-v2",
+                "web_framework_completeness_capability": "framework-semantic-completeness-v1",
+                "web_framework_completeness_status": "complete",
+                "web_framework_completeness_issue_count": "0",
+                "web_framework_completeness_ledger": ledger.to_string()
+            }
+        });
+        assert_eq!(
+            verify_packaged_web_framework_ledger(&profile, &["astro", "next"])?,
+            ["astro"]
+        );
+        profile["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("web_framework_completeness_issue_count");
+        assert_eq!(
+            verify_packaged_web_framework_ledger(&profile, &["astro"])?,
+            ["astro"]
+        );
+        profile["properties"]["web_framework_completeness_issue_count"] = serde_json::json!("1");
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        profile["properties"]["web_framework_completeness_issue_count"] = serde_json::json!("0");
+        assert!(verify_packaged_web_framework_ledger(&profile, &["next"]).is_err());
+        profile["features"] = serde_json::json!([]);
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        profile["features"] = serde_json::json!(["astro"]);
+        ledger[0]["emitted_capabilities"] = serde_json::json!(["framework-semantic-graph-v1"]);
+        profile["properties"]["web_framework_completeness_ledger"] =
+            Value::String(ledger.to_string());
+        assert!(verify_packaged_web_framework_ledger(&profile, &["astro"]).is_err());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

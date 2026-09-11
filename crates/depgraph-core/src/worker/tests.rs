@@ -7151,7 +7151,8 @@ fn web_release_handshake_covers_the_semantic_compatibility_unit() -> Result<()> 
 
     for mismatch in [
         handshake.replace(TYPESCRIPT_COMPILER_VERSION, "9.9.9"),
-        handshake.replace("capabilities astro", "unknown astro"),
+        handshake.replace("analysis-source-batch-v1,", ""),
+        handshake.replace("capabilities ", "unknown "),
         handshake.replace(
             "astro-component-render-hydration-v1,framework-semantic-completeness-v1",
             "framework-semantic-completeness-v1,astro-component-render-hydration-v1",
@@ -7383,6 +7384,89 @@ async fn verified_web_release_worker_receives_the_typescript_release_gate() -> R
         Some(WorkerFailureKind::NonzeroExit)
     );
     assert!(unverified.error.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_internal_timeout_exit_is_retryable_but_other_exits_are_not() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let program = resolve_safe_executable("node", root.path())?;
+    for (code, expected) in [
+        (124, WorkerFailureKind::Timeout),
+        (3, WorkerFailureKind::NonzeroExit),
+    ] {
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Web,
+            artifact_path: program.clone(),
+            program: program.clone().into_os_string(),
+            leading_args: vec![
+                "-e".into(),
+                format!("process.exit({code})").into(),
+                "--".into(),
+            ],
+            display: "internal-timeout-fixture".into(),
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            root.path(),
+            "internal-timeout",
+            &ScanConfig::default(),
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(execution.failure_kind, Some(expected));
+        assert!(execution.error.is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn go_worker_runtime_limits_follow_the_configured_process_budgets() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let program = resolve_safe_executable("node", root.path())?;
+    for (adapter, budget, timeout, expected) in [
+        (AdapterKind::Go, 2_147_483_648, 300, "1610612736|300"),
+        (AdapterKind::Go, 536_870_912, 7, "402653184|7"),
+        (AdapterKind::Web, 536_870_912, 7, "unset|unset"),
+    ] {
+        let spec = WorkerSpec {
+            adapter,
+            artifact_path: program.clone(),
+            program: program.clone().into_os_string(),
+            leading_args: vec![
+                "-e".into(),
+                "process.stderr.write([process.env.GOMEMLIMIT, process.env.DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS].map(value => value ?? 'unset').join('|')); process.exit(3)".into(),
+                "--".into(),
+            ],
+            display: "runtime-memory-limit-fixture".into(),
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            root.path(),
+            "runtime-memory-limit",
+            &ScanConfig {
+                max_worker_memory_bytes: budget,
+                worker_timeout_seconds: timeout,
+                ..ScanConfig::default()
+            },
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(execution.failure_kind, Some(WorkerFailureKind::NonzeroExit));
+        assert_eq!(execution.stderr, expected);
+    }
     Ok(())
 }
 
@@ -7828,5 +7912,26 @@ async fn normal_worker_exit_reaps_pipe_holding_descendants() -> Result<()> {
     .await;
     assert!(started.elapsed() < Duration::from_millis(1500));
     assert!(output.error.unwrap().contains("incomplete protocol stream"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn protocol_validation_does_not_starve_another_workers_pipe_reader() -> Result<()> {
+    let (release, wait) = std::sync::mpsc::channel();
+    let (writer, reader) = tokio::io::duplex(64);
+    drop(writer);
+    let reader = tokio::spawn(read_capped(reader, 64));
+    let validation = run_protocol_validation(move || wait.recv_timeout(Duration::from_secs(1)));
+    let drain = async move {
+        let mut errors = Vec::new();
+        let result = finish_reader(reader, "stderr", &mut errors).await?;
+        release.send(())?;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(result, (Vec::new(), false));
+        Ok::<_, anyhow::Error>(())
+    };
+    let (validation, drain) = tokio::join!(validation, drain);
+    drain?;
+    validation??;
     Ok(())
 }

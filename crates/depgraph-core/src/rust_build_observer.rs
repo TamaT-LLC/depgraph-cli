@@ -1799,6 +1799,7 @@ mod tests {
                 ..CoverageRecord::default()
             },
             profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         }
     }
 

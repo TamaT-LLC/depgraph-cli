@@ -1581,10 +1581,9 @@ fn validate_analysis_unit_ledger_schema_and_rows(connection: &Connection) -> Res
 }
 
 pub(crate) fn validate_store_foreign_keys(connection: &Connection, version: i64) -> Result<()> {
-    let violations =
-        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get::<_, u64>(0)
-        })?;
+    let violations = crate::profiling::run("store-foreign-keys", || {
+        crate::foreign_keys::count_violations(connection)
+    })?;
     if violations != 0 {
         bail!("store schema {version} migration left {violations} foreign key violations");
     }

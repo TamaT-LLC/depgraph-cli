@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,7 +23,19 @@ type goLoaderReport struct {
 }
 
 func loadGoPackagesInventoryPackageScope(root string, modules []Module, targets []goLoaderTargetSpec, bodyPaths map[string]bool, work WorkFile, tags []string, buildCacheDir string, progress AnalysisProgressFunc) goPackagesInventory {
-	return loadGoPackagesInventoryPackageScopeWith(root, modules, targets, bodyPaths, work, tags, buildCacheDir, packages.Load, goPackagesLoadTimeout, progress)
+	return loadGoPackagesInventoryPackageScopeWith(root, modules, targets, bodyPaths, work, tags, buildCacheDir, packages.Load, configuredGoLoaderTimeout(), progress)
+}
+
+func configuredGoLoaderTimeout() time.Duration {
+	// Core still enforces the total worker deadline. A serial export build
+	// must be allowed to use that budget instead of silently falling back
+	// to syntax at the historical 30-second go/packages deadline.
+	value := os.Getenv("DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS")
+	seconds, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || seconds == 0 || seconds > uint64((1<<63-1)/time.Second) {
+		return goPackagesLoadTimeout
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // loadGoPackagesInventoryPackageScopeWith runs the hybrid loader for the

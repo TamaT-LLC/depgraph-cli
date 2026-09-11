@@ -193,6 +193,31 @@ checks that a plain snapshot is collected in ranges with one `scan` layer while
 a runtime-session child reports `mode: whole_snapshot`, the `runtime_sessions`
 and `scan` layers, and zero ranges.
 
+Dependency projection tests compare complete findings with the full-graph
+analyzer across Rust, Go, and Web cases. They cover Go subpackages and local
+replacement aliases, nested and ambiguous ownership, unknown parents,
+structural cycles, a 20,000-node ownership chain, duplicate findings, and
+manifest hash conflicts. A separate public fixture adds 2,000 unrelated call
+sites and edges: the full analyzer exhausts a 500-step budget, while projection
+loading and matching each complete within that same budget and retain the
+identical unused-dependency and test-only-dependency findings.
+
+Dependency loading also projects node ownership in SQL, retaining package
+nodes and the ancestors needed by dependency sources and targets. Unrelated
+symbol bodies do not consume the dependency loader's row budget. The public
+projection tests preserve nested ownership and conservative ambiguity handling.
+
+The ranged service streams finding bodies into a bounded response selector.
+The 10,000-finding limit still applies to each range and list response; summary
+counts and collection digests cover every completed range. Compact IDs are
+sorted through temporary files with at most 16 input files per merge, and a
+duplicate ID fails the collection even when its kind is filtered out. A detail
+request can retrieve an ID beyond the first list page. The public large-result
+test compares counts, the digest, the first page, and a later ID against the
+whole-graph oracle and verifies checkpoint reuse. Unit tests cover multiple
+merge passes, escaped IDs, corruption, cancellation cleanup, and partial-result
+confidence filtering with bounded retained pages.
+
 The item of #467 that refers to the original private test repository cannot be
 verified from this public checkout. That run is a **required closer for
 epic #464**, not a follow-up after the epic is closed. The maintainer command
@@ -227,8 +252,9 @@ on `main` at `564c064` (re-run 2026-09-07). They do not close the epic.
 | Splits for many-package repositories and large single packages reduce loaded input and simultaneous retention | `cargo xtask go-loader-scope-e2e` at the unchanged 192 MiB per-unit limit (`scripts/go-loader-scope-e2e.mjs`) | Pass. Fan-out (64×8): whole-module peak 574.7 MiB, control `partial` at 192 MiB; package batches `completed` at 92.3 MiB, resume 27/27 reused. 1,024-file package: whole-module peak 604.1 MiB, control `partial` at 192 MiB; `staged_bodies` `completed` at 86.7 MiB (74 typed + 74 semantic), resume 222/222 reused. Production `max_worker_memory_bytes` stays 2 GiB. |
 | Health store load and preprocess split so repo-wide cumulative volume alone cannot fail the request | `cargo xtask health-range-e2e`; `whole_graph_over_the_budget_completes_in_ranges_under_the_same_budget` | Pass. Whole-snapshot control is `resource_exhausted` at the unchanged 1,000,000 budget; ranged path completes 4 ranges (max 433,340 steps) with 72 identical findings. |
 | Out-of-unit refs, cycles, and coverage preserved; graph / evidence / findings match across split and resume | `out_of_unit_references_are_retained_in_loader_and_reference_scope`, `cycle_group_is_kept_in_one_analysis_context`; Go e2e canonical-graph equality vs the module-loader control; `ranged_findings_equal_whole_snapshot_findings_on_every_public_shape`, `range_order_permutations_produce_identical_findings`, `interrupt_after_each_range_then_resume_matches_the_uninterrupted_run`; `cargo xtask resumable-analysis-e2e` | Pass. Split vs resume of the same loader mode keeps nodes, sites, exact edges, evidence, and coverage. Package-mode vs the module-loader control matches those payloads too; CHA `may_call` is the one declared exception (a subset under `package-with-declaration-deps`). |
-| Memory-limit re-split of one pre-split batch keeps retained siblings and applies replacements without raising limits | `resplit_of_a_pre_split_batch_keeps_retained_chunk_numbering`, `chained_resplit_of_a_pre_split_batch_keeps_successful_siblings`, `resplit_of_pre_split_typed_batches_keeps_retained_work_item_numbering`, `v2_typed_rows_may_mix_chunk_counts_after_a_resplit`, `resplit_of_one_pre_split_batch_keeps_retained_chunk_and_coverage_joins` | Pass. A 3-file public package pre-split into 2 typed batches keeps the sibling `batch_index`/`batch_count` so scan recovery is `applied`, not `deferred`. Replacements keep the same per-unit memory budget and are not treated as saved successes. A second re-split of a still-splittable replacement leaves the original sibling retained. Replaying the recorded refinement history reproduces the plan. Store coverage still requires a uniform `0..count` set when every row shares one count; mixed retained+replacement counts join when they partition the owned sources. |
+| Memory-limit re-split of one pre-split batch keeps retained siblings and applies replacements without raising limits | `resplit_of_a_pre_split_batch_keeps_retained_chunk_numbering`, `chained_resplit_of_a_pre_split_batch_keeps_successful_siblings`, `resplit_of_pre_split_typed_batches_keeps_retained_work_item_numbering`, `v2_typed_rows_may_mix_chunk_counts_after_a_resplit`, `resplit_of_one_pre_split_batch_keeps_retained_chunk_and_coverage_joins` | Pass. A 3-file public package pre-split into 2 typed batches keeps the sibling `batch_index`/`batch_count` so scan recovery is `applied`, not `deferred`. Replacements keep the same per-unit memory budget and are not treated as saved successes. A second re-split of a still-splittable replacement leaves the original sibling retained. Replaying the recorded refinement history reproduces the plan. Store coverage requires every unique slot in `0..max(chunk_count)` and the complete owned-source partition, including mixed retained+replacement generations. |
 | A public synthetic fixture that used to hit the limit now completes without raising per-unit limits | Go e2e control `partial` vs package path `completed` at 192 MiB; health-range whole-snapshot `"resource_exhausted"` vs ranged complete at 1,000,000 | Pass. Do not close on scan JSON `status: "partial"` or health-range e2e `"resource_exhausted"` (from internal `HealthAnalysisError::ResourceExhausted`). Public JSON success is `status: "completed"` with `partial_ranges: false`. |
+| Original private trial target: scan and health complete | Requires a run by a maintainer with access to the original target; public fixtures provide separate evidence. See the required verification below. | Required before closing #464; tracked in #482. |
 
 **Large single package vs `staged_bodies`.** Semantic work is still
 file-batch `staged_bodies`, not package-granular SSA: `ssautil.Packages` has
@@ -245,7 +271,13 @@ own.
 and `go_call_graph_program_scope` are merge identity keys, not coverage
 `profile_axes`. Package-mode CHA is not exact whole-program RTA.
 
-### Required private-trial closer (pending)
+### Required private-trial closer
+
+The current verification verdict and tested `depgraph-cli` commit are recorded
+in [#482](https://github.com/TamaT-LLC/depgraph-cli/issues/482) and
+[#464](https://github.com/TamaT-LLC/depgraph-cli/issues/464). These issue records
+must remain pending until every required check below has passed. Keep detailed
+evidence in the private verification record.
 
 Leave #464 OPEN until a maintainer who can reach the original trial tree
 comments on that issue that the checklist below passed on one named
@@ -348,6 +380,86 @@ Shipped per-unit limits unchanged. Tree identity omitted.
 - [ ] private record id: <id>
 ```
 
+## Regression checks for #479 and #480
+
+`cargo xtask resumable-analysis-e2e` also runs
+`scripts/analysis-resplit-e2e.mjs` on POSIX. Its public five-file Go fixture
+starts with multiple batches and a fixed 192 MiB worker limit. A wrapper
+forces larger batches over that limit, then pauses a replacement so the test
+can interrupt and restart the CLI. A separate run exceeds the output cap
+under the same fixture configuration, after emitting a valid partial stream,
+and must recover by refinement as well. An unsplittable run keeps the valid
+leaf prefixes as partial evidence and cannot confirm unused findings.
+The test checks repeated refinement,
+retained syntax/typed checkpoints, completed replacement execution, and equal
+graph, evidence, and coverage against a run without injected failures.
+Semantic results produced before all typed references are bound remain
+ineligible for checkpoint reuse and are replayed conservatively.
+The memory gate records which unit checkpoints exist before resuming and
+requires every valid checkpoint to be reused. If typed refinement left
+semantic work without a reference binding, that work must execute once after
+the typed stage recovers; a further scan must then reuse every unit. A
+typed-only failure fixture exercises this boundary and compares graph,
+evidence and coverage through both repeats.
+Applied refinements are stored atomically as disposable planning hints beside
+the unit checkpoints. The cache key binds the original split plan, input
+contents, root and unit execution witnesses. A new process rebuilds the plan
+from those refinements before dispatch; malformed or stale hints fall back to
+the original plan, and `--no-cache` neither reads nor writes them. Restoring a
+plan does not bypass unit input, protocol or reference validation. The restart
+fixture removes the injected failure before resuming, so reuse must work even
+when the original larger units would now succeed.
+
+A separate two-package fixture verifies that an unchanged second scan reuses
+both semantic units and that editing the referenced package invalidates them.
+Its result must match a fresh scan after the edit. Go's no-follow, loader,
+fingerprint, and race tests run in the regular Linux CI job and the macOS
+leg of full CI. These public regressions supplement the original-target completion requirement above.
+
+The Web integration fixture also checks projects with several frameworks.
+Each source-batch profile declares only the frameworks in its projected
+completeness ledger; TypeChecker counters exclude framework-specific records.
+An incomplete framework ledger prevents semantic-complete coverage and keeps
+its diagnostic reason. Nested units accept repository-root workspace manifests
+while rejecting sibling manifests and traversal paths. The worker, core, and
+packager agree on the `analysis-source-batch-v1` capability.
+Astro endpoint batches explicitly request the bounded set of HTTP method
+export proofs, so exact handler resolution does not depend on imports in
+another unit.
+The scheduler assigns static TanStack configuration witnesses to the first
+semantic batch, including batches without a file route.
+Assigned TanStack configuration ASTs remain available to the virtual route
+collector within the existing AST budget, without adding native dependency
+occurrences from auxiliary files or emitting their routes in sibling batches.
+Build observations select the matching framework semantic profile among v2
+logical units; syntax and unrelated framework profiles are excluded, while
+multiple matching semantic parents still reject the observation.
+Web stage joins compare the base profile and selected configuration rather
+than the stage's emitted framework feature list. Syntax keeps its empty
+framework semantic ledger, while a matching completed semantic stage can
+establish aggregate semantic completeness. Different base profiles, selected
+inputs, and unknown dependencies still prevent that join; Go build tags remain
+part of the configuration identity.
+
+Compiler timeouts dispose the IPC request queue before reaping the compiler.
+The worker flushes its failure frames and stderr before exiting with code 124,
+so pending replies and upstream partial-frame timers cannot replace the timeout
+outcome or prevent resource resplitting. A synthetic compiler holds an open
+snapshot and floods filesystem callbacks to exercise this shutdown path.
+The package-loader memory gate retains superseded attempts in its report but
+checks the completed replacement units against the original memory limit and
+requires complete durable analysis coverage before comparing their graphs.
+
+Completion validation aggregates site status counts in its existing site pass
+instead of rescanning every site for each profile. A public synthetic test
+checks SQLite work growth as the profile and site counts increase.
+
+Canonical exports retain logical profiles and graph counts. Per-execution
+counters stay in validated worker/checkpoint streams, so the integration gate
+checks graph evidence, profile memberships, coverage, and diagnostics rather
+than requiring those counters on canonical profiles. It also compares exports
+from independent checkouts.
+
 ## Acceptance matrix
 
 The matrix maps the six child issues (#459, #462, #463, #465, #466, #467)
@@ -355,7 +467,8 @@ and the parent #464. Extra rows `#464 (pre-split)` and `#467 (health split)`
 are the 2026-09-07 reopen items, not additional issues. Public checks below
 were run in this checkout on 2026-09-06, then re-verified for the reopen
 items on `main` at `564c064`. The original trial target remains a required
-#464 closer (issue #482); it is not recorded as passed.
+#464 closer. Its current verification verdict is tracked in #482 and #464;
+the public results in this matrix do not establish that private verdict.
 
 The full `cargo xtask test` gate passed with Rust 1.93.1, Go 1.26.1,
 Node.js 24.18.0, and pnpm 10.33.0 on macOS arm64. It included 1,798 passing
@@ -374,7 +487,7 @@ and retains its integration report separately from these local measurements.
 | #462 | Web project batches preserve compiler context, semantic targets, diagnostics, and canonical graph behavior | `cd workers/web && pnpm test`; `analysis-unit.test.ts` (`semantic source batches keep context targets while bounding dependency traversal`, `semantic source batches retain ambient declarations in the full compiler context`, `source batch size and order preserve one canonical graph`); `analysis-unit-issues.test.ts` (`batch semantic issue counts describe emitted diagnostics while context failures stay incomplete`); `DEPGRAPH_WEB_BENCHMARK=1 pnpm exec tsx --test test/analysis-unit-benchmark.test.ts` | Full Web suite, quality, and 1,024-file semantic benchmark passed; canonical joins also pass failed-chunk permutation and shared-external membership regressions |
 | #463 | Remaining pre-split: lightweight listing then bounded loader and budget; package units that do not re-load the module; staged bodies for a large single package; cross-unit types, calls, and cycles with declared CHA completeness; public fixture where the whole-module path fails the same per-unit memory limit the package path completes | `cargo xtask go-loader-scope-e2e`; Go `TestSyntheticAnalysisUnitCanonicalProjection`, `TestGoLoader*`, `TestAnalysisSplit*`, `TestReleaseGoSSASyntaxAfterBuildDropsLoaderTrees`; Core `go_package_execution_units_join_into_one_logical_profile`, `go_semantic_batches_join_their_call_graph_outcome`, `package_semantic_checkpoints_bind_the_typed_reference_fingerprint`, `reference_digest_extends_the_key`; store `v2_typed_rows_may_partition_the_owned_sources` | Public package-bounded hybrid loader, declared CHA program scope, shared scan GOCACHE, reference fingerprint in `UnitCheckpointKey.reference_digest`, syntax drop after SSA, mapping progress, and the public 64-by-8 / 1,024-file evidence gate. The original trial tree is a required #464 closer, not a #463 residual; see [Go validation](analysis-unit-go-validation.md) and "Required private-trial closer". |
 | #464 | Repository-first planning, unit scheduling, interruption/restart, invalidation, and public fixture evidence | `cargo xtask resumable-analysis-e2e` (calls `scripts/resumable-analysis-e2e.mjs`) | Passed: 13 baseline units, 22 split units, and all 22 reused after process restart; interruption and invalidation checks also passed |
-| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. Public fixtures are necessary and not sufficient: the original trial target must complete a fresh scan, ordinary health, and same-input resume before the epic closes. | Public: `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. Private: "Required private-trial closer". | Public passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Private scan + ordinary health + resume: **required, pending**. |
+| #464 (pre-split) | Same input and budget plan execution units before heavy analysis; many-package and large-single-package input/retention shrink; ranged health load and preprocess; graph/evidence/findings match across split and resume; public over-limit fixtures complete without raising per-unit limits. Public fixtures are necessary and not sufficient: the original trial target must complete a fresh scan, ordinary health, and same-input resume before the epic closes. | Public: `cargo test -p depgraph-core --test analysis_split_contract`; `cargo xtask go-loader-scope-e2e`; `cargo xtask health-range-e2e`; `cargo xtask resumable-analysis-e2e`; `cargo test -p depgraph-core --test health_range`. Private: "Required private-trial closer". | Public passed on `main` at `564c064` (re-run 2026-09-07): children #465/#463/#467 merged; Go e2e at 192 MiB (fan-out 92.3 MiB complete vs 574.7 MiB control `partial`; 1,024-file `staged_bodies` 86.7 MiB complete vs 604.1 MiB control `partial`); health-range 4 ranges complete vs whole-snapshot `resource_exhausted` at 1,000,000. Private scan + ordinary health + resume: **required**; current verdict in [#482](https://github.com/TamaT-LLC/depgraph-cli/issues/482) and [#464](https://github.com/TamaT-LLC/depgraph-cli/issues/464). |
 | #465 | Pre-split planning contract: explainable execution units, budget- and boundary-driven scope and parallelism before execution, dependency/cycle/shared-input retention, staged large package, re-split dispositions, the worker loader binding, and the review follow-ups (loader-scope capability required for the bounded package boundary, file-count-only partition and byte-identical requests for workers without loader scope, zero admitted memory for an empty plan, exact syntax loader scope in the Go worker) | `cargo test -p depgraph-core --test analysis_split_contract` (16 tests over `fixtures/analysis-split-plan-v1`, golden `expected/split-plans.json`); `cargo test -p depgraph-core loader_scope_binding_is_attached_only_after_negotiation_and_keeps_requests_stable`; `cd workers/go && go test ./internal/worker -run TestAnalysisSplit`; `cd workers/go && go test ./internal/worker -run TestReadAnalysisUnitRequestAcceptsSplit`; `cargo test -p depgraph-cli --test cli scan_split_plan_explains_execution_units_without_starting_workers_or_writing_a_store` | Passed locally on 2026-09-07; see [the pre-split planning ADR](adr-presplit-analysis-planning.md) |
 | #466 | Atomic checkpoint publication, failure/cancel retention, resource limits, and Store/journal compatibility | `cargo test -p depgraph-core incomplete_semantics_remain_readable_but_are_not_reused`; `cargo test -p depgraph-core typed_checkpoint_requires_a_completed_typed_graph_without_claiming_ssa`; `cargo test -p depgraph-store analysis_unit_snapshots_reject_legacy_delta_and_staging_without_losing_the_ledger`; `cargo test -p depgraph-store analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors` | Passed in the pinned full Rust gate, including fake-clock aggregate-budget behavior, atomic ledger/checkpoint, input-proof snapshot identity, and metadata-only terminal summary regressions |
 | #467 | Cross-unit `deps`, `dependents`, `why`, and `impact`, exact stored provenance, partial selection, and conservative unused confidence | `cargo xtask resumable-analysis-e2e`; query assertions are in `scripts/resumable-analysis-query-assertions.mjs`; `cargo test -p depgraph-core incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles`; `cargo test -p depgraph-core health::unused::tests::issue_467` | Passed: all four partial queries with exact stored provenance, unchanged current completed snapshot, canonical graph equality, 8 partial unused-file findings with no confirmed confidence, and equivalent-stage health work/provenance regressions |
@@ -429,3 +542,10 @@ The integration fixture complements these focused checks:
 
 Worker unit tests and the existing Rust workspace, Go race/vet, Web quality,
 protocol/schema, and release compatibility gates remain part of validation.
+
+The fixed release query still returns no rows and remains identical across
+checkout-equivalent scans. Its pinned native digests must be regenerated when
+the canonical analysis graph changes. The manual CI input
+`extra_native_packages` adds Linux ARM64 and Intel macOS package validation to
+the regular Linux x64, Apple Silicon macOS, and Windows checks; it does not
+publish release artifacts or skip any compatibility assertion.

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet},
     path::Path,
 };
 
@@ -11,18 +11,22 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod analysis_coverage;
+mod analysis_dependency_coverage;
 mod build;
 mod cache;
 mod diff;
+mod foreign_keys;
 mod health_range;
 mod impact_cache;
 mod incremental;
 mod profile_matrix;
+mod profiling;
 mod read;
 mod records;
 mod runtime;
 mod schema;
 mod snapshot;
+mod validation;
 
 pub use analysis_coverage::aggregate_analysis_coverage;
 use build::{
@@ -61,10 +65,9 @@ pub use profile_matrix::{
     refresh_profile_matrix_view,
 };
 use read::{
-    EdgeValidationRecord, load_adapter_logs, load_diagnostics, load_edge_validation_records,
-    load_edges, load_evidence, load_file_coverage, load_nodes, load_profiles,
-    load_scan_attempt_summary, load_scan_topology, load_site_validation_records, load_sites,
-    merge_coverage, observed_coverage, topology_from_snapshot,
+    load_adapter_logs, load_diagnostics, load_edges, load_evidence, load_file_coverage, load_nodes,
+    load_profiles, load_scan_attempt_summary, load_scan_topology, load_sites, merge_coverage,
+    observed_coverage, topology_from_snapshot,
 };
 pub use records::*;
 pub use runtime::{
@@ -74,11 +77,11 @@ pub use runtime::{
 use schema::{table_exists, table_has_column};
 use snapshot::{
     SnapshotSource, backfill_completed_snapshot_seals, backfill_completed_snapshot_seals_v1,
-    backfill_completed_snapshots, completed_snapshot_identity, create_completed_snapshot,
+    backfill_completed_snapshots, completed_snapshot_identity,
+    create_and_maybe_promote_scan_snapshot, create_completed_snapshot,
     load_base_snapshot_from_connection, load_completed_snapshot_from_connection,
     load_completed_snapshot_profiles_from_connection, load_completed_snapshot_record,
-    persist_completed_snapshot_seal, promote_completed_snapshot,
-    promote_completed_snapshot_if_current_parent, verify_completed_snapshot_seal,
+    persist_completed_snapshot_seal, promote_completed_snapshot, verify_completed_snapshot_seal,
     verify_completed_snapshot_seal_v1,
 };
 
@@ -1349,106 +1352,14 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn validate_scan(&self, scan_id: &str) -> Result<()> {
-        let missing_nodes: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM edges e
-             LEFT JOIN nodes src ON src.scan_id = e.scan_id AND src.id = e.source
-             LEFT JOIN nodes dst ON dst.scan_id = e.scan_id AND dst.id = e.target
-             WHERE e.scan_id = ?1 AND (src.id IS NULL OR dst.id IS NULL)",
-            [scan_id],
-            |row| row.get(0),
-        )?;
-        if missing_nodes > 0 {
-            bail!("scan {scan_id} has {missing_nodes} edges with missing endpoint nodes");
-        }
-
-        let (site_count, resolved, candidates, external, unresolved): (i64, i64, i64, i64, i64) =
-            self.connection.query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
-                 FROM sites WHERE scan_id = ?1",
-                [scan_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )?;
-        if site_count != resolved + candidates + external + unresolved {
-            bail!("coverage invariant failed for scan {scan_id}");
-        }
-
-        let invalid_sentinels: i64 = self.connection.query_row(
-            "SELECT COUNT(*)
-               FROM sites s
-               JOIN edges e ON e.scan_id=s.scan_id AND e.site_id=s.id
-               JOIN nodes n ON n.scan_id=e.scan_id AND n.id=e.target
-              WHERE s.scan_id=?1
-                AND ((s.resolution_status='resolved' AND n.kind IN ('external_system','unknown_target'))
-                  OR (s.resolution_status='external' AND n.kind!='external_system')
-                  OR (s.resolution_status='unresolved' AND n.kind!='unknown_target'))",
-            [scan_id],
-            |row| row.get(0),
-        )?;
-        if invalid_sentinels > 0 {
-            bail!(
-                "scan {scan_id} has {invalid_sentinels} invalid resolution target classifications"
-            );
-        }
-
-        let sites = load_site_validation_records(&self.connection, scan_id)?;
-        let edges = load_edge_validation_records(&self.connection, scan_id)?;
-        let mut edges_by_site = BTreeMap::<&str, Vec<&EdgeValidationRecord>>::new();
-        for edge in &edges {
-            if let Some(site_id) = &edge.site_id {
-                edges_by_site.entry(site_id).or_default().push(edge);
-            }
-        }
-        for site in &sites {
-            let expected = site
-                .target_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            if expected.len() != site.target_ids.len() {
-                bail!("site {} contains duplicate target IDs", site.id);
-            }
-            let site_edges = edges_by_site
-                .get(site.id.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            match site.resolution_status.as_str() {
-                "resolved" | "external" | "unresolved"
-                    if expected.len() == 1 && site_edges.len() == 1 => {}
-                "candidates" if !expected.is_empty() && site_edges.len() == expected.len() => {}
-                "resolved" | "candidates" | "external" | "unresolved" => bail!(
-                    "site {} violates {} cardinality: {} targets, {} edges",
-                    site.id,
-                    site.resolution_status,
-                    expected.len(),
-                    site_edges.len()
-                ),
-                status => bail!("site {} has unknown resolution status {status}", site.id),
-            }
-            let observed = site_edges
-                .iter()
-                .map(|edge| edge.target.as_str())
-                .collect::<BTreeSet<_>>();
-            if expected != observed || site_edges.len() != expected.len() {
-                bail!("site {} target IDs do not match its edge targets", site.id);
-            }
-            for edge in site_edges {
-                if edge.source != site.source
-                    || edge.profile_id != site.profile_id
-                    || edge.resolution_status != site.resolution_status
-                    || edge.precision != site.precision
-                {
-                    bail!(
-                        "site {} and edge {} disagree on contract fields",
-                        site.id,
-                        edge.id
-                    );
-                }
-            }
-        }
+        let validation::ScanValidationCounts {
+            sites: site_count,
+            resolved,
+            candidates,
+            external,
+            unresolved,
+            sites_by_profile: site_counts_by_profile,
+        } = validation::validate_scan_graph(&self.connection, scan_id)?;
 
         let coverage_json = self
             .connection
@@ -1552,17 +1463,13 @@ ORDER BY id COLLATE BINARY
             max_profile_unsupported_syntax =
                 max_profile_unsupported_syntax.max(profile.unsupported_syntax);
             profile_executed_project_code |= profile.project_code_executed;
-            let (total, resolved, candidates, external, unresolved):
-                (i64, i64, i64, i64, i64) = self.connection.query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN resolution_status='resolved' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='candidates' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='external' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN resolution_status='unresolved' THEN 1 ELSE 0 END), 0)
-                   FROM sites WHERE scan_id=?1 AND profile_id=?2",
-                params![scan_id, profile_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )?;
+            // These records were already read and validated above. Re-querying
+            // the site table here scans every site once per logical profile,
+            // making completion I/O grow with profiles multiplied by sites.
+            let [total, resolved, candidates, external, unresolved] = site_counts_by_profile
+                .get(profile_id.as_str())
+                .copied()
+                .unwrap_or_default();
             let reported = (
                 profile.dependency_sites,
                 profile.resolved,
@@ -1570,13 +1477,7 @@ ORDER BY id COLLATE BINARY
                 profile.external,
                 profile.unresolved,
             );
-            let observed = (
-                total as u64,
-                resolved as u64,
-                candidates as u64,
-                external as u64,
-                unresolved as u64,
-            );
+            let observed = (total, resolved, candidates, external, unresolved);
             if reported != observed {
                 bail!(
                     "profile {profile_id} coverage site counts {reported:?} do not match stored counts {observed:?}"
@@ -2307,14 +2208,14 @@ ORDER BY id COLLATE BINARY
             "UPDATE scans SET status = ?2, completed_at = ?3, error = ?4 WHERE id = ?1",
             params![scan_id, status, completed_at, error],
         )?;
-        let completed_snapshot_id = if status == "completed" {
+        let (completed_snapshot_id, promoted) = if status == "completed" {
             let (parent_snapshot_id, source_revision): (Option<String>, Option<String>) = tx
                 .query_row(
                     "SELECT parent_snapshot_id, source_revision FROM scans WHERE id=?1",
                     [scan_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-            Some(create_completed_snapshot(
+            let (snapshot_id, promoted) = create_and_maybe_promote_scan_snapshot(
                 &tx,
                 SnapshotSource {
                     source_kind: "scan",
@@ -2327,32 +2228,18 @@ ORDER BY id COLLATE BINARY
                     source_revision: source_revision.as_deref(),
                     created_at: &completed_at,
                 },
-            )?)
+                promote,
+            )?;
+            (Some(snapshot_id), promoted)
         } else {
-            None
+            (None, false)
         };
-        let mut promoted = false;
-        if promote {
-            let snapshot_id = completed_snapshot_id
-                .as_deref()
-                .context("completed scan did not create a snapshot")?;
-            let expected_parent = tx.query_row(
-                "SELECT parent_snapshot_id FROM scans WHERE id=?1",
+        if promoted {
+            tx.execute(
+                "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
                 [scan_id],
-                |row| row.get::<_, Option<String>>(0),
             )?;
-            promoted = promote_completed_snapshot_if_current_parent(
-                &tx,
-                snapshot_id,
-                expected_parent.as_deref(),
-            )?;
-            if promoted {
-                tx.execute(
-                    "INSERT INTO current_successful(singleton, scan_id) VALUES (1, ?1)
-                     ON CONFLICT(singleton) DO UPDATE SET scan_id = excluded.scan_id",
-                    [scan_id],
-                )?;
-            }
         }
         if !matches!(status, "completed" | "cancelled") {
             tx.execute(
@@ -2786,7 +2673,12 @@ ORDER BY id COLLATE BINARY
     }
 
     /// Read deterministic unit evidence for an analysis attempt.
+    /// A proven semantic no-op inherits its parent's evidence, retaining the
+    /// original execution scan IDs and fingerprints rather than claiming that
+    /// the overlay executed workers or produced new checkpoint inputs.
     pub fn analysis_units(&self, scan_id: &str) -> Result<Vec<AnalysisUnitLedgerRecord>> {
+        let evidence_scan = incremental::analysis_evidence_scan(&self.connection, scan_id)?;
+        let scan_id = evidence_scan.as_str();
         let mut statement = self.connection.prepare(
             "SELECT scan_id, contract_version, unit_id, adapter, unit_root, stage,
                     chunk_id, chunk_index, chunk_count, status, reused,
@@ -2880,7 +2772,11 @@ ORDER BY id COLLATE BINARY
     }
 
     /// Return the immutable scan-level analysis completeness projection.
+    /// For a semantic no-op this describes the inherited execution evidence;
+    /// its input digest remains the original analysis input identity.
     pub fn analysis_coverage(&self, scan_id: &str) -> Result<Option<AnalysisCoverageSummary>> {
+        let evidence_scan = incremental::analysis_evidence_scan(&self.connection, scan_id)?;
+        let scan_id = evidence_scan.as_str();
         let metadata = self
             .connection
             .query_row(
@@ -2927,10 +2823,31 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn mark_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
+        self.mark_coverage_limit(scan_id, reason, false)
+    }
+
+    /// Preserve execution and syntax coverage while recording that unresolved
+    /// dependency context prevents a repository-wide semantic guarantee.
+    pub fn mark_semantic_coverage_incomplete(&mut self, scan_id: &str, reason: &str) -> Result<()> {
+        self.mark_coverage_limit(scan_id, reason, true)
+    }
+
+    fn mark_coverage_limit(
+        &mut self,
+        scan_id: &str,
+        reason: &str,
+        semantic_only: bool,
+    ) -> Result<()> {
         let tx = self.connection.transaction()?;
         ensure_scan_staging(&tx, scan_id)?;
         let mut coverage = read::load_staging_coverage(&tx, scan_id)?;
-        coverage.completeness.clear();
+        if semantic_only {
+            coverage
+                .completeness
+                .retain(|level| level != "semantic-complete");
+        } else {
+            coverage.completeness.clear();
+        }
         coverage.reasons.push(reason.to_owned());
         coverage.reasons.sort();
         coverage.reasons.dedup();
@@ -3982,6 +3899,7 @@ mod tests {
         validate_runtime_import_operation_ownership_schema_and_rows,
         validate_scan_operation_staging_schema_and_rows, validate_store_foreign_keys,
     };
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::sync::{
         Arc,
@@ -5691,6 +5609,56 @@ mod tests {
                 .finish_scan("scan-1", "completed", None, true)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_validation_work_scales_with_sites_not_profile_site_product() -> Result<()> {
+        fn validation_work(profile_count: usize) -> Result<usize> {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let mut store = Store::open_in_memory()?;
+            store.start_scan("scan-golden", Path::new("/fixture"), false)?;
+            let fixture =
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson");
+            for index in 0..profile_count {
+                let scoped = fixture
+                    .replace("web:production:server", &format!("profile-{index}"))
+                    .replace("sha256:", &format!("sha256:{index}:"))
+                    .replace("diagnostic:golden", &format!("diagnostic:{index}"))
+                    .replace("src/", &format!("project-{index}/src/"));
+                let mut events = scoped
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+                for event in events {
+                    if event["event"] != "scan_started" {
+                        store.ingest_event(&event)?;
+                    }
+                }
+            }
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            store.connection.progress_handler(
+                100,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let result = store.validate_scan("scan-golden");
+            store.connection.progress_handler(0, None::<fn() -> bool>);
+            result?;
+            Ok(steps.load(Ordering::Relaxed))
+        }
+        let small = validation_work(64)?;
+        let large = validation_work(512)?;
+        // Eight times the graph should not cause 64 times the SQL work.
+        // VM instructions make this independent of machine speed and I/O.
+        assert!(large <= small * 12 + 100, "small={small}, large={large}");
         Ok(())
     }
 

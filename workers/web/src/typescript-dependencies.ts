@@ -3561,7 +3561,7 @@ export async function extractTypeScriptRawDependencyDelta(
   definitions: TypeScriptRawDefinitionDelta,
   priorTypeCheckerQueries = 0,
   validationTarget?: TypeScriptDependencyValidationTarget,
-  options: { sourcePaths?: ReadonlySet<string> } = {},
+  options: { sourcePaths?: ReadonlySet<string>; moduleExportPaths?: readonly (readonly string[])[] } = {},
 ): Promise<TypeScriptRawDependencyDelta> {
   const counter: QueryCounter = { value: 0, prior: priorTypeCheckerQueries };
   const sites: TypeScriptRawDependencySite[] = [];
@@ -3999,7 +3999,7 @@ export async function extractTypeScriptRawDependencyDelta(
       sources,
       index,
       sourcesByPath,
-      uniqueSites
+      [...(options.moduleExportPaths ?? []), ...uniqueSites
         .filter((site) => (
           site.exportPath !== null
           && (
@@ -4007,7 +4007,7 @@ export async function extractTypeScriptRawDependencyDelta(
             || (site.exportPath.length === 0 && site.importedName === "=")
           )
         ))
-        .map((site) => site.exportPath!),
+        .map((site) => site.exportPath!)],
       uniqueSites
         .filter((site) => site.bindingKind === "import_equals" && site.exportPath !== null)
         .map((site) => site.exportPath!),

@@ -129,6 +129,15 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
             // worker/checkpoint stream; canonical profiles carry configuration
             // and semantic status, while graph/coverage provide logical counts.
             properties.retain(|key, _| !execution_counter(key));
+            if !go_profile && properties.get("analysis_stage") == Some(&json!("syntax")) {
+                // Syntax opens only its owned parser batch. Explicit lib
+                // references can also change the standard libraries it loads.
+                // These sizes are execution observations, unlike semantic
+                // project sizes.
+                properties.remove("typescript_project_root_files");
+                properties.remove("typescript_program_files");
+                properties.remove("typescript_standard_library_files");
+            }
             if go_profile {
                 properties.retain(|key, _| !go_execution_observation(key));
             }
@@ -983,6 +992,53 @@ fn merge_coverage(target: &mut Value, incoming: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_parser_sizes_do_not_change_logical_profiles() -> Result<()> {
+        let batch = |stage: &str, count: &str, libraries: &str| -> Result<Value> {
+            let logical = stable_id_from_value(
+                "profile",
+                &json!({"base_profile":"web:base", "contract_version":V2, "stage":stage, "unit_id":"unit"}),
+            );
+            let mut events = vec![json!({
+                "event":"profile_declared",
+                "profile":{"id":"wire", "language":"web", "features":[], "properties":{
+                    "analysis_unit_contract":V2, "analysis_base_profile_id":"web:base",
+                    "analysis_unit_id":"unit", "analysis_stage":stage,
+                    "analysis_logical_profile_id":logical,
+                    "typescript_project_model_status":"ready",
+                    "typescript_project_model_failure_reason":"none",
+                    "typescript_project_root_files":count, "typescript_program_files":count,
+                    "typescript_standard_library_files":libraries,
+                    "typescript_static_config_files":"2",
+                    "typescript_path_mappings":"1"
+                }}
+            })];
+            normalize_source_batch_profiles(&mut events)?;
+            Ok(events.remove(0)["profile"].clone())
+        };
+        let small = batch("syntax", "1", "93")?;
+        let mut large = batch("syntax", "128", "94")?;
+        assert_eq!(small, large);
+        merge_logical_profile(&small, &mut large)?;
+        assert_eq!(small, large);
+        let available = project_metadata_available(&large)?;
+        assert!(!available.contains("typescript_program_files"));
+        assert!(!available.contains("typescript_project_root_files"));
+        assert!(!available.contains("typescript_standard_library_files"));
+        let mut changed_config = large.clone();
+        changed_config["properties"]["typescript_static_config_files"] = json!("3");
+        assert!(merge_logical_profile(&small, &mut changed_config).is_err());
+        let semantic = batch("semantic", "128", "93")?;
+        assert_eq!(semantic["properties"]["typescript_program_files"], "128");
+        assert_eq!(
+            semantic["properties"]["typescript_standard_library_files"],
+            "93"
+        );
+        assert!(merge_logical_profile(&semantic, &mut batch("semantic", "129", "93")?).is_err());
+        assert!(merge_logical_profile(&semantic, &mut batch("semantic", "128", "94")?).is_err());
+        Ok(())
+    }
 
     #[test]
     fn shared_definitions_union_verified_profiles_without_changing_identity() -> Result<()> {

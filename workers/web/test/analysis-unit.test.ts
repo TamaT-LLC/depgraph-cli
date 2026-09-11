@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
   analysisUnitLogicalProfileId,
@@ -10,6 +11,7 @@ import {
   validateAnalysisUnitForRoot,
 } from "../src/analysis-unit";
 import { scan } from "../src/scanner";
+import { walkFiles } from "../src/fs";
 import type { ProgressReporter } from "../src/progress";
 import { BASE_PROFILE_ID } from "../src/types";
 
@@ -65,6 +67,94 @@ function progressRecorder(): { reporter: ProgressReporter; events: Array<{ statu
     },
   };
 }
+
+test("root workspace manifests stay bounded ancestors of nested analysis units", () => {
+  const request = {
+    contract_version: "depgraph-analysis-unit-v2",
+    unit_id: "web:nested", adapter: "web", unit_root: "apps/web",
+    source_paths: ["apps/web/index.ts"], context_paths: ["apps/web/index.ts"],
+    auxiliary_paths: ["package.json", "pnpm-workspace.yaml"],
+    stage: "syntax", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+    context_fingerprint: "a".repeat(64),
+  };
+  assert.deepEqual(parseAnalysisUnitRequest(request).auxiliary_paths, request.auxiliary_paths);
+  for (const auxiliary of ["apps/other/package.json", "tsconfig.json", "../package.json"]) {
+    assert.throws(() => parseAnalysisUnitRequest({ ...request, auxiliary_paths: [auxiliary] }));
+  }
+});
+
+test("assigned TanStack configuration retains virtual routes without native dependency ownership", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const source = "apps/router/depgraph-build.mjs";
+  const config = "apps/router/vite.config.ts";
+  const request = parseAnalysisUnitRequest({
+    contract_version: "depgraph-analysis-unit-v2", unit_id: "web:router", adapter: "web",
+    unit_root: "apps/router", source_paths: [source], context_paths: [source],
+    auxiliary_paths: ["apps/router/package.json", config, "package.json"],
+    stage: "semantic", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 2,
+    context_fingerprint: "c".repeat(64),
+  });
+  const files = await walkFiles(root);
+  const model = await scan(root, files, [], undefined, request);
+  const virtual = model.nodes.find((node) => node.kind === "route" && node.properties.route_kind === "tanstack-virtual-route");
+  assert.ok(virtual);
+  assert.equal(virtual.properties.route_pattern, "/router/virtual");
+  const registration = model.sites.find((site) => site.target_ids.includes(virtual.id) && site.kind === "route_entry");
+  assert.ok(registration?.evidence.some((item) => item.path === config));
+  assert.equal(model.sites.some((site) => site.evidence.some((item) => item.path === config
+    && item.extractor === "typescript-native-typechecker")), false);
+  const sibling = await scan(root, files, [], undefined, parseAnalysisUnitRequest({
+    ...request, chunk_id: "chunk-1", chunk_index: 1, auxiliary_paths: [],
+  }));
+  assert.equal(sibling.nodes.some((node) => node.properties.route_kind === "tanstack-virtual-route"), false);
+});
+
+test("an isolated Astro endpoint obtains its own export proof without another import site", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const source = "apps/astro-app/src/pages/api/status.ts";
+  const request = parseAnalysisUnitRequest({
+    contract_version: "depgraph-analysis-unit-v2", unit_id: "web:astro", adapter: "web",
+    unit_root: "apps/astro-app", source_paths: [source], context_paths: [source],
+    auxiliary_paths: ["apps/astro-app/package.json", "package.json"],
+    stage: "semantic", chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+    context_fingerprint: "c".repeat(64),
+  });
+  const model = await scan(root, await walkFiles(root), [], undefined, request);
+  const handler = model.sites.find((site) => site.kind === "handled_by");
+  assert.equal(handler?.specifier, "GET");
+  assert.equal(handler?.resolution_status, "resolved");
+  assert.equal(handler?.precision, "exact");
+  assert.ok(model.nodes.some((node) => node.kind === "symbol" && node.display_name === "GET"
+    && handler?.target_ids.includes(node.id)));
+});
+
+test("framework analysis profiles declare exactly their projected completeness ledger", async () => {
+  const root = fileURLToPath(new URL("./fixtures/polyglot", import.meta.url));
+  const files = await walkFiles(root);
+  for (const stage of ["syntax", "semantic"] as const) {
+    const request = parseAnalysisUnitRequest({
+      contract_version: "depgraph-analysis-unit-v2",
+      unit_id: "web:next", adapter: "web", unit_root: "apps/next-app",
+      source_paths: ["apps/next-app/src/pages/about.tsx"],
+      context_paths: ["apps/next-app/src/pages/about.tsx"],
+      auxiliary_paths: ["apps/next-app/package.json", "package.json"],
+      stage, chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1,
+      context_fingerprint: "b".repeat(64),
+    });
+    const model = await scan(root, files, [], undefined, request);
+    assert.deepEqual(model.detectedFrameworks, model.frameworkSemantic.completionLedger.map((entry) => entry.framework));
+    assert.deepEqual(model.detectedFrameworks, stage === "syntax" ? [] : ["next"]);
+    const primaryTypeChecker = (record: { evidence: readonly { kind: string; extractor: string }[] }): boolean => (
+      record.evidence[0]?.kind === "semantic" && record.evidence[0]?.extractor === "typescript-native-typechecker"
+    );
+    assert.equal(model.typeScriptProject.semanticRelations, model.edges.filter(primaryTypeChecker).length);
+    assert.equal(model.typeScriptProject.semanticSites, model.sites.filter(primaryTypeChecker).length);
+    if (model.frameworkSemantic.completionStatus === "incomplete") {
+      assert.ok(model.coverage.reasons.includes("framework_semantic_incomplete"));
+      assert.ok(!model.coverage.completeness.includes("semantic-complete"));
+    }
+  }
+});
 
 test("analysis-unit profiles differ by chunk while logical stage identity stays stable", () => {
   const common = {

@@ -15,8 +15,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use depgraph_protocol::stable_id_from_value;
-use rusqlite::{Connection, OptionalExtension, params};
+use depgraph_protocol::{canonical_json, stable_id_from_value};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -25,8 +26,15 @@ use crate::{
     LEGACY_COMPLETED_SNAPSHOT_SEAL_VERSION, ProfileMatrixRecord, ProfileRecord, ScanRecord,
     incremental, load_adapter_logs, load_diagnostics, load_edges, load_evidence,
     load_file_coverage, load_nodes, load_profiles, load_sites, merge_build_delta,
-    observed_coverage, profile_matrix::refresh_profile_matrix, runtime, table_exists,
-    table_has_column,
+    observed_coverage,
+    profile_matrix::{
+        is_profile_matrix_diagnostic, refresh_profile_matrix, refresh_profile_matrix_for_identity,
+    },
+    read::{
+        load_staging_coverage, visit_adapter_logs, visit_edges, visit_evidence,
+        visit_file_coverage, visit_nodes, visit_sites,
+    },
+    runtime, table_exists, table_has_column,
 };
 
 struct AnalysisLedgerIdentityRow {
@@ -215,6 +223,18 @@ impl SnapshotSealHasher {
     }
 
     fn write_query(
+        &mut self,
+        connection: &Connection,
+        snapshot_id: &str,
+        domain: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        crate::profiling::run(&format!("store-snapshot-seal-{domain}"), || {
+            self.write_query_rows(connection, snapshot_id, domain, suffix)
+        })
+    }
+
+    fn write_query_rows(
         &mut self,
         connection: &Connection,
         snapshot_id: &str,
@@ -623,6 +643,8 @@ SELECT diagnostic.session_id, diagnostic.ordinal, diagnostic.id,
 }
 
 fn completed_snapshot_storage_seal(connection: &Connection, snapshot_id: &str) -> Result<String> {
+    #[cfg(test)]
+    identity_tests::observe_work(2);
     completed_snapshot_storage_seal_with_version(
         connection,
         snapshot_id,
@@ -689,8 +711,19 @@ pub(crate) fn persist_completed_snapshot_seal(
         return Ok(());
     }
     validate_completed_snapshot_for_seal(connection, snapshot_id)?;
+    persist_validated_snapshot_seal(connection, snapshot_id).map(|_| ())
+}
+
+// The returned change count is usable only by the uninterrupted creation path
+// below, in the same transaction. Seal rows and source mappings are outside the
+// hashed closure; triggers that mutate anything else invalidate this proof.
+fn persist_validated_snapshot_seal(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<Option<u64>> {
     let observed = completed_snapshot_storage_seal(connection, snapshot_id)?;
-    connection.execute(
+    let changes_before = connection.total_changes();
+    let inserted = connection.execute(
         "INSERT INTO completed_snapshot_seals(snapshot_id, seal_version, seal_sha256)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(snapshot_id) DO NOTHING",
@@ -705,7 +738,9 @@ pub(crate) fn persist_completed_snapshot_seal(
     if stored != observed {
         bail!("completed snapshot {snapshot_id} storage seal does not match immutable rows");
     }
-    Ok(())
+    Ok((!connection.is_autocommit()
+        && changes_before.checked_add(inserted as u64) == Some(connection.total_changes()))
+    .then(|| connection.total_changes()))
 }
 
 pub(crate) fn verify_completed_snapshot_seal(
@@ -864,6 +899,10 @@ pub(crate) fn load_base_snapshot_from_connection(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<GraphSnapshot> {
+    load_base_snapshot(connection, scan_id, SnapshotPurpose::View)
+}
+
+fn load_scan_record(connection: &Connection, scan_id: &str) -> Result<ScanRecord> {
     let health_columns_available =
         table_has_column(connection, "scans", "health_policy_config_digest")?;
     let health_projection = if health_columns_available {
@@ -879,7 +918,7 @@ pub(crate) fn load_base_snapshot_from_connection(
                     {health_projection}
                FROM scans WHERE id=?1"
     );
-    let scan = connection
+    connection
         .query_row(&scan_query, [scan_id], |row| {
             Ok(ScanRecord {
                 id: row.get(0)?,
@@ -898,7 +937,22 @@ pub(crate) fn load_base_snapshot_from_connection(
             })
         })
         .optional()?
-        .with_context(|| format!("scan {scan_id} was not found"))?;
+        .with_context(|| format!("scan {scan_id} was not found"))
+}
+
+enum SnapshotPurpose {
+    View,
+    Identity,
+}
+
+fn load_base_snapshot(
+    connection: &Connection,
+    scan_id: &str,
+    purpose: SnapshotPurpose,
+) -> Result<GraphSnapshot> {
+    #[cfg(test)]
+    identity_tests::observe_work(0);
+    let scan = load_scan_record(connection, scan_id)?;
     let profiles = load_profiles(connection, scan_id)?;
     let nodes = load_nodes(connection, scan_id)?;
     let sites = load_sites(connection, scan_id)?;
@@ -935,8 +989,17 @@ pub(crate) fn load_base_snapshot_from_connection(
         adapter_logs,
         coverage,
         profile_matrix: ProfileMatrixRecord::default(),
+        analysis_dependency_coverage:
+            super::analysis_dependency_coverage::load_analysis_dependency_coverage(
+                connection,
+                scan_id,
+                || Ok(()),
+            )?,
     };
-    refresh_profile_matrix(&mut snapshot, false);
+    match purpose {
+        SnapshotPurpose::View => refresh_profile_matrix(&mut snapshot, false),
+        SnapshotPurpose::Identity => refresh_profile_matrix_for_identity(&mut snapshot),
+    }
     Ok(snapshot)
 }
 
@@ -1153,6 +1216,7 @@ fn apply_semantic_noop_overlay(snapshot: &mut GraphSnapshot, overlay: GraphSnaps
             snapshot.adapter_logs.push(log);
         }
     }
+    snapshot.analysis_dependency_coverage = None;
     snapshot.scan = overlay.scan;
     snapshot.nodes.sort_by(|left, right| left.id.cmp(&right.id));
     snapshot
@@ -1188,6 +1252,13 @@ pub(crate) fn completed_snapshot_identity(
                 .with_context(|| format!("parent completed snapshot {parent_id} was not found"))
         })
         .transpose()?;
+    if !layered {
+        match streamed_scan_identity(connection, scan_id, parent_snapshot_id, source_revision) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if error.is::<ObservedScanIdentity>() => {}
+            Err(error) => return Err(error),
+        }
+    }
     let mut snapshot = if layered {
         if let Some(parent_id) = parent_snapshot_id {
             load_completed_snapshot_from_connection(connection, parent_id)?
@@ -1195,7 +1266,9 @@ pub(crate) fn completed_snapshot_identity(
             load_effective_scan_snapshot(connection, scan_id)?
         }
     } else {
-        load_effective_scan_snapshot(connection, scan_id)?
+        // Semantic no-op overlays returned above. A full scan needs the
+        // canonical graph and its diagnostics, not the public matrix view.
+        load_base_snapshot(connection, scan_id, SnapshotPurpose::Identity)?
     };
     if let Some(attempt_id) = build_attempt_id
         && parent_record
@@ -1225,56 +1298,281 @@ pub(crate) fn completed_snapshot_identity(
     profile_ids.sort();
     profile_ids.dedup();
     let analysis_digest = analysis_proof_digest(connection, scan_id)?;
-    let mut identity = json!({
-        "schema": if runtime_session_ids.is_empty() {
-            if analysis_digest.is_some() {
-                "completed-snapshot-v3-analysis"
-            } else {
-                "completed-snapshot-v1"
+    let snapshot_id = hash_snapshot_identity(
+        &snapshot,
+        &profile_ids,
+        analysis_digest.as_deref(),
+        runtime_session_ids,
+        parent_snapshot_id,
+        source_revision,
+    )?;
+    Ok((snapshot_id, profile_ids))
+}
+
+/// A static scan needs only profiles and diagnostics together in memory.
+/// Build evidence can also become profile-axis diagnostic evidence regardless
+/// of its owner, so observed scans retain the existing reconstruction path.
+/// Detect observations during hashing to avoid a separate full evidence read.
+fn streamed_scan_identity(
+    connection: &Connection,
+    scan_id: &str,
+    parent_snapshot_id: Option<&str>,
+    source_revision: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    let mut metadata = GraphSnapshot {
+        scan: load_scan_record(connection, scan_id)?,
+        profiles: load_profiles(connection, scan_id)?,
+        nodes: Vec::new(),
+        sites: Vec::new(),
+        edges: Vec::new(),
+        evidence: Vec::new(),
+        diagnostics: load_diagnostics(connection, scan_id)?,
+        file_coverage: Vec::new(),
+        adapter_logs: Vec::new(),
+        coverage: load_staging_coverage(connection, scan_id)?,
+        profile_matrix: ProfileMatrixRecord::default(),
+        analysis_dependency_coverage: None,
+    };
+    // Match the evidence pruning performed before derived diagnostics are
+    // rebuilt. A stale derived diagnostic ID must not retain its old evidence
+    // merely because a newly generated diagnostic has the same ID.
+    let retained_diagnostic_ids = metadata
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| !is_profile_matrix_diagnostic(diagnostic))
+        .map(|diagnostic| diagnostic.id.clone())
+        .collect::<BTreeSet<_>>();
+    refresh_profile_matrix_for_identity(&mut metadata);
+    // Logs are absent from the identity contract, but a full graph load also
+    // decodes them. Keep those validation errors without retaining all logs.
+    visit_adapter_logs(connection, scan_id, |_| Ok(()))?;
+    let mut profile_ids = metadata
+        .profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    profile_ids.sort();
+    profile_ids.dedup();
+    let analysis_digest = analysis_proof_digest(connection, scan_id)?;
+    let snapshot_id = hash_snapshot_identity_with(
+        &metadata,
+        &profile_ids,
+        analysis_digest.as_deref(),
+        &[],
+        parent_snapshot_id,
+        source_revision,
+        |hash, array| match array {
+            IdentityArray::Edges => {
+                hash_identity_records(hash, |emit| visit_edges(connection, scan_id, emit))
             }
-        } else if analysis_digest.is_some() {
-            "completed-snapshot-v4-analysis-runtime"
-        } else {
-            "completed-snapshot-v2"
+            IdentityArray::Evidence => hash_identity_records(hash, |emit| {
+                visit_evidence(connection, scan_id, |evidence| {
+                    // Check before pruning: even evidence absent from the
+                    // final identity must select the reconstruction path.
+                    // The caller discards this partial hash and starts over.
+                    if matches!(evidence.kind.as_str(), "build" | "runtime") {
+                        return Err(ObservedScanIdentity.into());
+                    }
+                    // Decode even discarded evidence, just as the full load
+                    // does, so corrupt JSON cannot disappear through pruning.
+                    if evidence.owner_type != "diagnostic"
+                        || retained_diagnostic_ids.contains(&evidence.owner_id)
+                    {
+                        emit(evidence)?;
+                    }
+                    Ok(())
+                })
+            }),
+            IdentityArray::FileCoverage => {
+                hash_identity_records(hash, |emit| visit_file_coverage(connection, scan_id, emit))
+            }
+            IdentityArray::Nodes => {
+                hash_identity_records(hash, |emit| visit_nodes(connection, scan_id, emit))
+            }
+            IdentityArray::Sites => {
+                hash_identity_records(hash, |emit| visit_sites(connection, scan_id, emit))
+            }
         },
-        "parent_snapshot_id": parent_snapshot_id,
-        "source_revision": source_revision,
-        "profile_ids": profile_ids,
-        "graph": {
-            "profiles": snapshot.profiles,
-            "nodes": snapshot.nodes,
-            "sites": snapshot.sites,
-            "edges": snapshot.edges,
-            "evidence": snapshot.evidence,
-            "diagnostics": snapshot.diagnostics,
-            "file_coverage": snapshot.file_coverage,
-            "coverage": snapshot.coverage,
+    )?;
+    Ok((snapshot_id, profile_ids))
+}
+
+/// Internal control flow, caught only by the unlayered identity dispatcher.
+/// Storage and decoding failures must propagate rather than trigger a retry.
+#[derive(Debug, thiserror::Error)]
+#[error("observed evidence requires full snapshot reconstruction")]
+struct ObservedScanIdentity;
+
+enum IdentityArray {
+    Edges,
+    Evidence,
+    FileCoverage,
+    Nodes,
+    Sites,
+}
+
+/// Hash the existing canonical JSON contract one record at a time. Constructing
+/// a Value for the whole graph, sorting its copy, and then serializing it keeps
+/// several full graph representations alive during completion.
+fn hash_snapshot_identity(
+    snapshot: &GraphSnapshot,
+    profile_ids: &[String],
+    analysis_digest: Option<&str>,
+    runtime_session_ids: &[String],
+    parent_snapshot_id: Option<&str>,
+    source_revision: Option<&str>,
+) -> Result<String> {
+    hash_snapshot_identity_with(
+        snapshot,
+        profile_ids,
+        analysis_digest,
+        runtime_session_ids,
+        parent_snapshot_id,
+        source_revision,
+        |hash, array| match array {
+            IdentityArray::Edges => hash_identity_array(hash, &snapshot.edges),
+            IdentityArray::Evidence => hash_identity_array(hash, &snapshot.evidence),
+            IdentityArray::FileCoverage => hash_identity_array(hash, &snapshot.file_coverage),
+            IdentityArray::Nodes => hash_identity_array(hash, &snapshot.nodes),
+            IdentityArray::Sites => hash_identity_array(hash, &snapshot.sites),
         },
-    });
-    if let Some(analysis_digest) = analysis_digest {
-        identity["analysis_proof_digest"] = json!(analysis_digest);
+    )
+}
+
+fn hash_snapshot_identity_with(
+    snapshot: &GraphSnapshot,
+    profile_ids: &[String],
+    analysis_digest: Option<&str>,
+    runtime_session_ids: &[String],
+    parent_snapshot_id: Option<&str>,
+    source_revision: Option<&str>,
+    mut write_array: impl FnMut(&mut Sha256, IdentityArray) -> Result<()>,
+) -> Result<String> {
+    #[cfg(test)]
+    identity_tests::observe_work(1);
+    let mut hash = Sha256::new();
+    hash.update(b"{");
+    if let Some(digest) = analysis_digest {
+        hash.update(b"\"analysis_proof_digest\":");
+        hash_identity_value(&mut hash, &digest)?;
+        hash.update(b",");
     }
+    // Both object levels use the lexicographic field order of canonical_json.
+    hash.update(b"\"graph\":{\"coverage\":");
+    hash_identity_value(&mut hash, &snapshot.coverage)?;
+    hash.update(b",\"diagnostics\":");
+    hash_identity_array(&mut hash, &snapshot.diagnostics)?;
+    hash.update(b",\"edges\":");
+    write_array(&mut hash, IdentityArray::Edges)?;
+    hash.update(b",\"evidence\":");
+    write_array(&mut hash, IdentityArray::Evidence)?;
+    hash.update(b",\"file_coverage\":");
+    write_array(&mut hash, IdentityArray::FileCoverage)?;
+    hash.update(b",\"nodes\":");
+    write_array(&mut hash, IdentityArray::Nodes)?;
+    hash.update(b",\"profiles\":");
+    hash_identity_array(&mut hash, &snapshot.profiles)?;
+    hash.update(b",\"sites\":");
+    write_array(&mut hash, IdentityArray::Sites)?;
+    hash.update(b"},\"parent_snapshot_id\":");
+    hash_identity_value(&mut hash, &parent_snapshot_id)?;
+    hash.update(b",\"profile_ids\":");
+    hash_identity_array(&mut hash, profile_ids)?;
     if !runtime_session_ids.is_empty() {
-        identity["runtime_session_ids"] = json!(runtime_session_ids);
+        hash.update(b",\"runtime_session_ids\":");
+        hash_identity_array(&mut hash, runtime_session_ids)?;
     }
-    Ok((stable_id_from_value("snapshot", &identity), profile_ids))
+    hash.update(b",\"schema\":");
+    let schema = match (runtime_session_ids.is_empty(), analysis_digest.is_some()) {
+        (true, false) => "completed-snapshot-v1",
+        (true, true) => "completed-snapshot-v3-analysis",
+        (false, false) => "completed-snapshot-v2",
+        (false, true) => "completed-snapshot-v4-analysis-runtime",
+    };
+    hash_identity_value(&mut hash, &schema)?;
+    hash.update(b",\"source_revision\":");
+    hash_identity_value(&mut hash, &source_revision)?;
+    hash.update(b"}");
+    Ok(format!("snapshot:sha256:{:x}", hash.finalize()))
+}
+
+fn hash_identity_value(hash: &mut Sha256, value: &impl Serialize) -> Result<()> {
+    hash.update(canonical_json(&serde_json::to_value(value)?).as_bytes());
+    Ok(())
+}
+
+fn hash_identity_array<T: Serialize>(hash: &mut Sha256, values: &[T]) -> Result<()> {
+    hash_identity_records(hash, |emit| values.iter().try_for_each(emit))
+}
+
+fn hash_identity_records<T: Serialize>(
+    hash: &mut Sha256,
+    read: impl FnOnce(&mut dyn FnMut(T) -> Result<()>) -> Result<()>,
+) -> Result<()> {
+    hash.update(b"[");
+    let mut first = true;
+    read(&mut |value| {
+        if !first {
+            hash.update(b",");
+        }
+        first = false;
+        hash_identity_value(hash, &value)
+    })?;
+    hash.update(b"]");
+    Ok(())
 }
 
 pub(crate) fn create_completed_snapshot(
     connection: &Connection,
     source: SnapshotSource<'_>,
 ) -> Result<String> {
-    let (snapshot_id, profile_ids) = completed_snapshot_identity(
-        connection,
-        source.scan_id,
-        source.build_attempt_id,
-        source.runtime_session_ids,
-        source.parent_snapshot_id,
-        source.source_revision,
-    )?;
+    create_completed_snapshot_inner(connection, source, false).map(|(id, _)| id)
+}
+
+pub(crate) fn create_and_maybe_promote_scan_snapshot(
+    transaction: &Transaction<'_>,
+    source: SnapshotSource<'_>,
+    promote: bool,
+) -> Result<(String, bool)> {
+    if source.source_kind != "scan"
+        || source.build_attempt_id.is_some()
+        || source.runtime_import_id.is_some()
+        || !source.runtime_session_ids.is_empty()
+    {
+        bail!("scan completion requires an unlayered scan snapshot");
+    }
+    create_completed_snapshot_inner(transaction, source, promote)
+}
+
+fn create_completed_snapshot_inner(
+    connection: &Connection,
+    source: SnapshotSource<'_>,
+    promote_scan: bool,
+) -> Result<(String, bool)> {
+    let (snapshot_id, profile_ids) = crate::profiling::run("store-snapshot-identity", || {
+        completed_snapshot_identity(
+            connection,
+            source.scan_id,
+            source.build_attempt_id,
+            source.runtime_session_ids,
+            source.parent_snapshot_id,
+            source.source_revision,
+        )
+    })?;
     let profile_set_json = serde_json::to_string(&profile_ids)?;
     let runtime_session_set_json = serde_json::to_string(source.runtime_session_ids)?;
-    connection.execute(
+    // A fresh full-scan identity has already loaded and canonically validated
+    // exactly the graph that its newly inserted metadata will reconstruct.
+    // Existing identities and layered/overlay snapshots still take the full
+    // validation path; a shared ID may refer to a different historical scan.
+    let can_reuse_identity = !connection.is_autocommit()
+        && source.source_kind == "scan"
+        && source.build_attempt_id.is_none()
+        && source.runtime_import_id.is_none()
+        && source.runtime_session_ids.is_empty()
+        && !incremental::scan_is_semantic_noop_overlay(connection, source.scan_id)?;
+    let changes_before_insert = connection.total_changes();
+    let inserted = connection.execute(
         "INSERT INTO completed_snapshots(
             id, source_kind, source_attempt_id, scan_id, build_attempt_id,
             runtime_import_id, runtime_session_set_json, parent_snapshot_id,
@@ -1306,8 +1604,24 @@ pub(crate) fn create_completed_snapshot(
     {
         bail!("completed snapshot identity collision for {snapshot_id}");
     }
-    persist_completed_snapshot_seal(connection, &snapshot_id)?;
-    connection.execute(
+    let reuse_identity = can_reuse_identity
+        && inserted == 1
+        && changes_before_insert.checked_add(1) == Some(connection.total_changes())
+        && stored.source_kind == source.source_kind
+        && stored.scan_id == source.scan_id
+        && stored.build_attempt_id.as_deref() == source.build_attempt_id;
+    let seal_verified_at = if completed_snapshot_seal_table_exists(connection)? {
+        crate::profiling::run("store-snapshot-seal", || {
+            if !reuse_identity {
+                validate_completed_snapshot_for_seal(connection, &snapshot_id)?;
+            }
+            persist_validated_snapshot_seal(connection, &snapshot_id)
+        })?
+    } else {
+        None
+    };
+    let changes_before_source = connection.total_changes();
+    let source_inserted = connection.execute(
         "INSERT INTO snapshot_sources(source_kind, source_attempt_id, snapshot_id, promoted_at)
          VALUES (?1, ?2, ?3, ?4)",
         params![
@@ -1317,7 +1631,17 @@ pub(crate) fn create_completed_snapshot(
             source.created_at
         ],
     )?;
-    Ok(snapshot_id)
+    let seal_still_verified = seal_verified_at == Some(changes_before_source)
+        && source_inserted == 1
+        && changes_before_source.checked_add(1) == Some(connection.total_changes());
+    let promoted = promote_scan
+        && promote_completed_snapshot_if_current_parent(
+            connection,
+            &snapshot_id,
+            source.parent_snapshot_id,
+            seal_still_verified,
+        )?;
+    Ok((snapshot_id, promoted))
 }
 
 pub(crate) fn promote_completed_snapshot(connection: &Connection, snapshot_id: &str) -> Result<()> {
@@ -1343,10 +1667,11 @@ pub(crate) fn promote_completed_snapshot(connection: &Connection, snapshot_id: &
     Ok(())
 }
 
-pub(crate) fn promote_completed_snapshot_if_current_parent(
+fn promote_completed_snapshot_if_current_parent(
     connection: &Connection,
     snapshot_id: &str,
     expected_parent_snapshot_id: Option<&str>,
+    seal_already_verified: bool,
 ) -> Result<bool> {
     let status = connection
         .query_row(
@@ -1359,7 +1684,7 @@ pub(crate) fn promote_completed_snapshot_if_current_parent(
     if status != "completed" {
         bail!("snapshot {snapshot_id} cannot be promoted from status {status}");
     }
-    if completed_snapshot_seal_table_exists(connection)? {
+    if !seal_already_verified && completed_snapshot_seal_table_exists(connection)? {
         verify_completed_snapshot_seal(connection, snapshot_id)?;
     }
     let updated = if let Some(expected_parent_snapshot_id) = expected_parent_snapshot_id {
@@ -1501,4 +1826,585 @@ pub(crate) fn backfill_completed_snapshots(connection: &Connection) -> Result<()
         promote_completed_snapshot(connection, &snapshot_id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::Store;
+    use serde_json::Value;
+    use std::path::Path;
+
+    thread_local! {
+        static WORK: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    }
+
+    pub(super) fn observe_work(index: usize) {
+        WORK.with(|counts| {
+            let mut value = counts.get();
+            value[index] += 1;
+            counts.set(value);
+        });
+    }
+
+    fn stage_fixture(store: &mut Store, scan_id: &str) -> Result<()> {
+        store.start_scan(scan_id, Path::new("/fixture"), false)?;
+        let mut events =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson")
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+        events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+        for mut event in events {
+            event["scan_id"] = json!(scan_id);
+            store.ingest_event(&event)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn derived_dependency_scope_preserves_identity_and_is_cleared_by_overlays() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "scope")?;
+        let mut view = load_base_snapshot_from_connection(&store.connection, "scope")?;
+        let profile_ids = view
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let expected = hash_snapshot_identity(&view, &profile_ids, None, &[], None, None)?;
+        let scope = Some(crate::AnalysisDependencyCoverage {
+            unknown_dependencies: std::collections::BTreeMap::from([
+                ("go".into(), false),
+                ("web".into(), true),
+            ]),
+        });
+        view.analysis_dependency_coverage = scope.clone();
+        assert_eq!(
+            hash_snapshot_identity(&view, &profile_ids, None, &[], None, None)?,
+            expected
+        );
+        // Deserialization of older snapshots must preserve the fallback.
+        let mut legacy = serde_json::to_value(&view)?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("analysis_dependency_coverage");
+        assert!(
+            serde_json::from_value::<GraphSnapshot>(legacy)?
+                .analysis_dependency_coverage
+                .is_none()
+        );
+
+        let mut overlay = view.clone();
+        overlay.nodes.truncate(1);
+        apply_semantic_noop_overlay(&mut view, overlay)?;
+        assert!(view.analysis_dependency_coverage.is_none());
+        view.analysis_dependency_coverage = scope.clone();
+        merge_build_delta(&mut view, BuildGraphDelta::default(), "build")?;
+        assert!(view.analysis_dependency_coverage.is_none());
+        view.analysis_dependency_coverage = scope;
+        runtime::merge_runtime_sessions(&store.connection, &mut view, &[])?;
+        assert!(view.analysis_dependency_coverage.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_scan_completion_streams_without_loading_the_whole_graph() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "single-pass")?;
+        let expected = store.prospective_scan_snapshot_id("single-pass")?;
+        let view = load_base_snapshot_from_connection(&store.connection, "single-pass")?;
+        let identity =
+            load_base_snapshot(&store.connection, "single-pass", SnapshotPurpose::Identity)?;
+        assert!(!view.profile_matrix.correlations.is_empty());
+        assert!(identity.profile_matrix.correlations.is_empty());
+        let mut profile_ids = view
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        profile_ids.sort();
+        profile_ids.dedup();
+        assert_eq!(
+            hash_snapshot_identity(&view, &profile_ids, None, &[], None, None)?,
+            expected
+        );
+        WORK.set([0; 3]);
+        store.finish_scan("single-pass", "completed", None, true)?;
+        assert_eq!(
+            WORK.get(),
+            [0, 1, 1],
+            "whole graph loads, identity hashes, storage hashes"
+        );
+        assert_eq!(
+            store.current_snapshot_id()?.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(store.verify_snapshot_integrity(&expected)?.valid);
+        verify_completed_snapshot_seal(&store.connection, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn identity_only_matrix_preserves_axis_and_observed_conflict_diagnostics() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "diagnostics")?;
+        let base = load_base_snapshot_from_connection(&store.connection, "diagnostics")?;
+        for observed in [false, true] {
+            let mut view = base.clone();
+            let mut child = view.profiles[0].clone();
+            child.id = "child-profile".into();
+            child.target = Some("different-target".into());
+            child.properties["parent_profile_id"] = json!(view.profiles[0].id);
+            let mut axis_evidence = view.evidence[0].clone();
+            axis_evidence.owner_type = "profile".into();
+            axis_evidence.owner_id = child.id.clone();
+            axis_evidence.kind = "build".into();
+            axis_evidence.properties = json!({"profile_id":child.id});
+            view.evidence.push(axis_evidence);
+            view.profiles.push(child);
+            if observed {
+                let mut site = view.sites[0].clone();
+                site.id = "observed-site".into();
+                site.target_ids = vec!["different-target".into()];
+                let mut evidence = view.evidence[0].clone();
+                evidence.owner_type = "site".into();
+                evidence.owner_id = site.id.clone();
+                evidence.ordinal = 0;
+                evidence.kind = "build".into();
+                view.sites.push(site);
+                view.evidence.push(evidence);
+            }
+            let mut identity = view.clone();
+            refresh_profile_matrix(&mut view, false);
+            refresh_profile_matrix_for_identity(&mut identity);
+            assert!(
+                view.diagnostics
+                    .iter()
+                    .any(|item| item.code == "PROFILE_MATRIX_PROFILE_CONFLICT")
+            );
+            assert_eq!(identity.diagnostics, view.diagnostics);
+            assert_eq!(identity.evidence, view.evidence);
+            let profiles = view
+                .profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                hash_snapshot_identity(&identity, &profiles, None, &[], None, None)?,
+                hash_snapshot_identity(&view, &profiles, None, &[], None, None)?,
+            );
+            if observed {
+                assert!(view.profile_matrix.difference_counts["conflict"] > 0);
+                assert_eq!(identity.profile_matrix, view.profile_matrix);
+            } else {
+                assert!(!view.profile_matrix.correlations.is_empty());
+                assert!(identity.profile_matrix.correlations.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_scan_identity_matches_view(
+        store: &Store,
+        scan_id: &str,
+        parent: Option<&str>,
+        revision: Option<&str>,
+        graph_loads: usize,
+    ) -> Result<GraphSnapshot> {
+        let view = load_base_snapshot_from_connection(&store.connection, scan_id)?;
+        let mut profiles = view
+            .profiles
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>();
+        profiles.sort();
+        profiles.dedup();
+        let analysis = analysis_proof_digest(&store.connection, scan_id)?;
+        let expected =
+            hash_snapshot_identity(&view, &profiles, analysis.as_deref(), &[], parent, revision)?;
+        WORK.set([0; 3]);
+        let actual =
+            completed_snapshot_identity(&store.connection, scan_id, None, &[], parent, revision)?;
+        assert_eq!(actual, (expected, profiles));
+        assert_eq!(WORK.get(), [graph_loads, graph_loads + 1, 0]);
+        Ok(view)
+    }
+
+    #[test]
+    fn streamed_scan_preserves_coverage_ordering_and_identity_metadata() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("empty", Path::new("/fixture"), false)?;
+        assert_scan_identity_matches_view(&store, "empty", None, None, 0)?;
+        stage_fixture(&mut store, "parent")?;
+        store.finish_scan("parent", "completed", None, true)?;
+        let parent = store.current_snapshot_id()?.unwrap();
+        stage_fixture(&mut store, "streamed")?;
+        store.initialize_analysis_unit_ledger(
+            "streamed",
+            "depgraph-analysis-unit-v1",
+            Some("plan"),
+            Some("input"),
+            &[],
+        )?;
+        for id in ["雪", "z", "a"] {
+            store.connection.execute(
+                "INSERT INTO nodes(scan_id,id,kind,locator,display_name,properties_json,raw_json)
+                 VALUES('streamed',?1,'file',?1,?1,?2,'{}')",
+                params![
+                    id,
+                    json!({"z":[null,{"雪":"\n\"\\","a":-3.25},true],"a":false}).to_string()
+                ],
+            )?;
+        }
+        // Stored worker counters may be stale; both paths must use observed
+        // counters while preserving completeness, reasons, and execution state.
+        store.connection.execute(
+            "UPDATE scans SET project_code_executed=1 WHERE id='streamed'",
+            [],
+        )?;
+        for coverage in [
+            Some(json!({
+                "profiles":99,"dependency_sites":999,"resolved":999,
+                "files_discovered":99,"files_analyzed":99,"files_skipped":0,
+                "candidates":0,"external":0,"unresolved":0,"unsupported_syntax":0,
+                "project_code_executed":false,
+                "completeness":["syntax-complete"],"reasons":["partial worker result"]
+            })),
+            None,
+        ] {
+            store
+                .connection
+                .execute("DELETE FROM coverage WHERE scan_id='streamed'", [])?;
+            if let Some(value) = coverage {
+                store.connection.execute(
+                    "INSERT INTO coverage(scan_id,json) VALUES('streamed',?1)",
+                    [value.to_string()],
+                )?;
+            }
+            let view = assert_scan_identity_matches_view(
+                &store,
+                "streamed",
+                Some(&parent),
+                Some("revision\n雪"),
+                0,
+            )?;
+            assert_eq!(view.coverage.dependency_sites, 1);
+            assert!(view.coverage.project_code_executed);
+        }
+        assert!(
+            completed_snapshot_identity(
+                &store.connection,
+                "streamed",
+                None,
+                &[],
+                Some("missing-parent"),
+                None,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scan_prunes_stale_diagnostic_evidence_and_preserves_observed_fallback() -> Result<()>
+    {
+        for (owner, kind) in [
+            ("profile", "source"),
+            ("profile", "semantic"),
+            ("profile", "BUILD"),
+            ("profile", "build"),
+            ("profile", "runtime"),
+            ("site", "build"),
+            ("site", "runtime"),
+            ("edge", "build"),
+            ("edge", "runtime"),
+            ("node", "build"),
+            ("node", "runtime"),
+            ("diagnostic", "build"),
+            ("diagnostic", "runtime"),
+            ("unknown-owner", "build"),
+            ("unknown-owner", "runtime"),
+        ] {
+            let mut store = Store::open_in_memory()?;
+            stage_fixture(&mut store, "diagnostics")?;
+            let mut profile: Value = serde_json::from_str(&store.connection.query_row(
+                "SELECT json FROM profiles WHERE scan_id='diagnostics'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)?;
+            profile["id"] = json!("child");
+            profile["target"] = json!("different-target");
+            profile["properties"]["parent_profile_id"] = json!("web:production:server");
+            store.connection.execute(
+                "INSERT INTO profiles(scan_id,id,json) VALUES('diagnostics','child',?1)",
+                [profile.to_string()],
+            )?;
+            let view = load_base_snapshot_from_connection(&store.connection, "diagnostics")?;
+            let derived = view
+                .diagnostics
+                .iter()
+                .find(|d| d.code == "PROFILE_MATRIX_PROFILE_CONFLICT")
+                .unwrap();
+            store.connection.execute(
+                "INSERT INTO diagnostics(scan_id,ordinal,id,severity,code,message,raw_json)
+                 VALUES('diagnostics',42,?1,'warning','STALE','stale diagnostic',?2)",
+                params![
+                    derived.id,
+                    json!({"properties":{
+                        "profile_matrix_schema":"profile-matrix-v1"
+                    }})
+                    .to_string()
+                ],
+            )?;
+            for id in [derived.id.as_str(), "orphan", "diagnostic:golden"] {
+                store.connection.execute(
+                    "INSERT INTO evidence
+                     SELECT scan_id,'diagnostic',?1,7,kind,extractor,extractor_version,path,
+                            start_line,start_column,end_line,end_column,raw_json
+                       FROM evidence WHERE scan_id='diagnostics' AND owner_type='edge' LIMIT 1",
+                    [id],
+                )?;
+            }
+            store.connection.execute(
+                "INSERT INTO evidence
+                 SELECT scan_id,?1,?2,9,?3,extractor,extractor_version,path,
+                        start_line,start_column,end_line,end_column,?4
+                   FROM evidence WHERE scan_id='diagnostics' AND owner_type='edge' LIMIT 1",
+                params![
+                    owner,
+                    if owner == "site" {
+                        "site:sha256:import"
+                    } else {
+                        "child"
+                    },
+                    kind,
+                    json!({"properties":{"profile_id":"child"}}).to_string()
+                ],
+            )?;
+            let view = assert_scan_identity_matches_view(
+                &store,
+                "diagnostics",
+                None,
+                None,
+                usize::from(matches!(kind, "build" | "runtime")),
+            )?;
+            assert!(!view.evidence.iter().any(|e| e.owner_id == "orphan"));
+            assert!(
+                !view
+                    .evidence
+                    .iter()
+                    .any(|e| e.owner_id == derived.id && e.ordinal == 7)
+            );
+            assert!(
+                view.evidence
+                    .iter()
+                    .any(|e| e.owner_id == "diagnostic:golden" && e.ordinal == 7)
+            );
+            assert_eq!(view.diagnostics.last().unwrap().ordinal, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scan_ignores_observations_in_other_scans() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "static")?;
+        stage_fixture(&mut store, "observed")?;
+        store.connection.execute(
+            "UPDATE evidence SET kind='build' WHERE scan_id='observed'",
+            [],
+        )?;
+        assert_scan_identity_matches_view(&store, "static", None, None, 0)?;
+        assert_scan_identity_matches_view(&store, "observed", None, None, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn observed_identity_fallback_preserves_errors_before_and_after_detection() -> Result<()> {
+        for corrupt_owner in ["a-corrupt", "z-corrupt"] {
+            let mut store = Store::open_in_memory()?;
+            stage_fixture(&mut store, "corrupt")?;
+            for (owner, kind, raw) in [
+                ("m-observed", "build", "{}"),
+                (corrupt_owner, "source", "{"),
+            ] {
+                store.connection.execute(
+                    "INSERT INTO evidence
+                     SELECT scan_id,?1,owner_id,ordinal,?2,extractor,extractor_version,path,
+                            start_line,start_column,end_line,end_column,?3
+                       FROM evidence WHERE scan_id='corrupt' AND owner_type='edge' LIMIT 1",
+                    params![owner, kind, raw],
+                )?;
+            }
+            WORK.set([0; 3]);
+            let error = store.prospective_scan_snapshot_id("corrupt").unwrap_err();
+            assert!(error.is::<serde_json::Error>(), "{error:#}");
+            assert_eq!(
+                WORK.get(),
+                [usize::from(corrupt_owner == "z-corrupt"), 1, 0],
+                "decoding errors must propagate; only observed evidence triggers a retry"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scan_rejects_corrupt_rows_even_when_absent_from_identity() -> Result<()> {
+        for sql in [
+            "UPDATE nodes SET properties_json='{'",
+            "UPDATE sites SET condition_json='{'",
+            "UPDATE sites SET target_ids_json='{}'",
+            "UPDATE edges SET condition_json='{'",
+            "UPDATE evidence SET raw_json='{'",
+            "UPDATE evidence SET owner_type='diagnostic',owner_id='orphan-'||owner_id,raw_json='{'",
+            "UPDATE diagnostics SET raw_json='{'",
+            "UPDATE profiles SET json='{'",
+            "UPDATE coverage SET json='{'",
+            "UPDATE file_coverage SET discovered_sites=-1",
+            "INSERT INTO adapter_logs(scan_id,adapter,stderr,truncated) VALUES('corrupt','web',x'ff',0)",
+        ] {
+            let mut store = Store::open_in_memory()?;
+            stage_fixture(&mut store, "corrupt")?;
+            store.connection.execute(sql, [])?;
+            assert!(
+                load_base_snapshot_from_connection(&store.connection, "corrupt").is_err(),
+                "{sql}"
+            );
+            assert!(
+                store.prospective_scan_snapshot_id("corrupt").is_err(),
+                "{sql}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scan_completion_revalidates_existing_identity_before_reusing_it() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        stage_fixture(&mut store, "first")?;
+        let expected = store.prospective_scan_snapshot_id("first")?;
+        store.finish_scan("first", "completed", None, false)?;
+        stage_fixture(&mut store, "second")?;
+        assert_eq!(store.prospective_scan_snapshot_id("second")?, expected);
+        store.connection.execute(
+            r#"UPDATE nodes SET properties_json='{"changed":true}' WHERE scan_id='first'"#,
+            [],
+        )?;
+        let error = store
+            .finish_scan("second", "completed", None, true)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical identity validation"));
+        assert_eq!(store.scan("second")?.unwrap().status, "staging");
+        assert_eq!(store.current_snapshot_id()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_proofs_are_invalidated_by_trigger_writes() -> Result<()> {
+        for table in [
+            "completed_snapshots",
+            "completed_snapshot_seals",
+            "snapshot_sources",
+        ] {
+            let mut store = Store::open_in_memory()?;
+            stage_fixture(&mut store, "triggered")?;
+            store.connection.execute_batch(&format!(
+                r#"CREATE TRIGGER change_graph AFTER INSERT ON {table}
+                   BEGIN
+                     UPDATE nodes SET properties_json='{{"changed":true}}'
+                       WHERE scan_id='triggered';
+                   END;"#,
+            ))?;
+            let error = store
+                .finish_scan("triggered", "completed", None, true)
+                .expect_err("a write after validation must not publish a stale proof");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("canonical identity validation")
+                    || message.contains("storage seal mismatch"),
+                "{table}: {message}"
+            );
+            assert_eq!(store.scan("triggered")?.unwrap().status, "staging");
+            assert_eq!(store.current_snapshot_id()?, None);
+            let snapshots: i64 = store.connection.query_row(
+                "SELECT COUNT(*) FROM completed_snapshots",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                snapshots, 0,
+                "failed completion must roll back its snapshot"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_snapshot_identity_preserves_every_legacy_schema() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("scan-golden", Path::new("/fixture"), false)?;
+        let mut events =
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson")
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+        events.sort_by_key(|event| (event["event"] == "edge_upsert") as u8);
+        for event in events {
+            store.ingest_event(&event)?;
+        }
+        let mut snapshot = store.load_snapshot("scan-golden")?;
+        snapshot.nodes[0].properties = json!({
+            "z": [null, {"雪": "\n\"\\", "a": -3.25}, true], "a": false
+        });
+        let profiles = snapshot
+            .profiles
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>();
+        for analysis in [None, Some("analysis:proof")] {
+            for runtime in [vec![], vec!["runtime:z".into(), "runtime:a".into()]] {
+                for parent in [None, Some("snapshot:parent")] {
+                    for revision in [None, Some("revision\n雪")] {
+                        let schema = match (runtime.is_empty(), analysis.is_some()) {
+                            (true, false) => "completed-snapshot-v1",
+                            (true, true) => "completed-snapshot-v3-analysis",
+                            (false, false) => "completed-snapshot-v2",
+                            (false, true) => "completed-snapshot-v4-analysis-runtime",
+                        };
+                        let mut legacy = json!({
+                            "schema": schema,
+                            "parent_snapshot_id": parent,
+                            "source_revision": revision,
+                            "profile_ids": profiles,
+                            "graph": {
+                                "profiles": snapshot.profiles,
+                                "nodes": snapshot.nodes,
+                                "sites": snapshot.sites,
+                                "edges": snapshot.edges,
+                                "evidence": snapshot.evidence,
+                                "diagnostics": snapshot.diagnostics,
+                                "file_coverage": snapshot.file_coverage,
+                                "coverage": snapshot.coverage,
+                            },
+                        });
+                        if let Some(analysis) = analysis {
+                            legacy["analysis_proof_digest"] = json!(analysis);
+                        }
+                        if !runtime.is_empty() {
+                            legacy["runtime_session_ids"] = json!(runtime);
+                        }
+                        assert_eq!(
+                            hash_snapshot_identity(
+                                &snapshot, &profiles, analysis, &runtime, parent, revision
+                            )?,
+                            stable_id_from_value("snapshot", &legacy)
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }

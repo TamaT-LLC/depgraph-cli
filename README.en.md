@@ -52,7 +52,7 @@ Go and Web scans discover directories and workspaces before processing logical
 units and source batches. Run `scan` again with the same Store to reuse completed
 work after validating its inputs and worker compatibility. There is no default
 whole-scan deadline. Each worker has inactivity, memory, output, and concurrency
-limits. In `.depgraph.toml`, `[scan]` supports `max_unit_source_files` (default 128),
+limits. In `.depgraph.toml`, `[scan]` supports `max_unit_source_files` (default 2,048),
 `max_unit_source_bytes` (8 MiB), `max_context_source_bytes` (64 MiB),
 `max_concurrent_units` (2), `max_worker_memory_bytes` (2 GiB), and
 `worker_timeout_seconds` (300 seconds without progress). Set

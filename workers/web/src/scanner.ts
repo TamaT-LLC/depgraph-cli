@@ -21,7 +21,7 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
-import { collectAstroSemanticDelta } from "./astro-semantic";
+import { ASTRO_HTTP_METHODS, collectAstroSemanticDelta } from "./astro-semantic";
 import { collectNextSemanticDelta } from "./next-semantic";
 import { collectTanStackRouterSemanticDelta } from "./tanstack-router-semantic";
 import { collectTanStackStartSemanticDelta } from "./tanstack-start-semantic";
@@ -1846,6 +1846,29 @@ function hydrateAnalysisFileWitnesses(nodes: Iterable<GraphNode>, sources: Reado
   }
 }
 
+async function readAnalysisFileWitnesses(
+  root: string,
+  nodes: Iterable<GraphNode>,
+  sources: Map<string, string>,
+): Promise<void> {
+  // A syntax batch reads its own bodies only. Direct import targets still
+  // need the same content identity as their owning batch, but no target AST,
+  // transitive import closure, or file coverage is needed for this witness.
+  const paths = [...nodes]
+    .filter((node) => node.kind === "file")
+    .map((node) => node.properties.path)
+    .filter((value): value is string => typeof value === "string"
+      && TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(value).toLowerCase())
+      && !sources.has(value));
+  for (let offset = 0; offset < paths.length; offset += SOURCE_READ_CONCURRENCY) {
+    const batch = paths.slice(offset, offset + SOURCE_READ_CONCURRENCY);
+    const contents = await readUtf8Batch(root, batch.map((relative) => path.join(root, relative)));
+    contents.forEach((source, index) => {
+      if (source !== null) sources.set(batch[index]!, source);
+    });
+  }
+}
+
 type AnalysisUnitSiteCounts = {
   expected: number;
   produced: number;
@@ -2163,6 +2186,7 @@ function analysisUnitSemanticComplete(
   request: AnalysisUnitRequest,
   coverageStats: AnalysisUnitCoverageStatistics,
   semanticDiagnostics: readonly Diagnostic[],
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): boolean {
   const blockers = [
     request.stage !== "semantic",
@@ -2171,6 +2195,7 @@ function analysisUnitSemanticComplete(
     coverageStats.counts.unresolved > 0,
     !analysisUnitNativeSemanticComplete(model),
     semanticDiagnostics.length > 0,
+    frameworkSemantic.completionStatus === "incomplete",
   ];
   return !blockers.some(Boolean);
 }
@@ -2196,16 +2221,20 @@ function projectAnalysisUnitTypeScriptSummary(
   return {
     ...model.typeScriptProject,
     semanticNodes: nodes.filter((node) => node.kind === "symbol" || node.kind === "type").length,
-    // Relation coverage includes definition and dependency edges. The
-    // emitted semantic stream exposes both, and the profile count must
-    // describe that same stream after unit projection.
-    semanticRelations: edges.filter((edge) => edge.phase === "semantic").length,
-    semanticSites: sites.filter((site) => analysisUnitSemanticEvidence(site.evidence)).length,
-    semanticCallSites: sites.filter((site) => site.kind === "call" && analysisUnitSemanticEvidence(site.evidence)).length,
+    // Match the primary TypeChecker evidence counted by the protocol gate;
+    // framework relations carry their own independent semantic counters.
+    semanticRelations: edges.filter((edge) => analysisUnitTypeScriptEvidence(edge.evidence)).length,
+    semanticSites: sites.filter((site) => analysisUnitTypeScriptEvidence(site.evidence)).length,
+    semanticCallSites: sites.filter((site) => site.kind === "call" && analysisUnitTypeScriptEvidence(site.evidence)).length,
     // The wire counter attests emitted issue records. Context-only issues
     // still prevent completion above, but are owned by another batch.
     semanticIssues: diagnostics.filter(analysisUnitHasTypeScriptIssue).length,
   };
+}
+
+function analysisUnitTypeScriptEvidence(evidence: readonly Evidence[]): boolean {
+  const primary = evidence[0];
+  return primary?.kind === "semantic" && primary.extractor === "typescript-native-typechecker";
 }
 
 function projectAnalysisUnitSemantics(
@@ -2216,6 +2245,7 @@ function projectAnalysisUnitSemantics(
   edges: readonly GraphEdge[],
   diagnostics: readonly Diagnostic[],
   coverageStats: AnalysisUnitCoverageStatistics,
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): {
   syntaxComplete: boolean;
   semanticComplete: boolean;
@@ -2232,7 +2262,7 @@ function projectAnalysisUnitSemantics(
   const typeScriptProject = projectAnalysisUnitTypeScriptSummary(model, request, nodes, sites, edges, diagnostics);
   return {
     syntaxComplete,
-    semanticComplete: analysisUnitSemanticComplete(model, request, coverageStats, semanticDiagnostics),
+    semanticComplete: analysisUnitSemanticComplete(model, request, coverageStats, semanticDiagnostics, frameworkSemantic),
     typeScriptProject,
   };
 }
@@ -2251,11 +2281,15 @@ function analysisUnitCompletenessReasons(
   counts: AnalysisUnitCoverageStatistics["counts"],
   unsupportedSyntax: number,
   skipped: number,
+  frameworkSemantic: ScanModel["frameworkSemantic"],
 ): string[] {
   const reasons: string[] = [];
   appendAnalysisUnitCompletenessReason(reasons, counts.unresolved > 0, "unresolved_dependency_sites");
   appendAnalysisUnitCompletenessReason(reasons, unsupportedSyntax > 0, "unsupported_syntax");
   appendAnalysisUnitCompletenessReason(reasons, skipped > 0, "skipped_sites");
+  appendAnalysisUnitCompletenessReason(
+    reasons, frameworkSemantic.completionStatus === "incomplete", "framework_semantic_incomplete",
+  );
   appendAnalysisUnitCompletenessReason(
     reasons,
     request.stage === "semantic" && model.typeScriptProject.definitionGraphStatus === "failed",
@@ -2343,6 +2377,23 @@ function projectAnalysisUnitFrameworkSemantic(
   return projectAnalysisUnitFrameworkSemanticStage(model, ownedFrameworks, nodes, sites, edges);
 }
 
+function tanStackRouterConfigPaths(root: string, workspace: Workspace, unit: AnalysisUnitRequest | null): Set<string> {
+  if (unit?.stage !== "semantic") return new Set();
+  return new Set(unit.auxiliary_paths.filter((relative) => {
+    if (!/(?:^|\/)(?:vite|tanstack|router)\.config\.(?:js|jsx|ts|tsx|mjs|cjs)$/u.test(relative)) return false;
+    const dependencies = owningPackage(workspace, path.resolve(root, relative)).dependencies;
+    const router = ["@tanstack/react-router", "@tanstack/router-core"].some((name) => dependencies.has(name));
+    const start = ["@tanstack/start", "@tanstack/react-start"].some((name) => dependencies.has(name));
+    return router && !start;
+  }));
+}
+
+function astroEndpointExportPaths(entries: readonly RouteEntry[]): readonly (readonly string[])[] {
+  return entries.some((entry) => entry.framework === "astro" && entry.entryKind === "endpoint")
+    ? ASTRO_HTTP_METHODS.map((method) => [method])
+    : [];
+}
+
 function projectAnalysisUnitModel(
   model: ScanModel,
   request: AnalysisUnitRequest,
@@ -2351,6 +2402,9 @@ function projectAnalysisUnitModel(
   const records = projectAnalysisUnitRecords(model, request);
   const diagnostics = projectAnalysisUnitDiagnostics(model, request, records.ownedPaths);
   const { files, coverageStats } = projectAnalysisUnitFiles(model, records.ownedPaths, records.sites);
+  const frameworkSemantic = projectAnalysisUnitFrameworkSemantic(
+    model, request, ownedFrameworks, records.nodes, records.sites, records.edges,
+  );
   const semantic = projectAnalysisUnitSemantics(
     model,
     request,
@@ -2359,10 +2413,12 @@ function projectAnalysisUnitModel(
     records.edges,
     diagnostics,
     coverageStats,
+    frameworkSemantic,
   );
   const { counts, unsupportedSyntax, skipped } = coverageStats;
   return {
     ...model,
+    detectedFrameworks: frameworkSemantic.completionLedger.map((entry) => entry.framework),
     nodes: records.nodes,
     sites: records.sites,
     edges: records.edges,
@@ -2374,17 +2430,10 @@ function projectAnalysisUnitModel(
         ...(semantic.syntaxComplete ? ["syntax-complete"] : []),
         ...(semantic.semanticComplete ? ["semantic-complete"] : []),
       ],
-      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped),
+      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
     },
     typeScriptProject: semantic.typeScriptProject,
-    frameworkSemantic: projectAnalysisUnitFrameworkSemantic(
-      model,
-      request,
-      ownedFrameworks,
-      records.nodes,
-      records.sites,
-      records.edges,
-    ),
+    frameworkSemantic,
   };
 }
 
@@ -2450,6 +2499,7 @@ async function localTypeScriptVersion(workspace: Workspace): Promise<LocalTypeSc
 
 interface TypeScriptAstSelection {
   paths: Set<string>;
+  definitionPaths: Set<string>;
   contextTargetFiles: number;
   truncated: boolean;
 }
@@ -2457,7 +2507,8 @@ interface TypeScriptAstSelection {
 interface TypeScriptAstSelectionState {
   selected: Set<string>;
   pending: string[];
-  queued: Set<string>;
+  expandDependencies: Set<string>;
+  expanded: Set<string>;
   truncated: boolean;
 }
 
@@ -2476,18 +2527,37 @@ function compilerPathsByPackage(
   return pathsByPackage;
 }
 
+function upgradeTypeScriptAstPath(
+  relativePath: string,
+  state: TypeScriptAstSelectionState,
+  expandDependencies: boolean,
+): void {
+  // A file first admitted only as a side-effect import witness may later
+  // be needed for a named binding. Upgrade it and traverse its declarations.
+  if (expandDependencies && !state.expandDependencies.has(relativePath)) {
+    state.expandDependencies.add(relativePath);
+    state.pending.push(relativePath);
+  }
+}
+
 function enqueueTypeScriptAstPath(
   relativePath: string,
   compilerSources: ReadonlyMap<string, string>,
   state: TypeScriptAstSelectionState,
+  expandDependencies = true,
 ): void {
-  if (!compilerSources.has(relativePath) || state.selected.has(relativePath) || state.queued.has(relativePath)) return;
-  if (state.selected.size + state.pending.length >= MAX_TYPESCRIPT_AST_SOURCE_FILES) {
+  if (!compilerSources.has(relativePath)) return;
+  if (state.selected.has(relativePath)) {
+    upgradeTypeScriptAstPath(relativePath, state, expandDependencies);
+    return;
+  }
+  if (state.selected.size >= MAX_TYPESCRIPT_AST_SOURCE_FILES) {
     state.truncated = true;
     return;
   }
+  state.selected.add(relativePath);
+  if (expandDependencies) state.expandDependencies.add(relativePath);
   state.pending.push(relativePath);
-  state.queued.add(relativePath);
 }
 
 function typeScriptAstExtraction(
@@ -2517,18 +2587,20 @@ function enqueueTypeScriptResolutionTarget(
   compilerSources: ReadonlyMap<string, string>,
   target: ResolvedTarget,
   state: TypeScriptAstSelectionState,
+  expandDependencies: boolean,
 ): void {
   if (target.kind === "file") {
     enqueueTypeScriptAstPath(
       normalizeRelative(path.relative(root, target.absolutePath)),
       compilerSources,
       state,
+      expandDependencies,
     );
     return;
   }
   if (target.kind === "workspace_package") {
     for (const candidate of pathsByPackage.get(target.package.id) ?? []) {
-      enqueueTypeScriptAstPath(candidate, compilerSources, state);
+      enqueueTypeScriptAstPath(candidate, compilerSources, state, expandDependencies);
     }
   }
 }
@@ -2546,20 +2618,49 @@ async function enqueueTypeScriptAstDependencies(
   const absolutePath = path.join(root, ...relativePath.split("/"));
   const owner = owningPackage(workspace, absolutePath);
   const extraction = typeScriptAstExtraction(root, relativePath, compilerSources, extractionCache);
-  const resolutions = await Promise.all(extraction.dependencies.map((dependency) => (
-    resolver.resolve(dependency, absolutePath, owner)
-  )));
-  for (const resolution of resolutions) {
+  const resolutions = await Promise.all(extraction.dependencies.map(async (dependency) => ({
+    resolution: await resolver.resolve(dependency, absolutePath, owner),
+    expandDependencies: dependency.kind !== "side_effect_import",
+  })));
+  for (const { resolution, expandDependencies } of resolutions) {
     for (const target of resolution.targets) {
-      enqueueTypeScriptResolutionTarget(root, pathsByPackage, compilerSources, target, state);
+      enqueueTypeScriptResolutionTarget(root, pathsByPackage, compilerSources, target, state, expandDependencies);
     }
   }
 }
 
+function needsGlobalTypeScriptAst(relativePath: string, source: string): boolean {
+  // moduleDetection=force isolates ordinary source declarations. Ambient
+  // declarations and possible global/prototype augmentation still need ASTs
+  // even through a side-effect-only import chain. Escapes are conservative:
+  // they can spell a global identifier without its literal source spelling.
+  return /\.d\.[cm]?ts$/iu.test(relativePath)
+    || /\b(?:declare|globalThis|global|window|self|prototype)\b|\\/u.test(source);
+}
+
+async function expandTypeScriptAstSelection(
+  root: string,
+  workspace: Workspace,
+  compilerSources: ReadonlyMap<string, string>,
+  pathsByPackage: ReadonlyMap<string, readonly string[]>,
+  resolver: ModuleResolver,
+  extractionCache: Map<string, ReturnType<typeof extractDependencies>>,
+  state: TypeScriptAstSelectionState,
+): Promise<void> {
+  while (state.pending.length > 0) {
+    const relativePath = state.pending.shift()!;
+    if (!state.expandDependencies.has(relativePath) || state.expanded.has(relativePath)) continue;
+    state.expanded.add(relativePath);
+    await enqueueTypeScriptAstDependencies(
+      root, workspace, compilerSources, pathsByPackage, resolver, extractionCache, relativePath, state,
+    );
+  }
+}
+
 /**
- * Select owned ASTs plus the local declaration files needed to resolve their
- * imports. The native Program still receives every context source, while the
- * scanner only asks the async API for this bounded closure.
+ * Select owned ASTs, binding declarations, and direct side-effect file
+ * witnesses. The native Program still receives every context source, while
+ * the scanner only transfers this bounded set through the async API.
  */
 async function selectTypeScriptAstPaths(
   root: string,
@@ -2578,7 +2679,8 @@ const requested = [...ownedPaths]
  const state: TypeScriptAstSelectionState = {
    selected: new Set<string>(),
    pending: [],
-   queued: new Set<string>(),
+   expandDependencies: new Set<string>(),
+   expanded: new Set<string>(),
    truncated: false,
  };
  for (const relativePath of requested) enqueueTypeScriptAstPath(relativePath, compilerSources, state);
@@ -2589,27 +2691,19 @@ const requested = [...ownedPaths]
    // bounded AST selection admits the unit's output first; the native Program
    // still keeps the complete context in its VFS.
    for (const relativePath of [...compilerSources.keys()]
-     .filter((candidate) => candidate.toLowerCase().endsWith(".d.ts"))
+     .filter((candidate) => needsGlobalTypeScriptAst(candidate, compilerSources.get(candidate)!))
      .sort(compareUtf8)) {
     enqueueTypeScriptAstPath(relativePath, compilerSources, state);
    }
- }
- while (state.pending.length > 0) {
-   const relativePath = state.pending.shift()!;
-   if (state.selected.has(relativePath)) continue;
-   state.selected.add(relativePath);
-   if (!includeDependencyClosure) continue;
-   await enqueueTypeScriptAstDependencies(
+   await expandTypeScriptAstSelection(
      root,
      workspace,
      compilerSources,
      pathsByPackage,
      resolver,
      extractionCache,
-     relativePath,
      state,
    );
-   if (state.truncated && state.selected.size >= MAX_TYPESCRIPT_AST_SOURCE_FILES) break;
  }
  const contextTargetFiles = [...state.selected].filter((relativePath) => !ownedPaths.has(relativePath)).length;
  progress.complete("typescript_ast_selection", {
@@ -2619,7 +2713,7 @@ const requested = [...ownedPaths]
    context_target_files: contextTargetFiles,
    selection_truncated: state.truncated,
  });
- return { paths: state.selected, contextTargetFiles, truncated: state.truncated };
+ return { paths: state.selected, definitionPaths: state.expandDependencies, contextTargetFiles, truncated: state.truncated };
 }
 
 export async function scan(
@@ -2800,6 +2894,7 @@ export async function scan(
   const analysisContextPaths = analysisUnit === null ? null : new Set(analysisUnit.context_paths);
   const analysisSourcePaths = analysisUnit === null ? null : new Set(analysisUnit.source_paths);
   const analysisAuxiliaryPaths = analysisUnit === null ? null : new Set(analysisUnit.auxiliary_paths);
+  const frameworkConfigPaths = tanStackRouterConfigPaths(root, workspace, analysisUnit);
   const discoveredSourceFiles = allFiles
     .filter((file) => PARSED_EXTENSIONS.has(path.extname(file).toLowerCase()) || routeFiles.has(path.resolve(file)));
   const requestedSourceFiles = analysisUnit === null
@@ -2828,10 +2923,12 @@ export async function scan(
   const sourceCache = new Map<string, string | null>();
   const compilerSources = new Map<string, string>();
   const astroSources = new Map<string, string>();
+  const compilerScopePaths = analysisUnit?.stage === "syntax" ? analysisSourcePaths : analysisContextPaths;
   const compilerFiles = sourceFiles.filter((file) => {
     if (!TYPESCRIPT_SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) return false;
-    if (analysisContextPaths === null) return true;
-    return analysisContextPaths.has(normalizeRelative(path.relative(root, file)));
+    if (compilerScopePaths === null) return true;
+    const relative = normalizeRelative(path.relative(root, file));
+    return compilerScopePaths.has(relative) || frameworkConfigPaths.has(relative);
   });
   const scanFiles = analysisUnit === null
     ? sourceFiles
@@ -2892,6 +2989,8 @@ export async function scan(
         for (const specifier of extractPotentialTypeScriptModuleSpecifiers(absolute, source)) {
           typeScriptPathRequests.push({ sourceFile: absolute, specifier });
         }
+        extractedFiles += 1;
+        if (analysisUnit.stage === "syntax") continue;
         for (const dependency of extraction.dependencies) {
           const resolution = await resolver.resolve(dependency, absolute, owningPackage(workspace, file));
           for (const target of resolution.targets) {
@@ -2902,7 +3001,6 @@ export async function scan(
             pending.push(targetRelative);
           }
         }
-        extractedFiles += 1;
       }
       pending.sort(compareUtf8);
       progress.checkpoint("source_read", {
@@ -2957,7 +3055,7 @@ export async function scan(
       root,
       workspace,
       compilerSources,
-      new Set(analysisUnit.source_paths),
+      new Set([...analysisUnit.source_paths, ...frameworkConfigPaths]),
       resolver,
       precompilerExtractions,
       progress,
@@ -2976,11 +3074,16 @@ export async function scan(
     compilerSources,
     resolver.typeScriptStaticConfig(typeScriptPathRequests),
     progress,
-    analysisUnit === null ? {} : {
-      sourcePaths: new Set(analysisUnit.source_paths),
-      astPaths: astSelection!.paths,
-      astSelectionTruncated: astSelection!.truncated,
-      stage: analysisUnit.stage,
+    {
+      moduleExportPaths: astroEndpointExportPaths(outputRouteEntries),
+      frameworkConfigPaths,
+      ...(analysisUnit === null ? {} : {
+        sourcePaths: new Set(analysisUnit.source_paths),
+        astPaths: astSelection!.paths,
+        definitionPaths: astSelection!.definitionPaths,
+        astSelectionTruncated: astSelection!.truncated,
+        stage: analysisUnit.stage,
+      }),
     },
   );
   if (analysisUnit !== null) {
@@ -3341,14 +3444,15 @@ export async function scan(
     }
   }
   const tanstackRouterEntries = outputRouteEntries.filter((entry) => entry.framework === "tanstack-router");
-  if (tanstackRouterEntries.length > 0) {
+  if (tanstackRouterEntries.length > 0 || frameworkConfigPaths.size > 0) {
     frameworkAttempted = true;
     if (semanticGraphEmitted && nativeTypeScript.project.definitionGraphStatus === "ready") {
       try {
         const result = collectTanStackRouterSemanticDelta({
           entries: tanstackRouterEntries,
+          configurationPaths: frameworkConfigPaths,
           sources: compilerSources,
-          sourceFiles: nativeTypeScript.semanticSourceFiles,
+          sourceFiles: new Map([...nativeTypeScript.semanticSourceFiles, ...nativeTypeScript.frameworkConfigSourceFiles]),
           definitions: nativeTypeScript.definitionGraph,
           definitionNode: (key) => graph.typeScriptDefinitionNode(key),
           fileNode: (relativePath) => graph.fileNodeByRelativePath(relativePath),
@@ -3569,6 +3673,9 @@ export async function scan(
     });
   }
 
+  if (analysisUnit?.stage === "syntax") {
+    await readAnalysisFileWitnesses(root, graph.nodes.values(), compilerSources);
+  }
   if (analysisUnit !== null) hydrateAnalysisFileWitnesses(graph.nodes.values(), compilerSources);
   const files = [...graph.files.values()].sort((left, right) => compareUtf8(left.path, right.path));
   const sites = [...graph.sites.values()].sort(compareById);

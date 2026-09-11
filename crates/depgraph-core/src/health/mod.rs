@@ -2,6 +2,7 @@ pub mod audit;
 mod budget;
 pub mod contract;
 pub mod dependency;
+mod dependency_projection;
 pub mod hotspot;
 pub mod range_checkpoint;
 pub mod ranged;

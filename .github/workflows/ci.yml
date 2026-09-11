@@ -5,12 +5,21 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      benchmark_only:
+        description: Run the benchmark and its Rust, Go, and Web prerequisite checks
+        type: boolean
+        default: false
+      extra_native_packages:
+        description: Verify Linux ARM64 and Intel macOS release packages as well
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ inputs.extra_native_packages || false }}-${{ inputs.benchmark_only || false }}
   cancel-in-progress: true
 
 jobs:
@@ -125,6 +134,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-windows-amd64.test" ./internal/worker
 
   go-macos:
+    if: ${{ !inputs.benchmark_only }}
     runs-on: macos-15
     env:
       GOTOOLCHAIN: local
@@ -229,6 +239,7 @@ jobs:
           if-no-files-found: error
 
   compiler-precise-hostile:
+    if: ${{ !inputs.benchmark_only }}
     runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
@@ -347,6 +358,8 @@ jobs:
       DEPGRAPH_CACHE_HIT_MIN_IMPROVEMENT_PERCENT: "5"
       DEPGRAPH_BENCH_REPORT: "dist/benchmark-report.json"
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
+      DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
+      DEPGRAPH_SCAN_PROFILE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -378,11 +391,12 @@ jobs:
           path: |
             dist/benchmark-report.json
             dist/cache-hit-benchmark-report.json
+            dist/benchmark-diagnostics/
           if-no-files-found: error
 
   integration:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     strategy:
       # Preserve the successful platform evidence when the other matrix leg
       # fails so a transient/native failure cannot erase its diagnostics.
@@ -431,6 +445,15 @@ jobs:
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
+      - name: Go no-follow confinement, reference fingerprints, and loader regressions
+        if: runner.os == 'macOS'
+        working-directory: workers/go
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+        run: |
+          go vet ./...
+          go test -race ./...
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.33.0
@@ -494,11 +517,12 @@ jobs:
               and .properties.typescript_typechecker_status == "definition-import-type-call-graph-emitted"
               and .properties.typescript_definition_graph_status == "ready"
               and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v2"
-              and .properties.typescript_semantic_issue_count == "0"
-              and (.properties.typescript_semantic_node_count | tonumber) == ($semantic_nodes | length)
-              and (.properties.typescript_semantic_relation_count | tonumber) == ($semantic_edges | length)
-              and (.properties.typescript_semantic_site_count | tonumber) == ($semantic_sites | length)
-              and (.properties.typescript_semantic_call_site_count | tonumber) == ($call_sites | length)))
+              and .properties.analysis_unit_contract == "depgraph-analysis-unit-v2"
+              and .properties.analysis_stage == "semantic"))
+            and ($semantic_nodes | length) > 0
+            and ($semantic_edges | length) > 0
+            and ($semantic_sites | length) > 0
+            and ($call_sites | length) > 0
             and ($graph.nodes | any(.kind == "symbol"))
             and ($graph.nodes | any(.kind == "type" and .properties.type_kind == "generic_instance"))
             and ([$definition_edges[].kind] | unique | sort
@@ -624,7 +648,7 @@ jobs:
                     | $graph.nodes | any(
                       .id == $target and .kind == "external_system"
                       and .properties.language == "typescript"
-                      and .properties.profile_id == $site.profile_id
+                      and ((.properties.profile_ids // [.properties.profile_id]) | index($site.profile_id))
                       and .properties.compiler_version == "7.0.2"
                       and .properties.external == true and (.properties.workspace != true)
                     )))
@@ -633,7 +657,7 @@ jobs:
                     | $graph.nodes | any(
                       .id == $target and .kind == "unknown_target"
                       and .properties.language == "web"
-                      and .properties.profile_id == $site.profile_id
+                      and ((.properties.profile_ids // [.properties.profile_id]) | index($site.profile_id))
                     )))
                 elif $site.kind == "call" then
                   ($site.target_ids | all(. as $target
@@ -755,11 +779,11 @@ jobs:
             | [$graph.evidence[] | select(
                 .owner_type == "site" and .ordinal == 0 and .kind == "semantic"
                 and .extractor == "typescript-native-typechecker" and .extractor_version == "7.0.2"
-                and .properties.module_specifier == "node:fs"
+                and .properties.module_specifier == "node:fs/promises"
                 and .properties.type_only == false
               ) | .owner_id] as $builtin_site_ids
             | [$graph.sites[] | select(
-                .kind == "web_import" and .specifier == "node:fs"
+                .kind == "web_import" and .specifier == "node:fs/promises"
                 and (.id as $id | $builtin_site_ids | index($id))
               )] as $builtin_sites
             | ($builtin_sites | length) > 0
@@ -768,12 +792,12 @@ jobs:
                 and (.reason == null) and (.target_ids | length) == 1
                 and (.target_ids[0] as $target | $graph.nodes | any(
                   .id == $target and .kind == "external_system"
-                  and .locator == "external://typescript/node%3Afs"
-                  and .display_name == "node:fs"
+                  and .locator == "external://typescript/node%3Afs%2Fpromises"
+                  and .display_name == "node:fs/promises"
                   and .properties.canonical_identity == {
                     "language":"typescript",
                     "compiler_version":"7.0.2",
-                    "locator":"node:fs"
+                    "locator":"node:fs/promises"
                   }
                 ))
               ))
@@ -826,11 +850,14 @@ jobs:
                 and .properties.typescript_typechecker_status == "definition-import-type-call-graph-emitted"
                 and .properties.typescript_definition_graph_status == "ready"
                 and .properties.typescript_semantic_graph_emission == "definition-import-type-call-graph-v2"
-                and .properties.typescript_semantic_diagnostics == "0"
-                and .properties.typescript_emitted_semantic_diagnostics == "0"
-                and .properties.typescript_semantic_issue_count == "0"
+                and .properties.analysis_unit_contract == "depgraph-analysis-unit-v2"
+                and .properties.analysis_stage == "semantic"
                 and .properties.project_code_executed == "false"
               ))
+            and ($graph.diagnostics | all(
+              .properties.typescript_semantic_scaffold != true
+              and .properties.typescript_dependency_issue != true))
+            and ($graph.coverage.completeness | index("semantic-complete"))
             and ($graph.sites | any(.resolution_status == "candidates"))
             and ($graph.sites | any(.resolution_status == "external"))' "$tmp/semantic-complete.json"
           cp -R workers/web/test/fixtures/polyglot "$tmp/checkout-two"
@@ -887,7 +914,7 @@ jobs:
 
   windows-smoke:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     runs-on: windows-2025
     env:
       # This job builds debug then release on one runner without reclaiming
@@ -1378,3 +1405,43 @@ jobs:
           if (Test-Path workers\web\test\fixtures\polyglot\apps\astro-app\ASTRO_CONFIG_EXECUTED) { throw 'Astro config executed' }
       - run: cargo xtask go-semantic-e2e
       - run: cargo xtask rust-semantic-e2e
+
+  extra-native-package:
+    if: github.event_name == 'workflow_dispatch' && inputs.extra_native_packages && !inputs.benchmark_only
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
+      - run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'workflow_dispatch' }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.1
+          cache-dependency-path: workers/go/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.33.0
+          standalone: false
+      - name: Verify the additional native release package
+        env:
+          DEPGRAPH_TARGET: ${{ matrix.target }}
+        run: cargo xtask package

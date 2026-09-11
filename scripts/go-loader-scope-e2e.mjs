@@ -23,6 +23,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
+import { assertValidCheckpointReuse, checkpointedUnitIds } from "./analysis-checkpoint-assertions.mjs";
 
 const workspace = path.resolve(import.meta.dirname, "..");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
@@ -513,6 +514,22 @@ function assertSameCanonicalGraph(actual, expected, label) {
 function goUnits(outcome) {
   return (outcome.output.analysis?.units ?? []).filter((unit) => unit.adapter === "go");
 }
+function activeGoUnits(outcome) {
+  const coverage = outcome.output.analysis_coverage;
+  assert.equal(coverage?.complete, true, "package scan has incomplete analysis coverage");
+  for (const key of ["failed_units", "unanalysed_units", "cancelled_units"]) {
+    assert.equal(coverage[key], 0, `package scan has ${key}`);
+  }
+  const units = goUnits(outcome);
+  const active = units.filter((unit) => unit.loader?.analysis_resplit !== "superseded");
+  for (const unit of units.filter((unit) => unit.loader?.analysis_resplit === "superseded")) {
+    assert.equal(unit.status, "failed", "superseded attempt must retain its failure");
+    assert.ok(active.some((replacement) => replacement.stage === unit.stage
+      && replacement.loader?.analysis_resplit === "replacement"
+      && replacement.status === "completed"), "superseded attempt has no completed replacement stage");
+  }
+  return active;
+}
 // The control has no split binding, so the worker reports no loader scope
 // and no loader metrics: the pre-#463 module path, byte for byte.
 function assertModuleLoaderControl(outcome, label) {
@@ -655,7 +672,7 @@ try {
   const fanoutStore = path.join(parent, "fanout-package.sqlite");
   const fanoutPackage = scan("fanout-package", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutPackage.output.status, "completed", JSON.stringify(fanoutPackage.output.diagnostics));
-  const fanoutBounded = goUnits(fanoutPackage).filter((unit) => unit.stage !== "syntax");
+  const fanoutBounded = activeGoUnits(fanoutPackage).filter((unit) => unit.stage !== "syntax");
   assertPackageBoundedUnits(fanoutBounded, "fanout-package");
   const fanoutTypedBatches = fanoutBounded.filter((unit) => unit.stage === "typed");
   assert.ok(fanoutTypedBatches.length > 1, "fan-out typed stage was not batched by package");
@@ -678,15 +695,20 @@ try {
     whole_module_peak_bytes: fanoutWholePeak,
   });
 
-  // --- fan-out: resume replays every typed and semantic batch -------------
+  // --- fan-out: reuse every valid checkpoint, then any recovered semantics -
+  const fanoutCheckpoints = checkpointedUnitIds(fanoutStore);
   const fanoutResume = scan("fanout-resume", fanoutRoot, fanoutStore, shippedWorker);
   assert.equal(fanoutResume.output.status, "completed");
-  for (const unit of goUnits(fanoutResume)) {
-    assert.ok(unit.reused, `fanout-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
-  }
-  assertPackageBoundedUnits(goUnits(fanoutResume).filter((unit) => unit.stage !== "syntax"), "fanout-resume");
+  const fanoutSemanticReplays = assertValidCheckpointReuse(fanoutPackage.output, fanoutResume.output, fanoutCheckpoints);
+  assertPackageBoundedUnits(activeGoUnits(fanoutResume).filter((unit) => unit.stage !== "syntax"), "fanout-resume");
   assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-resume");
-  record(fanoutResume, { canonical_graph_equal_to_control: true });
+  record(fanoutResume, { canonical_graph_equal_to_control: true, semantic_replays_after_typed_refinement: fanoutSemanticReplays });
+  if (fanoutSemanticReplays) {
+    const stable = scan("fanout-stable-resume", fanoutRoot, fanoutStore, shippedWorker);
+    assert.ok(activeGoUnits(stable).every((unit) => unit.reused), "stable fan-out checkpoint re-ran");
+    assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-stable-resume");
+    record(stable, { canonical_graph_equal_to_control: true });
+  }
 
   // --- big package: module-loader control ---------------------------------
   const { expected: bigExpected, wholeModulePeak } = controlScenarios("bigpkg", bigRoot, control);
@@ -705,7 +727,7 @@ try {
   const bigPackage = scan("bigpkg-package", bigRoot, bigStore, shippedWorker);
   assert.equal(bigPackage.output.status, "completed", JSON.stringify(bigPackage.output.diagnostics));
   assert.equal(bigPackage.exit_code, 0);
-  const staged = goUnits(bigPackage).filter((unit) => unit.stage !== "syntax");
+  const staged = activeGoUnits(bigPackage).filter((unit) => unit.stage !== "syntax");
   assertPackageBoundedUnits(staged, "bigpkg-package");
   const typedBatches = assertBodiesLoadedOnce(staged, "typed", BIG_PACKAGE_FILES, "bigpkg-package");
   const semanticBatches = assertBodiesLoadedOnce(staged, "semantic", BIG_PACKAGE_FILES, "bigpkg-package");
@@ -725,17 +747,22 @@ try {
     whole_module_peak_bytes: wholeModulePeak,
   });
 
-  // --- big package: resume reuses every staged batch ----------------------
+  // --- big package: reuse valid staged batches and recovered semantics ----
+  const bigCheckpoints = checkpointedUnitIds(bigStore);
   const bigResume = scan("bigpkg-resume", bigRoot, bigStore, shippedWorker);
   assert.equal(bigResume.output.status, "completed", JSON.stringify(bigResume.output.diagnostics));
-  const resumedStaged = goUnits(bigResume).filter((unit) => unit.stage !== "syntax");
+  const resumedStaged = activeGoUnits(bigResume).filter((unit) => unit.stage !== "syntax");
   assert.equal(resumedStaged.length, staged.length);
-  for (const unit of goUnits(bigResume)) {
-    assert.ok(unit.reused, `bigpkg-resume: ${unit.stage} unit ${unit.unit_id} re-ran`);
-  }
+  const bigSemanticReplays = assertValidCheckpointReuse(bigPackage.output, bigResume.output, bigCheckpoints);
   assertPackageBoundedUnits(resumedStaged, "bigpkg-resume");
   assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-resume");
-  record(bigResume, { canonical_graph_equal_to_control: true, reused_staged: resumedStaged.length });
+  record(bigResume, { canonical_graph_equal_to_control: true, reused_staged: resumedStaged.filter((unit) => unit.reused).length, semantic_replays_after_typed_refinement: bigSemanticReplays });
+  if (bigSemanticReplays) {
+    const stable = scan("bigpkg-stable-resume", bigRoot, bigStore, shippedWorker);
+    assert.ok(activeGoUnits(stable).every((unit) => unit.reused), "stable big-package checkpoint re-ran");
+    assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-stable-resume");
+    record(stable, { canonical_graph_equal_to_control: true });
+  }
 
   report.summary = `at ${mib(REDUCED_WORKER_MEMORY_BYTES)} MiB per unit the module-loader control fails `
     + `(${BIG_PACKAGE_FILES}-file package whole-module peak ${mib(wholeModulePeak)} MiB, fan-out ${mib(fanoutWholePeak)} MiB); `

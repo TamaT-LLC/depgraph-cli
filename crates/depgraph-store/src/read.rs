@@ -8,7 +8,7 @@
 //! sibling modules (e.g. `cache`) call across module boundaries are
 //! `pub(crate)`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -474,6 +474,19 @@ pub(crate) fn load_profiles(connection: &Connection, scan_id: &str) -> Result<Ve
 }
 
 pub(crate) fn load_nodes(connection: &Connection, scan_id: &str) -> Result<Vec<NodeRecord>> {
+    let mut records = Vec::new();
+    visit_nodes(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_nodes(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(NodeRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, kind, locator, display_name, properties_json FROM nodes
          WHERE scan_id=?1 ORDER BY id",
@@ -498,7 +511,7 @@ pub(crate) fn load_nodes(connection: &Connection, scan_id: &str) -> Result<Vec<N
             properties: serde_json::from_str(&properties)?,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_scan_topology(connection: &Connection, scan_id: &str) -> Result<GraphTopology> {
@@ -547,6 +560,19 @@ pub(crate) fn topology_from_snapshot(snapshot: GraphSnapshot) -> GraphTopology {
 }
 
 pub(crate) fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<SiteRecord>> {
+    let mut records = Vec::new();
+    visit_sites(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_sites(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(SiteRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, source, kind, specifier, profile_id, resolution_status, precision,
                 condition_json, target_ids_json, reason
@@ -592,7 +618,7 @@ pub(crate) fn load_sites(connection: &Connection, scan_id: &str) -> Result<Vec<S
             reason,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) struct SiteValidationRecord {
@@ -604,37 +630,10 @@ pub(crate) struct SiteValidationRecord {
     pub(crate) target_ids: Vec<String>,
 }
 
-pub(crate) fn load_site_validation_records(
-    connection: &Connection,
-    scan_id: &str,
-) -> Result<Vec<SiteValidationRecord>> {
-    let mut statement = connection.prepare(
-        "SELECT id, source, profile_id, resolution_status, precision, target_ids_json
-         FROM sites WHERE scan_id=?1 ORDER BY id",
-    )?;
-    statement
-        .query_map([scan_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?
-        .map(|row| {
-            let (id, source, profile_id, resolution_status, precision, target_ids) = row?;
-            Ok(SiteValidationRecord {
-                id,
-                source,
-                profile_id,
-                resolution_status,
-                precision,
-                target_ids: serde_json::from_str(&target_ids)?,
-            })
-        })
-        .collect()
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidationTargetKind {
+    ExternalSystem,
+    UnknownTarget,
 }
 
 pub(crate) struct EdgeValidationRecord {
@@ -645,33 +644,108 @@ pub(crate) struct EdgeValidationRecord {
     pub(crate) profile_id: String,
     pub(crate) resolution_status: String,
     pub(crate) precision: String,
+    pub(crate) target_kind: Option<ValidationTargetKind>,
 }
 
-pub(crate) fn load_edge_validation_records(
+/// Merge ordered site and edge cursors, retaining only the current site's
+/// targets and edges. Both tables are decoded completely, including legacy
+/// edges without a site and dangling site references ignored by this check.
+pub(crate) fn visit_site_validation_groups(
     connection: &Connection,
     scan_id: &str,
-) -> Result<Vec<EdgeValidationRecord>> {
-    let mut statement = connection.prepare(
-        "SELECT id, site_id, source, target, profile_id, resolution_status, precision
-         FROM edges WHERE scan_id=?1 ORDER BY id",
+    mut visit: impl FnMut(SiteValidationRecord, &[EdgeValidationRecord]) -> Result<()>,
+) -> Result<()> {
+    // Only sentinel kinds participate in the resolution classification
+    // check. Avoid looking up a full node row for every edge target.
+    let mut sentinel_kinds = HashMap::new();
+    let mut sentinel_statement = connection.prepare(
+        "SELECT id, kind FROM nodes
+         WHERE scan_id=?1 AND kind IN ('external_system', 'unknown_target')",
     )?;
-    statement
-        .query_map([scan_id], |row| {
-            Ok(EdgeValidationRecord {
-                id: row.get(0)?,
-                site_id: row.get(1)?,
-                source: row.get(2)?,
-                target: row.get(3)?,
-                profile_id: row.get(4)?,
-                resolution_status: row.get(5)?,
-                precision: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut sentinels = sentinel_statement.query([scan_id])?;
+    while let Some(row) = sentinels.next()? {
+        let kind = match row.get::<_, String>(1)?.as_str() {
+            "external_system" => ValidationTargetKind::ExternalSystem,
+            "unknown_target" => ValidationTargetKind::UnknownTarget,
+            _ => continue,
+        };
+        // A BLOB node ID cannot equal a decoded TEXT edge target in SQLite.
+        // Keep raw TEXT bytes so unrelated malformed IDs are not decoded by
+        // this check; the ordinary node reader remains responsible for them.
+        if let rusqlite::types::ValueRef::Text(id) = row.get_ref(0)? {
+            sentinel_kinds.insert(id.to_vec(), kind);
+        }
+    }
+    drop(sentinels);
+    drop(sentinel_statement);
+    let mut site_statement = connection.prepare(
+        "SELECT id, source, profile_id, resolution_status, precision, target_ids_json
+         FROM sites WHERE scan_id=?1 ORDER BY id",
+    )?;
+    let mut edge_statement = connection.prepare(
+        "SELECT id, site_id, source, target, profile_id, resolution_status, precision
+         FROM edges WHERE scan_id=?1 ORDER BY site_id, id",
+    )?;
+    let mut edges = edge_statement.query_map([scan_id], |row| {
+        let target: String = row.get(3)?;
+        Ok(EdgeValidationRecord {
+            id: row.get(0)?,
+            site_id: row.get(1)?,
+            source: row.get(2)?,
+            target_kind: sentinel_kinds.get(target.as_bytes()).copied(),
+            target,
+            profile_id: row.get(4)?,
+            resolution_status: row.get(5)?,
+            precision: row.get(6)?,
+        })
+    })?;
+    let mut next_edge = edges.next().transpose()?;
+    let mut sites = site_statement.query([scan_id])?;
+    while let Some(row) = sites.next()? {
+        let target_ids: String = row.get(5)?;
+        let site = SiteValidationRecord {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            profile_id: row.get(2)?,
+            resolution_status: row.get(3)?,
+            precision: row.get(4)?,
+            target_ids: serde_json::from_str(&target_ids)?,
+        };
+        let mut site_edges = Vec::new();
+        while next_edge
+            .as_ref()
+            .is_some_and(|edge| edge.site_id.as_deref() <= Some(site.id.as_str()))
+        {
+            let edge = next_edge.take().expect("the next edge was just checked");
+            if edge.site_id.as_deref() == Some(site.id.as_str()) {
+                site_edges.push(edge);
+            }
+            next_edge = edges.next().transpose()?;
+        }
+        visit(site, &site_edges)?;
+    }
+    // The lookahead has already been decoded. Decode every remaining edge
+    // too, even when its site does not exist or the scan has no sites.
+    for edge in edges {
+        edge?;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<EdgeRecord>> {
+    let mut records = Vec::new();
+    visit_edges(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_edges(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(EdgeRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT id, site_id, source, target, kind, phase, environment, profile_id,
                 resolution_status, precision, condition_json, generated
@@ -723,10 +797,23 @@ pub(crate) fn load_edges(connection: &Connection, scan_id: &str) -> Result<Vec<E
             generated,
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_evidence(connection: &Connection, scan_id: &str) -> Result<Vec<EvidenceRecord>> {
+    let mut records = Vec::new();
+    visit_evidence(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_evidence(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(EvidenceRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT owner_type, owner_id, ordinal, kind, extractor, extractor_version, path,
                 start_line, start_column, end_line, end_column, raw_json
@@ -786,7 +873,7 @@ pub(crate) fn load_evidence(connection: &Connection, scan_id: &str) -> Result<Ve
                 .unwrap_or_else(|| json!({})),
         })
     })
-    .collect()
+    .try_for_each(|record: Result<_>| visit(record?))
 }
 
 pub(crate) fn load_diagnostics(
@@ -837,11 +924,24 @@ pub(crate) fn load_file_coverage(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<Vec<FileCoverageRecord>> {
+    let mut records = Vec::new();
+    visit_file_coverage(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_file_coverage(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(FileCoverageRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT adapter, path, discovered_sites, emitted_sites, skipped_sites, skipped, reason
            FROM file_coverage WHERE scan_id=?1 ORDER BY adapter, path",
     )?;
-    let rows = statement.query_map([scan_id], |row| {
+    let mut rows = statement.query_map([scan_id], |row| {
         Ok(FileCoverageRecord {
             adapter: row.get(0)?,
             path: row.get(1)?,
@@ -852,26 +952,37 @@ pub(crate) fn load_file_coverage(
             reason: row.get(6)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    rows.try_for_each(|row| visit(row?))
 }
 
 pub(crate) fn load_adapter_logs(
     connection: &Connection,
     scan_id: &str,
 ) -> Result<Vec<AdapterLogRecord>> {
+    let mut records = Vec::new();
+    visit_adapter_logs(connection, scan_id, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub(crate) fn visit_adapter_logs(
+    connection: &Connection,
+    scan_id: &str,
+    mut visit: impl FnMut(AdapterLogRecord) -> Result<()>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT adapter, stderr, truncated FROM adapter_logs WHERE scan_id=?1 ORDER BY adapter",
     )?;
-    let rows = statement.query_map([scan_id], |row| {
+    let mut rows = statement.query_map([scan_id], |row| {
         Ok(AdapterLogRecord {
             adapter: row.get(0)?,
             stderr: row.get(1)?,
             truncated: row.get(2)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    rows.try_for_each(|row| visit(row?))
 }
 
 /// Refresh staging coverage from normalized counters without reconstructing
@@ -891,20 +1002,10 @@ pub(crate) fn load_staging_coverage(
         )
         .optional()?
         .with_context(|| format!("scan {scan_id} was not found"))?;
-    let mut coverage = stored
+    let stored = stored
         .map(|raw| serde_json::from_str::<CoverageRecord>(&raw))
-        .transpose()?
-        .unwrap_or_else(|| CoverageRecord {
-            reasons: vec!["final worker coverage unavailable".to_owned()],
-            ..CoverageRecord::default()
-        });
-    (
-        coverage.dependency_sites,
-        coverage.resolved,
-        coverage.candidates,
-        coverage.external,
-        coverage.unresolved,
-    ) = connection.query_row(
+        .transpose()?;
+    let site_counts = connection.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(resolution_status='resolved'), 0),
                 COALESCE(SUM(resolution_status='candidates'), 0),
@@ -922,6 +1023,63 @@ pub(crate) fn load_staging_coverage(
             ))
         },
     )?;
+    coverage_with_observed_counts(connection, scan_id, site_counts, executed, stored)
+}
+
+pub(crate) fn observed_coverage(
+    connection: &Connection,
+    scan_id: &str,
+    sites: &[SiteRecord],
+    project_code_executed: bool,
+    stored: Option<CoverageRecord>,
+) -> Result<CoverageRecord> {
+    let mut resolved = 0;
+    let mut candidates = 0;
+    let mut external = 0;
+    let mut unresolved = 0;
+    for site in sites {
+        match site.resolution_status.as_str() {
+            "resolved" => resolved += 1,
+            "candidates" => candidates += 1,
+            "external" => external += 1,
+            "unresolved" => unresolved += 1,
+            _ => {}
+        }
+    }
+    coverage_with_observed_counts(
+        connection,
+        scan_id,
+        (
+            sites.len() as u64,
+            resolved,
+            candidates,
+            external,
+            unresolved,
+        ),
+        project_code_executed,
+        stored,
+    )
+}
+
+fn coverage_with_observed_counts(
+    connection: &Connection,
+    scan_id: &str,
+    site_counts: (u64, u64, u64, u64, u64),
+    project_code_executed: bool,
+    stored: Option<CoverageRecord>,
+) -> Result<CoverageRecord> {
+    let had_final_coverage = stored.is_some();
+    let mut coverage = stored.unwrap_or_else(|| CoverageRecord {
+        reasons: vec!["final worker coverage unavailable".to_owned()],
+        ..CoverageRecord::default()
+    });
+    (
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+    ) = site_counts;
     (
         coverage.profiles,
         coverage.files_discovered,
@@ -936,49 +1094,6 @@ pub(crate) fn load_staging_coverage(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     coverage.files_analyzed = coverage.files_discovered - coverage.files_skipped;
-    coverage.project_code_executed |= executed;
-    Ok(coverage)
-}
-
-pub(crate) fn observed_coverage(
-    connection: &Connection,
-    scan_id: &str,
-    sites: &[SiteRecord],
-    project_code_executed: bool,
-    stored: Option<CoverageRecord>,
-) -> Result<CoverageRecord> {
-    let had_final_coverage = stored.is_some();
-    let mut coverage = stored.unwrap_or_else(|| CoverageRecord {
-        reasons: vec!["final worker coverage unavailable".to_owned()],
-        ..CoverageRecord::default()
-    });
-    coverage.dependency_sites = sites.len() as u64;
-    coverage.resolved = 0;
-    coverage.candidates = 0;
-    coverage.external = 0;
-    coverage.unresolved = 0;
-    for site in sites {
-        match site.resolution_status.as_str() {
-            "resolved" => coverage.resolved += 1,
-            "candidates" => coverage.candidates += 1,
-            "external" => coverage.external += 1,
-            "unresolved" => coverage.unresolved += 1,
-            _ => {}
-        }
-    }
-    let (profiles, files, skipped): (i64, i64, i64) = connection.query_row(
-        "SELECT
-            (SELECT COUNT(*) FROM profiles WHERE scan_id=?1),
-            (SELECT COUNT(*) FROM file_coverage WHERE scan_id=?1),
-            (SELECT COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0)
-               FROM file_coverage WHERE scan_id=?1)",
-        [scan_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    coverage.profiles = profiles as u64;
-    coverage.files_discovered = files as u64;
-    coverage.files_skipped = skipped as u64;
-    coverage.files_analyzed = (files - skipped) as u64;
     coverage.project_code_executed |= project_code_executed;
     if !had_final_coverage {
         coverage.completeness.clear();

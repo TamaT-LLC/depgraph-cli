@@ -70,6 +70,70 @@ pub(crate) struct StagedUnitCheckpoint {
 }
 
 impl UnitCheckpointStore {
+    /// Disposable planning hints. They never authorize output reuse: the
+    /// planner rebuilds the plan and each resulting unit still validates its
+    /// own input, execution and reference witnesses.
+    pub(crate) fn read_refinements(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<crate::analysis_split::AnalysisSplitRefinement>>> {
+        let path = self.directory.join(format!("refinements-{key}.json"));
+        let limit = self.max_bytes.min(1024 * 1024);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limit as u64
+        {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        open_checkpoint(&path)?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Ok(None);
+        }
+        let Ok(value) = serde_json::from_slice::<RefinementCheckpoint>(&bytes) else {
+            return Ok(None);
+        };
+        if value.contract != "depgraph-analysis-refinements-v1"
+            || value.key != key
+            || value.digest
+                != format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&value.refinements)?)
+                )
+        {
+            return Ok(None);
+        }
+        Ok(Some(value.refinements))
+    }
+
+    pub(crate) fn write_refinements(
+        &self,
+        key: &str,
+        refinements: &[crate::analysis_split::AnalysisSplitRefinement],
+    ) -> Result<()> {
+        let value = RefinementCheckpoint {
+            contract: "depgraph-analysis-refinements-v1".to_owned(),
+            key: key.to_owned(),
+            digest: format!("{:x}", Sha256::digest(serde_json::to_vec(refinements)?)),
+            refinements: refinements.to_vec(),
+        };
+        let bytes = serde_json::to_vec(&value)?;
+        if bytes.len() > self.max_bytes.min(1024 * 1024) {
+            return Ok(());
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        file.write_all(&bytes)?;
+        file.as_file().sync_all()?;
+        file.persist(self.directory.join(format!("refinements-{key}.json")))
+            .map_err(|error| error.error)?;
+        self.prune()
+    }
+
     pub fn open(store_path: &Path, max_bytes: usize) -> Result<Self> {
         let parent = store_path
             .parent()
@@ -207,6 +271,15 @@ impl UnitCheckpointStore {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RefinementCheckpoint {
+    contract: String,
+    key: String,
+    digest: String,
+    refinements: Vec<crate::analysis_split::AnalysisSplitRefinement>,
+}
+
 /// The Go build cache one scan shares across its package-scoped units.
 ///
 /// `go list -export` of a package-bounded unit compiles the export data of
@@ -319,6 +392,34 @@ mod tests {
             json!({"event":"scan_started"}),
             json!({"event":"scan_completed"}),
         ]
+    }
+
+    #[test]
+    fn refinement_hints_are_atomic_bounded_and_reject_changed_payloads() -> Result<()> {
+        use crate::analysis_split::{AnalysisResplitTrigger, AnalysisSplitRefinement};
+        let temp = tempfile::tempdir()?;
+        let store = UnitCheckpointStore::open(&temp.path().join("store"), 4096)?;
+        let refinements = vec![AnalysisSplitRefinement {
+            execution_unit_id: "unit-a".into(),
+            trigger: AnalysisResplitTrigger::WorkerMemory,
+        }];
+        assert_eq!(store.read_refinements("key-a")?, None);
+        store.write_refinements("key-a", &refinements)?;
+        assert_eq!(store.read_refinements("key-a")?, Some(refinements.clone()));
+        assert_eq!(store.read_refinements("key-b")?, None);
+        let path = store.directory.join("refinements-key-a.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        value["refinements"][0]["execution_unit_id"] = json!("unit-b");
+        fs::write(&path, serde_json::to_vec(&value)?)?;
+        assert_eq!(store.read_refinements("key-a")?, None);
+        fs::write(&path, b"{")?;
+        assert_eq!(store.read_refinements("key-a")?, None);
+        fs::write(&path, vec![b' '; 4097])?;
+        assert_eq!(store.read_refinements("key-a")?, None);
+        let small = UnitCheckpointStore::open(&temp.path().join("small"), 1)?;
+        small.write_refinements("key-a", &refinements)?;
+        assert_eq!(small.read_refinements("key-a")?, None);
+        Ok(())
     }
 
     #[test]

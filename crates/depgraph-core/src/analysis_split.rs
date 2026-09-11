@@ -757,7 +757,9 @@ pub struct AnalysisExecutionUnit {
     pub unit_id: String,
     pub adapter: AnalysisAdapter,
     pub stage: AnalysisStage,
+    /// Stable slot within this unit and stage; retained batches are never renumbered.
     pub batch_index: u64,
+    /// Slot count when this batch was created, preserved across later refinements.
     pub batch_count: u64,
     pub split_kind: AnalysisSplitKind,
     pub split_reasons: Vec<AnalysisSplitReason>,

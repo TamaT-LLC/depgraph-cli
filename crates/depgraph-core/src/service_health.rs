@@ -10,6 +10,10 @@ use depgraph_store::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[path = "service_health_collection.rs"]
+mod collection;
+use collection::{CollectedFindings, FindingCollector, FindingSelection};
+
 use crate::{
     CancellationToken,
     bounded_query::{QueryFailureClass, read_bounded_repository_file},
@@ -25,7 +29,7 @@ use crate::{
         range_checkpoint::HealthRangeCheckpointStore,
         ranged::{
             HealthRangeDiagnostics, RangeOrder, RangedHealthError, RangedUnusedOptions,
-            analyze_dependencies_ranged, analyze_unused_ranged, load_dependency_projection,
+            analyze_dependencies_ranged, analyze_unused_ranged_to, load_dependency_projection,
         },
         score_hotspots_cancellable,
     },
@@ -554,31 +558,14 @@ impl DepgraphService {
         let snapshot_id = snapshot_request.snapshot_id().clone();
         let collected = self.collect_snapshot_scoped_request(
             snapshot_request,
+            FindingSelection::Summary(request.kinds.as_deref()),
             request.allow_partial,
             cancellation,
         )?;
-        let filtered = collected.findings.into_iter().filter(|finding| {
-            request
-                .kinds
-                .as_ref()
-                .is_none_or(|kinds| kinds.contains(&finding.kind))
-        });
-        let mut counts_by_kind = BTreeMap::new();
-        let mut counts_by_confidence = BTreeMap::new();
-        let mut ids = Vec::new();
-        for finding in filtered {
-            *counts_by_kind
-                .entry(finding.kind.as_str().to_owned())
-                .or_insert(0) += 1;
-            *counts_by_confidence
-                .entry(finding.confidence.as_str().to_owned())
-                .or_insert(0) += 1;
-            ids.push(finding.id);
-        }
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        let collection_digest = collection_digest(
+        let collection_digest = collected.findings.ids.digest(
             &CollectionIdentity {
                 snapshot_ids: vec![snapshot_id.as_str().to_owned()],
                 manifest_digest: collected.manifest_digest.clone(),
@@ -590,15 +577,15 @@ impl DepgraphService {
                 hotspot_weights: None,
                 partial_ranges: collected.diagnostics.partial_range_status(),
             },
-            &ids,
-        );
+            cancellation,
+        )?;
         Ok(HealthSummaryResult {
             snapshot_id,
             scan_id: collected.scan_id,
             collection_digest,
             manifest_digest: collected.manifest_digest,
-            counts_by_kind,
-            counts_by_confidence,
+            counts_by_kind: collected.findings.counts_by_kind,
+            counts_by_confidence: collected.findings.counts_by_confidence,
             coverage: HealthCoverageOverview {
                 completeness: collected.coverage.completeness,
                 files_skipped: collected.coverage.files_skipped,
@@ -618,20 +605,11 @@ impl DepgraphService {
         let snapshot_id = snapshot_request.snapshot_id().clone();
         let collected = self.collect_snapshot_scoped_request(
             snapshot_request,
+            FindingSelection::List(request),
             request.allow_partial,
             cancellation,
         )?;
-        let mut findings = collected.findings;
-        findings.retain(|finding| {
-            (request.kinds.is_empty() || request.kinds.contains(&finding.kind))
-                && (request.severities.is_empty() || request.severities.contains(&finding.severity))
-                && (request.confidences.is_empty()
-                    || request.confidences.contains(&finding.confidence))
-        });
-        findings.sort_by(|left, right| left.id.cmp(&right.id));
-        if findings.len() > request.limit {
-            findings.truncate(request.limit);
-        }
+        let findings = collected.findings.findings;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
@@ -672,6 +650,7 @@ impl DepgraphService {
     fn collect_snapshot_scoped_request(
         &self,
         snapshot_request: &mut SnapshotReadRequest,
+        selection: FindingSelection<'_>,
         allow_partial: bool,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<SnapshotScopedCollection> {
@@ -704,9 +683,15 @@ impl DepgraphService {
                     store,
                     &identity,
                     &root,
-                    limits,
-                    allow_partial,
-                    checkpoints,
+                    selection,
+                    RangedUnusedOptions {
+                        limits,
+                        maximum_findings: MAX_HEALTH_FINDINGS,
+                        allow_partial,
+                        order: RangeOrder::Forward,
+                        checkpoints,
+                        progress: None,
+                    },
                     cancellation,
                 );
                 // The projection is connection-scoped scratch space; a failure
@@ -728,6 +713,7 @@ impl DepgraphService {
                 collect_snapshot_scoped(
                     &snapshot,
                     self.config().canonical_root(),
+                    selection,
                     HealthRangeDiagnostics::whole_snapshot(identity.layers, limits.per_range_work),
                     cancellation,
                 )
@@ -741,17 +727,14 @@ impl DepgraphService {
         request: &HealthFindingGetRequest,
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<HealthFindingDetail> {
-        let result = self.health_findings(
+        let result = self.collect_snapshot_scoped_request(
             snapshot_request,
-            &HealthFindingsRequest::try_new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                MAX_HEALTH_FINDINGS,
-            )?,
+            FindingSelection::Detail(&request.finding_id),
+            false,
             cancellation,
         )?;
         let Some(finding) = result
+            .findings
             .findings
             .into_iter()
             .find(|finding| finding.id == request.finding_id)
@@ -1095,7 +1078,7 @@ fn evaluate_audit_boundary_ids_with_limit(
 }
 
 struct SnapshotScopedCollection {
-    findings: Vec<HealthFinding>,
+    findings: CollectedFindings,
     manifest_digest: Option<String>,
     scan_id: String,
     coverage: CoverageRecord,
@@ -1106,6 +1089,7 @@ struct SnapshotScopedCollection {
 fn collect_snapshot_scoped(
     snapshot: &GraphSnapshot,
     root: &Path,
+    selection: FindingSelection<'_>,
     diagnostics: HealthRangeDiagnostics,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<SnapshotScopedCollection> {
@@ -1134,10 +1118,10 @@ fn collect_snapshot_scoped(
         )
         .map_err(map_health_analysis_error)?,
     );
-    findings.retain(|finding| finding.kind.is_snapshot_scoped());
-    findings.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut collector = FindingCollector::new(selection)?;
+    collector.add(findings, cancellation)?;
     Ok(SnapshotScopedCollection {
-        findings: bound_findings(findings)?,
+        findings: collector.finish(&diagnostics, cancellation)?,
         manifest_digest: manifests_digest(&manifests),
         scan_id: snapshot.scan.id.clone(),
         coverage: snapshot.coverage.clone(),
@@ -1150,9 +1134,8 @@ fn collect_ranged(
     store: &Store,
     identity: &HealthInputIdentity,
     root: &Path,
-    limits: HealthRangeLimits,
-    allow_partial: bool,
-    checkpoints: Option<HealthRangeCheckpointStore>,
+    selection: FindingSelection<'_>,
+    options: RangedUnusedOptions<'_>,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<SnapshotScopedCollection> {
     let map_ranged_error = |error: RangedHealthError| match error {
@@ -1160,23 +1143,24 @@ fn collect_ranged(
         RangedHealthError::Store(_) if cancellation.is_cancelled() => {
             DepgraphServiceError::Cancelled
         }
-        RangedHealthError::Store(source) => DepgraphServiceError::store_operation(source),
+        RangedHealthError::Store(source) => source
+            .downcast::<DepgraphServiceError>()
+            .unwrap_or_else(DepgraphServiceError::store_operation),
     };
-    let unused = analyze_unused_ranged(
+    let mut collector = FindingCollector::new(selection)?;
+    let limits = options.limits;
+    let unused = analyze_unused_ranged_to(
         store,
         identity,
-        RangedUnusedOptions {
-            limits,
-            maximum_findings: MAX_HEALTH_FINDINGS,
-            allow_partial,
-            order: RangeOrder::Forward,
-            checkpoints,
-            progress: None,
-        },
+        options,
         || cancellation.is_cancelled(),
+        |findings| {
+            collector
+                .add(findings, cancellation)
+                .map_err(anyhow::Error::from)
+        },
     )
     .map_err(map_ranged_error)?;
-    let mut findings = unused.findings;
     let mut diagnostics = unused.diagnostics;
 
     // Dependency findings read the trimmed projection (no evidence or
@@ -1187,29 +1171,21 @@ fn collect_ranged(
     .map_err(map_ranged_error)?;
     diagnostics.work.dependencies_load = projection.work_used;
     let manifests = load_manifests(root, &projection.snapshot, cancellation)?;
-    let remaining = MAX_HEALTH_FINDINGS.saturating_sub(findings.len());
-    let (dependency_findings, dependency_work) =
-        analyze_dependencies_ranged(&projection.snapshot, &manifests, remaining, &limits, || {
-            cancellation.is_cancelled()
-        })
-        .map_err(map_health_analysis_error)?;
+    let (dependency_findings, dependency_work) = analyze_dependencies_ranged(
+        &projection.snapshot,
+        &manifests,
+        MAX_HEALTH_FINDINGS,
+        &limits,
+        || cancellation.is_cancelled(),
+    )
+    .map_err(map_health_analysis_error)?;
     diagnostics.work.dependencies = dependency_work;
     drop(projection);
-    if diagnostics.partial {
-        // Dependency findings are complete on their own, but the collection
-        // they join is not; mark them like the unused findings so nothing in
-        // a partial view reads as confirmed.
-        let mut partial = dependency_findings;
-        crate::health::ranged::mark_partial(&mut partial, &diagnostics);
-        findings.extend(partial);
-    } else {
-        findings.extend(dependency_findings);
-    }
-    findings.retain(|finding| finding.kind.is_snapshot_scoped());
-    findings.sort_by(|left, right| left.id.cmp(&right.id));
+    collector.add(dependency_findings, cancellation)?;
+    let findings = collector.finish(&diagnostics, cancellation)?;
     diagnostics.peak_rss_kib = crate::health::ranged::peak_rss_kib();
     Ok(SnapshotScopedCollection {
-        findings: bound_findings(findings)?,
+        findings,
         manifest_digest: manifests_digest(&manifests),
         scan_id: unused.scan.id,
         coverage: unused.coverage,
@@ -1822,6 +1798,7 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
             profile_matrix: ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         }
     }
 

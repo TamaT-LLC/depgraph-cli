@@ -105,6 +105,10 @@ export interface TypeScriptStaticConfig {
 }
 
 export interface TypeScriptAnalysisOptions {
+  /** Assigned static framework configs; retained for framework collectors only. */
+  frameworkConfigPaths?: ReadonlySet<string>;
+  /** Bounded export names needed by framework entrypoints without import sites. */
+  moduleExportPaths?: readonly (readonly string[])[];
   /** Source files whose AST/semantic DTOs may be returned to the scanner. */
   sourcePaths?: ReadonlySet<string>;
   /**
@@ -114,6 +118,8 @@ export interface TypeScriptAnalysisOptions {
    * DTOs against the same TypeChecker.
    */
   astPaths?: ReadonlySet<string>;
+  /** ASTs needed for declarations; other retained ASTs only attest file targets. */
+  definitionPaths?: ReadonlySet<string>;
   /** A bounded AST selection could not include every required context target. */
   astSelectionTruncated?: boolean;
   /** Syntax units defer semantic graph extraction to their semantic stage. */
@@ -133,6 +139,7 @@ export interface TypeOnlyDependencyRange {
 
 export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagnostic[]> {
   readonly semanticSourceFiles = new Map<string, SourceFile>();
+  readonly frameworkConfigSourceFiles = new Map<string, SourceFile>();
   readonly typeOnlyDependencyRanges = new Map<string, TypeOnlyDependencyRange[]>();
   readonly importTypeModuleSpans = new Map<string, Array<{ startOffset: number; endOffset: number }>>();
   readonly moduleCallSpans = new Map<string, TypeScriptModuleCallValidationSpan[]>();
@@ -181,12 +188,14 @@ export class TypeScriptProjectAnalysis extends Map<string, TypeScriptSyntaxDiagn
 interface CompilerConnection {
   onError(listener: (error: Error) => void): { dispose(): void };
   onClose(listener: () => void): { dispose(): void };
+  dispose(): void;
 }
 
 interface CompilerClientInternals {
   client?: {
     process?: ChildProcess;
     connection?: CompilerConnection;
+    close?(): Promise<void>;
   };
 }
 
@@ -205,11 +214,14 @@ export type TypeScriptProjectFailureReason =
 
 export class TypeScriptProjectError extends Error {
   readonly reason: TypeScriptProjectFailureReason;
+  readonly exitCode: number;
 
   constructor(reason: TypeScriptProjectFailureReason, message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "TypeScriptProjectError";
     this.reason = reason;
+    // The supervisor reserves 124 for an adapter's internal time budget.
+    this.exitCode = reason === "compiler_timeout" ? 124 : 3;
   }
 }
 
@@ -266,9 +278,11 @@ interface BundledStandardLibrary {
 }
 
 export interface TypeScriptAnalysisTestRuntime {
-  compiler: string;
-  standardLibraryRoot: string;
-  timeoutMs: number;
+  compiler?: string;
+  standardLibraryRoot?: string;
+  timeoutMs?: number;
+  /** Lower the source cap to exercise the real compiler boundary with small fixtures. */
+  maxDefinitionSourceFiles?: number;
 }
 
 export type TypeScriptLifecycleTestMode = "crash" | "protocol-error" | "timeout" | "strict-close";
@@ -506,7 +520,14 @@ async function closeCompiler(
 ): Promise<void> {
   const child = retainedChild;
   if (force) {
-    child?.kill("SIGKILL");
+    // Reject pending requests and discard queued VFS callbacks while the
+    // transport is still alive. Killing first leaves JSON-RPC replies racing
+    // writes to a destroyed pipe, which can replace the timeout exit code.
+    const client = (api as unknown as CompilerClientInternals).client;
+    client?.connection?.dispose();
+    // Let rejected operations unwind their snapshot finalizers before close
+    // resets the client's connected state; otherwise cleanup can reconnect.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     let closeTimer: NodeJS.Timeout | undefined;
     await Promise.race([
       api.close().catch(() => undefined),
@@ -515,12 +536,18 @@ async function closeCompiler(
       }),
     ]);
     if (closeTimer) clearTimeout(closeTimer);
+    await client?.close?.().catch(() => undefined);
     if (child && !(await waitForExit(child, 1_000))) {
       child.kill("SIGKILL");
       if (!(await waitForExit(child, 1_000))) {
         throw new CompilerProtocolError("TypeScript native compiler could not be reaped after forced close");
       }
     }
+    // The disposed reader no longer drains stdout. Release any unread pipe
+    // data after reaping so failed analysis cannot keep the worker alive.
+    child?.stdin?.destroy();
+    child?.stdout?.destroy();
+    child?.stderr?.destroy();
     return;
   }
 
@@ -742,6 +769,10 @@ async function analyzeTypeScriptProjectInner(
       moduleDetection: "force",
       moduleResolution: "bundler",
       noEmit: true,
+      // Syntax units only need the native parser for their owned sources.
+      // Import resolution and project-wide diagnostics belong to semantic
+      // units, which still load the complete isolated compiler context.
+      ...(options.stage === "syntax" ? { noResolve: true } : {}),
       paths: Object.fromEntries(Object.entries(staticConfig.paths).map(([pattern, replacements]) => [
         pattern,
         replacements.map((replacement) => replacement.startsWith(".") ? replacement : `./${replacement}`),
@@ -779,6 +810,9 @@ async function analyzeTypeScriptProjectInner(
       const requestedAstPaths = options.astPaths === undefined
         ? new Set(sources.keys())
         : new Set([...options.astPaths].filter((relativePath) => sources.has(relativePath)));
+      const requestedDefinitionPaths = options.definitionPaths === undefined
+        ? requestedAstPaths
+        : new Set([...requestedAstPaths].filter((relativePath) => options.definitionPaths!.has(relativePath)));
       const requestedAstBytes = [...requestedAstPaths].reduce(
         (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
         0,
@@ -793,14 +827,18 @@ async function analyzeTypeScriptProjectInner(
       const actualRoots = new Set(project.rootFiles.map(pathKey));
       const sourceFiles = new Map<string, SourceFile>();
       const dependencyValidationQueryBudget = { value: 0 };
-      const definitionSourceLimitExceeded = requestedAstPaths.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
+      const definitionSourceLimit = Math.min(
+        testRuntime?.maxDefinitionSourceFiles ?? TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
+        TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
+      );
+      const definitionSourceLimitExceeded = requestedDefinitionPaths.size > definitionSourceLimit;
       if (definitionSourceLimitExceeded) {
         result.definitionGraph = {
           definitions: [],
           relations: [],
           issues: [{
             code: "typescript_semantic_source_limit_exceeded",
-            message: `TypeScript semantic definition extraction received ${requestedAstPaths.size} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
+            message: `TypeScript semantic definition extraction received ${requestedDefinitionPaths.size} sources; limit=${definitionSourceLimit}`,
             relativePath: null,
             fatal: true,
           }],
@@ -828,6 +866,7 @@ async function analyzeTypeScriptProjectInner(
           throw new Error(`TypeScript native project analysis returned an AST that disagrees with the confined inventory (${sourceMismatches.join(",")}) for ${relativePath}`);
         }
         sourceFiles.set(relativePath, sourceFile);
+        if (options.frameworkConfigPaths?.has(relativePath)) result.frameworkConfigSourceFiles.set(relativePath, sourceFile);
         if (options.sourcePaths === undefined || options.sourcePaths.has(relativePath)) {
           result.semanticSourceFiles.set(relativePath, sourceFile);
         }
@@ -928,18 +967,28 @@ async function analyzeTypeScriptProjectInner(
             sourceFile,
             syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
           }));
-        progress.start("typescript_definition_graph", { source_files: semanticSources.length });
+        const definitionSources = semanticSources.filter((source) => requestedDefinitionPaths.has(source.relativePath));
+        progress.start("typescript_definition_graph", { source_files: definitionSources.length });
         result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
           project.checker,
-          semanticSources,
+          definitionSources,
         );
+        const definitionSourcePaths = new Set(definitionSources.map((source) => source.relativePath));
+        if ([...syntacticallyInvalidPaths].some((relativePath) => !definitionSourcePaths.has(relativePath))) {
+          result.definitionGraph.issues.push({
+            code: "typescript_semantic_syntax_invalid",
+            message: "Compiler context outside the declaration batch contains syntactic diagnostics",
+            relativePath: null,
+            fatal: false,
+          });
+        }
         progress.complete("typescript_definition_graph", {
           definitions: result.definitionGraph.definitions.length,
-          source_files: semanticSources.length,
+          source_files: definitionSources.length,
         });
         if (!result.definitionGraph.issues.some((issue) => issue.fatal)) {
-          // Keep the full project source list for canonical definition and
-          // export identity, but traverse dependency/call occurrences only
+          // Keep every retained AST for file-target attestation and canonical
+          // export lookup, but traverse dependency/call occurrences only
           // for this batch. The TypeChecker still resolves each occurrence
           // against the same Program, so imports, re-exports and calls into a
           // context-only file retain their targets without retaining a second
@@ -957,7 +1006,7 @@ async function analyzeTypeScriptProjectInner(
             result.definitionGraph,
             result.definitionGraph.typeCheckerQueries,
             result,
-            options.sourcePaths === undefined ? {} : { sourcePaths: options.sourcePaths },
+            options,
           );
           progress.complete("typescript_dependency_graph", {
             dependency_sites: result.dependencyGraph.sites.length,
@@ -979,11 +1028,11 @@ async function analyzeTypeScriptProjectInner(
         + result.dependencyGraph.typeCheckerQueries
         + dependencyValidationQueryBudget.value;
       progress.start("typescript_semantic_diagnostics", { source_files: sources.size });
-      const diagnostics = [
+      const diagnostics = (options.stage === "syntax" ? [] : [
         ...await project.program.getProgramDiagnostics(),
         ...await project.program.getGlobalDiagnostics(),
         ...await project.program.getSemanticDiagnostics(),
-      ].map((diagnostic) => semanticDiagnostic(
+      ]).map((diagnostic) => semanticDiagnostic(
         diagnostic,
         sources,
         virtualToRelative,
@@ -1072,6 +1121,10 @@ export async function exerciseTypeScriptCompilerLifecycleForTest(
   const errorListeners = new Set<(error: Error) => void>();
   const closeListeners = new Set<() => void>();
   const connection: CompilerConnection = {
+    dispose: () => {
+      errorListeners.clear();
+      closeListeners.clear();
+    },
     onError: (listener) => {
       errorListeners.add(listener);
       return { dispose: () => { errorListeners.delete(listener); } };
@@ -1137,9 +1190,10 @@ export async function analyzeTypeScriptProject(
 export async function analyzeTypeScriptProjectWithRuntimeForTest(
   sources: ReadonlyMap<string, string>,
   runtime: TypeScriptAnalysisTestRuntime,
+  options: TypeScriptAnalysisOptions = {},
 ): Promise<TypeScriptProjectAnalysis> {
   try {
-    return await analyzeTypeScriptProjectInner(sources, { configFiles: 0, paths: {} }, runtime);
+    return await analyzeTypeScriptProjectInner(sources, { configFiles: 0, paths: {} }, runtime, NOOP_PROGRESS, options);
   } catch (error) {
     throw projectFailure(error);
   }

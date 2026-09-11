@@ -13,9 +13,33 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/tools/go/packages"
 )
+
+func TestGoLoaderTimeoutUsesTheWorkerBudgetAndRejectsInvalidValues(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{"300", 300 * time.Second},
+		{"7", 7 * time.Second},
+		{"", goPackagesLoadTimeout},
+		{"0", goPackagesLoadTimeout},
+		{"-1", goPackagesLoadTimeout},
+		{"1s", goPackagesLoadTimeout},
+		{"9223372037", goPackagesLoadTimeout},
+		{"18446744073709551616", goPackagesLoadTimeout},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			t.Setenv("DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS", test.value)
+			if got := configuredGoLoaderTimeout(); got != test.want {
+				t.Fatalf("timeout = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
 
 // goLoaderTestModules discovers and parses every go.mod under root the same
 // way the scanner does, so loader tests see the same module identities.
@@ -301,12 +325,29 @@ func TestGoLoaderPackageScopeLoadsTargetsFromSourceAndDependenciesFromExportData
 	modules := goLoaderTestModules(t, root)
 	module := goLoaderTestModule(t, modules, ".")
 	session := goLoaderTestSession(t, root, "")
+	load := session.loader
+	exportSeen := false
+	session.loader = func(config *packages.Config, patterns ...string) ([]*packages.Package, error) {
+		wantFlags := []string{"-tags=depgraph_fixture"}
+		if config.Mode == goLoaderExportMode {
+			exportSeen = true
+			wantFlags = append(wantFlags, "-gcflags=all=-N -l")
+		}
+		if strings.Join(config.BuildFlags, "|") != strings.Join(wantFlags, "|") {
+			t.Fatalf("load mode %v flags = %v, want %v", config.Mode, config.BuildFlags, wantFlags)
+		}
+		return load(config, patterns...)
+	}
 
 	result := session.loadPackageScope(goLoaderScope{
 		Module: module, Modules: modules, Targets: []goLoaderTargetSpec{{Dir: "use", PkgPath: goLoaderBasicModule + "/use"}},
+		Tags: []string{"depgraph_fixture"},
 	}, nil)
 	if result.Status != "loaded" {
 		t.Fatalf("status = %q, diagnostics:\n%s", result.Status, goLoaderDiagnosticSummary(result.Diagnostics))
+	}
+	if !exportSeen {
+		t.Fatal("the fixture did not exercise the dependency export-data load")
 	}
 	wantTargets := []string{
 		goLoaderBasicModule + "/use",

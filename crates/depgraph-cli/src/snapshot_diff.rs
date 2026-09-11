@@ -1204,6 +1204,7 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
             profile_matrix: depgraph_store::ProfileMatrixRecord::default(),
+            analysis_dependency_coverage: None,
         };
         to.evidence.push(EvidenceRecord {
             owner_type: "edge".to_owned(),

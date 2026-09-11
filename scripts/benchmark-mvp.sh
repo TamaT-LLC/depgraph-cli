@@ -11,6 +11,22 @@ daemon_pid=""
 incremental_store=""
 
 cleanup() {
+  local exit_status=$?
+  if [[ -n "${DEPGRAPH_BENCH_DIAGNOSTICS_DIR:-}" ]]; then
+    mkdir -p "$DEPGRAPH_BENCH_DIAGNOSTICS_DIR"
+    printf '%d\n' "$exit_status" > "$DEPGRAPH_BENCH_DIAGNOSTICS_DIR/exit-status.txt"
+    # Preserve timings and worker summaries even when the final report cannot
+    # be produced. Full graph exports and databases are intentionally omitted.
+    local item
+    for item in "$raw"/*; do
+      [[ -f "$item" ]] || continue
+      case "$(basename "$item")" in
+        *-ms.txt|initial-scan-*.json|cache-*-warmup.json|cache-*-hit-[0-9]*.json|cache-*-bypass-[0-9]*.json|daemon*.json|daemon.log|incremental-status-*.json)
+          cp "$item" "$DEPGRAPH_BENCH_DIAGNOSTICS_DIR/"
+          ;;
+      esac
+    done
+  fi
   if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     "$binary" --store "$incremental_store" daemon stop "$fixture" --json >/dev/null 2>&1 || true
     wait "$daemon_pid" 2>/dev/null || true

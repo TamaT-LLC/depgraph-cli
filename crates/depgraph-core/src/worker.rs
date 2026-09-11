@@ -91,6 +91,7 @@ const PROTOCOL_SCHEMA_PATH: &str = "schemas/depgraph-protocol-v1.schema.json";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const PROJECT_LICENSE_PATHS: [&str; 2] = ["LICENSE-APACHE", "LICENSE-MIT"];
 const WEB_SEMANTIC_CAPABILITIES: &[&str] = &[
+    "analysis-source-batch-v1",
     "astro-component-render-hydration-v1",
     "framework-semantic-completeness-v1",
     "framework-semantic-graph-v1",
@@ -1747,10 +1748,15 @@ where
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
     if spec.adapter == AdapterKind::Go {
-        // Soft cap the Go heap at the same budget the 250ms RSS watch enforces.
-        // A typed/SSA load can otherwise allocate many gigabytes between ticks
-        // and OOM the host before the worker-memory re-split can fire.
-        command.env("GOMEMLIMIT", config.max_worker_memory_bytes.to_string());
+        // Go's soft runtime limit excludes some resident memory, and go list
+        // children share the worker's hard process-tree RSS budget. Reserve
+        // headroom so GC starts before the 250ms RSS watch reaches that budget.
+        let go_memory_limit = config.max_worker_memory_bytes - config.max_worker_memory_bytes / 4;
+        command.env("GOMEMLIMIT", go_memory_limit.to_string());
+        command.env(
+            "DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS",
+            config.worker_timeout_seconds.to_string(),
+        );
     }
     if spec.adapter == AdapterKind::Rust
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
@@ -1827,7 +1833,13 @@ where
     match wait_result {
         WaitResult::Process(Ok(Ok(status))) if !status.success() => {
             errors.push(format!("{} exited with {status}", spec.display));
-            failure_kinds.push(WorkerFailureKind::NonzeroExit);
+            // Adapters use 124 when an internal operation exhausts its time
+            // budget, so the scheduler can retry a smaller analysis unit.
+            failure_kinds.push(if status.code() == Some(124) {
+                WorkerFailureKind::Timeout
+            } else {
+                WorkerFailureKind::NonzeroExit
+            });
         }
         WaitResult::Process(Ok(Ok(_))) => {}
         WaitResult::Process(Ok(Err(error))) => {
@@ -1891,39 +1903,52 @@ where
         errors.len() - previous_error_count,
     ));
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    // Parsing and contract validation can process a large bounded stream.
+    // Keep that synchronous work off the async executor so another worker's
+    // pipe reader and deadline can still run while this output is validated.
+    let validation_root = root.to_path_buf();
+    let validation_scan_id = scan_id.to_owned();
+    let delta_request = delta_request.cloned();
+    let max_line_bytes = config.max_protocol_line_bytes;
+    let expected_version = spec.expected_version.clone();
+    let release_attested = spec.release_attested;
+    let adapter = spec.adapter;
     let (events, delta, parsed_error, parsed_failure_kind, parsed_security_violation) =
-        if let Some(request) = delta_request {
-            let parsed = parse_delta_events(
-                &stdout_bytes,
-                request,
-                config.max_protocol_line_bytes,
-                spec.expected_version.as_deref(),
-            );
-            (
-                Vec::new(),
-                parsed.delta,
-                parsed.error,
-                parsed.failure_kind,
-                parsed.security_violation,
-            )
-        } else {
-            let parsed = parse_events_preserving_prefix(
-                &stdout_bytes,
-                scan_id,
-                spec.adapter.name(),
-                root,
-                config.max_protocol_line_bytes,
-                spec.expected_version.as_deref(),
-                Some(spec.release_attested),
-            );
-            (
-                parsed.events,
-                None,
-                parsed.error,
-                parsed.failure_kind,
-                parsed.security_violation,
-            )
-        };
+        run_protocol_validation(move || {
+            if let Some(request) = delta_request.as_ref() {
+                let parsed = parse_delta_events(
+                    &stdout_bytes,
+                    request,
+                    max_line_bytes,
+                    expected_version.as_deref(),
+                );
+                (
+                    Vec::new(),
+                    parsed.delta,
+                    parsed.error,
+                    parsed.failure_kind,
+                    parsed.security_violation,
+                )
+            } else {
+                let parsed = parse_events_preserving_prefix(
+                    &stdout_bytes,
+                    &validation_scan_id,
+                    adapter.name(),
+                    &validation_root,
+                    max_line_bytes,
+                    expected_version.as_deref(),
+                    Some(release_attested),
+                );
+                (
+                    parsed.events,
+                    None,
+                    parsed.error,
+                    parsed.failure_kind,
+                    parsed.security_violation,
+                )
+            }
+        })
+        .await?;
     if stdout_truncated {
         errors.push(format!(
             "{} protocol output exceeded {} bytes",
@@ -1955,6 +1980,16 @@ where
         security_violation,
         peak_memory_bytes: process_guard.peak_memory_bytes(),
     })
+}
+
+async fn run_protocol_validation<F, T>(validation: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(validation)
+        .await
+        .context("worker protocol validation task failed")
 }
 
 pub(crate) async fn read_capped(

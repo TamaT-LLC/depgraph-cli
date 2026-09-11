@@ -39,6 +39,11 @@ The scheduler derives every batch from the pre-split plan before any worker star
 Go workers also advertising `analysis-unit-typed-v1` receive a separate `typed` stage between them.
 Each later stage waits until all preceding chunks of its own unit have been saved and ingested; other units can proceed concurrently.
 Web stages use source batches; TypeScript retains the project context while AST transfer and dependency extraction select the current batch.
+Side-effect imports retain direct file-target AST witnesses without recursively
+collecting unused declarations. A later named reference upgrades a witness to
+the declaration closure. Ambient/global declaration candidates remain selected,
+and the native compiler still checks every context source, including syntax and
+type errors in sources outside the transferred declaration batch.
 Go syntax parses selected files. Typed and semantic requests that carry a
 `split` binding with `loader.kind=package` use the hybrid loader: only the
 named package roots are parsed and type-checked with bodies, and in-repo
@@ -93,7 +98,7 @@ A caller may configure an explicit total budget in `.depgraph.toml`:
 worker_timeout_seconds = 300
 max_worker_memory_bytes = 2147483648
 max_concurrent_units = 2
-max_unit_source_files = 128
+max_unit_source_files = 2048
 # Pre-split byte budgets (see adr-presplit-analysis-planning.md).
 max_unit_source_bytes = 8388608
 max_context_source_bytes = 67108864
@@ -142,6 +147,12 @@ Corrupt, mismatched, or truncated entries become cache misses; unfinished stream
 `--no-cache` disables checkpoint reads and writes.
 
 Daemon changes against an analysis-unit snapshot use this same scheduler and valid checkpoints.
+For a single Web file whose dependency-relevant tokens and their positions are unchanged,
+the daemon may instead commit a validated content-hash-only overlay.
+That overlay inherits the parent's immutable analysis ledger and coverage; returned unit
+rows retain their original execution scan IDs and input fingerprints.
+It creates no new execution evidence or checkpoint inputs.
+Missing or unfinished ledger rows and unsupported changes retain the scheduler path.
 Legacy graph deltas cannot carry the immutable unit ledger and are rejected by Store before staging or publication.
 The check follows sparse semantic-noop overlays to their effective parent snapshot; legacy repository snapshots retain their existing delta path.
 Entry count and total size are bounded, with older entries pruned.

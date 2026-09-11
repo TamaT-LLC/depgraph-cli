@@ -1741,6 +1741,7 @@ mod tests {
             adapter_logs: Vec::new(),
             coverage: CoverageRecord::default(),
             profile_matrix: Default::default(),
+            analysis_dependency_coverage: None,
         }
     }
 

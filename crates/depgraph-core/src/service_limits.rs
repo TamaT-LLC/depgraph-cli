@@ -33,7 +33,8 @@ pub const MAX_IMPACT_MATERIALIZED_PATH_STEPS: usize = 50_000;
 pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
     crate::query::MAX_INTERACTIVE_QUERY_TRAVERSAL;
 
-/// Maximum snapshot-scoped health findings retained for one request.
+/// Maximum findings in one health response or one analyzed range. Summary
+/// counts may span more ranges without retaining all of their finding bodies.
 pub const MAX_HEALTH_FINDINGS: usize = 10_000;
 
 /// Maximum health execution ranges (planned plus re-split halves) for one
