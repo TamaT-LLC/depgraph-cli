@@ -536,6 +536,11 @@ pub struct AnalysisDependencyCoverage {
     pub unknown_dependencies: std::collections::BTreeMap<String, bool>,
 }
 
+impl AnalysisDependencyCoverage {
+    /// Closed set of adapters whose dependency proof this version understands.
+    pub const KNOWN_ADAPTERS: &'static [&'static str] = &["go", "rust", "web"];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphSnapshot {
     /// Scan metadata, including optional schema-18 health provenance used to

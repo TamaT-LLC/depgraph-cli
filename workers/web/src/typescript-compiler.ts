@@ -278,9 +278,11 @@ interface BundledStandardLibrary {
 }
 
 export interface TypeScriptAnalysisTestRuntime {
-  compiler: string;
-  standardLibraryRoot: string;
-  timeoutMs: number;
+  compiler?: string;
+  standardLibraryRoot?: string;
+  timeoutMs?: number;
+  /** Lower the source cap to exercise the real compiler boundary with small fixtures. */
+  maxDefinitionSourceFiles?: number;
 }
 
 export type TypeScriptLifecycleTestMode = "crash" | "protocol-error" | "timeout" | "strict-close";
@@ -808,6 +810,9 @@ async function analyzeTypeScriptProjectInner(
       const requestedAstPaths = options.astPaths === undefined
         ? new Set(sources.keys())
         : new Set([...options.astPaths].filter((relativePath) => sources.has(relativePath)));
+      const requestedDefinitionPaths = options.definitionPaths === undefined
+        ? requestedAstPaths
+        : new Set([...requestedAstPaths].filter((relativePath) => options.definitionPaths!.has(relativePath)));
       const requestedAstBytes = [...requestedAstPaths].reduce(
         (total, relativePath) => total + Buffer.byteLength(sources.get(relativePath)!, "utf8"),
         0,
@@ -822,14 +827,18 @@ async function analyzeTypeScriptProjectInner(
       const actualRoots = new Set(project.rootFiles.map(pathKey));
       const sourceFiles = new Map<string, SourceFile>();
       const dependencyValidationQueryBudget = { value: 0 };
-      const definitionSourceLimitExceeded = requestedAstPaths.size > TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES;
+      const definitionSourceLimit = Math.min(
+        testRuntime?.maxDefinitionSourceFiles ?? TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
+        TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES,
+      );
+      const definitionSourceLimitExceeded = requestedDefinitionPaths.size > definitionSourceLimit;
       if (definitionSourceLimitExceeded) {
         result.definitionGraph = {
           definitions: [],
           relations: [],
           issues: [{
             code: "typescript_semantic_source_limit_exceeded",
-            message: `TypeScript semantic definition extraction received ${requestedAstPaths.size} sources; limit=${TYPESCRIPT_SEMANTIC_MAX_SOURCE_FILES}`,
+            message: `TypeScript semantic definition extraction received ${requestedDefinitionPaths.size} sources; limit=${definitionSourceLimit}`,
             relativePath: null,
             fatal: true,
           }],
@@ -958,9 +967,7 @@ async function analyzeTypeScriptProjectInner(
             sourceFile,
             syntacticallyValid: !syntacticallyInvalidPaths.has(relativePath),
           }));
-        const definitionSources = options.definitionPaths === undefined
-          ? semanticSources
-          : semanticSources.filter((source) => options.definitionPaths!.has(source.relativePath));
+        const definitionSources = semanticSources.filter((source) => requestedDefinitionPaths.has(source.relativePath));
         progress.start("typescript_definition_graph", { source_files: definitionSources.length });
         result.definitionGraph = await extractTypeScriptRawDefinitionDelta(
           project.checker,
@@ -1183,9 +1190,10 @@ export async function analyzeTypeScriptProject(
 export async function analyzeTypeScriptProjectWithRuntimeForTest(
   sources: ReadonlyMap<string, string>,
   runtime: TypeScriptAnalysisTestRuntime,
+  options: TypeScriptAnalysisOptions = {},
 ): Promise<TypeScriptProjectAnalysis> {
   try {
-    return await analyzeTypeScriptProjectInner(sources, { configFiles: 0, paths: {} }, runtime);
+    return await analyzeTypeScriptProjectInner(sources, { configFiles: 0, paths: {} }, runtime, NOOP_PROGRESS, options);
   } catch (error) {
     throw projectFailure(error);
   }

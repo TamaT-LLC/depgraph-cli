@@ -21,7 +21,7 @@ cleanup() {
     for item in "$raw"/*; do
       [[ -f "$item" ]] || continue
       case "$(basename "$item")" in
-        *-ms.txt|initial-scan-*.json|cache-*-hit-[0-9]*.json|cache-*-bypass-[0-9]*.json|daemon*.json|daemon.log|incremental-status-*.json)
+        *-ms.txt|initial-scan-*.json|cache-*-warmup.json|cache-*-hit-[0-9]*.json|cache-*-bypass-[0-9]*.json|daemon*.json|daemon.log|incremental-status-*.json)
           cp "$item" "$DEPGRAPH_BENCH_DIAGNOSTICS_DIR/"
           ;;
       esac

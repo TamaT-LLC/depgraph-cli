@@ -1002,20 +1002,10 @@ pub(crate) fn load_staging_coverage(
         )
         .optional()?
         .with_context(|| format!("scan {scan_id} was not found"))?;
-    let mut coverage = stored
+    let stored = stored
         .map(|raw| serde_json::from_str::<CoverageRecord>(&raw))
-        .transpose()?
-        .unwrap_or_else(|| CoverageRecord {
-            reasons: vec!["final worker coverage unavailable".to_owned()],
-            ..CoverageRecord::default()
-        });
-    (
-        coverage.dependency_sites,
-        coverage.resolved,
-        coverage.candidates,
-        coverage.external,
-        coverage.unresolved,
-    ) = connection.query_row(
+        .transpose()?;
+    let site_counts = connection.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(resolution_status='resolved'), 0),
                 COALESCE(SUM(resolution_status='candidates'), 0),
@@ -1033,6 +1023,63 @@ pub(crate) fn load_staging_coverage(
             ))
         },
     )?;
+    coverage_with_observed_counts(connection, scan_id, site_counts, executed, stored)
+}
+
+pub(crate) fn observed_coverage(
+    connection: &Connection,
+    scan_id: &str,
+    sites: &[SiteRecord],
+    project_code_executed: bool,
+    stored: Option<CoverageRecord>,
+) -> Result<CoverageRecord> {
+    let mut resolved = 0;
+    let mut candidates = 0;
+    let mut external = 0;
+    let mut unresolved = 0;
+    for site in sites {
+        match site.resolution_status.as_str() {
+            "resolved" => resolved += 1,
+            "candidates" => candidates += 1,
+            "external" => external += 1,
+            "unresolved" => unresolved += 1,
+            _ => {}
+        }
+    }
+    coverage_with_observed_counts(
+        connection,
+        scan_id,
+        (
+            sites.len() as u64,
+            resolved,
+            candidates,
+            external,
+            unresolved,
+        ),
+        project_code_executed,
+        stored,
+    )
+}
+
+fn coverage_with_observed_counts(
+    connection: &Connection,
+    scan_id: &str,
+    site_counts: (u64, u64, u64, u64, u64),
+    project_code_executed: bool,
+    stored: Option<CoverageRecord>,
+) -> Result<CoverageRecord> {
+    let had_final_coverage = stored.is_some();
+    let mut coverage = stored.unwrap_or_else(|| CoverageRecord {
+        reasons: vec!["final worker coverage unavailable".to_owned()],
+        ..CoverageRecord::default()
+    });
+    (
+        coverage.dependency_sites,
+        coverage.resolved,
+        coverage.candidates,
+        coverage.external,
+        coverage.unresolved,
+    ) = site_counts;
     (
         coverage.profiles,
         coverage.files_discovered,
@@ -1047,49 +1094,6 @@ pub(crate) fn load_staging_coverage(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     coverage.files_analyzed = coverage.files_discovered - coverage.files_skipped;
-    coverage.project_code_executed |= executed;
-    Ok(coverage)
-}
-
-pub(crate) fn observed_coverage(
-    connection: &Connection,
-    scan_id: &str,
-    sites: &[SiteRecord],
-    project_code_executed: bool,
-    stored: Option<CoverageRecord>,
-) -> Result<CoverageRecord> {
-    let had_final_coverage = stored.is_some();
-    let mut coverage = stored.unwrap_or_else(|| CoverageRecord {
-        reasons: vec!["final worker coverage unavailable".to_owned()],
-        ..CoverageRecord::default()
-    });
-    coverage.dependency_sites = sites.len() as u64;
-    coverage.resolved = 0;
-    coverage.candidates = 0;
-    coverage.external = 0;
-    coverage.unresolved = 0;
-    for site in sites {
-        match site.resolution_status.as_str() {
-            "resolved" => coverage.resolved += 1,
-            "candidates" => coverage.candidates += 1,
-            "external" => coverage.external += 1,
-            "unresolved" => coverage.unresolved += 1,
-            _ => {}
-        }
-    }
-    let (profiles, files, skipped): (i64, i64, i64) = connection.query_row(
-        "SELECT
-            (SELECT COUNT(*) FROM profiles WHERE scan_id=?1),
-            (SELECT COUNT(*) FROM file_coverage WHERE scan_id=?1),
-            (SELECT COALESCE(SUM(CASE WHEN skipped THEN 1 ELSE 0 END), 0)
-               FROM file_coverage WHERE scan_id=?1)",
-        [scan_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    coverage.profiles = profiles as u64;
-    coverage.files_discovered = files as u64;
-    coverage.files_skipped = skipped as u64;
-    coverage.files_analyzed = (files - skipped) as u64;
     coverage.project_code_executed |= project_code_executed;
     if !had_final_coverage {
         coverage.completeness.clear();

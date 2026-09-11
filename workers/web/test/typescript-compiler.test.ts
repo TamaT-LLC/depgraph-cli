@@ -89,6 +89,34 @@ test("TypeChecker smoke remains valid for empty and declaration-free projects", 
   }
 });
 
+test("definition source limits exclude retained context ASTs", async () => {
+  const sources = new Map([
+    ["entry.ts", "export const value = 1;\n"],
+    ["context.ts", "export const context = 2;\n"],
+    ["other-context.ts", "export const other = 3;\n"],
+  ]);
+  const runtime = { maxDefinitionSourceFiles: 1 };
+  const analysis = await analyzeTypeScriptProjectWithRuntimeForTest(sources, runtime, {
+    astPaths: new Set(sources.keys()),
+    definitionPaths: new Set(["entry.ts", "missing.ts"]),
+    sourcePaths: new Set(["entry.ts"]),
+  });
+  assert.equal(analysis.astRetainedSourceFiles, 3);
+  assert.equal(analysis.definitionGraph.issues.some((issue) => issue.fatal), false);
+  assert.ok(analysis.definitionGraph.definitions.length > 0);
+  assert.ok(analysis.definitionGraph.definitions.every((definition) => definition.relativePath === "entry.ts"));
+  assert.deepEqual([...analysis.semanticSourceFiles.keys()], ["entry.ts"]);
+
+  const oversized = await analyzeTypeScriptProjectWithRuntimeForTest(sources, runtime, {
+    astPaths: new Set(sources.keys()),
+    definitionPaths: new Set(["entry.ts", "context.ts"]),
+  });
+  const issue = oversized.definitionGraph.issues.find((entry) => entry.code === "typescript_semantic_source_limit_exceeded");
+  assert.equal(issue?.fatal, true);
+  assert.match(issue!.message, /received 2 sources; limit=1/u);
+  assert.equal(oversized.astRetainedSourceFiles, 0);
+});
+
 test("project analysis carries the cumulative exact-call capability and call validation ledger", async () => {
   const analysis = await analyzeTypeScriptProject(new Map([
     ["valid.ts", [

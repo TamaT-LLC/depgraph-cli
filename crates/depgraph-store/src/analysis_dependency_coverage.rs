@@ -63,7 +63,7 @@ pub(crate) fn load_analysis_dependency_coverage(
         let status: String = row.get(2)?;
         let unknown: i64 = row.get(3)?;
         if row_contract != contract
-            || !matches!(adapter.as_str(), "go" | "rust" | "web")
+            || !AnalysisDependencyCoverage::KNOWN_ADAPTERS.contains(&adapter.as_str())
             || status != "completed"
             || !matches!(unknown, 0 | 1)
         {

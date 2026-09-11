@@ -763,13 +763,14 @@ fn semantic_noop_delta_base(
     }
     if snapshot_uses_analysis_units(connection, snapshot_id)? {
         let evidence_scan = analysis_evidence_scan(connection, &record.scan_id)?;
-        // Missing or unfinished execution evidence must use the scheduler.
+        // Missing, unfinished, or non-Web execution evidence must use the
+        // scheduler: semantic no-op requests are handled by the Web worker.
         // General graph deltas remain forbidden even when this proof exists.
         let eligible: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM analysis_scan_metadata WHERE scan_id=?1)
                  AND EXISTS(SELECT 1 FROM analysis_unit_ledger WHERE scan_id=?1)
                  AND NOT EXISTS(SELECT 1 FROM analysis_unit_ledger
-                                WHERE scan_id=?1 AND status != 'completed')",
+                                WHERE scan_id=?1 AND (status != 'completed' OR adapter != 'web'))",
             [&evidence_scan],
             |row| row.get(0),
         )?;

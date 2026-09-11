@@ -15,6 +15,7 @@
 変更が解析結果に影響しないことを worker と保存処理で検証し、元の snapshot のグラフと解析完了記録を引き継ぐ。
 引き継いだ実行記録の scan ID と入力 fingerprint は元の値を保持する。
 解析記録がない場合、実行が未完了の場合、設定や依存関係が変わった場合は再解析する。
+この増分更新は Web の解析単位だけを持つスナップショットに限定し、Go・Rust が混在する場合は再解析する。
 
 ベンチマーク CI は途中で失敗しても、取得済みの計測値と daemon の状態を artifact に残す。
 手動実行の `benchmark_only` では、Rust・Go・Web の検査とベンチマークを実行する。
@@ -53,7 +54,7 @@ Web の内蔵 TypeScript コンパイラーのタイムアウトも再分割対�
 macOS の Go 解析でも、リポジトリ内依存の参照 fingerprint を生成できるようにした。
 Linux と共通の `openat` と `O_NOFOLLOW` による読み込みを使い、参照元の変更を検出しながら package semantic の結果を再利用する。
 この経路の Go race/vet 検証は、通常の pull request と main push の macOS CI でも実行する。
-追加依存は Go 公式拡張パッケージ `golang.org/x/sys v0.47.0`（BSD-3-Clause）で、`workers/go/go.mod` と `go.sum` に固定している。
+既存依存の Go 公式拡張パッケージ `golang.org/x/sys v0.47.0`（BSD-3-Clause）を利用する。
 
 元の試験対象での scan と health の完了確認は、Epic #464 の必須条件として扱う。
 公開合成 fixture の成功や、部分グラフに対する health の成功だけでは完了扱いにしない。

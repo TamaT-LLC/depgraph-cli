@@ -450,15 +450,14 @@ impl<'a> AnalysisCoverageScope<'a> {
             return Self::Incomplete;
         }
         if let Some(coverage) = source.analysis_dependency_coverage
-            && coverage.unknown_dependencies.len() <= 3
             && coverage
                 .unknown_dependencies
                 .values()
                 .any(|unknown| *unknown)
-            && coverage
-                .unknown_dependencies
-                .keys()
-                .all(|adapter| matches!(adapter.as_str(), "go" | "rust" | "web"))
+            && coverage.unknown_dependencies.keys().all(|adapter| {
+                depgraph_store::AnalysisDependencyCoverage::KNOWN_ADAPTERS
+                    .contains(&adapter.as_str())
+            })
         {
             return Self::UnknownDependencies(coverage);
         }
