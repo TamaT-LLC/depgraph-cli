@@ -7426,6 +7426,50 @@ async fn adapter_internal_timeout_exit_is_retryable_but_other_exits_are_not() ->
     Ok(())
 }
 
+#[tokio::test]
+async fn go_worker_runtime_limits_follow_the_configured_process_budgets() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let program = resolve_safe_executable("node", root.path())?;
+    for (adapter, budget, timeout, expected) in [
+        (AdapterKind::Go, 2_147_483_648, 300, "1610612736|300"),
+        (AdapterKind::Go, 536_870_912, 7, "402653184|7"),
+        (AdapterKind::Web, 536_870_912, 7, "unset|unset"),
+    ] {
+        let spec = WorkerSpec {
+            adapter,
+            artifact_path: program.clone(),
+            program: program.clone().into_os_string(),
+            leading_args: vec![
+                "-e".into(),
+                "process.stderr.write([process.env.GOMEMLIMIT, process.env.DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS].map(value => value ?? 'unset').join('|')); process.exit(3)".into(),
+                "--".into(),
+            ],
+            display: "runtime-memory-limit-fixture".into(),
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let execution = execute_worker_inner_with_cancellation(
+            &spec,
+            root.path(),
+            "runtime-memory-limit",
+            &ScanConfig {
+                max_worker_memory_bytes: budget,
+                worker_timeout_seconds: timeout,
+                ..ScanConfig::default()
+            },
+            &ProfileConfig::default(),
+            None,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await?;
+        assert_eq!(execution.failure_kind, Some(WorkerFailureKind::NonzeroExit));
+        assert_eq!(execution.stderr, expected);
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn worker_memory_budget_terminates_a_live_process_without_waiting_for_timeout() -> Result<()>

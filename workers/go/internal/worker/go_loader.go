@@ -323,6 +323,12 @@ func (s *goLoaderSession) load(dir, work string, mode packages.LoadMode, tests b
 	if len(tags) > 0 {
 		config.BuildFlags = []string{"-tags=" + strings.Join(tags, ",")}
 	}
+	if mode == goLoaderExportMode {
+		// Only type declarations are consumed from these archives. Optimizing
+		// and inlining their executable bodies wastes the worker's memory and
+		// time budget, especially for large generated dependency packages.
+		config.BuildFlags = append(config.BuildFlags, "-gcflags=all=-N -l")
+	}
 	loaded, err := s.loader(config, patterns...)
 	if contextErr := loadContext.Err(); errors.Is(contextErr, context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return nil, context.DeadlineExceeded

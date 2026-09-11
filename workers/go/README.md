@@ -20,8 +20,8 @@ replacement before the first load. This also prevents `go.work.sum` from being
 written into the repository. Missing offline cache entries or toolchain failures
 produce module-scoped diagnostics while preserving the parser-derived graph.
 
-`NeedDeps` remains enabled intentionally so the main `go list` query uses
-`-export=false` and does not build missing export data. Consequently the typed
+In the whole-module loader, `NeedDeps` remains enabled so the main `go list`
+query uses `-export=false` and does not build missing export data. Consequently the typed
 pass may parse/type-check transitive dependency source already present in the
 offline cache; only packages backed by confined module source are retained, and
 a 30-second context deadline is applied per module. The Go type checker is not
@@ -95,10 +95,19 @@ Progress is reported at parsed-file, completed-package, completed-SSA-input,
 and SSA-mapping (every 64 pending call sites) boundaries. A single
 `go/packages` load and a single SSA program build remain atomic operations;
 after `ssa.Program.Build` the worker drops `Syntax` and `TypesInfo` before
-CHA and mapping. The core sets `GOMEMLIMIT` to the per-unit worker memory
-budget so a typed or SSA load cannot allocate past that budget between RSS
-samples. Profile properties record these granularity limits and
+CHA and mapping. The core sets `GOMEMLIMIT` to 75% of the per-unit worker
+memory budget, leaving headroom for memory outside the Go runtime and child
+processes. The RSS watch enforces the full configured budget over the process
+tree. Profile properties record these granularity limits and
 incomplete loads retain explicit fallback diagnostics.
+
+Dependency export-data builds use one compiler process at a time and one
+Go runtime execution thread per compiler (`-p=1`, `GOMAXPROCS=1`). They disable
+optimization and inlining with `-gcflags=all=-N -l`, since analysis consumes
+type declarations without running the generated code. Package-scoped loads
+use the worker timeout supplied by Core; direct callers retain the
+30-second default. See [the resource-limit contract](../../docs/40_arch_design/analysis-unit-go-validation.md)
+for the process inputs and fallback behavior.
 
 The typed graph is the durable boundary used by the core for resumable
 semantic work. Go `types.Package`, `types.Info`, and SSA objects are process

@@ -1748,10 +1748,15 @@ where
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS", "cargo:token");
     if spec.adapter == AdapterKind::Go {
-        // Soft cap the Go heap at the same budget the 250ms RSS watch enforces.
-        // A typed/SSA load can otherwise allocate many gigabytes between ticks
-        // and OOM the host before the worker-memory re-split can fire.
-        command.env("GOMEMLIMIT", config.max_worker_memory_bytes.to_string());
+        // Go's soft runtime limit excludes some resident memory, and go list
+        // children share the worker's hard process-tree RSS budget. Reserve
+        // headroom so GC starts before the 250ms RSS watch reaches that budget.
+        let go_memory_limit = config.max_worker_memory_bytes - config.max_worker_memory_bytes / 4;
+        command.env("GOMEMLIMIT", go_memory_limit.to_string());
+        command.env(
+            "DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS",
+            config.worker_timeout_seconds.to_string(),
+        );
     }
     if spec.adapter == AdapterKind::Rust
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")

@@ -163,10 +163,20 @@ SSA is built with `ssautil.Packages` over that declared program
 RTA/VTA require bodies on every dependency and are not attempted. After
 `ssa.Program.Build` the worker drops `Syntax` and `TypesInfo` before CHA and
 mapping, and reports `go_ssa_mapping` progress every 64 pending call sites.
-The core sets `GOMEMLIMIT` to `scan.max_worker_memory_bytes` on every Go
-worker so the runtime GCs inside the same budget the 250 ms RSS watch
-enforces; the hybrid loader forwards a decimal-byte `GOMEMLIMIT` to `go
-list` children.
+The core sets `GOMEMLIMIT` to 75% of `scan.max_worker_memory_bytes` on every
+Go worker, leaving headroom for memory outside the Go runtime and child
+processes. The 250 ms RSS watch still enforces the configured limit over the
+whole process tree. The hybrid loader forwards the decimal-byte runtime
+limit to `go list` children and sets `-p=1` and `GOMAXPROCS=1` to bound
+compiler concurrency.
+
+Dependency export-data builds use `-gcflags=all=-N -l` because analysis
+consumes their type declarations without running their executable code.
+Disabling optimization and inlining reduces compilation memory. For package
+loads, Core supplies `scan.worker_timeout_seconds` through
+`DEPGRAPH_GO_LOAD_TIMEOUT_SECONDS`; its total worker deadline remains in
+force. Direct library callers without that input retain the 30-second
+default. Invalid or overflowing timeout values also use that default.
 
 ### Completeness and identity
 

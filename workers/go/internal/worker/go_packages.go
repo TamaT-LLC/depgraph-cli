@@ -782,7 +782,11 @@ func constrainedGoEnvironment(root, pathValue string) (goCommandEnvironment, err
 		"CGO_ENABLED=0",
 		"GO111MODULE=on",
 		"GOENV=off",
-		"GOFLAGS=-mod=readonly",
+		// The worker RSS budget includes go list and its compiler children.
+		// GOMEMLIMIT applies to each process separately, so also bound both
+		// concurrent package builds and parallelism within each compiler.
+		"GOFLAGS=-mod=readonly -p=1",
+		"GOMAXPROCS=1",
 		"GOPACKAGESDRIVER=off",
 		"GOPROXY=off",
 		"GOSUMDB=off",

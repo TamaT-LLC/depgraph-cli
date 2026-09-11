@@ -519,12 +519,14 @@ func TestGoPackagesUsesConstrainedEnvironmentWithoutRunningProjectHooks(t *testi
 	writeTestFile(t, filepath.Join(root, "asset.txt"), "safe static asset\n")
 	writeExecutable(t, driverPath, "#!/bin/sh\ntouch "+shellQuote(driverMarker)+"\nprintf '{\"NotHandled\":true}'\n")
 	wrapper := "#!/bin/sh\n" +
-		"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$GOPACKAGESDRIVER\" \"$GOPROXY\" \"$GOTOOLCHAIN\" \"$GOFLAGS\" \"$CGO_ENABLED\" \"$GOENV\" \"$XDG_CONFIG_HOME\" \"$HOME\" \"$PWD\" >> " + shellQuote(logPath) + "\n" +
+		"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$GOPACKAGESDRIVER\" \"$GOPROXY\" \"$GOTOOLCHAIN\" \"$GOFLAGS\" \"$CGO_ENABLED\" \"$GOENV\" \"$XDG_CONFIG_HOME\" \"$HOME\" \"$PWD\" \"$GOMAXPROCS\" >> " + shellQuote(logPath) + "\n" +
 		"printf '%s\\n' \"$*\" >> " + shellQuote(argsLogPath) + "\n" +
 		"exec " + shellQuote(realGo) + " \"$@\"\n"
 	writeExecutable(t, filepath.Join(bin, "go"), wrapper)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+filepath.Dir(realGo)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("GOPACKAGESDRIVER", driverPath)
+	t.Setenv("GOFLAGS", "-mod=mod -p=64")
+	t.Setenv("GOMAXPROCS", "64")
 
 	beforeModule, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
@@ -574,11 +576,14 @@ func TestGoPackagesUsesConstrainedEnvironmentWithoutRunningProjectHooks(t *testi
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(logBytes)), "\n") {
 		fields := strings.Split(line, "|")
-		if len(fields) != 9 {
+		if len(fields) != 10 {
 			t.Fatalf("unexpected wrapper log line: %q", line)
 		}
-		if fields[0] != "off" || fields[1] != "off" || fields[2] != "local" || fields[3] != "-mod=readonly" || fields[4] != "0" || fields[5] != "off" {
+		if fields[0] != "off" || fields[1] != "off" || fields[2] != "local" || fields[3] != "-mod=readonly -p=1" || fields[4] != "0" || fields[5] != "off" {
 			t.Fatalf("go command received an unsafe environment: %q", line)
+		}
+		if fields[9] != "1" {
+			t.Fatalf("go command compiler parallelism is unbounded: %q", line)
 		}
 		if fields[6] == "" || isWithinRoot(canonicalRoot, fields[6]) || fields[7] == "" || isWithinRoot(canonicalRoot, fields[7]) {
 			t.Fatalf("go command HOME is not isolated outside the scan root: %q", line)
