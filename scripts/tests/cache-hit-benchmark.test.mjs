@@ -48,6 +48,7 @@ test("cache hit comparison uses paired medians and a fixed improvement floor", (
 function rawReportFixture(t, unitReplay = true) {
   const rawDir = mkdtempSync(join(tmpdir(), "depgraph-cache-report-"));
   t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+  /** Serialize one raw scan or graph export fixture as JSON. */
   const write = (name, value) => writeFileSync(join(rawDir, name), JSON.stringify(value));
   for (const [size, files] of Object.entries(CACHE_HIT_FIXTURE_SIZES)) {
     const coverage = {
@@ -106,8 +107,13 @@ function rawReportFixture(t, unitReplay = true) {
     }
   }
   return {
+    /**
+     * Validate the current raw evidence and write its benchmark report.
+     */
     create: () => createCacheHitReport({ rawDir, output: join(rawDir, "report.json") }),
-    /** Alter one raw sample while preserving the other paired evidence. */
+    /**
+     * Alter one raw sample while preserving the other paired evidence.
+     */
     mutate(name, update) {
       const value = JSON.parse(readFileSync(join(rawDir, name), "utf8"));
       update(value);
