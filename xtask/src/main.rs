@@ -345,6 +345,14 @@ enum Task {
         #[arg(long)]
         checksum: Option<PathBuf>,
     },
+    /// Select the newest eligible all-green Full CI run from captured API results.
+    SelectFullCiRun {
+        candidates: PathBuf,
+        #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     StableReleaseGate {
         release_verification: PathBuf,
         benchmark_report: PathBuf,
@@ -836,7 +844,7 @@ struct StableReleaseGateInput<'a> {
     workflow_results: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FullCiRunEvidenceInput {
     database_id: u64,
@@ -969,6 +977,11 @@ fn main() -> Result<()> {
         Task::VerifyReleaseArchive { archive, checksum } => {
             verify_release_archive(&archive, checksum.as_deref())
         }
+        Task::SelectFullCiRun {
+            candidates,
+            source_sha,
+            output,
+        } => select_full_ci_run(&candidates, &source_sha, &output),
         Task::StableReleaseGate {
             release_verification,
             benchmark_report,
@@ -3774,12 +3787,31 @@ fn release_asset_set_sha256(assets: &[ReleaseAssetEvidence]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn select_full_ci_run(candidates: &Path, source_sha: &str, output: &Path) -> Result<()> {
+    let inputs: Vec<FullCiRunEvidenceInput> = serde_json::from_slice(&fs::read(candidates)?)
+        .context("full CI candidates do not satisfy their closed schema")?;
+    let selected = inputs
+        .iter()
+        .filter(|input| validate_full_ci_input((*input).clone(), source_sha).is_ok())
+        .max_by_key(|input| input.database_id)
+        .context("no eligible all-green Full CI run for the candidate on main")?;
+    fs::write(output, serde_json::to_vec_pretty(selected)?)?;
+    Ok(())
+}
+
 fn validate_full_ci_run(path: &Path, source_sha: &str) -> Result<FullCiRunEvidence> {
     let input: FullCiRunEvidenceInput = serde_json::from_slice(
         &fs::read(path)
             .with_context(|| format!("failed to read full CI evidence {}", path.display()))?,
     )
     .context("full CI evidence does not satisfy its closed schema")?;
+    validate_full_ci_input(input, source_sha)
+}
+
+fn validate_full_ci_input(
+    input: FullCiRunEvidenceInput,
+    source_sha: &str,
+) -> Result<FullCiRunEvidence> {
     let mut jobs = input.jobs;
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let expected = FULL_CI_JOB_NAMES
@@ -5737,6 +5769,60 @@ mod tests {
         let tag = format!("v{STABLE_RELEASE_VERSION}");
         let (_temp, request) = post_publish_evidence_fixture(&tag)?;
         release_post_publish_evidence(request)
+    }
+
+    #[test]
+    fn full_ci_selection_skips_newer_ineligible_runs_and_chooses_latest_valid() -> Result<()> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        let mut valid: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let source_sha = valid["head_sha"].as_str().unwrap().to_owned();
+        valid["head_branch"] = json!("main");
+        let candidate = |id: u64| {
+            let mut run = valid.clone();
+            run["database_id"] = json!(id);
+            run["url"] = json!(super::canonical_actions_run_url(id));
+            run
+        };
+        let older_valid = candidate(100);
+        let latest_valid = candidate(200);
+        let mut default_run = candidate(300);
+        let jobs = default_run["jobs"].as_array_mut().unwrap();
+        jobs.retain(|job| {
+            !job["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("extra-native-package")
+        });
+        jobs.push(json!({"name": "extra-native-package", "conclusion": "skipped"}));
+        let mut wrong_branch = candidate(400);
+        wrong_branch["head_branch"] = json!("feature");
+        let mut wrong_sha = candidate(500);
+        wrong_sha["head_sha"] = json!("f".repeat(40));
+        let temp = tempfile::tempdir()?;
+        let candidates = temp.path().join("candidates.json");
+        let output = temp.path().join("selected.json");
+        fs::write(
+            &candidates,
+            serde_json::to_vec(&json!([
+                default_run,
+                latest_valid,
+                wrong_sha,
+                older_valid,
+                wrong_branch
+            ]))?,
+        )?;
+        super::select_full_ci_run(&candidates, &source_sha, &output)?;
+        assert_eq!(validate_full_ci_run(&output, &source_sha)?.run_id, 200);
+        fs::write(
+            &candidates,
+            serde_json::to_vec(&json!([default_run, wrong_sha, wrong_branch]))?,
+        )?;
+        let missing_output = temp.path().join("not-selected.json");
+        assert!(super::select_full_ci_run(&candidates, &source_sha, &missing_output).is_err());
+        assert!(!missing_output.exists());
+        fs::write(&candidates, b"[]")?;
+        assert!(super::select_full_ci_run(&candidates, &source_sha, &missing_output).is_err());
+        Ok(())
     }
 
     #[test]

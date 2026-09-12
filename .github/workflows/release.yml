@@ -335,11 +335,15 @@ jobs:
 
           gh run list --workflow CI --event workflow_dispatch --commit "$GITHUB_SHA" --status success --limit 100 \
             --json databaseId,headSha,headBranch,conclusion,event,url > artifacts/ci-runs.json
-          ci_run_id="$(jq -r 'map(select(.headSha == env.GITHUB_SHA and .headBranch == "main")) | sort_by(.databaseId) | last | .databaseId // empty' artifacts/ci-runs.json)"
-          test -n "$ci_run_id"
-          gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
-            | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}' \
-            > artifacts/full-ci.json
+          # Inspect each candidate's complete job set before choosing a run.
+          # A later default/benchmark-only dispatch must not hide a valid Full CI.
+          jq -r '.[] | select(.headSha == env.GITHUB_SHA and .headBranch == "main") | .databaseId' artifacts/ci-runs.json \
+            | while IFS= read -r ci_run_id; do
+                gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
+                  | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}'
+              done | jq -s '.' > artifacts/full-ci-candidates.json
+          cargo xtask select-full-ci-run artifacts/full-ci-candidates.json \
+            --source-sha "$GITHUB_SHA" --output artifacts/full-ci.json
 
           echo "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree" >> "$GITHUB_ENV"
           echo "DEPGRAPH_RELEASE_MAIN_HEAD_SHA=$main_head_sha" >> "$GITHUB_ENV"

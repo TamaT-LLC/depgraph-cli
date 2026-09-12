@@ -2201,6 +2201,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-release-assets post-publish/normal",
         "cargo xtask verify-compiler-pack-assets post-publish/compiler",
         "gh run list --workflow CI --event workflow_dispatch --commit \"$GITHUB_SHA\" --status success",
+        "cargo xtask select-full-ci-run artifacts/full-ci-candidates.json",
         "cargo xtask release-post-publish-evidence",
         "ci_run_id=\"$(jq -r '.workflow_results.full_ci_run_id // empty' artifacts/stable-release-gate.json)\"",
         "gh release upload \"$GITHUB_REF_NAME\" \"$evidence\"",
