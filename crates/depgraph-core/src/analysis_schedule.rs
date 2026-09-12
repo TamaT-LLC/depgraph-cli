@@ -262,6 +262,8 @@ fn go_syntax_checkpoint_input_digest(content_digest: &str, unit_digest: &str) ->
     )
 }
 
+/// Bind discovered units to worker capabilities and verified checkpoint inputs.
+/// Reuse admission probes while retaining execution and input fingerprint checks.
 pub(crate) async fn prepare_analysis_schedule(
     context: &AnalysisExecutionContext<'_>,
     workers: Vec<(AdapterKind, WorkerSpec)>,

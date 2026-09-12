@@ -478,6 +478,8 @@ async fn prepare_scan_with_cache_mode_and_cancellation(
     })
 }
 
+/// Run worker analysis under cache, cancellation and promotion constraints.
+/// Source batches replay their unit ledger before the completed graph is promoted.
 async fn run_scan_with_cache_mode_and_cancellation_inner(
     store: &mut Store,
     root: PathBuf,

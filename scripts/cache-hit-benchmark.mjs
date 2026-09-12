@@ -79,6 +79,7 @@ function canonicalGraph(envelope) {
   );
 }
 
+/** Return sorted Web stage identities only when coverage and reuse are complete. */
 function completedWebUnits(scan, reused) {
   const coverage = scan.analysis_coverage;
   const units = scan.analysis?.units;
@@ -108,6 +109,7 @@ function completedWebUnits(scan, reused) {
     .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
 }
 
+/** Validate either a legacy snapshot hit or consistent source-batch replay evidence. */
 function validatedSemanticReuse(hit, bypass) {
   if (hit.analysis === undefined && hit.analysis_coverage === undefined
     && bypass.analysis_coverage?.contract_version !== "depgraph-analysis-unit-v2") {
@@ -118,11 +120,16 @@ function validatedSemanticReuse(hit, bypass) {
   // not claim a whole-snapshot cache hit: their unit ledger is the evidence.
   const hitUnits = completedWebUnits(hit, true);
   const bypassUnits = completedWebUnits(bypass, false);
-  return hitUnits !== null && bypassUnits !== null
+  return [hit, bypass].every((scan) =>
+    Array.isArray(scan.cache_events)
+    && !scan.cache_events.some((event) =>
+      event?.layer === "semantic" && event.outcome === "hit"))
+    && hitUnits !== null && bypassUnits !== null
     && JSON.stringify(hitUnits) === JSON.stringify(bypassUnits)
     && JSON.stringify(hit.analysis_coverage) === JSON.stringify(bypass.analysis_coverage);
 }
 
+/** Check every scan pair and equal exported graphs before attesting timing samples. */
 function validateScanEvidence(rawDir, size, sampleCount) {
   let coverage = null;
   for (let index = 0; index < sampleCount; index += 1) {

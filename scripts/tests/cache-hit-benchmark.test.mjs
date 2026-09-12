@@ -44,6 +44,7 @@ test("cache hit comparison uses paired medians and a fixed improvement floor", (
   assert.equal(regression.passed, false);
 });
 
+/** Write valid paired scan evidence that tests can selectively corrupt. */
 function rawReportFixture(t, unitReplay = true) {
   const rawDir = mkdtempSync(join(tmpdir(), "depgraph-cache-report-"));
   t.after(() => rmSync(rawDir, { recursive: true, force: true }));
@@ -106,6 +107,7 @@ function rawReportFixture(t, unitReplay = true) {
   }
   return {
     create: () => createCacheHitReport({ rawDir, output: join(rawDir, "report.json") }),
+    /** Alter one raw sample while preserving the other paired evidence. */
     mutate(name, update) {
       const value = JSON.parse(readFileSync(join(rawDir, name), "utf8"));
       update(value);
@@ -148,6 +150,16 @@ for (const [name, mode, mutate] of [
     delete scan.analysis_coverage;
     scan.cache_events.push({ layer: "semantic", outcome: "hit", reason: "validated" });
   }],
+  ["a snapshot hit alongside replayed units", "hit", (scan) => {
+    scan.cache_events.push({ layer: "semantic", outcome: "hit", reason: "validated" });
+  }],
+  ["a snapshot hit alongside uncached units", "bypass", (scan) => {
+    scan.cache_events.push({ layer: "semantic", outcome: "hit", reason: "validated" });
+  }],
+  ["a snapshot hit with an unknown reason", "hit", (scan) => {
+    scan.cache_events.push({ layer: "semantic", outcome: "hit", reason: "unknown" });
+  }],
+  ["missing source-batch cache events", "hit", (scan) => { delete scan.cache_events; }],
   ["no-cache reused a unit", "bypass", (scan) => { scan.analysis.units[0].reused = true; }],
   ["no-cache did not reject caching", "bypass", (scan) => { scan.cache_events = []; }],
   ["different unit set", "bypass", (scan) => { scan.analysis.units[0].unit_id += "changed"; }],
