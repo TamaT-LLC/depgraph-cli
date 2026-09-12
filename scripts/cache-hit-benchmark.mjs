@@ -79,6 +79,57 @@ function canonicalGraph(envelope) {
   );
 }
 
+/** Return sorted Web stage identities only when coverage and reuse are complete. */
+function completedWebUnits(scan, reused) {
+  const coverage = scan.analysis_coverage;
+  const units = scan.analysis?.units;
+  if (
+    coverage?.contract_version !== "depgraph-analysis-unit-v2"
+    || coverage.complete !== true
+    || !Number.isSafeInteger(coverage.expected_units)
+    || coverage.expected_units < 1
+    || coverage.completed_units !== coverage.expected_units
+    || coverage.semantic_complete_units !== coverage.expected_units
+    || coverage.failed_units !== 0
+    || coverage.unanalysed_units !== 0
+    || coverage.cancelled_units !== 0
+    || !Array.isArray(units)
+    || !units.some((unit) => unit?.stage === "syntax")
+    || !units.some((unit) => unit?.stage === "semantic")
+    || !units.every((unit) =>
+      typeof unit?.unit_id === "string" && unit.unit_id.length > 0
+      && unit.adapter === "web"
+      && ["syntax", "semantic"].includes(unit.stage)
+      && unit.status === "completed" && unit.reused === reused)
+    || new Set(units.map((unit) => unit.unit_id)).size !== units.length
+  ) {
+    return null;
+  }
+  return units.map(({ unit_id, adapter, stage }) => [unit_id, adapter, stage])
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+}
+
+/** Validate either a legacy snapshot hit or consistent source-batch replay evidence. */
+function validatedSemanticReuse(hit, bypass) {
+  if (hit.analysis === undefined && hit.analysis_coverage === undefined
+    && bypass.analysis_coverage?.contract_version !== "depgraph-analysis-unit-v2") {
+    return hit.cache_events?.some((event) =>
+      event.layer === "semantic" && event.outcome === "hit" && event.reason === "validated");
+  }
+  // Source-batch scans replay individually validated checkpoints. They must
+  // not claim a whole-snapshot cache hit: their unit ledger is the evidence.
+  const hitUnits = completedWebUnits(hit, true);
+  const bypassUnits = completedWebUnits(bypass, false);
+  return [hit, bypass].every((scan) =>
+    Array.isArray(scan.cache_events)
+    && !scan.cache_events.some((event) =>
+      event?.layer === "semantic" && event.outcome === "hit"))
+    && hitUnits !== null && bypassUnits !== null
+    && JSON.stringify(hitUnits) === JSON.stringify(bypassUnits)
+    && JSON.stringify(hit.analysis_coverage) === JSON.stringify(bypass.analysis_coverage);
+}
+
+/** Check every scan pair and equal exported graphs before attesting timing samples. */
 function validateScanEvidence(rawDir, size, sampleCount) {
   let coverage = null;
   for (let index = 0; index < sampleCount; index += 1) {
@@ -93,12 +144,7 @@ function validateScanEvidence(rawDir, size, sampleCount) {
       || bypass.exit_code !== 0
       || hit.coverage?.project_code_executed !== false
       || JSON.stringify(hit.coverage) !== JSON.stringify(bypass.coverage)
-      || !hit.cache_events?.some(
-        (event) =>
-          event.layer === "semantic"
-          && event.outcome === "hit"
-          && event.reason === "validated",
-      )
+      || !validatedSemanticReuse(hit, bypass)
       || !bypass.cache_events?.some(
         (event) =>
           event.layer === "semantic"
@@ -106,7 +152,7 @@ function validateScanEvidence(rawDir, size, sampleCount) {
           && event.reason === "disabled-by-request",
       )
     ) {
-      throw new Error(`cache benchmark scan evidence failed for ${size}`);
+      throw new Error(`cache benchmark scan evidence failed for ${size} sample ${index}`);
     }
     coverage ??= hit.coverage;
     if (JSON.stringify(coverage) !== JSON.stringify(hit.coverage)) {
