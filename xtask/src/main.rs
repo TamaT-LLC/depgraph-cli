@@ -132,7 +132,10 @@ const MAX_RELEASE_CHECKSUM_BYTES: u64 = 1024;
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
+    "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+    "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
     "rust",
@@ -157,6 +160,9 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
     "ga-baseline-full-ci",
     "workflow-quality-closure",
 ];
+const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-34682206659.json";
+const CURRENT_FULL_CI_RUN_FIXTURE_SHA256: &str =
+    "3dc448af592da881ca2d973976fe2918a20cd1329bf212b2a1dc1c90ffc669a2";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
@@ -4395,7 +4401,7 @@ fn evaluate_stable_release_gate(
                 && (release.tag != format!("v{STABLE_RELEASE_VERSION}")
                     || stable_baseline_matches_source),
             evidence: format!(
-                "full CI run {} has the exact eight all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
+                "full CI run {} has the exact eleven all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
                 full_ci.run_id, full_ci.head_sha
             ),
         },
@@ -5734,29 +5740,79 @@ mod tests {
     }
 
     #[test]
-    fn full_ci_job_identity_matches_captured_github_api_response() -> Result<()> {
+    fn current_full_ci_job_identity_matches_captured_github_api_response() -> Result<()> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        assert_eq!(
+            super::sha256_file_streaming(&fixture)?,
+            super::CURRENT_FULL_CI_RUN_FIXTURE_SHA256
+        );
+        let mut input: Value = serde_json::from_slice(&fs::read(&fixture)?)?;
+        let source_sha = input["head_sha"]
+            .as_str()
+            .expect("captured source")
+            .to_owned();
+        assert!(validate_full_ci_run(&fixture, &source_sha).is_err());
+        // The capture is a branch run. Change only its branch in this synthetic
+        // admission test; the real API job inventory remains independent of constants.
+        input["head_branch"] = json!("main");
+        let temp = tempfile::tempdir()?;
+        let eligible = temp.path().join("main-full-ci.json");
+        fs::write(&eligible, serde_json::to_vec(&input)?)?;
+        let run = validate_full_ci_run(&eligible, &source_sha)?;
+        assert_eq!(run.jobs.len(), 11);
+        for name in [
+            "go-macos",
+            "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+            "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
+        ] {
+            for change in ["missing", "skipped", "failure", "renamed", "duplicate"] {
+                let mut drift = input.clone();
+                let jobs = drift["jobs"].as_array_mut().expect("captured jobs");
+                let index = jobs.iter().position(|job| job["name"] == name).unwrap();
+                match change {
+                    "missing" => {
+                        jobs.remove(index);
+                    }
+                    "renamed" => jobs[index]["name"] = json!(format!("{name}-drift")),
+                    "duplicate" => jobs.push(jobs[index].clone()),
+                    _ => jobs[index]["conclusion"] = json!(change),
+                }
+                fs::write(&eligible, serde_json::to_vec(&drift)?)?;
+                assert!(
+                    validate_full_ci_run(&eligible, &source_sha).is_err(),
+                    "must reject {change} job {name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_full_ci_fixture_stays_pinned_but_is_not_a_current_release_run() -> Result<()> {
         let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
         assert_eq!(
             super::sha256_file_streaming(&fixture)?,
             V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256
         );
         let source_sha = "7b0cd4cb31067874a71854c212be037b00519889";
-        let run = validate_full_ci_run(&fixture, source_sha)?;
-        assert_eq!(run.run_id, 31_867_648_482);
-        assert_eq!(run.head_sha, source_sha);
-        assert_eq!(run.jobs.len(), 8);
-        assert!(run.jobs.iter().any(|job| {
-            job.name
-                == "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)"
-                && job.conclusion == "success"
-        }));
+        let historical: Value = serde_json::from_slice(&fs::read(&fixture)?)?;
+        assert_eq!(historical["database_id"], 31_867_648_482_u64);
+        assert_eq!(
+            historical["jobs"]
+                .as_array()
+                .expect("historical jobs")
+                .len(),
+            8
+        );
+        assert!(validate_full_ci_run(&fixture, source_sha).is_err());
         Ok(())
     }
 
     #[test]
     fn full_ci_job_identity_rejects_the_stale_linux_display_name() -> Result<()> {
-        let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
         let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        input["head_branch"] = json!("main");
         let linux = input["jobs"]
             .as_array_mut()
             .expect("captured Full CI jobs")
@@ -5771,7 +5827,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let stale = temp.path().join("stale-full-ci.json");
         fs::write(&stale, serde_json::to_vec(&input)?)?;
-        let error = validate_full_ci_run(&stale, "7b0cd4cb31067874a71854c212be037b00519889")
+        let error = validate_full_ci_run(&stale, "04fb7163d5e2139811a2e69e2a9978cfeb6e87dc")
             .expect_err("stale implicit matrix job identity must fail closed");
         assert_eq!(
             error.to_string(),

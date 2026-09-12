@@ -33,7 +33,8 @@ The v0.6.0 compatibility tuple is:
 
 At publication, the signed `v0.6.0` tag, remote `main`, and
 `refs/heads/release/0.6` must identify the same reviewed commit. That commit
-must pass the exact Full CI run, the stable source guard, the five-target
+must pass the exact eleven-job Full CI run (`extra_native_packages=true`),
+the stable source guard, the five-target
 package gates, and the post-publish evidence checks. The candidate SHA is not
 chosen by this ADR; it is recorded only after the release candidate is frozen
 and Full CI has passed. The baseline status is maintenance-ref-pinned.
@@ -125,7 +126,10 @@ The release PR adds [`v0.6.0` release notes](../releases/v0.6.0.md) and keeps
 the version change with the release documentation. CI must be green and
 Greptile must have no unresolved findings before merge. Release and workflow
 changes additionally require the manual Full CI run on the frozen `main`
-commit.
+commit. The Full CI inventory includes `go-macos` and both extra native
+package jobs; a missing, skipped, failed, duplicated, or renamed job is
+rejected by the release gate and the packaged Agent preflight. The historical
+eight-job v0.5 evidence remains unchanged.
 
 The signed tag is created only after the exact source and maintenance-ref
 checks pass. Release builds all five native targets, verifies the compiler

@@ -125,7 +125,7 @@ tuple.
   digest from the local evidence file, archive, checksum, or manifest.
 - Pass the evidence file with `--release-evidence`. `agent-config` requires the
   exact official repository, product version/canonical tag, allowed signed-tag
-  result, all-green eight-job Full CI and release workflow identities, and the
+  result, all-green eleven-job Full CI and release workflow identities, and the
   sorted 51-asset public closure. It binds the selected archive, checksum, and
   target compiler-pack requirement by exact filename, size, and SHA-256.
 - Verify the release checksum and `release-manifest.json`, then use

@@ -1915,7 +1915,10 @@ fn create_release_evidence(
             "jobs":[
                 {"name":"benchmark","conclusion":"success"},
                 {"name":"compiler-precise-hostile","conclusion":"success"},
+                {"name":"extra-native-package (macos-15-intel, x86_64-apple-darwin)","conclusion":"success"},
+                {"name":"extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)","conclusion":"success"},
                 {"name":"go","conclusion":"success"},
+                {"name":"go-macos","conclusion":"success"},
                 {"name":"integration (macos-15, aarch64-apple-darwin)","conclusion":"success"},
                 {"name":"integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)","conclusion":"success"},
                 {"name":"rust","conclusion":"success"},
