@@ -268,6 +268,7 @@ pub(crate) async fn prepare_analysis_schedule(
     store_path: Option<&Path>,
     profile_plan_id: &str,
     initial_content_digest: Option<String>,
+    probed_capabilities: &BTreeMap<AdapterKind, Vec<String>>,
 ) -> Result<AnalysisSchedule> {
     let plan = match plan_analysis_units(context.root, context.config, store_path) {
         Ok(plan) => Some(plan),
@@ -292,16 +293,24 @@ pub(crate) async fn prepare_analysis_schedule(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let capabilities =
-            if matches!(adapter, AdapterKind::Go | AdapterKind::Web) && !units.is_empty() {
+        let capabilities = if matches!(adapter, AdapterKind::Go | AdapterKind::Web)
+            && !units.is_empty()
+        {
+            // The whole-snapshot cache admission may already have made
+            // this exact handshake. Input and execution fingerprints are
+            // still checked before reuse, checkpoint writes and promotion.
+            if let Some(capabilities) = probed_capabilities.get(&adapter) {
+                capabilities.clone()
+            } else {
                 probe_worker_version_with_cancellation(&spec, context.root, context.cancellation)
                     .await
                     .ok()
                     .map(|version| worker_capabilities(&version))
                     .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
         let supports_batches = capabilities
             .iter()
             .any(|capability| capability == "analysis-source-batch-v1");
@@ -334,7 +343,13 @@ pub(crate) async fn prepare_analysis_schedule(
                 }
                 input_proof.is_some()
             };
-        let cache = if context.cache_mode == ScanCacheMode::Enabled {
+        // Source batches use their context fingerprint and execution digest,
+        // never this whole-repository cache key. Preparing it would hash the
+        // runtime and probe its version again for no reusable result. Keep the
+        // per-unit execution/input checks and the scan's postflight proof.
+        let cache = if context.cache_mode == ScanCacheMode::Enabled
+            && !(supports_units && supports_batches)
+        {
             match prepare_scan_cache(
                 context.root,
                 context.config,

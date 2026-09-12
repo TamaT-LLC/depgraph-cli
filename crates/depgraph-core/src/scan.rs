@@ -591,6 +591,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         mut failures,
     } = preflight_workers(adapters, locate_worker);
     let mut cache_plan = None;
+    let mut probed_capabilities = BTreeMap::new();
     // V2 must replay its unit checkpoints so this attempt has a verified unit
     // ledger and observable reuse. Preserve the whole-snapshot shortcut for
     // older workers; a failed capability probe cannot authorize that shortcut.
@@ -601,11 +602,18 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 continue;
             }
             match probe_worker_version_with_cancellation(spec, &root, &cancellation).await {
-                Ok(version)
-                    if !worker_capabilities(&version)
+                Ok(version) => {
+                    let capabilities = worker_capabilities(&version);
+                    let supports_batches = capabilities
                         .iter()
-                        .any(|capability| capability == "analysis-source-batch-v1") => {}
-                _ => {
+                        .any(|capability| capability == "analysis-source-batch-v1");
+                    probed_capabilities.insert(*adapter, capabilities);
+                    if supports_batches {
+                        whole_snapshot_cache_allowed = false;
+                        break;
+                    }
+                }
+                Err(_) => {
                     whole_snapshot_cache_allowed = false;
                     break;
                 }
@@ -814,6 +822,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         checkpoint_store_path.as_deref(),
         &profile_plan.plan_id,
         initial_content_digest,
+        &probed_capabilities,
     )
     .await?;
     let analysis_plan = schedule.plan;
@@ -1424,12 +1433,16 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
     }
 
     let promotion_started = Instant::now();
+    // A source-batch scan must replay its unit ledger on every attempt. The
+    // whole-snapshot cache cannot serve it, so retain the input checks above
+    // without serializing and storing an unused snapshot cache payload.
+    let reusable_snapshot_cache = cache_plan.as_ref().filter(|_| whole_snapshot_cache_allowed);
     let mut outcome = complete_scan_with_mode(
         store,
         &scan_id,
         strict,
         config,
-        cache_plan.as_ref(),
+        reusable_snapshot_cache,
         &cancellation,
         promotion,
     )?;

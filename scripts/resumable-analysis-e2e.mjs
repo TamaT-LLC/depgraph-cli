@@ -521,6 +521,11 @@ try {
   const resumed = scan(splitStore);
   assert.ok(resumed.output.analysis.units.some((unit) => unit.reused), "warm scan reused no completed units");
   assert.deepEqual(graph(splitStore), expected, "restarted CLI changed the canonical graph");
+  for (const attempt of [baseline, split, resumed]) {
+    assert.ok(!attempt.output.cache_events.some((event) => (
+      event.outcome === "stored" || event.reason === "payload-conflict"
+    )), "source-batch scan wrote a whole-snapshot cache that cannot be reused");
+  }
 
   for (const [command, args] of includeWeb ? [
     ["deps", ["path:frontend/apps/web/src/index.ts", "--transitive", "--all"]],
