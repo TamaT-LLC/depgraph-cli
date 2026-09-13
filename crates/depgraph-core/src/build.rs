@@ -944,7 +944,7 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let source_preflight_digest = fingerprint_build_source(&source_root)?.0;
+    let source_preflight_digest = source_mutation_fingerprint(&source_root)?;
     let compiler_precise_stage = matches!(
         plan.adapter.as_str(),
         COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
@@ -1383,7 +1383,7 @@ where
     let source_mutation = BuildSourceMutationAudit::from_postflight(
         plan.isolation,
         &source_preflight_digest,
-        fingerprint_build_source(&source_root).map(|fingerprints| fingerprints.0),
+        source_mutation_fingerprint(&source_root),
     );
     if source_mutation.status != BuildSourceMutationStatus::Unchanged {
         outcome = BuildOutcomeKind::SecurityFailed;
@@ -2260,6 +2260,7 @@ async fn probe_build_tool_version(program: &Path, root: &Path) -> Result<String>
 fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
     let mut files = 0_usize;
     let mut bytes = 0_u64;
+    let mut staged_symlinks = Vec::new();
     for entry in WalkDir::new(source)
         .follow_links(false)
         .into_iter()
@@ -2271,13 +2272,17 @@ fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
         let target = destination.join(relative);
+        if metadata.file_type().is_symlink() {
+            files += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                bail!("security policy violation: staged workspace exceeds file or byte limit");
+            }
+            stage_workspace_symlink(entry.path(), relative, &target)?;
+            staged_symlinks.push(target);
+            continue;
+        }
         if metadata.is_dir() {
             fs::create_dir_all(&target)?;
             continue;
@@ -2298,6 +2303,75 @@ fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
         }
         fs::copy(entry.path(), &target)?;
         fs::set_permissions(&target, metadata.permissions())?;
+    }
+    confine_staged_symlinks(destination, &staged_symlinks)
+}
+
+/// Recreate one workspace symlink inside the staged copy.
+///
+/// Package managers such as pnpm build `node_modules` out of relative
+/// symlinks that stay within the repository (for example
+/// `node_modules/foo -> .pnpm/foo@1.0.0/node_modules/foo`), so refusing every
+/// symlink makes staged builds impossible for those projects. Relative links
+/// are recreated verbatim; because the staged tree mirrors the repository
+/// layout, an in-repository link resolves to the staged copy of its target.
+/// Absolute targets would keep pointing at the original checkout (or anywhere
+/// else on the host), so they remain a policy violation.
+#[cfg(unix)]
+fn stage_workspace_symlink(source: &Path, relative: &Path, staged: &Path) -> Result<()> {
+    let link_target = fs::read_link(source)?;
+    if link_target.is_absolute() {
+        bail!(
+            "security policy violation: staged workspace contains symlink {} with an absolute target; only relative symlinks that stay within the repository are staged",
+            display_logical(relative)
+        );
+    }
+    if let Some(parent) = staged.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(&link_target, staged)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn stage_workspace_symlink(_source: &Path, relative: &Path, _staged: &Path) -> Result<()> {
+    bail!(
+        "security policy violation: staged workspace contains symlink {}; symlink staging is not supported on this platform",
+        display_logical(relative)
+    );
+}
+
+/// Verify that every staged symlink resolves inside the staged workspace.
+///
+/// The check runs after the whole tree is copied so chains of links resolve
+/// with their real runtime semantics (lexical checks are defeated by links
+/// that pass through parent directories which are themselves symlinks).
+/// Dangling links stay inert: they cannot be followed, so they are allowed
+/// (for example links into ignored build caches that were not staged).
+fn confine_staged_symlinks(destination: &Path, staged_symlinks: &[PathBuf]) -> Result<()> {
+    if staged_symlinks.is_empty() {
+        return Ok(());
+    }
+    let root = destination.canonicalize()?;
+    for staged in staged_symlinks {
+        let relative = staged.strip_prefix(destination).unwrap_or(staged);
+        match staged.canonicalize() {
+            Ok(resolved) => {
+                if !resolved.starts_with(&root) {
+                    bail!(
+                        "security policy violation: staged workspace symlink {} resolves outside the repository; keep the link target within the repository or remove the link",
+                        display_logical(relative)
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "staged workspace symlink {} could not be resolved",
+                    display_logical(relative)
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2689,6 +2763,16 @@ fn digest_workspace(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Fingerprint the source tree for the pre/postflight mutation audit.
+///
+/// The staging metadata digest participates so that swapping a regular file
+/// for a symlink (or the reverse) is always detected even when the content
+/// hashes collide by construction.
+fn source_mutation_fingerprint(root: &Path) -> Result<String> {
+    let (source_digest, _, staging_metadata_digest) = fingerprint_build_source(root)?;
+    Ok(format!("{source_digest}:{staging_metadata_digest}"))
+}
+
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
     let mut source = Sha256::new();
     source.update(b"depgraph-build-source-v1\0");
@@ -2710,13 +2794,33 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
         let logical = display_logical(relative);
+        if metadata.file_type().is_symlink() {
+            let link_target = fs::read_link(entry.path())?;
+            if link_target.is_absolute() {
+                bail!(
+                    "security policy violation: staged workspace contains symlink {} with an absolute target; only relative symlinks that stay within the repository are staged",
+                    logical
+                );
+            }
+            files += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                bail!("security policy violation: staged workspace exceeds file or byte limit");
+            }
+            let target_logical = display_logical(&link_target);
+            staging_metadata.update(b"symlink\0");
+            staging_metadata.update(logical.as_bytes());
+            staging_metadata.update([0]);
+            staging_metadata.update(target_logical.as_bytes());
+            staging_metadata.update([0]);
+            source.update(logical.as_bytes());
+            source.update([0]);
+            source.update(b"depgraph-staged-symlink-v1\0");
+            source.update(target_logical.as_bytes());
+            source.update([0]);
+            continue;
+        }
         if metadata.is_dir() {
             staging_metadata.update(b"directory\0");
             staging_metadata.update(logical.as_bytes());
@@ -3783,6 +3887,114 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(!destination.path().join("target").exists());
         assert!(!destination.path().join(".next").exists());
         assert!(!destination.path().join("nested/.git").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_recreates_repository_internal_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let package = root
+            .path()
+            .join("node_modules/.pnpm/foo@1.0.0/node_modules/foo");
+        fs::create_dir_all(&package)?;
+        fs::write(package.join("index.js"), "module.exports = 1;\n")?;
+        symlink(
+            Path::new(".pnpm/foo@1.0.0/node_modules/foo"),
+            root.path().join("node_modules/foo"),
+        )?;
+        fs::create_dir_all(root.path().join("node_modules/.bin"))?;
+        symlink(
+            Path::new("../foo/index.js"),
+            root.path().join("node_modules/.bin/foo"),
+        )?;
+        // Links into content that is never staged stay inert instead of
+        // aborting the whole staging pass.
+        symlink(
+            Path::new(".next/cache/pack"),
+            root.path().join("dangling-cache-link"),
+        )?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+
+        let staged_package = destination.path().join("node_modules/foo");
+        assert!(
+            fs::symlink_metadata(&staged_package)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&staged_package)?,
+            Path::new(".pnpm/foo@1.0.0/node_modules/foo")
+        );
+        let resolved = destination
+            .path()
+            .join("node_modules/.bin/foo")
+            .canonicalize()?;
+        assert!(resolved.starts_with(destination.path().canonicalize()?));
+        assert_eq!(fs::read(resolved)?, b"module.exports = 1;\n");
+        assert!(
+            fs::symlink_metadata(destination.path().join("dangling-cache-link"))?
+                .file_type()
+                .is_symlink()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_symlinks_that_leave_the_repository() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let absolute = tempfile::tempdir()?;
+        fs::write(absolute.path().join("keep.txt"), "fixture")?;
+        symlink(Path::new("/etc"), absolute.path().join("etc-link"))?;
+        let destination = tempfile::tempdir()?;
+        let error = stage_workspace(absolute.path(), destination.path())
+            .expect_err("absolute symlink targets must be rejected");
+        assert!(error.to_string().contains("absolute target"), "{error}");
+
+        let escaping = tempfile::tempdir()?;
+        fs::write(escaping.path().join("keep.txt"), "fixture")?;
+        symlink(Path::new(".."), escaping.path().join("up-link"))?;
+        let destination = tempfile::tempdir()?;
+        let error = stage_workspace(escaping.path(), destination.path())
+            .expect_err("relative symlink escapes must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside the repository"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_mutation_fingerprint_tracks_symlink_targets_and_kinds() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("first.txt"), "fixture")?;
+        fs::write(root.path().join("second.txt"), "fixture")?;
+        symlink(Path::new("first.txt"), root.path().join("link"))?;
+        let original = source_mutation_fingerprint(root.path())?;
+
+        fs::remove_file(root.path().join("link"))?;
+        symlink(Path::new("second.txt"), root.path().join("link"))?;
+        let retargeted = source_mutation_fingerprint(root.path())?;
+        assert_ne!(original, retargeted);
+
+        fs::remove_file(root.path().join("link"))?;
+        fs::write(
+            root.path().join("link"),
+            b"depgraph-staged-symlink-v1\0second.txt",
+        )?;
+        let materialized = source_mutation_fingerprint(root.path())?;
+        assert_ne!(retargeted, materialized);
         Ok(())
     }
 }
