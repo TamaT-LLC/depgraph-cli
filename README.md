@@ -437,6 +437,32 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
 失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
+Webプロジェクトは`package.json`に version 付きの`depgraph.build`実行プランを置く。シェルコマンドや npm/pnpm/yarn の lifecycle は受け付けない。
+
+| フィールド | 型 | 意味 |
+|---|---|---|
+| `adapter` | string | `next` / `astro` / `tanstack-router` / `tanstack-start` |
+| `entrypoint` | リポジトリ相対パス | 一時ワークスペース内で `node <entrypoint>` として**引数なし**で起動する通常ファイル |
+| `version` | string | フレームワークの version 文字列。JSON の数値 `1` ではなく `"16.2.3"` のような文字列 |
+| `timeout_seconds` | integer | 省略可。既定は 900 秒 |
+
+entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
+
+```json
+{
+  "depgraph": {
+    "build": {
+      "adapter": "next",
+      "entrypoint": "scripts/depgraph-build.mjs",
+      "version": "16.2.3",
+      "timeout_seconds": 900
+    }
+  }
+}
+```
+
+プランが無い場合のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
+
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 
 ## 厳格ポリシーと終了コード

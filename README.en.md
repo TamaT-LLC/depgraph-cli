@@ -935,7 +935,21 @@ The explicit-consent guard is enforced before path, configuration, store, or too
 ```
 
 The allowed Web adapter values are `next`, `astro`, `tanstack-router`, and
-`tanstack-start`. The relative entrypoint must integrate the release-provided
+`tanstack-start`. Every field is JSON-typed: `version` must be a string
+(for example `"16.2.3"`), not the number `1`. `timeout_seconds` is optional
+and defaults to 900.
+
+depgraph launches the entrypoint as `node <entrypoint>` with **no extra
+arguments** inside a temporary staged copy of the repository. It does not
+resolve npm/pnpm/yarn scripts. Pointing `entrypoint` at `next.config.ts` or
+`node_modules/next/dist/bin/next` does not work; the file must spawn the real
+framework build and inherit its exit code without modifying project source.
+The child receives `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next)
+plus `DEPGRAPH_OUTPUT_DIR`. A copyable Next.js script is
+[`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
+Missing `depgraph.build` fails with that template and `depgraph resolve --help`.
+
+The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
 the real build lifecycle. It runs in a temporary staged workspace using
 canonical system Node, a cleared allowlisted environment, temporary
