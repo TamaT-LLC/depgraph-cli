@@ -315,6 +315,17 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   return canonicalRelativePath(relative);
 }
 
+function nodeModulePackageName(relative: string): string | null {
+  return [...relative.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/.][^/]*)(?=\/|$)/g)].at(-1)?.[1]
+    ?? null;
+}
+
+function sameNodeModulePackage(left: string, right: string): boolean {
+  const leftPackage = nodeModulePackageName(left);
+  const rightPackage = nodeModulePackageName(right);
+  return leftPackage !== null && leftPackage === rightPackage;
+}
+
 function secretShapedObserverValue(value: string): boolean {
   const lower = value.toLowerCase();
   return [
@@ -671,9 +682,11 @@ async function digestArtifact(
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
+  const hintMatchesPath = hinted === contained
+    || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
-    || (logicalHint !== undefined && hinted !== contained)) {
-    const reason = logicalHint !== undefined && contained !== null && hinted !== contained
+    || (logicalHint !== undefined && !hintMatchesPath)) {
+    const reason = logicalHint !== undefined && contained !== null && !hintMatchesPath
       ? "hint_mismatch"
       : "not_contained";
     const detail: Record<string, string> = { reason };
