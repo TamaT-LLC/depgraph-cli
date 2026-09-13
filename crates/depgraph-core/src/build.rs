@@ -157,7 +157,7 @@ struct WebBuildPackageConfig {
 
 #[derive(Debug, Deserialize)]
 struct WebDepgraphConfig {
-    build: WebBuildConfig,
+    build: Option<WebBuildConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +188,8 @@ pub struct BuildExecutionPlan {
     pub compiler_unit_graph: Option<RustCargoUnitGraph>,
     pub expected_source_root_digest: Option<String>,
 }
+
+const MISSING_WEB_BUILD_PLAN: &str = "package.json has no versioned depgraph.build execution plan; add a string-valued object such as {\"depgraph\":{\"build\":{\"adapter\":\"next\",\"entrypoint\":\"scripts/depgraph-build.mjs\",\"version\":\"16.2.3\",\"timeout_seconds\":900}}} and see `depgraph resolve --help`";
 
 #[derive(Debug, Clone)]
 pub struct BuildExecutionRequest {
@@ -237,10 +239,8 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             .context("package.json has an invalid depgraph build configuration")?;
         let config = package
             .depgraph
-            .context(
-                "package.json has no versioned depgraph.build execution plan; add a string-valued object such as {\"depgraph\":{\"build\":{\"adapter\":\"next\",\"entrypoint\":\"scripts/depgraph-build.mjs\",\"version\":\"16.2.3\",\"timeout_seconds\":900}}} and see `depgraph resolve --help`",
-            )?
-            .build;
+            .and_then(|config| config.build)
+            .context(MISSING_WEB_BUILD_PLAN)?;
         validate_logical_path(&config.entrypoint, false)?;
         if !source_root.join(&config.entrypoint).is_file() {
             bail!(
@@ -4125,6 +4125,19 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             .to_string();
         assert!(error.contains("package.json has no versioned depgraph.build execution plan"));
         assert!(error.contains("\"adapter\":\"next\""));
+        assert!(error.contains("scripts/depgraph-build.mjs"));
+        assert!(error.contains("depgraph resolve --help"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_web_build_object_explains_the_package_json_template() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("package.json"), "{\"depgraph\":{}}")?;
+        let error = create_build_execution_request(root.path())
+            .expect_err("empty depgraph object must fail as a missing plan")
+            .to_string();
+        assert!(error.contains("package.json has no versioned depgraph.build execution plan"));
         assert!(error.contains("scripts/depgraph-build.mjs"));
         assert!(error.contains("depgraph resolve --help"));
         Ok(())

@@ -1,5 +1,12 @@
 # 未リリース
 
+## depgraph.build の欠落診断と Next observer の自動ロード
+
+`{"depgraph":{}}` のように `build` だけが欠けている場合も、コピー可能な雛形と `depgraph resolve --help` を出す。
+Next.js 16.2 以降は `NEXT_ADAPTER_PATH` から observer を自動ロードするため、公式例は `next build` を spawn するだけで `modifyConfig` / `onBuildComplete` を呼ばない。
+
+関連: [#491](https://github.com/TamaT-LLC/depgraph-cli/issues/491)。
+
 ## resolve と safe scan の失敗診断
 
 `resolve --build` が失敗したときは、ビルド子プロセスの redacted な stderr 末尾を表示し、一時ディレクトリに `depgraph-build-<run-id>.stderr.log` を残す。

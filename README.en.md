@@ -945,9 +945,13 @@ resolve npm/pnpm/yarn scripts. Pointing `entrypoint` at `next.config.ts` or
 `node_modules/next/dist/bin/next` does not work; the file must spawn the real
 framework build and inherit its exit code without modifying project source.
 The child receives `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next)
-plus `DEPGRAPH_OUTPUT_DIR`. A copyable Next.js script is
+plus `DEPGRAPH_OUTPUT_DIR`. Next.js 16.2+ loads the observer from
+`NEXT_ADAPTER_PATH` automatically, so the entrypoint must spawn `next build`
+and must not call `modifyConfig` / `onBuildComplete` itself. A copyable
+Next.js script is
 [`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
-Missing `depgraph.build` fails with that template and `depgraph resolve --help`.
+Missing `depgraph.build` (including `{"depgraph":{}}` with no `build` object)
+fails with that template and `depgraph resolve --help`.
 
 The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
