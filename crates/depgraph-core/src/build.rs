@@ -2346,8 +2346,11 @@ fn stage_workspace_symlink(_source: &Path, relative: &Path, _staged: &Path) -> R
 /// The check runs after the whole tree is copied so chains of links resolve
 /// with their real runtime semantics (lexical checks are defeated by links
 /// that pass through parent directories which are themselves symlinks).
-/// Dangling links stay inert: they cannot be followed, so they are allowed
-/// (for example links into ignored build caches that were not staged).
+/// Dangling links cannot be followed, so links into not-yet-generated
+/// content (for example ignored build caches that were not staged) are
+/// allowed — but only when the place where the target would materialize
+/// also stays inside the staged workspace, because best-effort builds keep
+/// the workspace writable and could otherwise create the target outside it.
 fn confine_staged_symlinks(destination: &Path, staged_symlinks: &[PathBuf]) -> Result<()> {
     if staged_symlinks.is_empty() {
         return Ok(());
@@ -2364,7 +2367,20 @@ fn confine_staged_symlinks(destination: &Path, staged_symlinks: &[PathBuf]) -> R
                     );
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let resolved = resolve_dangling_symlink_target(staged).with_context(|| {
+                    format!(
+                        "staged workspace symlink {} could not be resolved",
+                        display_logical(relative)
+                    )
+                })?;
+                if !resolved.starts_with(&root) {
+                    bail!(
+                        "security policy violation: staged workspace symlink {} points outside the repository even though its target does not exist yet; keep the link target within the repository or remove the link",
+                        display_logical(relative)
+                    );
+                }
+            }
             Err(error) => {
                 return Err(anyhow::Error::new(error).context(format!(
                     "staged workspace symlink {} could not be resolved",
@@ -2374,6 +2390,41 @@ fn confine_staged_symlinks(destination: &Path, staged_symlinks: &[PathBuf]) -> R
         }
     }
     Ok(())
+}
+
+/// Best-effort resolution for a dangling staged symlink: canonicalize every
+/// prefix of the target that already exists (so links passing through
+/// existing symlinked directories resolve with their runtime semantics) and
+/// process the remaining, not-yet-existing components lexically. The result
+/// is where the operating system would materialize the target if the build
+/// created it.
+fn resolve_dangling_symlink_target(staged: &Path) -> Result<PathBuf> {
+    let parent = staged
+        .parent()
+        .context("staged symlink has no parent directory")?
+        .canonicalize()?;
+    let target = fs::read_link(staged)?;
+    let mut resolved = parent;
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let Ok(canonical) = resolved.canonicalize() {
+                    resolved = canonical;
+                }
+            }
+            // Absolute targets are rejected at staging time; treat any that
+            // slip through as their literal root so containment fails.
+            Component::RootDir | Component::Prefix(_) => {
+                resolved = PathBuf::from(component.as_os_str());
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn stage_cargo_dependency_cache(source: &Path, destination: &Path) -> Result<()> {
@@ -3967,6 +4018,22 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             error
                 .to_string()
                 .contains("resolves outside the repository"),
+            "{error}"
+        );
+
+        // A dangling link whose target would materialize outside the staged
+        // workspace must be rejected even though it cannot be followed yet.
+        let dangling = tempfile::tempdir()?;
+        fs::write(dangling.path().join("keep.txt"), "fixture")?;
+        symlink(
+            Path::new("../escaped-not-yet-created"),
+            dangling.path().join("dangling-escape"),
+        )?;
+        let destination = tempfile::tempdir()?;
+        let error = stage_workspace(dangling.path(), destination.path())
+            .expect_err("dangling symlink targets that escape must be rejected");
+        assert!(
+            error.to_string().contains("points outside the repository"),
             "{error}"
         );
         Ok(())
