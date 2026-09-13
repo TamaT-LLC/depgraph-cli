@@ -417,6 +417,51 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   );
 });
 
+test("assets hinted with a package-exports alias resolve to their real path within the same package", async () => {
+  const aliased = buildContext();
+  (aliased.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const observed = await collectNextBuildObservation(aliased, () => digest("a"));
+  assert.equal(
+    observed.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+  assert.equal(JSON.stringify(observed).includes("setup-node-env.js\""), false);
+
+  const scoped = buildContext();
+  (scoped.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/@vercel/og/index.node.js":
+      "/repo/node_modules/@vercel/og/dist/index.node.js",
+  };
+  const scopedObserved = await collectNextBuildObservation(scoped, () => digest("a"));
+  assert.equal(
+    scopedObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/@vercel/og/dist/index.node.js",
+  );
+
+  const crossPackage = buildContext();
+  (crossPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js": "/repo/node_modules/other/dist/impostor.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(crossPackage, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  const outsideNodeModules = buildContext();
+  (outsideNodeModules.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "apps/site/aliased.js": "/repo/apps/site/.next/server/chunks/shared.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(outsideNodeModules, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+});
+
 test("observed outputs correlate to canonical safe routes and become deterministic build evidence", async () => {
   const observed = await observation();
   const route = baseRoute();

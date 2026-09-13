@@ -612,6 +612,12 @@ function stableOutputIdentity(output: NextObservedOutput): string {
   });
 }
 
+const LAST_NODE_MODULES_PACKAGE = /^(?:.*\/)?node_modules\/(@[^/]+\/[^/.][^/]*|[^/@.][^/]*)\//u;
+
+function nodeModulesPackageName(logicalPath: string): string | null {
+  return LAST_NODE_MODULES_PACKAGE.exec(logicalPath)?.[1] ?? null;
+}
+
 async function digestArtifact(
   repoRoot: string,
   absolutePath: unknown,
@@ -620,10 +626,22 @@ async function digestArtifact(
 ): Promise<{ logicalPath: string; digest: string }> {
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
-  const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
-  if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
-    || (logicalHint !== undefined && hinted !== contained)) {
+  if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)) {
     fail("web.next_build_artifact_path_unsafe");
+  }
+  if (logicalHint !== undefined) {
+    const hinted = canonicalRelativePath(logicalHint);
+    // Next.js 16.2 hints assets with their package-exports alias (e.g.
+    // `node_modules/next/setup-node-env.js`) while the artifact lives at the
+    // resolved file (`node_modules/next/dist/build/adapter/...`). Accept an
+    // alias that stays within the same node_modules package; anything else
+    // remains a contract violation.
+    const hintedPackage = hinted === null ? null : nodeModulesPackageName(hinted);
+    const samePackageAlias = hintedPackage !== null
+      && hintedPackage === nodeModulesPackageName(contained);
+    if (hinted !== contained && !samePackageAlias) {
+      fail("web.next_build_artifact_path_unsafe");
+    }
   }
   const logicalPath = contained;
   let digest: string;
