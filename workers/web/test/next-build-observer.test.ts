@@ -441,12 +441,65 @@ test("assets hinted with a package-exports alias resolve to their real path with
     "node_modules/@vercel/og/dist/index.node.js",
   );
 
+  // pnpm's isolated layout stores the real file under
+  // node_modules/.pnpm/<pkg>@<version>/node_modules/<pkg>; the innermost
+  // package boundary is what must match the exports alias.
+  const pnpmLayout = buildContext();
+  (pnpmLayout.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const pnpmObserved = await collectNextBuildObservation(pnpmLayout, () => digest("a"));
+  assert.equal(
+    pnpmObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
+  // Nested installations of the package resolve against the innermost
+  // node_modules boundary on both sides.
+  const nestedInstall = buildContext();
+  (nestedInstall.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/app/node_modules/next/setup-node-env.js":
+      "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const nestedObserved = await collectNextBuildObservation(nestedInstall, () => digest("a"));
+  assert.equal(
+    nestedObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
   const crossPackage = buildContext();
   (crossPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
     "node_modules/next/setup-node-env.js": "/repo/node_modules/other/dist/impostor.js",
   };
   await assert.rejects(
     collectNextBuildObservation(crossPackage, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  // A hint naming the outer package must not alias a file that belongs to a
+  // package nested inside it: the innermost boundary decides the package.
+  const outerHintForNestedFile = buildContext();
+  (outerHintForNestedFile.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/app/index.js":
+      "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(outerHintForNestedFile, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  // Scoped packages keep their two-segment name across nesting: an alias for
+  // one scoped package cannot name a different package in the same scope.
+  const scopedMismatch = buildContext();
+  (scopedMismatch.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/@vercel/og/index.node.js":
+      "/repo/node_modules/@vercel/analytics/dist/index.node.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(scopedMismatch, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );
