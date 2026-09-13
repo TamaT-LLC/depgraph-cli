@@ -316,21 +316,8 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
 }
 
 function nodeModulePackageName(relative: string): string | null {
-  const parts = relative.split("/");
-  let packageName: string | null = null;
-  for (let index = 0; index < parts.length; index += 1) {
-    if (parts[index] !== "node_modules" || index + 1 >= parts.length) continue;
-    const name = parts[index + 1];
-    if (name === undefined || name.startsWith(".")) continue;
-    if (name.startsWith("@")) {
-      const scoped = parts[index + 2];
-      if (scoped === undefined || scoped.length === 0) continue;
-      packageName = `${name}/${scoped}`;
-      continue;
-    }
-    packageName = name;
-  }
-  return packageName;
+  return [...relative.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/.][^/]*)(?=\/|$)/g)].at(-1)?.[1]
+    ?? null;
 }
 
 function sameNodeModulePackage(left: string, right: string): boolean {
