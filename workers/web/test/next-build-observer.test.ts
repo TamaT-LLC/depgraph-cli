@@ -417,6 +417,40 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   );
 });
 
+test("package export aliases may differ from the contained file path inside the same module", async () => {
+  const context = buildContext();
+  (context.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const observed = await collectNextBuildObservation(context, () => digest("c"));
+  assert.equal(
+    observed.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
+  const pnpmLayout = buildContext();
+  (pnpmLayout.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const pnpmObserved = await collectNextBuildObservation(pnpmLayout, () => digest("c"));
+  assert.equal(
+    pnpmObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
+  const crossedPackage = buildContext();
+  (crossedPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js": "/repo/node_modules/react/index.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(crossedPackage, () => digest("c")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+});
+
 test("observed outputs correlate to canonical safe routes and become deterministic build evidence", async () => {
   const observed = await observation();
   const route = baseRoute();

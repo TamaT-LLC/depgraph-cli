@@ -315,6 +315,30 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   return canonicalRelativePath(relative);
 }
 
+function nodeModulePackageName(relative: string): string | null {
+  const parts = relative.split("/");
+  let packageName: string | null = null;
+  for (let index = 0; index < parts.length; index += 1) {
+    if (parts[index] !== "node_modules" || index + 1 >= parts.length) continue;
+    const name = parts[index + 1];
+    if (name === undefined || name.startsWith(".")) continue;
+    if (name.startsWith("@")) {
+      const scoped = parts[index + 2];
+      if (scoped === undefined || scoped.length === 0) continue;
+      packageName = `${name}/${scoped}`;
+      continue;
+    }
+    packageName = name;
+  }
+  return packageName;
+}
+
+function sameNodeModulePackage(left: string, right: string): boolean {
+  const leftPackage = nodeModulePackageName(left);
+  const rightPackage = nodeModulePackageName(right);
+  return leftPackage !== null && leftPackage === rightPackage;
+}
+
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   const raw = boundedString(value);
   if (raw === null) return allowEmpty && value === "" ? "" : null;
@@ -621,8 +645,10 @@ async function digestArtifact(
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
+  const hintMatchesPath = hinted === contained
+    || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
-    || (logicalHint !== undefined && hinted !== contained)) {
+    || (logicalHint !== undefined && !hintMatchesPath)) {
     fail("web.next_build_artifact_path_unsafe");
   }
   const logicalPath = contained;

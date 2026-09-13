@@ -1,5 +1,14 @@
 # 未リリース
 
+## Next.js の package exports エイリアス
+
+Next.js 16.2 はアセットの `logicalHint` に `next/setup-node-env.js` のような package exports エイリアスを渡し、実ファイルは `node_modules/next/dist/...` にある。
+同じ `node_modules` パッケージ内であればヒントと実パスの文字列一致を要求せず、安全性判定はリポジトリ内に収まっている実パスで行う。
+別パッケージやリポジトリ外、不正なヒントは従来どおり `web.next_build_artifact_path_unsafe` で拒否する。
+保存する観測値の `logical_path` は実パスのままである。
+
+関連: [#490](https://github.com/TamaT-LLC/depgraph-cli/issues/490)。
+
 ## 未解決依存がある場合の health 判定
 
 完了した解析の実行記録から未解決依存の範囲を証明できる場合、health の保留理由を該当する言語アダプターに限定する。
