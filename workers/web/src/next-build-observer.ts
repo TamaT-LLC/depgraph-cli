@@ -315,6 +315,17 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   return canonicalRelativePath(relative);
 }
 
+function nodeModulePackageName(relative: string): string | null {
+  return [...relative.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/.][^/]*)(?=\/|$)/g)].at(-1)?.[1]
+    ?? null;
+}
+
+function sameNodeModulePackage(left: string, right: string): boolean {
+  const leftPackage = nodeModulePackageName(left);
+  const rightPackage = nodeModulePackageName(right);
+  return leftPackage !== null && leftPackage === rightPackage;
+}
+
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   const raw = boundedString(value);
   if (raw === null) return allowEmpty && value === "" ? "" : null;
@@ -628,8 +639,10 @@ async function digestArtifact(
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
+  const hintMatchesPath = hinted === contained
+    || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
-    || (logicalHint !== undefined && hinted !== contained)) {
+    || (logicalHint !== undefined && !hintMatchesPath)) {
     fail("web.next_build_artifact_path_unsafe");
   }
   const logicalPath = contained;
