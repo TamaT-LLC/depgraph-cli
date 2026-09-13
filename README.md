@@ -316,6 +316,7 @@ depgraph daemon stop /path/to/repository
 
 # 権限を伴うビルド観測。実行ごとに明示的な同意が必要になる。
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -437,6 +438,7 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 一時ワークスペースにコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
 循環リンクと `.git` / `.depgraph` / リポジトリ直下の `target` / `.next` を指すリンクはコピーしない。
 リポジトリ外を指すリンクは拒否する。`.depgraph.toml` の `[build] ignored_paths` にリポジトリ相対プレフィックスを書くと、その配下はステージング対象から外れる。未知の `[build]` キーはエラーになる。
+失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
 Webプロジェクトは`package.json`に version 付きの`depgraph.build`実行プランを置く。シェルコマンドや npm/pnpm/yarn の lifecycle は受け付けない。
 

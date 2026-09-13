@@ -370,6 +370,7 @@ depgraph daemon stop /path/to/repository
 
 # Privileged build observation; every invocation requires explicit consent.
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -965,7 +966,11 @@ prefixes from staging, and unknown `[build]` keys are rejected. `[daemon]
 ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
 isolation capability, and outcome; raw stdout/stderr and temporary or host
-paths are not persisted. Network isolation is reported as `best-effort` unless
+paths are not persisted in the audit record. On a failed, timed-out, or
+cancelled attempt, a redacted stderr tail is printed and a redacted log file
+is written under the process temp directory as
+`depgraph-build-<run-id>.stderr.log`. `resolve --json` returns `build_run`,
+`status`, `diagnostic`, `exit_code`, `log_path`, and `stderr_tail`. Network isolation is reported as `best-effort` unless
 an outer namespace/container enforces it.
 
 Validated observer output uses the shared `framework-build-graph-v1` contract:
