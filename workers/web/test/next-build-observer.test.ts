@@ -651,6 +651,56 @@ test("same-source conditional routing entries remain distinct while exact duplic
   assert.equal(graph.edges.filter((edge) => edge.kind === "routes_in_phase").length, 2);
 });
 
+test("observer failures carry bounded pathname-only detail for the failing value", async () => {
+  const invalidDestination = buildContext();
+  invalidDestination.routing.dynamicRoutes = [{
+    source: "/blogs/[id]",
+    sourceRegex: "^/blogs/(?<nxtPid>[^/]+?)(?:/)?$",
+    destination: "/blogs/[id]\\bad?token=must-not-be-persisted",
+  }];
+  await assert.rejects(
+    collectNextBuildObservation(invalidDestination, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_invalid"
+      && error.detail?.phase === "dynamicRoutes"
+      && error.detail?.reason === "route pathname contract"
+      && error.detail?.source === "/blogs/[id]"
+      && error.detail?.destination === "/blogs/[id]\\bad?<redacted-query>"
+      && error.message.startsWith("web.next_build_manifest_invalid ")
+      && !error.message.includes("must-not-be-persisted"),
+  );
+
+  const mismatchedHint = buildContext();
+  (mismatchedHint.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js": "/repo/node_modules/other/dist/impostor.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(mismatchedHint, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.logical_hint === "node_modules/next/setup-node-env.js"
+      && error.detail?.contained === "node_modules/other/dist/impostor.js",
+  );
+
+  const detailed = nextBuildFailureDiagnostic(
+    new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
+      logical_hint: "node_modules/next/setup-node-env.js",
+      contained: "node_modules/other/dist/impostor.js",
+    }),
+    provenance.profile_id,
+  );
+  assert.equal(detailed.code, "web.next_build_artifact_path_unsafe");
+  assert.deepEqual(detailed.properties?.failure_detail, {
+    logical_hint: "node_modules/next/setup-node-env.js",
+    contained: "node_modules/other/dist/impostor.js",
+  });
+  const plain = nextBuildFailureDiagnostic(
+    new NextBuildObserverError("web.next_build_manifest_invalid"),
+    provenance.profile_id,
+  );
+  assert.equal(plain.properties?.failure_detail, undefined);
+});
+
 test("observer identity remains aligned across build evidence and adapter metadata", () => {
   assert.equal(NEXT_BUILD_OBSERVER, "next-adapter-observer");
   assert.equal(NEXT_BUILD_OBSERVER_VERSION, "0.2.0");

@@ -240,14 +240,37 @@ export interface NextBuildGraphDelta {
   diagnostics: Diagnostic[];
 }
 
+const MAX_FAILURE_DETAIL_VALUE = 200;
+
+export type NextBuildFailureDetail = Record<string, string>;
+
+function boundedFailureDetail(
+  detail: Record<string, string | null | undefined>,
+): NextBuildFailureDetail | undefined {
+  const entries = Object.entries(detail)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .map(([key, value]) => [key, value.slice(0, MAX_FAILURE_DETAIL_VALUE)] as const);
+  return entries.length === 0 ? undefined : Object.fromEntries(entries);
+}
+
 export class NextBuildObserverError extends Error {
   readonly code: string;
+  readonly detail?: NextBuildFailureDetail;
 
-  constructor(code: string) {
-    super(code);
+  constructor(code: string, detail?: NextBuildFailureDetail) {
+    super(detail === undefined ? code : `${code} ${JSON.stringify(detail)}`);
     this.name = "NextBuildObserverError";
     this.code = code;
+    if (detail !== undefined) this.detail = detail;
   }
+}
+
+// The bounded, already-redacted failure detail survives into the diagnostic
+// so a failed observation names the value that was rejected.
+function failureDetailProperties(error: unknown): Record<string, JsonValue> {
+  return error instanceof NextBuildObserverError && error.detail !== undefined
+    ? { failure_detail: { ...error.detail } }
+    : {};
 }
 
 export function nextBuildFailureDiagnostic(error: unknown, profileId: string): Diagnostic {
@@ -261,6 +284,7 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
     capability: NEXT_BUILD_OBSERVER_CAPABILITY,
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
+    ...failureDetailProperties(error),
   };
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
@@ -273,8 +297,14 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   };
 }
 
-function fail(code: string): never {
-  throw new NextBuildObserverError(code);
+// The optional detail carries only bounded route patterns and logical paths
+// (never header, environment, or query values) so the redacted reason for a
+// failed validation survives into the child process stderr and diagnostics.
+function fail(code: string, detail?: Record<string, string | null | undefined>): never {
+  throw new NextBuildObserverError(
+    code,
+    detail === undefined ? undefined : boundedFailureDetail(detail),
+  );
 }
 
 function record(value: unknown): UnknownRecord | null {
@@ -521,6 +551,14 @@ async function defaultArtifactReader(absolutePath: string, _logicalPath: string,
   }
 }
 
+// Failure details never carry query strings: only the pathname part of a
+// route value identifies the failing entry.
+function routingDetailPathname(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const queryIndex = value.indexOf("?");
+  return queryIndex < 0 ? value : `${value.slice(0, queryIndex)}?<redacted-query>`;
+}
+
 function sanitizeRouting(
   routing: Record<string, unknown>,
   buildId: string,
@@ -534,13 +572,18 @@ function sanitizeRouting(
       if (entries.length >= MAX_ROUTING_ENTRIES) fail("web.next_build_routing_limit_exceeded");
       const route = record(value);
       if (route === null || boundedString(route.sourceRegex) === null) {
-        fail("web.next_build_manifest_invalid");
+        fail("web.next_build_manifest_invalid", { phase, reason: "route entry contract" });
       }
       const rawSource = canonicalPathname(route.source);
       const rawDestination = canonicalPathname(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
-        fail("web.next_build_manifest_invalid");
+        fail("web.next_build_manifest_invalid", {
+          phase,
+          reason: "route pathname contract",
+          source: routingDetailPathname(route.source),
+          destination: routingDetailPathname(route.destination),
+        });
       }
       const source = rawSource === null ? null : replaceBuildId(rawSource, buildId);
       const destination = rawDestination === null ? null : replaceBuildId(rawDestination, buildId);
@@ -623,7 +666,10 @@ async function digestArtifact(
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
     || (logicalHint !== undefined && hinted !== contained)) {
-    fail("web.next_build_artifact_path_unsafe");
+    fail("web.next_build_artifact_path_unsafe", {
+      logical_hint: typeof logicalHint === "string" ? logicalHint : null,
+      contained,
+    });
   }
   const logicalPath = contained;
   let digest: string;
@@ -649,9 +695,19 @@ async function sanitizeOutput(
     fail("web.next_build_manifest_invalid");
   }
   const pathname = canonicalPathname(output.pathname);
-  if (pathname === null) fail("web.next_build_output_pathname_unsafe");
+  if (pathname === null) {
+    fail("web.next_build_output_pathname_unsafe", {
+      type: expectedType,
+      pathname: routingDetailPathname(output.pathname),
+    });
+  }
   const sourcePage = output.sourcePage === undefined ? null : canonicalSourcePage(output.sourcePage);
-  if (output.sourcePage !== undefined && sourcePage === null) fail("web.next_build_source_page_unsafe");
+  if (output.sourcePage !== undefined && sourcePage === null) {
+    fail("web.next_build_source_page_unsafe", {
+      type: expectedType,
+      source_page: routingDetailPathname(output.sourcePage),
+    });
+  }
   const requestOutput = REQUEST_OUTPUT_TYPES.has(expectedType) || expectedType === "MIDDLEWARE";
   if (requestOutput && sourcePage === null) fail("web.next_build_partial_build");
   const runtime: NextObservedOutput["runtime"] = output.runtime === "edge"

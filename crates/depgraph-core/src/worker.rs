@@ -242,6 +242,8 @@ pub(crate) enum WorkerFailureKind {
     NonzeroExit,
     IncompleteProtocol,
     TaskPanic,
+    /// The worker could not be located or launched, so it never ran.
+    LaunchFailed,
     Other,
 }
 
@@ -256,6 +258,7 @@ impl WorkerFailureKind {
             Self::NonzeroExit => "nonzero-exit",
             Self::IncompleteProtocol => "incomplete-protocol",
             Self::TaskPanic => "task-panic",
+            Self::LaunchFailed => "launch-failed",
             Self::Other => "other",
         }
     }
@@ -271,6 +274,7 @@ fn select_worker_failure_kind(kinds: &[WorkerFailureKind]) -> Option<WorkerFailu
         WorkerFailureKind::MalformedProtocol,
         WorkerFailureKind::IncompleteProtocol,
         WorkerFailureKind::TaskPanic,
+        WorkerFailureKind::LaunchFailed,
         WorkerFailureKind::Other,
     ];
     PRECEDENCE

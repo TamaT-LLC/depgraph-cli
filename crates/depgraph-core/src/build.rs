@@ -640,6 +640,7 @@ pub fn compiler_precise_cache_hit_audit(source: &BuildAudit) -> BuildAudit {
     audit.exit_code = None;
     audit.stdout_truncated = false;
     audit.stderr_truncated = false;
+    audit.stderr_tail = None;
     audit.diagnostic_code = None;
     audit.compiler_failure = None;
     audit
@@ -898,6 +899,11 @@ pub struct BuildAudit {
     pub exit_code: Option<i32>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Bounded tail of the build child's stderr, retained only for
+    /// non-completed outcomes with secret-shaped lines redacted, so a failed
+    /// `resolve --build` can report why the child failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
     pub validated_output_digest: Option<String>,
     pub diagnostic_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1225,7 +1231,7 @@ where
     let mut reader_errors = Vec::new();
     let (stdout, stdout_truncated) =
         finish_reader(stdout_task, "build stdout", &mut reader_errors).await?;
-    let (_stderr, stderr_truncated) =
+    let (stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
     let mut outcome = outcome;
@@ -1402,6 +1408,11 @@ where
         web_observation = None;
     }
     let finished_wall = Utc::now();
+    let stderr_tail = if matches!(outcome, BuildOutcomeKind::Completed) {
+        None
+    } else {
+        bounded_stderr_tail(&stderr)
+    };
     let audit = BuildAudit {
         schema_version: BUILD_SUPERVISOR_VERSION.to_owned(),
         run_id: Uuid::new_v4().to_string(),
@@ -1434,6 +1445,7 @@ where
         exit_code,
         stdout_truncated,
         stderr_truncated,
+        stderr_tail,
         validated_output_digest,
         diagnostic_code,
         compiler_failure,
@@ -2204,6 +2216,56 @@ fn audit_environment_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<S
         }
     }
     (visible.into_iter().collect(), redacted)
+}
+
+/// Bytes of the child's stderr retained in the audit of a failed build. The
+/// tail is where build tools report their terminal error, and the bound keeps
+/// failed-run audits small even against the 10 MiB capture limit.
+const BUILD_STDERR_TAIL_LIMIT_BYTES: usize = 32 * 1024;
+
+/// Retain a bounded stderr tail for failure diagnosis: keep the last
+/// [`BUILD_STDERR_TAIL_LIMIT_BYTES`] of the capture, replace control
+/// characters other than line breaks and tabs, and redact secret-shaped
+/// lines instead of persisting them.
+fn bounded_stderr_tail(stderr: &[u8]) -> Option<String> {
+    let skip = stderr.len().saturating_sub(BUILD_STDERR_TAIL_LIMIT_BYTES);
+    let tail = String::from_utf8_lossy(&stderr[skip..]);
+    let mut redacted = String::with_capacity(tail.len());
+    for line in tail.lines() {
+        if is_secret_shaped_line(line) {
+            redacted.push_str("[REDACTED LINE]");
+        } else {
+            redacted.extend(line.chars().map(|character| {
+                if character.is_control() && character != '\t' {
+                    ' '
+                } else {
+                    character
+                }
+            }));
+        }
+        redacted.push('\n');
+    }
+    let redacted = redacted.trim_end().to_owned();
+    (!redacted.is_empty()).then_some(redacted)
+}
+
+/// A stderr line that looks like it carries a credential: key material
+/// markers or a secret-shaped `key=value` / `key: value` assignment.
+fn is_secret_shaped_line(line: &str) -> bool {
+    let lowercase = line.to_ascii_lowercase();
+    if lowercase.contains("-----begin") {
+        return true;
+    }
+    if lowercase
+        .split_once(':')
+        .is_some_and(|(key, value)| !value.trim().is_empty() && is_secret_key(key.trim()))
+    {
+        return true;
+    }
+    lowercase
+        .split(|character: char| character.is_whitespace() || character == ';' || character == ',')
+        .filter_map(|fragment| fragment.split_once('='))
+        .any(|(key, value)| !value.trim().is_empty() && is_secret_key(key.trim()))
 }
 
 fn redact_arguments(arguments: &[String]) -> Vec<String> {
@@ -3361,6 +3423,10 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         assert_eq!(outcome.audit.outcome, BuildOutcomeKind::Completed);
         assert!(outcome.project_code_executed);
         assert!(outcome.audit.validated_output_digest.is_some());
+        assert!(
+            outcome.audit.stderr_tail.is_none(),
+            "a completed build must not retain a stderr tail"
+        );
         assert!(!root.path().join("PROJECT_CODE_EXECUTED").exists());
         let serialized = serde_json::to_string(&outcome.audit)?;
         assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
@@ -3475,6 +3541,11 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             Some("build-child-failed")
         );
         assert!(failed.audit.validated_output_digest.is_none());
+        assert_eq!(
+            failed.audit.stderr_tail.as_deref(),
+            Some("compiler panic fixture"),
+            "a failed build must retain the child's stderr tail for diagnosis"
+        );
 
         fs::write(
             root.path().join("noisy.mjs"),
@@ -3724,6 +3795,44 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
                 "--password=secret".to_owned()
             ]),
             vec!["--token", "[REDACTED]", "--password=[REDACTED]"]
+        );
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_and_redacts_secret_shaped_lines() {
+        assert_eq!(bounded_stderr_tail(b""), None);
+        assert_eq!(bounded_stderr_tail(b"\n\n"), None);
+        assert_eq!(
+            bounded_stderr_tail("Error: manifest invalid\r\n\tat routesManifest\n".as_bytes()),
+            Some("Error: manifest invalid\n\tat routesManifest".to_owned())
+        );
+        assert_eq!(
+            bounded_stderr_tail(b"progress\x1b[2K\rdone"),
+            Some("progress [2K done".to_owned()),
+            "control characters inside a line must not reach the audit"
+        );
+
+        let leaked = concat!(
+            "Error [NextBuildObserverError]: web.next_build_manifest_invalid\n",
+            "npm_config_registry_token=hunter2\n",
+            "Authorization: Bearer hunter2\n",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "build failed with exit code 1",
+        );
+        let tail = bounded_stderr_tail(leaked.as_bytes()).expect("tail is retained");
+        assert!(tail.contains("web.next_build_manifest_invalid"));
+        assert!(tail.contains("build failed with exit code 1"));
+        assert!(!tail.contains("hunter2"));
+        assert!(!tail.contains("PRIVATE KEY"));
+        assert_eq!(tail.matches("[REDACTED LINE]").count(), 3);
+
+        let mut oversized = vec![b'a'; 2 * BUILD_STDERR_TAIL_LIMIT_BYTES];
+        oversized.extend_from_slice(b"\nterminal build error");
+        let tail = bounded_stderr_tail(&oversized).expect("tail is retained");
+        assert!(tail.len() <= BUILD_STDERR_TAIL_LIMIT_BYTES);
+        assert!(
+            tail.ends_with("terminal build error"),
+            "the tail must keep the end of the stream where the error is reported"
         );
     }
 

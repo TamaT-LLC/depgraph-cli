@@ -166,6 +166,7 @@ pub struct ValidatedScanSummary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalScanMetadata {
     pub status: String,
+    pub error: Option<String>,
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
     pub cache_events: Vec<CacheEventRecord>,

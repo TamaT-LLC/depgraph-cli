@@ -189,6 +189,10 @@ enum Commands {
             requires = "rust_compiler_precise"
         )]
         compiler_pack_requirement: Option<PathBuf>,
+        /// Emit the build run, status, diagnostic, child exit code, retained
+        /// stderr tail, and stderr log path as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Report worker, toolchain, coverage, and protocol health.
     Doctor {
@@ -1275,6 +1279,9 @@ async fn run(cli: Cli) -> Result<u8> {
                         diagnostic.severity, diagnostic.code, diagnostic.message
                     );
                 }
+                if let Some(error) = &outcome.error {
+                    eprintln!("error: {error}");
+                }
                 if let Some(policy) = &outcome.policy {
                     println!(
                         "policy: {} errors, {} warnings, {} suppressed",
@@ -1406,6 +1413,7 @@ async fn run(cli: Cli) -> Result<u8> {
             allow_project_code,
             rust_compiler_precise,
             compiler_pack_requirement,
+            json,
         } => {
             debug_assert!(build, "clap requires --build");
             if rust_compiler_precise {
@@ -1431,53 +1439,90 @@ async fn run(cli: Cli) -> Result<u8> {
                 .resolve_build_cancellable(&request, &cancellation)
                 .await?;
             let outcome = result.execution();
-            if let Some(ledger) = outcome.rust_compiler_invocation_ledger.as_ref() {
-                println!("Rust compiler invocations: {}", ledger.entries.len());
-                println!("Rust compiler invocation ledger digest: {}", ledger.digest);
-            }
-            if let Some(ledger) = outcome.rust_compiler_mir_ledger.as_ref() {
-                let body_count = ledger
-                    .entries
-                    .iter()
-                    .map(|entry| entry.bodies.len())
-                    .sum::<usize>();
-                println!("Rust typed MIR bodies: {body_count}");
-                println!("Rust typed MIR ledger digest: {}", ledger.digest);
-            }
-            if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
-                println!("Cargo units: {}", unit_graph.units.len());
-                println!("Cargo unit graph digest: {}", unit_graph.digest);
-            }
-            println!("build run: {}", outcome.audit.run_id);
-            println!("status: {:?}", outcome.audit.outcome);
-            println!("project code executed: {}", outcome.project_code_executed);
-            println!("build evidence: {}", result.evidence_status());
-            println!(
-                "build cache lookup: {} ({})",
-                result.cache_lookup_status(),
-                result.cache_lookup_reason()
-            );
-            println!("build cache: {}", result.build_cache_status());
-            println!("network isolation: {:?}", outcome.audit.network_isolation);
-            println!("execution isolation: {:?}", outcome.audit.isolation);
-            println!(
-                "source non-mutation guaranteed: {}",
-                outcome.audit.source_mutation.non_mutation_guaranteed
-            );
-            if let Some(diagnostic) = &outcome.audit.diagnostic_code {
-                println!("diagnostic: {diagnostic}");
-            }
-            if let Some(failure) = &outcome.audit.compiler_failure {
-                println!("compiler Cargo unit: {}", failure.unit_id);
+            if json {
                 println!(
-                    "compiler Cargo unit context: kind={}, mode={}, platform={}",
-                    failure.unit_kind, failure.mode, failure.cargo_platform
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": "1.0",
+                        "command": "resolve",
+                        "build_run": outcome.audit.run_id,
+                        "status": outcome.audit.outcome,
+                        "diagnostic": outcome.audit.diagnostic_code,
+                        "exit_code": outcome.audit.exit_code,
+                        "stderr_tail": outcome.audit.stderr_tail,
+                        "stderr_log_path": result.stderr_log_path(),
+                        "project_code_executed": outcome.project_code_executed,
+                        "evidence": result.evidence_status(),
+                        "cache_lookup": {
+                            "status": result.cache_lookup_status(),
+                            "reason": result.cache_lookup_reason(),
+                        },
+                        "build_cache": result.build_cache_status(),
+                        "store": store_path,
+                        "audit": outcome.audit,
+                    }))?
                 );
+            } else {
+                if let Some(ledger) = outcome.rust_compiler_invocation_ledger.as_ref() {
+                    println!("Rust compiler invocations: {}", ledger.entries.len());
+                    println!("Rust compiler invocation ledger digest: {}", ledger.digest);
+                }
+                if let Some(ledger) = outcome.rust_compiler_mir_ledger.as_ref() {
+                    let body_count = ledger
+                        .entries
+                        .iter()
+                        .map(|entry| entry.bodies.len())
+                        .sum::<usize>();
+                    println!("Rust typed MIR bodies: {body_count}");
+                    println!("Rust typed MIR ledger digest: {}", ledger.digest);
+                }
+                if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
+                    println!("Cargo units: {}", unit_graph.units.len());
+                    println!("Cargo unit graph digest: {}", unit_graph.digest);
+                }
+                println!("build run: {}", outcome.audit.run_id);
+                println!("status: {:?}", outcome.audit.outcome);
+                println!("project code executed: {}", outcome.project_code_executed);
+                println!("build evidence: {}", result.evidence_status());
+                println!(
+                    "build cache lookup: {} ({})",
+                    result.cache_lookup_status(),
+                    result.cache_lookup_reason()
+                );
+                println!("build cache: {}", result.build_cache_status());
+                println!("network isolation: {:?}", outcome.audit.network_isolation);
+                println!("execution isolation: {:?}", outcome.audit.isolation);
+                println!(
+                    "source non-mutation guaranteed: {}",
+                    outcome.audit.source_mutation.non_mutation_guaranteed
+                );
+                if let Some(diagnostic) = &outcome.audit.diagnostic_code {
+                    println!("diagnostic: {diagnostic}");
+                }
+                if let Some(exit_code) = outcome.audit.exit_code
+                    && !matches!(outcome.audit.outcome, BuildOutcomeKind::Completed)
+                {
+                    println!("build child exit code: {exit_code}");
+                }
+                if let Some(failure) = &outcome.audit.compiler_failure {
+                    println!("compiler Cargo unit: {}", failure.unit_id);
+                    println!(
+                        "compiler Cargo unit context: kind={}, mode={}, platform={}",
+                        failure.unit_kind, failure.mode, failure.cargo_platform
+                    );
+                }
+                if let Some(path) = result.stderr_log_path() {
+                    println!("build stderr log: {}", path.display());
+                }
+                if let Some(tail) = &outcome.audit.stderr_tail {
+                    eprintln!("build stderr (bounded tail):");
+                    eprintln!("{tail}");
+                }
+                println!("store: {}", store_path.display());
             }
             if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
                 eprintln!("warning: {diagnostic}");
             }
-            println!("store: {}", store_path.display());
             Ok(match outcome.audit.outcome {
                 BuildOutcomeKind::Completed => 0,
                 BuildOutcomeKind::SecurityFailed => 4,

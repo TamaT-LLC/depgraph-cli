@@ -409,6 +409,7 @@ fn cross_language_ffi_outcome(
             exit_code: Some(0),
             stdout_truncated: false,
             stderr_truncated: false,
+            stderr_tail: None,
             validated_output_digest: Some(validated_output_digest),
             diagnostic_code: None,
             compiler_failure: None,

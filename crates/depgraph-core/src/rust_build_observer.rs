@@ -1840,6 +1840,7 @@ mod tests {
             exit_code: Some(0),
             stdout_truncated: false,
             stderr_truncated: false,
+            stderr_tail: None,
             validated_output_digest: Some("e".repeat(64)),
             diagnostic_code: None,
             compiler_failure: None,
