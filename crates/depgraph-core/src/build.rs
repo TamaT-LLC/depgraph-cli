@@ -237,7 +237,9 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             .context("package.json has an invalid depgraph build configuration")?;
         let config = package
             .depgraph
-            .context("package.json has no versioned depgraph.build execution plan")?
+            .context(
+                "package.json has no versioned depgraph.build execution plan; add a string-valued object such as {\"depgraph\":{\"build\":{\"adapter\":\"next\",\"entrypoint\":\"scripts/depgraph-build.mjs\",\"version\":\"16.2.3\",\"timeout_seconds\":900}}} and see `depgraph resolve --help`",
+            )?
             .build;
         validate_logical_path(&config.entrypoint, false)?;
         if !source_root.join(&config.entrypoint).is_file() {
@@ -3912,6 +3914,20 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             "1.168.28".to_owned(),
         );
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_web_build_plan_explains_the_package_json_template() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("package.json"), "{\"name\":\"fixture\"}")?;
+        let error = create_build_execution_request(root.path())
+            .expect_err("missing plan must fail before a child starts")
+            .to_string();
+        assert!(error.contains("package.json has no versioned depgraph.build execution plan"));
+        assert!(error.contains("\"adapter\":\"next\""));
+        assert!(error.contains("scripts/depgraph-build.mjs"));
+        assert!(error.contains("depgraph resolve --help"));
+        Ok(())
     }
 
     #[test]

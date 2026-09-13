@@ -390,6 +390,30 @@ test("prerenders without a fallback artifact use deterministic synthetic metadat
   assert.equal(JSON.stringify(observed).includes("private-prerender-output-id"), false);
 });
 
+test("dynamicRoutes destinations keep the pathname when Next includes a named capture query", async () => {
+  const context = buildContext();
+  context.routing.dynamicRoutes = [
+    {
+      source: "/blogs/[id]",
+      sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+      destination: "/blogs/[id]?nxtPid=$nxtPid",
+    },
+    {
+      source: "/blogs/[id].rsc",
+      sourceRegex: "^/blogs/([^/]+?)\\.rsc(?:/)?$",
+      destination: "/blogs/[id]$rscSuffix?nxtPid=$nxtPid",
+    },
+  ];
+  const observed = await collectNextBuildObservation(context, () => digest("a"));
+  const destinations = observed.routing
+    .filter((entry) => entry.phase === "dynamicRoutes")
+    .map((entry) => entry.destination)
+    .sort();
+  assert.deepEqual(destinations, ["/blogs/[id]", "/blogs/[id]$rscSuffix"]);
+  assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
+  assert.equal(JSON.stringify(observed).includes("?"), false);
+});
+
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {
   const escaped = buildContext();
   (escaped.outputs.appPages as Array<Record<string, unknown>>)[0]!.filePath = "/outside/page.js";
@@ -414,6 +438,18 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
     collectNextBuildObservation(mismatchedAsset, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  const queryOnlyDestination = buildContext();
+  queryOnlyDestination.routing.dynamicRoutes = [{
+    source: "/blogs/[id]",
+    sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+    destination: "?nxtPid=$nxtPid",
+  }];
+  await assert.rejects(
+    collectNextBuildObservation(queryOnlyDestination, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_invalid",
   );
 });
 
