@@ -435,6 +435,51 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 設定、環境変数、`CI=true`、TTYの状態、過去の同意によって権限を付与することはできない。
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
 
+`Cargo.toml`と`Cargo.lock`を持つRustワークスペースはCargoで実行する。
+Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。
+
+```json
+{
+  "depgraph": {
+    "build": {
+      "adapter": "next",
+      "entrypoint": "depgraph-build.mjs",
+      "version": "16.2.10",
+      "timeout_seconds": 900
+    }
+  }
+}
+```
+
+各フィールドは厳格に検証され、未知のフィールドは設定ミスに気づけるよう拒否される。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `adapter` | 文字列 | `next`・`astro`・`tanstack-router`・`tanstack-start`のいずれか。リリースに固定された観測契約を選択する |
+| `entrypoint` | 文字列 | リポジトリ相対パスのNodeスクリプト。`node <entrypoint>`として引数なしで起動される。絶対パスと`..`は拒否され、ファイルが存在しなければならない |
+| `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.10"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
+| `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト。既定は`900` |
+
+entrypointの起動規約は次のとおりである。
+
+- ビルドはリポジトリの一時的なステージングコピーの中で、そのルートを作業ディレクトリとして実行される。entrypointはソースを変更してはならない（変更は実行後のソース監査で失敗になる）。
+- `node <entrypoint>`にCLI引数は渡されない。設定は環境変数で渡される。`DEPGRAPH_OBSERVER`はリリース同梱の観測モジュールのパス（Nextには`NEXT_ADAPTER_PATH`としても渡される）、観測結果は`DEPGRAPH_OUTPUT_DIR`へ書き出される。
+- スクリプトは実際のフレームワークビルド（例: `next build`のspawn）を起動し、その終了コードで終了することが期待される。`next.config.ts`やフレームワークのバイナリを直接`entrypoint`に指定しても、観測がビルドライフサイクルへ組み込まれないため動作しない。
+
+最小のNext.js向けentrypointの例:
+
+```js
+// depgraph-build.mjs
+import { spawnSync } from "node:child_process";
+
+const result = spawnSync(
+  process.execPath,
+  ["node_modules/next/dist/bin/next", "build"],
+  { stdio: "inherit" },
+);
+process.exit(result.status ?? 1);
+```
+
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 
 ## 厳格ポリシーと終了コード

@@ -169,6 +169,22 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Observe a project build only after explicit project-code consent.
+    ///
+    /// Rust workspaces with `Cargo.toml` and `Cargo.lock` build through Cargo.
+    /// Web projects declare a versioned execution plan in `package.json`, for
+    /// example: {"depgraph":{"build":{"adapter":"next","entrypoint":
+    /// "depgraph-build.mjs","version":"16.2.10","timeout_seconds":900}}}.
+    /// `adapter` is one of next, astro, tanstack-router, or tanstack-start;
+    /// `version` is a non-empty framework version string; `timeout_seconds`
+    /// is optional (default 900); unknown fields are rejected. The
+    /// repository-relative `entrypoint` is launched as `node <entrypoint>`
+    /// with no arguments inside a temporary staged copy of the repository. It
+    /// must start the real framework build (for example spawn `next build`),
+    /// exit with the build's exit code, and leave sources unchanged. The
+    /// release-provided observer path arrives as DEPGRAPH_OBSERVER (Next also
+    /// receives NEXT_ADAPTER_PATH) and the observation artifact is written to
+    /// DEPGRAPH_OUTPUT_DIR. See the README build-mode consent boundary
+    /// section for the full contract.
     Resolve {
         /// Select build observation mode. No other resolve mode is available yet.
         #[arg(long, required = true)]

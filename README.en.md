@@ -933,6 +933,44 @@ The explicit-consent guard is enforced before path, configuration, store, or too
 }
 ```
 
+Every `depgraph.build` field is validated strictly, and unknown fields are
+rejected so misspelled configuration cannot be silently ignored:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `adapter` | string | One of `next`, `astro`, `tanstack-router`, `tanstack-start`; selects the release-pinned observer contract. |
+| `entrypoint` | string | Repository-relative path to a Node script launched as `node <entrypoint>` with no arguments. Absolute paths and `..` segments are rejected, and the file must exist. |
+| `version` | string | Non-empty target framework version (for example `"16.2.10"`). It must be a JSON string; a bare number is rejected. Astro and TanStack adapters receive it as `DEPGRAPH_ASTRO_VERSION`, `DEPGRAPH_TANSTACK_ROUTER_VERSION`, or `DEPGRAPH_TANSTACK_START_VERSION`. |
+| `timeout_seconds` | integer, optional | Whole-build timeout; defaults to `900`. |
+
+The entrypoint launch convention is:
+
+- The build runs inside a temporary staged copy of the repository with the
+  staged workspace root as the working directory; the entrypoint must leave
+  the sources unchanged (mutations fail the run's source audit).
+- `node <entrypoint>` receives no CLI arguments. Configuration arrives through
+  environment variables: `DEPGRAPH_OBSERVER` names the release-provided
+  observer module (Next also receives it as `NEXT_ADAPTER_PATH`), and the
+  observer writes its observation artifact into `DEPGRAPH_OUTPUT_DIR`.
+- The script is expected to start the real framework build (for example spawn
+  `next build`) and exit with the build's exit code. Pointing `entrypoint` at
+  `next.config.ts` or at the framework binary itself does not work because
+  nothing would integrate the observer into the build lifecycle.
+
+A minimal Next.js entrypoint:
+
+```js
+// depgraph-build.mjs
+import { spawnSync } from "node:child_process";
+
+const result = spawnSync(
+  process.execPath,
+  ["node_modules/next/dist/bin/next", "build"],
+  { stdio: "inherit" },
+);
+process.exit(result.status ?? 1);
+```
+
 The allowed Web adapter values are `next`, `astro`, `tanstack-router`, and
 `tanstack-start`. The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into

@@ -237,7 +237,13 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             .context("package.json has an invalid depgraph build configuration")?;
         let config = package
             .depgraph
-            .context("package.json has no versioned depgraph.build execution plan")?
+            .context(
+                "package.json has no versioned depgraph.build execution plan; declare one such as \
+                 {\"depgraph\":{\"build\":{\"adapter\":\"next\",\"entrypoint\":\"depgraph-build.mjs\",\
+                 \"version\":\"16.2.10\",\"timeout_seconds\":900}}} where the repository-relative \
+                 entrypoint is launched as `node <entrypoint>` without arguments and must start the \
+                 real framework build (see the README build-mode consent boundary section)",
+            )?
             .build;
         validate_logical_path(&config.entrypoint, false)?;
         if !source_root.join(&config.entrypoint).is_file() {
