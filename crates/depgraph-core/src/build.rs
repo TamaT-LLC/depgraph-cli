@@ -1412,7 +1412,13 @@ where
         web_observation = None;
     }
     let finished_wall = Utc::now();
-    let stderr_tail = if matches!(outcome, BuildOutcomeKind::Completed) {
+    // Compiler-precise runs keep their stricter release contract: build
+    // script and compiler output is never persisted, and failures are
+    // explained by the reason-coded invocation-ledger diagnostics instead.
+    let stderr_tail = if matches!(outcome, BuildOutcomeKind::Completed)
+        || plan.adapter == COMPILER_PRECISE_UNIT_GRAPH_ADAPTER
+        || plan.adapter == COMPILER_PRECISE_INVOCATION_ADAPTER
+    {
         None
     } else {
         bounded_stderr_tail(&stderr)
@@ -3441,6 +3447,44 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         assert!(!rustc_marker.exists());
         assert!(!wrapper_marker.exists());
         assert!(!build_script_marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiler_precise_failures_never_persist_a_stderr_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src"))?;
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"unit-graph-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )?;
+        fs::write(project.join("Cargo.lock"), "version = 4\n")?;
+        fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let cargo_script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'cargo 1.99.0-nightly\n'; exit 0; fi
+echo 'DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE' >&2
+exit 101
+"#;
+        let (requirement, _) = compiler_pack_fixture_with_scripts(
+            &temp,
+            cargo_script,
+            "#!/bin/sh\nexit 93\n",
+            "#!/bin/sh\nexit 94\n",
+        )?;
+        let request = create_compiler_precise_unit_graph_request(&project, requirement)?;
+        let outcome = execute_build_request(&request).await?;
+        assert_ne!(outcome.audit.outcome, BuildOutcomeKind::Completed);
+        assert!(
+            outcome.audit.stderr_tail.is_none(),
+            "compiler-precise audits must never persist child stderr"
+        );
+        let serialized = serde_json::to_string(&outcome.audit)?;
+        assert!(
+            !serialized.contains("DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE"),
+            "compiler-precise child stderr must not escape into the audit"
+        );
         Ok(())
     }
 
