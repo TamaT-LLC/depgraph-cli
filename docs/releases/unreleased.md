@@ -1,5 +1,14 @@
 # 未リリース
 
+## resolve と safe scan の失敗診断
+
+`resolve --build` が失敗したときは、ビルド子プロセスの redacted な stderr 末尾を表示し、一時ディレクトリに `depgraph-build-<run-id>.stderr.log` を残す。
+`resolve --json` は `build_run` / `status` / `diagnostic` / `exit_code` / `log_path` / `stderr_tail` を返す。
+監査記録には raw stderr とホストパスを載せない。シークレット形状の行は `[REDACTED]` にする。
+Next.js observer の `fail` は pathname とルートパターンに限定した `detail` を持ち、診断へ伝搬する。
+safe scan の worker 起動失敗は `worker-failure:web:launch` など具体的な reason を返し、stderr を adapter log に残す。
+進捗がない `other` 失敗でも inventory / typescript / launch のフェーズを推定する。
+
 ## Next.js の package exports エイリアス
 
 Next.js 16.2 はアセットの `logicalHint` に `next/setup-node-env.js` のような package exports エイリアスを渡し、実ファイルは `node_modules/next/dist/...` にある。

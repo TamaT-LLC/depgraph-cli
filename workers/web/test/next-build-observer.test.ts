@@ -420,7 +420,10 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   await assert.rejects(
     collectNextBuildObservation(escaped, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_artifact_path_unsafe",
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "not_contained"
+      && error.detail?.contained === undefined
+      && JSON.stringify(error).includes("/outside/page.js") === false,
   );
 
   const unsupported = buildContext({ nextVersion: "17.0.0" });
@@ -437,8 +440,24 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   await assert.rejects(
     collectNextBuildObservation(mismatchedAsset, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_artifact_path_unsafe",
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "hint_mismatch"
+      && JSON.stringify(error).includes("private\\secret.js") === false
+      && JSON.stringify(error).includes("C:") === false,
   );
+
+  const leakedHint = nextBuildFailureDiagnostic(
+    new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
+      reason: "hint_mismatch",
+      contained: "apps/site/.next/server/app/page.js",
+      hinted: "token=raw-secret",
+    }),
+    provenance.profile_id,
+  );
+  assert.equal(leakedHint.properties?.reason, "hint_mismatch");
+  assert.equal(leakedHint.properties?.contained, "apps/site/.next/server/app/page.js");
+  assert.equal(leakedHint.properties?.hinted, undefined);
+  assert.equal(JSON.stringify(leakedHint).includes("raw-secret"), false);
 
   const queryOnlyDestination = buildContext();
   queryOnlyDestination.routing.dynamicRoutes = [{
