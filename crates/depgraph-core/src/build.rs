@@ -3640,7 +3640,7 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             redact_build_log(b"compiler panic\nAuthorization: Bearer leaked-token\n"),
             "compiler panic\n[REDACTED]"
         );
-        let prefix = "a".repeat(1);
+        let prefix = "a".to_string();
         let wide = "é".repeat(CHILD_STDERR_TAIL_BYTES);
         let (tail, path) = persist_child_stderr_log("utf8-tail", &format!("{prefix}{wide}"), true);
         let tail = tail.expect("stderr tail is missing");

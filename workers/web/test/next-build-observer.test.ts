@@ -445,9 +445,9 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
     }),
     provenance.profile_id,
   );
-  assert.equal(leakedHint.properties.reason, "hint_mismatch");
-  assert.equal(leakedHint.properties.contained, "apps/site/.next/server/app/page.js");
-  assert.equal(leakedHint.properties.hinted, undefined);
+  assert.equal(leakedHint.properties?.reason, "hint_mismatch");
+  assert.equal(leakedHint.properties?.contained, "apps/site/.next/server/app/page.js");
+  assert.equal(leakedHint.properties?.hinted, undefined);
   assert.equal(JSON.stringify(leakedHint).includes("raw-secret"), false);
 });
 

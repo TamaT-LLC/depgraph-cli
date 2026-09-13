@@ -241,12 +241,12 @@ export interface NextBuildGraphDelta {
 }
 
 export class NextBuildObserverError extends Error {
-  readonly code: string;
-  readonly detail: Record<string, string> | undefined;
-
-  constructor(code: string, detail?: Record<string, string>) {
+  constructor(
+    readonly code: string,
+    readonly detail?: Record<string, string>,
+  ) {
     super(detail === undefined ? code : `${code}: ${JSON.stringify(detail)}`);
-    Object.assign(this, { name: "NextBuildObserverError", code, detail });
+    this.name = "NextBuildObserverError";
   }
 }
 
