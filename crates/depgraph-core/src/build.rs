@@ -2643,11 +2643,73 @@ fn default_skip_directory(entry: &DirEntry) -> bool {
     entry.depth() == 1 && matches!(name.as_ref(), "target" | ".next")
 }
 
+fn skipped_stage_target(canonical_root: &Path, target: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(canonical_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    for (depth, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return true;
+        };
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        if matches!(name, ".git" | ".depgraph") {
+            return true;
+        }
+        if depth == 0 && matches!(name, "target" | ".next") {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_staged_path(
+    collected: &mut Vec<(PathBuf, StagedPathKind)>,
+    logical: PathBuf,
+    kind: StagedPathKind,
+) -> Result<()> {
+    if collected.len() >= MAX_STAGED_FILES {
+        bail!("security policy violation: staged workspace exceeds file or byte limit");
+    }
+    collected.push((logical, kind));
+    Ok(())
+}
+
+fn symlink_target_for_stage(
+    logical: &Path,
+    link_path: &Path,
+    canonical_root: &Path,
+    walk_stack: &BTreeSet<PathBuf>,
+) -> Result<Option<(PathBuf, fs::Metadata)>> {
+    let target = fs::canonicalize(link_path).map_err(|_| symlink_policy_violation(logical))?;
+    if !target.starts_with(canonical_root) {
+        return Err(symlink_policy_violation(logical));
+    }
+    if skipped_stage_target(canonical_root, &target) || walk_stack.contains(&target) {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&target).map_err(|_| symlink_policy_violation(logical))?;
+    Ok(Some((target, metadata)))
+}
+
 fn symlink_policy_violation(relative: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "security policy violation: staged workspace contains symlink {} that is not a regular in-repository target; set [build] ignored_paths in .depgraph.toml to exclude it, or keep the link target inside the repository",
         display_logical(relative)
     )
+}
+
+struct StageWalk<'a> {
+    source: &'a Path,
+    canonical_root: &'a Path,
+    policy: &'a StagePolicy,
+    collected: &'a mut Vec<(PathBuf, StagedPathKind)>,
+    seen_logical: &'a mut BTreeSet<PathBuf>,
+    walk_stack: &'a mut BTreeSet<PathBuf>,
 }
 
 fn collect_staged_paths(
@@ -2659,28 +2721,37 @@ fn collect_staged_paths(
         .context("build source root is unavailable")?;
     let mut collected = Vec::new();
     let mut seen_logical = BTreeSet::new();
-    walk_stage_tree(
+    let mut walk_stack = BTreeSet::new();
+    let mut walk = StageWalk {
         source,
-        source,
-        Path::new(""),
-        &canonical_root,
+        canonical_root: &canonical_root,
         policy,
-        &mut collected,
-        &mut seen_logical,
-    )?;
+        collected: &mut collected,
+        seen_logical: &mut seen_logical,
+        walk_stack: &mut walk_stack,
+    };
+    walk_stage_tree(&mut walk, source, Path::new(""))?;
     collected.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(collected)
 }
 
-fn walk_stage_tree(
-    source: &Path,
+fn walk_stage_tree(walk: &mut StageWalk<'_>, walk_root: &Path, logical_root: &Path) -> Result<()> {
+    let canonical_walk = fs::canonicalize(walk_root).context("build source root is unavailable")?;
+    if !walk.walk_stack.insert(canonical_walk.clone()) {
+        return Ok(());
+    }
+    let walked = walk_stage_tree_body(walk, walk_root, logical_root);
+    walk.walk_stack.remove(&canonical_walk);
+    walked
+}
+
+fn walk_stage_tree_body(
+    walk: &mut StageWalk<'_>,
     walk_root: &Path,
     logical_root: &Path,
-    canonical_root: &Path,
-    policy: &StagePolicy,
-    collected: &mut Vec<(PathBuf, StagedPathKind)>,
-    seen_logical: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
+    let source = walk.source;
+    let ignored_paths = walk.policy.ignored_paths.clone();
     for entry in WalkDir::new(walk_root)
         .follow_links(false)
         .into_iter()
@@ -2690,8 +2761,7 @@ fn walk_stage_tree(
             }
             logical_path_for_walk(source, walk_root, logical_root, entry.path()).is_some_and(
                 |logical| {
-                    logical.as_os_str().is_empty()
-                        || !path_is_ignored(&logical, &policy.ignored_paths)
+                    logical.as_os_str().is_empty() || !path_is_ignored(&logical, &ignored_paths)
                 },
             )
         })
@@ -2708,51 +2778,19 @@ fn walk_stage_tree(
         if logical.as_os_str().is_empty() {
             continue;
         }
-        if path_is_ignored(&logical, &policy.ignored_paths) {
+        if path_is_ignored(&logical, &ignored_paths) {
             continue;
         }
-        if !seen_logical.insert(logical.clone()) {
+        if !walk.seen_logical.insert(logical.clone()) {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.file_type().is_symlink() {
-            let target =
-                fs::canonicalize(entry.path()).map_err(|_| symlink_policy_violation(&logical))?;
-            if !target.starts_with(canonical_root) {
-                return Err(symlink_policy_violation(&logical));
-            }
-            let target_meta =
-                fs::metadata(&target).map_err(|_| symlink_policy_violation(&logical))?;
-            if target_meta.is_dir() {
-                collected.push((logical.clone(), StagedPathKind::Directory));
-                walk_stage_tree(
-                    source,
-                    &target,
-                    &logical,
-                    canonical_root,
-                    policy,
-                    collected,
-                    seen_logical,
-                )?;
-                continue;
-            }
-            if target_meta.is_file() {
-                collected.push((
-                    logical,
-                    StagedPathKind::File {
-                        from: target,
-                        metadata: target_meta,
-                    },
-                ));
-                continue;
-            }
-            bail!(
-                "security policy violation: staged workspace contains non-regular file {}",
-                display_logical(&logical)
-            );
+            stage_symlink_entry(walk, &logical, entry.path())?;
+            continue;
         }
         if metadata.is_dir() {
-            collected.push((logical, StagedPathKind::Directory));
+            push_staged_path(walk.collected, logical, StagedPathKind::Directory)?;
             continue;
         }
         if !metadata.is_file() {
@@ -2761,15 +2799,46 @@ fn walk_stage_tree(
                 display_logical(&logical)
             );
         }
-        collected.push((
+        push_staged_path(
+            walk.collected,
             logical,
             StagedPathKind::File {
                 from: entry.path().to_path_buf(),
                 metadata,
             },
-        ));
+        )?;
     }
     Ok(())
+}
+
+fn stage_symlink_entry(walk: &mut StageWalk<'_>, logical: &Path, link_path: &Path) -> Result<()> {
+    let Some((target, target_meta)) =
+        symlink_target_for_stage(logical, link_path, walk.canonical_root, walk.walk_stack)?
+    else {
+        return Ok(());
+    };
+    if target_meta.is_dir() {
+        push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::Directory,
+        )?;
+        return walk_stage_tree(walk, &target, logical);
+    }
+    if target_meta.is_file() {
+        return push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::File {
+                from: target,
+                metadata: target_meta,
+            },
+        );
+    }
+    bail!(
+        "security policy violation: staged workspace contains non-regular file {}",
+        display_logical(logical)
+    )
 }
 
 fn logical_path_for_walk(
@@ -4008,6 +4077,49 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(error.contains("security policy violation"));
         assert!(error.contains("leak"));
         assert!(error.contains("[build] ignored_paths"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_cyclic_directory_symlinks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        std::os::unix::fs::symlink(".", root.path().join("loop"))?;
+        fs::create_dir_all(root.path().join("sub"))?;
+        std::os::unix::fs::symlink("..", root.path().join("sub/up"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join("loop").exists());
+        assert!(!destination.path().join("sub/up").exists());
+        assert!(!destination.path().join("loop/loop").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_control_directory_symlink_targets() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        fs::create_dir_all(root.path().join(".git/objects"))?;
+        fs::write(root.path().join(".git/config"), "secret=fixture")?;
+        fs::write(root.path().join(".git/objects/pack"), "pack")?;
+        fs::create_dir_all(root.path().join("target/debug"))?;
+        fs::write(root.path().join("target/debug/out"), "artifact")?;
+        std::os::unix::fs::symlink(".git", root.path().join("metadata-link"))?;
+        std::os::unix::fs::symlink(".git/objects", root.path().join("objects-link"))?;
+        std::os::unix::fs::symlink("target", root.path().join("build-out"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join(".git").exists());
+        assert!(!destination.path().join("metadata-link").exists());
+        assert!(!destination.path().join("objects-link").exists());
+        assert!(!destination.path().join("build-out").exists());
+        assert!(!destination.path().join("target").exists());
         Ok(())
     }
 }

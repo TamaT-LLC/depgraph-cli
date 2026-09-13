@@ -955,7 +955,8 @@ canonical system Node, a cleared allowlisted environment, temporary
 HOME/cache/output, bounded output, timeout/cancellation, and cross-platform
 process-tree cleanup. In-repository symbolic links are materialized as regular
 files or directories; a link whose canonical target leaves the repository fails
-closed. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
+closed. Cyclic links and links into `.git`, `.depgraph`, or the repository-root
+`target` / `.next` directories are omitted rather than copied. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
 prefixes from staging, and unknown `[build]` keys are rejected. `[daemon]
 ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
