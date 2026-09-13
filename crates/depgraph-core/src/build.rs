@@ -2254,6 +2254,7 @@ fn secret_shaped_build_line(line: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+        || is_secret_key(line)
 }
 
 fn persist_child_stderr_log(
@@ -3641,6 +3642,10 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         assert_eq!(
             redact_build_log(b"compiler panic\nAuthorization: Bearer leaked-token\n"),
             "compiler panic\n[REDACTED]"
+        );
+        assert_eq!(
+            redact_build_log(b"kind=custom-build, mode=run-custom-build\nDEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE\n"),
+            "kind=custom-build, mode=run-custom-build\n[REDACTED]"
         );
         let prefix = "a".to_string();
         let wide = "é".repeat(CHILD_STDERR_TAIL_BYTES);
