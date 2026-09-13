@@ -4183,7 +4183,34 @@ fn resolve_requires_the_explicit_build_mode_selector() {
         .success()
         .stdout(predicate::str::contains("--build"))
         .stdout(predicate::str::contains("--allow-project-code"))
-        .stdout(predicate::str::contains("untrusted project code"));
+        .stdout(predicate::str::contains("untrusted project code"))
+        .stdout(predicate::str::contains("depgraph.build"))
+        .stdout(predicate::str::contains("node <entrypoint>"))
+        .stdout(predicate::str::contains("NEXT_ADAPTER_PATH"));
+}
+
+#[test]
+fn resolve_missing_web_build_plan_prints_a_copyable_template() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+    let store = root.path().join("store.sqlite");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "package.json has no versioned depgraph.build execution plan",
+        ))
+        .stderr(predicate::str::contains("scripts/depgraph-build.mjs"))
+        .stderr(predicate::str::contains("depgraph resolve --help"));
 }
 
 #[cfg(unix)]
