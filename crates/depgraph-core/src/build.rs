@@ -2260,48 +2260,30 @@ async fn probe_build_tool_version(program: &Path, root: &Path) -> Result<String>
 }
 
 fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
+    let policy = load_stage_policy(source)?;
     let mut files = 0_usize;
     let mut bytes = 0_u64;
-    for entry in WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(admit_stage_entry)
-    {
-        let entry = entry?;
-        let relative = entry.path().strip_prefix(source)?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
+    for_each_staged_path(source, &policy, |relative, kind| {
         let target = destination.join(relative);
-        if metadata.is_dir() {
-            fs::create_dir_all(&target)?;
-            continue;
+        match kind {
+            StagedPathKind::Directory => {
+                fs::create_dir_all(&target)?;
+            }
+            StagedPathKind::File { from, metadata } => {
+                files += 1;
+                bytes = bytes.saturating_add(metadata.len());
+                if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                    bail!("security policy violation: staged workspace exceeds file or byte limit");
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(from, &target)?;
+                fs::set_permissions(&target, metadata.permissions())?;
+            }
         }
-        if !metadata.is_file() {
-            bail!(
-                "security policy violation: staged workspace contains non-regular file {}",
-                display_logical(relative)
-            );
-        }
-        files += 1;
-        bytes = bytes.saturating_add(metadata.len());
-        if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
-            bail!("security policy violation: staged workspace exceeds file or byte limit");
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(entry.path(), &target)?;
-        fs::set_permissions(&target, metadata.permissions())?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn stage_cargo_dependency_cache(source: &Path, destination: &Path) -> Result<()> {
@@ -2624,15 +2606,267 @@ fn validate_cargo_cache_metadata(path: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
-fn admit_stage_entry(entry: &DirEntry) -> bool {
+struct StagePolicy {
+    ignored_paths: Vec<String>,
+}
+
+enum StagedPathKind {
+    Directory,
+    File {
+        from: PathBuf,
+        metadata: fs::Metadata,
+    },
+}
+
+fn load_stage_policy(source: &Path) -> Result<StagePolicy> {
+    let config = crate::config::Config::load(source)?;
+    Ok(StagePolicy {
+        ignored_paths: config.build.ignored_paths,
+    })
+}
+
+fn path_is_ignored(relative: &Path, ignored: &[String]) -> bool {
+    let logical = display_logical(relative);
+    ignored
+        .iter()
+        .any(|prefix| logical == *prefix || logical.starts_with(&format!("{prefix}/")))
+}
+
+fn default_skip_directory(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
-        return true;
+        return false;
     }
     let name = entry.file_name().to_string_lossy();
     if matches!(name.as_ref(), ".git" | ".depgraph") {
+        return true;
+    }
+    entry.depth() == 1 && matches!(name.as_ref(), "target" | ".next")
+}
+
+fn skipped_stage_target(canonical_root: &Path, target: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(canonical_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
         return false;
     }
-    entry.depth() != 1 || !matches!(name.as_ref(), "target" | ".next")
+    for (depth, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return true;
+        };
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        if matches!(name, ".git" | ".depgraph") {
+            return true;
+        }
+        if depth == 0 && matches!(name, "target" | ".next") {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_staged_path(
+    collected: &mut Vec<(PathBuf, StagedPathKind)>,
+    logical: PathBuf,
+    kind: StagedPathKind,
+) -> Result<()> {
+    if collected.len() >= MAX_STAGED_FILES {
+        bail!("security policy violation: staged workspace exceeds file or byte limit");
+    }
+    collected.push((logical, kind));
+    Ok(())
+}
+
+fn symlink_target_for_stage(
+    logical: &Path,
+    link_path: &Path,
+    canonical_root: &Path,
+    walk_stack: &BTreeSet<PathBuf>,
+) -> Result<Option<(PathBuf, fs::Metadata)>> {
+    let target = fs::canonicalize(link_path).map_err(|_| symlink_policy_violation(logical))?;
+    if !target.starts_with(canonical_root) {
+        return Err(symlink_policy_violation(logical));
+    }
+    if skipped_stage_target(canonical_root, &target) || walk_stack.contains(&target) {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&target).map_err(|_| symlink_policy_violation(logical))?;
+    Ok(Some((target, metadata)))
+}
+
+fn symlink_policy_violation(relative: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "security policy violation: staged workspace contains symlink {} that is not a regular in-repository target; set [build] ignored_paths in .depgraph.toml to exclude it, or keep the link target inside the repository",
+        display_logical(relative)
+    )
+}
+
+struct StageWalk<'a> {
+    source: &'a Path,
+    canonical_root: &'a Path,
+    policy: &'a StagePolicy,
+    collected: &'a mut Vec<(PathBuf, StagedPathKind)>,
+    seen_logical: &'a mut BTreeSet<PathBuf>,
+    walk_stack: &'a mut BTreeSet<PathBuf>,
+}
+
+fn collect_staged_paths(
+    source: &Path,
+    policy: &StagePolicy,
+) -> Result<Vec<(PathBuf, StagedPathKind)>> {
+    let canonical_root = source
+        .canonicalize()
+        .context("build source root is unavailable")?;
+    let mut collected = Vec::new();
+    let mut seen_logical = BTreeSet::new();
+    let mut walk_stack = BTreeSet::new();
+    let mut walk = StageWalk {
+        source,
+        canonical_root: &canonical_root,
+        policy,
+        collected: &mut collected,
+        seen_logical: &mut seen_logical,
+        walk_stack: &mut walk_stack,
+    };
+    walk_stage_tree(&mut walk, source, Path::new(""))?;
+    collected.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(collected)
+}
+
+fn walk_stage_tree(walk: &mut StageWalk<'_>, walk_root: &Path, logical_root: &Path) -> Result<()> {
+    let canonical_walk = fs::canonicalize(walk_root).context("build source root is unavailable")?;
+    if !walk.walk_stack.insert(canonical_walk.clone()) {
+        return Ok(());
+    }
+    let walked = walk_stage_tree_body(walk, walk_root, logical_root);
+    walk.walk_stack.remove(&canonical_walk);
+    walked
+}
+
+fn walk_stage_tree_body(
+    walk: &mut StageWalk<'_>,
+    walk_root: &Path,
+    logical_root: &Path,
+) -> Result<()> {
+    let source = walk.source;
+    let ignored_paths = walk.policy.ignored_paths.clone();
+    for entry in WalkDir::new(walk_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if default_skip_directory(entry) {
+                return false;
+            }
+            logical_path_for_walk(source, walk_root, logical_root, entry.path()).is_some_and(
+                |logical| {
+                    logical.as_os_str().is_empty() || !path_is_ignored(&logical, &ignored_paths)
+                },
+            )
+        })
+    {
+        let entry = entry?;
+        let relative_from_walk = entry.path().strip_prefix(walk_root)?;
+        let logical = if logical_root.as_os_str().is_empty() {
+            relative_from_walk.to_path_buf()
+        } else if relative_from_walk.as_os_str().is_empty() {
+            logical_root.to_path_buf()
+        } else {
+            logical_root.join(relative_from_walk)
+        };
+        if logical.as_os_str().is_empty() {
+            continue;
+        }
+        if path_is_ignored(&logical, &ignored_paths) {
+            continue;
+        }
+        if !walk.seen_logical.insert(logical.clone()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            stage_symlink_entry(walk, &logical, entry.path())?;
+            continue;
+        }
+        if metadata.is_dir() {
+            push_staged_path(walk.collected, logical, StagedPathKind::Directory)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!(
+                "security policy violation: staged workspace contains non-regular file {}",
+                display_logical(&logical)
+            );
+        }
+        push_staged_path(
+            walk.collected,
+            logical,
+            StagedPathKind::File {
+                from: entry.path().to_path_buf(),
+                metadata,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn stage_symlink_entry(walk: &mut StageWalk<'_>, logical: &Path, link_path: &Path) -> Result<()> {
+    let Some((target, target_meta)) =
+        symlink_target_for_stage(logical, link_path, walk.canonical_root, walk.walk_stack)?
+    else {
+        return Ok(());
+    };
+    if target_meta.is_dir() {
+        push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::Directory,
+        )?;
+        return walk_stage_tree(walk, &target, logical);
+    }
+    if target_meta.is_file() {
+        return push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::File {
+                from: target,
+                metadata: target_meta,
+            },
+        );
+    }
+    bail!(
+        "security policy violation: staged workspace contains non-regular file {}",
+        display_logical(logical)
+    )
+}
+
+fn logical_path_for_walk(
+    source: &Path,
+    walk_root: &Path,
+    logical_root: &Path,
+    path: &Path,
+) -> Option<PathBuf> {
+    let relative_from_walk = path.strip_prefix(walk_root).ok()?;
+    if logical_root.as_os_str().is_empty() {
+        Some(relative_from_walk.to_path_buf())
+    } else if relative_from_walk.as_os_str().is_empty() {
+        Some(logical_root.to_path_buf())
+    } else {
+        Some(logical_root.join(relative_from_walk))
+    }
+    .or_else(|| path.strip_prefix(source).ok().map(Path::to_path_buf))
+}
+
+fn for_each_staged_path(
+    source: &Path,
+    policy: &StagePolicy,
+    mut visit: impl FnMut(&Path, &StagedPathKind) -> Result<()>,
+) -> Result<()> {
+    for (relative, kind) in collect_staged_paths(source, policy)? {
+        visit(&relative, &kind)?;
+    }
+    Ok(())
 }
 
 fn digest_output_tree(output: &Path, stdout: &[u8]) -> Result<String> {
@@ -2692,66 +2926,48 @@ fn digest_workspace(root: &Path) -> Result<String> {
 }
 
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
+    let policy = load_stage_policy(root)?;
     let mut source = Sha256::new();
     source.update(b"depgraph-build-source-v1\0");
     let mut controls = Sha256::new();
     controls.update(b"depgraph-build-manifest-lock-config-v1\0");
     let mut staging_metadata = Sha256::new();
     staging_metadata.update(b"depgraph-build-staging-metadata-v1\0");
-    let mut entries = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(admit_stage_entry)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path().to_path_buf());
     let mut files = 0_usize;
     let mut bytes = 0_u64;
-    for entry in entries {
-        let relative = entry.path().strip_prefix(root)?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
+    for_each_staged_path(root, &policy, |relative, kind| {
         let logical = display_logical(relative);
-        if metadata.is_dir() {
-            staging_metadata.update(b"directory\0");
-            staging_metadata.update(logical.as_bytes());
-            staging_metadata.update([0]);
-            continue;
+        match kind {
+            StagedPathKind::Directory => {
+                staging_metadata.update(b"directory\0");
+                staging_metadata.update(logical.as_bytes());
+                staging_metadata.update([0]);
+            }
+            StagedPathKind::File { from, metadata } => {
+                files += 1;
+                bytes = bytes.saturating_add(metadata.len());
+                if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                    bail!("security policy violation: staged workspace exceeds file or byte limit");
+                }
+                let contents = fs::read(from)?;
+                staging_metadata.update(b"file\0");
+                staging_metadata.update(logical.as_bytes());
+                staging_metadata.update([0]);
+                staging_metadata.update(staged_file_permission_fingerprint(metadata).to_le_bytes());
+                source.update(logical.as_bytes());
+                source.update([0]);
+                source.update(&contents);
+                source.update([0]);
+                if is_build_control_path(relative) {
+                    controls.update(logical.as_bytes());
+                    controls.update([0]);
+                    controls.update(&contents);
+                    controls.update([0]);
+                }
+            }
         }
-        if !metadata.is_file() {
-            bail!(
-                "security policy violation: staged workspace contains non-regular file {}",
-                display_logical(relative)
-            );
-        }
-        files += 1;
-        bytes = bytes.saturating_add(metadata.len());
-        if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
-            bail!("security policy violation: staged workspace exceeds file or byte limit");
-        }
-        let contents = fs::read(entry.path())?;
-        staging_metadata.update(b"file\0");
-        staging_metadata.update(logical.as_bytes());
-        staging_metadata.update([0]);
-        staging_metadata.update(staged_file_permission_fingerprint(&metadata).to_le_bytes());
-        source.update(logical.as_bytes());
-        source.update([0]);
-        source.update(&contents);
-        source.update([0]);
-        if is_build_control_path(relative) {
-            controls.update(logical.as_bytes());
-            controls.update([0]);
-            controls.update(&contents);
-            controls.update([0]);
-        }
-    }
+        Ok(())
+    })?;
     Ok((
         hex::encode(source.finalize()),
         hex::encode(controls.finalize()),
@@ -3799,6 +4015,111 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(!destination.path().join("target").exists());
         assert!(!destination.path().join(".next").exists());
         assert!(!destination.path().join("nested/.git").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_dereferences_in_repository_symlinks_and_honors_build_ignored_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(
+            root.path()
+                .join("node_modules/.pnpm/pkg@1/node_modules/pkg"),
+        )?;
+        fs::write(
+            root.path()
+                .join("node_modules/.pnpm/pkg@1/node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        std::os::unix::fs::symlink(
+            ".pnpm/pkg@1/node_modules/pkg",
+            root.path().join("node_modules/pkg"),
+        )?;
+        fs::create_dir_all(root.path().join("node_modules/.bin"))?;
+        std::os::unix::fs::symlink(
+            "../.pnpm/pkg@1/node_modules/pkg/index.js",
+            root.path().join("node_modules/.bin/pkg"),
+        )?;
+        fs::create_dir_all(root.path().join(".claude/worktrees/extra"))?;
+        std::os::unix::fs::symlink(
+            "../../node_modules/pkg",
+            root.path().join(".claude/worktrees/extra/link"),
+        )?;
+        fs::write(
+            root.path().join(".depgraph.toml"),
+            "schema_version = 1\n[build]\nignored_paths = ['.claude']\n",
+        )?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        let staged_pkg = destination.path().join("node_modules/pkg/index.js");
+        assert!(staged_pkg.is_file());
+        assert!(!staged_pkg.symlink_metadata()?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(staged_pkg)?, "module.exports = 1;\n");
+        let staged_bin = destination.path().join("node_modules/.bin/pkg");
+        assert!(staged_bin.is_file());
+        assert!(!staged_bin.symlink_metadata()?.file_type().is_symlink());
+        assert!(!destination.path().join(".claude").exists());
+        fingerprint_build_source(root.path())?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_escaping_symlinks_with_ignored_paths_remediation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(outside.path().join("secret"), "token=fixture")?;
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("leak"))?;
+        let error = stage_workspace(root.path(), tempfile::tempdir()?.path())
+            .expect_err("escaping symlink must fail closed")
+            .to_string();
+        assert!(error.contains("security policy violation"));
+        assert!(error.contains("leak"));
+        assert!(error.contains("[build] ignored_paths"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_cyclic_directory_symlinks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        std::os::unix::fs::symlink(".", root.path().join("loop"))?;
+        fs::create_dir_all(root.path().join("sub"))?;
+        std::os::unix::fs::symlink("..", root.path().join("sub/up"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join("loop").exists());
+        assert!(!destination.path().join("sub/up").exists());
+        assert!(!destination.path().join("loop/loop").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_control_directory_symlink_targets() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        fs::create_dir_all(root.path().join(".git/objects"))?;
+        fs::write(root.path().join(".git/config"), "secret=fixture")?;
+        fs::write(root.path().join(".git/objects/pack"), "pack")?;
+        fs::create_dir_all(root.path().join("target/debug"))?;
+        fs::write(root.path().join("target/debug/out"), "artifact")?;
+        std::os::unix::fs::symlink(".git", root.path().join("metadata-link"))?;
+        std::os::unix::fs::symlink(".git/objects", root.path().join("objects-link"))?;
+        std::os::unix::fs::symlink("target", root.path().join("build-out"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join(".git").exists());
+        assert!(!destination.path().join("metadata-link").exists());
+        assert!(!destination.path().join("objects-link").exists());
+        assert!(!destination.path().join("build-out").exists());
+        assert!(!destination.path().join("target").exists());
         Ok(())
     }
 }

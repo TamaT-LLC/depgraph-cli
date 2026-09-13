@@ -1,5 +1,14 @@
 # 未リリース
 
+## resolve --build のステージングと pnpm
+
+一時ワークスペースへコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
+循環リンクと `.git` / `.depgraph` / `target` / `.next` を指すリンクはコピーせず、収集中に件数上限も適用する。
+リポジトリ外を指すリンクは従来どおり拒否し、`.depgraph.toml` の `[build] ignored_paths` で除外できることを案内する。
+未知の `[build]` キーはエラーになる。`[daemon] ignored_paths` は resolve のステージングには使わない。
+
+関連: [#489](https://github.com/TamaT-LLC/depgraph-cli/issues/489)。
+
 ## Next.js 16.2 の dynamicRoutes destination
 
 Next.js 16.2 は動的ルートの `destination` に `?nxtPid=$nxtPid` のような named capture クエリを付ける。
