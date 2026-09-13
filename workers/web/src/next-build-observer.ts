@@ -364,6 +364,29 @@ function failWithDetail(code: string, detail: Record<string, string>): never {
   throw new NextBuildObserverError(code, detail);
 }
 
+function unsafeArtifactReason(
+  logicalHint: unknown,
+  contained: string | null,
+  hintMatchesPath: boolean,
+): string {
+  if (logicalHint === undefined || contained === null || hintMatchesPath) return "not_contained";
+  return "hint_mismatch";
+}
+
+function unsafeArtifactDetail(
+  logicalHint: unknown,
+  contained: string | null,
+  hinted: string | null,
+  hintMatchesPath: boolean,
+): Record<string, string> {
+  const detail: Record<string, string> = {
+    reason: unsafeArtifactReason(logicalHint, contained, hintMatchesPath),
+  };
+  if (contained !== null) detail.contained = contained;
+  if (hinted !== null) detail.hinted = hinted;
+  return detail;
+}
+
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   const raw = boundedString(value);
   if (raw === null) return allowEmpty && value === "" ? "" : null;
@@ -686,13 +709,10 @@ async function digestArtifact(
     || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
     || (logicalHint !== undefined && !hintMatchesPath)) {
-    const reason = logicalHint !== undefined && contained !== null && !hintMatchesPath
-      ? "hint_mismatch"
-      : "not_contained";
-    const detail: Record<string, string> = { reason };
-    if (contained !== null) detail.contained = contained;
-    if (hinted !== null) detail.hinted = hinted;
-    failWithDetail("web.next_build_artifact_path_unsafe", detail);
+    failWithDetail(
+      "web.next_build_artifact_path_unsafe",
+      unsafeArtifactDetail(logicalHint, contained, hinted, hintMatchesPath),
+    );
   }
   const logicalPath = contained;
   let digest: string;
