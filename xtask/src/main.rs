@@ -37,9 +37,9 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.5.4";
+const STABLE_RELEASE_VERSION: &str = "0.6.0";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
-const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.5";
+const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.6";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
 const AGENT_DOGFOOD_REPORT_PATH: &str =
     "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json";
@@ -132,7 +132,10 @@ const MAX_RELEASE_CHECKSUM_BYTES: u64 = 1024;
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
+    "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+    "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
     "rust",
@@ -157,6 +160,9 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
     "ga-baseline-full-ci",
     "workflow-quality-closure",
 ];
+const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-34682206659.json";
+const CURRENT_FULL_CI_RUN_FIXTURE_SHA256: &str =
+    "3dc448af592da881ca2d973976fe2918a20cd1329bf212b2a1dc1c90ffc669a2";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
@@ -185,46 +191,48 @@ struct TargetNativeSmokeExpectation {
     profile_plan_output_sha256: &'static str,
 }
 
+// These outputs bind the core/adapter versions as well as native target context.
+// Refresh them from native gates after a version bump, preserving semantic checks.
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:4ebe330ccc66927a5e7326ddc319f852f2f428f56732dd9381f45e4b84575dc6",
-        query_result_digest: "bounded-query-result:sha256:584d166da205bdeda518ff2447732eef9d312963c9fd8d787ff8a8ae20248be7",
-        query_output_sha256: "fdb8af37db13ee946cff735214da362175d3b35d9fda5357c0e336ba2463ab39",
-        profile_plan_digest: "profile-selection-plan:sha256:2d6ae1975930464929de3dba67f62f2290f6aaa10c549d909a1cfcf4eb717b61",
-        profile_plan_output_sha256: "12bc417acd93327d558c62744a688d7b704dc4d43e3ca7cd7ada2b6f4f4691af",
+        query_plan_digest: "bounded-query-plan:sha256:8e580dcb7bd2cc760598651e319ff4d335299a6d199083d15eb4b9029617b8ca",
+        query_result_digest: "bounded-query-result:sha256:5b7fbe66887e35ac5e762b7a7d3f686c5ec3fa2a33b7980355a302e8b5336819",
+        query_output_sha256: "0a2584d76e6d6d403c862f1d9adffda615a546ac14456def1de12c6ce8ae87fd",
+        profile_plan_digest: "profile-selection-plan:sha256:65761c94739401993ff59f846f8b0866baf359c0291ae541d982a60af0b15ac8",
+        profile_plan_output_sha256: "c665c641dfeb4dbecf60658da483bb2617d4e0ad52952cc5a52ce520910dd89e",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:5482f63b705bf4842d90088600d38764fdb0a1a527f47d905f88693f8ed8f0ec",
-        query_result_digest: "bounded-query-result:sha256:01886d8fa1745533d149d205fe7f4b51dbd44c6aa7add5ae8b884cf825455c3a",
-        query_output_sha256: "15bad627f5cb26701cff9c5fba40a1f5a8dfc00268ea1c9ba3ff88d45f286eb8",
-        profile_plan_digest: "profile-selection-plan:sha256:70125b85631b7b4be67a98ca951369c8f9b443180aabdd6858f9e78707692a8b",
-        profile_plan_output_sha256: "e5b8343b56b4227920873c1106454dff28f866117f23f05990e6796f9137c20b",
+        query_plan_digest: "bounded-query-plan:sha256:db537bc438d74f71ee04ff5e6ad81d5e9e5d1c2b6de0ba8ebbc17eaa7f8091ea",
+        query_result_digest: "bounded-query-result:sha256:e99ed6f6735ae24cd4014f1716adcb1c19eede8c5d2921a343176f01dfa31e62",
+        query_output_sha256: "fa7b89e3ea8420515974ab5d23d282c930d939584393e376ccf133fd598c4fad",
+        profile_plan_digest: "profile-selection-plan:sha256:77409694a6f32f537b77f68a3e5960c1efa34aa2d27b56493ab95a14b03a1109",
+        profile_plan_output_sha256: "0b831baaadd841e93a0664444e1affd9adef10b96d480711907a2f6f15f54b9a",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:45472e6fae9b70438d0370795b2c3d8940ac89cdcb54dc899c3fe973db4a4a7b",
-        query_result_digest: "bounded-query-result:sha256:7ea240f10adbfea0efcc0a78b02a7f21df9dfe436aa1160e10f07fa1146f1bdd",
-        query_output_sha256: "5b741ce69909338667ab9f39eb684298688137bb2b253d4a85bf795b93cf6a56",
-        profile_plan_digest: "profile-selection-plan:sha256:8f62b9ef2cd022b8a25146045fb23e7e5982be77b63bacc23d7a570acbd30056",
-        profile_plan_output_sha256: "d16c8902cd70289261004985a649a2ab73efa6fda9bf3fe7c0fe218dc35da2e8",
+        query_plan_digest: "bounded-query-plan:sha256:0c98785e4fa34cbb27f24b5fd0deff55f944c68b5427594d4feb4df30427b955",
+        query_result_digest: "bounded-query-result:sha256:02edd507d4a0da68715d1a5ca7b095b162011e0eb152e3990ca715e15e940514",
+        query_output_sha256: "2b26381d521c1982e4a1b9e7f3dc4fc6c2d3bb4842d193444777998e2117a67c",
+        profile_plan_digest: "profile-selection-plan:sha256:1809c39fff963b2d02a8e4af93c01e651967ffd9cac6b5e9473a9ef09a9bca00",
+        profile_plan_output_sha256: "aec7e1b33d4b95b0601aa81ec60bdff8720ec169dfb64409e5c6323610514f5e",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:f445edc3bd1225535a8e7b92a7fa649dc2ec8dbcec72012b22f9a90e69d22e8c",
-        query_result_digest: "bounded-query-result:sha256:47e7e3fdb16540eb1d087004249713f56535da538f25810a24a72df19aa4555a",
-        query_output_sha256: "10e0c00aa4415c1701bf7044c65787676728d05a73f3bd1f8b08f15b70c6ff42",
-        profile_plan_digest: "profile-selection-plan:sha256:10f4c03150c9626bb7e96d0fc7975d38d0c0a831b1de1c8f9d407efd30551a9c",
-        profile_plan_output_sha256: "b9763738ac03eea4826ba3a7d25d8be0a4c1c85a74d46e392706fbc393f8baec",
+        query_plan_digest: "bounded-query-plan:sha256:2c79fbcc55ccfa4820b6c139cca7dccda4254ffffc43e15187d36213002bc8a2",
+        query_result_digest: "bounded-query-result:sha256:4eb8578017bbcd4e85d94ba2c0bb478d0c7a85b0b2611a589fef73b290189466",
+        query_output_sha256: "77891326b68de5f1dce0190cffc856d8568e05e090c5a65240a65ae566a54faa",
+        profile_plan_digest: "profile-selection-plan:sha256:c4801bc1a678c003e1aa8ea9777e0c00f86d5b7262197b2f38abab257045eddb",
+        profile_plan_output_sha256: "0f0f6c492b9bde57feb3fa86dadc9126480b8d22e5e320fff3839d49f95e0045",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:e1713c76757907790bbbe99a292e0a421ffeac11af5c7f1535e1702ae074f7de",
-        query_result_digest: "bounded-query-result:sha256:fc21464a3178b6cb3d1576585eb2d716e285cbf0330f92bf086718ca1b654c5f",
-        query_output_sha256: "a72e59200c732a0043670c53c6f21c45dc1e9a0abe35b9d583d9818fb8efa57f",
-        profile_plan_digest: "profile-selection-plan:sha256:7264907427af6b7c80911a1fb1e3e4d67d446b5feaff21b426b83521a2f4714c",
-        profile_plan_output_sha256: "7379fe0698d3c49b14a1b3a26dbad1ad873a0eb5c93599d49bf31f6024d09a82",
+        query_plan_digest: "bounded-query-plan:sha256:6e8f3e0a7b407aa8333dfb6f40468726f317016bf51e317a1c357cf391c9c1ba",
+        query_result_digest: "bounded-query-result:sha256:2457b1d266ffb2d2433a884a7bd2ff5d67e9c4ba723e1f53bd4f984a924d4353",
+        query_output_sha256: "996fc56abc158f1c8748fa38a8ad90054e7d83addd7c6efa9717f1dc95d1c641",
+        profile_plan_digest: "profile-selection-plan:sha256:f19b543b5c5eae9de78c9455972dfedf7b086496f4523cf3fa391055e12a8e2d",
+        profile_plan_output_sha256: "552efb36e050111c1f177aeccc6fead3799010c9bdada3d7c722282cf6b9cf3e",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -338,6 +346,14 @@ enum Task {
         /// Checksum sidecar. Defaults to `<archive>.sha256`.
         #[arg(long)]
         checksum: Option<PathBuf>,
+    },
+    /// Select the newest eligible all-green Full CI run from captured API results.
+    SelectFullCiRun {
+        candidates: PathBuf,
+        #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     StableReleaseGate {
         release_verification: PathBuf,
@@ -597,15 +613,15 @@ fn v0_4_stable_release_baseline_digest() -> String {
     ))
 }
 
-fn v0_5_stable_release_baseline_record(commit: &str) -> String {
+fn stable_release_baseline_record(commit: &str) -> String {
     format!(
         "release-baseline-v1\nrepository=TamaT-LLC/depgraph-cli\nversion={STABLE_RELEASE_VERSION}\ncommit={commit}\n"
     )
 }
 
-fn v0_5_stable_release_baseline_digest(commit: &str) -> String {
+fn stable_release_baseline_digest(commit: &str) -> String {
     hex::encode(Sha256::digest(
-        v0_5_stable_release_baseline_record(commit).as_bytes(),
+        stable_release_baseline_record(commit).as_bytes(),
     ))
 }
 
@@ -670,15 +686,19 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "V0_5_2_RELEASE_SOURCE_SHA: 08e077b9b2f7dbe6dd919ae75e0c20f559b14cbb",
         "github.event.workflow_run.head_branch == 'v0.5.3'",
         "V0_5_3_RELEASE_SOURCE_SHA: ebac6e8836905164d5e1522f7c87844d5d8e2fe7",
-        "STABLE_MAINTENANCE_REF: heads/release/0.5",
+        "github.event.workflow_run.head_branch == 'v0.5.4'",
+        "V0_5_4_RELEASE_SOURCE_SHA: ea16edec63e88923c7d169152caedbf4285b4713",
+        "STABLE_MAINTENANCE_REF: heads/release/0.6",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
         "signed tag preserved for retry",
         "http_status\" == \"404\"",
-        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.5 baseline",
+        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.6 baseline",
     ] {
         if !source_guard.contains(required) {
-            bail!("stable release source guard is missing v0.5 contract {required:?}");
+            bail!(
+                "stable release source guard is missing historical/current contract {required:?}"
+            );
         }
     }
     for required in [
@@ -826,7 +846,7 @@ struct StableReleaseGateInput<'a> {
     workflow_results: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FullCiRunEvidenceInput {
     database_id: u64,
@@ -959,6 +979,11 @@ fn main() -> Result<()> {
         Task::VerifyReleaseArchive { archive, checksum } => {
             verify_release_archive(&archive, checksum.as_deref())
         }
+        Task::SelectFullCiRun {
+            candidates,
+            source_sha,
+            output,
+        } => select_full_ci_run(&candidates, &source_sha, &output),
         Task::StableReleaseGate {
             release_verification,
             benchmark_report,
@@ -3764,12 +3789,31 @@ fn release_asset_set_sha256(assets: &[ReleaseAssetEvidence]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn select_full_ci_run(candidates: &Path, source_sha: &str, output: &Path) -> Result<()> {
+    let inputs: Vec<FullCiRunEvidenceInput> = serde_json::from_slice(&fs::read(candidates)?)
+        .context("full CI candidates do not satisfy their closed schema")?;
+    let selected = inputs
+        .iter()
+        .filter(|input| validate_full_ci_input((*input).clone(), source_sha).is_ok())
+        .max_by_key(|input| input.database_id)
+        .context("no eligible all-green Full CI run for the candidate on main")?;
+    fs::write(output, serde_json::to_vec_pretty(selected)?)?;
+    Ok(())
+}
+
 fn validate_full_ci_run(path: &Path, source_sha: &str) -> Result<FullCiRunEvidence> {
     let input: FullCiRunEvidenceInput = serde_json::from_slice(
         &fs::read(path)
             .with_context(|| format!("failed to read full CI evidence {}", path.display()))?,
     )
     .context("full CI evidence does not satisfy its closed schema")?;
+    validate_full_ci_input(input, source_sha)
+}
+
+fn validate_full_ci_input(
+    input: FullCiRunEvidenceInput,
+    source_sha: &str,
+) -> Result<FullCiRunEvidence> {
     let mut jobs = input.jobs;
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let expected = FULL_CI_JOB_NAMES
@@ -3877,7 +3921,7 @@ fn validate_post_publish_aggregates(
     let benchmark_sha = required_asset_digest(&digests, "benchmark-report.json")?;
     let full_ci_jobs_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&full_ci.jobs)?));
     let full_ci_run_id = full_ci.run_id.to_string();
-    let expected_baseline_digest = v0_5_stable_release_baseline_digest(source_sha);
+    let expected_baseline_digest = stable_release_baseline_digest(source_sha);
     if stable.schema_version != STABLE_RELEASE_GATE_SCHEMA_VERSION
         || stable.release_version != VERSION
         || stable.upgrade_source_version != STABLE_UPGRADE_SOURCE_VERSION
@@ -4074,7 +4118,7 @@ fn evaluate_stable_release_gate(
         .get("maintenance_head_sha")
         .cloned()
         .unwrap_or_default();
-    let baseline_digest = v0_5_stable_release_baseline_digest(&source_sha);
+    let baseline_digest = stable_release_baseline_digest(&source_sha);
     workflow_results.insert("baseline_digest".to_owned(), baseline_digest.clone());
     let full_ci_matches_source = lowercase_git_sha(&source_sha)
         && full_ci.run_id != 0
@@ -4382,7 +4426,7 @@ fn evaluate_stable_release_gate(
             passed: verify_stable_release_source_guard(&workspace_root()).is_ok()
                 && release_source_matches_tag,
             evidence: format!(
-                "the immutable v0.4.0 and v0.5.0 sources remain enforced; canonical v{STABLE_RELEASE_VERSION}-rc.N tags bind their exact source SHA; stable v{STABLE_RELEASE_VERSION} binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
+                "the immutable v0.4.0 and v0.5.x sources remain enforced; canonical v{STABLE_RELEASE_VERSION}-rc.N tags bind their exact source SHA; stable v{STABLE_RELEASE_VERSION} binds main, {STABLE_RELEASE_MAINTENANCE_BRANCH}, tag, source tree, and full CI at baseline status {STABLE_RELEASE_BASELINE_STATUS}"
             ),
         },
         StableReleaseGateCheck {
@@ -4391,7 +4435,7 @@ fn evaluate_stable_release_gate(
                 && (release.tag != format!("v{STABLE_RELEASE_VERSION}")
                     || stable_baseline_matches_source),
             evidence: format!(
-                "full CI run {} has the exact eight all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
+                "full CI run {} has the exact eleven all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
                 full_ci.run_id, full_ci.head_sha
             ),
         },
@@ -5556,7 +5600,7 @@ mod tests {
                     "source_tree": source_tree,
                     "main_head_sha": source_sha,
                     "maintenance_head_sha": source_sha,
-                    "baseline_digest": super::v0_5_stable_release_baseline_digest(&source_sha),
+                    "baseline_digest": super::stable_release_baseline_digest(&source_sha),
                     "agent_dogfood_report_sha256": AGENT_DOGFOOD_REPORT_SHA256,
                     "agent_dogfood_code_health_report_sha256": AGENT_DOGFOOD_CODE_HEALTH_REPORT_SHA256,
                     "full_ci_run_id": "123",
@@ -5646,12 +5690,12 @@ mod tests {
         super::project_metadata::verify_japanese_readme_contract(&readme, &english_readme)?;
 
         let store_schema = format!(
-            "tag後の現行`main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
+            "current `main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             depgraph_store::STORE_SCHEMA_VERSION
         );
         let drifted_schema = readme.replacen(
             &store_schema,
-            "tag後の現行`main`はStore schema `999`を使用し、schema 999へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
+            "current `main`はStore schema `999`を使用し、schema 999へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             1,
         );
         assert_ne!(drifted_schema, readme);
@@ -5730,29 +5774,133 @@ mod tests {
     }
 
     #[test]
-    fn full_ci_job_identity_matches_captured_github_api_response() -> Result<()> {
+    fn full_ci_selection_skips_newer_ineligible_runs_and_chooses_latest_valid() -> Result<()> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        let mut valid: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let source_sha = valid["head_sha"].as_str().unwrap().to_owned();
+        valid["head_branch"] = json!("main");
+        let candidate = |id: u64| {
+            let mut run = valid.clone();
+            run["database_id"] = json!(id);
+            run["url"] = json!(super::canonical_actions_run_url(id));
+            run
+        };
+        let older_valid = candidate(100);
+        let latest_valid = candidate(200);
+        let mut default_run = candidate(300);
+        let jobs = default_run["jobs"].as_array_mut().unwrap();
+        jobs.retain(|job| {
+            !job["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("extra-native-package")
+        });
+        jobs.push(json!({"name": "extra-native-package", "conclusion": "skipped"}));
+        let mut wrong_branch = candidate(400);
+        wrong_branch["head_branch"] = json!("feature");
+        let mut wrong_sha = candidate(500);
+        wrong_sha["head_sha"] = json!("f".repeat(40));
+        let temp = tempfile::tempdir()?;
+        let candidates = temp.path().join("candidates.json");
+        let output = temp.path().join("selected.json");
+        fs::write(
+            &candidates,
+            serde_json::to_vec(&json!([
+                default_run,
+                latest_valid,
+                wrong_sha,
+                older_valid,
+                wrong_branch
+            ]))?,
+        )?;
+        super::select_full_ci_run(&candidates, &source_sha, &output)?;
+        assert_eq!(validate_full_ci_run(&output, &source_sha)?.run_id, 200);
+        fs::write(
+            &candidates,
+            serde_json::to_vec(&json!([default_run, wrong_sha, wrong_branch]))?,
+        )?;
+        let missing_output = temp.path().join("not-selected.json");
+        assert!(super::select_full_ci_run(&candidates, &source_sha, &missing_output).is_err());
+        assert!(!missing_output.exists());
+        fs::write(&candidates, b"[]")?;
+        assert!(super::select_full_ci_run(&candidates, &source_sha, &missing_output).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn current_full_ci_job_identity_matches_captured_github_api_response() -> Result<()> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        assert_eq!(
+            super::sha256_file_streaming(&fixture)?,
+            super::CURRENT_FULL_CI_RUN_FIXTURE_SHA256
+        );
+        let mut input: Value = serde_json::from_slice(&fs::read(&fixture)?)?;
+        let source_sha = input["head_sha"]
+            .as_str()
+            .expect("captured source")
+            .to_owned();
+        assert!(validate_full_ci_run(&fixture, &source_sha).is_err());
+        // The capture is a branch run. Change only its branch in this synthetic
+        // admission test; the real API job inventory remains independent of constants.
+        input["head_branch"] = json!("main");
+        let temp = tempfile::tempdir()?;
+        let eligible = temp.path().join("main-full-ci.json");
+        fs::write(&eligible, serde_json::to_vec(&input)?)?;
+        let run = validate_full_ci_run(&eligible, &source_sha)?;
+        assert_eq!(run.jobs.len(), 11);
+        for name in [
+            "go-macos",
+            "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+            "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
+        ] {
+            for change in ["missing", "skipped", "failure", "renamed", "duplicate"] {
+                let mut drift = input.clone();
+                let jobs = drift["jobs"].as_array_mut().expect("captured jobs");
+                let index = jobs.iter().position(|job| job["name"] == name).unwrap();
+                match change {
+                    "missing" => {
+                        jobs.remove(index);
+                    }
+                    "renamed" => jobs[index]["name"] = json!(format!("{name}-drift")),
+                    "duplicate" => jobs.push(jobs[index].clone()),
+                    _ => jobs[index]["conclusion"] = json!(change),
+                }
+                fs::write(&eligible, serde_json::to_vec(&drift)?)?;
+                assert!(
+                    validate_full_ci_run(&eligible, &source_sha).is_err(),
+                    "must reject {change} job {name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_full_ci_fixture_stays_pinned_but_is_not_a_current_release_run() -> Result<()> {
         let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
         assert_eq!(
             super::sha256_file_streaming(&fixture)?,
             V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256
         );
         let source_sha = "7b0cd4cb31067874a71854c212be037b00519889";
-        let run = validate_full_ci_run(&fixture, source_sha)?;
-        assert_eq!(run.run_id, 31_867_648_482);
-        assert_eq!(run.head_sha, source_sha);
-        assert_eq!(run.jobs.len(), 8);
-        assert!(run.jobs.iter().any(|job| {
-            job.name
-                == "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)"
-                && job.conclusion == "success"
-        }));
+        let historical: Value = serde_json::from_slice(&fs::read(&fixture)?)?;
+        assert_eq!(historical["database_id"], 31_867_648_482_u64);
+        assert_eq!(
+            historical["jobs"]
+                .as_array()
+                .expect("historical jobs")
+                .len(),
+            8
+        );
+        assert!(validate_full_ci_run(&fixture, source_sha).is_err());
         Ok(())
     }
 
     #[test]
     fn full_ci_job_identity_rejects_the_stale_linux_display_name() -> Result<()> {
-        let fixture = workspace_root().join(V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH);
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
         let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        input["head_branch"] = json!("main");
         let linux = input["jobs"]
             .as_array_mut()
             .expect("captured Full CI jobs")
@@ -5767,7 +5915,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let stale = temp.path().join("stale-full-ci.json");
         fs::write(&stale, serde_json::to_vec(&input)?)?;
-        let error = validate_full_ci_run(&stale, "7b0cd4cb31067874a71854c212be037b00519889")
+        let error = validate_full_ci_run(&stale, "04fb7163d5e2139811a2e69e2a9978cfeb6e87dc")
             .expect_err("stale implicit matrix job identity must fail closed");
         assert_eq!(
             error.to_string(),

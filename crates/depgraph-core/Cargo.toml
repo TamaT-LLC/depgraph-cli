@@ -32,7 +32,7 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
-workspace-hack = { version = "0.5", path = "../../workspace-hack" }
+workspace-hack = { version = "0.6", path = "../../workspace-hack" }
 
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1"

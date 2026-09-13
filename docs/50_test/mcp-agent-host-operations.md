@@ -6,6 +6,13 @@ stdio server. Start with the read-only example in the
 profile below only when its effects are required; do not register several
 profiles for the same repository as an accidental privilege fallback.
 
+The examples use the planned stable `v0.6.0` package. `v0.6.0` is a minor
+release from current `main`: its Store schema is `19` and its code-health
+contract/API is included. The published `v0.5.4` package remains the immutable
+schema-17 baseline until the v0.6.0 Release and post-publish evidence are
+public. Do not mix the two versions' binaries, workers, compiler packs, or
+Stores.
+
 ## Scoped Agent host onboarding
 
 The lifecycle command supports Codex, Claude Code, Cursor, and Grok. Run it
@@ -118,7 +125,7 @@ tuple.
   digest from the local evidence file, archive, checksum, or manifest.
 - Pass the evidence file with `--release-evidence`. `agent-config` requires the
   exact official repository, product version/canonical tag, allowed signed-tag
-  result, all-green eight-job Full CI and release workflow identities, and the
+  result, all-green eleven-job Full CI and release workflow identities, and the
   sorted 51-asset public closure. It binds the selected archive, checksum, and
   target compiler-pack requirement by exact filename, size, and SHA-256.
 - Verify the release checksum and `release-manifest.json`, then use
@@ -163,7 +170,7 @@ instead.
 <!-- depgraph-agent-config:codex -->
 ```toml
 [mcp_servers.depgraph]
-command = "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp"
+command = "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp"
 args = ["--root", "/absolute/path/to/repository", "--store", "/absolute/path/to/state/depgraph.sqlite", "--capability", "read", "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json", "--log-level", "warn"]
 enabled = true
 required = true
@@ -180,7 +187,7 @@ the following entry into the user or workspace `mcp.json` `servers` object.
   "servers": {
     "depgraph": {
       "type": "stdio",
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root",
         "/absolute/path/to/repository",
@@ -221,8 +228,9 @@ from selected failures:
 The compiler-pack requirement remains mandatory for read-only startup. The
 dogfood evidence achieved 3/3 setup success with the existing requirement and
 showed no blocker that would justify weakening the single verified startup
-tuple. Consequently this task makes no capability-authority change and needs
-no replacement ADR.
+tuple. Consequently this onboarding task makes no capability-authority change
+and needs no additional ADR. ADR-011 separately defines the v0.6 release
+boundary.
 
 ## Store-write profile
 
@@ -235,7 +243,7 @@ writes, daemon control, or project-code execution.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -260,7 +268,7 @@ symlinks, reparse points, and repository escapes remain denied.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -285,7 +293,7 @@ valid closure is `read` plus `store-write` plus `daemon-control`; omitting
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -311,7 +319,7 @@ project code. The valid closure is `read` plus `store-write` plus
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -337,7 +345,7 @@ effects.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.5.4-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -434,7 +442,7 @@ does not promote partial store or repository output.
 ## Upgrade and rollback policy
 
 The compatibility tuple is the release version, MCP protocol revision, tool
-schema `depgraph-mcp-tools-v1`, operation contract `depgraph-operation-v1`, the
+schema `depgraph-mcp-tools-v1`, operation contract `depgraph-operation-v2`, the
 store schema declared by that release manifest, and the journal schema owned by
 its packaged operation runtime. `2025-11-25` remains a baseline-only legacy
 transport; `2026-07-28` adds Tasks without replacing portable operation tools.
@@ -459,6 +467,13 @@ Upgrade one fixed root/store at a time:
    and roll forward deliberately. A contract rename/removal, protocol removal,
    or non-migratable store change requires the release's explicit migration
    procedure; do not infer compatibility from SemVer alone.
+
+The `v0.5.4` to `v0.6.0` upgrade is a schema migration, not an in-place patch.
+The old package uses Store schema `17`; the v0.6.0 package uses schema `19`
+and the code-health contract/API. Verify the v0.6.0 release evidence before
+opening a migrated Store, and keep the complete pre-migration database/WAL/SHM
+backup for rollback. The published v0.5.4 binary must never open that schema-19
+Store.
 
 To roll back, quiesce the new version, preserve its state separately for
 diagnosis, restore the complete pre-upgrade store/journal/WAL/SHM set, and point

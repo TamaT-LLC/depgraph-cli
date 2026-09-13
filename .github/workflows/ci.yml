@@ -182,7 +182,7 @@ jobs:
       # through the shared scheduler, so it belongs with a worker gate. It runs
       # here rather than in `go` because `go test -race` already fills that
       # job's wall clock, while this job finishes early; keeping it inside an
-      # existing job preserves the release evidence's eight-job identity.
+      # existing job keeps these integration checks inside the Web job.
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

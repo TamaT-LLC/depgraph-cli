@@ -3,7 +3,7 @@
 `cargo xtask resumable-analysis-e2e` builds the CLI and the real Go and Web
 workers, then runs a generated public repository through the shared scheduler
 and Store. CI's existing Web job runs this command on Linux after the Web
-worker gate, preserving the eight-job identity required by the release evidence
+worker gate, without adding a separate integration job to the release evidence
 verifier; it moved there from the Go job because `go test -race` already fills
 that job's wall clock. The fixture contains no source or configuration copied
 from a private repository.
@@ -127,7 +127,7 @@ boundary; CI runs both adapters and uploads the report as the
 plain input but plans bounded store ranges, analyzes each range under the
 unchanged per-range budget, and reuses per-range checkpoints. The same Web CI
 job runs it after the resumable fixture and uploads the report as the
-`health-range-report` artifact, keeping the eight-job identity. The xtask
+`health-range-report` artifact, without adding a separate integration job. The xtask
 writes the report before it raises the verdict on every path — fixture
 generation failure, a runner that exited without its own report, a CLI
 failure, or a failed comparison — with `gate.passed`, `gate.failure`, the

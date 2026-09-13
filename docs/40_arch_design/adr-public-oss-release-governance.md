@@ -455,7 +455,7 @@ reproducible release closure whose commit matches the readiness record.
 Evidence: CI run identities, stable gate and artifact digests, signed tag
 verification, support matrix, and release dry-run results.
 
-### Preserved v0.4 baseline and v0.5 maintenance line
+### Preserved baselines and maintenance lines
 
 The unpublished v0.4 stable plan is anchored by `release-baseline-v1` at commit
 `d5ca92bae4b4fdbbedb2f3cabd4aa3ef731e7c9f`. The canonical record and its
@@ -500,6 +500,13 @@ canonical baseline digest, workflow identities, and asset closure.
 The same identity rule applies to `v0.5.1` and later v0.5 stable patches.
 The maintenance ref is fast-forwarded only after the exact `main` candidate
 passes Full CI, then the signed tag is created at that shared source SHA.
+
+The v0.6 line applies the same source identity rule without changing v0.5
+history. `v0.6.0` promotes Store schema 19 and the code-health API from the
+post-v0.5.4 development line, so it uses the separate `release/0.6` ref. The
+signed tag, `main`, and that ref must identify the exact Full-CI-green commit.
+The v0.6 decision and migration boundary are recorded in
+[`PROJ-ARC-001-ADR-011`](adr-v0.6-release-contract.md).
 
 ### Gate 8: migration dry run and change window
 

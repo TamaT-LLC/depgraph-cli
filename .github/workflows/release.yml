@@ -316,7 +316,7 @@ jobs:
         with:
           name: compiler-pack-verification
           path: compiler-artifacts
-      - name: Bind the stable candidate to main, release/0.5, and exact Full CI
+      - name: Bind the stable candidate to main, release/0.6, and exact Full CI
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -328,23 +328,27 @@ jobs:
           main_head_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
           test "$GITHUB_SHA" = "$main_head_sha"
           maintenance_head_sha="$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.5.4" ]]; then
-            maintenance_head_sha="$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')"
+          if [[ "$GITHUB_REF_NAME" == "v0.6.0" ]]; then
+            maintenance_head_sha="$(git ls-remote origin refs/heads/release/0.6 | awk '{print $1}')"
             test "$GITHUB_SHA" = "$maintenance_head_sha"
           fi
 
           gh run list --workflow CI --event workflow_dispatch --commit "$GITHUB_SHA" --status success --limit 100 \
             --json databaseId,headSha,headBranch,conclusion,event,url > artifacts/ci-runs.json
-          ci_run_id="$(jq -r 'map(select(.headSha == env.GITHUB_SHA and .headBranch == "main")) | sort_by(.databaseId) | last | .databaseId // empty' artifacts/ci-runs.json)"
-          test -n "$ci_run_id"
-          gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
-            | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}' \
-            > artifacts/full-ci.json
+          # Inspect each candidate's complete job set before choosing a run.
+          # A later default/benchmark-only dispatch must not hide a valid Full CI.
+          jq -r '.[] | select(.headSha == env.GITHUB_SHA and .headBranch == "main") | .databaseId' artifacts/ci-runs.json \
+            | while IFS= read -r ci_run_id; do
+                gh run view "$ci_run_id" --json databaseId,headSha,headBranch,conclusion,event,url,jobs \
+                  | jq '{database_id:.databaseId,head_sha:.headSha,head_branch:.headBranch,event,conclusion,url,jobs:[.jobs[]|{name,conclusion}]}'
+              done | jq -s '.' > artifacts/full-ci-candidates.json
+          cargo xtask select-full-ci-run artifacts/full-ci-candidates.json \
+            --source-sha "$GITHUB_SHA" --output artifacts/full-ci.json
 
           echo "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree" >> "$GITHUB_ENV"
           echo "DEPGRAPH_RELEASE_MAIN_HEAD_SHA=$main_head_sha" >> "$GITHUB_ENV"
           echo "DEPGRAPH_RELEASE_MAINTENANCE_HEAD_SHA=$maintenance_head_sha" >> "$GITHUB_ENV"
-      - name: Evaluate the machine-readable v0.5 release gate
+      - name: Evaluate the machine-readable v0.6 release gate
         env:
           DEPGRAPH_RELEASE_QUALITY_RESULT: ${{ needs.quality.result }}
           DEPGRAPH_RELEASE_COMPILER_PRECISE_HOSTILE_RESULT: ${{ needs.compiler-precise-hostile.result }}
@@ -401,8 +405,8 @@ jobs:
           test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
           test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.5.4" ]]; then
-            test "$(git ls-remote origin refs/heads/release/0.5 | awk '{print $1}')" = "$GITHUB_SHA"
+          if [[ "$GITHUB_REF_NAME" == "v0.6.0" ]]; then
+            test "$(git ls-remote origin refs/heads/release/0.6 | awk '{print $1}')" = "$GITHUB_SHA"
           fi
           test "$(jq -r '.verification.signature != null' <<<"$tag_payload")" = "true"
           signature_verification="$(jq -r '.verification.reason' <<<"$tag_payload")"
@@ -446,7 +450,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           version="${version%%-rc.*}"
-          test "$version" = "0.5.4"
+          test "$version" = "0.6.0"
 
           mkdir -p post-publish/public post-publish/normal post-publish/compiler post-publish/redownload
           gh release download "$GITHUB_REF_NAME" --dir post-publish/public

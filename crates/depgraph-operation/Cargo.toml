@@ -21,7 +21,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-workspace-hack = { version = "0.5", path = "../../workspace-hack" }
+workspace-hack = { version = "0.6", path = "../../workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

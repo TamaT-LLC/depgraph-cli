@@ -36,7 +36,10 @@ const OFFICIAL_RELEASE_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
+    "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+    "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
     "rust",
@@ -1336,6 +1339,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_ci_jobs_match_the_captured_eleven_job_workflow() -> Result<()> {
+        let captured: Value = serde_json::from_str(include_str!(
+            "../../../xtask/fixtures/full-ci-run-34682206659.json"
+        ))?;
+        let mut names = captured["jobs"]
+            .as_array()
+            .expect("captured jobs")
+            .iter()
+            .map(|job| job["name"].as_str().expect("job name"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, FULL_CI_JOB_NAMES);
+        Ok(())
+    }
+
+    #[test]
     fn connection_probe_allows_cold_initialize_but_keeps_follow_up_requests_bounded() {
         assert_eq!(INITIALIZE_RESPONSE_DEADLINE, Duration::from_secs(30));
         assert_eq!(RESPONSE_DEADLINE, Duration::from_secs(10));
@@ -1570,6 +1589,42 @@ mod tests {
         )?;
         assert_eq!(verified.tag, format!("v{version}-rc.1"));
         assert_eq!(verified.evidence_sha256, trusted_digest);
+
+        let original_bytes = fs::read(&evidence)?;
+        let original: Value = serde_json::from_slice(&original_bytes)?;
+        for name in [
+            "go-macos",
+            "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
+            "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
+        ] {
+            for change in ["missing", "skipped", "failure"] {
+                let mut drift = original.clone();
+                let jobs = drift["full_ci"]["jobs"].as_array_mut().expect("CI jobs");
+                let index = jobs.iter().position(|job| job["name"] == name).unwrap();
+                if change == "missing" {
+                    jobs.remove(index);
+                } else {
+                    jobs[index]["conclusion"] = json!(change);
+                }
+                fs::write(&evidence, serde_json::to_vec(&drift)?)?;
+                let digest = sha256_file(&evidence)?;
+                let error = verify_release_evidence(
+                    &evidence,
+                    &digest,
+                    version,
+                    target,
+                    [&local_assets[0], &local_assets[1], &local_assets[2]],
+                )
+                .err()
+                .expect("current Full CI jobs must all succeed");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("exact all-green Full CI closure")
+                );
+            }
+        }
+        fs::write(&evidence, original_bytes)?;
 
         assert!(
             verify_release_evidence(

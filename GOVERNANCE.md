@@ -65,15 +65,24 @@ and GitHub Actions quality gates, five-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
 maintainer plus an independent approver. The supported stable line is the
 newest stable version whose official Release and matching post-publish evidence
-exist. During the `v0.5.4` rollout, `v0.5.3` remains supported until that
-condition is satisfied for `v0.5.4`. The existing `release/0.4` ref and v0.4
-tags are preserved historical anchors, not a current maintenance promise.
+exist. The published `v0.5.4` remains supported while `v0.6.0` is prepared.
+`v0.6.0` is a minor release for current `main`: it publishes Store schema `19`
+and the code-health contract/API. It is not a patch to the `v0.5.4` contract.
+
+The signed `v0.5.4` tag, its source, and its Store schema `17` artifact remain
+immutable history. The v0.6.0 release contract is recorded in
+[ADR-011](docs/40_arch_design/adr-v0.6-release-contract.md). It requires a
+reviewed exact source, complete Full CI, and the release gate before
+publication. The `release/0.5` ref remains the maintenance line for v0.5 and
+is not rewritten for v0.6.0.
+
 For each stable v0.5 patch, the signed tag, remote `main`, and `release/0.5`
 must identify the same reviewed, exact-Full-CI-green source at publication.
-Compatible fixes land on `main` first. After Full CI fixes the release
-candidate, `release/0.5` advances to that exact commit by fast-forward only.
-Force-pushes, history rewrites, and breaking defaults are forbidden on the
-maintenance line.
+The signed `v0.6.0` tag, remote `main`, and initial `release/0.6` ref follow
+the same identity rule. Compatible fixes land on `main` first. After Full CI
+fixes the release candidate, the matching minor maintenance ref advances to
+that exact commit by fast-forward only. Force-pushes, history rewrites, and
+breaking defaults are forbidden on maintenance lines.
 
 Release support is best effort and has no implied SLA. Security fixes follow
 [SECURITY.md](SECURITY.md); other support follows [SUPPORT.md](SUPPORT.md).

@@ -1487,7 +1487,7 @@ mod tests {
                 display: "test Go worker".to_owned(),
                 artifact_path: worker.clone(),
                 runtime_requirement: None,
-                expected_version: Some("0.5.4".to_owned()),
+                expected_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 release_attested: false,
                 attested_rust_sysroot: None,
             },
