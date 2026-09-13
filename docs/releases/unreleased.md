@@ -1,5 +1,13 @@
 # 未リリース
 
+## resolve --build のステージングと pnpm
+
+一時ワークスペースへコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
+リポジトリ外を指すリンクは従来どおり拒否し、`.depgraph.toml` の `[build] ignored_paths` で除外できることを案内する。
+未知の `[build]` キーはエラーになる。`[daemon] ignored_paths` は resolve のステージングには使わない。
+
+関連: [#489](https://github.com/TamaT-LLC/depgraph-cli/issues/489)。
+
 ## 未解決依存がある場合の health 判定
 
 完了した解析の実行記録から未解決依存の範囲を証明できる場合、health の保留理由を該当する言語アダプターに限定する。

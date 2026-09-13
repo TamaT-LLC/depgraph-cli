@@ -939,7 +939,11 @@ observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
 the real build lifecycle. It runs in a temporary staged workspace using
 canonical system Node, a cleared allowlisted environment, temporary
 HOME/cache/output, bounded output, timeout/cancellation, and cross-platform
-process-tree cleanup. Every launched attempt saves a secret-free audit
+process-tree cleanup. In-repository symbolic links are materialized as regular
+files or directories; a link whose canonical target leaves the repository fails
+closed. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
+prefixes from staging, and unknown `[build]` keys are rejected. `[daemon]
+ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
 isolation capability, and outcome; raw stdout/stderr and temporary or host
 paths are not persisted. Network isolation is reported as `best-effort` unless
