@@ -667,7 +667,7 @@ async function digestArtifact(
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
     || (logicalHint !== undefined && hinted !== contained)) {
     fail("web.next_build_artifact_path_unsafe", {
-      logical_hint: typeof logicalHint === "string" ? logicalHint : null,
+      logical_hint: routingDetailPathname(logicalHint),
       contained,
     });
   }

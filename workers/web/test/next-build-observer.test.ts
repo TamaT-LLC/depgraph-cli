@@ -682,6 +682,18 @@ test("observer failures carry bounded pathname-only detail for the failing value
       && error.detail?.contained === "node_modules/other/dist/impostor.js",
   );
 
+  const credentialHint = buildContext();
+  (credentialHint.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js?token=hunter2": "/repo/node_modules/other/dist/impostor.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(credentialHint, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.logical_hint === "node_modules/next/setup-node-env.js?<redacted-query>"
+      && !error.message.includes("hunter2"),
+  );
+
   const detailed = nextBuildFailureDiagnostic(
     new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
       logical_hint: "node_modules/next/setup-node-env.js",

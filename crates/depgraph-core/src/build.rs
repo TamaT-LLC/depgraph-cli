@@ -13,7 +13,11 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::timeout,
+};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
@@ -1180,7 +1184,7 @@ where
     let stdout = child.stdout.take().context("build stdout is unavailable")?;
     let stderr = child.stderr.take().context("build stderr is unavailable")?;
     let stdout_task = tokio::spawn(read_capped(stdout, plan.stdout_limit_bytes));
-    let stderr_task = tokio::spawn(read_capped(stderr, plan.stderr_limit_bytes));
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr, plan.stderr_limit_bytes));
     tokio::pin!(cancellation);
     enum WaitResult {
         Process(std::io::Result<std::process::ExitStatus>),
@@ -2223,6 +2227,33 @@ fn audit_environment_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<S
 /// failed-run audits small even against the 10 MiB capture limit.
 const BUILD_STDERR_TAIL_LIMIT_BYTES: usize = 32 * 1024;
 
+/// Drain the build child's stderr to EOF, reporting whether the stream
+/// exceeded `limit` while keeping only the last
+/// [`BUILD_STDERR_TAIL_LIMIT_BYTES`]. Unlike a head-capped capture, the ring
+/// keeps the true end of the stream, which is where build tools report their
+/// terminal error even after megabytes of earlier diagnostics.
+async fn read_stderr_tail(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut tail = Vec::with_capacity(BUILD_STDERR_TAIL_LIMIT_BYTES.min(64 * 1024));
+    let mut total: u64 = 0;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        tail.extend_from_slice(&buffer[..read]);
+        if tail.len() > BUILD_STDERR_TAIL_LIMIT_BYTES {
+            let excess = tail.len() - BUILD_STDERR_TAIL_LIMIT_BYTES;
+            tail.drain(..excess);
+        }
+    }
+    Ok((tail, total > limit as u64))
+}
+
 /// Retain a bounded stderr tail for failure diagnosis: keep the last
 /// [`BUILD_STDERR_TAIL_LIMIT_BYTES`] of the capture, replace control
 /// characters other than line breaks and tabs, and redact secret-shaped
@@ -2250,7 +2281,8 @@ fn bounded_stderr_tail(stderr: &[u8]) -> Option<String> {
 }
 
 /// A stderr line that looks like it carries a credential: key material
-/// markers or a secret-shaped `key=value` / `key: value` assignment.
+/// markers or a secret-shaped `key=value` / `key: value` assignment,
+/// including assignments padded with whitespace such as `TOKEN = value`.
 fn is_secret_shaped_line(line: &str) -> bool {
     let lowercase = line.to_ascii_lowercase();
     if lowercase.contains("-----begin") {
@@ -2262,10 +2294,19 @@ fn is_secret_shaped_line(line: &str) -> bool {
     {
         return true;
     }
-    lowercase
-        .split(|character: char| character.is_whitespace() || character == ';' || character == ',')
-        .filter_map(|fragment| fragment.split_once('='))
-        .any(|(key, value)| !value.trim().is_empty() && is_secret_key(key.trim()))
+    lowercase.match_indices('=').any(|(index, _)| {
+        let value = lowercase[index + 1..].trim_start_matches('=').trim();
+        if value.is_empty() {
+            return false;
+        }
+        lowercase[..index]
+            .trim_end()
+            .rsplit(|character: char| {
+                character.is_whitespace() || character == ';' || character == ','
+            })
+            .next()
+            .is_some_and(|key| is_secret_key(key.trim()))
+    })
 }
 
 fn redact_arguments(arguments: &[String]) -> Vec<String> {
@@ -3816,6 +3857,9 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             "Error [NextBuildObserverError]: web.next_build_manifest_invalid\n",
             "npm_config_registry_token=hunter2\n",
             "Authorization: Bearer hunter2\n",
+            "TOKEN = hunter2\n",
+            "export NPM_SECRET =  hunter2\n",
+            "level=info API_KEY = hunter2\n",
             "-----BEGIN RSA PRIVATE KEY-----\n",
             "build failed with exit code 1",
         );
@@ -3824,7 +3868,7 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(tail.contains("build failed with exit code 1"));
         assert!(!tail.contains("hunter2"));
         assert!(!tail.contains("PRIVATE KEY"));
-        assert_eq!(tail.matches("[REDACTED LINE]").count(), 3);
+        assert_eq!(tail.matches("[REDACTED LINE]").count(), 6);
 
         let mut oversized = vec![b'a'; 2 * BUILD_STDERR_TAIL_LIMIT_BYTES];
         oversized.extend_from_slice(b"\nterminal build error");
@@ -3834,6 +3878,33 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             tail.ends_with("terminal build error"),
             "the tail must keep the end of the stream where the error is reported"
         );
+    }
+
+    #[test]
+    fn stderr_reader_keeps_the_true_stream_tail_beyond_the_capture_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let capture_limit = 64 * 1024;
+        let mut stream = vec![b'a'; capture_limit + BUILD_STDERR_TAIL_LIMIT_BYTES];
+        stream.extend_from_slice(b"\nterminal build error");
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(stream.as_slice(), capture_limit))
+            .unwrap();
+        assert!(truncated, "a stream larger than the limit must be flagged");
+        assert!(tail.len() <= BUILD_STDERR_TAIL_LIMIT_BYTES);
+        assert!(
+            tail.ends_with(b"terminal build error"),
+            "the ring must keep the true end of the stream, not the head of the capture"
+        );
+
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(&b"short failure"[..], capture_limit))
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(tail, b"short failure");
     }
 
     #[test]
