@@ -323,6 +323,17 @@ function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   return normalized.length > 1 ? normalized.replace(/\/$/u, "") : normalized;
 }
 
+function canonicalDestination(value: unknown): string | null {
+  const raw = boundedString(value);
+  if (raw === null) return null;
+  // Next.js 16.2 forwards named captures to dynamic route destinations through
+  // a query suffix (e.g. `/blogs/[id]?nxtPid=$nxtPid`). The query never
+  // contributes to the observed pathname, so validate and keep only the
+  // pathname part.
+  const queryIndex = raw.indexOf("?");
+  return canonicalPathname(queryIndex < 0 ? raw : raw.slice(0, queryIndex));
+}
+
 function canonicalSourcePage(value: unknown): string | null {
   const raw = boundedString(value);
   if (raw === null || raw.includes("\\") || raw.includes("?") || raw.includes("#") || /\s/u.test(raw)) return null;
@@ -537,7 +548,7 @@ function sanitizeRouting(
         fail("web.next_build_manifest_invalid");
       }
       const rawSource = canonicalPathname(route.source);
-      const rawDestination = canonicalPathname(route.destination);
+      const rawDestination = canonicalDestination(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
         fail("web.next_build_manifest_invalid");
