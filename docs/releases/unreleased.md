@@ -1,5 +1,22 @@
 # 未リリース
 
+## Next.js 16.2 の dynamicRoutes destination
+
+Next.js 16.2 は動的ルートの `destination` に `?nxtPid=$nxtPid` のような named capture クエリを付ける。
+観測時はクエリとフラグメントを除いた pathname だけを正規化し、クエリ付きであることだけを理由に `web.next_build_manifest_invalid` で落とさない。
+pathname 部が空、または pathname として不正な destination は従来どおり拒否する。
+保存する観測値にクエリ文字列は残さない。
+
+関連: [#488](https://github.com/TamaT-LLC/depgraph-cli/issues/488)。
+
+## depgraph.build 実行プランの案内
+
+`package.json` の `depgraph.build` 書式、entrypoint の起動規約（引数なしの `node` 実行、渡す環境変数、一時ワークスペース）、Next.js 向けの最小スクリプトを README と `depgraph resolve --help` に記載した。
+プランが無い場合のエラーはコピー可能な雛形を含む。
+`depgraph init` は従来どおり `.depgraph.toml` だけを書き、`package.json` は変更しない。
+
+関連: [#491](https://github.com/TamaT-LLC/depgraph-cli/issues/491)。
+
 ## 未解決依存がある場合の health 判定
 
 完了した解析の実行記録から未解決依存の範囲を証明できる場合、health の保留理由を該当する言語アダプターに限定する。
