@@ -60,7 +60,7 @@ package.json. The plan is a JSON object (not a shell command) with:
   adapter          one of next, astro, tanstack-router, tanstack-start
   entrypoint       repository-relative path to a regular file
   version          framework version string (JSON string, not a number)
-  timeout_seconds  optional integer; default 900
+  timeout_seconds  optional integer between 1 and 3600; default 900
 
 depgraph launches the entrypoint as `node <entrypoint>` with no extra \
 arguments, in a temporary staged workspace. It does not run npm/pnpm/yarn \

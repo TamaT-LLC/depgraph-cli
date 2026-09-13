@@ -458,7 +458,7 @@ Webプロジェクトは`package.json`にバージョン付きの`depgraph.build
 | `adapter` | 文字列 | `next`・`astro`・`tanstack-router`・`tanstack-start`のいずれか。リリースに固定された観測契約を選択する |
 | `entrypoint` | 文字列 | リポジトリ相対パスのNodeスクリプト。`node <entrypoint>`として引数なしで起動される。絶対パスと`..`は拒否され、ファイルが存在しなければならない |
 | `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.3"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
-| `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト。既定は`900` |
+| `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト（秒）。許容範囲は1〜3600で、既定は`900` |
 
 entrypointの起動規約は次のとおりである。
 
@@ -479,6 +479,8 @@ const result = spawnSync(
 );
 process.exit(result.status ?? 1);
 ```
+
+Next.jsではこの例で完結する。entrypoint自身はobserverをimportせず、`next build`が環境変数`NEXT_ADAPTER_PATH`を読み取ってリリース同梱アダプターのビルドフック（`modifyConfig`・`onBuildComplete`）を呼び出し、観測結果を`DEPGRAPH_OUTPUT_DIR`へ書き出す。この自動組み込みこそが、entrypointに本物の`next build`プロセスの起動を求める理由である。
 
 コピーして使えるNext.js向けスクリプトは[docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs)にもある。
 プランが無い場合のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。

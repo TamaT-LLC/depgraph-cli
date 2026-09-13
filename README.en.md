@@ -941,7 +941,7 @@ rejected so misspelled configuration cannot be silently ignored:
 | `adapter` | string | One of `next`, `astro`, `tanstack-router`, `tanstack-start`; selects the release-pinned observer contract. |
 | `entrypoint` | string | Repository-relative path to a Node script launched as `node <entrypoint>` with no arguments. Absolute paths and `..` segments are rejected, and the file must exist. |
 | `version` | string | Non-empty target framework version (for example `"16.2.3"`). It must be a JSON string; a bare number is rejected. Astro and TanStack adapters receive it as `DEPGRAPH_ASTRO_VERSION`, `DEPGRAPH_TANSTACK_ROUTER_VERSION`, or `DEPGRAPH_TANSTACK_START_VERSION`. |
-| `timeout_seconds` | integer, optional | Whole-build timeout; defaults to `900`. |
+| `timeout_seconds` | integer, optional | Whole-build timeout in seconds; the accepted range is 1–3600 and the default is `900`. |
 
 The entrypoint launch convention is:
 
@@ -970,6 +970,13 @@ const result = spawnSync(
 );
 process.exit(result.status ?? 1);
 ```
+
+This example is complete for Next.js: the entrypoint never imports the
+observer itself. Next.js reads `NEXT_ADAPTER_PATH` during `next build` and
+invokes the release-provided adapter's build hooks (`modifyConfig`,
+`onBuildComplete`), which write the observation artifact into
+`DEPGRAPH_OUTPUT_DIR`. That automatic integration is exactly why the
+entrypoint must launch the real `next build` process.
 
 A copyable Next.js script also ships as
 [`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
