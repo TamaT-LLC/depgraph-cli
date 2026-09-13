@@ -920,6 +920,10 @@ pub struct BuildExecutionOutcome {
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
+    #[serde(skip)]
+    pub child_stderr_tail: Option<String>,
+    #[serde(skip)]
+    pub child_stderr_log_path: Option<PathBuf>,
 }
 
 pub async fn supervise_build(
@@ -1225,7 +1229,7 @@ where
     let mut reader_errors = Vec::new();
     let (stdout, stdout_truncated) =
         finish_reader(stdout_task, "build stdout", &mut reader_errors).await?;
-    let (_stderr, stderr_truncated) =
+    let (stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
     let mut outcome = outcome;
@@ -1402,9 +1406,16 @@ where
         web_observation = None;
     }
     let finished_wall = Utc::now();
+    let run_id = Uuid::new_v4().to_string();
+    let redacted_stderr = redact_build_log(&stderr);
+    let (child_stderr_tail, child_stderr_log_path) = persist_child_stderr_log(
+        &run_id,
+        &redacted_stderr,
+        !matches!(outcome, BuildOutcomeKind::Completed),
+    );
     let audit = BuildAudit {
         schema_version: BUILD_SUPERVISOR_VERSION.to_owned(),
-        run_id: Uuid::new_v4().to_string(),
+        run_id,
         adapter: plan.adapter.clone(),
         adapter_version: plan.adapter_version.clone(),
         profile_id: plan.profile_id.clone(),
@@ -1447,6 +1458,8 @@ where
         rust_compiler_mir_ledger,
         rust_observation,
         web_observation,
+        child_stderr_tail,
+        child_stderr_log_path,
     })
 }
 
@@ -2204,6 +2217,68 @@ fn audit_environment_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<S
         }
     }
     (visible.into_iter().collect(), redacted)
+}
+
+const CHILD_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+fn redact_build_log(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| {
+            if secret_shaped_build_line(line) {
+                "[REDACTED]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn secret_shaped_build_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "-----begin ",
+        "authorization:",
+        "bearer ",
+        "password=",
+        "passwd=",
+        "client_secret=",
+        "private_key=",
+        "secret_key=",
+        "api_key=",
+        "access_token=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn persist_child_stderr_log(
+    run_id: &str,
+    redacted: &str,
+    persist: bool,
+) -> (Option<String>, Option<PathBuf>) {
+    if !persist || redacted.trim().is_empty() {
+        return (None, None);
+    }
+    let tail = tail_from_end(redacted, CHILD_STDERR_TAIL_BYTES);
+    let path = std::env::temp_dir().join(format!("depgraph-build-{run_id}.stderr.log"));
+    let log_path = fs::write(&path, redacted).ok().map(|_| path);
+    (Some(tail), log_path)
+}
+
+fn tail_from_end(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let start = value.len() - max_bytes;
+    let start = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= start)
+        .unwrap_or(value.len());
+    value[start..].to_owned()
 }
 
 fn redact_arguments(arguments: &[String]) -> Vec<String> {
@@ -3474,7 +3549,43 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             failed.audit.diagnostic_code.as_deref(),
             Some("build-child-failed")
         );
+        assert_eq!(
+            failed.child_stderr_tail.as_deref(),
+            Some("compiler panic fixture")
+        );
+        let log_path = failed
+            .child_stderr_log_path
+            .as_ref()
+            .context("failed child stderr log path is missing")?;
+        assert_eq!(fs::read_to_string(log_path)?, "compiler panic fixture");
+        let serialized = serde_json::to_string(&failed)?;
+        assert!(!serialized.contains("compiler panic fixture"));
+        assert!(!serialized.contains("child_stderr"));
         assert!(failed.audit.validated_output_digest.is_none());
+
+        fs::write(
+            root.path().join("secret.mjs"),
+            "process.stderr.write('Authorization: Bearer leaked-token\\ncompiler panic'); process.exit(72);\n",
+        )?;
+        let secret =
+            supervise_build(root.path(), &node_plan(vec!["secret.mjs".to_owned()])).await?;
+        assert_eq!(secret.audit.outcome, BuildOutcomeKind::Failed);
+        let secret_tail = secret
+            .child_stderr_tail
+            .as_deref()
+            .context("redacted stderr tail is missing")?;
+        assert!(secret_tail.contains("[REDACTED]"));
+        assert!(secret_tail.contains("compiler panic"));
+        assert!(!secret_tail.contains("leaked-token"));
+        let secret_log = fs::read_to_string(
+            secret
+                .child_stderr_log_path
+                .as_ref()
+                .context("redacted stderr log path is missing")?,
+        )?;
+        assert!(secret_log.contains("[REDACTED]"));
+        assert!(!secret_log.contains("leaked-token"));
+        assert!(!serde_json::to_string(&secret)?.contains("leaked-token"));
 
         fs::write(
             root.path().join("noisy.mjs"),
@@ -3521,6 +3632,29 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         );
         assert!(disk.audit.validated_output_digest.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn redacted_child_stderr_tail_stays_on_utf8_boundaries_and_omits_secret_shaped_lines() {
+        assert_eq!(
+            redact_build_log(b"compiler panic\nAuthorization: Bearer leaked-token\n"),
+            "compiler panic\n[REDACTED]"
+        );
+        let prefix = "a".repeat(1);
+        let wide = "é".repeat(CHILD_STDERR_TAIL_BYTES);
+        let (tail, path) = persist_child_stderr_log("utf8-tail", &format!("{prefix}{wide}"), true);
+        let tail = tail.expect("stderr tail is missing");
+        assert!(tail.len() <= CHILD_STDERR_TAIL_BYTES + "é".len());
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(!tail.contains('a'));
+        let path = path.expect("stderr log path is missing");
+        assert!(path.ends_with("depgraph-build-utf8-tail.stderr.log"));
+        assert!(fs::read_to_string(&path).unwrap().starts_with('a'));
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            persist_child_stderr_log("unused", "compiler panic", false),
+            (None, None)
+        );
     }
 
     #[test]

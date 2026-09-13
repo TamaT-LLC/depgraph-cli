@@ -4183,6 +4183,7 @@ fn resolve_requires_the_explicit_build_mode_selector() {
         .success()
         .stdout(predicate::str::contains("--build"))
         .stdout(predicate::str::contains("--allow-project-code"))
+        .stdout(predicate::str::contains("--json"))
         .stdout(predicate::str::contains("untrusted project code"));
 }
 

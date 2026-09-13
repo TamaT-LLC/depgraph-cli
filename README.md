@@ -316,6 +316,7 @@ depgraph daemon stop /path/to/repository
 
 # 権限を伴うビルド観測。実行ごとに明示的な同意が必要になる。
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -434,6 +435,7 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 対話的な確認は行わず、実行のたびに`--allow-project-code`を明示しなければならない。
 設定、環境変数、`CI=true`、TTYの状態、過去の同意によって権限を付与することはできない。
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
+失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 

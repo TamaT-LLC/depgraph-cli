@@ -242,11 +242,13 @@ export interface NextBuildGraphDelta {
 
 export class NextBuildObserverError extends Error {
   readonly code: string;
+  readonly detail: Record<string, string> | undefined;
 
-  constructor(code: string) {
-    super(code);
+  constructor(code: string, detail?: Record<string, string>) {
+    super(detail === undefined ? code : `${code}: ${JSON.stringify(detail)}`);
     this.name = "NextBuildObserverError";
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -262,6 +264,13 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
   };
+  if (error instanceof NextBuildObserverError && error.detail !== undefined) {
+    for (const [key, value] of Object.entries(error.detail)) {
+      if (/^[a-z_]+$/u.test(key) && value.length <= MAX_SAFE_STRING && !secretShapedObserverValue(value)) {
+        properties[key] = value;
+      }
+    }
+  }
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
     severity: "error",
@@ -273,8 +282,32 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   };
 }
 
-function fail(code: string): never {
-  throw new NextBuildObserverError(code);
+function fail(code: string, detail?: Record<string, string>): never {
+  throw new NextBuildObserverError(code, detail);
+}
+
+function secretShapedObserverValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  return [
+    "-----begin ",
+    "authorization:",
+    "bearer ",
+    "password=",
+    "passwd=",
+    "client_secret=",
+    "private_key=",
+    "secret_key=",
+    "api_key=",
+    "access_token=",
+    "token=",
+  ].some((marker) => lower.includes(marker));
+}
+
+function observerRouteDetail(value: unknown): string | undefined {
+  const raw = boundedString(value);
+  if (raw === null || secretShapedObserverValue(raw)) return undefined;
+  if (/^[a-z]:/iu.test(raw) || raw.includes("\\") || raw.startsWith("//")) return undefined;
+  return raw;
 }
 
 function record(value: unknown): UnknownRecord | null {
@@ -540,7 +573,12 @@ function sanitizeRouting(
       const rawDestination = canonicalPathname(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
-        fail("web.next_build_manifest_invalid");
+        const detail: Record<string, string> = { phase };
+        const source = observerRouteDetail(route.source);
+        const destination = observerRouteDetail(route.destination);
+        if (source !== undefined) detail.source = source;
+        if (destination !== undefined) detail.destination = destination;
+        fail("web.next_build_manifest_invalid", detail);
       }
       const source = rawSource === null ? null : replaceBuildId(rawSource, buildId);
       const destination = rawDestination === null ? null : replaceBuildId(rawDestination, buildId);
@@ -623,7 +661,13 @@ async function digestArtifact(
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
     || (logicalHint !== undefined && hinted !== contained)) {
-    fail("web.next_build_artifact_path_unsafe");
+    const reason = logicalHint !== undefined && contained !== null && hinted !== contained
+      ? "hint_mismatch"
+      : "not_contained";
+    const detail: Record<string, string> = { reason };
+    if (contained !== null) detail.contained = contained;
+    if (hinted !== null) detail.hinted = hinted;
+    fail("web.next_build_artifact_path_unsafe", detail);
   }
   const logicalPath = contained;
   let digest: string;
