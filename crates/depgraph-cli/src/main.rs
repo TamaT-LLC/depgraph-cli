@@ -51,6 +51,34 @@ use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
 use snapshot_diff::render_service_human_diff;
 
+const RESOLVE_LONG_HELP: &str = "\
+Observe a project build only after explicit project-code consent.
+
+Web projects declare a versioned `depgraph.build` execution plan in \
+package.json. The plan is a JSON object (not a shell command) with:
+
+  adapter          one of next, astro, tanstack-router, tanstack-start
+  entrypoint       repository-relative path to a regular file
+  version          framework version string (JSON string, not a number)
+  timeout_seconds  optional integer; default 900
+
+depgraph launches the entrypoint as `node <entrypoint>` with no extra \
+arguments, in a temporary staged workspace. It does not run npm/pnpm/yarn \
+scripts. The process receives DEPGRAPH_OBSERVER (and NEXT_ADAPTER_PATH for \
+Next) plus DEPGRAPH_OUTPUT_DIR. The entrypoint must spawn the real framework \
+build and inherit its exit code without modifying project source.
+
+Example package.json fragment:
+
+  \"depgraph\": { \"build\": { \"adapter\": \"next\", \
+\"entrypoint\": \"scripts/depgraph-build.mjs\", \"version\": \"16.2.3\", \
+\"timeout_seconds\": 900 } }
+
+A Next.js entrypoint example lives at docs/examples/next-depgraph-build.mjs. \
+Missing plans fail with a copyable template. Full contract: README.en.md \
+build-mode consent boundary.
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "depgraph",
@@ -169,22 +197,7 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Observe a project build only after explicit project-code consent.
-    ///
-    /// Rust workspaces with `Cargo.toml` and `Cargo.lock` build through Cargo.
-    /// Web projects declare a versioned execution plan in `package.json`, for
-    /// example: {"depgraph":{"build":{"adapter":"next","entrypoint":
-    /// "depgraph-build.mjs","version":"16.2.10","timeout_seconds":900}}}.
-    /// `adapter` is one of next, astro, tanstack-router, or tanstack-start;
-    /// `version` is a non-empty framework version string; `timeout_seconds`
-    /// is optional (default 900); unknown fields are rejected. The
-    /// repository-relative `entrypoint` is launched as `node <entrypoint>`
-    /// with no arguments inside a temporary staged copy of the repository. It
-    /// must start the real framework build (for example spawn `next build`),
-    /// exit with the build's exit code, and leave sources unchanged. The
-    /// release-provided observer path arrives as DEPGRAPH_OBSERVER (Next also
-    /// receives NEXT_ADAPTER_PATH) and the observation artifact is written to
-    /// DEPGRAPH_OUTPUT_DIR. See the README build-mode consent boundary
-    /// section for the full contract.
+    #[command(long_about = RESOLVE_LONG_HELP)]
     Resolve {
         /// Select build observation mode. No other resolve mode is available yet.
         #[arg(long, required = true)]

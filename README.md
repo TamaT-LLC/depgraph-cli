@@ -436,15 +436,15 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
 
 `Cargo.toml`と`Cargo.lock`を持つRustワークスペースはCargoで実行する。
-Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。
+Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。シェルコマンドやnpm/pnpm/yarnのlifecycleは受け付けない。
 
 ```json
 {
   "depgraph": {
     "build": {
       "adapter": "next",
-      "entrypoint": "depgraph-build.mjs",
-      "version": "16.2.10",
+      "entrypoint": "scripts/depgraph-build.mjs",
+      "version": "16.2.3",
       "timeout_seconds": 900
     }
   }
@@ -457,7 +457,7 @@ Webプロジェクトは`package.json`にバージョン付きの`depgraph.build
 | --- | --- | --- |
 | `adapter` | 文字列 | `next`・`astro`・`tanstack-router`・`tanstack-start`のいずれか。リリースに固定された観測契約を選択する |
 | `entrypoint` | 文字列 | リポジトリ相対パスのNodeスクリプト。`node <entrypoint>`として引数なしで起動される。絶対パスと`..`は拒否され、ファイルが存在しなければならない |
-| `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.10"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
+| `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.3"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
 | `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト。既定は`900` |
 
 entrypointの起動規約は次のとおりである。
@@ -469,7 +469,7 @@ entrypointの起動規約は次のとおりである。
 最小のNext.js向けentrypointの例:
 
 ```js
-// depgraph-build.mjs
+// scripts/depgraph-build.mjs
 import { spawnSync } from "node:child_process";
 
 const result = spawnSync(
@@ -479,6 +479,9 @@ const result = spawnSync(
 );
 process.exit(result.status ?? 1);
 ```
+
+コピーして使えるNext.js向けスクリプトは[docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs)にもある。
+プランが無い場合のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 

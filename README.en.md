@@ -925,8 +925,8 @@ The explicit-consent guard is enforced before path, configuration, store, or too
   "depgraph": {
     "build": {
       "adapter": "next",
-      "entrypoint": "depgraph-build.mjs",
-      "version": "16.2.10",
+      "entrypoint": "scripts/depgraph-build.mjs",
+      "version": "16.2.3",
       "timeout_seconds": 900
     }
   }
@@ -940,7 +940,7 @@ rejected so misspelled configuration cannot be silently ignored:
 | --- | --- | --- |
 | `adapter` | string | One of `next`, `astro`, `tanstack-router`, `tanstack-start`; selects the release-pinned observer contract. |
 | `entrypoint` | string | Repository-relative path to a Node script launched as `node <entrypoint>` with no arguments. Absolute paths and `..` segments are rejected, and the file must exist. |
-| `version` | string | Non-empty target framework version (for example `"16.2.10"`). It must be a JSON string; a bare number is rejected. Astro and TanStack adapters receive it as `DEPGRAPH_ASTRO_VERSION`, `DEPGRAPH_TANSTACK_ROUTER_VERSION`, or `DEPGRAPH_TANSTACK_START_VERSION`. |
+| `version` | string | Non-empty target framework version (for example `"16.2.3"`). It must be a JSON string; a bare number is rejected. Astro and TanStack adapters receive it as `DEPGRAPH_ASTRO_VERSION`, `DEPGRAPH_TANSTACK_ROUTER_VERSION`, or `DEPGRAPH_TANSTACK_START_VERSION`. |
 | `timeout_seconds` | integer, optional | Whole-build timeout; defaults to `900`. |
 
 The entrypoint launch convention is:
@@ -960,7 +960,7 @@ The entrypoint launch convention is:
 A minimal Next.js entrypoint:
 
 ```js
-// depgraph-build.mjs
+// scripts/depgraph-build.mjs
 import { spawnSync } from "node:child_process";
 
 const result = spawnSync(
@@ -971,8 +971,12 @@ const result = spawnSync(
 process.exit(result.status ?? 1);
 ```
 
-The allowed Web adapter values are `next`, `astro`, `tanstack-router`, and
-`tanstack-start`. The relative entrypoint must integrate the release-provided
+A copyable Next.js script also ships as
+[`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
+A missing `depgraph.build` plan fails with a copyable template and a pointer
+to `depgraph resolve --help`.
+
+The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
 the real build lifecycle. It runs in a temporary staged workspace using
 canonical system Node, a cleared allowlisted environment, temporary
