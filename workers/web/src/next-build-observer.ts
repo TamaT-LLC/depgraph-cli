@@ -246,9 +246,7 @@ export class NextBuildObserverError extends Error {
 
   constructor(code: string, detail?: Record<string, string>) {
     super(detail === undefined ? code : `${code}: ${JSON.stringify(detail)}`);
-    this.name = "NextBuildObserverError";
-    this.code = code;
-    this.detail = detail;
+    Object.assign(this, { name: "NextBuildObserverError", code, detail });
   }
 }
 
@@ -256,21 +254,14 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   const code = error instanceof NextBuildObserverError && /^web\.next_build_[a-z0-9_]+$/u.test(error.code)
     ? error.code
     : "web.next_build_observer_failed";
-  const properties: Record<string, JsonValue> = {
+  const properties: Record<string, JsonValue> = observerFailureDetail(error, {
     framework: "next",
     observer: NEXT_BUILD_OBSERVER,
     observer_version: NEXT_BUILD_OBSERVER_VERSION,
     capability: NEXT_BUILD_OBSERVER_CAPABILITY,
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
-  };
-  if (error instanceof NextBuildObserverError && error.detail !== undefined) {
-    for (const [key, value] of Object.entries(error.detail)) {
-      if (/^[a-z_]+$/u.test(key) && value.length <= MAX_SAFE_STRING && !secretShapedObserverValue(value)) {
-        properties[key] = value;
-      }
-    }
-  }
+  });
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
     severity: "error",
@@ -282,32 +273,8 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   };
 }
 
-function fail(code: string, detail?: Record<string, string>): never {
-  throw new NextBuildObserverError(code, detail);
-}
-
-function secretShapedObserverValue(value: string): boolean {
-  const lower = value.toLowerCase();
-  return [
-    "-----begin ",
-    "authorization:",
-    "bearer ",
-    "password=",
-    "passwd=",
-    "client_secret=",
-    "private_key=",
-    "secret_key=",
-    "api_key=",
-    "access_token=",
-    "token=",
-  ].some((marker) => lower.includes(marker));
-}
-
-function observerRouteDetail(value: unknown): string | undefined {
-  const raw = boundedString(value);
-  if (raw === null || secretShapedObserverValue(raw)) return undefined;
-  if (/^[a-z]:/iu.test(raw) || raw.includes("\\") || raw.startsWith("//")) return undefined;
-  return raw;
+function fail(code: string): never {
+  throw new NextBuildObserverError(code);
 }
 
 function record(value: unknown): UnknownRecord | null {
@@ -346,6 +313,44 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   const relative = path.relative(path.resolve(repoRoot), path.resolve(raw));
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   return canonicalRelativePath(relative);
+}
+
+function secretShapedObserverValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  return [
+    "-----begin ",
+    "authorization:",
+    "bearer ",
+    "password=",
+    "passwd=",
+    "client_secret=",
+    "private_key=",
+    "secret_key=",
+    "api_key=",
+    "access_token=",
+    "token=",
+  ].some((marker) => lower.includes(marker));
+}
+
+function observerRouteDetail(value: unknown): string | undefined {
+  const raw = boundedString(value);
+  return raw === null || raw.includes("\\") ? undefined : raw;
+}
+
+function omitSecretShapedDetails(detail: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(detail).filter((entry) => !secretShapedObserverValue(entry[1])));
+}
+
+function observerFailureDetail(
+  error: unknown,
+  properties: Record<string, JsonValue>,
+): Record<string, JsonValue> {
+  const detail = error instanceof NextBuildObserverError ? error.detail : undefined;
+  return Object.assign(properties, omitSecretShapedDetails(detail ?? {}));
+}
+
+function failWithDetail(code: string, detail: Record<string, string>): never {
+  throw new NextBuildObserverError(code, detail);
 }
 
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
@@ -578,7 +583,7 @@ function sanitizeRouting(
         const destination = observerRouteDetail(route.destination);
         if (source !== undefined) detail.source = source;
         if (destination !== undefined) detail.destination = destination;
-        fail("web.next_build_manifest_invalid", detail);
+        failWithDetail("web.next_build_manifest_invalid", detail);
       }
       const source = rawSource === null ? null : replaceBuildId(rawSource, buildId);
       const destination = rawDestination === null ? null : replaceBuildId(rawDestination, buildId);
@@ -667,7 +672,7 @@ async function digestArtifact(
     const detail: Record<string, string> = { reason };
     if (contained !== null) detail.contained = contained;
     if (hinted !== null) detail.hinted = hinted;
-    fail("web.next_build_artifact_path_unsafe", detail);
+    failWithDetail("web.next_build_artifact_path_unsafe", detail);
   }
   const logicalPath = contained;
   let digest: string;
