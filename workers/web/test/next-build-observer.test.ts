@@ -390,6 +390,30 @@ test("prerenders without a fallback artifact use deterministic synthetic metadat
   assert.equal(JSON.stringify(observed).includes("private-prerender-output-id"), false);
 });
 
+test("dynamicRoutes destinations keep the pathname when Next includes a named capture query", async () => {
+  const context = buildContext();
+  context.routing.dynamicRoutes = [
+    {
+      source: "/blogs/[id]",
+      sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+      destination: "/blogs/[id]?nxtPid=$nxtPid",
+    },
+    {
+      source: "/blogs/[id].rsc",
+      sourceRegex: "^/blogs/([^/]+?)\\.rsc(?:/)?$",
+      destination: "/blogs/[id]$rscSuffix?nxtPid=$nxtPid",
+    },
+  ];
+  const observed = await collectNextBuildObservation(context, () => digest("a"));
+  const destinations = observed.routing
+    .filter((entry) => entry.phase === "dynamicRoutes")
+    .map((entry) => entry.destination)
+    .sort();
+  assert.deepEqual(destinations, ["/blogs/[id]", "/blogs/[id]$rscSuffix"]);
+  assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
+  assert.equal(JSON.stringify(observed).includes("?"), false);
+});
+
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {
   const escaped = buildContext();
   (escaped.outputs.appPages as Array<Record<string, unknown>>)[0]!.filePath = "/outside/page.js";
@@ -422,21 +446,6 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
       && JSON.stringify(error).includes("C:") === false,
   );
 
-  const queryRoute = buildContext();
-  queryRoute.routing.dynamicRoutes = [{
-    source: "/products/[id]",
-    sourceRegex: "^/products/([^/]+)$",
-    destination: "/products/[id]?nxtPid=$nxtPid",
-  }];
-  await assert.rejects(
-    collectNextBuildObservation(queryRoute, () => digest("a")),
-    (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_manifest_invalid"
-      && error.detail?.phase === "dynamicRoutes"
-      && error.detail?.source === "/products/[id]"
-      && error.detail?.destination === "/products/[id]?nxtPid=$nxtPid",
-  );
-
   const leakedHint = nextBuildFailureDiagnostic(
     new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
       reason: "hint_mismatch",
@@ -449,6 +458,18 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   assert.equal(leakedHint.properties?.contained, "apps/site/.next/server/app/page.js");
   assert.equal(leakedHint.properties?.hinted, undefined);
   assert.equal(JSON.stringify(leakedHint).includes("raw-secret"), false);
+
+  const queryOnlyDestination = buildContext();
+  queryOnlyDestination.routing.dynamicRoutes = [{
+    source: "/blogs/[id]",
+    sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+    destination: "?nxtPid=$nxtPid",
+  }];
+  await assert.rejects(
+    collectNextBuildObservation(queryOnlyDestination, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_invalid",
+  );
 });
 
 test("observed outputs correlate to canonical safe routes and become deterministic build evidence", async () => {
