@@ -444,7 +444,7 @@ Webプロジェクトは`package.json`に version 付きの`depgraph.build`実�
 | `version` | string | フレームワークの version 文字列。JSON の数値 `1` ではなく `"16.2.3"` のような文字列 |
 | `timeout_seconds` | integer | 省略可。既定は 900 秒 |
 
-entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
+entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。Next.js 16.2 以降は `NEXT_ADAPTER_PATH` から observer を自動ロードするので、entrypoint が `modifyConfig` / `onBuildComplete` を自分で呼ぶ必要はない。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
 
 ```json
 {
@@ -459,7 +459,7 @@ entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next
 }
 ```
 
-プランが無い場合のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
+プランが無い場合（`depgraph` キー自体が無い、または `{"depgraph":{}}` のように `build` だけが欠ける場合）のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 
