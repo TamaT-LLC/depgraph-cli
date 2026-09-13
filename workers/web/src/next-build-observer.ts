@@ -334,6 +334,13 @@ function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   return normalized.length > 1 ? normalized.replace(/\/$/u, "") : normalized;
 }
 
+function routingDestinationPathname(value: unknown): string | null {
+  const raw = boundedString(value);
+  if (raw === null) return null;
+  const separator = raw.search(/[?#]/u);
+  return canonicalPathname(separator === -1 ? raw : raw.slice(0, separator));
+}
+
 function canonicalSourcePage(value: unknown): string | null {
   const raw = boundedString(value);
   if (raw === null || raw.includes("\\") || raw.includes("?") || raw.includes("#") || /\s/u.test(raw)) return null;
@@ -548,7 +555,7 @@ function sanitizeRouting(
         fail("web.next_build_manifest_invalid");
       }
       const rawSource = canonicalPathname(route.source);
-      const rawDestination = canonicalPathname(route.destination);
+      const rawDestination = routingDestinationPathname(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
         fail("web.next_build_manifest_invalid");
