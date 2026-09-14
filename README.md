@@ -440,16 +440,8 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 リポジトリ外を指すリンクは拒否する。`.depgraph.toml` の `[build] ignored_paths` にリポジトリ相対プレフィックスを書くと、その配下はステージング対象から外れる。未知の `[build]` キーはエラーになる。
 失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
-Webプロジェクトは`package.json`に version 付きの`depgraph.build`実行プランを置く。シェルコマンドや npm/pnpm/yarn の lifecycle は受け付けない。
-
-| フィールド | 型 | 意味 |
-|---|---|---|
-| `adapter` | string | `next` / `astro` / `tanstack-router` / `tanstack-start` |
-| `entrypoint` | リポジトリ相対パス | 一時ワークスペース内で `node <entrypoint>` として**引数なし**で起動する通常ファイル |
-| `version` | string | フレームワークの version 文字列。JSON の数値 `1` ではなく `"16.2.3"` のような文字列 |
-| `timeout_seconds` | integer | 省略可。既定は 900 秒 |
-
-entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。Next.js 16.2 以降は `NEXT_ADAPTER_PATH` から observer を自動ロードするので、entrypoint が `modifyConfig` / `onBuildComplete` を自分で呼ぶ必要はない。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
+`Cargo.toml`と`Cargo.lock`を持つRustワークスペースはCargoで実行する。
+Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。シェルコマンドやnpm/pnpm/yarnのlifecycleは受け付けない。
 
 ```json
 {
@@ -464,7 +456,39 @@ entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next
 }
 ```
 
-プランが無い場合（`depgraph` キー自体が無い、または `{"depgraph":{}}` のように `build` だけが欠ける場合）のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
+各フィールドは厳格に検証され、未知のフィールドは設定ミスに気づけるよう拒否される。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `adapter` | 文字列 | `next`・`astro`・`tanstack-router`・`tanstack-start`のいずれか。リリースに固定された観測契約を選択する |
+| `entrypoint` | 文字列 | リポジトリ相対パスのNodeスクリプト。`node <entrypoint>`として引数なしで起動される。絶対パスと`..`は拒否され、ファイルが存在しなければならない |
+| `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.3"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
+| `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト（秒）。許容範囲は1〜3600で、既定は`900` |
+
+entrypointの起動規約は次のとおりである。
+
+- ビルドはリポジトリの一時的なステージングコピーの中で、そのルートを作業ディレクトリとして実行される。entrypointはソースを変更してはならない（変更は実行後のソース監査で失敗になる）。
+- `node <entrypoint>`にCLI引数は渡されない。設定は環境変数で渡される。`DEPGRAPH_OBSERVER`はリリース同梱の観測モジュールのパス（Nextには`NEXT_ADAPTER_PATH`としても渡される）、観測結果は`DEPGRAPH_OUTPUT_DIR`へ書き出される。
+- スクリプトは実際のフレームワークビルド（例: `next build`のspawn）を起動し、その終了コードで終了することが期待される。`next.config.ts`やフレームワークのバイナリを直接`entrypoint`に指定しても、観測がビルドライフサイクルへ組み込まれないため動作しない。
+
+最小のNext.js向けentrypointの例:
+
+```js
+// scripts/depgraph-build.mjs
+import { spawnSync } from "node:child_process";
+
+const result = spawnSync(
+  process.execPath,
+  ["node_modules/next/dist/bin/next", "build"],
+  { stdio: "inherit" },
+);
+process.exit(result.status ?? 1);
+```
+
+Next.jsではこの例で完結する。Next.js 16.2以降では、entrypoint自身はobserverをimportせず、`next build`が環境変数`NEXT_ADAPTER_PATH`を読み取ってリリース同梱アダプターのビルドフック（`modifyConfig`・`onBuildComplete`）を呼び出し、観測結果を`DEPGRAPH_OUTPUT_DIR`へ書き出す。この自動組み込みこそが、entrypointに本物の`next build`プロセスの起動を求める理由である。
+
+コピーして使えるNext.js向けスクリプトは[docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs)にもある。
+プランが無い場合（`depgraph`キー自体が無い、または`{"depgraph":{}}`のように`build`だけが欠ける場合）のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 
