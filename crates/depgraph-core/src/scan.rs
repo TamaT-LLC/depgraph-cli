@@ -276,9 +276,35 @@ impl ScanFailure {
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_'))
             .then_some(phase)
         }) else {
-            return identity;
+            return match self.kind {
+                WorkerFailureKind::Launch => format!("{identity}; failure_phase=launch"),
+                WorkerFailureKind::Other => {
+                    if let Some(phase) = infer_worker_failure_phase(&self.detail) {
+                        format!("{identity}; failure_phase={phase}")
+                    } else {
+                        identity
+                    }
+                }
+                _ => identity,
+            };
         };
         format!("{identity}; last_progress_phase={phase}")
+    }
+}
+
+fn infer_worker_failure_phase(detail: &str) -> Option<&'static str> {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("inventory") {
+        Some("inventory")
+    } else if lower.contains("typescript") {
+        Some("typescript")
+    } else if lower.contains("failed to start")
+        || lower.contains("failed to spawn")
+        || lower.contains("no such file")
+    {
+        Some("launch")
+    } else {
+        None
     }
 }
 
@@ -2981,6 +3007,42 @@ mod tests {
         assert_eq!(
             failure.diagnostic_message(),
             "worker-failure:web:timeout; last_progress_phase=typescript_dependency_graph"
+        );
+    }
+
+    #[test]
+    fn worker_launch_diagnostic_reports_launch_phase_without_progress() {
+        let failure = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "failed to start node: No such file or directory".to_owned(),
+            WorkerFailureKind::Launch,
+        );
+        assert_eq!(
+            failure.diagnostic_message(),
+            "worker-failure:web:launch; failure_phase=launch"
+        );
+        assert_eq!(failure.stable_identity(), "worker-failure:web:launch");
+    }
+
+    #[test]
+    fn worker_other_diagnostic_infers_inventory_or_typescript_phase() {
+        let inventory = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "web worker failed: inventory walk failed".to_owned(),
+            WorkerFailureKind::Other,
+        );
+        assert_eq!(
+            inventory.diagnostic_message(),
+            "worker-failure:web:other; failure_phase=inventory"
+        );
+        let typescript = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "web worker failed: typescript program create failed".to_owned(),
+            WorkerFailureKind::Other,
+        );
+        assert_eq!(
+            typescript.diagnostic_message(),
+            "worker-failure:web:other; failure_phase=typescript"
         );
     }
 

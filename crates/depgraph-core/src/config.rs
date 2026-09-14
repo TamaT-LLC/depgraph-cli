@@ -16,6 +16,7 @@ pub struct Config {
     pub schema_version: u32,
     pub scan: ScanConfig,
     pub daemon: DaemonConfig,
+    pub build: BuildConfig,
     pub strict: StrictConfig,
     pub profiles: ProfileConfig,
     pub policy: PolicyConfig,
@@ -52,6 +53,12 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct BuildConfig {
+    pub ignored_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StrictConfig {
     pub max_unresolved: u64,
     pub max_skipped: u64,
@@ -75,6 +82,7 @@ impl Default for Config {
             schema_version: 1,
             scan: ScanConfig::default(),
             daemon: DaemonConfig::default(),
+            build: BuildConfig::default(),
             strict: StrictConfig::default(),
             profiles: ProfileConfig::default(),
             policy: PolicyConfig::default(),
@@ -221,7 +229,16 @@ impl Config {
             bail!("daemon.ignored_paths must not contain duplicates");
         }
         for path in &ignored_paths {
-            validate_ignored_path(path)?;
+            validate_ignored_path("daemon", path)?;
+        }
+        let mut build_ignored_paths = self.build.ignored_paths.clone();
+        build_ignored_paths.sort();
+        build_ignored_paths.dedup();
+        if build_ignored_paths.len() != self.build.ignored_paths.len() {
+            bail!("build.ignored_paths must not contain duplicates");
+        }
+        for path in &build_ignored_paths {
+            validate_ignored_path("build", path)?;
         }
         if !matches!(self.profiles.rust_mode.as_str(), "check" | "build" | "test") {
             bail!("profiles.rust_mode must be check, build, or test");
@@ -238,7 +255,7 @@ impl Config {
     }
 }
 
-fn validate_ignored_path(path: &str) -> Result<()> {
+fn validate_ignored_path(section: &str, path: &str) -> Result<()> {
     if path.is_empty()
         || path.starts_with('/')
         || path.ends_with('/')
@@ -248,7 +265,7 @@ fn validate_ignored_path(path: &str) -> Result<()> {
             .split('/')
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
-        bail!("daemon ignored path {path:?} must be a normalized repository-relative path");
+        bail!("{section} ignored path {path:?} must be a normalized repository-relative path");
     }
     Ok(())
 }
@@ -313,6 +330,7 @@ mod tests {
         assert_eq!(parsed.scan.max_unit_source_bytes, 8 * 1024 * 1024);
         assert_eq!(parsed.scan.max_context_source_bytes, 64 * 1024 * 1024);
         assert_eq!(parsed.daemon.debounce_milliseconds, 200);
+        assert!(parsed.build.ignored_paths.is_empty());
         assert_eq!(parsed.strict.max_unresolved, 0);
         assert_eq!(parsed.profiles.rust_mode, "check");
         assert_eq!(parsed.profiles.go_call_graph, "rta-cha");
@@ -341,6 +359,30 @@ mod tests {
     }
 
     #[test]
+    fn build_ignored_paths_load_and_reject_unknown_keys() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join(CONFIG_FILE),
+            "schema_version = 1\n[build]\nignored_paths = ['.claude', '.next/cache']\n",
+        )?;
+        let loaded = Config::load(root.path())?;
+        assert_eq!(
+            loaded.build.ignored_paths,
+            vec![".claude".to_owned(), ".next/cache".to_owned()]
+        );
+        std::fs::write(
+            root.path().join(CONFIG_FILE),
+            "schema_version = 1\n[build]\nexcluded_paths = ['.claude']\n",
+        )?;
+        let error = format!("{:#}", Config::load(root.path()).unwrap_err());
+        assert!(
+            error.contains("unknown") || error.contains("excluded_paths"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn config_rejects_unknown_fields_and_invalid_worker_limits() -> Result<()> {
         let root = tempfile::tempdir()?;
         for raw in [
@@ -363,6 +405,9 @@ mod tests {
             "schema_version = 1\n[daemon]\ndebounce_milliseconds = 0\n",
             "schema_version = 1\n[daemon]\nignored_paths = ['../outside']\n",
             "schema_version = 1\n[daemon]\nignored_paths = ['vendor', 'vendor']\n",
+            "schema_version = 1\n[build]\nunknown = true\n",
+            "schema_version = 1\n[build]\nignored_paths = ['../outside']\n",
+            "schema_version = 1\n[build]\nignored_paths = ['vendor', 'vendor']\n",
             "schema_version = 1\n[profiles]\nrust_mode = 'release'\n",
             "schema_version = 1\n[profiles]\ngo_call_graph = 'pta'\n",
             "schema_version = 1\n[policy]\nschema_version = '2.0'\n",

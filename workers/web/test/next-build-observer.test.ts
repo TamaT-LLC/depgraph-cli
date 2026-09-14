@@ -420,7 +420,10 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   await assert.rejects(
     collectNextBuildObservation(escaped, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_artifact_path_unsafe",
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "not_contained"
+      && error.detail?.contained === undefined
+      && JSON.stringify(error).includes("/outside/page.js") === false,
   );
 
   const unsupported = buildContext({ nextVersion: "17.0.0" });
@@ -437,8 +440,24 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   await assert.rejects(
     collectNextBuildObservation(mismatchedAsset, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_artifact_path_unsafe",
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "hint_mismatch"
+      && JSON.stringify(error).includes("private\\secret.js") === false
+      && JSON.stringify(error).includes("C:") === false,
   );
+
+  const leakedHint = nextBuildFailureDiagnostic(
+    new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
+      reason: "hint_mismatch",
+      contained: "apps/site/.next/server/app/page.js",
+      hinted: "token=raw-secret",
+    }),
+    provenance.profile_id,
+  );
+  assert.equal(leakedHint.properties?.reason, "hint_mismatch");
+  assert.equal(leakedHint.properties?.contained, "apps/site/.next/server/app/page.js");
+  assert.equal(leakedHint.properties?.hinted, undefined);
+  assert.equal(JSON.stringify(leakedHint).includes("raw-secret"), false);
 
   const queryOnlyDestination = buildContext();
   queryOnlyDestination.routing.dynamicRoutes = [{
@@ -453,13 +472,13 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   );
 });
 
-test("assets hinted with a package-exports alias resolve to their real path within the same package", async () => {
-  const aliased = buildContext();
-  (aliased.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+test("package export aliases may differ from the contained file path inside the same module", async () => {
+  const context = buildContext();
+  (context.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
     "node_modules/next/setup-node-env.js":
       "/repo/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   };
-  const observed = await collectNextBuildObservation(aliased, () => digest("a"));
+  const observed = await collectNextBuildObservation(context, () => digest("c"));
   assert.equal(
     observed.outputs[0]?.assets[0]?.logical_path,
     "node_modules/next/dist/build/adapter/setup-node-env.external.js",
@@ -471,7 +490,7 @@ test("assets hinted with a package-exports alias resolve to their real path with
     "node_modules/@vercel/og/index.node.js":
       "/repo/node_modules/@vercel/og/dist/index.node.js",
   };
-  const scopedObserved = await collectNextBuildObservation(scoped, () => digest("a"));
+  const scopedObserved = await collectNextBuildObservation(scoped, () => digest("c"));
   assert.equal(
     scopedObserved.outputs[0]?.assets[0]?.logical_path,
     "node_modules/@vercel/og/dist/index.node.js",
@@ -485,7 +504,7 @@ test("assets hinted with a package-exports alias resolve to their real path with
     "node_modules/next/setup-node-env.js":
       "/repo/node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   };
-  const pnpmObserved = await collectNextBuildObservation(pnpmLayout, () => digest("a"));
+  const pnpmObserved = await collectNextBuildObservation(pnpmLayout, () => digest("c"));
   assert.equal(
     pnpmObserved.outputs[0]?.assets[0]?.logical_path,
     "node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
@@ -498,18 +517,18 @@ test("assets hinted with a package-exports alias resolve to their real path with
     "node_modules/app/node_modules/next/setup-node-env.js":
       "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   };
-  const nestedObserved = await collectNextBuildObservation(nestedInstall, () => digest("a"));
+  const nestedObserved = await collectNextBuildObservation(nestedInstall, () => digest("c"));
   assert.equal(
     nestedObserved.outputs[0]?.assets[0]?.logical_path,
     "node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   );
 
-  const crossPackage = buildContext();
-  (crossPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
-    "node_modules/next/setup-node-env.js": "/repo/node_modules/other/dist/impostor.js",
+  const crossedPackage = buildContext();
+  (crossedPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js": "/repo/node_modules/react/index.js",
   };
   await assert.rejects(
-    collectNextBuildObservation(crossPackage, () => digest("a")),
+    collectNextBuildObservation(crossedPackage, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );
@@ -522,7 +541,7 @@ test("assets hinted with a package-exports alias resolve to their real path with
       "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   };
   await assert.rejects(
-    collectNextBuildObservation(outerHintForNestedFile, () => digest("a")),
+    collectNextBuildObservation(outerHintForNestedFile, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );
@@ -535,7 +554,7 @@ test("assets hinted with a package-exports alias resolve to their real path with
       "/repo/node_modules/@vercel/analytics/dist/index.node.js",
   };
   await assert.rejects(
-    collectNextBuildObservation(scopedMismatch, () => digest("a")),
+    collectNextBuildObservation(scopedMismatch, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );
@@ -545,7 +564,7 @@ test("assets hinted with a package-exports alias resolve to their real path with
     "apps/site/aliased.js": "/repo/apps/site/.next/server/chunks/shared.js",
   };
   await assert.rejects(
-    collectNextBuildObservation(outsideNodeModules, () => digest("a")),
+    collectNextBuildObservation(outsideNodeModules, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );

@@ -7915,6 +7915,46 @@ async fn normal_worker_exit_reaps_pipe_holding_descendants() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_launch_failure_reports_launch_kind_and_stderr() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root)?;
+    let root = root.canonicalize()?;
+    let artifact = temp.path().join("depgraph-missing-worker");
+    std::fs::write(&artifact, "#!/bin/sh\n")?;
+    let mut permissions = std::fs::metadata(&artifact)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&artifact, permissions)?;
+    let spec = WorkerSpec {
+        adapter: AdapterKind::Go,
+        program: std::ffi::OsString::from("/this/path/does/not/exist/depgraph-worker"),
+        leading_args: Vec::new(),
+        display: "missing-go-worker".to_owned(),
+        artifact_path: artifact,
+        runtime_requirement: None,
+        expected_version: None,
+        release_attested: false,
+        attested_rust_sysroot: None,
+    };
+    let output = execute_worker(
+        spec,
+        root,
+        "launch-scan".to_owned(),
+        ScanConfig::default(),
+        ProfileConfig::default(),
+    )
+    .await;
+    assert_eq!(output.failure_kind, Some(WorkerFailureKind::Launch));
+    assert!(output.events.is_empty());
+    assert!(output.stderr.contains("failed to start missing-go-worker"));
+    assert_eq!(output.error.as_deref(), Some(output.stderr.as_str()));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn protocol_validation_does_not_starve_another_workers_pipe_reader() -> Result<()> {
     let (release, wait) = std::sync::mpsc::channel();

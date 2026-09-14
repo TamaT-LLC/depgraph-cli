@@ -241,12 +241,12 @@ export interface NextBuildGraphDelta {
 }
 
 export class NextBuildObserverError extends Error {
-  readonly code: string;
-
-  constructor(code: string) {
-    super(code);
+  constructor(
+    readonly code: string,
+    readonly detail?: Record<string, string>,
+  ) {
+    super(detail === undefined ? code : `${code}: ${JSON.stringify(detail)}`);
     this.name = "NextBuildObserverError";
-    this.code = code;
   }
 }
 
@@ -254,14 +254,14 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   const code = error instanceof NextBuildObserverError && /^web\.next_build_[a-z0-9_]+$/u.test(error.code)
     ? error.code
     : "web.next_build_observer_failed";
-  const properties: Record<string, JsonValue> = {
+  const properties: Record<string, JsonValue> = observerFailureDetail(error, {
     framework: "next",
     observer: NEXT_BUILD_OBSERVER,
     observer_version: NEXT_BUILD_OBSERVER_VERSION,
     capability: NEXT_BUILD_OBSERVER_CAPABILITY,
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
-  };
+  });
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
     severity: "error",
@@ -313,6 +313,78 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   const relative = path.relative(path.resolve(repoRoot), path.resolve(raw));
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   return canonicalRelativePath(relative);
+}
+
+function nodeModulePackageName(relative: string): string | null {
+  return [...relative.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/.][^/]*)(?=\/|$)/g)].at(-1)?.[1]
+    ?? null;
+}
+
+function sameNodeModulePackage(left: string, right: string): boolean {
+  const leftPackage = nodeModulePackageName(left);
+  const rightPackage = nodeModulePackageName(right);
+  return leftPackage !== null && leftPackage === rightPackage;
+}
+
+function secretShapedObserverValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  return [
+    "-----begin ",
+    "authorization:",
+    "bearer ",
+    "password=",
+    "passwd=",
+    "client_secret=",
+    "private_key=",
+    "secret_key=",
+    "api_key=",
+    "access_token=",
+    "token=",
+  ].some((marker) => lower.includes(marker));
+}
+
+function observerRouteDetail(value: unknown): string | undefined {
+  const raw = boundedString(value);
+  return raw === null || raw.includes("\\") ? undefined : raw;
+}
+
+function omitSecretShapedDetails(detail: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(detail).filter((entry) => !secretShapedObserverValue(entry[1])));
+}
+
+function observerFailureDetail(
+  error: unknown,
+  properties: Record<string, JsonValue>,
+): Record<string, JsonValue> {
+  const detail = error instanceof NextBuildObserverError ? error.detail : undefined;
+  return Object.assign(properties, omitSecretShapedDetails(detail ?? {}));
+}
+
+function failWithDetail(code: string, detail: Record<string, string>): never {
+  throw new NextBuildObserverError(code, detail);
+}
+
+function unsafeArtifactReason(
+  logicalHint: unknown,
+  contained: string | null,
+  hintMatchesPath: boolean,
+): string {
+  if (logicalHint === undefined || contained === null || hintMatchesPath) return "not_contained";
+  return "hint_mismatch";
+}
+
+function unsafeArtifactDetail(
+  logicalHint: unknown,
+  contained: string | null,
+  hinted: string | null,
+  hintMatchesPath: boolean,
+): Record<string, string> {
+  const detail: Record<string, string> = {
+    reason: unsafeArtifactReason(logicalHint, contained, hintMatchesPath),
+  };
+  if (contained !== null) detail.contained = contained;
+  if (hinted !== null) detail.hinted = hinted;
+  return detail;
 }
 
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
@@ -547,7 +619,12 @@ function sanitizeRouting(
       const rawDestination = routingDestinationPathname(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
-        fail("web.next_build_manifest_invalid");
+        const detail: Record<string, string> = { phase };
+        const source = observerRouteDetail(route.source);
+        const destination = observerRouteDetail(route.destination);
+        if (source !== undefined) detail.source = source;
+        if (destination !== undefined) detail.destination = destination;
+        failWithDetail("web.next_build_manifest_invalid", detail);
       }
       const source = rawSource === null ? null : replaceBuildId(rawSource, buildId);
       const destination = rawDestination === null ? null : replaceBuildId(rawDestination, buildId);
@@ -619,12 +696,6 @@ function stableOutputIdentity(output: NextObservedOutput): string {
   });
 }
 
-const LAST_NODE_MODULES_PACKAGE = /^(?:.*\/)?node_modules\/(@[^/]+\/[^/.][^/]*|[^/@.][^/]*)\//u;
-
-function nodeModulesPackageName(logicalPath: string): string | null {
-  return LAST_NODE_MODULES_PACKAGE.exec(logicalPath)?.[1] ?? null;
-}
-
 async function digestArtifact(
   repoRoot: string,
   absolutePath: unknown,
@@ -633,22 +704,15 @@ async function digestArtifact(
 ): Promise<{ logicalPath: string; digest: string }> {
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
-  if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)) {
-    fail("web.next_build_artifact_path_unsafe");
-  }
-  if (logicalHint !== undefined) {
-    const hinted = canonicalRelativePath(logicalHint);
-    // Next.js 16.2 hints assets with their package-exports alias (e.g.
-    // `node_modules/next/setup-node-env.js`) while the artifact lives at the
-    // resolved file (`node_modules/next/dist/build/adapter/...`). Accept an
-    // alias that stays within the same node_modules package; anything else
-    // remains a contract violation.
-    const hintedPackage = hinted === null ? null : nodeModulesPackageName(hinted);
-    const samePackageAlias = hintedPackage !== null
-      && hintedPackage === nodeModulesPackageName(contained);
-    if (hinted !== contained && !samePackageAlias) {
-      fail("web.next_build_artifact_path_unsafe");
-    }
+  const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
+  const hintMatchesPath = hinted === contained
+    || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
+  if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
+    || (logicalHint !== undefined && !hintMatchesPath)) {
+    failWithDetail(
+      "web.next_build_artifact_path_unsafe",
+      unsafeArtifactDetail(logicalHint, contained, hinted, hintMatchesPath),
+    );
   }
   const logicalPath = contained;
   let digest: string;
