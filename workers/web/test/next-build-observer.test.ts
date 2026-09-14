@@ -412,6 +412,16 @@ test("dynamicRoutes destinations keep the pathname when Next includes a named ca
   assert.deepEqual(destinations, ["/blogs/[id]", "/blogs/[id]$rscSuffix"]);
   assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
   assert.equal(JSON.stringify(observed).includes("?"), false);
+  const dynamicEntries = observed.routing.filter((entry) => entry.phase === "dynamicRoutes");
+  const rsc = dynamicEntries.find((entry) => entry.variant === "rsc");
+  assert.equal(rsc?.canonical_route_pattern, "/blogs/[id]");
+  const route = dynamicEntries.find((entry) => entry.variant === "route");
+  assert.equal(route?.destination_present, true);
+  assert.equal(route?.canonical_route_pattern, "/blogs/[id]");
+  const graph = buildNextObservedGraph({ observation: observed, provenance, baseNodes: [] });
+  assert.ok(graph.nodes.some((node) => (
+    node.kind === "route" && node.properties.route_pattern === "/blogs/[id]"
+  )));
 });
 
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {

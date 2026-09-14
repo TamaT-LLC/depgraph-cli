@@ -926,32 +926,65 @@ The explicit-consent guard is enforced before path, configuration, store, or too
   "depgraph": {
     "build": {
       "adapter": "next",
-      "entrypoint": "depgraph-build.mjs",
-      "version": "16.2.10",
+      "entrypoint": "scripts/depgraph-build.mjs",
+      "version": "16.2.3",
       "timeout_seconds": 900
     }
   }
 }
 ```
 
-The allowed Web adapter values are `next`, `astro`, `tanstack-router`, and
-`tanstack-start`. Every field is JSON-typed: `version` must be a string
-(for example `"16.2.3"`), not the number `1`. `timeout_seconds` is optional
-and defaults to 900.
+Every `depgraph.build` field is validated strictly, and unknown fields are
+rejected so misspelled configuration cannot be silently ignored:
 
-depgraph launches the entrypoint as `node <entrypoint>` with **no extra
-arguments** inside a temporary staged copy of the repository. It does not
-resolve npm/pnpm/yarn scripts. Pointing `entrypoint` at `next.config.ts` or
-`node_modules/next/dist/bin/next` does not work; the file must spawn the real
-framework build and inherit its exit code without modifying project source.
-The child receives `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next)
-plus `DEPGRAPH_OUTPUT_DIR`. Next.js 16.2+ loads the observer from
-`NEXT_ADAPTER_PATH` automatically, so the entrypoint must spawn `next build`
-and must not call `modifyConfig` / `onBuildComplete` itself. A copyable
-Next.js script is
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `adapter` | string | One of `next`, `astro`, `tanstack-router`, `tanstack-start`; selects the release-pinned observer contract. |
+| `entrypoint` | string | Repository-relative path to a Node script launched as `node <entrypoint>` with no arguments. Absolute paths and `..` segments are rejected, and the file must exist. |
+| `version` | string | Non-empty target framework version (for example `"16.2.3"`). It must be a JSON string; a bare number is rejected. Astro and TanStack adapters receive it as `DEPGRAPH_ASTRO_VERSION`, `DEPGRAPH_TANSTACK_ROUTER_VERSION`, or `DEPGRAPH_TANSTACK_START_VERSION`. |
+| `timeout_seconds` | integer, optional | Whole-build timeout in seconds; the accepted range is 1–3600 and the default is `900`. |
+
+The entrypoint launch convention is:
+
+- The build runs inside a temporary staged copy of the repository with the
+  staged workspace root as the working directory; the entrypoint must leave
+  the sources unchanged (mutations fail the run's source audit).
+- `node <entrypoint>` receives no CLI arguments. Configuration arrives through
+  environment variables: `DEPGRAPH_OBSERVER` names the release-provided
+  observer module (Next also receives it as `NEXT_ADAPTER_PATH`), and the
+  observer writes its observation artifact into `DEPGRAPH_OUTPUT_DIR`.
+- The script is expected to start the real framework build (for example spawn
+  `next build`) and exit with the build's exit code. Pointing `entrypoint` at
+  `next.config.ts` or at the framework binary itself does not work because
+  nothing would integrate the observer into the build lifecycle.
+
+A minimal Next.js entrypoint:
+
+```js
+// scripts/depgraph-build.mjs
+import { spawnSync } from "node:child_process";
+
+const result = spawnSync(
+  process.execPath,
+  ["node_modules/next/dist/bin/next", "build"],
+  { stdio: "inherit" },
+);
+process.exit(result.status ?? 1);
+```
+
+This example is complete for Next.js: the entrypoint never imports the
+observer itself and must not call `modifyConfig` / `onBuildComplete` itself.
+Next.js 16.2+ reads `NEXT_ADAPTER_PATH` during `next build` and
+invokes the release-provided adapter's build hooks (`modifyConfig`,
+`onBuildComplete`), which write the observation artifact into
+`DEPGRAPH_OUTPUT_DIR`. That automatic integration is exactly why the
+entrypoint must launch the real `next build` process.
+
+A copyable Next.js script also ships as
 [`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
-Missing `depgraph.build` (including `{"depgraph":{}}` with no `build` object)
-fails with that template and `depgraph resolve --help`.
+A missing `depgraph.build` plan (including `{"depgraph":{}}` with no `build`
+object) fails with a copyable template and a pointer to
+`depgraph resolve --help`.
 
 The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
