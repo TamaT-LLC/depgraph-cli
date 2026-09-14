@@ -51,6 +51,34 @@ use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
 use snapshot_diff::render_service_human_diff;
 
+const RESOLVE_LONG_HELP: &str = "\
+Observe a project build only after explicit project-code consent.
+
+Web projects declare a versioned `depgraph.build` execution plan in \
+package.json. The plan is a JSON object (not a shell command) with:
+
+  adapter          one of next, astro, tanstack-router, tanstack-start
+  entrypoint       repository-relative path to a regular file
+  version          framework version string (JSON string, not a number)
+  timeout_seconds  optional integer; default 900
+
+depgraph launches the entrypoint as `node <entrypoint>` with no extra \
+arguments, in a temporary staged workspace. It does not run npm/pnpm/yarn \
+scripts. The process receives DEPGRAPH_OBSERVER (and NEXT_ADAPTER_PATH for \
+Next) plus DEPGRAPH_OUTPUT_DIR. The entrypoint must spawn the real framework \
+build and inherit its exit code without modifying project source.
+
+Example package.json fragment:
+
+  \"depgraph\": { \"build\": { \"adapter\": \"next\", \
+\"entrypoint\": \"scripts/depgraph-build.mjs\", \"version\": \"16.2.3\", \
+\"timeout_seconds\": 900 } }
+
+A Next.js entrypoint example lives at docs/examples/next-depgraph-build.mjs. \
+Missing plans fail with a copyable template. Full contract: README.en.md \
+build-mode consent boundary.
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "depgraph",
@@ -169,6 +197,7 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Observe a project build only after explicit project-code consent.
+    #[command(long_about = RESOLVE_LONG_HELP)]
     Resolve {
         /// Select build observation mode. No other resolve mode is available yet.
         #[arg(long, required = true)]
@@ -189,6 +218,9 @@ enum Commands {
             requires = "rust_compiler_precise"
         )]
         compiler_pack_requirement: Option<PathBuf>,
+        /// Emit a versioned JSON envelope instead of human-readable status lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Report worker, toolchain, coverage, and protocol health.
     Doctor {
@@ -1406,6 +1438,7 @@ async fn run(cli: Cli) -> Result<u8> {
             allow_project_code,
             rust_compiler_precise,
             compiler_pack_requirement,
+            json,
         } => {
             debug_assert!(build, "clap requires --build");
             if rust_compiler_precise {
@@ -1431,53 +1464,82 @@ async fn run(cli: Cli) -> Result<u8> {
                 .resolve_build_cancellable(&request, &cancellation)
                 .await?;
             let outcome = result.execution();
-            if let Some(ledger) = outcome.rust_compiler_invocation_ledger.as_ref() {
-                println!("Rust compiler invocations: {}", ledger.entries.len());
-                println!("Rust compiler invocation ledger digest: {}", ledger.digest);
-            }
-            if let Some(ledger) = outcome.rust_compiler_mir_ledger.as_ref() {
-                let body_count = ledger
-                    .entries
-                    .iter()
-                    .map(|entry| entry.bodies.len())
-                    .sum::<usize>();
-                println!("Rust typed MIR bodies: {body_count}");
-                println!("Rust typed MIR ledger digest: {}", ledger.digest);
-            }
-            if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
-                println!("Cargo units: {}", unit_graph.units.len());
-                println!("Cargo unit graph digest: {}", unit_graph.digest);
-            }
-            println!("build run: {}", outcome.audit.run_id);
-            println!("status: {:?}", outcome.audit.outcome);
-            println!("project code executed: {}", outcome.project_code_executed);
-            println!("build evidence: {}", result.evidence_status());
-            println!(
-                "build cache lookup: {} ({})",
-                result.cache_lookup_status(),
-                result.cache_lookup_reason()
-            );
-            println!("build cache: {}", result.build_cache_status());
-            println!("network isolation: {:?}", outcome.audit.network_isolation);
-            println!("execution isolation: {:?}", outcome.audit.isolation);
-            println!(
-                "source non-mutation guaranteed: {}",
-                outcome.audit.source_mutation.non_mutation_guaranteed
-            );
-            if let Some(diagnostic) = &outcome.audit.diagnostic_code {
-                println!("diagnostic: {diagnostic}");
-            }
-            if let Some(failure) = &outcome.audit.compiler_failure {
-                println!("compiler Cargo unit: {}", failure.unit_id);
+            if json {
                 println!(
-                    "compiler Cargo unit context: kind={}, mode={}, platform={}",
-                    failure.unit_kind, failure.mode, failure.cargo_platform
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": "1.0",
+                        "command": "resolve",
+                        "data": {
+                            "build_run": outcome.audit.run_id,
+                            "status": outcome.audit.outcome,
+                            "diagnostic": outcome.audit.diagnostic_code,
+                            "exit_code": outcome.audit.exit_code,
+                            "log_path": outcome.child_stderr_log_path.as_ref().map(|path| path.display().to_string()),
+                            "stderr_truncated": outcome.audit.stderr_truncated,
+                            "stderr_tail": outcome.child_stderr_tail,
+                            "project_code_executed": outcome.project_code_executed,
+                            "build_evidence": result.evidence_status(),
+                            "store": store_path.display().to_string(),
+                        }
+                    }))?
                 );
+            } else {
+                if let Some(ledger) = outcome.rust_compiler_invocation_ledger.as_ref() {
+                    println!("Rust compiler invocations: {}", ledger.entries.len());
+                    println!("Rust compiler invocation ledger digest: {}", ledger.digest);
+                }
+                if let Some(ledger) = outcome.rust_compiler_mir_ledger.as_ref() {
+                    let body_count = ledger
+                        .entries
+                        .iter()
+                        .map(|entry| entry.bodies.len())
+                        .sum::<usize>();
+                    println!("Rust typed MIR bodies: {body_count}");
+                    println!("Rust typed MIR ledger digest: {}", ledger.digest);
+                }
+                if let Some(unit_graph) = outcome.rust_cargo_unit_graph.as_ref() {
+                    println!("Cargo units: {}", unit_graph.units.len());
+                    println!("Cargo unit graph digest: {}", unit_graph.digest);
+                }
+                println!("build run: {}", outcome.audit.run_id);
+                println!("status: {:?}", outcome.audit.outcome);
+                println!("project code executed: {}", outcome.project_code_executed);
+                println!("build evidence: {}", result.evidence_status());
+                println!(
+                    "build cache lookup: {} ({})",
+                    result.cache_lookup_status(),
+                    result.cache_lookup_reason()
+                );
+                println!("build cache: {}", result.build_cache_status());
+                println!("network isolation: {:?}", outcome.audit.network_isolation);
+                println!("execution isolation: {:?}", outcome.audit.isolation);
+                println!(
+                    "source non-mutation guaranteed: {}",
+                    outcome.audit.source_mutation.non_mutation_guaranteed
+                );
+                if let Some(diagnostic) = &outcome.audit.diagnostic_code {
+                    println!("diagnostic: {diagnostic}");
+                }
+                if let Some(failure) = &outcome.audit.compiler_failure {
+                    println!("compiler Cargo unit: {}", failure.unit_id);
+                    println!(
+                        "compiler Cargo unit context: kind={}, mode={}, platform={}",
+                        failure.unit_kind, failure.mode, failure.cargo_platform
+                    );
+                }
+                if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
+                    eprintln!("warning: {diagnostic}");
+                }
+                if let Some(path) = &outcome.child_stderr_log_path {
+                    println!("stderr log: {}", path.display());
+                }
+                if let Some(tail) = &outcome.child_stderr_tail {
+                    eprintln!("--- build stderr (redacted tail) ---");
+                    eprintln!("{tail}");
+                }
+                println!("store: {}", store_path.display());
             }
-            if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
-                eprintln!("warning: {diagnostic}");
-            }
-            println!("store: {}", store_path.display());
             Ok(match outcome.audit.outcome {
                 BuildOutcomeKind::Completed => 0,
                 BuildOutcomeKind::SecurityFailed => 4,

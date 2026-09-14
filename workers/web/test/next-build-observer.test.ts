@@ -390,13 +390,40 @@ test("prerenders without a fallback artifact use deterministic synthetic metadat
   assert.equal(JSON.stringify(observed).includes("private-prerender-output-id"), false);
 });
 
+test("dynamicRoutes destinations keep the pathname when Next includes a named capture query", async () => {
+  const context = buildContext();
+  context.routing.dynamicRoutes = [
+    {
+      source: "/blogs/[id]",
+      sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+      destination: "/blogs/[id]?nxtPid=$nxtPid",
+    },
+    {
+      source: "/blogs/[id].rsc",
+      sourceRegex: "^/blogs/([^/]+?)\\.rsc(?:/)?$",
+      destination: "/blogs/[id]$rscSuffix?nxtPid=$nxtPid",
+    },
+  ];
+  const observed = await collectNextBuildObservation(context, () => digest("a"));
+  const destinations = observed.routing
+    .filter((entry) => entry.phase === "dynamicRoutes")
+    .map((entry) => entry.destination)
+    .sort();
+  assert.deepEqual(destinations, ["/blogs/[id]", "/blogs/[id]$rscSuffix"]);
+  assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
+  assert.equal(JSON.stringify(observed).includes("?"), false);
+});
+
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {
   const escaped = buildContext();
   (escaped.outputs.appPages as Array<Record<string, unknown>>)[0]!.filePath = "/outside/page.js";
   await assert.rejects(
     collectNextBuildObservation(escaped, () => digest("a")),
     (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_artifact_path_unsafe",
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "not_contained"
+      && error.detail?.contained === undefined
+      && JSON.stringify(error).includes("/outside/page.js") === false,
   );
 
   const unsupported = buildContext({ nextVersion: "17.0.0" });
@@ -412,6 +439,68 @@ test("unsafe artifact paths and unsupported output contracts fail without a part
   };
   await assert.rejects(
     collectNextBuildObservation(mismatchedAsset, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "hint_mismatch"
+      && JSON.stringify(error).includes("private\\secret.js") === false
+      && JSON.stringify(error).includes("C:") === false,
+  );
+
+  const leakedHint = nextBuildFailureDiagnostic(
+    new NextBuildObserverError("web.next_build_artifact_path_unsafe", {
+      reason: "hint_mismatch",
+      contained: "apps/site/.next/server/app/page.js",
+      hinted: "token=raw-secret",
+    }),
+    provenance.profile_id,
+  );
+  assert.equal(leakedHint.properties?.reason, "hint_mismatch");
+  assert.equal(leakedHint.properties?.contained, "apps/site/.next/server/app/page.js");
+  assert.equal(leakedHint.properties?.hinted, undefined);
+  assert.equal(JSON.stringify(leakedHint).includes("raw-secret"), false);
+
+  const queryOnlyDestination = buildContext();
+  queryOnlyDestination.routing.dynamicRoutes = [{
+    source: "/blogs/[id]",
+    sourceRegex: "^/blogs/([^/]+?)(?:/)?$",
+    destination: "?nxtPid=$nxtPid",
+  }];
+  await assert.rejects(
+    collectNextBuildObservation(queryOnlyDestination, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_invalid",
+  );
+});
+
+test("package export aliases may differ from the contained file path inside the same module", async () => {
+  const context = buildContext();
+  (context.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const observed = await collectNextBuildObservation(context, () => digest("c"));
+  assert.equal(
+    observed.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
+  const pnpmLayout = buildContext();
+  (pnpmLayout.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js":
+      "/repo/node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const pnpmObserved = await collectNextBuildObservation(pnpmLayout, () => digest("c"));
+  assert.equal(
+    pnpmObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
+  const crossedPackage = buildContext();
+  (crossedPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js": "/repo/node_modules/react/index.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(crossedPackage, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );

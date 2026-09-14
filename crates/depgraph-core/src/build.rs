@@ -157,7 +157,7 @@ struct WebBuildPackageConfig {
 
 #[derive(Debug, Deserialize)]
 struct WebDepgraphConfig {
-    build: WebBuildConfig,
+    build: Option<WebBuildConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +188,8 @@ pub struct BuildExecutionPlan {
     pub compiler_unit_graph: Option<RustCargoUnitGraph>,
     pub expected_source_root_digest: Option<String>,
 }
+
+const MISSING_WEB_BUILD_PLAN: &str = "package.json has no versioned depgraph.build execution plan; add a string-valued object such as {\"depgraph\":{\"build\":{\"adapter\":\"next\",\"entrypoint\":\"scripts/depgraph-build.mjs\",\"version\":\"16.2.3\",\"timeout_seconds\":900}}} and see `depgraph resolve --help`";
 
 #[derive(Debug, Clone)]
 pub struct BuildExecutionRequest {
@@ -237,8 +239,8 @@ pub fn create_build_execution_request(source_root: &Path) -> Result<BuildExecuti
             .context("package.json has an invalid depgraph build configuration")?;
         let config = package
             .depgraph
-            .context("package.json has no versioned depgraph.build execution plan")?
-            .build;
+            .and_then(|config| config.build)
+            .context(MISSING_WEB_BUILD_PLAN)?;
         validate_logical_path(&config.entrypoint, false)?;
         if !source_root.join(&config.entrypoint).is_file() {
             bail!(
@@ -920,6 +922,10 @@ pub struct BuildExecutionOutcome {
     pub rust_observation: Option<RustBuildObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_observation: Option<WebBuildObservation>,
+    #[serde(skip)]
+    pub child_stderr_tail: Option<String>,
+    #[serde(skip)]
+    pub child_stderr_log_path: Option<PathBuf>,
 }
 
 pub async fn supervise_build(
@@ -1225,7 +1231,7 @@ where
     let mut reader_errors = Vec::new();
     let (stdout, stdout_truncated) =
         finish_reader(stdout_task, "build stdout", &mut reader_errors).await?;
-    let (_stderr, stderr_truncated) =
+    let (stderr, stderr_truncated) =
         finish_reader(stderr_task, "build stderr", &mut reader_errors).await?;
     let output_limit_exceeded = stdout_truncated || stderr_truncated;
     let mut outcome = outcome;
@@ -1402,9 +1408,16 @@ where
         web_observation = None;
     }
     let finished_wall = Utc::now();
+    let run_id = Uuid::new_v4().to_string();
+    let redacted_stderr = redact_build_log(&stderr);
+    let (child_stderr_tail, child_stderr_log_path) = persist_child_stderr_log(
+        &run_id,
+        &redacted_stderr,
+        !matches!(outcome, BuildOutcomeKind::Completed),
+    );
     let audit = BuildAudit {
         schema_version: BUILD_SUPERVISOR_VERSION.to_owned(),
-        run_id: Uuid::new_v4().to_string(),
+        run_id,
         adapter: plan.adapter.clone(),
         adapter_version: plan.adapter_version.clone(),
         profile_id: plan.profile_id.clone(),
@@ -1447,6 +1460,8 @@ where
         rust_compiler_mir_ledger,
         rust_observation,
         web_observation,
+        child_stderr_tail,
+        child_stderr_log_path,
     })
 }
 
@@ -2206,6 +2221,69 @@ fn audit_environment_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<S
     (visible.into_iter().collect(), redacted)
 }
 
+const CHILD_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+fn redact_build_log(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| {
+            if secret_shaped_build_line(line) {
+                "[REDACTED]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn secret_shaped_build_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "-----begin ",
+        "authorization:",
+        "bearer ",
+        "password=",
+        "passwd=",
+        "client_secret=",
+        "private_key=",
+        "secret_key=",
+        "api_key=",
+        "access_token=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || is_secret_key(line)
+}
+
+fn persist_child_stderr_log(
+    run_id: &str,
+    redacted: &str,
+    persist: bool,
+) -> (Option<String>, Option<PathBuf>) {
+    if !persist || redacted.trim().is_empty() {
+        return (None, None);
+    }
+    let tail = tail_from_end(redacted, CHILD_STDERR_TAIL_BYTES);
+    let path = std::env::temp_dir().join(format!("depgraph-build-{run_id}.stderr.log"));
+    let log_path = fs::write(&path, redacted).ok().map(|_| path);
+    (Some(tail), log_path)
+}
+
+fn tail_from_end(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let start = value.len() - max_bytes;
+    let start = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= start)
+        .unwrap_or(value.len());
+    value[start..].to_owned()
+}
+
 fn redact_arguments(arguments: &[String]) -> Vec<String> {
     let mut redacted = Vec::with_capacity(arguments.len());
     let mut redact_next = false;
@@ -2258,48 +2336,30 @@ async fn probe_build_tool_version(program: &Path, root: &Path) -> Result<String>
 }
 
 fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
+    let policy = load_stage_policy(source)?;
     let mut files = 0_usize;
     let mut bytes = 0_u64;
-    for entry in WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(admit_stage_entry)
-    {
-        let entry = entry?;
-        let relative = entry.path().strip_prefix(source)?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
+    for_each_staged_path(source, &policy, |relative, kind| {
         let target = destination.join(relative);
-        if metadata.is_dir() {
-            fs::create_dir_all(&target)?;
-            continue;
+        match kind {
+            StagedPathKind::Directory => {
+                fs::create_dir_all(&target)?;
+            }
+            StagedPathKind::File { from, metadata } => {
+                files += 1;
+                bytes = bytes.saturating_add(metadata.len());
+                if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                    bail!("security policy violation: staged workspace exceeds file or byte limit");
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(from, &target)?;
+                fs::set_permissions(&target, metadata.permissions())?;
+            }
         }
-        if !metadata.is_file() {
-            bail!(
-                "security policy violation: staged workspace contains non-regular file {}",
-                display_logical(relative)
-            );
-        }
-        files += 1;
-        bytes = bytes.saturating_add(metadata.len());
-        if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
-            bail!("security policy violation: staged workspace exceeds file or byte limit");
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(entry.path(), &target)?;
-        fs::set_permissions(&target, metadata.permissions())?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn stage_cargo_dependency_cache(source: &Path, destination: &Path) -> Result<()> {
@@ -2622,15 +2682,267 @@ fn validate_cargo_cache_metadata(path: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
-fn admit_stage_entry(entry: &DirEntry) -> bool {
+struct StagePolicy {
+    ignored_paths: Vec<String>,
+}
+
+enum StagedPathKind {
+    Directory,
+    File {
+        from: PathBuf,
+        metadata: fs::Metadata,
+    },
+}
+
+fn load_stage_policy(source: &Path) -> Result<StagePolicy> {
+    let config = crate::config::Config::load(source)?;
+    Ok(StagePolicy {
+        ignored_paths: config.build.ignored_paths,
+    })
+}
+
+fn path_is_ignored(relative: &Path, ignored: &[String]) -> bool {
+    let logical = display_logical(relative);
+    ignored
+        .iter()
+        .any(|prefix| logical == *prefix || logical.starts_with(&format!("{prefix}/")))
+}
+
+fn default_skip_directory(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
-        return true;
+        return false;
     }
     let name = entry.file_name().to_string_lossy();
     if matches!(name.as_ref(), ".git" | ".depgraph") {
+        return true;
+    }
+    entry.depth() == 1 && matches!(name.as_ref(), "target" | ".next")
+}
+
+fn skipped_stage_target(canonical_root: &Path, target: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(canonical_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
         return false;
     }
-    entry.depth() != 1 || !matches!(name.as_ref(), "target" | ".next")
+    for (depth, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return true;
+        };
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        if matches!(name, ".git" | ".depgraph") {
+            return true;
+        }
+        if depth == 0 && matches!(name, "target" | ".next") {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_staged_path(
+    collected: &mut Vec<(PathBuf, StagedPathKind)>,
+    logical: PathBuf,
+    kind: StagedPathKind,
+) -> Result<()> {
+    if collected.len() >= MAX_STAGED_FILES {
+        bail!("security policy violation: staged workspace exceeds file or byte limit");
+    }
+    collected.push((logical, kind));
+    Ok(())
+}
+
+fn symlink_target_for_stage(
+    logical: &Path,
+    link_path: &Path,
+    canonical_root: &Path,
+    walk_stack: &BTreeSet<PathBuf>,
+) -> Result<Option<(PathBuf, fs::Metadata)>> {
+    let target = fs::canonicalize(link_path).map_err(|_| symlink_policy_violation(logical))?;
+    if !target.starts_with(canonical_root) {
+        return Err(symlink_policy_violation(logical));
+    }
+    if skipped_stage_target(canonical_root, &target) || walk_stack.contains(&target) {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&target).map_err(|_| symlink_policy_violation(logical))?;
+    Ok(Some((target, metadata)))
+}
+
+fn symlink_policy_violation(relative: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "security policy violation: staged workspace contains symlink {} that is not a regular in-repository target; set [build] ignored_paths in .depgraph.toml to exclude it, or keep the link target inside the repository",
+        display_logical(relative)
+    )
+}
+
+struct StageWalk<'a> {
+    source: &'a Path,
+    canonical_root: &'a Path,
+    policy: &'a StagePolicy,
+    collected: &'a mut Vec<(PathBuf, StagedPathKind)>,
+    seen_logical: &'a mut BTreeSet<PathBuf>,
+    walk_stack: &'a mut BTreeSet<PathBuf>,
+}
+
+fn collect_staged_paths(
+    source: &Path,
+    policy: &StagePolicy,
+) -> Result<Vec<(PathBuf, StagedPathKind)>> {
+    let canonical_root = source
+        .canonicalize()
+        .context("build source root is unavailable")?;
+    let mut collected = Vec::new();
+    let mut seen_logical = BTreeSet::new();
+    let mut walk_stack = BTreeSet::new();
+    let mut walk = StageWalk {
+        source,
+        canonical_root: &canonical_root,
+        policy,
+        collected: &mut collected,
+        seen_logical: &mut seen_logical,
+        walk_stack: &mut walk_stack,
+    };
+    walk_stage_tree(&mut walk, source, Path::new(""))?;
+    collected.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(collected)
+}
+
+fn walk_stage_tree(walk: &mut StageWalk<'_>, walk_root: &Path, logical_root: &Path) -> Result<()> {
+    let canonical_walk = fs::canonicalize(walk_root).context("build source root is unavailable")?;
+    if !walk.walk_stack.insert(canonical_walk.clone()) {
+        return Ok(());
+    }
+    let walked = walk_stage_tree_body(walk, walk_root, logical_root);
+    walk.walk_stack.remove(&canonical_walk);
+    walked
+}
+
+fn walk_stage_tree_body(
+    walk: &mut StageWalk<'_>,
+    walk_root: &Path,
+    logical_root: &Path,
+) -> Result<()> {
+    let source = walk.source;
+    let ignored_paths = walk.policy.ignored_paths.clone();
+    for entry in WalkDir::new(walk_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if default_skip_directory(entry) {
+                return false;
+            }
+            logical_path_for_walk(source, walk_root, logical_root, entry.path()).is_some_and(
+                |logical| {
+                    logical.as_os_str().is_empty() || !path_is_ignored(&logical, &ignored_paths)
+                },
+            )
+        })
+    {
+        let entry = entry?;
+        let relative_from_walk = entry.path().strip_prefix(walk_root)?;
+        let logical = if logical_root.as_os_str().is_empty() {
+            relative_from_walk.to_path_buf()
+        } else if relative_from_walk.as_os_str().is_empty() {
+            logical_root.to_path_buf()
+        } else {
+            logical_root.join(relative_from_walk)
+        };
+        if logical.as_os_str().is_empty() {
+            continue;
+        }
+        if path_is_ignored(&logical, &ignored_paths) {
+            continue;
+        }
+        if !walk.seen_logical.insert(logical.clone()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            stage_symlink_entry(walk, &logical, entry.path())?;
+            continue;
+        }
+        if metadata.is_dir() {
+            push_staged_path(walk.collected, logical, StagedPathKind::Directory)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!(
+                "security policy violation: staged workspace contains non-regular file {}",
+                display_logical(&logical)
+            );
+        }
+        push_staged_path(
+            walk.collected,
+            logical,
+            StagedPathKind::File {
+                from: entry.path().to_path_buf(),
+                metadata,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn stage_symlink_entry(walk: &mut StageWalk<'_>, logical: &Path, link_path: &Path) -> Result<()> {
+    let Some((target, target_meta)) =
+        symlink_target_for_stage(logical, link_path, walk.canonical_root, walk.walk_stack)?
+    else {
+        return Ok(());
+    };
+    if target_meta.is_dir() {
+        push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::Directory,
+        )?;
+        return walk_stage_tree(walk, &target, logical);
+    }
+    if target_meta.is_file() {
+        return push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::File {
+                from: target,
+                metadata: target_meta,
+            },
+        );
+    }
+    bail!(
+        "security policy violation: staged workspace contains non-regular file {}",
+        display_logical(logical)
+    )
+}
+
+fn logical_path_for_walk(
+    source: &Path,
+    walk_root: &Path,
+    logical_root: &Path,
+    path: &Path,
+) -> Option<PathBuf> {
+    let relative_from_walk = path.strip_prefix(walk_root).ok()?;
+    if logical_root.as_os_str().is_empty() {
+        Some(relative_from_walk.to_path_buf())
+    } else if relative_from_walk.as_os_str().is_empty() {
+        Some(logical_root.to_path_buf())
+    } else {
+        Some(logical_root.join(relative_from_walk))
+    }
+    .or_else(|| path.strip_prefix(source).ok().map(Path::to_path_buf))
+}
+
+fn for_each_staged_path(
+    source: &Path,
+    policy: &StagePolicy,
+    mut visit: impl FnMut(&Path, &StagedPathKind) -> Result<()>,
+) -> Result<()> {
+    for (relative, kind) in collect_staged_paths(source, policy)? {
+        visit(&relative, &kind)?;
+    }
+    Ok(())
 }
 
 fn digest_output_tree(output: &Path, stdout: &[u8]) -> Result<String> {
@@ -2690,66 +3002,48 @@ fn digest_workspace(root: &Path) -> Result<String> {
 }
 
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
+    let policy = load_stage_policy(root)?;
     let mut source = Sha256::new();
     source.update(b"depgraph-build-source-v1\0");
     let mut controls = Sha256::new();
     controls.update(b"depgraph-build-manifest-lock-config-v1\0");
     let mut staging_metadata = Sha256::new();
     staging_metadata.update(b"depgraph-build-staging-metadata-v1\0");
-    let mut entries = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(admit_stage_entry)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path().to_path_buf());
     let mut files = 0_usize;
     let mut bytes = 0_u64;
-    for entry in entries {
-        let relative = entry.path().strip_prefix(root)?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "security policy violation: staged workspace contains symlink {}",
-                display_logical(relative)
-            );
-        }
+    for_each_staged_path(root, &policy, |relative, kind| {
         let logical = display_logical(relative);
-        if metadata.is_dir() {
-            staging_metadata.update(b"directory\0");
-            staging_metadata.update(logical.as_bytes());
-            staging_metadata.update([0]);
-            continue;
+        match kind {
+            StagedPathKind::Directory => {
+                staging_metadata.update(b"directory\0");
+                staging_metadata.update(logical.as_bytes());
+                staging_metadata.update([0]);
+            }
+            StagedPathKind::File { from, metadata } => {
+                files += 1;
+                bytes = bytes.saturating_add(metadata.len());
+                if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
+                    bail!("security policy violation: staged workspace exceeds file or byte limit");
+                }
+                let contents = fs::read(from)?;
+                staging_metadata.update(b"file\0");
+                staging_metadata.update(logical.as_bytes());
+                staging_metadata.update([0]);
+                staging_metadata.update(staged_file_permission_fingerprint(metadata).to_le_bytes());
+                source.update(logical.as_bytes());
+                source.update([0]);
+                source.update(&contents);
+                source.update([0]);
+                if is_build_control_path(relative) {
+                    controls.update(logical.as_bytes());
+                    controls.update([0]);
+                    controls.update(&contents);
+                    controls.update([0]);
+                }
+            }
         }
-        if !metadata.is_file() {
-            bail!(
-                "security policy violation: staged workspace contains non-regular file {}",
-                display_logical(relative)
-            );
-        }
-        files += 1;
-        bytes = bytes.saturating_add(metadata.len());
-        if files > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES {
-            bail!("security policy violation: staged workspace exceeds file or byte limit");
-        }
-        let contents = fs::read(entry.path())?;
-        staging_metadata.update(b"file\0");
-        staging_metadata.update(logical.as_bytes());
-        staging_metadata.update([0]);
-        staging_metadata.update(staged_file_permission_fingerprint(&metadata).to_le_bytes());
-        source.update(logical.as_bytes());
-        source.update([0]);
-        source.update(&contents);
-        source.update([0]);
-        if is_build_control_path(relative) {
-            controls.update(logical.as_bytes());
-            controls.update([0]);
-            controls.update(&contents);
-            controls.update([0]);
-        }
-    }
+        Ok(())
+    })?;
     Ok((
         hex::encode(source.finalize()),
         hex::encode(controls.finalize()),
@@ -3474,7 +3768,43 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
             failed.audit.diagnostic_code.as_deref(),
             Some("build-child-failed")
         );
+        assert_eq!(
+            failed.child_stderr_tail.as_deref(),
+            Some("compiler panic fixture")
+        );
+        let log_path = failed
+            .child_stderr_log_path
+            .as_ref()
+            .context("failed child stderr log path is missing")?;
+        assert_eq!(fs::read_to_string(log_path)?, "compiler panic fixture");
+        let serialized = serde_json::to_string(&failed)?;
+        assert!(!serialized.contains("compiler panic fixture"));
+        assert!(!serialized.contains("child_stderr"));
         assert!(failed.audit.validated_output_digest.is_none());
+
+        fs::write(
+            root.path().join("secret.mjs"),
+            "process.stderr.write('Authorization: Bearer leaked-token\\ncompiler panic'); process.exit(72);\n",
+        )?;
+        let secret =
+            supervise_build(root.path(), &node_plan(vec!["secret.mjs".to_owned()])).await?;
+        assert_eq!(secret.audit.outcome, BuildOutcomeKind::Failed);
+        let secret_tail = secret
+            .child_stderr_tail
+            .as_deref()
+            .context("redacted stderr tail is missing")?;
+        assert!(secret_tail.contains("[REDACTED]"));
+        assert!(secret_tail.contains("compiler panic"));
+        assert!(!secret_tail.contains("leaked-token"));
+        let secret_log = fs::read_to_string(
+            secret
+                .child_stderr_log_path
+                .as_ref()
+                .context("redacted stderr log path is missing")?,
+        )?;
+        assert!(secret_log.contains("[REDACTED]"));
+        assert!(!secret_log.contains("leaked-token"));
+        assert!(!serde_json::to_string(&secret)?.contains("leaked-token"));
 
         fs::write(
             root.path().join("noisy.mjs"),
@@ -3521,6 +3851,33 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         );
         assert!(disk.audit.validated_output_digest.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn redacted_child_stderr_tail_stays_on_utf8_boundaries_and_omits_secret_shaped_lines() {
+        assert_eq!(
+            redact_build_log(b"compiler panic\nAuthorization: Bearer leaked-token\n"),
+            "compiler panic\n[REDACTED]"
+        );
+        assert_eq!(
+            redact_build_log(b"kind=custom-build, mode=run-custom-build\nDEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE\n"),
+            "kind=custom-build, mode=run-custom-build\n[REDACTED]"
+        );
+        let prefix = "a".to_string();
+        let wide = "é".repeat(CHILD_STDERR_TAIL_BYTES);
+        let (tail, path) = persist_child_stderr_log("utf8-tail", &format!("{prefix}{wide}"), true);
+        let tail = tail.expect("stderr tail is missing");
+        assert!(tail.len() <= CHILD_STDERR_TAIL_BYTES + "é".len());
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(!tail.contains('a'));
+        let path = path.expect("stderr log path is missing");
+        assert!(path.ends_with("depgraph-build-utf8-tail.stderr.log"));
+        assert!(fs::read_to_string(&path).unwrap().starts_with('a'));
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            persist_child_stderr_log("unused", "compiler panic", false),
+            (None, None)
+        );
     }
 
     #[test]
@@ -3760,6 +4117,33 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
     }
 
     #[test]
+    fn missing_web_build_plan_explains_the_package_json_template() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("package.json"), "{\"name\":\"fixture\"}")?;
+        let error = create_build_execution_request(root.path())
+            .expect_err("missing plan must fail before a child starts")
+            .to_string();
+        assert!(error.contains("package.json has no versioned depgraph.build execution plan"));
+        assert!(error.contains("\"adapter\":\"next\""));
+        assert!(error.contains("scripts/depgraph-build.mjs"));
+        assert!(error.contains("depgraph resolve --help"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_web_build_object_explains_the_package_json_template() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("package.json"), "{\"depgraph\":{}}")?;
+        let error = create_build_execution_request(root.path())
+            .expect_err("empty depgraph object must fail as a missing plan")
+            .to_string();
+        assert!(error.contains("package.json has no versioned depgraph.build execution plan"));
+        assert!(error.contains("scripts/depgraph-build.mjs"));
+        assert!(error.contains("depgraph resolve --help"));
+        Ok(())
+    }
+
+    #[test]
     fn staging_preserves_source_directories_named_like_common_outputs() -> Result<()> {
         let root = tempfile::tempdir()?;
         for path in [
@@ -3783,6 +4167,111 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(!destination.path().join("target").exists());
         assert!(!destination.path().join(".next").exists());
         assert!(!destination.path().join("nested/.git").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_dereferences_in_repository_symlinks_and_honors_build_ignored_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(
+            root.path()
+                .join("node_modules/.pnpm/pkg@1/node_modules/pkg"),
+        )?;
+        fs::write(
+            root.path()
+                .join("node_modules/.pnpm/pkg@1/node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        std::os::unix::fs::symlink(
+            ".pnpm/pkg@1/node_modules/pkg",
+            root.path().join("node_modules/pkg"),
+        )?;
+        fs::create_dir_all(root.path().join("node_modules/.bin"))?;
+        std::os::unix::fs::symlink(
+            "../.pnpm/pkg@1/node_modules/pkg/index.js",
+            root.path().join("node_modules/.bin/pkg"),
+        )?;
+        fs::create_dir_all(root.path().join(".claude/worktrees/extra"))?;
+        std::os::unix::fs::symlink(
+            "../../node_modules/pkg",
+            root.path().join(".claude/worktrees/extra/link"),
+        )?;
+        fs::write(
+            root.path().join(".depgraph.toml"),
+            "schema_version = 1\n[build]\nignored_paths = ['.claude']\n",
+        )?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        let staged_pkg = destination.path().join("node_modules/pkg/index.js");
+        assert!(staged_pkg.is_file());
+        assert!(!staged_pkg.symlink_metadata()?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(staged_pkg)?, "module.exports = 1;\n");
+        let staged_bin = destination.path().join("node_modules/.bin/pkg");
+        assert!(staged_bin.is_file());
+        assert!(!staged_bin.symlink_metadata()?.file_type().is_symlink());
+        assert!(!destination.path().join(".claude").exists());
+        fingerprint_build_source(root.path())?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_escaping_symlinks_with_ignored_paths_remediation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(outside.path().join("secret"), "token=fixture")?;
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("leak"))?;
+        let error = stage_workspace(root.path(), tempfile::tempdir()?.path())
+            .expect_err("escaping symlink must fail closed")
+            .to_string();
+        assert!(error.contains("security policy violation"));
+        assert!(error.contains("leak"));
+        assert!(error.contains("[build] ignored_paths"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_cyclic_directory_symlinks() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        std::os::unix::fs::symlink(".", root.path().join("loop"))?;
+        fs::create_dir_all(root.path().join("sub"))?;
+        std::os::unix::fs::symlink("..", root.path().join("sub/up"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join("loop").exists());
+        assert!(!destination.path().join("sub/up").exists());
+        assert!(!destination.path().join("loop/loop").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_skips_control_directory_symlink_targets() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("src.rs"), "fn main() {}\n")?;
+        fs::create_dir_all(root.path().join(".git/objects"))?;
+        fs::write(root.path().join(".git/config"), "secret=fixture")?;
+        fs::write(root.path().join(".git/objects/pack"), "pack")?;
+        fs::create_dir_all(root.path().join("target/debug"))?;
+        fs::write(root.path().join("target/debug/out"), "artifact")?;
+        std::os::unix::fs::symlink(".git", root.path().join("metadata-link"))?;
+        std::os::unix::fs::symlink(".git/objects", root.path().join("objects-link"))?;
+        std::os::unix::fs::symlink("target", root.path().join("build-out"))?;
+
+        let destination = tempfile::tempdir()?;
+        stage_workspace(root.path(), destination.path())?;
+        assert!(destination.path().join("src.rs").is_file());
+        assert!(!destination.path().join(".git").exists());
+        assert!(!destination.path().join("metadata-link").exists());
+        assert!(!destination.path().join("objects-link").exists());
+        assert!(!destination.path().join("build-out").exists());
+        assert!(!destination.path().join("target").exists());
         Ok(())
     }
 }
