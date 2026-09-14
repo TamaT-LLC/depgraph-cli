@@ -6,10 +6,9 @@ stdio server. Start with the read-only example in the
 profile below only when its effects are required; do not register several
 profiles for the same repository as an accidental privilege fallback.
 
-The examples use the planned stable `v0.6.0` package. `v0.6.0` is a minor
-release from current `main`: its Store schema is `19` and its code-health
-contract/API is included. The published `v0.5.4` package remains the immutable
-schema-17 baseline until the v0.6.0 Release and post-publish evidence are
+The examples use the planned stable `v0.6.1` package. `v0.6.1` is a patch
+release retaining the v0.6.0 Store schema `19` and code-health contract/API. The published `v0.5.4` package remains the immutable
+schema-17 baseline until the v0.6.1 Release and post-publish evidence are
 public. Do not mix the two versions' binaries, workers, compiler packs, or
 Stores.
 
@@ -170,7 +169,7 @@ instead.
 <!-- depgraph-agent-config:codex -->
 ```toml
 [mcp_servers.depgraph]
-command = "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp"
+command = "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp"
 args = ["--root", "/absolute/path/to/repository", "--store", "/absolute/path/to/state/depgraph.sqlite", "--capability", "read", "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json", "--log-level", "warn"]
 enabled = true
 required = true
@@ -187,7 +186,7 @@ the following entry into the user or workspace `mcp.json` `servers` object.
   "servers": {
     "depgraph": {
       "type": "stdio",
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root",
         "/absolute/path/to/repository",
@@ -243,7 +242,7 @@ writes, daemon control, or project-code execution.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -268,7 +267,7 @@ symlinks, reparse points, and repository escapes remain denied.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -293,7 +292,7 @@ valid closure is `read` plus `store-write` plus `daemon-control`; omitting
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -319,7 +318,7 @@ project code. The valid closure is `read` plus `store-write` plus
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -345,7 +344,7 @@ effects.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.0-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.1-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -468,9 +467,9 @@ Upgrade one fixed root/store at a time:
    or non-migratable store change requires the release's explicit migration
    procedure; do not infer compatibility from SemVer alone.
 
-The `v0.5.4` to `v0.6.0` upgrade is a schema migration, not an in-place patch.
-The old package uses Store schema `17`; the v0.6.0 package uses schema `19`
-and the code-health contract/API. Verify the v0.6.0 release evidence before
+The `v0.5.4` to `v0.6.1` upgrade is a schema migration, not an in-place patch.
+The old package uses Store schema `17`; the v0.6.1 package uses schema `19`
+and the code-health contract/API. Verify the v0.6.1 release evidence before
 opening a migrated Store, and keep the complete pre-migration database/WAL/SHM
 backup for rollback. The published v0.5.4 binary must never open that schema-19
 Store.

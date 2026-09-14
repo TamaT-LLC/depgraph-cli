@@ -20,7 +20,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 ## リリース準備
 
 1. バージョン変更とrelease noteを一つのPRにまとめる。
-   次のstable minorではbase versionを`0.6.0`とする。
+   次のstable patchではbase versionを`0.6.1`とする。
 2. release noteを`docs/releases/<タグ名>.md`として追加する。
 3. タグ名をworkspace versionと一致する`vX.Y.Z`または`vX.Y.Z-rc.N`にする。
 4. `N`には先頭ゼロのない正整数を使う。
@@ -29,7 +29,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
 `v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。
 公開済み`v0.5.4`はStore schema `17`のimmutable baselineである。
-`v0.6.0`はcurrent `main`のStore schema `19`とcode-health契約／APIを含むminor releaseであり、baseline statusを`maintenance-ref-pinned`とする。
+`v0.6.1`はcurrent `main`のStore schema `19`とcode-health契約／APIを維持するpatch releaseであり、baseline statusを`maintenance-ref-pinned`とする。
 tag source、remote `main`、`refs/heads/release/0.6`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければ、default-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
 公開済み`v0.5.4`のtag、source SHA、asset、evidenceは履歴検証用に固定し、現行candidateのSHAとして再利用しない。
 
@@ -87,15 +87,15 @@ publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIか�
 `actions/checkout`の既定shallow tag checkoutはpeeled commitを同名のlocal tag refへ
 配置するため、local `git rev-parse <tag>^{tag}`では正しいremote annotated tagを検証
 できない。署名payloadとpeeled commitの検証にはremote tag object SHAだけを使う。
-v0.6.0の候補は`v0.6.0-rc.N`とし、修正後はRC番号を増やす。
+v0.6.1の候補は`v0.6.1-rc.N`とし、修正後はRC番号を増やす。
 push済みtagを移動・再利用しない。
 初回stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、exact Full CIを通過した同一SHAで`refs/heads/release/0.5`を作成した。
 `v0.5.1`以降のpatch releaseでは、同じexact-source条件を維持したまま、既存の`release/0.5`をcandidateへfast-forwardする。
-v0.6.0では、`refs/heads/release/0.6`をcandidateに作成する。既存refならfast-forwardし、signed tagと同じsource SHAへ固定する。
+v0.6.1では、`refs/heads/release/0.6`をcandidateに作成する。既存refならfast-forwardし、signed tagと同じsource SHAへ固定する。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
-release_tag="v0.6.0-rc.N" # stable tagは v0.6.0
+release_tag="v0.6.1-rc.N" # stable tagは v0.6.1
 candidate_record="$(git rev-parse --git-path depgraph-release-candidate)"
 test -f "$candidate_record"
 test ! -L "$candidate_record"
@@ -108,7 +108,7 @@ git fetch origin main
 test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 test -f "docs/releases/${release_tag}.md"
 
-if [[ "$release_tag" == "v0.6.0" ]]; then
+if [[ "$release_tag" == "v0.6.1" ]]; then
   maintenance="$(git ls-remote origin refs/heads/release/0.6 | awk '{print $1}')"
   if [[ -n "$maintenance" ]]; then
     git fetch origin refs/heads/release/0.6
@@ -120,7 +120,7 @@ if [[ "$release_tag" == "v0.6.0" ]]; then
   printf '%s\n' \
     release-baseline-v1 \
     repository=TamaT-LLC/depgraph-cli \
-    version=0.6.0 \
+    version=0.6.1 \
     commit="$candidate" |
     shasum -a 256
 fi
@@ -137,7 +137,7 @@ default-branch source guardはRelease run要求時に三つのrefを照合し、
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
 tag側のstable gateはGitHub APIから`main` headのexact eleven-job Full CIを再取得する。
 製品価値の`agent-dogfood-report-v1`（SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`）と、Issue #436のcode-health `agent-dogfood-report-v2`（SHA-256 `7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`）をそれぞれ14 gateで再計算する。
-exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.6.0.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
+exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.6.1.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。
@@ -167,7 +167,7 @@ Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-t
 欠損、改変、version drift、target間schema driftを拒否する。
 
 公開済み`v0.5.4`のMCP sidecarは`mcp-package-smoke-v2`である。
-`v0.6.0`の各native jobは`mcp-package-smoke-v3`を使う。従来のprotocol/catalog、
+`v0.6.1`の各native jobは`mcp-package-smoke-v3`を使う。従来のprotocol/catalog、
 durable recovery、stdio purityに加え、`depgraph-agent-host-config-v1`からCodex、
 Claude Desktop、VS Codeのread-only設定をclean temporary homeで生成する。公開前smokeは
 closed synthetic `release-post-publish-evidence-v1`と別計算したtrusted digestを用い、
@@ -189,7 +189,7 @@ state削除までをclean home上で5 targetすべて検証する。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
 公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksumを入力に、schema 17へtransactional migrationする履歴を固定する。
-`v0.6.0`のgateは同じfixtureをschema 19まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
+`v0.6.1`のgateは同じfixtureをschema 19まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
 どちらもcompleted graph identityとrollback copyのbyte不変を検証する。
 実運用ではwriterを停止し、Storeと操作ジャーナルのそれぞれでdatabaseとWAL/SHMを一組としてbackupし、checksumを記録する。
 操作ジャーナルもschema 5から6へ移行するため、rollbackではStoreと一緒に旧版の一式へ戻す。
