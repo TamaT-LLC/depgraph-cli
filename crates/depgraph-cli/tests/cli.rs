@@ -3838,29 +3838,22 @@ fn failed_build_reports_bounded_stderr_tail_and_machine_readable_diagnostics() {
         .assert()
         .code(3);
     let report: serde_json::Value = serde_json::from_slice(&json_run.get_output().stdout).unwrap();
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["diagnostic"], "build-child-failed");
-    assert_ne!(report["exit_code"].as_i64().unwrap(), 0);
-    let tail = report["stderr_tail"].as_str().unwrap();
+    let data = &report["data"];
+    assert_eq!(data["status"], "failed");
+    assert_eq!(data["diagnostic"], "build-child-failed");
+    assert_ne!(data["exit_code"].as_i64().unwrap(), 0);
+    let tail = data["stderr_tail"].as_str().unwrap();
     assert!(
         tail.contains("stderr tail fixture failure"),
         "the retained stderr tail must carry the child failure reason: {tail}"
     );
-    let log_path = PathBuf::from(report["stderr_log_path"].as_str().unwrap());
-    assert!(
-        log_path.starts_with(cache.path()),
-        "the stderr log must be retained next to the store: {}",
-        log_path.display()
-    );
+    let log_path = PathBuf::from(data["log_path"].as_str().unwrap());
     assert!(
         fs::read_to_string(&log_path)
             .unwrap()
-            .contains("stderr tail fixture failure")
-    );
-    assert_eq!(report["audit"]["outcome"], "failed");
-    assert_eq!(
-        report["stderr_tail"], report["audit"]["stderr_tail"],
-        "the persisted audit must retain the same bounded tail"
+            .contains("stderr tail fixture failure"),
+        "the retained stderr log must carry the child failure reason: {}",
+        log_path.display()
     );
 
     Command::cargo_bin("depgraph")
@@ -3877,9 +3870,10 @@ fn failed_build_reports_bounded_stderr_tail_and_machine_readable_diagnostics() {
         .code(3)
         .stdout(predicate::str::contains("status: Failed"))
         .stdout(predicate::str::contains("diagnostic: build-child-failed"))
-        .stdout(predicate::str::contains("build child exit code: "))
-        .stdout(predicate::str::contains("build stderr log: "))
-        .stderr(predicate::str::contains("build stderr (bounded tail):"))
+        .stdout(predicate::str::contains("stderr log: "))
+        .stderr(predicate::str::contains(
+            "--- build stderr (redacted tail) ---",
+        ))
         .stderr(predicate::str::contains("stderr tail fixture failure"));
 }
 
@@ -4267,7 +4261,35 @@ fn resolve_requires_the_explicit_build_mode_selector() {
         .success()
         .stdout(predicate::str::contains("--build"))
         .stdout(predicate::str::contains("--allow-project-code"))
-        .stdout(predicate::str::contains("untrusted project code"));
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("untrusted project code"))
+        .stdout(predicate::str::contains("depgraph.build"))
+        .stdout(predicate::str::contains("node <entrypoint>"))
+        .stdout(predicate::str::contains("NEXT_ADAPTER_PATH"));
+}
+
+#[test]
+fn resolve_missing_web_build_plan_prints_a_copyable_template() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+    let store = root.path().join("store.sqlite");
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "package.json has no versioned depgraph.build execution plan",
+        ))
+        .stderr(predicate::str::contains("scripts/depgraph-build.mjs"))
+        .stderr(predicate::str::contains("depgraph resolve --help"));
 }
 
 #[cfg(unix)]

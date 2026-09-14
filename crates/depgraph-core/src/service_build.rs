@@ -1,7 +1,4 @@
-use std::{
-    io::Cursor,
-    path::{Path, PathBuf},
-};
+use std::io::Cursor;
 
 use anyhow::{Context as _, Result as AnyResult, bail};
 use depgraph_store::{CacheLayer, Store};
@@ -75,7 +72,6 @@ pub struct ResolveBuildServiceOutcome {
     cache_lookup_reason: String,
     build_cache_status: &'static str,
     cache_reused: bool,
-    stderr_log_path: Option<PathBuf>,
 }
 
 impl ResolveBuildServiceOutcome {
@@ -117,13 +113,6 @@ impl ResolveBuildServiceOutcome {
     #[must_use]
     pub const fn cache_reused(&self) -> bool {
         self.cache_reused
-    }
-
-    /// Path of the retained stderr-tail log of a failed build attempt, when
-    /// one was written next to the store.
-    #[must_use]
-    pub fn stderr_log_path(&self) -> Option<&Path> {
-        self.stderr_log_path.as_deref()
     }
 }
 
@@ -287,6 +276,8 @@ async fn resolve_build_inner(
                                             rust_compiler_mir_ledger: Some(evidence.mir_ledger),
                                             rust_observation: None,
                                             web_observation: None,
+                                            child_stderr_tail: None,
+                                            child_stderr_log_path: None,
                                         },
                                         completed_snapshot_id: store.current_snapshot_id()?,
                                         evidence_status: "reused compiler-precise graph",
@@ -294,7 +285,6 @@ async fn resolve_build_inner(
                                         cache_lookup_reason: "validated".to_owned(),
                                         build_cache_status: "hit",
                                         cache_reused: true,
-                                        stderr_log_path: None,
                                     });
                                 }
                             }
@@ -351,6 +341,8 @@ async fn resolve_build_inner(
                         rust_compiler_mir_ledger: None,
                         rust_observation: None,
                         web_observation: None,
+                        child_stderr_tail: None,
+                        child_stderr_log_path: None,
                     },
                     completed_snapshot_id: store.current_snapshot_id()?,
                     evidence_status: "reused",
@@ -358,7 +350,6 @@ async fn resolve_build_inner(
                     cache_lookup_reason: "validated".to_owned(),
                     build_cache_status: "hit",
                     cache_reused: true,
-                    stderr_log_path: None,
                 });
             }
             cache_lookup_status = "reject".to_owned();
@@ -393,7 +384,6 @@ async fn resolve_build_inner(
 
     let audit_value = serde_json::to_value(&outcome.audit)?;
     store.save_build_audit(&audit_value)?;
-    let stderr_log_path = write_build_stderr_log(store_path, &outcome.audit);
     let mut evidence_status = "audit-only (no completed base scan)";
     let mut build_cache_status = "not stored";
     if let Some(base_scan_id) = base_scan_id {
@@ -693,24 +683,7 @@ async fn resolve_build_inner(
         cache_lookup_reason,
         build_cache_status,
         cache_reused: false,
-        stderr_log_path,
     })
-}
-
-/// Persist the retained stderr tail of a failed build attempt next to the
-/// store, where it survives the temporary build workspace. The write is
-/// best-effort: the tail is already part of the audit, and a log-file failure
-/// must not mask the build outcome being reported.
-fn write_build_stderr_log(store_path: &Path, audit: &BuildAudit) -> Option<PathBuf> {
-    let tail = audit.stderr_tail.as_deref()?;
-    let directory = store_path.parent()?.join("build-logs");
-    std::fs::create_dir_all(&directory).ok()?;
-    let path = directory.join(format!("{}.stderr.log", audit.run_id));
-    let mut contents = String::with_capacity(tail.len() + 1);
-    contents.push_str(tail);
-    contents.push('\n');
-    std::fs::write(&path, contents).ok()?;
-    Some(path)
 }
 
 fn requires_build_attempt(

@@ -242,8 +242,7 @@ pub(crate) enum WorkerFailureKind {
     NonzeroExit,
     IncompleteProtocol,
     TaskPanic,
-    /// The worker could not be located or launched, so it never ran.
-    LaunchFailed,
+    Launch,
     Other,
 }
 
@@ -258,7 +257,7 @@ impl WorkerFailureKind {
             Self::NonzeroExit => "nonzero-exit",
             Self::IncompleteProtocol => "incomplete-protocol",
             Self::TaskPanic => "task-panic",
-            Self::LaunchFailed => "launch-failed",
+            Self::Launch => "launch",
             Self::Other => "other",
         }
     }
@@ -274,7 +273,7 @@ fn select_worker_failure_kind(kinds: &[WorkerFailureKind]) -> Option<WorkerFailu
         WorkerFailureKind::MalformedProtocol,
         WorkerFailureKind::IncompleteProtocol,
         WorkerFailureKind::TaskPanic,
-        WorkerFailureKind::LaunchFailed,
+        WorkerFailureKind::Launch,
         WorkerFailureKind::Other,
     ];
     PRECEDENCE
@@ -1462,9 +1461,9 @@ pub async fn execute_worker(
             WorkerOutput {
                 adapter,
                 events: Vec::new(),
-                stderr: String::new(),
+                stderr: error.clone(),
                 stderr_truncated: false,
-                failure_kind: Some(WorkerFailureKind::Other),
+                failure_kind: Some(WorkerFailureKind::Launch),
                 security_violation: is_security_error(&error),
                 error: Some(error),
                 peak_memory_bytes: None,
@@ -1520,9 +1519,9 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
             WorkerOutput {
                 adapter,
                 events: Vec::new(),
-                stderr: String::new(),
+                stderr: error.clone(),
                 stderr_truncated: false,
-                failure_kind: Some(WorkerFailureKind::Other),
+                failure_kind: Some(WorkerFailureKind::Launch),
                 security_violation: is_security_error(&error),
                 error: Some(error),
                 peak_memory_bytes: None,
@@ -1569,9 +1568,9 @@ pub(crate) async fn execute_worker_delta_with_cancellation(
             WorkerDeltaOutput {
                 adapter,
                 delta: None,
-                stderr: String::new(),
+                stderr: error.clone(),
                 stderr_truncated: false,
-                failure_kind: Some(WorkerFailureKind::Other),
+                failure_kind: Some(WorkerFailureKind::Launch),
                 security_violation: is_security_error(&error),
                 error: Some(error),
             }

@@ -409,7 +409,6 @@ fn cross_language_ffi_outcome(
             exit_code: Some(0),
             stdout_truncated: false,
             stderr_truncated: false,
-            stderr_tail: None,
             validated_output_digest: Some(validated_output_digest),
             diagnostic_code: None,
             compiler_failure: None,
@@ -421,6 +420,8 @@ fn cross_language_ffi_outcome(
         rust_compiler_mir_ledger: None,
         rust_observation: None,
         web_observation: None,
+        child_stderr_tail: None,
+        child_stderr_log_path: None,
     })
 }
 

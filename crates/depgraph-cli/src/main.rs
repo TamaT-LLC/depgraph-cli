@@ -51,6 +51,34 @@ use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
 use snapshot_diff::render_service_human_diff;
 
+const RESOLVE_LONG_HELP: &str = "\
+Observe a project build only after explicit project-code consent.
+
+Web projects declare a versioned `depgraph.build` execution plan in \
+package.json. The plan is a JSON object (not a shell command) with:
+
+  adapter          one of next, astro, tanstack-router, tanstack-start
+  entrypoint       repository-relative path to a regular file
+  version          framework version string (JSON string, not a number)
+  timeout_seconds  optional integer; default 900
+
+depgraph launches the entrypoint as `node <entrypoint>` with no extra \
+arguments, in a temporary staged workspace. It does not run npm/pnpm/yarn \
+scripts. The process receives DEPGRAPH_OBSERVER (and NEXT_ADAPTER_PATH for \
+Next) plus DEPGRAPH_OUTPUT_DIR. The entrypoint must spawn the real framework \
+build and inherit its exit code without modifying project source.
+
+Example package.json fragment:
+
+  \"depgraph\": { \"build\": { \"adapter\": \"next\", \
+\"entrypoint\": \"scripts/depgraph-build.mjs\", \"version\": \"16.2.3\", \
+\"timeout_seconds\": 900 } }
+
+A Next.js entrypoint example lives at docs/examples/next-depgraph-build.mjs. \
+Missing plans fail with a copyable template. Full contract: README.en.md \
+build-mode consent boundary.
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "depgraph",
@@ -169,6 +197,7 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Observe a project build only after explicit project-code consent.
+    #[command(long_about = RESOLVE_LONG_HELP)]
     Resolve {
         /// Select build observation mode. No other resolve mode is available yet.
         #[arg(long, required = true)]
@@ -189,8 +218,7 @@ enum Commands {
             requires = "rust_compiler_precise"
         )]
         compiler_pack_requirement: Option<PathBuf>,
-        /// Emit the build run, status, diagnostic, child exit code, retained
-        /// stderr tail, and stderr log path as JSON.
+        /// Emit a versioned JSON envelope instead of human-readable status lines.
         #[arg(long)]
         json: bool,
     },
@@ -1445,21 +1473,18 @@ async fn run(cli: Cli) -> Result<u8> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": "1.0",
                         "command": "resolve",
-                        "build_run": outcome.audit.run_id,
-                        "status": outcome.audit.outcome,
-                        "diagnostic": outcome.audit.diagnostic_code,
-                        "exit_code": outcome.audit.exit_code,
-                        "stderr_tail": outcome.audit.stderr_tail,
-                        "stderr_log_path": result.stderr_log_path(),
-                        "project_code_executed": outcome.project_code_executed,
-                        "evidence": result.evidence_status(),
-                        "cache_lookup": {
-                            "status": result.cache_lookup_status(),
-                            "reason": result.cache_lookup_reason(),
-                        },
-                        "build_cache": result.build_cache_status(),
-                        "store": store_path,
-                        "audit": outcome.audit,
+                        "data": {
+                            "build_run": outcome.audit.run_id,
+                            "status": outcome.audit.outcome,
+                            "diagnostic": outcome.audit.diagnostic_code,
+                            "exit_code": outcome.audit.exit_code,
+                            "log_path": outcome.child_stderr_log_path.as_ref().map(|path| path.display().to_string()),
+                            "stderr_truncated": outcome.audit.stderr_truncated,
+                            "stderr_tail": outcome.child_stderr_tail,
+                            "project_code_executed": outcome.project_code_executed,
+                            "build_evidence": result.evidence_status(),
+                            "store": store_path.display().to_string(),
+                        }
                     }))?
                 );
             } else {
@@ -1499,11 +1524,6 @@ async fn run(cli: Cli) -> Result<u8> {
                 if let Some(diagnostic) = &outcome.audit.diagnostic_code {
                     println!("diagnostic: {diagnostic}");
                 }
-                if let Some(exit_code) = outcome.audit.exit_code
-                    && !matches!(outcome.audit.outcome, BuildOutcomeKind::Completed)
-                {
-                    println!("build child exit code: {exit_code}");
-                }
                 if let Some(failure) = &outcome.audit.compiler_failure {
                     println!("compiler Cargo unit: {}", failure.unit_id);
                     println!(
@@ -1511,17 +1531,17 @@ async fn run(cli: Cli) -> Result<u8> {
                         failure.unit_kind, failure.mode, failure.cargo_platform
                     );
                 }
-                if let Some(path) = result.stderr_log_path() {
-                    println!("build stderr log: {}", path.display());
+                if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
+                    eprintln!("warning: {diagnostic}");
                 }
-                if let Some(tail) = &outcome.audit.stderr_tail {
-                    eprintln!("build stderr (bounded tail):");
+                if let Some(path) = &outcome.child_stderr_log_path {
+                    println!("stderr log: {}", path.display());
+                }
+                if let Some(tail) = &outcome.child_stderr_tail {
+                    eprintln!("--- build stderr (redacted tail) ---");
                     eprintln!("{tail}");
                 }
                 println!("store: {}", store_path.display());
-            }
-            if let Some(diagnostic) = &outcome.audit.isolation_diagnostic {
-                eprintln!("warning: {diagnostic}");
             }
             Ok(match outcome.audit.outcome {
                 BuildOutcomeKind::Completed => 0,

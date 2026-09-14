@@ -280,9 +280,35 @@ impl ScanFailure {
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_'))
             .then_some(phase)
         }) else {
-            return identity;
+            return match self.kind {
+                WorkerFailureKind::Launch => format!("{identity}; failure_phase=launch"),
+                WorkerFailureKind::Other => {
+                    if let Some(phase) = infer_worker_failure_phase(&self.detail) {
+                        format!("{identity}; failure_phase={phase}")
+                    } else {
+                        identity
+                    }
+                }
+                _ => identity,
+            };
         };
         format!("{identity}; last_progress_phase={phase}")
+    }
+}
+
+fn infer_worker_failure_phase(detail: &str) -> Option<&'static str> {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("inventory") {
+        Some("inventory")
+    } else if lower.contains("typescript") {
+        Some("typescript")
+    } else if lower.contains("failed to start")
+        || lower.contains("failed to spawn")
+        || lower.contains("no such file")
+    {
+        Some("launch")
+    } else {
+        None
     }
 }
 
@@ -327,7 +353,7 @@ fn preflight_workers(
                 failures.push(ScanFailure::with_classification(
                     adapter,
                     error,
-                    WorkerFailureKind::LaunchFailed,
+                    WorkerFailureKind::Launch,
                     security_violation,
                 ));
             }
@@ -3025,6 +3051,42 @@ mod tests {
     }
 
     #[test]
+    fn worker_launch_diagnostic_reports_launch_phase_without_progress() {
+        let failure = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "failed to start node: No such file or directory".to_owned(),
+            WorkerFailureKind::Launch,
+        );
+        assert_eq!(
+            failure.diagnostic_message(),
+            "worker-failure:web:launch; failure_phase=launch"
+        );
+        assert_eq!(failure.stable_identity(), "worker-failure:web:launch");
+    }
+
+    #[test]
+    fn worker_other_diagnostic_infers_inventory_or_typescript_phase() {
+        let inventory = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "web worker failed: inventory walk failed".to_owned(),
+            WorkerFailureKind::Other,
+        );
+        assert_eq!(
+            inventory.diagnostic_message(),
+            "worker-failure:web:other; failure_phase=inventory"
+        );
+        let typescript = ScanFailure::with_kind(
+            AdapterKind::Web,
+            "web worker failed: typescript program create failed".to_owned(),
+            WorkerFailureKind::Other,
+        );
+        assert_eq!(
+            typescript.diagnostic_message(),
+            "worker-failure:web:other; failure_phase=typescript"
+        );
+    }
+
+    #[test]
     fn worker_phase_profile_accepts_only_completed_bounded_metrics() {
         let output = WorkerOutput {
             adapter: AdapterKind::Rust,
@@ -3439,12 +3501,12 @@ mod tests {
         assert!(!preflight.failures[0].security_violation);
         assert_eq!(
             preflight.failures[0].kind,
-            WorkerFailureKind::LaunchFailed,
+            WorkerFailureKind::Launch,
             "a worker that never launched must not be reported as `other`"
         );
         assert_eq!(
             preflight.failures[0].stable_identity(),
-            "worker-failure:go:launch-failed"
+            "worker-failure:go:launch"
         );
     }
 

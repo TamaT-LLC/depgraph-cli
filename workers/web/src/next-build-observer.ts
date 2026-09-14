@@ -254,38 +254,27 @@ function boundedFailureDetail(
 }
 
 export class NextBuildObserverError extends Error {
-  readonly code: string;
-  readonly detail?: NextBuildFailureDetail;
-
-  constructor(code: string, detail?: NextBuildFailureDetail) {
-    super(detail === undefined ? code : `${code} ${JSON.stringify(detail)}`);
+  constructor(
+    readonly code: string,
+    readonly detail?: Record<string, string>,
+  ) {
+    super(detail === undefined ? code : `${code}: ${JSON.stringify(detail)}`);
     this.name = "NextBuildObserverError";
-    this.code = code;
-    if (detail !== undefined) this.detail = detail;
   }
-}
-
-// The bounded, already-redacted failure detail survives into the diagnostic
-// so a failed observation names the value that was rejected.
-function failureDetailProperties(error: unknown): Record<string, JsonValue> {
-  return error instanceof NextBuildObserverError && error.detail !== undefined
-    ? { failure_detail: { ...error.detail } }
-    : {};
 }
 
 export function nextBuildFailureDiagnostic(error: unknown, profileId: string): Diagnostic {
   const code = error instanceof NextBuildObserverError && /^web\.next_build_[a-z0-9_]+$/u.test(error.code)
     ? error.code
     : "web.next_build_observer_failed";
-  const properties: Record<string, JsonValue> = {
+  const properties: Record<string, JsonValue> = observerFailureDetail(error, {
     framework: "next",
     observer: NEXT_BUILD_OBSERVER,
     observer_version: NEXT_BUILD_OBSERVER_VERSION,
     capability: NEXT_BUILD_OBSERVER_CAPABILITY,
     contract_version: FRAMEWORK_BUILD_GRAPH_CONTRACT_VERSION,
     observer_failure: true,
-    ...failureDetailProperties(error),
-  };
+  });
   return {
     id: stableId("diagnostic", { code, profile_id: profileId, properties }),
     severity: "error",
@@ -345,12 +334,94 @@ function logicalFromAbsolute(repoRoot: string, absolutePath: unknown): string | 
   return canonicalRelativePath(relative);
 }
 
+function nodeModulePackageName(relative: string): string | null {
+  return [...relative.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/.][^/]*)(?=\/|$)/g)].at(-1)?.[1]
+    ?? null;
+}
+
+function sameNodeModulePackage(left: string, right: string): boolean {
+  const leftPackage = nodeModulePackageName(left);
+  const rightPackage = nodeModulePackageName(right);
+  return leftPackage !== null && leftPackage === rightPackage;
+}
+
+function secretShapedObserverValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  return [
+    "-----begin ",
+    "authorization:",
+    "bearer ",
+    "password=",
+    "passwd=",
+    "client_secret=",
+    "private_key=",
+    "secret_key=",
+    "api_key=",
+    "access_token=",
+    "token=",
+  ].some((marker) => lower.includes(marker));
+}
+
+function observerRouteDetail(value: unknown): string | undefined {
+  const raw = boundedString(value);
+  return raw === null || raw.includes("\\") ? undefined : raw;
+}
+
+function omitSecretShapedDetails(detail: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(detail).filter((entry) => !secretShapedObserverValue(entry[1])));
+}
+
+function observerFailureDetail(
+  error: unknown,
+  properties: Record<string, JsonValue>,
+): Record<string, JsonValue> {
+  const detail = error instanceof NextBuildObserverError ? error.detail : undefined;
+  return Object.assign(properties, omitSecretShapedDetails(detail ?? {}));
+}
+
+function failWithDetail(code: string, detail: Record<string, string>): never {
+  throw new NextBuildObserverError(code, detail);
+}
+
+function unsafeArtifactReason(
+  logicalHint: unknown,
+  contained: string | null,
+  hintMatchesPath: boolean,
+): string {
+  if (logicalHint === undefined || contained === null || hintMatchesPath) return "not_contained";
+  return "hint_mismatch";
+}
+
+function unsafeArtifactDetail(
+  logicalHint: unknown,
+  contained: string | null,
+  hinted: string | null,
+  hintMatchesPath: boolean,
+): Record<string, string> {
+  const detail: Record<string, string> = {
+    reason: unsafeArtifactReason(logicalHint, contained, hintMatchesPath),
+  };
+  if (contained !== null) detail.contained = contained;
+  // A rejected hint may carry a query suffix; keep only its pathname so
+  // query-borne values never enter the failure detail or error message.
+  const hintedDetail = hinted === null ? null : routingDetailPathname(hinted);
+  if (hintedDetail !== null) detail.hinted = hintedDetail;
+  return detail;
+}
+
 function canonicalPathname(value: unknown, allowEmpty = false): string | null {
   const raw = boundedString(value);
   if (raw === null) return allowEmpty && value === "" ? "" : null;
   if (!raw.startsWith("/") || raw.includes("\\") || raw.includes("?") || raw.includes("#") || /\s/u.test(raw)) return null;
   const normalized = raw.replace(/\/{2,}/gu, "/");
   return normalized.length > 1 ? normalized.replace(/\/$/u, "") : normalized;
+}
+
+function routingDestinationPathname(value: unknown): string | null {
+  const raw = boundedString(value);
+  if (raw === null) return null;
+  const separator = raw.search(/[?#]/u);
+  return canonicalPathname(separator === -1 ? raw : raw.slice(0, separator));
 }
 
 function canonicalSourcePage(value: unknown): string | null {
@@ -575,15 +646,15 @@ function sanitizeRouting(
         fail("web.next_build_manifest_invalid", { phase, reason: "route entry contract" });
       }
       const rawSource = canonicalPathname(route.source);
-      const rawDestination = canonicalPathname(route.destination);
+      const rawDestination = routingDestinationPathname(route.destination);
       if ((route.source !== undefined && rawSource === null)
         || (route.destination !== undefined && rawDestination === null)) {
-        fail("web.next_build_manifest_invalid", {
-          phase,
-          reason: "route pathname contract",
-          source: routingDetailPathname(route.source),
-          destination: routingDetailPathname(route.destination),
-        });
+        const detail: Record<string, string> = { phase };
+        const source = observerRouteDetail(route.source);
+        const destination = observerRouteDetail(route.destination);
+        if (source !== undefined) detail.source = source;
+        if (destination !== undefined) detail.destination = destination;
+        failWithDetail("web.next_build_manifest_invalid", detail);
       }
       const source = rawSource === null ? null : replaceBuildId(rawSource, buildId);
       const destination = rawDestination === null ? null : replaceBuildId(rawDestination, buildId);
@@ -664,12 +735,14 @@ async function digestArtifact(
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
   const hinted = logicalHint === undefined ? null : canonicalRelativePath(logicalHint);
+  const hintMatchesPath = hinted === contained
+    || (hinted !== null && contained !== null && sameNodeModulePackage(hinted, contained));
   if (rawAbsolute === null || contained === null || !path.isAbsolute(rawAbsolute)
-    || (logicalHint !== undefined && hinted !== contained)) {
-    fail("web.next_build_artifact_path_unsafe", {
-      logical_hint: routingDetailPathname(logicalHint),
-      contained,
-    });
+    || (logicalHint !== undefined && !hintMatchesPath)) {
+    failWithDetail(
+      "web.next_build_artifact_path_unsafe",
+      unsafeArtifactDetail(logicalHint, contained, hinted, hintMatchesPath),
+    );
   }
   const logicalPath = contained;
   let digest: string;

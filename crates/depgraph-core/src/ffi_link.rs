@@ -1200,7 +1200,6 @@ mod tests {
                 exit_code: Some(0),
                 stdout_truncated: false,
                 stderr_truncated: false,
-                stderr_tail: None,
                 validated_output_digest: Some("c".repeat(64)),
                 diagnostic_code: None,
                 compiler_failure: None,
@@ -1212,6 +1211,8 @@ mod tests {
             rust_compiler_mir_ledger: None,
             rust_observation: None,
             web_observation: None,
+            child_stderr_tail: None,
+            child_stderr_log_path: None,
         }
     }
 
