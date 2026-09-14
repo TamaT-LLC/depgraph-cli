@@ -1307,6 +1307,9 @@ async fn run(cli: Cli) -> Result<u8> {
                         diagnostic.severity, diagnostic.code, diagnostic.message
                     );
                 }
+                if let Some(error) = &outcome.error {
+                    eprintln!("error: {error}");
+                }
                 if let Some(policy) = &outcome.policy {
                     println!(
                         "policy: {} errors, {} warnings, {} suppressed",

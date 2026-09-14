@@ -240,6 +240,19 @@ export interface NextBuildGraphDelta {
   diagnostics: Diagnostic[];
 }
 
+const MAX_FAILURE_DETAIL_VALUE = 200;
+
+export type NextBuildFailureDetail = Record<string, string>;
+
+function boundedFailureDetail(
+  detail: Record<string, string | null | undefined>,
+): NextBuildFailureDetail | undefined {
+  const entries = Object.entries(detail)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .map(([key, value]) => [key, value.slice(0, MAX_FAILURE_DETAIL_VALUE)] as const);
+  return entries.length === 0 ? undefined : Object.fromEntries(entries);
+}
+
 export class NextBuildObserverError extends Error {
   constructor(
     readonly code: string,
@@ -273,8 +286,14 @@ export function nextBuildFailureDiagnostic(error: unknown, profileId: string): D
   };
 }
 
-function fail(code: string): never {
-  throw new NextBuildObserverError(code);
+// The optional detail carries only bounded route patterns and logical paths
+// (never header, environment, or query values) so the redacted reason for a
+// failed validation survives into the child process stderr and diagnostics.
+function fail(code: string, detail?: Record<string, string | null | undefined>): never {
+  throw new NextBuildObserverError(
+    code,
+    detail === undefined ? undefined : boundedFailureDetail(detail),
+  );
 }
 
 function record(value: unknown): UnknownRecord | null {
@@ -383,7 +402,10 @@ function unsafeArtifactDetail(
     reason: unsafeArtifactReason(logicalHint, contained, hintMatchesPath),
   };
   if (contained !== null) detail.contained = contained;
-  if (hinted !== null) detail.hinted = hinted;
+  // A rejected hint may carry a query suffix; keep only its pathname so
+  // query-borne values never enter the failure detail or error message.
+  const hintedDetail = hinted === null ? null : routingDetailPathname(hinted);
+  if (hintedDetail !== null) detail.hinted = hintedDetail;
   return detail;
 }
 
@@ -600,6 +622,14 @@ async function defaultArtifactReader(absolutePath: string, _logicalPath: string,
   }
 }
 
+// Failure details never carry query strings or fragments: only the pathname
+// part of a route value identifies the failing entry.
+function routingDetailPathname(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const suffixIndex = value.search(/[?#]/u);
+  return suffixIndex < 0 ? value : `${value.slice(0, suffixIndex)}?<redacted-query>`;
+}
+
 function sanitizeRouting(
   routing: Record<string, unknown>,
   buildId: string,
@@ -613,7 +643,7 @@ function sanitizeRouting(
       if (entries.length >= MAX_ROUTING_ENTRIES) fail("web.next_build_routing_limit_exceeded");
       const route = record(value);
       if (route === null || boundedString(route.sourceRegex) === null) {
-        fail("web.next_build_manifest_invalid");
+        fail("web.next_build_manifest_invalid", { phase, reason: "route entry contract" });
       }
       const rawSource = canonicalPathname(route.source);
       const rawDestination = routingDestinationPathname(route.destination);
@@ -738,9 +768,19 @@ async function sanitizeOutput(
     fail("web.next_build_manifest_invalid");
   }
   const pathname = canonicalPathname(output.pathname);
-  if (pathname === null) fail("web.next_build_output_pathname_unsafe");
+  if (pathname === null) {
+    fail("web.next_build_output_pathname_unsafe", {
+      type: expectedType,
+      pathname: routingDetailPathname(output.pathname),
+    });
+  }
   const sourcePage = output.sourcePage === undefined ? null : canonicalSourcePage(output.sourcePage);
-  if (output.sourcePage !== undefined && sourcePage === null) fail("web.next_build_source_page_unsafe");
+  if (output.sourcePage !== undefined && sourcePage === null) {
+    fail("web.next_build_source_page_unsafe", {
+      type: expectedType,
+      source_page: routingDetailPathname(output.sourcePage),
+    });
+  }
   const requestOutput = REQUEST_OUTPUT_TYPES.has(expectedType) || expectedType === "MIDDLEWARE";
   if (requestOutput && sourcePage === null) fail("web.next_build_partial_build");
   const runtime: NextObservedOutput["runtime"] = output.runtime === "edge"

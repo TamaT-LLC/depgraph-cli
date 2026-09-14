@@ -61,6 +61,10 @@ pub struct ScanOutcome {
     pub scan_id: String,
     pub status: String,
     pub exit_code: u8,
+    /// Bounded failure summary of a non-promoted terminal scan: the adapter
+    /// failure details retained by the store, absent for completed scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub coverage: CoverageRecord,
     pub diagnostics: Vec<DiagnosticRecord>,
     pub cache_events: Vec<CacheEventRecord>,
@@ -349,7 +353,7 @@ fn preflight_workers(
                 failures.push(ScanFailure::with_classification(
                     adapter,
                     error,
-                    WorkerFailureKind::Other,
+                    WorkerFailureKind::Launch,
                     security_violation,
                 ));
             }
@@ -760,6 +764,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                                         scan_id: scan_id.clone(),
                                         status: "completed".to_owned(),
                                         exit_code: 0,
+                                        error: None,
                                         coverage: cached_coverage.clone(),
                                         diagnostics: hit.diagnostics().to_vec(),
                                         cache_events: Vec::new(),
@@ -939,8 +944,8 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 adapter.name()
             ))
         } else {
-            bind_worker_output_to_profile_plan(output, &profile_plan).and_then(|output| {
-                ingest_worker_output(
+            match bind_worker_output_to_profile_plan(output, &profile_plan) {
+                Ok(output) => ingest_worker_output(
                     store,
                     &scan_id,
                     output,
@@ -948,8 +953,19 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                     Some(&mut file_coverage_ledgers),
                     Some(&mut analysis_unit_file_paths),
                     Some(&mut pending_analysis_unit_completions),
-                )
-            })
+                ),
+                // Ingestion retains worker stderr as an adapter log; a binding
+                // rejection must keep that diagnosis trail available too.
+                Err(binding) => {
+                    store.save_adapter_log(
+                        &scan_id,
+                        adapter.name(),
+                        &binding.stderr,
+                        binding.stderr_truncated,
+                    )?;
+                    Err(binding.error)
+                }
+            }
         };
         ingest_ms += elapsed_ms(ingest_started);
         match result {
@@ -1571,10 +1587,10 @@ fn bind_worker_outputs_to_profile_plan(
             let security_violation = output.security_violation;
             match bind_worker_output_to_profile_plan(output, plan) {
                 Ok(output) => Some(output),
-                Err(error) => {
+                Err(rejection) => {
                     failures.push(ScanFailure::with_classification(
                         adapter,
-                        format!("worker profile-plan binding failed: {error:#}"),
+                        format!("worker profile-plan binding failed: {:#}", rejection.error),
                         WorkerFailureKind::MalformedProtocol,
                         security_violation,
                     ));
@@ -1585,10 +1601,32 @@ fn bind_worker_outputs_to_profile_plan(
         .collect()
 }
 
+/// A profile-plan binding failure that keeps the rejected worker's retained
+/// stderr available for adapter-log persistence.
+struct WorkerBindingRejection {
+    error: anyhow::Error,
+    stderr: String,
+    stderr_truncated: bool,
+}
+
 fn bind_worker_output_to_profile_plan(
     mut output: WorkerOutput,
     plan: &DefaultProfileSelectionPlan,
-) -> Result<WorkerOutput> {
+) -> std::result::Result<WorkerOutput, WorkerBindingRejection> {
+    match bind_worker_output_to_profile_plan_inner(&mut output, plan) {
+        Ok(()) => Ok(output),
+        Err(error) => Err(WorkerBindingRejection {
+            error,
+            stderr: output.stderr,
+            stderr_truncated: output.stderr_truncated,
+        }),
+    }
+}
+
+fn bind_worker_output_to_profile_plan_inner(
+    output: &mut WorkerOutput,
+    plan: &DefaultProfileSelectionPlan,
+) -> Result<()> {
     validate_profile_selection_plan(plan)?;
     let selected_profile_ids = plan
         .selected
@@ -1641,7 +1679,7 @@ fn bind_worker_output_to_profile_plan(
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
@@ -1831,6 +1869,7 @@ fn complete_scan_with_mode(
         scan_id: scan_id.to_owned(),
         status: "completed".to_owned(),
         exit_code: 0,
+        error: None,
         coverage: summary.coverage,
         diagnostics: summary.diagnostics,
         cache_events: store.cache_events_for_scan(scan_id)?,
@@ -2811,6 +2850,7 @@ fn snapshot_outcome(store: &Store, scan_id: &str, exit_code: u8) -> Result<ScanO
         scan_id: scan_id.to_owned(),
         status: metadata.status,
         exit_code,
+        error: metadata.error,
         coverage: metadata.coverage,
         diagnostics: metadata.diagnostics,
         cache_events: metadata.cache_events,
@@ -3459,6 +3499,15 @@ mod tests {
         assert_eq!(preflight.failures.len(), 1);
         assert_eq!(preflight.failures[0].adapter, AdapterKind::Go);
         assert!(!preflight.failures[0].security_violation);
+        assert_eq!(
+            preflight.failures[0].kind,
+            WorkerFailureKind::Launch,
+            "a worker that never launched must not be reported as `other`"
+        );
+        assert_eq!(
+            preflight.failures[0].stable_identity(),
+            "worker-failure:go:launch"
+        );
     }
 
     #[tokio::test]
@@ -4539,7 +4588,8 @@ mod tests {
             security_violation: false,
             peak_memory_bytes: None,
         };
-        let bound = bind_worker_output_to_profile_plan(output, &plan)?;
+        let bound = bind_worker_output_to_profile_plan(output, &plan)
+            .map_err(|rejection| rejection.error)?;
         let properties = &bound.events[0]["profile"]["properties"];
         assert_eq!(properties["profile_selection_plan_id"], plan.plan_id);
         assert_eq!(
@@ -4580,7 +4630,8 @@ mod tests {
             security_violation: false,
             peak_memory_bytes: None,
         };
-        let bound = bind_worker_output_to_profile_plan(null_properties, &plan)?;
+        let bound = bind_worker_output_to_profile_plan(null_properties, &plan)
+            .map_err(|rejection| rejection.error)?;
         assert_eq!(
             bound.events[0]["profile"]["properties"]["profile_selection_plan_id"],
             plan.plan_id

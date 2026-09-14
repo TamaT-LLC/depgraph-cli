@@ -1641,11 +1641,13 @@ ORDER BY id COLLATE BINARY
     /// from being used for a completed or still-staging scan, whose snapshot
     /// and mutation semantics are different.
     pub fn load_terminal_scan_metadata(&self, scan_id: &str) -> Result<TerminalScanMetadata> {
-        let status = self
+        let (status, error) = self
             .connection
-            .query_row("SELECT status FROM scans WHERE id=?1", [scan_id], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT status, error FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
             .optional()?
             .with_context(|| format!("scan {scan_id} was not started"))?;
         if !matches!(
@@ -1656,6 +1658,7 @@ ORDER BY id COLLATE BINARY
         }
         Ok(TerminalScanMetadata {
             status,
+            error,
             coverage: read::load_staging_coverage(&self.connection, scan_id)?,
             diagnostics: load_diagnostics(&self.connection, scan_id)?,
             cache_events: self.cache_events_for_scan(scan_id)?,

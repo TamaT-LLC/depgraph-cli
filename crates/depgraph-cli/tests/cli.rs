@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use assert_cmd::Command;
 use depgraph_core::service::{
@@ -3799,6 +3802,81 @@ fn best_effort_build_detects_original_source_mutation_and_rejects_evidence() {
     );
 }
 
+#[test]
+fn failed_build_reports_bounded_stderr_tail_and_machine_readable_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='stderr-tail-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"stderr-tail-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "compile_error!(\"stderr tail fixture failure\");\n",
+    )
+    .unwrap();
+
+    let json_run = Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+            "--json",
+        ])
+        .assert()
+        .code(3);
+    let report: serde_json::Value = serde_json::from_slice(&json_run.get_output().stdout).unwrap();
+    let data = &report["data"];
+    assert_eq!(data["status"], "failed");
+    assert_eq!(data["diagnostic"], "build-child-failed");
+    assert_ne!(data["exit_code"].as_i64().unwrap(), 0);
+    let tail = data["stderr_tail"].as_str().unwrap();
+    assert!(
+        tail.contains("stderr tail fixture failure"),
+        "the retained stderr tail must carry the child failure reason: {tail}"
+    );
+    let log_path = PathBuf::from(data["log_path"].as_str().unwrap());
+    assert!(
+        fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("stderr tail fixture failure"),
+        "the retained stderr log must carry the child failure reason: {}",
+        log_path.display()
+    );
+
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "resolve",
+            "--build",
+            root.path().to_str().unwrap(),
+            "--allow-project-code",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("status: Failed"))
+        .stdout(predicate::str::contains("diagnostic: build-child-failed"))
+        .stdout(predicate::str::contains("stderr log: "))
+        .stderr(predicate::str::contains(
+            "--- build stderr (redacted tail) ---",
+        ))
+        .stderr(predicate::str::contains("stderr tail fixture failure"));
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_cancellation_stops_the_supervised_build_and_retains_the_safe_snapshot() {
@@ -5782,6 +5860,11 @@ fn nonzero_worker_exit_is_exit_three_and_keeps_its_valid_prefix() {
                         .as_str()
                         .is_some_and(|message| message == "worker-failure:go:nonzero-exit")
             })
+    );
+    let failure_summary = failed["error"].as_str().unwrap();
+    assert!(
+        failure_summary.contains("worker exploded"),
+        "the scan outcome must surface the worker failure detail: {failure_summary}"
     );
 
     let attempt_selector = format!("attempt:{}", failed["scan_id"].as_str().unwrap());

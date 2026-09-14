@@ -493,7 +493,22 @@ test("package export aliases may differ from the contained file path inside the 
     observed.outputs[0]?.assets[0]?.logical_path,
     "node_modules/next/dist/build/adapter/setup-node-env.external.js",
   );
+  assert.equal(JSON.stringify(observed).includes("setup-node-env.js\""), false);
 
+  const scoped = buildContext();
+  (scoped.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/@vercel/og/index.node.js":
+      "/repo/node_modules/@vercel/og/dist/index.node.js",
+  };
+  const scopedObserved = await collectNextBuildObservation(scoped, () => digest("c"));
+  assert.equal(
+    scopedObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/@vercel/og/dist/index.node.js",
+  );
+
+  // pnpm's isolated layout stores the real file under
+  // node_modules/.pnpm/<pkg>@<version>/node_modules/<pkg>; the innermost
+  // package boundary is what must match the exports alias.
   const pnpmLayout = buildContext();
   (pnpmLayout.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
     "node_modules/next/setup-node-env.js":
@@ -505,12 +520,61 @@ test("package export aliases may differ from the contained file path inside the 
     "node_modules/.pnpm/next@16.2.3/node_modules/next/dist/build/adapter/setup-node-env.external.js",
   );
 
+  // Nested installations of the package resolve against the innermost
+  // node_modules boundary on both sides.
+  const nestedInstall = buildContext();
+  (nestedInstall.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/app/node_modules/next/setup-node-env.js":
+      "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  const nestedObserved = await collectNextBuildObservation(nestedInstall, () => digest("c"));
+  assert.equal(
+    nestedObserved.outputs[0]?.assets[0]?.logical_path,
+    "node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  );
+
   const crossedPackage = buildContext();
   (crossedPackage.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
     "node_modules/next/setup-node-env.js": "/repo/node_modules/react/index.js",
   };
   await assert.rejects(
     collectNextBuildObservation(crossedPackage, () => digest("c")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  // A hint naming the outer package must not alias a file that belongs to a
+  // package nested inside it: the innermost boundary decides the package.
+  const outerHintForNestedFile = buildContext();
+  (outerHintForNestedFile.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/app/index.js":
+      "/repo/node_modules/app/node_modules/next/dist/build/adapter/setup-node-env.external.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(outerHintForNestedFile, () => digest("c")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  // Scoped packages keep their two-segment name across nesting: an alias for
+  // one scoped package cannot name a different package in the same scope.
+  const scopedMismatch = buildContext();
+  (scopedMismatch.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/@vercel/og/index.node.js":
+      "/repo/node_modules/@vercel/analytics/dist/index.node.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(scopedMismatch, () => digest("c")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe",
+  );
+
+  const outsideNodeModules = buildContext();
+  (outsideNodeModules.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "apps/site/aliased.js": "/repo/apps/site/.next/server/chunks/shared.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(outsideNodeModules, () => digest("c")),
     (error: unknown) => error instanceof NextBuildObserverError
       && error.code === "web.next_build_artifact_path_unsafe",
   );
@@ -748,6 +812,60 @@ test("same-source conditional routing entries remain distinct while exact duplic
     ["/docs", "/docs/conditional"],
   );
   assert.equal(graph.edges.filter((edge) => edge.kind === "routes_in_phase").length, 2);
+});
+
+test("observer failures carry bounded pathname-only detail for the failing value", async () => {
+  const invalidDestination = buildContext();
+  invalidDestination.routing.dynamicRoutes = [{
+    source: "/blogs/[id]",
+    sourceRegex: "^/blogs/(?<nxtPid>[^/]+?)(?:/)?$",
+    destination: "/blogs/[id]\\bad?token=must-not-be-persisted",
+  }];
+  await assert.rejects(
+    collectNextBuildObservation(invalidDestination, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_manifest_invalid"
+      && error.detail?.phase === "dynamicRoutes"
+      && error.detail?.source === "/blogs/[id]"
+      && error.detail?.destination === undefined
+      && !error.message.includes("must-not-be-persisted"),
+  );
+
+  const credentialHint = buildContext();
+  (credentialHint.outputs.appPages as Array<Record<string, unknown>>)[0]!.assets = {
+    "node_modules/next/setup-node-env.js?token=hunter2": "/repo/node_modules/other/dist/impostor.js",
+  };
+  await assert.rejects(
+    collectNextBuildObservation(credentialHint, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_artifact_path_unsafe"
+      && error.detail?.reason === "hint_mismatch"
+      && error.detail?.hinted === "node_modules/next/setup-node-env.js?<redacted-query>"
+      && !error.message.includes("hunter2"),
+  );
+
+  const unsafePathname = buildContext();
+  (unsafePathname.outputs.appPages as Array<Record<string, unknown>>)[0]!.pathname =
+    "/dashboard?token=must-not-be-persisted";
+  await assert.rejects(
+    collectNextBuildObservation(unsafePathname, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_output_pathname_unsafe"
+      && error.detail?.type === "APP_PAGE"
+      && error.detail?.pathname === "/dashboard?<redacted-query>"
+      && !error.message.includes("must-not-be-persisted"),
+  );
+
+  const fragmentPathname = buildContext();
+  (fragmentPathname.outputs.appPages as Array<Record<string, unknown>>)[0]!.pathname =
+    "/dashboard#must-not-be-persisted";
+  await assert.rejects(
+    collectNextBuildObservation(fragmentPathname, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_output_pathname_unsafe"
+      && error.detail?.pathname === "/dashboard?<redacted-query>"
+      && !error.message.includes("must-not-be-persisted"),
+  );
 });
 
 test("observer identity remains aligned across build evidence and adapter metadata", () => {

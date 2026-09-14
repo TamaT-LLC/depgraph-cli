@@ -13,7 +13,11 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::timeout,
+};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
@@ -950,7 +954,7 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let source_preflight_digest = fingerprint_build_source(&source_root)?.0;
+    let source_preflight_digest = source_mutation_fingerprint(&source_root)?;
     let compiler_precise_stage = matches!(
         plan.adapter.as_str(),
         COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
@@ -1180,7 +1184,7 @@ where
     let stdout = child.stdout.take().context("build stdout is unavailable")?;
     let stderr = child.stderr.take().context("build stderr is unavailable")?;
     let stdout_task = tokio::spawn(read_capped(stdout, plan.stdout_limit_bytes));
-    let stderr_task = tokio::spawn(read_capped(stderr, plan.stderr_limit_bytes));
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr, plan.stderr_limit_bytes));
     tokio::pin!(cancellation);
     enum WaitResult {
         Process(std::io::Result<std::process::ExitStatus>),
@@ -1389,7 +1393,7 @@ where
     let source_mutation = BuildSourceMutationAudit::from_postflight(
         plan.isolation,
         &source_preflight_digest,
-        fingerprint_build_source(&source_root).map(|fingerprints| fingerprints.0),
+        source_mutation_fingerprint(&source_root),
     );
     if source_mutation.status != BuildSourceMutationStatus::Unchanged {
         outcome = BuildOutcomeKind::SecurityFailed;
@@ -2223,6 +2227,45 @@ fn audit_environment_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> (Vec<S
 
 const CHILD_STDERR_TAIL_BYTES: usize = 64 * 1024;
 
+/// Drain the build child's stderr to EOF, keeping only the last `limit`
+/// bytes. Unlike a head-capped capture, the ring keeps the true end of the
+/// stream, which is where build tools report their terminal error even after
+/// megabytes of earlier diagnostics. When the ring overflowed, the leading
+/// partial line is dropped so downstream line-based redaction never sees a
+/// line whose secret-shaped prefix was cut away.
+async fn read_stderr_tail(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut tail = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total: u64 = 0;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        tail.extend_from_slice(&buffer[..read]);
+        if tail.len() > limit {
+            let excess = tail.len() - limit;
+            tail.drain(..excess);
+        }
+    }
+    let truncated = total > tail.len() as u64;
+    if truncated {
+        // The first remaining line is incomplete: its secret-shaped prefix
+        // may have been cut away by the ring. Drop it even when the buffer
+        // contains no newline, so an oversized `TOKEN=<opaque>` line cannot
+        // persist as a bare token fragment.
+        match tail.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => tail.drain(..=newline),
+            None => tail.drain(..),
+        };
+    }
+    Ok((tail, truncated))
+}
+
 fn redact_build_log(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -3001,6 +3044,16 @@ fn digest_workspace(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Fingerprint the source tree for the pre/postflight mutation audit.
+///
+/// The staging metadata digest participates so that swapping a regular file
+/// for a symlink (or the reverse) is always detected even when the content
+/// hashes collide by construction.
+fn source_mutation_fingerprint(root: &Path) -> Result<String> {
+    let (source_digest, _, staging_metadata_digest) = fingerprint_build_source(root)?;
+    Ok(format!("{source_digest}:{staging_metadata_digest}"))
+}
+
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
     let policy = load_stage_policy(root)?;
     let mut source = Sha256::new();
@@ -3635,6 +3688,46 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compiler_precise_failures_never_persist_a_stderr_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src"))?;
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"unit-graph-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )?;
+        fs::write(project.join("Cargo.lock"), "version = 4\n")?;
+        fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let cargo_script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'cargo 1.99.0-nightly\n'; exit 0; fi
+echo 'DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE' >&2
+exit 101
+"#;
+        let (requirement, _) = compiler_pack_fixture_with_scripts(
+            &temp,
+            cargo_script,
+            "#!/bin/sh\nexit 93\n",
+            "#!/bin/sh\nexit 94\n",
+        )?;
+        let request = create_compiler_precise_unit_graph_request(&project, requirement)?;
+        let outcome = execute_build_request(&request).await?;
+        assert_ne!(outcome.audit.outcome, BuildOutcomeKind::Completed);
+        let serialized = serde_json::to_string(&outcome.audit)?;
+        assert!(
+            !serialized.contains("DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE"),
+            "compiler-precise child stderr must not escape into the audit"
+        );
+        if let Some(tail) = outcome.child_stderr_tail.as_deref() {
+            assert!(
+                !tail.contains("DEPGRAPH_BUILD_SCRIPT_SECRET_MUST_NOT_ESCAPE"),
+                "secret-shaped build-script stderr must be redacted from the retained tail"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn marker_fixture_runs_only_in_staged_workspace_with_temporary_environment() -> Result<()>
     {
@@ -3655,6 +3748,10 @@ printf '{"version":1,"units":[{"pkg_id":"path+file://%s#0.1.0","target":{"kind":
         assert_eq!(outcome.audit.outcome, BuildOutcomeKind::Completed);
         assert!(outcome.project_code_executed);
         assert!(outcome.audit.validated_output_digest.is_some());
+        assert!(
+            outcome.child_stderr_tail.is_none(),
+            "a completed build must not retain a stderr tail"
+        );
         assert!(!root.path().join("PROJECT_CODE_EXECUTED").exists());
         let serialized = serde_json::to_string(&outcome.audit)?;
         assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
@@ -4085,6 +4182,48 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
     }
 
     #[test]
+    fn stderr_reader_keeps_the_true_stream_tail_beyond_the_capture_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let capture_limit = 64 * 1024;
+        let mut stream = vec![b'a'; 2 * capture_limit];
+        stream.extend_from_slice(b"\nTOKEN=hunter2\nterminal build error");
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(stream.as_slice(), capture_limit))
+            .unwrap();
+        assert!(truncated, "a stream larger than the limit must be flagged");
+        assert!(tail.len() <= capture_limit);
+        assert!(
+            tail.ends_with(b"terminal build error"),
+            "the ring must keep the true end of the stream, not the head of the capture"
+        );
+        assert!(
+            !tail.starts_with(b"a"),
+            "the leading partial line must be dropped so line-based redaction never sees a line with its secret-shaped prefix cut away"
+        );
+
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(&b"short failure"[..], capture_limit))
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(tail, b"short failure");
+
+        let mut secret_line = b"TOKEN=".to_vec();
+        secret_line.extend(std::iter::repeat_n(b'x', capture_limit + 32));
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(secret_line.as_slice(), capture_limit))
+            .unwrap();
+        assert!(truncated);
+        assert!(
+            tail.is_empty(),
+            "a truncated newline-free secret line must be dropped in full, not kept as a token fragment"
+        );
+    }
+
+    #[test]
     fn execution_plan_rejects_shell_paths_and_unsafe_environment() {
         let mut plan = node_plan(Vec::new());
         plan.program = "./node".to_owned();
@@ -4247,6 +4386,29 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(!destination.path().join("loop").exists());
         assert!(!destination.path().join("sub/up").exists());
         assert!(!destination.path().join("loop/loop").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_absolute_and_parent_traversal_symlink_escapes() -> Result<()> {
+        let absolute = tempfile::tempdir()?;
+        fs::write(absolute.path().join("keep.txt"), "fixture")?;
+        std::os::unix::fs::symlink("/etc", absolute.path().join("etc-link"))?;
+        let error = stage_workspace(absolute.path(), tempfile::tempdir()?.path())
+            .expect_err("absolute symlink targets outside the repository must be rejected")
+            .to_string();
+        assert!(error.contains("security policy violation"), "{error}");
+        assert!(error.contains("etc-link"), "{error}");
+
+        let escaping = tempfile::tempdir()?;
+        fs::write(escaping.path().join("keep.txt"), "fixture")?;
+        std::os::unix::fs::symlink("..", escaping.path().join("up-link"))?;
+        let error = stage_workspace(escaping.path(), tempfile::tempdir()?.path())
+            .expect_err("parent-traversal symlink escapes must be rejected")
+            .to_string();
+        assert!(error.contains("security policy violation"), "{error}");
+        assert!(error.contains("up-link"), "{error}");
         Ok(())
     }
 
