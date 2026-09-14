@@ -316,6 +316,7 @@ depgraph daemon stop /path/to/repository
 
 # 権限を伴うビルド観測。実行ごとに明示的な同意が必要になる。
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -434,6 +435,10 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 対話的な確認は行わず、実行のたびに`--allow-project-code`を明示しなければならない。
 設定、環境変数、`CI=true`、TTYの状態、過去の同意によって権限を付与することはできない。
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
+一時ワークスペースにコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
+循環リンクと `.git` / `.depgraph` / リポジトリ直下の `target` / `.next` を指すリンクはコピーしない。
+リポジトリ外を指すリンクは拒否する。`.depgraph.toml` の `[build] ignored_paths` にリポジトリ相対プレフィックスを書くと、その配下はステージング対象から外れる。未知の `[build]` キーはエラーになる。
+失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
 `Cargo.toml`と`Cargo.lock`を持つRustワークスペースはCargoで実行する。
 Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。シェルコマンドやnpm/pnpm/yarnのlifecycleは受け付けない。
@@ -480,10 +485,10 @@ const result = spawnSync(
 process.exit(result.status ?? 1);
 ```
 
-Next.jsではこの例で完結する。entrypoint自身はobserverをimportせず、`next build`が環境変数`NEXT_ADAPTER_PATH`を読み取ってリリース同梱アダプターのビルドフック（`modifyConfig`・`onBuildComplete`）を呼び出し、観測結果を`DEPGRAPH_OUTPUT_DIR`へ書き出す。この自動組み込みこそが、entrypointに本物の`next build`プロセスの起動を求める理由である。
+Next.jsではこの例で完結する。Next.js 16.2以降では、entrypoint自身はobserverをimportせず、`next build`が環境変数`NEXT_ADAPTER_PATH`を読み取ってリリース同梱アダプターのビルドフック（`modifyConfig`・`onBuildComplete`）を呼び出し、観測結果を`DEPGRAPH_OUTPUT_DIR`へ書き出す。この自動組み込みこそが、entrypointに本物の`next build`プロセスの起動を求める理由である。
 
 コピーして使えるNext.js向けスクリプトは[docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs)にもある。
-プランが無い場合のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。
+プランが無い場合（`depgraph`キー自体が無い、または`{"depgraph":{}}`のように`build`だけが欠ける場合）のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 

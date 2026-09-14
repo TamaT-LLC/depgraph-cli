@@ -370,6 +370,7 @@ depgraph daemon stop /path/to/repository
 
 # Privileged build observation; every invocation requires explicit consent.
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -972,7 +973,8 @@ process.exit(result.status ?? 1);
 ```
 
 This example is complete for Next.js: the entrypoint never imports the
-observer itself. Next.js reads `NEXT_ADAPTER_PATH` during `next build` and
+observer itself and must not call `modifyConfig` / `onBuildComplete` itself.
+Next.js 16.2+ reads `NEXT_ADAPTER_PATH` during `next build` and
 invokes the release-provided adapter's build hooks (`modifyConfig`,
 `onBuildComplete`), which write the observation artifact into
 `DEPGRAPH_OUTPUT_DIR`. That automatic integration is exactly why the
@@ -980,18 +982,28 @@ entrypoint must launch the real `next build` process.
 
 A copyable Next.js script also ships as
 [`docs/examples/next-depgraph-build.mjs`](docs/examples/next-depgraph-build.mjs).
-A missing `depgraph.build` plan fails with a copyable template and a pointer
-to `depgraph resolve --help`.
+A missing `depgraph.build` plan (including `{"depgraph":{}}` with no `build`
+object) fails with a copyable template and a pointer to
+`depgraph resolve --help`.
 
 The relative entrypoint must integrate the release-provided
 observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
 the real build lifecycle. It runs in a temporary staged workspace using
 canonical system Node, a cleared allowlisted environment, temporary
 HOME/cache/output, bounded output, timeout/cancellation, and cross-platform
-process-tree cleanup. Every launched attempt saves a secret-free audit
+process-tree cleanup. In-repository symbolic links are materialized as regular
+files or directories; a link whose canonical target leaves the repository fails
+closed. Cyclic links and links into `.git`, `.depgraph`, or the repository-root
+`target` / `.next` directories are omitted rather than copied. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
+prefixes from staging, and unknown `[build]` keys are rejected. `[daemon]
+ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
 isolation capability, and outcome; raw stdout/stderr and temporary or host
-paths are not persisted. Network isolation is reported as `best-effort` unless
+paths are not persisted in the audit record. On a failed, timed-out, or
+cancelled attempt, a redacted stderr tail is printed and a redacted log file
+is written under the process temp directory as
+`depgraph-build-<run-id>.stderr.log`. `resolve --json` returns `build_run`,
+`status`, `diagnostic`, `exit_code`, `log_path`, and `stderr_tail`. Network isolation is reported as `best-effort` unless
 an outer namespace/container enforces it.
 
 Validated observer output uses the shared `framework-build-graph-v1` contract:
