@@ -412,6 +412,16 @@ test("dynamicRoutes destinations keep the pathname when Next includes a named ca
   assert.deepEqual(destinations, ["/blogs/[id]", "/blogs/[id]$rscSuffix"]);
   assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
   assert.equal(JSON.stringify(observed).includes("?"), false);
+  const dynamicEntries = observed.routing.filter((entry) => entry.phase === "dynamicRoutes");
+  const rsc = dynamicEntries.find((entry) => entry.variant === "rsc");
+  assert.equal(rsc?.canonical_route_pattern, "/blogs/[id]");
+  const route = dynamicEntries.find((entry) => entry.variant === "route");
+  assert.equal(route?.destination_present, true);
+  assert.equal(route?.canonical_route_pattern, "/blogs/[id]");
+  const graph = buildNextObservedGraph({ observation: observed, provenance, baseNodes: [] });
+  assert.ok(graph.nodes.some((node) => (
+    node.kind === "route" && node.properties.route_pattern === "/blogs/[id]"
+  )));
 });
 
 test("unsafe artifact paths and unsupported output contracts fail without a partial observation", async () => {
@@ -738,49 +748,6 @@ test("same-source conditional routing entries remain distinct while exact duplic
     ["/docs", "/docs/conditional"],
   );
   assert.equal(graph.edges.filter((edge) => edge.kind === "routes_in_phase").length, 2);
-});
-
-test("dynamicRoutes destinations keep only their pathname when Next appends a named-capture query", async () => {
-  const context = buildContext();
-  context.routing.dynamicRoutes = [
-    {
-      source: "/blogs/[id].rsc",
-      sourceRegex: "^/blogs/(?<nxtPid>[^/]+?)\\.rsc(?:/)?$",
-      destination: "/blogs/[id]$rscSuffix?nxtPid=$nxtPid",
-    },
-    {
-      source: "/blogs/[id]",
-      sourceRegex: "^/blogs/(?<nxtPid>[^/]+?)(?:/)?$",
-      destination: "/blogs/[id]?nxtPid=$nxtPid",
-    },
-  ];
-  const observed = await collectNextBuildObservation(context, () => digest("a"));
-  const dynamicEntries = observed.routing.filter((entry) => entry.phase === "dynamicRoutes");
-  assert.equal(dynamicEntries.length, 2);
-  const rsc = dynamicEntries.find((entry) => entry.variant === "rsc");
-  assert.equal(rsc?.destination, "/blogs/[id]$rscSuffix");
-  assert.equal(rsc?.canonical_route_pattern, "/blogs/[id]");
-  const route = dynamicEntries.find((entry) => entry.variant === "route");
-  assert.equal(route?.destination, "/blogs/[id]");
-  assert.equal(route?.destination_present, true);
-  assert.equal(route?.canonical_route_pattern, "/blogs/[id]");
-  assert.equal(JSON.stringify(observed).includes("nxtPid"), false);
-  const graph = buildNextObservedGraph({ observation: observed, provenance, baseNodes: [] });
-  assert.ok(graph.nodes.some((node) => (
-    node.kind === "route" && node.properties.route_pattern === "/blogs/[id]"
-  )));
-
-  const queryOnly = buildContext();
-  queryOnly.routing.dynamicRoutes = [{
-    source: "/blogs/[id]",
-    sourceRegex: "^/blogs/(?<nxtPid>[^/]+?)(?:/)?$",
-    destination: "?nxtPid=$nxtPid",
-  }];
-  await assert.rejects(
-    collectNextBuildObservation(queryOnly, () => digest("a")),
-    (error: unknown) => error instanceof NextBuildObserverError
-      && error.code === "web.next_build_manifest_invalid",
-  );
 });
 
 test("observer identity remains aligned across build evidence and adapter metadata", () => {
