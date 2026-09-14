@@ -26,6 +26,12 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
+バージョン更新時は、`xtask/src/main.rs`の`TARGET_NATIVE_SMOKE_EXPECTATIONS`も5 targetのnative package検証結果から更新する。
+queryとprofileのdigestには製品・adapterのバージョンとnative targetが含まれる。
+意味的な検証とcheckout間の決定性検証を通過した実測値だけを採用し、出典のrun・job・source SHAを記録する。
+全targetの更新後に`TARGET_NATIVE_SMOKE_EXPECTATION_VERSION`を更新する。通常のmetadata検証はこのversionと製品versionの不一致を拒否する。
+固定値の収集で失敗したrunは公開承認の証跡に流用せず、更新後のexact sourceでFull CIを再実行する。
+
 Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
 `v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。
 公開済み`v0.5.4`はStore schema `17`のimmutable baselineである。

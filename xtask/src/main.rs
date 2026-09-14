@@ -193,46 +193,47 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.6.1";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:8e580dcb7bd2cc760598651e319ff4d335299a6d199083d15eb4b9029617b8ca",
-        query_result_digest: "bounded-query-result:sha256:5b7fbe66887e35ac5e762b7a7d3f686c5ec3fa2a33b7980355a302e8b5336819",
-        query_output_sha256: "0a2584d76e6d6d403c862f1d9adffda615a546ac14456def1de12c6ce8ae87fd",
-        profile_plan_digest: "profile-selection-plan:sha256:65761c94739401993ff59f846f8b0866baf359c0291ae541d982a60af0b15ac8",
-        profile_plan_output_sha256: "c665c641dfeb4dbecf60658da483bb2617d4e0ad52952cc5a52ce520910dd89e",
+        query_plan_digest: "bounded-query-plan:sha256:3df34059db947270a73e4ae52176dceeffe1db9ce03d2ede360de03f16a107f0",
+        query_result_digest: "bounded-query-result:sha256:35ec1efae0764507ddb12f6622130af414b8705f500d7ae00a738c58e4ddab34",
+        query_output_sha256: "bb38b9b0aa1367cd24df161eaf3cf3ecaaccca22a5228491ab84fe4bf0ce67fc",
+        profile_plan_digest: "profile-selection-plan:sha256:ed88f1ad1819c762846f93cfe875aff368b06eafe3b1af062f0ddfa41ef14083",
+        profile_plan_output_sha256: "a28513c865a8fcdc87b286e71e875c4d3820bbf7e5352bc8e7d84841045940e1",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:db537bc438d74f71ee04ff5e6ad81d5e9e5d1c2b6de0ba8ebbc17eaa7f8091ea",
-        query_result_digest: "bounded-query-result:sha256:e99ed6f6735ae24cd4014f1716adcb1c19eede8c5d2921a343176f01dfa31e62",
-        query_output_sha256: "fa7b89e3ea8420515974ab5d23d282c930d939584393e376ccf133fd598c4fad",
-        profile_plan_digest: "profile-selection-plan:sha256:77409694a6f32f537b77f68a3e5960c1efa34aa2d27b56493ab95a14b03a1109",
-        profile_plan_output_sha256: "0b831baaadd841e93a0664444e1affd9adef10b96d480711907a2f6f15f54b9a",
+        query_plan_digest: "bounded-query-plan:sha256:c47758a44a03fd92b5dd954c1b8b183e9eb9ee30a877d6a9c748f64cbacd0277",
+        query_result_digest: "bounded-query-result:sha256:b2e77a51400db37fc23026ceede0042abd6293178faf7e8351190a5f34b0f914",
+        query_output_sha256: "6ccaf0d9cf388dcb766b17ae140fe91d21d89052245a05383ef9369e4e4efbd3",
+        profile_plan_digest: "profile-selection-plan:sha256:5d55dd69f734b830308d3afe6116d3537b06b0329ba6611bcf5f8ab7d410593c",
+        profile_plan_output_sha256: "525b77fa3dcdb931f30f7ee7a824bd1407f1ea3b070db09b48fdd3c60775eda3",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:0c98785e4fa34cbb27f24b5fd0deff55f944c68b5427594d4feb4df30427b955",
-        query_result_digest: "bounded-query-result:sha256:02edd507d4a0da68715d1a5ca7b095b162011e0eb152e3990ca715e15e940514",
-        query_output_sha256: "2b26381d521c1982e4a1b9e7f3dc4fc6c2d3bb4842d193444777998e2117a67c",
-        profile_plan_digest: "profile-selection-plan:sha256:1809c39fff963b2d02a8e4af93c01e651967ffd9cac6b5e9473a9ef09a9bca00",
-        profile_plan_output_sha256: "aec7e1b33d4b95b0601aa81ec60bdff8720ec169dfb64409e5c6323610514f5e",
+        query_plan_digest: "bounded-query-plan:sha256:372935de59ffb986aae8be966f5a6ef81c672adc6c9b5b7e9415c110073564a5",
+        query_result_digest: "bounded-query-result:sha256:e38f6180b154bafb89d3a9a8090bee0624e2477a77bdc5422e11373e559f59e5",
+        query_output_sha256: "2074b4d571dc5c171f416872be3a53f679f7644a3fce70e77d45999bd913fbd5",
+        profile_plan_digest: "profile-selection-plan:sha256:6aedbc726fcb806fde2a83b9b832dd41f47e86f74f8baf0934195d6e6bd1acf0",
+        profile_plan_output_sha256: "235a8c33679aea5ca61b8db2f6829f6ba6dd24fc8a0187f1f8d60be2d60c62f7",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:2c79fbcc55ccfa4820b6c139cca7dccda4254ffffc43e15187d36213002bc8a2",
-        query_result_digest: "bounded-query-result:sha256:4eb8578017bbcd4e85d94ba2c0bb478d0c7a85b0b2611a589fef73b290189466",
-        query_output_sha256: "77891326b68de5f1dce0190cffc856d8568e05e090c5a65240a65ae566a54faa",
-        profile_plan_digest: "profile-selection-plan:sha256:c4801bc1a678c003e1aa8ea9777e0c00f86d5b7262197b2f38abab257045eddb",
-        profile_plan_output_sha256: "0f0f6c492b9bde57feb3fa86dadc9126480b8d22e5e320fff3839d49f95e0045",
+        query_plan_digest: "bounded-query-plan:sha256:54bb4d772262b282456d61593852244326363f359d5b7903317fe6748a0295c9",
+        query_result_digest: "bounded-query-result:sha256:9f60f1c3c35ab5d45785d9d68afd9e59a1cbec6846ec0f4c209003e66a9beaf6",
+        query_output_sha256: "4c07da35496c33303b2f3428913e486fdff578e9a1975455d963cf55b5e34863",
+        profile_plan_digest: "profile-selection-plan:sha256:68bbf71cd940d4c69dd35035de6c1f623f7116a93700eb8da05ee8f5d3567a41",
+        profile_plan_output_sha256: "42776496edc35232322739852413f475f7fd58237f368c4752274827f886bf5c",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:6e8f3e0a7b407aa8333dfb6f40468726f317016bf51e317a1c357cf391c9c1ba",
-        query_result_digest: "bounded-query-result:sha256:2457b1d266ffb2d2433a884a7bd2ff5d67e9c4ba723e1f53bd4f984a924d4353",
-        query_output_sha256: "996fc56abc158f1c8748fa38a8ad90054e7d83addd7c6efa9717f1dc95d1c641",
-        profile_plan_digest: "profile-selection-plan:sha256:f19b543b5c5eae9de78c9455972dfedf7b086496f4523cf3fa391055e12a8e2d",
-        profile_plan_output_sha256: "552efb36e050111c1f177aeccc6fead3799010c9bdada3d7c722282cf6b9cf3e",
+        query_plan_digest: "bounded-query-plan:sha256:6dd8d57ad1e664fd99c12a788db9ae212cfb7159ddc0bdc743169458e3e13135",
+        query_result_digest: "bounded-query-result:sha256:88fc30f6f6767fbfbea5f8f8c3db17dcea48b4cdfcc7e5852d280b82d228248b",
+        query_output_sha256: "56b7bb6a1039c3650180bd800028f52d81abeff64598624390127ea61d2ba318",
+        profile_plan_digest: "profile-selection-plan:sha256:0bdc696112cba859d469cf45331d1395d8416bb01933effc2d6d0e8ad2973d0a",
+        profile_plan_output_sha256: "084cebe4e2eb6eb29229b2f3fb8926ecc7c8b818be85c05ee822cb8cc99bc34f",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -7517,6 +7518,43 @@ jobs:
         }
         for path in ["toolchain/library.dll", "rust-src/build.sh", "README"] {
             assert!(!has_windows_executable_extension(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn native_smoke_pins_match_recorded_native_observations() {
+        let evidence: Value = serde_json::from_str(include_str!(
+            "../fixtures/native-smoke-v0.6.1-observations.json"
+        ))
+        .unwrap();
+        assert_eq!(evidence["version"], VERSION);
+        let targets = evidence["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), RELEASE_TARGETS.len());
+        for (target, _) in RELEASE_TARGETS {
+            let observations: Vec<_> = targets
+                .iter()
+                .filter(|row| row["target"] == *target)
+                .collect();
+            assert_eq!(observations.len(), 1, "{target}");
+            let observed = observations[0];
+            let expected = target_native_smoke_expectation(target).unwrap();
+            assert_eq!(observed["query_plan_digest"], expected.query_plan_digest);
+            assert_eq!(
+                observed["query_result_digest"],
+                expected.query_result_digest
+            );
+            assert_eq!(
+                observed["query_output_sha256"],
+                expected.query_output_sha256
+            );
+            assert_eq!(
+                observed["profile_plan_digest"],
+                expected.profile_plan_digest
+            );
+            assert_eq!(
+                observed["profile_plan_output_sha256"],
+                expected.profile_plan_output_sha256
+            );
         }
     }
 

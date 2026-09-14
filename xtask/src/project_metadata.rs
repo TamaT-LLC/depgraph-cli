@@ -1083,6 +1083,11 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
 }
 
 pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
+    if crate::TARGET_NATIVE_SMOKE_EXPECTATION_VERSION != VERSION {
+        bail!(
+            "native smoke expectations must be refreshed from all five native gates for {VERSION}"
+        );
+    }
     verify_github_actions_security(root)?;
     verify_mcp_tasks_architecture_decision(root)?;
     mcp_package_smoke::verify_documentation(root, VERSION)?;
