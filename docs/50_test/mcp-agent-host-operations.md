@@ -7,10 +7,12 @@ profile below only when its effects are required; do not register several
 profiles for the same repository as an accidental privilege fallback.
 
 The examples use the planned stable `v0.6.1` package. `v0.6.1` is a patch
-release retaining the v0.6.0 Store schema `19` and code-health contract/API. The published `v0.5.4` package remains the immutable
-schema-17 baseline until the v0.6.1 Release and post-publish evidence are
-public. Do not mix the two versions' binaries, workers, compiler packs, or
-Stores.
+release retaining the v0.6.0 Store schema `19` and code-health contract/API.
+The current supported stable is `v0.6.0` until the v0.6.1 Release and matching
+post-publish evidence are public. Use these versioned examples only after that
+publication. The published `v0.5.4` package is an immutable historical
+schema-17 baseline. Keep binaries, workers, and compiler packs from the same
+release; a schema-19 Store must never be opened by the v0.5.4 binary.
 
 ## Scoped Agent host onboarding
 

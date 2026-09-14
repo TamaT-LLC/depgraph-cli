@@ -153,7 +153,7 @@ evaluated separately.
 ## Install official packages
 
 The following installation guidance applies after the official Release and
-post-publish evidence exist. The published `v0.5.4` provides native packages
+post-publish evidence exist. The current stable `v0.6.0` provides native packages
 for Linux x86-64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows
 x86-64. The next patch release, `v0.6.1`, is planned for the same five targets.
 The `v0.6.1` examples below are valid only after its Release and evidence are
@@ -241,11 +241,11 @@ tests together. Development workflow and command details are in
 
 ## Releases and compatibility
 
-The published `v0.5.4` artifact implements the contract documented in the
-[`v0.5.4` release notes](docs/releases/v0.5.4.md). `main` may contain
+The current stable `v0.6.0` artifact implements the contract documented in the
+[`v0.6.0` release notes](docs/releases/v0.6.0.md). `main` may contain
 post-tag development changes that are not part of that published artifact. A
 stable release is valid only when the
-[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)
+[`v0.6.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.0)
 and its post-publish evidence exist and agree.
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
@@ -272,8 +272,10 @@ documented as [`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
-See the [`v0.5.4` release notes](docs/releases/v0.5.4.md) for the complete
+See the [`v0.6.0` release notes](docs/releases/v0.6.0.md) for the current stable
 compatibility tuple, Store migrations, rollback procedure, and known limits.
+The historical schema-17 contract remains in the
+[`v0.5.4` release notes](docs/releases/v0.5.4.md).
 The planned `v0.6.1` fixes and compatibility guarantees are recorded in the
 [`v0.6.1` release notes](docs/releases/v0.6.1.md).
 

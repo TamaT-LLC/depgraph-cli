@@ -140,7 +140,7 @@ sourceは自動変更しない。
 ## 公式パッケージの導入
 
 以下は、公式Releaseと公開後証跡が揃った後に適用される導入案内である。
-`v0.5.4`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
+公開済みstable `v0.6.0`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
 次のpatch release `v0.6.1`も同じ5 targetで提供する予定である。
 `v0.6.1`の導入例は、公式Releaseと公開後証跡が揃うまで実行しない。
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
@@ -221,8 +221,8 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-公開済みの`v0.5.4` artifactは[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に記載した`0.5.4`契約を実装している。
-`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.5.4` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.5.4)と公開後証跡が一致するときに限り有効である。
+現在の公開済みstable `v0.6.0` artifactは、[`v0.6.0`リリースノート](docs/releases/v0.6.0.md)に記載した契約を実装している。
+`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.0)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
 次のpatch release `v0.6.1`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
@@ -238,7 +238,8 @@ current `main`はStore schema `19`を使用し、schema 19へ移行したStore�
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
 過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
-完全な互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)を参照する。
+現行stableの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.0`リリースノート](docs/releases/v0.6.0.md)を参照する。
+過去のschema 17の契約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に保持する。
 `v0.6.1`の移行条件とAPI差分は、準備中の[`v0.6.1`リリースノート](docs/releases/v0.6.1.md)に記載する。
 
 ## プロジェクトの状況と公開コラボレーション
