@@ -2253,8 +2253,15 @@ async fn read_stderr_tail(
         }
     }
     let truncated = total > tail.len() as u64;
-    if truncated && let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
-        tail.drain(..=newline);
+    if truncated {
+        // The first remaining line is incomplete: its secret-shaped prefix
+        // may have been cut away by the ring. Drop it even when the buffer
+        // contains no newline, so an oversized `TOKEN=<opaque>` line cannot
+        // persist as a bare token fragment.
+        match tail.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => tail.drain(..=newline),
+            None => tail.drain(..),
+        };
     }
     Ok((tail, truncated))
 }
@@ -4203,6 +4210,17 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
             .unwrap();
         assert!(!truncated);
         assert_eq!(tail, b"short failure");
+
+        let mut secret_line = b"TOKEN=".to_vec();
+        secret_line.extend(std::iter::repeat_n(b'x', capture_limit + 32));
+        let (tail, truncated) = runtime
+            .block_on(read_stderr_tail(secret_line.as_slice(), capture_limit))
+            .unwrap();
+        assert!(truncated);
+        assert!(
+            tail.is_empty(),
+            "a truncated newline-free secret line must be dropped in full, not kept as a token fragment"
+        );
     }
 
     #[test]
