@@ -954,7 +954,7 @@ where
     if !source_root.is_dir() {
         bail!("build source root is not a directory");
     }
-    let source_preflight_digest = fingerprint_build_source(&source_root)?.0;
+    let source_preflight_digest = source_mutation_fingerprint(&source_root)?;
     let compiler_precise_stage = matches!(
         plan.adapter.as_str(),
         COMPILER_PRECISE_UNIT_GRAPH_ADAPTER | COMPILER_PRECISE_INVOCATION_ADAPTER
@@ -1393,7 +1393,7 @@ where
     let source_mutation = BuildSourceMutationAudit::from_postflight(
         plan.isolation,
         &source_preflight_digest,
-        fingerprint_build_source(&source_root).map(|fingerprints| fingerprints.0),
+        source_mutation_fingerprint(&source_root),
     );
     if source_mutation.status != BuildSourceMutationStatus::Unchanged {
         outcome = BuildOutcomeKind::SecurityFailed;
@@ -3037,6 +3037,16 @@ fn digest_workspace(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Fingerprint the source tree for the pre/postflight mutation audit.
+///
+/// The staging metadata digest participates so that swapping a regular file
+/// for a symlink (or the reverse) is always detected even when the content
+/// hashes collide by construction.
+fn source_mutation_fingerprint(root: &Path) -> Result<String> {
+    let (source_digest, _, staging_metadata_digest) = fingerprint_build_source(root)?;
+    Ok(format!("{source_digest}:{staging_metadata_digest}"))
+}
+
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
     let policy = load_stage_policy(root)?;
     let mut source = Sha256::new();
@@ -4358,6 +4368,29 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         assert!(!destination.path().join("loop").exists());
         assert!(!destination.path().join("sub/up").exists());
         assert!(!destination.path().join("loop/loop").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_absolute_and_parent_traversal_symlink_escapes() -> Result<()> {
+        let absolute = tempfile::tempdir()?;
+        fs::write(absolute.path().join("keep.txt"), "fixture")?;
+        std::os::unix::fs::symlink("/etc", absolute.path().join("etc-link"))?;
+        let error = stage_workspace(absolute.path(), tempfile::tempdir()?.path())
+            .expect_err("absolute symlink targets outside the repository must be rejected")
+            .to_string();
+        assert!(error.contains("security policy violation"), "{error}");
+        assert!(error.contains("etc-link"), "{error}");
+
+        let escaping = tempfile::tempdir()?;
+        fs::write(escaping.path().join("keep.txt"), "fixture")?;
+        std::os::unix::fs::symlink("..", escaping.path().join("up-link"))?;
+        let error = stage_workspace(escaping.path(), tempfile::tempdir()?.path())
+            .expect_err("parent-traversal symlink escapes must be rejected")
+            .to_string();
+        assert!(error.contains("security policy violation"), "{error}");
+        assert!(error.contains("up-link"), "{error}");
         Ok(())
     }
 
