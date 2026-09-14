@@ -855,6 +855,17 @@ test("observer failures carry bounded pathname-only detail for the failing value
       && error.detail?.pathname === "/dashboard?<redacted-query>"
       && !error.message.includes("must-not-be-persisted"),
   );
+
+  const fragmentPathname = buildContext();
+  (fragmentPathname.outputs.appPages as Array<Record<string, unknown>>)[0]!.pathname =
+    "/dashboard#must-not-be-persisted";
+  await assert.rejects(
+    collectNextBuildObservation(fragmentPathname, () => digest("a")),
+    (error: unknown) => error instanceof NextBuildObserverError
+      && error.code === "web.next_build_output_pathname_unsafe"
+      && error.detail?.pathname === "/dashboard?<redacted-query>"
+      && !error.message.includes("must-not-be-persisted"),
+  );
 });
 
 test("observer identity remains aligned across build evidence and adapter metadata", () => {

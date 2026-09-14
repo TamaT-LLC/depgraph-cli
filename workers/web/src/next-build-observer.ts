@@ -622,12 +622,12 @@ async function defaultArtifactReader(absolutePath: string, _logicalPath: string,
   }
 }
 
-// Failure details never carry query strings: only the pathname part of a
-// route value identifies the failing entry.
+// Failure details never carry query strings or fragments: only the pathname
+// part of a route value identifies the failing entry.
 function routingDetailPathname(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const queryIndex = value.indexOf("?");
-  return queryIndex < 0 ? value : `${value.slice(0, queryIndex)}?<redacted-query>`;
+  const suffixIndex = value.search(/[?#]/u);
+  return suffixIndex < 0 ? value : `${value.slice(0, suffixIndex)}?<redacted-query>`;
 }
 
 function sanitizeRouting(
