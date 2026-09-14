@@ -65,9 +65,8 @@ and GitHub Actions quality gates, five-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
 maintainer plus an independent approver. The supported stable line is the
 newest stable version whose official Release and matching post-publish evidence
-exist. The published `v0.5.4` remains supported while `v0.6.0` is prepared.
-`v0.6.0` is a minor release for current `main`: it publishes Store schema `19`
-and the code-health contract/API. It is not a patch to the `v0.5.4` contract.
+exist. The published `v0.6.0` remains supported while `v0.6.1` is prepared.
+`v0.6.1` retains the v0.6.0 Store schema `19` and code-health contract/API.
 
 The signed `v0.5.4` tag, its source, and its Store schema `17` artifact remain
 immutable history. The v0.6.0 release contract is recorded in
