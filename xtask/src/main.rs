@@ -7537,6 +7537,40 @@ jobs:
                 .collect();
             assert_eq!(observations.len(), 1, "{target}");
             let observed = observations[0];
+            let (run, job, source_commit) = match *target {
+                "aarch64-unknown-linux-gnu" => (
+                    34833093257_u64,
+                    103940719155_u64,
+                    "f64438941b5a386e262f909d81493559228a6ba0",
+                ),
+                "x86_64-unknown-linux-gnu" => (
+                    34829665257,
+                    103938269794,
+                    "0ea0099138833da5cde2cf35ef83109b5b0648e3",
+                ),
+                "x86_64-apple-darwin" => (
+                    34829665257,
+                    103929753716,
+                    "0ea0099138833da5cde2cf35ef83109b5b0648e3",
+                ),
+                "aarch64-apple-darwin" => (
+                    34829665257,
+                    103938269916,
+                    "0ea0099138833da5cde2cf35ef83109b5b0648e3",
+                ),
+                "x86_64-pc-windows-msvc" => (
+                    34829665257,
+                    103938269907,
+                    "0ea0099138833da5cde2cf35ef83109b5b0648e3",
+                ),
+                _ => panic!("missing recorded native job for {target}"),
+            };
+            assert_eq!(observed["source_commit"], source_commit, "{target}");
+            assert_eq!(
+                observed["job_url"],
+                format!("https://github.com/TamaT-LLC/depgraph-cli/actions/runs/{run}/job/{job}"),
+                "{target}"
+            );
             let expected = target_native_smoke_expectation(target).unwrap();
             assert_eq!(observed["query_plan_digest"], expected.query_plan_digest);
             assert_eq!(
