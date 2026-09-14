@@ -1,5 +1,39 @@
 # 未リリース
 
+## depgraph.build の欠落診断と Next observer の自動ロード
+
+`{"depgraph":{}}` のように `build` だけが欠けている場合も、コピー可能な雛形と `depgraph resolve --help` を出す。
+Next.js 16.2 以降は `NEXT_ADAPTER_PATH` から observer を自動ロードするため、公式例は `next build` を spawn するだけで `modifyConfig` / `onBuildComplete` を呼ばない。
+
+関連: [#491](https://github.com/TamaT-LLC/depgraph-cli/issues/491)。
+
+## resolve と safe scan の失敗診断
+
+`resolve --build` が失敗したときは、ビルド子プロセスの redacted な stderr 末尾を表示し、一時ディレクトリに `depgraph-build-<run-id>.stderr.log` を残す。
+`resolve --json` は `build_run` / `status` / `diagnostic` / `exit_code` / `log_path` / `stderr_tail` を返す。
+監査記録には raw stderr とホストパスを載せない。シークレット形状の行は `[REDACTED]` にする。
+Next.js observer の `fail` は pathname とルートパターンに限定した `detail` を持ち、診断へ伝搬する。
+safe scan の worker 起動失敗は `worker-failure:web:launch` など具体的な reason を返し、stderr を adapter log に残す。
+進捗がない `other` 失敗でも inventory / typescript / launch のフェーズを推定する。
+
+## Next.js の package exports エイリアス
+
+Next.js 16.2 はアセットの `logicalHint` に `next/setup-node-env.js` のような package exports エイリアスを渡し、実ファイルは `node_modules/next/dist/...` にある。
+同じ `node_modules` パッケージ内であればヒントと実パスの文字列一致を要求せず、安全性判定はリポジトリ内に収まっている実パスで行う。
+別パッケージやリポジトリ外、不正なヒントは従来どおり `web.next_build_artifact_path_unsafe` で拒否する。
+保存する観測値の `logical_path` は実パスのままである。
+
+関連: [#490](https://github.com/TamaT-LLC/depgraph-cli/issues/490)。
+
+## resolve --build のステージングと pnpm
+
+一時ワークスペースへコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
+循環リンクと `.git` / `.depgraph` / `target` / `.next` を指すリンクはコピーせず、収集中に件数上限も適用する。
+リポジトリ外を指すリンクは従来どおり拒否し、`.depgraph.toml` の `[build] ignored_paths` で除外できることを案内する。
+未知の `[build]` キーはエラーになる。`[daemon] ignored_paths` は resolve のステージングには使わない。
+
+関連: [#489](https://github.com/TamaT-LLC/depgraph-cli/issues/489)。
+
 ## Next.js 16.2 の dynamicRoutes destination
 
 Next.js 16.2 は動的ルートの `destination` に `?nxtPid=$nxtPid` のような named capture クエリを付ける。

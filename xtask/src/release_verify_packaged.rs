@@ -420,6 +420,8 @@ fn cross_language_ffi_outcome(
         rust_compiler_mir_ledger: None,
         rust_observation: None,
         web_observation: None,
+        child_stderr_tail: None,
+        child_stderr_log_path: None,
     })
 }
 

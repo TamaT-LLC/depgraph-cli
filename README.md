@@ -316,6 +316,7 @@ depgraph daemon stop /path/to/repository
 
 # 権限を伴うビルド観測。実行ごとに明示的な同意が必要になる。
 depgraph resolve --build /path/to/repository --allow-project-code
+depgraph resolve --build /path/to/repository --allow-project-code --json
 
 depgraph doctor --json
 depgraph doctor --details --json
@@ -434,6 +435,10 @@ Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネ
 対話的な確認は行わず、実行のたびに`--allow-project-code`を明示しなければならない。
 設定、環境変数、`CI=true`、TTYの状態、過去の同意によって権限を付与することはできない。
 同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
+一時ワークスペースにコピーするとき、リンク先がリポジトリ内に収まるシンボリックリンクは実体化する。
+循環リンクと `.git` / `.depgraph` / リポジトリ直下の `target` / `.next` を指すリンクはコピーしない。
+リポジトリ外を指すリンクは拒否する。`.depgraph.toml` の `[build] ignored_paths` にリポジトリ相対プレフィックスを書くと、その配下はステージング対象から外れる。未知の `[build]` キーはエラーになる。
+失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
 
 Webプロジェクトは`package.json`に version 付きの`depgraph.build`実行プランを置く。シェルコマンドや npm/pnpm/yarn の lifecycle は受け付けない。
 
@@ -444,7 +449,7 @@ Webプロジェクトは`package.json`に version 付きの`depgraph.build`実�
 | `version` | string | フレームワークの version 文字列。JSON の数値 `1` ではなく `"16.2.3"` のような文字列 |
 | `timeout_seconds` | integer | 省略可。既定は 900 秒 |
 
-entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
+entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next では同じ値を `NEXT_ADAPTER_PATH` にも渡す）と `DEPGRAPH_OUTPUT_DIR` を使って本家のビルドを spawn し、終了コードを引き継ぐ。Next.js 16.2 以降は `NEXT_ADAPTER_PATH` から observer を自動ロードするので、entrypoint が `modifyConfig` / `onBuildComplete` を自分で呼ぶ必要はない。`next.config.ts` や `node_modules/next/dist/bin/next` を entrypoint に直接指定しても動かない。Next.js 向けの最小スクリプトは [docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs) を参照する。
 
 ```json
 {
@@ -459,7 +464,7 @@ entrypoint はソースを変更せず、環境変数 `DEPGRAPH_OBSERVER`（Next
 }
 ```
 
-プランが無い場合のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
+プランが無い場合（`depgraph` キー自体が無い、または `{"depgraph":{}}` のように `build` だけが欠ける場合）のエラーは雛形と `depgraph resolve --help` への案内を含む。`depgraph init` は `.depgraph.toml` だけを書き、`package.json` は変更しない。
 
 ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
 
