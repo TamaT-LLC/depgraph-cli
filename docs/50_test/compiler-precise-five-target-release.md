@@ -10,9 +10,10 @@ release workflow は次の target ごとに compiler pack を構築する。
 | --- | --- | --- |
 | Linux x86-64 | `x86_64-unknown-linux-gnu` | `tar.gz` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `tar.gz` |
-| macOS Intel | `x86_64-apple-darwin` | `tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `tar.gz` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` | `zip` |
+
+`x86_64-apple-darwin`（macOS Intel）の通常 archive と compiler pack は、GitHub Actions の `macos-15-intel` runner 廃止に伴い提供を終了した。公開済み `v0.6.0` までの Intel macOS 成果物は履歴として残る。
 
 通常の `depgraph` archive と compiler pack は別の matrix job と artifact name を使う。
 通常 archive の verifier は compiler-pack file を許可しないため、compiler pack を通常配布物へ混入させる変更は release gate で失敗する。
@@ -69,7 +70,7 @@ Warm promotionのpre-commit検証を意図的に失敗させるrollback testは�
 
 ## Aggregate gate
 
-`cargo xtask verify-compiler-pack-assets` は五つの archive、checksum、requirement、target smoke を exact file set として検証する。
+`cargo xtask verify-compiler-pack-assets` は四つの archive、checksum、requirement、target smoke を exact file set として検証する。
 aggregate report は `compiler-pack-five-target-verification-v1` である。
 
 全 target は次の compatibility unit を共有しなければならない。
@@ -86,7 +87,7 @@ target ごとの executable digest と component tree digest は native artifact
 
 stable release gate は通常 archive の aggregate report、benchmark report、compiler-pack aggregate report を独立した入力として検証する。
 `compiler-pack` と `verify-compiler-packs` の workflow result が `success` でない場合も release を拒否する。
-さらに、通常 archive とcompiler packのrelease version、五つのtarget集合、compiler compatibility unitを直接比較し、同一release runの対応するassetだけを許可する。
+さらに、通常 archive とcompiler packのrelease version、四つのtarget集合、compiler compatibility unitを直接比較し、同一release runの対応するassetだけを許可する。
 未公開のimmutable `v0.4.0` baselineは従来どおり元の固定commitだけを許可し、current packageとしては公開しない。
 公開済み`v0.5.0`のsourceは履歴上の固定SHAだけを許可する。
 現行packageのpack付き公開検証には、v0.6.1またはcanonicalな`v0.6.1-rc.N` tagだけを許可する。

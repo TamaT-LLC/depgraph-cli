@@ -29,13 +29,6 @@ export const TARGETS = Object.freeze([
     cpu: "arm64",
   }),
   Object.freeze({
-    target: "x86_64-apple-darwin",
-    extension: "tar.gz",
-    packageName: "@tamat-llc/depgraph-darwin-x64",
-    os: "darwin",
-    cpu: "x64",
-  }),
-  Object.freeze({
     target: "aarch64-unknown-linux-gnu",
     extension: "tar.gz",
     packageName: "@tamat-llc/depgraph-linux-arm64-gnu",
@@ -353,7 +346,7 @@ export async function buildPackages({ releaseAssets, output }) {
     !Array.isArray(verification.targets) ||
     verification.targets.length !== TARGETS.length
   ) {
-    throw new Error("release-verification.json is not a stable five-target release closure");
+    throw new Error("release-verification.json is not a stable release-target closure");
   }
   const verificationTargets = new Map(verification.targets.map((target) => [target.target, target]));
   if (verificationTargets.size !== TARGETS.length || TARGETS.some((target) => !verificationTargets.has(target.target))) {

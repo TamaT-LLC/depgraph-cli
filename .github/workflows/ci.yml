@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       extra_native_packages:
-        description: Verify Linux ARM64 and Intel macOS release packages as well
+        description: Verify the Linux ARM64 release package as well
         type: boolean
         default: false
 
@@ -1414,8 +1414,6 @@ jobs:
         include:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: "0"

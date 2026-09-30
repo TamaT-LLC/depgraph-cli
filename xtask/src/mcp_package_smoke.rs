@@ -1915,7 +1915,6 @@ fn create_release_evidence(
             "jobs":[
                 {"name":"benchmark","conclusion":"success"},
                 {"name":"compiler-precise-hostile","conclusion":"success"},
-                {"name":"extra-native-package (macos-15-intel, x86_64-apple-darwin)","conclusion":"success"},
                 {"name":"extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)","conclusion":"success"},
                 {"name":"go","conclusion":"success"},
                 {"name":"go-macos","conclusion":"success"},
@@ -1963,7 +1962,6 @@ fn expected_release_asset_names(release_version: &str) -> BTreeSet<String> {
     for (target, extension) in [
         ("aarch64-apple-darwin", "tar.gz"),
         ("aarch64-unknown-linux-gnu", "tar.gz"),
-        ("x86_64-apple-darwin", "tar.gz"),
         ("x86_64-pc-windows-msvc", "zip"),
         ("x86_64-unknown-linux-gnu", "tar.gz"),
     ] {

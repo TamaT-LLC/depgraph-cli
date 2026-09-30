@@ -112,7 +112,7 @@ jobs:
           package-manager-cache: false
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
-      - name: Download the five-target public native release closure
+      - name: Download the public native release closure
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,7 +133,6 @@ jobs:
               --pattern "${base}.mcp-smoke.json"
           done <<'TARGETS'
           aarch64-apple-darwin tar.gz
-          x86_64-apple-darwin tar.gz
           aarch64-unknown-linux-gnu tar.gz
           x86_64-unknown-linux-gnu tar.gz
           x86_64-pc-windows-msvc zip
@@ -216,10 +215,9 @@ jobs:
               .release_tag == $tag and
               .release_version == $version and
               .npm_tag == "latest" and
-              ([.packages[] | select(.role == "platform")] | length) == 5 and
+              ([.packages[] | select(.role == "platform")] | length) == 4 and
               (.packages | map(.name)) == [
                 "@tamat-llc/depgraph-darwin-arm64",
-                "@tamat-llc/depgraph-darwin-x64",
                 "@tamat-llc/depgraph-linux-arm64-gnu",
                 "@tamat-llc/depgraph-linux-x64-gnu",
                 "@tamat-llc/depgraph-win32-x64",

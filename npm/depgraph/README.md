@@ -10,7 +10,8 @@ depgraph --version
 ```
 
 The package requires Node.js 24 or later and supports Linux glibc on x64 and
-ARM64, macOS on Intel and Apple Silicon, and Windows on x64. npm selects one
+ARM64, macOS on Apple Silicon, and Windows on x64. Intel macOS is not
+supported. npm selects one
 exact-version native package through `optionalDependencies`. Installation does
 not run a lifecycle script and does not download executable code from an
 unrelated host.

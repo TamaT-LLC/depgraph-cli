@@ -133,9 +133,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             rustflags: ""
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            rustflags: ""
           - os: macos-15
             target: aarch64-apple-darwin
             rustflags: ""
@@ -201,7 +198,7 @@ jobs:
         run: |
           node scripts/benchmark-report.mjs verify benchmark/benchmark-report.json
           node scripts/cache-hit-benchmark.mjs verify benchmark/cache-hit-benchmark-report.json
-      - name: Verify five-target release asset closure
+      - name: Verify release asset closure
         run: cargo xtask verify-release-assets artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -220,9 +217,6 @@ jobs:
             rustflags: -C linker-features=-lld
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            rustflags: ""
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
             rustflags: ""
           - os: macos-15
             target: aarch64-apple-darwin
@@ -283,7 +277,7 @@ jobs:
           pattern: compiler-pack-*
           path: compiler-artifacts
           merge-multiple: true
-      - name: Verify the compiler-pack five-target compatibility closure
+      - name: Verify the compiler-pack release compatibility closure
         run: cargo xtask verify-compiler-pack-assets compiler-artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -461,8 +455,8 @@ jobs:
 
           normal_assets=(post-publish/public/depgraph-"${version}"-*)
           compiler_assets=(post-publish/public/depgraph-compiler-pack-"${version}"-*)
-          test "${#normal_assets[@]}" -eq 25
-          test "${#compiler_assets[@]}" -eq 20
+          test "${#normal_assets[@]}" -eq 20
+          test "${#compiler_assets[@]}" -eq 16
           cp "${normal_assets[@]}" post-publish/normal/
           cp "${compiler_assets[@]}" post-publish/compiler/
 
@@ -532,10 +526,6 @@ jobs:
             executable_suffix: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            extension: tar.gz
-            executable_suffix: ""
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
             extension: tar.gz
             executable_suffix: ""
           - os: macos-15

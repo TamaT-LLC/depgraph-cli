@@ -10,7 +10,7 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 | PR | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile は関連 path 変更時のみ。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
 | `main` push | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile 含む4ジョブを常時） | マージ結果の確認 |
 | `workflow_dispatch` | CI | 上記4ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
-| `v*`タグのpush | Release | quality、hostile E2E、benchmark、全5 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
+| `v*`タグのpush | Release | quality、hostile E2E、benchmark、全4 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
 | `workflow_dispatch` | Release post-publish recovery（歴史的v0.5.0専用） | 固定済みv0.5.0 Release、元run、evidence、公開Linux archiveのread-only canary | 公開後orchestration失敗の復旧証明 |
 
 GreptileはGitHub Actionsのジョブではないが、PRをマージする前に未解決の指摘を残さない。
@@ -26,7 +26,7 @@ PRで compiler-precise hostile が関連 path 変更なしにより重いステ�
 4. `N`には先頭ゼロのない正整数を使う。
 5. PRのCIをgreenにし、Greptileの未解決指摘をゼロにしてから`main`へマージする。
 
-バージョン更新時は、`xtask/src/main.rs`の`TARGET_NATIVE_SMOKE_EXPECTATIONS`も5 targetのnative package検証結果から更新する。
+バージョン更新時は、`xtask/src/main.rs`の`TARGET_NATIVE_SMOKE_EXPECTATIONS`も4 targetのnative package検証結果から更新する。
 queryとprofileのdigestには製品・adapterのバージョンとnative targetが含まれる。
 意味的な検証とcheckout間の決定性検証を通過した実測値だけを採用し、出典のrun・job・source SHAを記録する。
 全targetの更新後に`TARGET_NATIVE_SMOKE_EXPECTATION_VERSION`を更新する。通常のmetadata検証はこのversionと製品versionの不一致を拒否する。
@@ -43,7 +43,7 @@ tag source、remote `main`、`refs/heads/release/0.6`、source tree、exact Full
 
 `main`へのマージを一時停止し、リリース対象commitを固定する。
 GitHubのActions画面で`CI`を選び、`Run workflow`から`main`を指定し、`extra_native_packages`を有効にして実行する。
-リリース用のFull CIは、GoのmacOS検証とLinux ARM64／Intel macOSの追加package検証を含む11ジョブすべての成功を要求する。
+リリース用のFull CIは、GoのmacOS（Apple Silicon）検証とLinux ARM64の追加package検証を含む10ジョブすべての成功を要求する。Intel macOS（`macos-15-intel`）のジョブは廃止した。
 
 CLIを使う場合は次のように実行する。
 
@@ -78,7 +78,7 @@ validatorのjob identityを同時に更新する。期待値の定数からtest 
 API driftを検出できない。既知の実API応答
 `xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json`を独立fixtureとして固定し、
 この8ジョブの履歴fixtureはbyteを固定したまま保持し、v0.6の公開証跡としては受理しない。
-現行11ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
+現行10ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
 これはブランチ検証の記録であり、リリース用mainのFull CIを代替しない。
 unit testは元のbranchを拒否し、mainを模した入力でジョブ名の一致と欠損・skip・改変の拒否を検証する。
 
@@ -141,7 +141,7 @@ maintenance ref側で新しいmerge commitやcherry-pickを作らず、force-pus
 stableではfast-forwardと一致確認の後だけsigned annotated tagを同じSHAへpushする。
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
-tag側のstable gateはGitHub APIから`main` headのexact eleven-job Full CIを再取得する。
+tag側のstable gateはGitHub APIから`main` headのexact ten-job Full CIを再取得する。
 製品価値の`agent-dogfood-report-v1`（SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`）と、Issue #436のcode-health `agent-dogfood-report-v2`（SHA-256 `7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`）をそれぞれ14 gateで再計算する。
 exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.6.1.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
@@ -164,7 +164,7 @@ gh release view "$release_tag"
 ```
 
 Releaseはquality、benchmark、hostile E2E、通常archive、compiler pack、aggregate reportを検証する。
-通常archiveの各5 targetには`bin/depgraph-mcp`（Windowsは`.exe`）、
+通常archiveの各4 targetには`bin/depgraph-mcp`（Windowsは`.exe`）、
 `libexec/depgraph-operation-runner`（Windowsは`.exe`）、
 `schemas/depgraph-mcp-tools-v1.schema.json`が含まれる。`release-manifest.json`は
 両binaryとschemaのSHA-256、tool/operation contract、`rmcp 3.1.0`、MCP revision
@@ -191,7 +191,7 @@ journal、そのWAL/SHM/rollback journal、runner purge lockはすべて不存�
 同じjobの公開後再取得・Agent host canaryまで成功しなければRelease workflow全体はsuccessにならない。
 公開後のnative onboarding jobは、Codex／Claude Code／Cursor／Grokをproject scopeと
 user scopeの両方で設定する。各entryのstatus、共有stateの保持、最後のuninstallによる
-state削除までをclean home上で5 targetすべて検証する。
+state削除までをclean home上で4 targetすべて検証する。Intel macOS では実行しない。
 `-rc.N`を含むタグはprereleaseとして公開される。
 
 公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksumを入力に、schema 17へtransactional migrationする履歴を固定する。
@@ -206,8 +206,8 @@ rollback時はmigrated databaseを退避し、backup一式をrestoreしてから
 
 最終`publish`ジョブはGitHub Releaseを作成した後、公開assetを新しいdirectoryへ
 再取得する。v0.6 release closureでは、通常archive、checksum、query / cross-language /
-MCP smokeが5 targetで25点、compiler pack、checksum、requirement、smokeが5 targetで
-20点、benchmark / cache-hit / hostile / 二つのaggregate / stable gateが6点の計51点である。
+MCP smokeが4 targetで20点、compiler pack、checksum、requirement、smokeが4 targetで
+16点、benchmark / cache-hit / hostile / 二つのaggregate / stable gateが6点の計42点である。
 
 再取得した通常archiveには`cargo xtask verify-release-assets`、compiler packには
 `cargo xtask verify-compiler-pack-assets`を再実行する。これによりchecksum、manifest、
@@ -216,15 +216,15 @@ safe scan reconnect、stdout purity、root seal、compiler semantic / rollback�
 再検証する。benchmark二種も公開reportを入力に再検証し、再生成aggregate reportが
 公開reportおよび元のworkflow artifactとbyte一致することを要求する。
 
-さらに51点すべてについてpublic downloadとworkflow artifactのfilename、size、SHA-256
+さらに42点すべてについてpublic downloadとworkflow artifactのfilename、size、SHA-256
 が一致しなければ失敗する。`release-post-publish-evidence-v1` JSONは、candidate commit /
-tree、署名tag object、exact manual full-CI runと11 job、Release run、51 asset digest、
+tree、署名tag object、exact manual full-CI runと10 job、Release run、42 asset digest、
 aggregate digest、asset-set digestを記録する。最終jobはこのJSONを同じGitHub Releaseへ
 追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。最終jobの
 job-scoped tokenは、Full CIのrun/jobを読むための`actions: read`と、Releaseへ成果物を
 公開するための`contents: write`だけを持つ。
 公開後検証は「その時点の最新run」を再選択せず、`stable-release-gate.json`が記録した
-同一`full_ci_run_id`を再取得し、SHA、branch、11 job、job-set digestまで一致させる。
+同一`full_ci_run_id`を再取得し、SHA、branch、10 job、job-set digestまで一致させる。
 
 最後にLinux x86-64の公開archiveを新しいdirectoryへ展開し、固定polyglot fixtureを
 公開`depgraph`でsafe scanする。GitHub release-asset APIからpost-publish evidenceの
@@ -236,7 +236,7 @@ compiler requirement、`initialize`、`tools/list`、`get_context`、source/Stor
 `realpath`で絶対パスへ固定してから公開binaryへ渡す。checkout-built product binaryを
 実行経路へ混ぜない。
 
-公開後は、対象commit、release note、5 targetのarchive、compiler pack、checksum、
+公開後は、対象commit、release note、4 targetのarchive、compiler pack、checksum、
 検証report、`release-post-publish-evidence-<tag>.json`が同じタグに結び付いていることを
 確認する。checkout内のproduct binaryや未公開package artifactを公開後verificationの
 代用品にしてはならない。

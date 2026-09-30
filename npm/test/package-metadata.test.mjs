@@ -38,12 +38,12 @@ test("release packaging adds exact optional platform dependencies and removes pr
     manifest.optionalDependencies,
     Object.fromEntries(TARGETS.map((target) => [target.packageName, template.version])),
   );
-  assert.equal(Object.keys(manifest.optionalDependencies).length, 5);
+  assert.equal(Object.keys(manifest.optionalDependencies).length, 4);
 });
 
-test("platform package constraints cover the five native release targets exactly", () => {
-  assert.equal(new Set(TARGETS.map((target) => target.target)).size, 5);
-  assert.equal(new Set(TARGETS.map((target) => target.packageName)).size, 5);
+test("platform package constraints cover the native release targets exactly", () => {
+  assert.equal(new Set(TARGETS.map((target) => target.target)).size, 4);
+  assert.equal(new Set(TARGETS.map((target) => target.packageName)).size, 4);
   for (const target of TARGETS) {
     assert.match(target.packageName, /^@tamat-llc\/depgraph-/u);
     const manifest = createPlatformManifest(target, template.version);
@@ -80,7 +80,7 @@ test("bootstrap packages are inert scoped name reservations", () => {
     ...TARGETS.map((target) => target.packageName),
     ROOT_PACKAGE_NAME,
   ]);
-  assert.equal(new Set(BOOTSTRAP_PACKAGE_NAMES).size, 6);
+  assert.equal(new Set(BOOTSTRAP_PACKAGE_NAMES).size, 5);
   for (const name of BOOTSTRAP_PACKAGE_NAMES) {
     const manifest = createBootstrapManifest(name);
     assert.equal(manifest.name, name);
