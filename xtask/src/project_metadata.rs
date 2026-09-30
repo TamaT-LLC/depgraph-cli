@@ -1992,7 +1992,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "`release-post-publish-evidence-v1`",
         "GitHub Git Data APIからremote",
         "local `git rev-parse <tag>^{tag}`",
-        "計51点",
+        "計42点",
         "checkout内のproduct binaryや未公開package artifact",
         "non-empty matrix値をすべて含む",
         "公開済み`v0.5.4`のMCP sidecarは`mcp-package-smoke-v2`",
