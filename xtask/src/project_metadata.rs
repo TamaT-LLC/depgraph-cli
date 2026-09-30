@@ -135,7 +135,7 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         "does not interpolate the `secrets` expression",
         "Only the final `publish` job receives job-scoped",
         "`release-post-publish-evidence-v1`",
-        "Every one of the 51 pre-evidence public assets",
+        "Every one of the 42 pre-evidence public assets",
         "The stable source guard handles `workflow_run` metadata without checking out",
         "The v0.5.0 post-publish recovery workflow is an incident-specific read-only",
         "It cannot upload or replace an\nasset, move a tag, change a check conclusion, or delete a run.",

@@ -78,7 +78,7 @@ validatorのjob identityを同時に更新する。期待値の定数からtest 
 API driftを検出できない。既知の実API応答
 `xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json`を独立fixtureとして固定し、
 この8ジョブの履歴fixtureはbyteを固定したまま保持し、v0.6の公開証跡としては受理しない。
-現行11ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
+現行10ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
 これはブランチ検証の記録であり、リリース用mainのFull CIを代替しない。
 unit testは元のbranchを拒否し、mainを模した入力でジョブ名の一致と欠損・skip・改変の拒否を検証する。
 
@@ -141,7 +141,7 @@ maintenance ref側で新しいmerge commitやcherry-pickを作らず、force-pus
 stableではfast-forwardと一致確認の後だけsigned annotated tagを同じSHAへpushする。
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
-tag側のstable gateはGitHub APIから`main` headのexact eleven-job Full CIを再取得する。
+tag側のstable gateはGitHub APIから`main` headのexact ten-job Full CIを再取得する。
 製品価値の`agent-dogfood-report-v1`（SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`）と、Issue #436のcode-health `agent-dogfood-report-v2`（SHA-256 `7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`）をそれぞれ14 gateで再計算する。
 exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.6.1.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 

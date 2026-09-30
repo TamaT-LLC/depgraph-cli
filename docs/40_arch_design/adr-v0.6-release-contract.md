@@ -33,8 +33,8 @@ The v0.6.0 compatibility tuple is:
 
 At publication, the signed `v0.6.0` tag, remote `main`, and
 `refs/heads/release/0.6` must identify the same reviewed commit. That commit
-must pass the exact eleven-job Full CI run (`extra_native_packages=true`),
-the stable source guard, the five-target
+must pass the exact ten-job Full CI run (`extra_native_packages=true`),
+the stable source guard, the four-target
 package gates, and the post-publish evidence checks. The candidate SHA is not
 chosen by this ADR; it is recorded only after the release candidate is frozen
 and Full CI has passed. The baseline status is maintenance-ref-pinned.
@@ -125,8 +125,9 @@ tool contract remain v1.
 The release PR adds [`v0.6.0` release notes](../releases/v0.6.0.md) and keeps
 the version change with the release documentation. CI must be green and
 Greptile must have no unresolved findings before merge. Release and workflow
-changes additionally require the manual Full CI run on the frozen `main`
-commit. The Full CI inventory includes `go-macos` and the Linux ARM64 extra
+changes additionally require the exact ten-job manual Full CI run on the
+frozen `main` commit. The four-target package gates build the remaining native
+archives and compiler packs. The Full CI inventory includes `go-macos` and the Linux ARM64 extra
 native package job. Intel macOS (`macos-15-intel`, `x86_64-apple-darwin`) is
 not part of that inventory. A missing, skipped, failed, duplicated, or renamed
 job is rejected by the release gate and the packaged Agent preflight. The

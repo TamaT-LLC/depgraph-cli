@@ -455,8 +455,8 @@ jobs:
 
           normal_assets=(post-publish/public/depgraph-"${version}"-*)
           compiler_assets=(post-publish/public/depgraph-compiler-pack-"${version}"-*)
-          test "${#normal_assets[@]}" -eq 25
-          test "${#compiler_assets[@]}" -eq 20
+          test "${#normal_assets[@]}" -eq 20
+          test "${#compiler_assets[@]}" -eq 16
           cp "${normal_assets[@]}" post-publish/normal/
           cp "${compiler_assets[@]}" post-publish/compiler/
 

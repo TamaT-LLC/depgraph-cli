@@ -4429,8 +4429,10 @@ fn evaluate_stable_release_gate(
                 && (release.tag != format!("v{STABLE_RELEASE_VERSION}")
                     || stable_baseline_matches_source),
             evidence: format!(
-                "full CI run {} has the exact eleven all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
-                full_ci.run_id, full_ci.head_sha
+                "full CI run {} has the exact {} all-green jobs for main SHA {}; stable baseline digest is sha256:{baseline_digest}",
+                full_ci.run_id,
+                FULL_CI_JOB_NAMES.len(),
+                full_ci.head_sha
             ),
         },
         StableReleaseGateCheck {

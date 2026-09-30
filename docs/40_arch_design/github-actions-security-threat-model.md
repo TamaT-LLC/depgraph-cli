@@ -53,7 +53,7 @@ checksums, SBOMs, licenses, benchmark report, and stable release gate before
 publication. The same final job requires a signed annotated tag object, creates
 the GitHub Release, downloads the public assets into a fresh directory, and
 repeats the package, compiler-pack, benchmark, and aggregate verification.
-Every one of the 51 pre-evidence public assets must have the same filename,
+Every one of the 42 pre-evidence public assets must have the same filename,
 size, and SHA-256 as its same-run workflow artifact. The resulting closed
 `release-post-publish-evidence-v1` record binds the candidate commit/tree,
 manual full-CI jobs, Release run, signed tag object, and public asset set; it is
