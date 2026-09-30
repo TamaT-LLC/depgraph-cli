@@ -15,11 +15,6 @@ const PLATFORM_PACKAGES = Object.freeze({
     target: "aarch64-apple-darwin",
     executableSuffix: "",
   }),
-  "darwin:x64": Object.freeze({
-    packageName: "@tamat-llc/depgraph-darwin-x64",
-    target: "x86_64-apple-darwin",
-    executableSuffix: "",
-  }),
   "linux:arm64": Object.freeze({
     packageName: "@tamat-llc/depgraph-linux-arm64-gnu",
     target: "aarch64-unknown-linux-gnu",

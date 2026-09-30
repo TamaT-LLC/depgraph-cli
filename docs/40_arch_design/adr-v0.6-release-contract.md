@@ -126,13 +126,14 @@ The release PR adds [`v0.6.0` release notes](../releases/v0.6.0.md) and keeps
 the version change with the release documentation. CI must be green and
 Greptile must have no unresolved findings before merge. Release and workflow
 changes additionally require the manual Full CI run on the frozen `main`
-commit. The Full CI inventory includes `go-macos` and both extra native
-package jobs; a missing, skipped, failed, duplicated, or renamed job is
-rejected by the release gate and the packaged Agent preflight. The historical
-eight-job v0.5 evidence remains unchanged.
+commit. The Full CI inventory includes `go-macos` and the Linux ARM64 extra
+native package job. Intel macOS (`macos-15-intel`, `x86_64-apple-darwin`) is
+not part of that inventory. A missing, skipped, failed, duplicated, or renamed
+job is rejected by the release gate and the packaged Agent preflight. The
+historical eight-job v0.5 evidence remains unchanged.
 
 The signed tag is created only after the exact source and maintenance-ref
-checks pass. Release builds all five native targets, verifies the compiler
+checks pass. Release builds the four remaining native targets, verifies the compiler
 packs and code-health CLI/MCP parity, and publishes the evidence-bound asset
 closure. npm publication follows successful GitHub Release and post-publish
 verification.

@@ -117,7 +117,6 @@ const PROJECT_LICENSES: &[(&str, &[u8])] = &[
 const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("x86_64-unknown-linux-gnu", "tar.gz"),
     ("aarch64-unknown-linux-gnu", "tar.gz"),
-    ("x86_64-apple-darwin", "tar.gz"),
     ("aarch64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
 ];
@@ -132,7 +131,6 @@ const MAX_RELEASE_CHECKSUM_BYTES: u64 = 1024;
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
-    "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
     "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
     "go-macos",
@@ -162,7 +160,7 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
 ];
 const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-34682206659.json";
 const CURRENT_FULL_CI_RUN_FIXTURE_SHA256: &str =
-    "3dc448af592da881ca2d973976fe2918a20cd1329bf212b2a1dc1c90ffc669a2";
+    "3313370b911c737a28ba40a8966cfc02a54729308fb28b08b8ff5682c2dc2201";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
@@ -210,14 +208,6 @@ const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
         query_output_sha256: "6ccaf0d9cf388dcb766b17ae140fe91d21d89052245a05383ef9369e4e4efbd3",
         profile_plan_digest: "profile-selection-plan:sha256:5d55dd69f734b830308d3afe6116d3537b06b0329ba6611bcf5f8ab7d410593c",
         profile_plan_output_sha256: "525b77fa3dcdb931f30f7ee7a824bd1407f1ea3b070db09b48fdd3c60775eda3",
-    },
-    TargetNativeSmokeExpectation {
-        target: "x86_64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:372935de59ffb986aae8be966f5a6ef81c672adc6c9b5b7e9415c110073564a5",
-        query_result_digest: "bounded-query-result:sha256:e38f6180b154bafb89d3a9a8090bee0624e2477a77bdc5422e11373e559f59e5",
-        query_output_sha256: "2074b4d571dc5c171f416872be3a53f679f7644a3fce70e77d45999bd913fbd5",
-        profile_plan_digest: "profile-selection-plan:sha256:6aedbc726fcb806fde2a83b9b832dd41f47e86f74f8baf0934195d6e6bd1acf0",
-        profile_plan_output_sha256: "235a8c33679aea5ca61b8db2f6829f6ba6dd24fc8a0187f1f8d60be2d60c62f7",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
@@ -3041,7 +3031,7 @@ fn verify_release_assets(directory: &Path, requested_targets: &[String]) -> Resu
     permitted_files.insert("release-verification.json".to_owned());
     if !expected_files.is_subset(&actual_files) || !actual_files.is_subset(&permitted_files) {
         bail!(
-            "release asset set differs from the five-target contract: expected {expected_files:?}, found {actual_files:?}"
+            "release asset set differs from the release-target contract: expected {expected_files:?}, found {actual_files:?}"
         );
     }
 
@@ -3874,7 +3864,7 @@ fn validate_post_publish_aggregates(
         || release["tag"] != tag
         || release_targets != expected_targets
     {
-        bail!("public release aggregate does not bind the exact five-target candidate");
+        bail!("public release aggregate does not bind the exact release-target candidate");
     }
 
     let compiler: Value = serde_json::from_slice(&fs::read(
@@ -3892,7 +3882,7 @@ fn validate_post_publish_aggregates(
         || compiler["release_version"] != VERSION
         || compiler_targets != expected_targets
     {
-        bail!("public compiler-pack aggregate does not bind the exact five-target candidate");
+        bail!("public compiler-pack aggregate does not bind the exact release-target candidate");
     }
 
     let benchmark: Value =
@@ -4159,7 +4149,7 @@ fn evaluate_stable_release_gate(
     let bounded_query_contract = depgraph_core::bounded_query_release_compatibility_contract();
     // Native query/profile identities are target-bound. Package and aggregate
     // verification bind the measured archive outputs to these same compiled
-    // expectations; this stable gate preserves that exact five-target binding.
+    // expectations; this stable gate preserves that exact release-target binding.
     let bounded_query_target_gate = release.targets.len() == RELEASE_TARGETS.len()
         && release.compatibility.bounded_query == bounded_query_contract
         && release.targets.iter().all(|target| {
@@ -4342,13 +4332,13 @@ fn evaluate_stable_release_gate(
                 && actual_targets == expected_targets
                 && release.license_expression == PROJECT_LICENSE_EXPRESSION,
             evidence:
-                "five native archives, checksums, manifests, SBOMs, licenses, and attestations"
+                "native archives, checksums, manifests, SBOMs, licenses, and attestations"
                     .to_owned(),
         },
         StableReleaseGateCheck {
             id: "mcp-five-target".to_owned(),
             passed: mcp_release_target_gate,
-            evidence: "five native archives attest identical packaged MCP discovery/fixture digests, bounded durable safe-scan submit with post-EOF recovery, clean stdin EOF, JSON-RPC-only stdout, server/runner binaries, and versioned compatibility metadata".to_owned(),
+            evidence: "native archives attest identical packaged MCP discovery/fixture digests, bounded durable safe-scan submit with post-EOF recovery, clean stdin EOF, JSON-RPC-only stdout, server/runner binaries, and versioned compatibility metadata".to_owned(),
         },
         StableReleaseGateCheck {
             id: "agent-dogfood-ga".to_owned(),
@@ -4385,21 +4375,21 @@ fn evaluate_stable_release_gate(
                 && benchmark["evidence"]["bounded_query"]["hostile_rejected"]
                     == Value::Bool(true),
             evidence:
-                "five native archives match their compiled target-native bounded query identities and canonical smoke outputs"
+                "native archives match their compiled target-native bounded query identities and canonical smoke outputs"
                     .to_owned(),
         },
         StableReleaseGateCheck {
             id: "profile-selection-five-target".to_owned(),
             passed: profile_selection_target_gate,
             evidence:
-                "five native archives match their compiled target-native profile-selection identities and canonical plan outputs"
+                "native archives match their compiled target-native profile-selection identities and canonical plan outputs"
                     .to_owned(),
         },
         StableReleaseGateCheck {
             id: "cross-language-five-target".to_owned(),
             passed: cross_language_target_gate,
             evidence:
-                "five native archives share the OpenAPI/Protobuf/GraphQL/HTTP/FFI capability ledger, schemas, graph, query, and export bytes"
+                "native archives share the OpenAPI/Protobuf/GraphQL/HTTP/FFI capability ledger, schemas, graph, query, and export bytes"
                     .to_owned(),
         },
         StableReleaseGateCheck {
@@ -5532,7 +5522,7 @@ mod tests {
         let source_tree = "b".repeat(40);
         let tag_object_sha = "c".repeat(40);
         let expected = expected_release_asset_names();
-        assert_eq!(expected.len(), 51);
+        assert_eq!(expected.len(), 42);
         for name in &expected {
             fs::write(workflow.join(name), format!("fixture:{name}\n"))?;
         }
@@ -5763,7 +5753,7 @@ mod tests {
             RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION
         );
         assert_eq!(evidence.decision, StableReleaseDecision::Allow);
-        assert_eq!(evidence.assets.len(), 51);
+        assert_eq!(evidence.assets.len(), 42);
         assert_eq!(evidence.full_ci.jobs.len(), FULL_CI_JOB_NAMES.len());
         assert!(evidence.workflow_public_asset_identity);
         assert!(evidence.public_download_reverified);
@@ -5844,17 +5834,17 @@ mod tests {
             .expect("captured source")
             .to_owned();
         assert!(validate_full_ci_run(&fixture, &source_sha).is_err());
-        // The capture is a branch run. Change only its branch in this synthetic
-        // admission test; the real API job inventory remains independent of constants.
+        // The fixture is the current Full CI job inventory. The original capture
+        // included an Intel macOS extra-native-package job; that job is no longer
+        // required. Change only the branch in this synthetic admission test.
         input["head_branch"] = json!("main");
         let temp = tempfile::tempdir()?;
         let eligible = temp.path().join("main-full-ci.json");
         fs::write(&eligible, serde_json::to_vec(&input)?)?;
         let run = validate_full_ci_run(&eligible, &source_sha)?;
-        assert_eq!(run.jobs.len(), 11);
+        assert_eq!(run.jobs.len(), 10);
         for name in [
             "go-macos",
-            "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
             "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
         ] {
             for change in ["missing", "skipped", "failure", "renamed", "duplicate"] {
@@ -7458,7 +7448,7 @@ jobs:
 
     #[test]
     fn release_target_matrix_and_executable_names_are_exact() {
-        assert_eq!(RELEASE_TARGETS.len(), 5);
+        assert_eq!(RELEASE_TARGETS.len(), 4);
         assert_eq!(
             RELEASE_TARGETS
                 .iter()
@@ -7467,7 +7457,6 @@ jobs:
             vec![
                 "x86_64-unknown-linux-gnu",
                 "aarch64-unknown-linux-gnu",
-                "x86_64-apple-darwin",
                 "aarch64-apple-darwin",
                 "x86_64-pc-windows-msvc",
             ]
@@ -7546,11 +7535,6 @@ jobs:
                 "x86_64-unknown-linux-gnu" => (
                     34829665257,
                     103938269794,
-                    "0ea0099138833da5cde2cf35ef83109b5b0648e3",
-                ),
-                "x86_64-apple-darwin" => (
-                    34829665257,
-                    103929753716,
                     "0ea0099138833da5cde2cf35ef83109b5b0648e3",
                 ),
                 "aarch64-apple-darwin" => (

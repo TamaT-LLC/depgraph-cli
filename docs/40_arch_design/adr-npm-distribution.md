@@ -28,20 +28,21 @@ names, so every supported package uses the `@tamat-llc` scope.
 
 ## Decision
 
-Publish one root package and five exact-version native packages.
+Publish one root package and four exact-version native packages.
+`@tamat-llc/depgraph-darwin-x64` (`x86_64-apple-darwin`) was published through
+`v0.6.0` and is discontinued. New releases do not build or publish it.
 
 | npm package | Native target | Constraint |
 | --- | --- | --- |
 | `@tamat-llc/depgraph` | Platform selector and launch shim | Node.js 24 or later |
 | `@tamat-llc/depgraph-darwin-arm64` | `aarch64-apple-darwin` | macOS ARM64 |
-| `@tamat-llc/depgraph-darwin-x64` | `x86_64-apple-darwin` | macOS x64 |
 | `@tamat-llc/depgraph-linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | Linux ARM64 with glibc |
 | `@tamat-llc/depgraph-linux-x64-gnu` | `x86_64-unknown-linux-gnu` | Linux x64 with glibc |
 | `@tamat-llc/depgraph-win32-x64` | `x86_64-pc-windows-msvc` | Windows x64 |
 
 The root package exposes `depgraph`, `depgraph-cli`, and `depgraph-mcp` through
 its `bin` map.
-It declares the five native packages as exact-version
+It declares the four native packages as exact-version
 `optionalDependencies`; npm selects the matching `os`, `cpu`, and `libc`
 package.
 Neither the root package nor a native package defines an install or publish
@@ -59,7 +60,7 @@ its remaining package closure.
 The checked-in root package template remains `private: true`.
 The release packager removes that field only in an isolated staging directory,
 adds exact optional dependencies, generates native metadata, runs `npm pack`,
-and records the six tarballs in `depgraph-npm-package-set-v1`.
+and records the five tarballs in `depgraph-npm-package-set-v1`.
 Source directories, tests, and fixtures outside the verified native release
 are not included.
 
@@ -69,7 +70,7 @@ The npm workflow is dispatched manually against the exact stable tag after the
 GitHub `Release` run succeeds.
 Its prepare job verifies the exact `main` commit, signed annotated tag, public
 Release, post-publish evidence and the successful Release run named by that
-evidence, five native archives, and generated npm package set without OIDC
+evidence, four native archives, and generated npm package set without OIDC
 permission.
 It installs the Linux root/native tarball pair with lifecycle scripts disabled
 and runs a packaged scan.

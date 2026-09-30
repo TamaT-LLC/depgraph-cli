@@ -36,7 +36,10 @@ test("selectPlatform maps every supported npm target", () => {
     selectPlatform({ platform: "darwin", arch: "arm64" }).packageName,
     "@tamat-llc/depgraph-darwin-arm64",
   );
-  assert.equal(selectPlatform({ platform: "darwin", arch: "x64" }).target, "x86_64-apple-darwin");
+  assert.throws(
+    () => selectPlatform({ platform: "darwin", arch: "x64" }),
+    /unsupported platform/u,
+  );
   assert.equal(
     selectPlatform({ platform: "linux", arch: "arm64", glibcVersionRuntime: "2.39" }).packageName,
     "@tamat-llc/depgraph-linux-arm64-gnu",

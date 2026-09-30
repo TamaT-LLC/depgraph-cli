@@ -20,10 +20,9 @@ pub const PUBLIC_VULNERABILITY_SCANNER_VERSION: &str = "1.0.0";
 pub const MAX_PUBLIC_PROVENANCE_ASSETS: usize = 100_000;
 pub const MAX_PUBLIC_PROVENANCE_DEPENDENCIES: usize = 100_000;
 
-pub const PUBLIC_RELEASE_TARGETS: [&str; 5] = [
+pub const PUBLIC_RELEASE_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ];
@@ -926,7 +925,7 @@ mod tests {
         let package_a = build_public_provenance_review_package(&input).unwrap();
         let package_b = build_public_provenance_review_package(&input.clone()).unwrap();
         assert_eq!(package_a, package_b);
-        assert_eq!(package_a.targets.len(), 5);
+        assert_eq!(package_a.targets.len(), PUBLIC_RELEASE_TARGETS.len());
         assert_eq!(
             evaluate_public_provenance_review(&package_a, &expected)
                 .unwrap()

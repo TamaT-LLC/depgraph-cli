@@ -13,16 +13,6 @@
       "profile_plan_output_sha256": "525b77fa3dcdb931f30f7ee7a824bd1407f1ea3b070db09b48fdd3c60775eda3"
     },
     {
-      "target": "x86_64-apple-darwin",
-      "source_commit": "0ea0099138833da5cde2cf35ef83109b5b0648e3",
-      "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/34829665257/job/103929753716",
-      "query_plan_digest": "bounded-query-plan:sha256:372935de59ffb986aae8be966f5a6ef81c672adc6c9b5b7e9415c110073564a5",
-      "query_result_digest": "bounded-query-result:sha256:e38f6180b154bafb89d3a9a8090bee0624e2477a77bdc5422e11373e559f59e5",
-      "query_output_sha256": "2074b4d571dc5c171f416872be3a53f679f7644a3fce70e77d45999bd913fbd5",
-      "profile_plan_digest": "profile-selection-plan:sha256:6aedbc726fcb806fde2a83b9b832dd41f47e86f74f8baf0934195d6e6bd1acf0",
-      "profile_plan_output_sha256": "235a8c33679aea5ca61b8db2f6829f6ba6dd24fc8a0187f1f8d60be2d60c62f7"
-    },
-    {
       "target": "x86_64-unknown-linux-gnu",
       "source_commit": "0ea0099138833da5cde2cf35ef83109b5b0648e3",
       "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/34829665257/job/103938269794",

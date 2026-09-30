@@ -1,17 +1,17 @@
 # npmリリース手順
 
-この手順は、検証済みGitHub Releaseを`@tamat-llc/depgraph`と5つのnative packageへ
+この手順は、検証済みGitHub Releaseを`@tamat-llc/depgraph`と4つのnative packageへ
 変換し、npm Trusted Publishingで公開する境界を定める。
+`@tamat-llc/depgraph-darwin-x64`（`x86_64-apple-darwin`）は `v0.6.1` から公開しない。
 アーキテクチャ上の決定は
 [`PROJ-ARC-001-ADR-008`](../40_arch_design/adr-npm-distribution.md)を参照する。
 
 ## 対象
 
-npmへ公開するpackageは次の6つである。
+npmへ公開するpackageは次の5つである。
 
 - `@tamat-llc/depgraph`
 - `@tamat-llc/depgraph-darwin-arm64`
-- `@tamat-llc/depgraph-darwin-x64`
 - `@tamat-llc/depgraph-linux-arm64-gnu`
 - `@tamat-llc/depgraph-linux-x64-gnu`
 - `@tamat-llc/depgraph-win32-x64`
@@ -37,9 +37,9 @@ draft/prerelease GitHub Release、post-publish evidenceがないRelease、eviden
 `prepare` jobは`actions: read`と`contents: read`だけを持ち、次を実行する。
 
 1. `main`、signed annotated tag、GitHub Release、successful Release runを照合する。
-2. 公開済み5 targetのarchive、checksum、3種類のsmoke reportを取得する。
+2. 公開済み4 targetのarchive、checksum、3種類のsmoke reportを取得する。
 3. `cargo xtask verify-release-assets release-assets`で公開byteを再検証する。
-4. `npm/scripts/build-packages.mjs`で6つのtarballと
+4. `npm/scripts/build-packages.mjs`で5つのtarballと
    `npm-package-set.json`を生成する。
 5. Linux x64のnative packageとroot packageを`--ignore-scripts`で導入し、
    version、MCP binary、safe scanを確認する。
@@ -49,13 +49,13 @@ draft/prerelease GitHub Release、post-publish evidenceがないRelease、eviden
 このjobはcheckoutせず、repository scriptも実行せず、同一runのpackage-set
 artifactだけを入力にする。
 各tarballのSHA-256、package名、version、repository、`private`と`scripts`の
-不存在を再確認し、5つのnative packageを先に、`@tamat-llc/depgraph`を最後に公開する。
+不存在を再確認し、4つのnative packageを先に、`@tamat-llc/depgraph`を最後に公開する。
 同じversionがすでに存在する場合はregistry上のintegrityとrepositoryが一致する
 ときだけskipするため、部分失敗後の再実行は安全である。
 `npm publish`の成功後にregistryのread APIが一時的に`E404`を返す場合がある。
 workflowは約30分を上限に同じversionの可視化を待ち、integrityが一致してから次の
 packageへ進む。
-6 packageの待機と処理時間を含む`publish` job全体は210分で終了する。
+5 packageの待機と処理時間を含む`publish` job全体は210分で終了する。
 待機中は同じversionを再公開しない。
 `E404`以外の参照失敗とintegrity不一致は直ちに失敗させる。
 
@@ -67,7 +67,7 @@ Environment secretは登録しない。
 ## ローカルでのpackage生成確認
 
 GitHub Releaseから通常archive、checksum、query smoke、cross-language smoke、
-MCP smokeの25ファイルを`release-assets/`へ取得する。
+MCP smokeの20ファイルを`release-assets/`へ取得する。
 compiler packやaggregate reportはこのdirectoryへ混ぜない。
 
 ```sh

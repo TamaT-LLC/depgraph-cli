@@ -36,7 +36,6 @@ const OFFICIAL_RELEASE_REPOSITORY: &str = "TamaT-LLC/depgraph-cli";
 const FULL_CI_JOB_NAMES: &[&str] = &[
     "benchmark",
     "compiler-precise-hostile",
-    "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
     "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
     "go-macos",
@@ -49,7 +48,6 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
 const RELEASE_TARGETS: &[(&str, &str)] = &[
     ("aarch64-apple-darwin", "tar.gz"),
     ("aarch64-unknown-linux-gnu", "tar.gz"),
-    ("x86_64-apple-darwin", "tar.gz"),
     ("x86_64-pc-windows-msvc", "zip"),
     ("x86_64-unknown-linux-gnu", "tar.gz"),
 ];
@@ -1339,7 +1337,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_ci_jobs_match_the_captured_eleven_job_workflow() -> Result<()> {
+    fn full_ci_jobs_match_the_captured_workflow() -> Result<()> {
         let captured: Value = serde_json::from_str(include_str!(
             "../../../xtask/fixtures/full-ci-run-34682206659.json"
         ))?;
@@ -1578,7 +1576,7 @@ mod tests {
             local_release_asset(&paths[1])?,
             local_release_asset(&paths[2])?,
         ];
-        assert_eq!(expected_release_asset_names(version).len(), 51);
+        assert_eq!(expected_release_asset_names(version).len(), 42);
         let (evidence, trusted_digest) = release_evidence_fixture(temporary.path(), &local_assets)?;
         let verified = verify_release_evidence(
             &evidence,
@@ -1594,7 +1592,6 @@ mod tests {
         let original: Value = serde_json::from_slice(&original_bytes)?;
         for name in [
             "go-macos",
-            "extra-native-package (macos-15-intel, x86_64-apple-darwin)",
             "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
         ] {
             for change in ["missing", "skipped", "failure"] {

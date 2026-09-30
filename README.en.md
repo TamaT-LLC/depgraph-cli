@@ -155,14 +155,16 @@ evaluated separately.
 The following installation guidance applies after the official Release and
 post-publish evidence exist. The current stable `v0.6.0` provides native packages
 for Linux x86-64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows
-x86-64. The next patch release, `v0.6.1`, is planned for the same five targets.
+x86-64. The next patch release, `v0.6.1`, drops Intel macOS
+(`x86_64-apple-darwin`) and ships the other four targets.
 The `v0.6.1` examples below are valid only after its Release and evidence are
 public. `v0.5.0` was distributed only through GitHub Releases; npm distribution
 starts with `v0.5.1`
 under TamaT LLC's `@tamat-llc` organization scope.
 
 `npm i -g @tamat-llc/depgraph` installs the verified native package for the
-same five targets without an install-time external download. The npm launcher
+same four targets without an install-time external download. Intel macOS
+packages stop at `v0.6.1`. The npm launcher
 requires Node.js 24 or later. The `depgraph` CLI runs entirely from the npm
 package. `depgraph-mcp` is included as well, but starting the MCP server also
 requires the compiler pack for the same version and target from the GitHub
@@ -176,7 +178,6 @@ environment below.
 | --- | --- |
 | Linux x86-64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| macOS Intel | `x86_64-apple-darwin` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
@@ -1086,12 +1087,12 @@ again after the supervised process tree has stopped. It never downloads through
 rustup or falls back to PATH, system, or project toolchains.
 
 Release tags build separate compiler packs for Linux x86-64/ARM64, macOS
-Intel/Apple Silicon, and Windows x86-64 with `cargo xtask
-compiler-pack-package`. Each native job verifies archive extraction,
+Apple Silicon, and Windows x86-64 with `cargo xtask
+compiler-pack-package`. Intel macOS packs are no longer built. Each native job verifies archive extraction,
 closed-tree attestation, wrapper/query handshakes, typed MIR and monomorphized
 call semantics, cross-checkout determinism, resource budgets, legal/provenance
 metadata, tamper rejection, and rollback. `cargo xtask
-verify-compiler-pack-assets` requires all five packs to share
+verify-compiler-pack-assets` requires every pack to share
 `compiler-pack-five-target-release-v1`, the pinned toolchain/rustc/schema/query
 identity, and the canonical semantic shape before the stable release gate can
 publish them. Release metadata and `doctor --json` expose this separate
@@ -1161,7 +1162,7 @@ evidence.
 
 Run `rustup component add rust-src --toolchain 1.93.1` once, then `cargo xtask package` to create a native archive under `dist/`. Release archives place `depgraph` and `depgraph-mcp` under `bin/`, compatible workers and `depgraph-operation-runner` under `libexec/`, and include the project's complete `LICENSE-MIT` and `LICENSE-APACHE` texts, checksum-verified protocol and `depgraph-mcp-tools-v1` schemas, an SPDX SBOM, and a separate third-party license inventory. The release manifest declares `MIT OR Apache-2.0`, attests both project license files independently from `THIRD_PARTY_LICENSES.txt`, and binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `depgraph-mcp-tools-v1`, and `depgraph-operation-v2`. The SBOM and license inventory include the complete shipped rmcp dependency closure and an Apache-2.0 notice. The release gate fixes Rust/Cargo `1.93.1`; the Rust worker manifest records the linked backend unit, rust-analyzer `0.0.330` at revision `8954b66d43225e62c92e8bbcc8500191b5cceb1e` with Salsa `0.26.1`. It also carries `rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf` under `libexec/rust-sysroot` as a licensed, SBOM-recorded `data-tree` copied only from that pinned toolchain's `rust-src` and independently matched to the known normalized digest `cc5465ef70b933d2a80c30472468abb9f8ab297fc767bd6433b2f6f554f4f0e7`. The Web worker manifest records the exact TypeScript version, the complete Web semantic capability set, and its Astro and TypeScript runtime components.
 
-The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, MCP/Rust/Web handshakes, per-framework scan/query/export E2E, dynamic framework build query/diff/impact/policy/JSON/GraphML E2E, cross-checkout determinism, rollback, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, MCP server/runner/schema/SDK metadata, Web worker, build observer/converter, Astro parser, TypeScript compiler, Rust sysroot source, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. The aggregate release verifier requires all five target archives to attest identical MCP schema and Rust sysroot source bytes. After core verifies that data tree, it hands the canonical root to the packaged Rust worker; the worker rechecks the pinned source identity, builds separate library VFS roots for `core`, `alloc`, and `std`, and emits exact standard-library import, type-use, and direct-call edges. Development, mismatched, missing, unsupported-target, and tampered inputs preserve syntax output without `semantic-complete`, and neither packaging nor scanning falls back implicitly to project or system `rust-src` or backend bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the MCP, Web semantic, dynamic framework, and Rust sysroot archive contracts.
+The package verifier extracts the archive and validates the manifest, both project licenses, every artifact and runtime component, MCP/Rust/Web handshakes, per-framework scan/query/export E2E, dynamic framework build query/diff/impact/policy/JSON/GraphML E2E, cross-checkout determinism, rollback, and the complete runtime SBOM and third-party license closure. Missing, added, modified, symlinked, or version-mismatched license, MCP server/runner/schema/SDK metadata, Web worker, build observer/converter, Astro parser, TypeScript compiler, Rust sysroot source, or schema input fails before worker launch. Runtime components distinguish an `executable-tree` with an executable entrypoint from a `data-tree` whose entrypoint is optional. The aggregate release verifier requires every target archive to attest identical MCP schema and Rust sysroot source bytes. After core verifies that data tree, it hands the canonical root to the packaged Rust worker; the worker rechecks the pinned source identity, builds separate library VFS roots for `core`, `alloc`, and `std`, and emits exact standard-library import, type-use, and direct-call edges. Development, mismatched, missing, unsupported-target, and tampered inputs preserve syntax output without `semantic-complete`, and neither packaging nor scanning falls back implicitly to project or system `rust-src` or backend bytes. Tier 1 Linux/macOS package gates and Windows safety/determinism smoke cover the MCP, Web semantic, dynamic framework, and Rust sysroot archive contracts.
 
 `mcp-package-smoke-v3` also runs `depgraph agent-config` for all three host
 formats from a clean temporary home, verifies the complete package/root/Store/

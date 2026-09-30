@@ -498,7 +498,7 @@ const BENCHMARK_ONLY_INPUT: &str = concat!(
 );
 const EXTRA_NATIVE_PACKAGES_INPUT: &str = concat!(
     "      extra_native_packages:\n",
-    "        description: Verify Linux ARM64 and Intel macOS release packages as well\n",
+    "        description: Verify the Linux ARM64 release package as well\n",
     "        type: boolean\n",
     "        default: false\n",
 );
@@ -996,8 +996,9 @@ pub(crate) fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
 
 pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
-    let release_package =
-        format!("次のpatch release `v{VERSION}`も同じ5 targetで提供する予定である。");
+    let release_package = format!(
+        "次のpatch release `v{VERSION}`は Intel macOS（`x86_64-apple-darwin`）を除く4 targetで提供する。"
+    );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
         "現行開発版のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
@@ -1085,7 +1086,7 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
 pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     if crate::TARGET_NATIVE_SMOKE_EXPECTATION_VERSION != VERSION {
         bail!(
-            "native smoke expectations must be refreshed from all five native gates for {VERSION}"
+            "native smoke expectations must be refreshed from all native release gates for {VERSION}"
         );
     }
     verify_github_actions_security(root)?;
