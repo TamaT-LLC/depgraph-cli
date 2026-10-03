@@ -12,14 +12,18 @@ use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 use crate::{
     BuildAudit, BuildOutcomeKind, WebBuildAdapter, WebBuildObservation,
     worker::{
-        copy_safe_environment, locate_web_build_runtime, process_argument_path,
+        copy_safe_environment, locate_web_build_runtime, process_argument_path, read_capped,
         resolve_safe_executable,
     },
 };
 
 const BUILD_EVIDENCE_CONVERTER: &str = "depgraph-web-build-evidence.mjs";
 const MAX_CONVERTER_INPUT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CONVERTER_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+// A valid Next graph can expand a small observation into tens of MiB of
+// provenance-bearing sites and edges. Keep an explicit transport budget,
+// aligned with input, without discarding graph records or their evidence.
+const MAX_CONVERTER_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONVERTER_STDERR_BYTES: usize = 64 * 1024;
 const FRAMEWORK_BUILD_NODE_KINDS: &[&str] = &[
     "route",
     "component",
@@ -457,27 +461,69 @@ pub async fn web_build_protocol_ndjson(
         .stdin
         .take()
         .context("Web build evidence converter stdin is unavailable")?;
-    let writer = tokio::spawn(async move {
+    let stdout = child
+        .stdout
+        .take()
+        .context("converter stdout is unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("converter stderr is unavailable")?;
+    // Read both pipes concurrently and cap retained bytes while draining.
+    // The deadline covers stdin, process exit, and EOF on both output pipes;
+    // no reader/writer tasks are detached on timeout or an I/O error.
+    let writer = async move {
         stdin.write_all(&input).await?;
         stdin.shutdown().await
-    });
-    let output = timeout(Duration::from_secs(30), child.wait_with_output())
-        .await
-        .context("Web build evidence converter timed out")??;
-    writer
-        .await
-        .context("Web build evidence converter input task failed")??;
-    if !output.status.success()
-        || !output.stderr.is_empty()
-        || output.stdout.is_empty()
-        || output.stdout.len() > MAX_CONVERTER_OUTPUT_BYTES
+    };
+    let captured = timeout(Duration::from_secs(30), async {
+        tokio::try_join!(
+            writer,
+            read_capped(stdout, MAX_CONVERTER_OUTPUT_BYTES),
+            read_capped(stderr, MAX_CONVERTER_STDERR_BYTES),
+            child.wait(),
+        )
+    })
+    .await;
+    let (_, (stdout, stdout_truncated), (stderr, stderr_truncated), status) = match captured {
+        Ok(Ok(output)) => output,
+        failure => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return match failure {
+                Err(error) => Err(error).context("Web build evidence converter timed out"),
+                Ok(Err(error)) => Err(error).context("Web build evidence converter I/O failed"),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
+    };
+    validate_converter_capture(
+        status.success(),
+        stdout.len(),
+        stderr.len(),
+        stdout_truncated || stderr_truncated,
+    )?;
+    let protocol = validate_build_evidence(std::io::Cursor::new(&stdout))?;
+    validate_framework_build_evidence_contract(&protocol)
+        .context("Web build evidence rejected by the framework graph contract")?;
+    Ok(stdout)
+}
+
+fn validate_converter_capture(
+    success: bool,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    truncated: bool,
+) -> Result<()> {
+    if !success
+        || stderr_bytes != 0
+        || stdout_bytes == 0
+        || stdout_bytes > MAX_CONVERTER_OUTPUT_BYTES
+        || truncated
     {
         bail!("Web build evidence converter rejected the observation");
     }
-    let protocol = validate_build_evidence(std::io::Cursor::new(&output.stdout))?;
-    validate_framework_build_evidence_contract(&protocol)
-        .context("Web build evidence rejected by the framework graph contract")?;
-    Ok(output.stdout)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +532,59 @@ mod tests {
     use depgraph_protocol::Profile;
     use serde_json::json;
     use std::{collections::BTreeMap, io::Cursor};
+
+    #[test]
+    fn converter_transport_accepts_bounded_large_graphs_and_rejects_invalid_captures() {
+        assert_eq!(MAX_CONVERTER_OUTPUT_BYTES, MAX_CONVERTER_INPUT_BYTES);
+        for bytes in [
+            1,
+            16 * 1024 * 1024 + 1,
+            35_011_313,
+            MAX_CONVERTER_OUTPUT_BYTES,
+        ] {
+            validate_converter_capture(true, bytes, 0, false).unwrap();
+        }
+        for (success, stdout, stderr, truncated) in [
+            (false, 1, 0, false),
+            (true, 0, 0, false),
+            (true, 1, 1, false),
+            (true, MAX_CONVERTER_OUTPUT_BYTES + 1, 0, false),
+            (true, MAX_CONVERTER_OUTPUT_BYTES, 0, true),
+            (true, 1, MAX_CONVERTER_STDERR_BYTES, true),
+        ] {
+            assert!(validate_converter_capture(success, stdout, stderr, truncated).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn converter_stdout_is_capped_at_the_boundary_and_never_promotes_truncation() -> Result<()>
+    {
+        use tokio::io::AsyncReadExt;
+
+        for size in [
+            MAX_CONVERTER_OUTPUT_BYTES - 1,
+            MAX_CONVERTER_OUTPUT_BYTES,
+            MAX_CONVERTER_OUTPUT_BYTES + 1,
+        ] {
+            let stream = tokio::io::repeat(b'x').take(size as u64);
+            let (captured, truncated) = read_capped(stream, MAX_CONVERTER_OUTPUT_BYTES).await?;
+            assert_eq!(captured.len(), size.min(MAX_CONVERTER_OUTPUT_BYTES));
+            assert_eq!(truncated, size > MAX_CONVERTER_OUTPUT_BYTES);
+            assert_eq!(
+                validate_converter_capture(true, captured.len(), 0, truncated).is_ok(),
+                size <= MAX_CONVERTER_OUTPUT_BYTES
+            );
+        }
+        let (stderr, truncated) = read_capped(
+            tokio::io::repeat(b'x').take(MAX_CONVERTER_STDERR_BYTES as u64 + 1),
+            MAX_CONVERTER_STDERR_BYTES,
+        )
+        .await?;
+        assert_eq!(stderr.len(), MAX_CONVERTER_STDERR_BYTES);
+        assert!(truncated);
+        assert!(validate_converter_capture(true, 1, stderr.len(), truncated).is_err());
+        Ok(())
+    }
 
     #[test]
     fn web_build_parent_selects_the_matching_semantic_unit_and_rejects_ambiguity() -> Result<()> {
