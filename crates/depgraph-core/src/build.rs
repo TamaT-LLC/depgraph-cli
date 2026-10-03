@@ -55,6 +55,9 @@ use crate::worker::{
     resolve_safe_executable, run_probe, sanitized_path, terminate_worker,
 };
 
+#[cfg(all(test, unix))]
+mod staging_tests;
+
 pub const BUILD_SUPERVISOR_VERSION: &str = "1.0";
 pub const DEFAULT_BUILD_TIMEOUT_SECONDS: u64 = 15 * 60;
 pub const MAX_BUILD_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -2382,6 +2385,7 @@ fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
     let policy = load_stage_policy(source)?;
     let mut files = 0_usize;
     let mut bytes = 0_u64;
+    let mut links = Vec::new();
     for_each_staged_path(source, &policy, |relative, kind| {
         let target = destination.join(relative);
         match kind {
@@ -2400,9 +2404,54 @@ fn stage_workspace(source: &Path, destination: &Path) -> Result<()> {
                 fs::copy(from, &target)?;
                 fs::set_permissions(&target, metadata.permissions())?;
             }
+            StagedPathKind::Symlink {
+                target: link,
+                directory,
+                ..
+            } => {
+                links.push((target, link.clone(), *directory));
+            }
         }
         Ok(())
-    })
+    })?;
+    // Install links last: no copied file or directory may be written through a
+    // staged link. Targets are canonical source paths rebased into this tree,
+    // never absolute paths back into the original checkout.
+    let canonical_destination = destination.canonicalize()?;
+    for (path, target, directory) in links {
+        let parent = path.parent().context("staged link has no parent")?;
+        fs::create_dir_all(parent)?;
+        let resolved = parent
+            .join(&target)
+            .canonicalize()
+            .context("staged symlink target is unavailable")?;
+        if !resolved.starts_with(&canonical_destination) {
+            bail!("security policy violation: staged symlink target escapes workspace");
+        }
+        create_staged_symlink(&target, &path, directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_staged_symlink(target: &Path, path: &Path, _directory: bool) -> Result<()> {
+    std::os::unix::fs::symlink(target, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_staged_symlink(target: &Path, path: &Path, directory: bool) -> Result<()> {
+    if directory {
+        std::os::windows::fs::symlink_dir(target, path)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_staged_symlink(_target: &Path, _path: &Path, _directory: bool) -> Result<()> {
+    bail!("preserving dependency symlinks is unsupported on this platform")
 }
 
 fn stage_cargo_dependency_cache(source: &Path, destination: &Path) -> Result<()> {
@@ -2735,6 +2784,12 @@ enum StagedPathKind {
         from: PathBuf,
         metadata: fs::Metadata,
     },
+    Symlink {
+        target: PathBuf,
+        original_target: PathBuf,
+        original_absolute: bool,
+        directory: bool,
+    },
 }
 
 fn load_stage_policy(source: &Path) -> Result<StagePolicy> {
@@ -2936,6 +2991,65 @@ fn stage_symlink_entry(walk: &mut StageWalk<'_>, logical: &Path, link_path: &Pat
     else {
         return Ok(());
     };
+    let target_relative = target.strip_prefix(walk.canonical_root)?;
+    if path_is_ignored(target_relative, &walk.policy.ignored_paths) {
+        return Ok(());
+    }
+    if logical
+        .components()
+        .any(|part| part.as_os_str() == "node_modules")
+    {
+        if !target_meta.is_file() && !target_meta.is_dir() {
+            return Err(symlink_policy_violation(logical));
+        }
+        // A link to an ancestor creates a directory traversal cycle even
+        // though canonicalize() itself succeeds for that link.
+        if target_meta.is_dir()
+            && link_path
+                .parent()
+                .context("dependency symlink has no parent")?
+                .canonicalize()?
+                .starts_with(&target)
+        {
+            return Ok(());
+        }
+        let parent = logical
+            .parent()
+            .context("dependency symlink has no parent")?;
+        let shared = parent
+            .components()
+            .zip(target_relative.components())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative_target = PathBuf::new();
+        for _ in parent.components().skip(shared) {
+            relative_target.push("..");
+        }
+        for component in target_relative.components().skip(shared) {
+            relative_target.push(component);
+        }
+        let original = fs::read_link(link_path)?;
+        let original_absolute = original.is_absolute();
+        let original_target = if original_absolute {
+            original
+                .strip_prefix(walk.canonical_root)
+                .or_else(|_| original.strip_prefix(walk.source))
+                .unwrap_or(&original)
+                .to_path_buf()
+        } else {
+            original
+        };
+        return push_staged_path(
+            walk.collected,
+            logical.to_path_buf(),
+            StagedPathKind::Symlink {
+                target: relative_target,
+                original_target,
+                original_absolute,
+                directory: target_meta.is_dir(),
+            },
+        );
+    }
     if target_meta.is_dir() {
         push_staged_path(
             walk.collected,
@@ -3025,7 +3139,7 @@ fn digest_output_tree(output: &Path, stdout: &[u8]) -> Result<String> {
 
 fn digest_workspace(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"depgraph-build-source-v1\0");
+    hasher.update(b"depgraph-build-source-v2\0");
     let mut entries = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -3033,12 +3147,24 @@ fn digest_workspace(root: &Path) -> Result<String> {
     entries.sort_by_key(|entry| entry.path().to_path_buf());
     for entry in entries {
         let relative = entry.path().strip_prefix(root)?;
-        if relative.as_os_str().is_empty() || !entry.file_type().is_file() {
+        if relative.as_os_str().is_empty() {
             continue;
         }
+        let contents = if entry.file_type().is_file() {
+            hasher.update(b"file\0");
+            fs::read(entry.path())?
+        } else if entry.file_type().is_symlink() {
+            hasher.update(b"symlink\0");
+            fs::read_link(entry.path())?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        } else {
+            continue;
+        };
         hasher.update(display_logical(relative).as_bytes());
         hasher.update([0]);
-        hasher.update(fs::read(entry.path())?);
+        hasher.update(contents);
         hasher.update([0]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -3057,11 +3183,11 @@ fn source_mutation_fingerprint(root: &Path) -> Result<String> {
 fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
     let policy = load_stage_policy(root)?;
     let mut source = Sha256::new();
-    source.update(b"depgraph-build-source-v1\0");
+    source.update(b"depgraph-build-source-v2\0");
     let mut controls = Sha256::new();
     controls.update(b"depgraph-build-manifest-lock-config-v1\0");
     let mut staging_metadata = Sha256::new();
-    staging_metadata.update(b"depgraph-build-staging-metadata-v1\0");
+    staging_metadata.update(b"depgraph-build-staging-metadata-v2\0");
     let mut files = 0_usize;
     let mut bytes = 0_u64;
     for_each_staged_path(root, &policy, |relative, kind| {
@@ -3071,6 +3197,23 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
                 staging_metadata.update(b"directory\0");
                 staging_metadata.update(logical.as_bytes());
                 staging_metadata.update([0]);
+            }
+            StagedPathKind::Symlink {
+                target,
+                original_target,
+                original_absolute,
+                directory,
+            } => {
+                source.update(b"symlink\0");
+                source.update(logical.as_bytes());
+                source.update([0]);
+                source.update(target.as_os_str().as_encoded_bytes());
+                source.update([0]);
+                staging_metadata.update(b"symlink\0");
+                staging_metadata.update(logical.as_bytes());
+                staging_metadata.update([0]);
+                staging_metadata.update(original_target.as_os_str().as_encoded_bytes());
+                staging_metadata.update([0, u8::from(*original_absolute), u8::from(*directory)]);
             }
             StagedPathKind::File { from, metadata } => {
                 files += 1;
@@ -3083,6 +3226,7 @@ fn fingerprint_build_source(root: &Path) -> Result<(String, String, String)> {
                 staging_metadata.update(logical.as_bytes());
                 staging_metadata.update([0]);
                 staging_metadata.update(staged_file_permission_fingerprint(metadata).to_le_bytes());
+                source.update(b"file\0");
                 source.update(logical.as_bytes());
                 source.update([0]);
                 source.update(&contents);
@@ -4311,7 +4455,7 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
 
     #[cfg(unix)]
     #[test]
-    fn staging_dereferences_in_repository_symlinks_and_honors_build_ignored_paths() -> Result<()> {
+    fn staging_preserves_dependency_symlinks_and_honors_build_ignored_paths() -> Result<()> {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(
             root.path()
@@ -4345,11 +4489,19 @@ printf yes > "$DEPGRAPH_OUTPUT_DIR/PROJECT_CODE_EXECUTED"
         stage_workspace(root.path(), destination.path())?;
         let staged_pkg = destination.path().join("node_modules/pkg/index.js");
         assert!(staged_pkg.is_file());
+        assert!(
+            destination
+                .path()
+                .join("node_modules/pkg")
+                .symlink_metadata()?
+                .file_type()
+                .is_symlink()
+        );
         assert!(!staged_pkg.symlink_metadata()?.file_type().is_symlink());
         assert_eq!(fs::read_to_string(staged_pkg)?, "module.exports = 1;\n");
         let staged_bin = destination.path().join("node_modules/.bin/pkg");
         assert!(staged_bin.is_file());
-        assert!(!staged_bin.symlink_metadata()?.file_type().is_symlink());
+        assert!(staged_bin.symlink_metadata()?.file_type().is_symlink());
         assert!(!destination.path().join(".claude").exists());
         fingerprint_build_source(root.path())?;
         Ok(())

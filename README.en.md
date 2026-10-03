@@ -994,11 +994,19 @@ observer named by `DEPGRAPH_OBSERVER` (and `NEXT_ADAPTER_PATH` for Next) into
 the real build lifecycle. It runs in a temporary staged workspace using
 canonical system Node, a cleared allowlisted environment, temporary
 HOME/cache/output, bounded output, timeout/cancellation, and cross-platform
-process-tree cleanup. In-repository symbolic links are materialized as regular
-files or directories; a link whose canonical target leaves the repository fails
-closed. Cyclic links and links into `.git`, `.depgraph`, or the repository-root
+process-tree cleanup. In-repository symbolic links inside `node_modules` are
+preserved, with their canonical targets rebased to relative paths inside the
+staged workspace. This preserves Node's realpath-based nested dependency
+resolution, including pnpm's isolated layout with multiple package versions;
+no package-manager or `.npmrc` detection is required. Other in-repository
+symbolic links are materialized as regular files or directories. A link whose
+canonical target leaves the repository, is missing, or is not a regular file
+or directory fails closed. Dangling dependency links are not silently skipped:
+repair the installation or explicitly exclude the unwanted link. Platforms
+must permit creating symbolic links; staging never falls back to flattening
+dependencies. Directory links back to an ancestor and links into `.git`, `.depgraph`, or the repository-root
 `target` / `.next` directories are omitted rather than copied. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
-prefixes from staging, and unknown `[build]` keys are rejected. `[daemon]
+prefixes and links to those targets from staging, and unknown `[build]` keys are rejected. `[daemon]
 ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
 isolation capability, and outcome; raw stdout/stderr and temporary or host
