@@ -1007,7 +1007,28 @@ must permit creating symbolic links; staging never falls back to flattening
 dependencies. Directory links back to an ancestor and links into `.git`, `.depgraph`, or the repository-root
 `target` / `.next` directories are omitted rather than copied. `.depgraph.toml` `[build].ignored_paths` excludes repository-relative
 prefixes and links to those targets from staging, and unknown `[build]` keys are rejected. `[daemon]
-ignored_paths` does not apply to resolve staging. Every launched attempt saves a secret-free audit
+ignored_paths` does not apply to resolve staging. Next's Node.js trace assets
+can include dependency directory links themselves: confined `node_modules`
+links receive a domain-separated topology digest, while their traced regular
+files retain content digests. This does not recursively hash untraced package
+contents or admit symlinks as main output, fallback, or Wasm files. Link and
+target identity are rechecked to reject changes during observation.
+Edge asset hints relative to Next's configured build directory are accepted
+only when they identify exactly the same confined artifact as its absolute
+path; recorded artifact paths remain repository-relative.
+Next output IDs are scoped by type and semantic variant. Prerenders may reuse
+their page's raw ID, but each parent reference must resolve to one primary
+request route; duplicate variants and missing or ambiguous parents fail closed.
+Shared traced files retain separate role-qualified graph identities when used
+in both server and Edge contexts, preserving both sets of load relations.
+The Web build-evidence converter has separate 64 MiB input and stdout bounds,
+a 64 KiB stderr capture bound, and a 30-second deadline. Stdout and stderr are
+drained concurrently with capped retention; any truncation, stderr, failed
+exit, or invalid protocol/graph rejects the entire result. These are internal
+build-conversion limits, separate from runtime trace and query limits. This
+admits complete provenance-rich graphs larger than the previous 16 MiB stdout
+budget without dropping their sites, edges, or evidence.
+Every launched attempt saves a secret-free audit
 containing command metadata, logical paths, environment key names, limits,
 isolation capability, and outcome; raw stdout/stderr and temporary or host
 paths are not persisted in the audit record. On a failed, timed-out, or

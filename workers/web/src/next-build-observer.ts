@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, open, realpath } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { canonicalJson, stableId } from "./ids";
 import {
@@ -130,7 +131,12 @@ export interface NextAdapterCapability {
   existingAdapter: "absent" | "chainable";
 }
 
-export type ArtifactReader = (absolutePath: string, logicalPath: string, repoRoot: string) => Awaitable<string>;
+export type ArtifactReader = (
+  absolutePath: string,
+  logicalPath: string,
+  repoRoot: string,
+  purpose?: "regular" | "traced_asset",
+) => Awaitable<string>;
 
 export interface NextObservedConfig {
   output: "default" | "standalone" | "export";
@@ -598,15 +604,111 @@ export function sanitizeNextConfig(config: UnknownRecord): NextObservedConfig {
   };
 }
 
-async function defaultArtifactReader(absolutePath: string, _logicalPath: string, repoRoot: string): Promise<string> {
+function sameArtifactIdentity(before: Stats, after: Stats): boolean {
+  const fields = ["dev", "ino", "mode", "size", "mtimeMs", "ctimeMs"] as const;
+  return fields.every((field) => before[field] === after[field]);
+}
+
+function isAncestorDirectory(ancestor: string, candidate: string): boolean {
+  const relative = path.relative(ancestor, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function safeDependencyLinkLocation(logicalPath: string | null): string {
+  if (logicalPath === null) fail("web.next_build_artifact_unsafe");
+  const segments = logicalPath.split("/");
+  if (segments.some((segment) => segment === ".git" || segment === ".depgraph")) {
+    fail("web.next_build_artifact_unsafe");
+  }
+  return logicalPath;
+}
+
+function safeDependencyLinkTarget(logicalPath: string | null): string {
+  const target = safeDependencyLinkLocation(logicalPath);
+  if (["target", ".next"].includes(target.split("/")[0]!)) fail("web.next_build_artifact_unsafe");
+  return target;
+}
+
+function validateDependencyDirectory(rawTarget: string, target: Stats, canonicalTarget: string, canonicalParent: string): void {
+  if (boundedString(rawTarget) === null || !target.isDirectory()
+    || isAncestorDirectory(canonicalTarget, canonicalParent)) {
+    fail("web.next_build_artifact_unsafe");
+  }
+}
+
+async function verifyDependencyLinkUnchanged(
+  absolutePath: string,
+  canonicalTarget: string,
+  canonicalParent: string,
+  rawTarget: string,
+  before: Stats,
+  targetBefore: Stats,
+): Promise<void> {
+  const [after, targetAfter, rawTargetAfter, resolvedAfter, parentAfter] = await Promise.all([
+    lstat(absolutePath), lstat(canonicalTarget), readlink(absolutePath), realpath(absolutePath),
+    realpath(path.dirname(absolutePath)),
+  ]);
+  const unchanged = [
+    sameArtifactIdentity(before, after), sameArtifactIdentity(targetBefore, targetAfter),
+    rawTarget === rawTargetAfter, canonicalTarget === resolvedAfter, canonicalParent === parentAfter,
+  ];
+  if (!unchanged.every(Boolean)) fail("web.next_build_artifact_unsafe");
+}
+
+async function digestTracedDependencyLink(
+  absolutePath: string,
+  logicalPath: string,
+  repoRoot: string,
+  canonicalRoot: string,
+  canonicalTarget: string,
+  before: Stats,
+): Promise<string> {
+  if (nodeModulePackageName(logicalPath) === null || before.size > MAX_SAFE_STRING) {
+    fail("web.next_build_artifact_unsafe");
+  }
+  safeDependencyLinkLocation(logicalPath);
+  const [rawTarget, canonicalParent, targetBefore] = await Promise.all([
+    readlink(absolutePath), realpath(path.dirname(absolutePath)), lstat(canonicalTarget),
+  ]);
+  const targetPath = path.resolve(canonicalParent, rawTarget);
+  const directTarget = safeDependencyLinkTarget(
+    logicalFromAbsolute(canonicalRoot, targetPath) ?? logicalFromAbsolute(repoRoot, targetPath),
+  );
+  const resolvedTarget = safeDependencyLinkTarget(logicalFromAbsolute(canonicalRoot, canonicalTarget));
+  // Next may generate package aliases below .next/node_modules. The link
+  // location remains confined, while its target must be outside build/control trees.
+  safeDependencyLinkLocation(logicalFromAbsolute(canonicalRoot, canonicalParent));
+  validateDependencyDirectory(rawTarget, targetBefore, canonicalTarget, canonicalParent);
+  await verifyDependencyLinkUnchanged(absolutePath, canonicalTarget, canonicalParent, rawTarget, before, targetBefore);
+  // NFT includes dependency-directory links as topology entries. Their traced
+  // descendants are hashed independently; never recursively read the package.
+  return digestIdentity({
+    kind: "next-traced-dependency-directory-link-v1",
+    logical_path: logicalPath,
+    direct_target: directTarget,
+    resolved_target: resolvedTarget,
+  });
+}
+
+async function defaultArtifactReader(
+  absolutePath: string,
+  logicalPath: string,
+  repoRoot: string,
+  purpose: "regular" | "traced_asset" = "regular",
+): Promise<string> {
   const [canonicalRoot, canonicalArtifact, before] = await Promise.all([
     realpath(repoRoot),
     realpath(absolutePath),
     lstat(absolutePath),
   ]);
   const relative = path.relative(canonicalRoot, canonicalArtifact);
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)
-    || !before.isFile() || before.isSymbolicLink() || before.size > MAX_ARTIFACT_BYTES) {
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    fail("web.next_build_artifact_unsafe");
+  }
+  if (before.isSymbolicLink() && purpose === "traced_asset") {
+    return digestTracedDependencyLink(absolutePath, logicalPath, repoRoot, canonicalRoot, canonicalArtifact, before);
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_ARTIFACT_BYTES) {
     fail("web.next_build_artifact_unsafe");
   }
   const handle = await open(absolutePath, "r");
@@ -707,6 +809,68 @@ interface SanitizedOutputRecord {
   output: NextObservedOutput;
 }
 
+function isPrimaryRequestOutput(output: NextObservedOutput): boolean {
+  return REQUEST_OUTPUT_TYPES.has(output.type) && output.variant === "route";
+}
+
+function validPrerenderRelationship(output: NextObservedOutput): boolean {
+  if (output.type !== "PRERENDER") {
+    return [output.parent_output_identity_digest, output.prerender_group_id].every((value) => value === null);
+  }
+  return output.parent_output_identity_digest !== null
+    && Number.isSafeInteger(output.prerender_group_id) && Number(output.prerender_group_id) >= 0;
+}
+
+function validObservedParentReference(output: NextObservedOutput, primaryIds: ReadonlySet<string>): boolean {
+  return output.parent_output_identity_digest === null || primaryIds.has(output.parent_output_identity_digest);
+}
+
+function validateObservedOutputParents(outputs: readonly NextObservedOutput[]): void {
+  const primaryIds = new Set(outputs.filter(isPrimaryRequestOutput).map((output) => output.output_identity_digest));
+  if (outputs.some((output) => !validPrerenderRelationship(output) || !validObservedParentReference(output, primaryIds))) {
+    fail("web.next_build_observation_contract_invalid");
+  }
+}
+
+function validateOutputNamespaces(records: readonly SanitizedOutputRecord[]): void {
+  const identities = new Set<string>();
+  for (const item of records) {
+    // Next reuses route IDs across request/prerender types, and its Edge SSR
+    // pages share an ID between the primary request and data variant.
+    const identity = canonicalJson([item.output.type, item.rawId, item.output.variant]);
+    if (identities.has(identity)) fail("web.next_build_manifest_invalid");
+    identities.add(identity);
+  }
+}
+
+function indexPrimaryRequestOutputs(records: readonly SanitizedOutputRecord[]): Map<string, NextObservedOutput[]> {
+  const parents = new Map<string, NextObservedOutput[]>();
+  for (const item of records) {
+    if (!isPrimaryRequestOutput(item.output)) continue;
+    const candidates = parents.get(item.rawId) ?? [];
+    candidates.push(item.output);
+    parents.set(item.rawId, candidates);
+  }
+  return parents;
+}
+
+function requestParentIdentity(parents: ReadonlyMap<string, NextObservedOutput[]>, rawParentId: string): string {
+  const candidates = parents.get(rawParentId);
+  if (candidates === undefined) fail("web.next_build_partial_build");
+  if (candidates.length !== 1) fail("web.next_build_manifest_invalid");
+  return candidates[0]!.output_identity_digest;
+}
+
+function resolveOutputParents(records: readonly SanitizedOutputRecord[]): void {
+  validateOutputNamespaces(records);
+  const parents = indexPrimaryRequestOutputs(records);
+  for (const item of records) {
+    if (item.rawParentId === null) continue;
+    item.output.parent_output_identity_digest = requestParentIdentity(parents, item.rawParentId);
+    item.output.output_identity_digest = stableOutputIdentity(item.output);
+  }
+}
+
 function stableOutputIdentity(output: NextObservedOutput): string {
   return digestIdentity({
     type: output.type,
@@ -731,6 +895,7 @@ async function digestArtifact(
   absolutePath: unknown,
   logicalHint: unknown,
   readArtifact: ArtifactReader,
+  purpose: "regular" | "traced_asset" = "regular",
 ): Promise<{ logicalPath: string; digest: string }> {
   const rawAbsolute = boundedString(absolutePath);
   const contained = logicalFromAbsolute(repoRoot, absolutePath);
@@ -747,7 +912,7 @@ async function digestArtifact(
   const logicalPath = contained;
   let digest: string;
   try {
-    digest = await readArtifact(rawAbsolute, logicalPath, repoRoot);
+    digest = await readArtifact(rawAbsolute, logicalPath, repoRoot, purpose);
   } catch (error) {
     if (error instanceof NextBuildObserverError) throw error;
     fail("web.next_build_artifact_read_failed");
@@ -756,10 +921,20 @@ async function digestArtifact(
   return { logicalPath, digest };
 }
 
+function edgeAssetLogicalHint(repoRoot: string, distDir: string, logicalHint: string, absolutePath: unknown): string {
+  const hinted = canonicalRelativePath(logicalHint);
+  const distLogicalPath = logicalFromAbsolute(repoRoot, distDir);
+  // Next's page.files aliases may be relative to distDir. Only admit an exact,
+  // canonical child path; do not strip arbitrary prefixes or normalize traversal.
+  if (hinted !== logicalHint || distLogicalPath === null) return logicalHint;
+  return path.resolve(distDir, hinted) === absolutePath ? path.posix.join(distLogicalPath, hinted) : logicalHint;
+}
+
 async function sanitizeOutput(
   raw: unknown,
   expectedType: string,
   repoRoot: string,
+  distDir: string,
   buildId: string,
   readArtifact: ArtifactReader,
 ): Promise<SanitizedOutputRecord> {
@@ -808,7 +983,11 @@ async function sanitizeOutput(
       fail("web.next_build_asset_contract_invalid");
     }
     for (const [logicalHint, absolutePath] of Object.entries(map)) {
-      const artifact = await digestArtifact(repoRoot, absolutePath, logicalHint, readArtifact);
+      const purpose = kind === "asset" && requestOutput && runtime === "nodejs" ? "traced_asset" : "regular";
+      const hint = kind === "asset" && runtime === "edge"
+        ? edgeAssetLogicalHint(repoRoot, distDir, logicalHint, absolutePath)
+        : logicalHint;
+      const artifact = await digestArtifact(repoRoot, absolutePath, hint, readArtifact, purpose);
       const stableLogicalPath = replaceBuildId(artifact.logicalPath, buildId);
       assets.push({
         logical_path: stableLogicalPath,
@@ -832,6 +1011,9 @@ async function sanitizeOutput(
     fail("web.next_build_output_metadata_limit_exceeded");
   }
   const rawParentId = boundedString(output.parentOutputId);
+  if (expectedType !== "PRERENDER" && (output.parentOutputId !== undefined || output.groupId !== undefined)) {
+    fail("web.next_build_manifest_invalid");
+  }
   const prerenderGroupId = Number.isSafeInteger(output.groupId) && Number(output.groupId) >= 0
     ? Number(output.groupId)
     : null;
@@ -921,7 +1103,7 @@ export async function collectNextBuildObservation(
   for (const [collection, type] of OUTPUT_COLLECTIONS) {
     for (const raw of outputArray(outputsInput, collection)) {
       if (records.length >= MAX_OUTPUTS) fail("web.next_build_output_limit_exceeded");
-      const recordValue = await sanitizeOutput(raw, type, context.repoRoot, context.buildId, readArtifact);
+      const recordValue = await sanitizeOutput(raw, type, context.repoRoot, context.distDir, context.buildId, readArtifact);
       totalAssets += recordValue.output.assets.length;
       if (totalAssets > MAX_TOTAL_ASSETS) fail("web.next_build_asset_limit_exceeded");
       records.push(recordValue);
@@ -933,6 +1115,7 @@ export async function collectNextBuildObservation(
       outputsInput.middleware,
       "MIDDLEWARE",
       context.repoRoot,
+      context.distDir,
       context.buildId,
       readArtifact,
     );
@@ -940,19 +1123,7 @@ export async function collectNextBuildObservation(
     if (totalAssets > MAX_TOTAL_ASSETS) fail("web.next_build_asset_limit_exceeded");
     records.push(middleware);
   }
-  const outputIdentityByRawId = new Map<string, string>();
-  for (const item of records) {
-    const existing = outputIdentityByRawId.get(item.rawId);
-    if (existing !== undefined) fail("web.next_build_manifest_invalid");
-    outputIdentityByRawId.set(item.rawId, item.output.output_identity_digest);
-  }
-  for (const item of records) {
-    if (item.rawParentId === null) continue;
-    const parentIdentity = outputIdentityByRawId.get(item.rawParentId);
-    if (parentIdentity === undefined) fail("web.next_build_partial_build");
-    item.output.parent_output_identity_digest = parentIdentity;
-    item.output.output_identity_digest = stableOutputIdentity(item.output);
-  }
+  resolveOutputParents(records);
   const outputs = records.map((item) => item.output);
   outputs.sort((left, right) => compareUtf8(
     canonicalJson(left as unknown as JsonValue),
@@ -1372,6 +1543,7 @@ function validateNextBuildObservation(observation: NextBuildObservation): void {
 
 export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGraphDelta {
   validateNextBuildObservation(input.observation);
+  validateObservedOutputParents(input.observation.outputs);
   for (const [field, value] of Object.entries(input.provenance)) {
     if (field === "build_run_id" || field === "profile_id") {
       if (boundedString(value) === null) fail("web.next_build_provenance_invalid");
@@ -1590,6 +1762,7 @@ export function buildNextObservedGraph(input: NextBuildGraphInput): NextBuildGra
       const assetIdentity: Record<string, JsonValue> = {
         framework: "next",
         artifact_kind: assetValue.kind,
+        asset_role: assetValue.role,
         logical_artifact_path: assetValue.logical_path,
         artifact_digest: assetValue.digest,
         profile_id: input.provenance.profile_id,
