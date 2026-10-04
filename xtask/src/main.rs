@@ -1117,6 +1117,7 @@ fn test() -> Result<()> {
         "scripts/tests/cache-hit-benchmark.test.mjs",
         "scripts/tests/agent-dogfood.test.mjs",
         "scripts/tests/release-post-publish-canary.test.mjs",
+        "scripts/tests/homebrew-tap.test.mjs",
     ]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")
@@ -6021,6 +6022,7 @@ mod tests {
 
         for workflow_name in [
             "ci.yml",
+            "homebrew-tap.yml",
             "npm-release.yml",
             "release-post-publish-recovery.yml",
             "release.yml",
@@ -6034,6 +6036,36 @@ mod tests {
                 &pins,
                 &mut BTreeSet::new(),
             )?;
+        }
+
+        let homebrew = fs::read_to_string(root.join(".github/workflows/homebrew-tap.yml"))?;
+        for drift in [
+            homebrew.replace(
+                "ref: refs/heads/main",
+                "ref: ${{ github.event.workflow_run.head_sha }}",
+            ),
+            homebrew.replace("--release-run-id", "--unbound-run"),
+            homebrew.replace("repositories: homebrew-tap", "repositories: depgraph-cli"),
+            homebrew.replace("permission-contents: write", "permission-contents: read"),
+            homebrew.replace("github.event.workflow_run.conclusion == 'success'", "true"),
+            homebrew.replace("github.ref == 'refs/heads/main'", "true"),
+            homebrew.replace("owner: TamaT-LLC", "owner: attacker"),
+            homebrew.replace(
+                "secrets.HOMEBREW_TAP_APP_PRIVATE_KEY",
+                "secrets.UNRELATED_SECRET",
+            ),
+            format!("{homebrew}\n          skip-token-revoke: true\n"),
+        ] {
+            assert_ne!(drift, homebrew);
+            assert!(
+                verify_workflow_policy_text(
+                    "homebrew-tap.yml",
+                    &drift,
+                    &pins,
+                    &mut BTreeSet::new()
+                )
+                .is_err()
+            );
         }
 
         let mutable = ci.replacen(

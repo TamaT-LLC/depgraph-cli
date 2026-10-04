@@ -1,0 +1,91 @@
+name: Homebrew tap
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable tag (vX.Y.Z)
+        required: true
+        type: string
+      dry_run:
+        description: Issue the App token and clone the tap without opening a PR
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  update-formula:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # Never check out workflow_run.head_sha, a tag, or a fork in this privileged workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Check out the immutable release verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TamaT-LLC/homebrew-tap
+          ref: 526e47e156ad5719f29c9ebb9341b1181d0fb9a0
+          path: tap-tools
+          persist-credentials: false
+      - name: Verify the public release before accessing App credentials
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tag="${MANUAL_TAG}"
+          run_args=()
+          if [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+            tag="${RELEASE_TAG}"
+            run_args=(--release-run-id "${RELEASE_RUN_ID}")
+          fi
+          python3 tap-tools/scripts/depgraph_release.py render --tag "${tag}" \
+            --formula "${RUNNER_TEMP}/depgraph.rb" "${run_args[@]}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+      - name: Check the App configuration
+        env:
+          APP_CLIENT_ID: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          HAS_PRIVATE_KEY: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY != '' }}
+        run: |
+          test -n "${APP_CLIENT_ID}" || { echo '::error::HOMEBREW_TAP_APP_CLIENT_ID is missing'; exit 1; }
+          test "${HAS_PRIVATE_KEY}" = true || { echo '::error::HOMEBREW_TAP_APP_PRIVATE_KEY is missing'; exit 1; }
+      - name: Issue a repository-scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.0.0
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: TamaT-LLC
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open the formula update PR or report no change
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: bash scripts/update-homebrew-tap.sh "${RELEASE_TAG}" "${RUNNER_TEMP}/depgraph.rb" "${DRY_RUN}"

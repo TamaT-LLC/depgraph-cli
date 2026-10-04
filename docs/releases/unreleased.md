@@ -1,5 +1,13 @@
 # 未リリース
 
+## Homebrew での導入
+
+macOS / Linux 向けに `brew install tamat-llc/tap/depgraph` を案内する。
+初回の導入後は `brew install depgraph` と `brew upgrade depgraph` に省略できる。
+公式パッケージを全体で保持し、Node.js 24 系を依存関係として導入する。
+Stable の公開後、署名付き tag と公開後証跡を検証して tap の更新 PR を作成する。
+npm の導入方法と公開プロトコルは変更しない。
+
 ビルド連携・失敗診断の修正は [v0.6.1](v0.6.1.md) に収録する。
 
 ## pnpm の依存解決を保つビルドステージング

@@ -411,6 +411,47 @@ pub(crate) fn verify_workflow_policy_text(
                 );
             }
         }
+        "homebrew-tap.yml" => {
+            let update = workflow_job_block(workflow, "update-formula")?;
+            let checker_ref = workflow.lines().find_map(|line| {
+                line.strip_prefix("          ref: ")
+                    .filter(|value| *value != "refs/heads/main")
+            });
+            if top_level_trigger_keys(workflow)? != ["workflow_dispatch", "workflow_run"]
+                || !checker_ref.is_some_and(|value| is_lower_hex_len(value, 40))
+                || top_permissions != ["contents: read"]
+                || job_permissions(update)? != ["actions: read", "contents: read"]
+                || write_permissions != ["permission-contents", "permission-pull-requests"]
+                || workflow.matches("actions/create-github-app-token@").count() != 1
+                || workflow.matches("actions/checkout@").count() != 2
+                || workflow.matches("persist-credentials: false").count() != 2
+                || workflow.contains("skip-token-revoke: true")
+                || workflow.contains("ref: ${{ github.event.workflow_run.head_sha")
+                || !workflow.contains("ref: refs/heads/main")
+                || !workflow.contains("github.ref == 'refs/heads/main'")
+                || !workflow.contains("github.event.workflow_run.conclusion == 'success'")
+                || !workflow.contains("github.event.workflow_run.event == 'push'")
+                || !workflow.contains(
+                    "github.event.workflow_run.head_repository.full_name == github.repository",
+                )
+                || !workflow.contains("--release-run-id")
+                || !workflow.contains("repository: TamaT-LLC/homebrew-tap")
+                || !workflow.contains("repositories: homebrew-tap")
+                || !workflow.contains("owner: TamaT-LLC")
+                || !workflow.contains("depgraph_release.py render")
+                || !workflow.contains("scripts/update-homebrew-tap.sh")
+                || workflow.find("depgraph_release.py render")
+                    >= workflow.find("actions/create-github-app-token@")
+                || workflow.lines().any(|line| {
+                    contains_expression_context(line, "secrets")
+                        && !line.contains("secrets.HOMEBREW_TAP_APP_PRIVATE_KEY")
+                })
+            {
+                bail!(
+                    "Homebrew updates must verify stable evidence before a tap-only App token, execute trusted main code, and keep GitHub job permissions read-only"
+                );
+            }
+        }
         "stable-release-source-guard.yml" => {
             if top_level_trigger_keys(workflow)? != ["workflow_run"]
                 || !workflow.contains("\n  workflow_run:")
@@ -997,7 +1038,7 @@ pub(crate) fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
 pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
     let release_package = format!(
-        "次のpatch release `v{VERSION}`は Intel macOS（`x86_64-apple-darwin`）を除く4 targetで提供する。"
+        "公開済み Stable `v{VERSION}` は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64 向けのネイティブパッケージを提供する。"
     );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
@@ -2551,7 +2592,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "日本語 | [English](README.en.md)",
                 "## プロジェクトの状況と公開コラボレーション",
-                "現在のサポート対象は、公開済み`v0.6.0`リリースである。",
+                "公開済み Stable `v0.6.1` の公式 Release と公開後証跡が揃っている。",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2564,7 +2605,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
-                "The supported line is currently anchored by the published `v0.6.0` Release.",
+                "The current stable `v0.6.1` Release and its public post-publish evidence are",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",

@@ -107,7 +107,7 @@ findingの`suppressions`はv1ではwire互換性のため保持するoutput-only
 tag後の現行`main`／評価用RCの監査では、before/afterがschema 19に保存したpolicy digest、analyzer version、finding contract versionを比較する。
 provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
 公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
-次のpatch release `v0.6.1` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
+公開済みpatch release `v0.6.1` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
 sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
@@ -139,14 +139,35 @@ sourceは自動変更しない。
 
 ## 公式パッケージの導入
 
-以下は、公式Releaseと公開後証跡が揃った後に適用される導入案内である。
-公開済みstable `v0.6.0`は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64向けのネイティブパッケージを提供する。
-次のpatch release `v0.6.1`は Intel macOS（`x86_64-apple-darwin`）を除く4 targetで提供する。
-`v0.6.1`の導入例は、公式Releaseと公開後証跡が揃うまで実行しない。
+公開済み Stable `v0.6.1` は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64 向けのネイティブパッケージを提供する。
+公式 Release と公開後証跡を確認した版を使用する。
+
+### Homebrew（macOS / Linux）
+
+```sh
+brew install tamat-llc/tap/depgraph
+```
+
+初回の導入後は tap 名を省略できる。
+
+```sh
+brew install depgraph
+brew upgrade depgraph
+```
+
+tap を追加済みで信頼設定がない場合は、先に `brew trust --formula tamat-llc/tap/depgraph` を実行する。
+Node.js 24 系と、ワーカー・schema・ライセンスを含む公式パッケージが入る。
+Homebrew の Node.js が検証済みの `24.18.0` と異なる場合、Web 解析は診断を伴う best-effort になる。
+Go / Rust の解析には対象プロジェクトのツールチェーンとオフライン依存関係が必要である。
+`depgraph-mcp` の起動には、後述の同じ版・ターゲットの compiler pack も必要である。
+公開・更新の手順は [Homebrew リリース手順](docs/50_test/homebrew-release-procedure.md) を参照する。
+
+### npm / GitHub Release
+
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
 
-`npm i -g @tamat-llc/depgraph`により、同じ4ターゲットの検証済みネイティブパッケージを導入できる。Intel macOS 向けパッケージは `v0.6.1` から提供しない。
+`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。Intel macOS 向けパッケージは `v0.6.1` から提供しない。
 インストールスクリプトによる外部ダウンロードは行わない。
 npm版のランチャーにはNode.js 24以上が必要である。
 `depgraph` CLIはnpmから導入したパッケージだけで実行できる。
@@ -160,6 +181,7 @@ npm版のランチャーにはNode.js 24以上が必要である。
 | Linux x86-64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel（GitHub Release / Homebrew） | `x86_64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
 公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
@@ -220,11 +242,11 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-現在の公開済みstable `v0.6.0` artifactは、[`v0.6.0`リリースノート](docs/releases/v0.6.0.md)に記載した契約を実装している。
-`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.0)と公開後証跡が一致するときに限り有効である。
+現在の公開済みstable `v0.6.1` artifactは、[`v0.6.1`リリースノート](docs/releases/v0.6.1.md)に記載した契約を実装している。
+`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.1` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.1)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
-次のpatch release `v0.6.1`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
+公開済みpatch release `v0.6.1`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
 `depgraph-health-finding-v1`、CLIの`health`／`cleanup`／`audit`／`hotspots`、および対応するMCP APIがこの境界に含まれる。
 v0.6.0から新たな保存形式の移行はない。
 
@@ -237,15 +259,14 @@ current `main`はStore schema `19`を使用し、schema 19へ移行したStore�
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
 過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
-現行stableの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.0`リリースノート](docs/releases/v0.6.0.md)を参照する。
+現行stableの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.1`リリースノート](docs/releases/v0.6.1.md)を参照する。
 過去のschema 17の契約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に保持する。
-`v0.6.1`の移行条件とAPI差分は、準備中の[`v0.6.1`リリースノート](docs/releases/v0.6.1.md)に記載する。
+`v0.6.1`の移行条件とAPI差分は、[`v0.6.1`リリースノート](docs/releases/v0.6.1.md)に記載する。
 
 ## プロジェクトの状況と公開コラボレーション
 
-現在のサポート対象は、公開済み`v0.6.0`リリースである。
-`v0.6.1`は、Store schema 19とcode-health契約／APIを含む次のpatch releaseとして準備中である。
-公式Releaseと公開後証跡が揃うまでは、`v0.6.0`を安定版として扱い、`v0.6.1`のmain／RC artifactを評価用に限定する。
+公開済み Stable `v0.6.1` の公式 Release と公開後証跡が揃っている。
+その tag より後の `main` の変更は開発版として扱う。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
 
 利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従う。

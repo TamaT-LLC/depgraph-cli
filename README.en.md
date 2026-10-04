@@ -116,7 +116,7 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, available, and total fields; confidence is capped at `probable` |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
-**Confidence** on `health` findings reserves `confirmed` for `unused-file`, `unused-export`, `unused-type`, and `unused-dependency`. It means the subject is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains. `test-only-dependency`, `manifest-mismatch`, audit, and hotspot findings are not proof of unusedness and are capped at `probable`. For unused findings, `probable` means there is no observed usage and no hard blocker, but applicable profiles are only syntax-complete. `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. For audits on the post-tag current `main` / evaluation RC, before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. The published stable `v0.5.4` artifact uses Store schema 17 and is outside this code-health audit provenance contract. The next patch release, `v0.6.1`, retains the v0.6.0 Store schema 19 and code-health contract/API. Source is never changed automatically.
+**Confidence** on `health` findings reserves `confirmed` for `unused-file`, `unused-export`, `unused-type`, and `unused-dependency`. It means the subject is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains. `test-only-dependency`, `manifest-mismatch`, audit, and hotspot findings are not proof of unusedness and are capped at `probable`. For unused findings, `probable` means there is no observed usage and no hard blocker, but applicable profiles are only syntax-complete. `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. For audits on the post-tag current `main` / evaluation RC, before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. The published stable `v0.5.4` artifact uses Store schema 17 and is outside this code-health audit provenance contract. The published patch release `v0.6.1` retains the v0.6.0 Store schema 19 and code-health contract/API. Source is never changed automatically.
 
 A **selector** identifies a graph node on the CLI. The accepted prefixes are
 `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:`. If more than one
@@ -152,19 +152,42 @@ evaluated separately.
 
 ## Install official packages
 
-The following installation guidance applies after the official Release and
-post-publish evidence exist. The current stable `v0.6.0` provides native packages
-for Linux x86-64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows
-x86-64. The next patch release, `v0.6.1`, drops Intel macOS
-(`x86_64-apple-darwin`) and ships the other four targets.
-The `v0.6.1` examples below are valid only after its Release and evidence are
-public. `v0.5.0` was distributed only through GitHub Releases; npm distribution
+The published stable `v0.6.1` provides native packages for Linux x86-64,
+Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x86-64.
+Use a version with its official Release and public post-publish evidence.
+
+### Homebrew (macOS / Linux)
+
+```sh
+brew install tamat-llc/tap/depgraph
+```
+
+After the first installation, the tap name can be omitted:
+
+```sh
+brew install depgraph
+brew upgrade depgraph
+```
+
+If the tap was already added without trusting the formula, first run
+`brew trust --formula tamat-llc/tap/depgraph`.
+Homebrew installs Node.js 24 and the complete native package, including workers,
+schemas, and license inventories. A Homebrew Node.js version different from the
+verified `24.18.0` baseline produces a best-effort Web analysis diagnostic.
+Go/Rust analysis needs the project's existing toolchains and offline dependencies.
+Starting `depgraph-mcp` additionally requires the matching compiler pack below.
+See the [Homebrew release procedure](docs/50_test/homebrew-release-procedure.md).
+
+### npm / GitHub Release
+
+`v0.5.0` was distributed only through GitHub Releases; npm distribution
 starts with `v0.5.1`
 under TamaT LLC's `@tamat-llc` organization scope.
 
-`npm i -g @tamat-llc/depgraph` installs the verified native package for the
-same four targets without an install-time external download. Intel macOS
-packages stop at `v0.6.1`. The npm launcher
+`npm i -g @tamat-llc/depgraph` installs verified native packages for macOS Apple
+Silicon, Linux x86-64 / ARM64, and Windows x86-64 without an install-time
+external download. Intel macOS
+packages are not provided for `v0.6.1`. The npm launcher
 requires Node.js 24 or later. The `depgraph` CLI runs entirely from the npm
 package. `depgraph-mcp` is included as well, but starting the MCP server also
 requires the compiler pack for the same version and target from the GitHub
@@ -179,6 +202,7 @@ environment below.
 | Linux x86-64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel (GitHub Release / Homebrew) | `x86_64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
 After publication, use GitHub CLI on macOS or Linux to download the archive and checksum.
@@ -242,15 +266,15 @@ tests together. Development workflow and command details are in
 
 ## Releases and compatibility
 
-The current stable `v0.6.0` artifact implements the contract documented in the
-[`v0.6.0` release notes](docs/releases/v0.6.0.md). `main` may contain
+The current stable `v0.6.1` artifact implements the contract documented in the
+[`v0.6.1` release notes](docs/releases/v0.6.1.md). `main` may contain
 post-tag development changes that are not part of that published artifact. A
 stable release is valid only when the
-[`v0.6.0` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.0)
+[`v0.6.1` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.1)
 and its post-publish evidence exist and agree.
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
-The next patch release, `v0.6.1`, is prepared from current `main`. It retains the v0.6.0
+The published patch release `v0.6.1` retains the v0.6.0
 Store schema `19` together with the `depgraph-health-finding-v1` code-health
 contract, the CLI `health` / `cleanup` / `audit` / `hotspots` APIs, and their MCP
 projections. No new storage migration is introduced from v0.6.0.
@@ -273,20 +297,18 @@ documented as [`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
-See the [`v0.6.0` release notes](docs/releases/v0.6.0.md) for the current stable
+See the [`v0.6.1` release notes](docs/releases/v0.6.1.md) for the current stable
 compatibility tuple, Store migrations, rollback procedure, and known limits.
 The historical schema-17 contract remains in the
 [`v0.5.4` release notes](docs/releases/v0.5.4.md).
-The planned `v0.6.1` fixes and compatibility guarantees are recorded in the
+The `v0.6.1` fixes and compatibility guarantees are recorded in the
 [`v0.6.1` release notes](docs/releases/v0.6.1.md).
 
 ## Project status and public collaboration
 
-The supported line is currently anchored by the published `v0.6.0` Release.
-`v0.6.1` becomes the current stable release only after its official Release and
-post-publish evidence are public. Until then, `v0.6.0` remains supported and
-`v0.6.1` main/RC artifacts are evaluation-only. Product support is best effort,
-without response-time or resolution-time SLAs.
+The current stable `v0.6.1` Release and its public post-publish evidence are
+available. `main` changes after that tag remain development changes.
+Product support is best effort, without response-time or resolution-time SLAs.
 
 Follow [SUPPORT.md](SUPPORT.md) for usage questions and bug reports. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request, and
