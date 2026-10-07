@@ -2,9 +2,11 @@
 
 ## Bootstrap
 
-Merge the [tap Formula PR](https://github.com/TamaT-LLC/homebrew-tap/pull/3)
-after all four native installation tests and the required `brew audit` /
-`release check` jobs pass. Before merging depgraph's workflow change, obtain
+The [initial tap Formula PR](https://github.com/TamaT-LLC/homebrew-tap/pull/3)
+was followed by the [v0.6.2 platform update](https://github.com/TamaT-LLC/homebrew-tap/pull/6).
+For current releases, require successful installation on the three supported
+targets, expected rejection on Intel macOS, and passing `brew audit` /
+`release check` jobs. Before merging depgraph's workflow change, obtain
 independent organization-assigned review under CONTRIBUTING.md/GOVERNANCE.md
 and update its pinned tap-tools revision to the reviewed commit if needed.
 
@@ -16,7 +18,7 @@ No App installation on depgraph-cli is needed. Never put the key in logs,
 source, PR bodies, or command arguments.
 
 After the reviewed workflow is on main, dispatch `Homebrew tap` with
-`tag=v0.6.1` and `dry_run=true`. It authenticates the public release before
+`tag=v0.6.2` and `dry_run=true`. It authenticates the public release before
 issuing the token, clones the tap, and reports no change when the Formula
 already matches. It does not push or open a PR in dry-run mode.
 
@@ -33,14 +35,15 @@ already tapped without trust, run `brew trust --formula tamat-llc/tap/depgraph`.
 `brew test` uses a temporary repository/store; it performs a Web scan, checks
 that the scan completed, and authenticates the release and all three workers
 through `doctor`. Go/Rust toolchains and the optional compiler pack are
-configured separately as described in the README. Test macOS ARM64/Intel and
-Ubuntu 24.04 ARM64/x86-64 before claiming a release works on all four platforms.
+configured separately as described in the README. Test macOS ARM64 and Ubuntu 24.04 ARM64/x86-64 before claiming Homebrew support
+for its three installation targets. On Intel macOS, verify that installation
+is rejected by the ARM64 requirement.
 
 ## Stable updates
 
 A successful stable `Release` triggers `Homebrew tap` on trusted main code.
 Its immutable verifier rejects any release without matching signed-tag,
-full-CI, Release, public evidence, and four native archive/checksum identities.
+full-CI, Release, public evidence, and three native archive/checksum identities.
 The App then pushes a Formula-only update branch and opens/reuses a tap PR.
 Merge it only after all platform checks are green and review is complete.
 An identical Formula produces no PR; newer tap versions cannot be downgraded.

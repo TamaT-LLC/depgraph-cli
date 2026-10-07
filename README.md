@@ -142,7 +142,7 @@ sourceは自動変更しない。
 次のpatch release `v0.6.2` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
 公式 Release と公開後証跡を確認した版を使用する。
 
-### Homebrew（macOS / Linux）
+### Homebrew（macOS Apple Silicon / Linux）
 
 ```sh
 brew install tamat-llc/tap/depgraph
@@ -167,7 +167,7 @@ Go / Rust の解析には対象プロジェクトのツールチェーンとオ�
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
 
-`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。Intel macOS 向けパッケージは `v0.6.1` から提供しない。
+`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。`v0.6.2` では Intel macOS 向けパッケージを提供しない。
 インストールスクリプトによる外部ダウンロードは行わない。
 npm版のランチャーにはNode.js 24以上が必要である。
 `depgraph` CLIはnpmから導入したパッケージだけで実行できる。
@@ -181,7 +181,6 @@ npm版のランチャーにはNode.js 24以上が必要である。
 | Linux x86-64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
 | macOS Apple Silicon | `aarch64-apple-darwin` |
-| macOS Intel（GitHub Release / Homebrew） | `x86_64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
 公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
