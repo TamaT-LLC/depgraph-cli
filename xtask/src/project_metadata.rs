@@ -1038,7 +1038,7 @@ pub(crate) fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
 pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
     let release_package = format!(
-        "公開済み Stable `v{VERSION}` は、Linux x86-64、Linux ARM64、macOS Intel、macOS Apple Silicon、Windows x86-64 向けのネイティブパッケージを提供する。"
+        "次のpatch release `v{VERSION}` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。"
     );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
@@ -1836,7 +1836,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "@tamat-llc/depgraph",
         "@tamat-llc/depgraph-win32-x64",
         "npm Trusted Publishing",
-        "release-post-publish-evidence-v0.6.1.json",
+        "release-post-publish-evidence-v0.6.2.json",
         "stable-v0.5.0-packaged-smoke-v1",
         "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
         "| Code-health finding | `depgraph-health-finding-v1` |",
@@ -2218,7 +2218,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
         "name: Bind the stable candidate to main, release/0.6, and exact Full CI",
-        "if [[ \"$GITHUB_REF_NAME\" == \"v0.6.1\" ]]",
+        "if [[ \"$GITHUB_REF_NAME\" == \"v0.6.2\" ]]",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -2592,7 +2592,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "日本語 | [English](README.en.md)",
                 "## プロジェクトの状況と公開コラボレーション",
-                "公開済み Stable `v0.6.1` の公式 Release と公開後証跡が揃っている。",
+                "現在のサポート対象は、公開済み`v0.6.1`リリースである。",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2605,7 +2605,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
-                "The current stable `v0.6.1` Release and its public post-publish evidence are",
+                "The supported line is currently anchored by the published `v0.6.1` Release.",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
