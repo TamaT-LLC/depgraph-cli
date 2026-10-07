@@ -107,7 +107,7 @@ findingの`suppressions`はv1ではwire互換性のため保持するoutput-only
 tag後の現行`main`／評価用RCの監査では、before/afterがschema 19に保存したpolicy digest、analyzer version、finding contract versionを比較する。
 provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
 公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
-`v0.6.2` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
+次のpatch release `v0.6.2` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
 sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
@@ -139,7 +139,7 @@ sourceは自動変更しない。
 
 ## 公式パッケージの導入
 
-`v0.6.2` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
+次のpatch release `v0.6.2` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
 公式 Release と公開後証跡を確認した版を使用する。
 
 ### Homebrew（macOS Apple Silicon / Linux）
