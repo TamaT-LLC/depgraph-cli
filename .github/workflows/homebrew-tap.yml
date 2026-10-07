@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: TamaT-LLC/homebrew-tap
-          ref: 526e47e156ad5719f29c9ebb9341b1181d0fb9a0
+          ref: 11f102090fd20e8fa702a26c2d05107b2ea57793
           path: tap-tools
           persist-credentials: false
       - name: Verify the public release before accessing App credentials
