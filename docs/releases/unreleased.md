@@ -1,5 +1,15 @@
 # 未リリース
 
+## Web スキャンのルート重複と型参照
+
+TanStack Router の生成ルートで、レイアウトと index が同じ `fullPath` を持つとスキャンが停止する問題を修正した（[#510](https://github.com/TamaT-LLC/depgraph-cli/issues/510)）。
+同じ論理ルートの識別子を保ち、各出現位置の根拠を統合する。
+
+TypeScript の未解決の名前空間参照と、`Error` / `ErrorConstructor` のように値と型の symbol が異なる継承を、不正な応答と誤判定する問題を修正した（[#511](https://github.com/TamaT-LLC/depgraph-cli/issues/511)）。
+`typeof` の型解決に成功した後も、途中の失敗理由が残って依存グラフを破棄する問題を修正した（[#512](https://github.com/TamaT-LLC/depgraph-cli/issues/512)）。
+未解決箇所の診断と、不正なコンパイラー応答を拒否する検証は維持する。
+CLI の既定値、公開プロトコル、Store スキーマ、依存パッケージの変更はない。
+
 ## Homebrew での導入
 
 macOS / Linux 向けに `brew install tamat-llc/tap/depgraph` を案内する。

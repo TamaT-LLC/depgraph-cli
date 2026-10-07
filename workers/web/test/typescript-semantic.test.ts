@@ -454,6 +454,98 @@ test("syntactically invalid sources and unresolved heritage do not fabricate def
   assert.ok(unresolved.issues.some((item) => item.code === "typescript_semantic_heritage_target_skipped"));
 });
 
+test("unresolved qualified heritage keeps unrelated definitions instead of failing correlation", async () => {
+  const delta = await extractFixture({
+    "src/index.ts": "import * as Missing from 'missing';\ninterface Local extends Missing.Base {}\nexport class Unrelated {}\n",
+  }, "__depgraph_ts_semantic_qualified_unresolved__");
+  assert.equal(delta.issues.some((item) => item.fatal), false, JSON.stringify(delta.issues));
+  assert.ok(delta.definitions.some((definition) => definition.displayName === "Unrelated"));
+  assert.equal(delta.relations.some((relation) => relation.kind === "extends"), false);
+  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_heritage_target_skipped"));
+});
+
+test("unresolved namespace heritage does not discard the dependency graph", async () => {
+  const result = await extractDependencyFixture({
+    "src/local.ts": "export interface LocalBase { value: string }\n",
+    "src/index.ts": `
+import * as Missing from 'missing';
+import type { LocalBase } from './local';
+export interface Remote extends Missing.Base {}
+export interface Good extends LocalBase {}
+`,
+  }, "__depgraph_ts_semantic_unknown_dependency__");
+  assert.equal(result.definitions.issues.some((item) => item.fatal), false, JSON.stringify(result.definitions.issues));
+  assert.equal(result.dependencies.issues.some((item) => item.fatal), false, JSON.stringify(result.dependencies.issues));
+  assert.ok(result.dependencies.sites.some((site) => site.edgeKind === "type_uses" && site.targets.length > 0));
+});
+
+test("heritage still rejects a known symbol for the wrong reference", async () => {
+  let unrelated: CompilerSymbol | undefined;
+  const delta = await extractFixture({
+    "src/index.ts": "export class Base {}\nexport class Other {}\nexport class Child extends Base {}\n",
+  }, "__depgraph_ts_semantic_heritage_spoof__", {
+    transformChecker: (checker) => transformCheckerBatches(checker, {
+      symbols: (nodes, values) => {
+        unrelated ??= values.find((value) => value?.name === "Other");
+        if (nodes[0]?.parent.kind === SyntaxKind.ExpressionWithTypeArguments) {
+          assert.ok(unrelated);
+          return values.map(() => unrelated);
+        }
+        return values;
+      },
+    }),
+  });
+  assert.deepEqual(delta.definitions, []);
+  assert.deepEqual(delta.relations, []);
+  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_typechecker_contract_violation" && item.fatal));
+});
+
+test("heritage accepts a constructor value whose type has a different symbol", async () => {
+  const delta = await extractFixture({
+    "src/index.ts": `
+interface Failure { message: string }
+interface FailureConstructor { new(): Failure }
+declare var Failure: FailureConstructor;
+export class CustomFailure extends Failure {}
+`,
+  }, "__depgraph_ts_semantic_constructor_heritage__");
+  assert.equal(delta.issues.some((item) => item.fatal), false, JSON.stringify(delta.issues));
+  const parent = delta.definitions.find((definition) => definition.displayName === "Failure" && definition.graphKind === "type");
+  const child = delta.definitions.find((definition) => definition.displayName === "CustomFailure" && definition.graphKind === "type");
+  assert.ok(parent);
+  assert.ok(child);
+  assert.ok(delta.relations.some((relation) => relation.kind === "extends"
+    && relation.source.kind === "definition" && relation.source.key === child.key && relation.target === parent.key));
+});
+
+test("heritage rejects a mismatched type even when the symbol name is correct", async () => {
+  let unrelated: CompilerType | undefined;
+  let corrupted = false;
+  const delta = await extractFixture({
+    "src/index.ts": "export class Base {}\nexport class Other {}\nexport class Child extends Base {}\n",
+  }, "__depgraph_ts_semantic_heritage_type_spoof__", {
+    transformChecker: (checker) => transformCheckerBatches(checker, {
+      types: (nodes, values) => {
+        for (const [index, node] of nodes.entries()) {
+          if (node.kind === SyntaxKind.ClassDeclaration && node.getText().startsWith("export class Other")) {
+            unrelated = values[index];
+          }
+        }
+        if (nodes[0]?.parent.kind === SyntaxKind.ExpressionWithTypeArguments) {
+          assert.ok(unrelated);
+          corrupted = true;
+          return values.map(() => unrelated);
+        }
+        return values;
+      },
+    }),
+  });
+  assert.ok(corrupted);
+  assert.deepEqual(delta.definitions, []);
+  assert.deepEqual(delta.relations, []);
+  assert.ok(delta.issues.some((item) => item.code === "typescript_semantic_typechecker_contract_violation" && item.fatal));
+});
+
 test("constructor signature query stays on its strict SyntaxKind path", async () => {
   const delta = await extractFixture(
     { "src/constructor.ts": "class Constructed { constructor(value: string) {} }\n" },
@@ -3836,6 +3928,21 @@ interface Uses {
       : null,
     "interface",
   );
+});
+
+test("a typeof value with a proven named type clears the rejected value-target reason", async () => {
+  const { dependencies } = await extractDependencyFixture({
+    "src/index.ts": `
+export interface Details { feature: string }
+export const settings: Details = { feature: 'enabled' };
+export type Keys = keyof typeof settings;
+`,
+  }, "__depgraph_ts_dependency_typeof_named__");
+  assert.deepEqual(dependencies.issues, []);
+  const site = dependencies.sites.find((item) => item.kind === "type_use" && item.importedName === "settings");
+  assert.ok(site);
+  assert.equal(site.status, "resolved");
+  assert.equal(site.reason, null);
 });
 
 test("case-distinct compiler paths remain distinct and setup failures are contained as fatal empty deltas", async () => {

@@ -606,9 +606,10 @@ test("moduleCallValidationSpans pins checker-confirmed module calls and its quer
   // Shadowed callees are rejected lexically, before any TypeChecker query is spent.
   assert.equal(snapshotFor(snapshots, "src/shadow.ts").sharedQueryBudget, 0);
   assert.equal(snapshotFor(snapshots, "src/imported-require.ts").sharedQueryBudget, 0);
-  assert.equal(snapshotFor(snapshots, "src/defs.ts").sharedQueryBudget, 2);
-  assert.equal(snapshotFor(snapshots, "src/doc.js").sharedQueryBudget, 2);
-  assert.equal(spans.sharedQueryBudget, 20);
+  // Resolved symbols also spend one query to exclude the native unknown sentinel.
+  assert.equal(snapshotFor(snapshots, "src/defs.ts").sharedQueryBudget, 3);
+  assert.equal(snapshotFor(snapshots, "src/doc.js").sharedQueryBudget, 3);
+  assert.equal(spans.sharedQueryBudget, 24);
 });
 
 // ---------------------------------------------------------------------------
