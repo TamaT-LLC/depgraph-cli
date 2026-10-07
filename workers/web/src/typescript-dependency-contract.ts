@@ -273,6 +273,10 @@ export async function querySymbol(
     throw new DependencyContractError(`${purpose} symbol response correlation mismatch`);
   }
   const symbol = batch[0];
+  if (symbol !== undefined) {
+    beginQuery(counter);
+    if (await checker.isUnknownSymbol(symbol)) return undefined;
+  }
   if (symbol !== undefined && node.kind === SyntaxKind.Identifier) {
     const requested = (node as Identifier).text;
     if (symbol.name !== requested) {

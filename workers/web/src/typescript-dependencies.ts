@@ -3117,7 +3117,7 @@ async function collectTypeReference(
     ? { ...referencedProvenance, resolutionMode: null, resolutionModeError: null }
     : referencedProvenance;
   return [createSite(context, "type_use", "type_uses", occurrenceKind, terminal, terminal.text, targets,
-    ambiguousBinding ? "ambiguous_binding_provenance" : nonTypeTarget ? "value_symbol_is_not_a_type" : null,
+    ambiguousBinding ? "ambiguous_binding_provenance" : nonTypeTarget && targets.length === 0 ? "value_symbol_is_not_a_type" : null,
     "TypeChecker named type reference occurrence", true, publicProvenance)];
 }
 

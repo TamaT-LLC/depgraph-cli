@@ -155,6 +155,16 @@ function sourceSpan(starts: readonly number[], startOffset: number, endOffset: n
   };
 }
 
+function sameRouteSite(existing: DependencySite | undefined, site: DependencySite): existing is DependencySite {
+  return existing !== undefined && site.kind === "route_entry"
+    && JSON.stringify({ ...existing, evidence: [] }) === JSON.stringify({ ...site, evidence: [] });
+}
+
+function mergeEvidence(left: readonly Evidence[], right: readonly Evidence[]): Evidence[] {
+  const unique = new Map([...left, ...right].map((item) => [JSON.stringify(item), item]));
+  return [...unique.entries()].sort(([leftKey], [rightKey]) => compareUtf8(leftKey, rightKey)).map(([, item]) => item);
+}
+
 class GraphBuilder {
   nodes = new Map<string, GraphNode>();
   readonly sites = new Map<string, DependencySite>();
@@ -178,10 +188,18 @@ class GraphBuilder {
     return existing ?? node;
   }
 
-  addSite(site: DependencySite): void {
+  addSite(site: DependencySite): boolean {
     const existing = this.sites.get(site.id);
+    // Generated route trees can describe both a pathless layout and its index
+    // with the same fullPath. They share a logical site, but not a source span.
+    if (sameRouteSite(existing, site)) {
+      const evidence = mergeEvidence(existing.evidence, site.evidence);
+      this.sites.set(site.id, { ...existing, evidence });
+      return false;
+    }
     if (existing && JSON.stringify(existing) !== JSON.stringify(site)) throw new Error(`conflicting site upsert for ${site.id}`);
-    this.sites.set(site.id, existing ?? site);
+    this.sites.set(site.id, site);
+    return existing === undefined;
   }
 
   addEdge(edge: GraphEdge): void {
@@ -196,9 +214,7 @@ class GraphBuilder {
       || existing.kind !== edge.kind
       || existing.resolution_status !== edge.resolution_status
     ) throw new Error(`conflicting edge upsert for ${edge.id}`);
-    const evidence = [...existing.evidence, ...edge.evidence]
-      .filter((item, index, array) => array.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(item)) === index)
-      .sort((left, right) => compareUtf8(JSON.stringify(left), JSON.stringify(right)));
+    const evidence = mergeEvidence(existing.evidence, edge.evidence);
     this.edges.set(edge.id, { ...existing, evidence });
   }
 
@@ -3570,7 +3586,7 @@ export async function scan(
       path: entry.relativeFile,
       entry_kind: entry.entryKind,
     });
-    graph.addSite({
+    const addedRouteSite = graph.addSite({
       id: siteId,
       source: fileNode.id,
       kind: "route_entry",
@@ -3598,7 +3614,7 @@ export async function scan(
       generated: entry.generated,
       evidence: [entry.evidence],
     });
-    graph.countSite(entry.relativeFile, "resolved");
+    if (addedRouteSite) graph.countSite(entry.relativeFile, "resolved");
     const groupKey = `${owner.id}\0${entry.framework}`;
     const group = routeNodesByGroup.get(groupKey) ?? new Map();
     group.set(entry.pattern, { node: routeNode, evidence: entry.evidence });

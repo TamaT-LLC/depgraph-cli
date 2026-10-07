@@ -28,6 +28,35 @@ async function run(
   };
 }
 
+test("generated routes sharing a fullPath retain every occurrence without duplicate sites", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-route-occurrences-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"));
+  await writeFile(path.join(root, "package.json"), JSON.stringify({
+    name: "route-occurrences", dependencies: { "@tanstack/react-router": "1.0.0" },
+  }));
+  const generatedFile = path.join(root, "src", "routeTree.gen.ts");
+  const source = "export interface Routes {\n  layout: { fullPath: '/' };\n  index: { fullPath: '/' };\n}\n";
+  await writeFile(generatedFile, source);
+  const first = await run("duplicate-routes", root);
+  const second = await run("duplicate-routes-repeat", root);
+  const sites = (result: typeof first) => result.events
+    .filter((event) => event.event === "dependency_site")
+    .map((event) => event.site).filter((site) => site.kind === "route_entry"
+      && site.evidence[0]?.extractor === "tanstack-generated-route-tree");
+  assert.equal(first.events.at(-1)?.event, "scan_completed");
+  assert.equal(first.events.at(-1)?.coverage.dependency_sites,
+    first.events.filter((event) => event.event === "dependency_site").length);
+  assert.equal(sites(first).length, 1);
+  assert.deepEqual(sites(first)[0].evidence.map((item: { start_line: number }) => item.start_line).sort(), [2, 3]);
+  assert.deepEqual(sites(first), sites(second));
+  await writeFile(generatedFile, source.replace("  index: { fullPath: '/' };\n", ""));
+  const single = await run("single-route", root);
+  assert.equal(sites(single).length, 1);
+  assert.equal(sites(single)[0].id, sites(first)[0].id);
+  assert.equal(sites(single)[0].evidence.length, 1);
+});
+
 test("worker emits deterministic protocol graph without executing project code", async () => {
   const markers = [
     new URL("./fixtures/polyglot/apps/next-app/NEXT_CONFIG_EXECUTED", import.meta.url),

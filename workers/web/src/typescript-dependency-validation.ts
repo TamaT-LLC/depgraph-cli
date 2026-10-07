@@ -2744,7 +2744,7 @@ function validateTypeScriptDependencySites(
       || (site.status === "external" && site.precision === "exact" && site.reason !== null)
       || (site.status === "unresolved" && (site.precision !== "heuristic" || site.targets.length !== 1 || !kinds.has("unknown") || !site.reason))
       || (site.status === "external" && site.precision === "heuristic" && !site.reason)
-    ) throw new DependencyContractError("raw dependency status/precision/target contract is invalid");
+    ) throw new DependencyContractError(`raw dependency status/precision/target contract is invalid at ${site.evidence.relativePath}:${site.evidence.startOffset} (${site.specifier}, ${site.status}, ${site.precision}, ${site.reason})`);
     if (site.reason !== null && (site.reason.length === 0 || site.reason.length > MAX_SPECIFIER_CHARS || hasUnpairedSurrogate(site.reason))) {
       throw new DependencyContractError("raw dependency reason is invalid");
     }

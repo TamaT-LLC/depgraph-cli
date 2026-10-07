@@ -2279,11 +2279,15 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
     "heritage",
   );
   for (const [index, heritage] of collection.heritage.entries()) {
-    const symbol = heritageSymbols[index];
+    let symbol = heritageSymbols[index];
     const targetType = heritageTargetTypes[index];
+    if (symbol !== undefined) {
+      beginTypeCheckerQuery(counter);
+      if (await checker.isUnknownSymbol(symbol)) symbol = undefined;
+    }
     const expectedName = terminalReferenceName(heritage.node.expression);
     if (symbol !== undefined && expectedName !== null && symbol.name !== expectedName) {
-      throw new TypeCheckerContractError("heritage symbol did not match the requested reference name", counter.value);
+      throw new TypeCheckerContractError(`heritage symbol did not match the requested reference name in ${heritage.owner.source.relativePath}: expected ${expectedName}, received ${symbol.name}`, counter.value);
     }
     const symbolTarget = symbol === undefined ? null : await unwrapAlias(checker, symbol, counter);
     let typeSymbol: CompilerSymbol | undefined;
@@ -2297,7 +2301,14 @@ async function extractTypeScriptRawDefinitionDeltaUnchecked(
     }
     const typeTarget = typeSymbol === undefined ? null : await unwrapAlias(checker, typeSymbol, counter);
     if (symbolTarget !== null && typeTarget !== null && symbolTarget.id !== typeTarget.id) {
-      throw new TypeCheckerContractError("heritage symbol and type responses did not correlate", counter.value);
+      // Constructor values such as Error have a different symbol from their
+      // value type (ErrorConstructor). Verify the type at this exact reference
+      // instead of requiring those two legitimate symbols to be identical.
+      beginTypeCheckerQuery(counter);
+      const symbolType = await checker.getTypeOfSymbolAtLocation(symbolTarget, heritage.node.expression);
+      if (symbolType.isErrorType() || symbolType.id !== targetType?.id) {
+        throw new TypeCheckerContractError(`heritage symbol and type responses did not correlate in ${heritage.owner.source.relativePath}: ${expectedName}, symbol ${symbolTarget.name}, type ${typeTarget.name}`, counter.value);
+      }
     }
     heritage.targetSymbol = symbolTarget ?? typeTarget;
   }
