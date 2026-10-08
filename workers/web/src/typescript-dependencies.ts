@@ -154,6 +154,7 @@ interface CollectionContext {
   owner: TypeScriptRawDefinitionEndpoint;
   syntacticallyValid: boolean;
   externalBindings: BindingProvenanceMap;
+  externalDeclarationTargets: ReadonlyMap<string, { locator: string; displayName: string }>;
   bindingProvenance: ReadonlyMap<string, BindingProvenance>;
   freshReceiverProof: FreshReceiverProofState;
 }
@@ -356,6 +357,22 @@ function externalTarget(specifier: string, symbolName?: string): TypeScriptRawDe
     locator: identity,
     displayName: symbolName === undefined ? identity : `${identity}#${symbolName}`,
   };
+}
+
+async function externalSymbolBoundary(
+  symbol: CompilerSymbol,
+  context: CollectionContext,
+  checker: Checker,
+  counter: QueryCounter,
+): Promise<TypeScriptRawDependencyTarget[]> {
+  const unwrapped = await unwrapAlias(checker, symbol, counter);
+  if (unwrapped === null) return [];
+  const declared = unwrapped.declarations.map((declaration) => context.externalDeclarationTargets.get(compilerPathKey(String(declaration.path))));
+  if (declared.some((target) => target !== undefined)) {
+    if (declared.some((target) => target === undefined)) return [];
+    return deduplicateTargets(declared.map((target) => ({ kind: "external", ...target! })));
+  }
+  return [externalTarget(`typescript:stdlib:${symbol.name}`, symbol.name)];
 }
 
 function isExternalModuleSpecifier(specifier: string): boolean {
@@ -2745,6 +2762,12 @@ async function collectSemanticCall(
       [{ kind: "unknown" }], "unresolved", "heuristic", "resolved_signature_unavailable", null)];
   }
 
+  const externalDeclaration = signature.declaration === undefined ? undefined
+    : context.externalDeclarationTargets.get(compilerPathKey(String(signature.declaration.path)));
+  if (externalDeclaration !== undefined) {
+    return [createCallSite(context, index, node, defaultCallKind(node), "external",
+      [{ kind: "external", ...externalDeclaration }], "external", "exact", null, null)];
+  }
   const resolved = await resolvedSignatureDeclaration(signature, counter, index, sourcesByPath);
   if (resolved.external) {
     const target = externalFromBinding ?? externalTarget(`typescript:stdlib:${callSpecifier(node, context.source.sourceFile)}`);
@@ -3076,7 +3099,7 @@ async function collectTypeReference(
       nonTypeTarget = true;
     }
     if (targets.length === 0 && resolved.external) {
-      targets = provenance?.targets.length ? provenance.targets : [externalTarget(`typescript:stdlib:${symbol.name}`, symbol.name)];
+      targets = provenance?.targets.length ? provenance.targets : await externalSymbolBoundary(symbol, context, checker, counter);
     }
   }
   if (targets.length === 0 && !ambiguousBinding && occurrenceKind === "heritage_type") {
@@ -3093,7 +3116,7 @@ async function collectTypeReference(
       }
       if (targets.length === 0 && resolved.external) {
         const typeBinding = context.externalBindings.get(typeSymbol.id) ?? provenance;
-        targets = typeBinding?.targets.length ? typeBinding.targets : [externalTarget(`typescript:stdlib:${typeSymbol.name}`, typeSymbol.name)];
+        targets = typeBinding?.targets.length ? typeBinding.targets : await externalSymbolBoundary(typeSymbol, context, checker, counter);
       }
     }
   }
@@ -3565,7 +3588,7 @@ export async function extractTypeScriptRawDependencyDelta(
   definitions: TypeScriptRawDefinitionDelta,
   priorTypeCheckerQueries = 0,
   validationTarget?: TypeScriptDependencyValidationTarget,
-  options: { sourcePaths?: ReadonlySet<string>; moduleExportPaths?: readonly (readonly string[])[] } = {},
+  options: { sourcePaths?: ReadonlySet<string>; moduleExportPaths?: readonly (readonly string[])[]; externalDeclarationTargets?: ReadonlyMap<string, { locator: string; displayName: string }> } = {},
 ): Promise<TypeScriptRawDependencyDelta> {
   const counter: QueryCounter = { value: 0, prior: priorTypeCheckerQueries };
   const sites: TypeScriptRawDependencySite[] = [];
@@ -3925,6 +3948,7 @@ export async function extractTypeScriptRawDependencyDelta(
           owner: { kind: "file", relativePath: source.relativePath },
           syntacticallyValid: source.syntacticallyValid,
           externalBindings,
+          externalDeclarationTargets: options.externalDeclarationTargets ?? new Map(),
           bindingProvenance: source.syntacticallyValid
             ? sourceBindingProvenance(source.sourceFile)
             : new Map<string, BindingProvenance>(),

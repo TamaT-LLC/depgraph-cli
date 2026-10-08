@@ -20,6 +20,7 @@ import {
   owningPackage,
   type LockInstance,
   type PackageRecord,
+  type PackageInstallSelection,
   type Workspace,
 } from "./workspace";
 
@@ -1771,6 +1772,32 @@ interface PackageFileTargets {
   reason: string | null;
 }
 
+function isDeclarationPackageSpecifier(specifier: string): boolean {
+  return /^(?:@[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\/)?[a-zA-Z0-9_-][a-zA-Z0-9_.-]*(?:\/[a-zA-Z0-9_.-]+)*$/u.test(specifier) && !isBuiltin(specifier);
+}
+
+function singlePackageFileSelection(selection: PackageFileTargets): boolean {
+  return selection.reason === null && selection.files.length === 1;
+}
+
+function declarationTypesSpecifier(specifier: string): string | null {
+  const name = packageNameOf(specifier);
+  if (name.startsWith("@types/")) return null;
+  const typesName = name.startsWith("@") ? name.slice(1).replace("/", "__") : name;
+  return `@types/${typesName}${specifier.slice(name.length)}`;
+}
+
+function declarationEntryForFile(file: string | null, packageRoot: string, locator: string): { file: string; packageRoot: string; locator: string } | null {
+  return file !== null && /\.d\.[cm]?ts$/u.test(file) ? { file, packageRoot, locator } : null;
+}
+
+function externalDeclarationLocator(selection: PackageInstallSelection, version: string, manager: string, packageName: string): string | null {
+  if (selection.workspacePackages.length > 0) return null;
+  const locked = selection.externalInstances.filter((instance) => instance.version === version);
+  if (locked.length > 1) return null;
+  return locked.length === 1 ? locked[0]!.locator : `${manager}:${packageName}@${version}`;
+}
+
 export class ModuleResolver {
   readonly #root: string;
   readonly #workspace: Workspace;
@@ -1784,6 +1811,7 @@ export class ModuleResolver {
   readonly #sourceOwnerIds: Set<string>;
   readonly #externalPackages = new Map<string, Promise<ExternalPackageManifest[]>>();
   readonly #externalPackageBoundaries = new Set<string>();
+  readonly #declarationIssues = new Map<string, ResolverIssue>();
   readonly #directoryPackageEntries = new Map<string, string[]>();
   readonly issues: ResolverIssue[] = [];
 
@@ -2429,6 +2457,103 @@ export class ModuleResolver {
     };
   }
 
+  #declarationOwner(specifier: string, sourceFile: string): PackageRecord | null {
+    if (!isDeclarationPackageSpecifier(specifier)) return null;
+    const owner = owningPackage(this.#workspace, sourceFile);
+    // Repository aliases and workspace sources already have their own confined inventory.
+    return this.#resolveAlias(specifier, owner, true) === null ? owner : null;
+  }
+
+  async #installedDeclarationRecord(specifier: string, sourceFile: string, owner: PackageRecord): Promise<ExternalPackageManifest | null> {
+    const lookup = this.#externalPackageLookup(owner, packageNameOf(specifier), path.dirname(sourceFile));
+    if (lookup === null) return null;
+    const installed = await this.#loadExternalPackages(packageNameOf(specifier), lookup);
+    return installed.length === 1 ? installed[0]! : null;
+  }
+
+  async #sharedDeclarationEntry(specifier: string, record: ExternalPackageManifest): Promise<string | null> {
+    const subpath = subpathOf(specifier, packageNameOf(specifier));
+    const imported = await this.#externalPackageFiles(record, subpath, true, "import");
+    const required = await this.#externalPackageFiles(record, subpath, true, "require");
+    if (!singlePackageFileSelection(imported) || !singlePackageFileSelection(required)) return null;
+    return imported.files[0] === required.files[0] ? imported.files[0]! : null;
+  }
+
+  #declarationLocator(specifier: string, sourceFile: string, owner: PackageRecord, record: ExternalPackageManifest): string | null {
+    if (record.version === null) return null;
+    const packageName = packageNameOf(specifier);
+    const declared = this.#fileSet.has(path.resolve(sourceFile)) ? owner.dependencies.get(packageName)?.range ?? null : null;
+    const selection = selectPackageInstallCandidates(this.#workspace, owner, packageName, declared);
+    return externalDeclarationLocator(selection, record.version, owner.manager, packageName);
+  }
+
+  /** Confined declaration entry, admitted only when both neutral resolver modes agree. */
+  async externalDeclaration(specifier: string, sourceFile: string): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const owner = this.#declarationOwner(specifier, sourceFile);
+    if (owner === null) return null;
+    const record = await this.#installedDeclarationRecord(specifier, sourceFile, owner);
+    if (record === null) return null;
+    const entry = await this.#declarationEntry(specifier, sourceFile, owner, record);
+    if (entry === null) this.#recordDeclarationIssue(sourceFile, specifier);
+    return entry;
+  }
+
+  #recordDeclarationIssue(sourceFile: string, specifier: string): void {
+    const relative = normalizeRelative(path.relative(this.#root, sourceFile));
+    if (this.#declarationIssues.size >= 128) return;
+    this.#declarationIssues.set(JSON.stringify([relative, specifier]), { path: relative, reason: "external_declaration_missing_or_ambiguous" });
+  }
+
+  externalDeclarationIssues(): readonly ResolverIssue[] {
+    return [...this.#declarationIssues.values()];
+  }
+
+  async #declarationEntry(specifier: string, sourceFile: string, owner: PackageRecord, record: ExternalPackageManifest): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const locator = this.#declarationLocator(specifier, sourceFile, owner, record);
+    if (locator === null) return null;
+    const file = await this.#sharedDeclarationEntry(specifier, record);
+    if (file === null) return null;
+    if (/\.d\.[cm]?ts$/u.test(file)) return { file, packageRoot: record.root, locator };
+    return await this.#fallbackDeclarationEntry(specifier, sourceFile, owner, locator);
+  }
+
+  async #fallbackDeclarationEntry(specifier: string, sourceFile: string, owner: PackageRecord, locator: string): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const typesSpecifier = declarationTypesSpecifier(specifier);
+    if (typesSpecifier === null) return null;
+    const record = await this.#installedDeclarationRecord(typesSpecifier, sourceFile, owner);
+    if (record === null) return null;
+    const file = await this.#sharedDeclarationEntry(typesSpecifier, record);
+    return declarationEntryForFile(file, record.root, locator);
+  }
+
+  async #confinedDeclarationFile(candidate: string, packageRoot: string): Promise<string | null> {
+    if (!/\.d\.[cm]?ts$/u.test(candidate)) return null;
+    const resolved = await resolveWithinRoot(this.#root, candidate);
+    if (resolved === null) return null;
+    return await this.#declarationFileInPackage(resolved, packageRoot);
+  }
+
+  async #declarationFileInPackage(file: string, packageRoot: string): Promise<string | null> {
+    if (!isWithinRoot(packageRoot, file)) return null;
+    return await isFile(this.#root, file) ? file : null;
+  }
+
+  async relativeDeclaration(specifier: string, sourceFile: string, packageRoot: string): Promise<string | null> {
+    const base = path.resolve(path.dirname(sourceFile), specifier);
+    if (!isWithinRoot(packageRoot, base)) return null;
+    for (const candidate of fileBaseCandidates(base, true, false, true)) {
+      const file = await this.#confinedDeclarationFile(candidate, packageRoot);
+      if (file !== null) return file;
+    }
+    return null;
+  }
+
   async #resolveExternalPackage(
     specifier: string,
     packageName: string,
@@ -2722,7 +2847,7 @@ export class ModuleResolver {
         useTypesCondition,
       );
       if (files.length === 0 && this.#isInventoryAsset(base)) {
-        return { status: "resolved", precision: "exact", targets: [{ kind: "file", absolutePath: base }], reason: "asset_type_declaration_unavailable" };
+        return { status: "unresolved", precision: "heuristic", targets: [], reason: "asset_type_declaration_unavailable" };
       }
       if (files.length === 0) return { status: "unresolved", precision: "heuristic", targets: [], reason: "relative_target_not_found" };
       return {

@@ -4148,8 +4148,8 @@ test("semantic asset imports distinguish file dependencies from missing type dec
   const model = await scan(root, files);
   const semantic = model.sites.filter((site) => site.evidence.some((evidence) => evidence.kind === "semantic"));
   const css = semantic.find((site) => site.specifier === "./style.css");
-  assert.equal(css?.resolution_status, "resolved", JSON.stringify(model.diagnostics));
-  assert.ok(css?.target_ids.some((id) => model.nodes.find((node) => node.id === id)?.properties.path === "style.css"));
+  assert.equal(css?.resolution_status, "unresolved", JSON.stringify(model.diagnostics));
+  assert.equal(css?.reason, "asset_type_declaration_unavailable");
   assert.equal(semantic.find((site) => site.specifier === "./image.png")?.reason, "asset_type_declaration_unavailable");
   assert.equal(semantic.find((site) => site.specifier === "./missing.css")?.reason, "relative_target_not_found");
   assert.equal(semantic.find((site) => site.specifier === "./image.png?raw")?.resolution_status, "unresolved");

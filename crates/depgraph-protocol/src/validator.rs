@@ -1345,7 +1345,7 @@ fn validate_semantic_maps(
                             site.id, target.id
                         ));
                     }
-                    "type_use" if target.kind != "type" => {
+                    "type_use" if !valid_semantic_type_target(site, target, web_semantic_site) => {
                         return invariant(format!(
                             "semantic type-use site {} concrete target {} must be a type node",
                             site.id, target.id
@@ -1726,6 +1726,28 @@ fn is_rust_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -
                     evidence.kind == EvidenceKind::Semantic
                         && evidence.extractor.starts_with("rust-analyzer")
                 })))
+}
+
+// A TypeScript typeof query names a value, while ordinary type references name types.
+fn valid_semantic_type_target(site: &DependencySite, target: &GraphNode, web: bool) -> bool {
+    let value_query = web
+        && site.evidence.first().is_some_and(|evidence| {
+            evidence
+                .properties
+                .get("occurrence_kind")
+                .and_then(Value::as_str)
+                == Some("type_query")
+        });
+    if value_query {
+        target.kind == "symbol"
+            || (target.kind == "type"
+                && matches!(
+                    target.properties.get("type_kind").and_then(Value::as_str),
+                    Some("class" | "enum")
+                ))
+    } else {
+        target.kind == "type"
+    }
 }
 
 fn is_web_semantic_dependency_site(site: &DependencySite, source: &GraphNode) -> bool {
@@ -3507,7 +3529,6 @@ fn validate_web_semantic_completeness(
         ("typescript_project_model_status", "ready"),
         ("typescript_project_model_failure_reason", "none"),
         ("typescript_project_config", "worker-neutral-allowlist"),
-        ("typescript_module_resolution", "inventory-only"),
         ("typescript_standard_library_source", "bundled"),
         (
             "typescript_semantic_graph_emission",
@@ -3528,6 +3549,20 @@ fn validate_web_semantic_completeness(
                 profile.id
             ));
         }
+    }
+
+    let resolution = profile
+        .properties
+        .get("typescript_module_resolution")
+        .and_then(Value::as_str);
+    if !matches!(
+        resolution,
+        Some("inventory-only" | "inventory-and-confined-declarations")
+    ) {
+        return invariant(format!(
+            "Web semantic-complete profile {} requires confined properties.typescript_module_resolution, found {resolution:?}",
+            profile.id
+        ));
     }
 
     let release_gate = profile

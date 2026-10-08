@@ -5,6 +5,14 @@
         "count": 1
       }
     },
+    "src/analysis-unit.ts": {
+      "crap_high": {
+        "count": 3
+      },
+      "crap_moderate": {
+        "count": 3
+      }
+    },
     "src/astro-build-integration-entry.ts": {
       "crap_critical": {
         "count": 1
@@ -66,9 +74,6 @@
       },
       "crap_high": {
         "count": 4
-      },
-      "crap_moderate": {
-        "count": 1
       }
     },
     "src/fs.ts": {
@@ -96,7 +101,7 @@
         "count": 8
       },
       "crap_moderate": {
-        "count": 8
+        "count": 9
       }
     },
     "src/incremental.ts": {
@@ -172,9 +177,6 @@
       }
     },
     "src/scanner.ts": {
-      "crap_moderate": {
-        "count": 13
-      },
       "complexity_critical": {
         "count": 4
       },
@@ -182,7 +184,10 @@
         "count": 5
       },
       "crap_high": {
-        "count": 7
+        "count": 6
+      },
+      "crap_moderate": {
+        "count": 13
       }
     },
     "src/semantic-delta.ts": {
@@ -196,7 +201,12 @@
         "count": 1
       },
       "crap_moderate": {
-        "count": 2
+        "count": 1
+      }
+    },
+    "src/semantic-validation-utils.ts": {
+      "crap_moderate": {
+        "count": 1
       }
     },
     "src/source-fingerprint.ts": {
@@ -303,7 +313,7 @@
         "count": 11
       },
       "crap_moderate": {
-        "count": 12
+        "count": 13
       }
     },
     "src/typescript-dependency-contract.ts": {
@@ -364,35 +374,52 @@
     },
     "src/workspace.ts": {
       "complexity_critical": {
-        "count": 8
+        "count": 7
       },
       "crap_critical": {
-        "count": 8
+        "count": 7
       },
       "crap_high": {
-        "count": 6
+        "count": 7
       },
       "crap_moderate": {
         "count": 9
-      }
-    },
-    "src/analysis-unit.ts": {
-      "crap_high": {
-        "count": 3
-      },
-      "crap_moderate": {
-        "count": 3
-      }
-    },
-    "src/semantic-validation-utils.ts": {
-      "crap_moderate": {
-        "count": 1
       }
     }
   },
   "identity_finding_counts": {
     "scripts/build.mjs\u0000bundledPackageName": {
       "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000isAncestorWorkspaceManifest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000isCanonicalRepositoryPath": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000pathList": {
+      "crap_high": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000readAnalysisUnitRequest": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000requiredString": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/analysis-unit.ts\u0000validateAnalysisUnitForRoot": {
+      "crap_high": {
         "count": 1
       }
     },
@@ -743,11 +770,6 @@
         "count": 1
       }
     },
-    "src/framework-semantic.ts\u0000objectValue": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
     "src/framework-semantic.ts\u0000sameAnchor": {
       "crap_high": {
         "count": 1
@@ -842,7 +864,7 @@
         "count": 1
       },
       "crap_moderate": {
-        "count": 1
+        "count": 2
       }
     },
     "src/imports.ts\u0000checkSegment": {
@@ -1540,6 +1562,16 @@
         "count": 1
       }
     },
+    "src/scanner.ts\u0000enqueueTypeScriptAstPath": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
+    "src/scanner.ts\u0000enqueueTypeScriptResolutionTarget": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
     "src/scanner.ts\u0000fileNode": {
       "crap_moderate": {
         "count": 1
@@ -1612,16 +1644,16 @@
         "count": 1
       }
     },
+    "src/scanner.ts\u0000targetNode": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
     "src/semantic-delta.ts\u0000mergeTypeScriptDefinitionDelta": {
       "complexity_critical": {
         "count": 1
       },
       "crap_critical": {
-        "count": 1
-      }
-    },
-    "src/semantic-delta.ts\u0000objectValue": {
-      "crap_moderate": {
         "count": 1
       }
     },
@@ -1648,6 +1680,11 @@
         "count": 1
       },
       "crap_critical": {
+        "count": 1
+      }
+    },
+    "src/semantic-validation-utils.ts\u0000objectValue": {
+      "crap_moderate": {
         "count": 1
       }
     },
@@ -2268,6 +2305,9 @@
         "count": 1
       },
       "crap_critical": {
+        "count": 1
+      },
+      "crap_moderate": {
         "count": 1
       }
     },
@@ -3222,6 +3262,11 @@
         "count": 1
       }
     },
+    "src/workspace.ts\u0000pnpmWorkspaceFileFor": {
+      "crap_moderate": {
+        "count": 1
+      }
+    },
     "src/workspace.ts\u0000repositoryIdentity": {
       "complexity_critical": {
         "count": 1
@@ -3257,70 +3302,7 @@
       }
     },
     "src/workspace.ts\u0000workspacePatterns": {
-      "complexity_critical": {
-        "count": 1
-      },
-      "crap_critical": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000isAncestorWorkspaceManifest": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000isCanonicalRepositoryPath": {
       "crap_high": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000pathList": {
-      "crap_high": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000readAnalysisUnitRequest": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000requiredString": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/analysis-unit.ts\u0000validateAnalysisUnitForRoot": {
-      "crap_high": {
-        "count": 1
-      }
-    },
-    "src/scanner.ts\u0000enqueueTypeScriptAstPath": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/scanner.ts\u0000enqueueTypeScriptResolutionTarget": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/scanner.ts\u0000selectTypeScriptAstPaths": {
-      "crap_high": {
-        "count": 1
-      }
-    },
-    "src/scanner.ts\u0000targetNode": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/semantic-validation-utils.ts\u0000objectValue": {
-      "crap_moderate": {
-        "count": 1
-      }
-    },
-    "src/workspace.ts\u0000pnpmWorkspaceFileFor": {
-      "crap_moderate": {
         "count": 1
       }
     }

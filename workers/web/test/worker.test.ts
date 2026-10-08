@@ -111,7 +111,7 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_definition_graph_status: "ready",
       typescript_project_model_status: "ready",
       typescript_project_config: "worker-neutral-allowlist",
-      typescript_module_resolution: "inventory-only",
+      typescript_module_resolution: "inventory-and-confined-declarations",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
@@ -1764,7 +1764,7 @@ test("native TypeScript 7 parser covers every TS and JS extension without loadin
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 
-test("TypeChecker definition graph resolves inventory modules and bundled stdlib without reading project packages", async (context) => {
+test("TypeChecker resolves inventory, bundled stdlib, and bounded package declarations without executing packages", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-typechecker-scaffold-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const packageRoot = path.join(root, "node_modules", "ambient-secret");
@@ -1835,7 +1835,7 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
     2,
   );
   assert.equal(Number(profile?.properties.typescript_emitted_semantic_diagnostics), semanticDiagnostics.length);
-  assert.ok(semanticDiagnostics.some((diagnostic) => diagnostic.path === "main.ts" && /TS2307.*ambient-secret/u.test(diagnostic.message)));
+  assert.ok(!semanticDiagnostics.some((diagnostic) => diagnostic.path === "main.ts" && /TS2307.*ambient-secret/u.test(diagnostic.message)));
   assert.ok(!semanticDiagnostics.some((diagnostic) => /TS2307.*@models\/model/u.test(diagnostic.message)));
   assert.ok(!semanticDiagnostics.some((diagnostic) => /Cannot find global type|Promise only refers to a type/u.test(diagnostic.message)));
   assert.ok(semanticDiagnostics.every((diagnostic) => (

@@ -677,6 +677,7 @@ fn discover_analysis_plan_with_exclusions(
         .filter(|(_, kind)| kind.is_config())
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
+    let declarations = crate::web_declarations::fingerprint(&canonical_root, files.keys())?;
     let (fingerprints, input_fingerprint) = global_fingerprints(
         &files,
         &digests,
@@ -693,7 +694,11 @@ fn discover_analysis_plan_with_exclusions(
         &digests,
         &input,
         &fingerprints,
+        &declarations,
     )?;
+    let input_fingerprint = sha256_digest(canonical_json(
+        &json!({ "inventory": input_fingerprint, "external_declarations": declarations }),
+    ));
     let dependency_groups = dependency_groups(&units)?;
     let mut limitations = BTreeSet::from([
         AnalysisPlanLimitation::StaticDiscoveryOnly,
@@ -2895,6 +2900,7 @@ fn finalize_units(
     digests: &BTreeMap<String, String>,
     input: &AnalysisPlanInput,
     global: &AnalysisInputFingerprints,
+    declarations: &str,
 ) -> Result<()> {
     let all_config_paths = files
         .iter()
@@ -2951,6 +2957,11 @@ fn finalize_units(
         unit.source_fingerprint = fingerprint_paths(digests, &unit.source_paths);
         unit.manifest_fingerprint = fingerprint_paths(digests, &unit.manifest_paths);
         unit.config_fingerprint = fingerprint_paths(digests, &unit.config_paths);
+        if unit.adapter == AnalysisAdapter::Web {
+            unit.config_fingerprint = sha256_digest(canonical_json(
+                &json!({ "configs": unit.config_fingerprint, "external_declarations": declarations }),
+            ));
+        }
         unit.profile_fingerprint = unit.profile_scope.fingerprint.clone();
         unit.analyzer_fingerprint = global.analyzer_fingerprint.clone();
         let mut refs = references.remove(&unit.id).unwrap_or_default();
@@ -4616,5 +4627,48 @@ catalog: {}
                 .canonicalized()
                 .is_err()
         );
+    }
+    #[test]
+    fn installed_declaration_changes_invalidate_web_unit_context() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"fixture","dependencies":{"library":"1.0.0"}}"#,
+        )?;
+        fs::write(
+            root.path().join("index.ts"),
+            "import { create } from 'library'; create().run();",
+        )?;
+        let package = root.path().join("node_modules/library");
+        fs::create_dir_all(&package)?;
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"library","version":"1.0.0","types":"index.d.ts"}"#,
+        )?;
+        fs::write(
+            package.join("index.d.ts"),
+            "export declare function create(): { run(): string };",
+        )?;
+        let before = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        fs::write(
+            package.join("index.d.ts"),
+            "export declare function create(): { run(): number };",
+        )?;
+        let after = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        assert_ne!(before.input_fingerprint, after.input_fingerprint);
+        for unit in before
+            .units
+            .iter()
+            .filter(|unit| unit.adapter == AnalysisAdapter::Web)
+        {
+            let changed = after
+                .units
+                .iter()
+                .find(|candidate| candidate.id == unit.id)
+                .unwrap();
+            assert_eq!(unit.source_fingerprint, changed.source_fingerprint);
+            assert_ne!(unit.input_fingerprint, changed.input_fingerprint);
+        }
+        Ok(())
     }
 }

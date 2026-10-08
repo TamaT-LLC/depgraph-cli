@@ -834,11 +834,23 @@ interface LockLoadResult {
   invalidReason: string | null;
 }
 
+function pnpmIndentIsValid(depth: number, ancestry: readonly string[]): boolean {
+  return Number.isInteger(depth) && depth <= ancestry.length;
+}
+
+function pnpmImporterVersionPath(parts: readonly string[]): boolean {
+  return parts.length === 5 && parts[0] === "importers" && parts[4] === "version";
+}
+
+function pnpmIgnorableLine(line: string): boolean {
+  return line.trim() === "" || line.trimStart().startsWith("#");
+}
+
 function pnpmStaticEntry(line: string, ancestry: string[]): { identity: string; rawValue: string | undefined } | null {
   const match = line.match(/^( *)(.*?):(?:[ \t]+(.*))?$/u);
   if (match === null) return null;
   const depth = match[1]!.length / 2;
-  if (!Number.isInteger(depth) || depth > ancestry.length) return null;
+  if (!pnpmIndentIsValid(depth, ancestry)) return null;
   const key = parsePnpmPattern(match[2]!);
   if (key === null) return null;
   ancestry.length = depth;
@@ -846,18 +858,35 @@ function pnpmStaticEntry(line: string, ancestry: string[]): { identity: string; 
   return { identity: JSON.stringify(ancestry), rawValue: match[3] };
 }
 
+function appendPnpmStaticValue(
+  line: string, ancestry: string[], blocks: Set<string>, values: Map<string, string | null>,
+): boolean {
+  const entry = pnpmStaticEntry(line, ancestry);
+  if (entry === null) { ancestry.length = 0; return true; }
+  if (!pnpmParentIsBlock(ancestry, blocks)) return true;
+  if (values.has(entry.identity)) return false;
+  recordPnpmStaticValue(entry, blocks, values);
+  return true;
+}
+
+function pnpmParentIsBlock(ancestry: readonly string[], blocks: ReadonlySet<string>): boolean {
+  return ancestry.length <= 1 || blocks.has(JSON.stringify(ancestry.slice(0, -1)));
+}
+
+function recordPnpmStaticValue(
+  entry: { identity: string; rawValue: string | undefined }, blocks: Set<string>, values: Map<string, string | null>,
+): void {
+  if (entry.rawValue === undefined) blocks.add(entry.identity);
+  values.set(entry.identity, entry.rawValue === undefined ? null : parsePnpmPattern(entry.rawValue));
+}
+
 function pnpmStaticValues(source: string): ReadonlyMap<string, string | null> {
   const values = new Map<string, string | null>();
   const ancestry: string[] = [];
   const blocks = new Set<string>();
   for (const line of source.split(/\r?\n/u)) {
-    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
-    const entry = pnpmStaticEntry(line, ancestry);
-    if (entry === null) { ancestry.length = 0; continue; }
-    if (ancestry.length > 1 && !blocks.has(JSON.stringify(ancestry.slice(0, -1)))) continue;
-    if (values.has(entry.identity)) return new Map();
-    if (entry.rawValue === undefined) blocks.add(entry.identity);
-    values.set(entry.identity, entry.rawValue === undefined ? null : parsePnpmPattern(entry.rawValue));
+    if (pnpmIgnorableLine(line)) continue;
+    if (!appendPnpmStaticValue(line, ancestry, blocks, values)) return new Map();
   }
   return values;
 }
@@ -867,7 +896,7 @@ function parsePnpmImporterResolutions(source: string): ReadonlyMap<string, PnpmI
   const result = new Map<string, PnpmImporterResolution>();
   for (const [key, value] of values) {
     const parts = JSON.parse(key) as string[];
-    if (parts.length !== 5 || parts[0] !== "importers" || parts[4] !== "version") continue;
+    if (!pnpmImporterVersionPath(parts)) continue;
     const specifier = values.get(JSON.stringify([...parts.slice(0, 4), "specifier"])) ?? null;
     result.set(JSON.stringify(parts.slice(1, 4)), { specifier, version: value });
   }

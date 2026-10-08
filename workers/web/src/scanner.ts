@@ -1,3 +1,4 @@
+import { externalDeclarationRequests, loadExternalDeclarations } from "./external-declarations";
 import { isTypeUseTargetKind } from "./typescript-dependency-contract";
 import path from "node:path";
 import ts from "typescript";
@@ -3092,11 +3093,24 @@ export async function scan(
       analysis_stage: analysisUnit.stage,
     });
   }
+  const externalDeclarations = analysisUnit?.stage === "syntax"
+    ? { files: new Map(), paths: {}, issues: [], bytes: 0 }
+    : await loadExternalDeclarations(root, resolver, externalDeclarationRequests(root, compilerSources));
+  for (const issue of externalDeclarations.issues) {
+    graph.addDiagnostic({
+      severity: "info", code: "web.external_declaration_incomplete",
+      message: `External declaration context is incomplete for ${issue.path}: ${issue.reason}`,
+      path: null, profile_id: PROFILE_ID,
+      properties: { typescript_dependency_issue: true, diagnostic_category: "type_information_unavailable", reason: issue.reason, declaration_path: issue.path },
+    });
+  }
+  const staticCompilerConfig = resolver.typeScriptStaticConfig(typeScriptPathRequests);
   const nativeTypeScript = await analyzeTypeScriptProject(
     compilerSources,
-    resolver.typeScriptStaticConfig(typeScriptPathRequests),
+    { ...staticCompilerConfig, paths: { ...externalDeclarations.paths, ...staticCompilerConfig.paths } },
     progress,
     {
+      externalDeclarations: externalDeclarations.files,
       moduleExportPaths: astroEndpointExportPaths(outputRouteEntries),
       frameworkConfigPaths,
       ...(analysisUnit === null ? {} : {
@@ -3108,6 +3122,7 @@ export async function scan(
       }),
     },
   );
+  nativeTypeScript.project.semanticIssues += externalDeclarations.issues.length;
   if (analysisUnit !== null) {
     progress.complete("typescript_context_rebuild", {
       context_source_files: compilerSources.size,

@@ -2458,3 +2458,5 @@ mod tests {
         ));
     }
 }
+
+mod web_declarations;
