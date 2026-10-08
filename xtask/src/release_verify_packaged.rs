@@ -3434,6 +3434,19 @@ fn successful_json(output: std::process::Output, scenario: &str) -> Result<Value
         .with_context(|| format!("{scenario} returned invalid JSON"))
 }
 
+fn packaged_web_type_target_matches(occurrence_kind: &str, node: &Value) -> bool {
+    if occurrence_kind == "type_query" {
+        node["kind"] == "symbol"
+            || (node["kind"] == "type"
+                && matches!(
+                    node["properties"]["type_kind"].as_str(),
+                    Some("class" | "enum")
+                ))
+    } else {
+        node["kind"] == "type"
+    }
+}
+
 fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -> Result<()> {
     let exported = packaged_web_export_json(executable, store)?;
     let graph = exported["graph"]
@@ -3717,7 +3730,7 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             ),
             "type_use" => matches!(
                 occurrence_kind,
-                "type_reference" | "heritage_type" | "jsdoc_type"
+                "type_reference" | "type_query" | "heritage_type" | "jsdoc_type"
             ),
             "call" => matches!(
                 occurrence_kind,
@@ -3993,10 +4006,10 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             && target_ids.iter().any(|target| {
                 nodes_by_id
                     .get(target)
-                    .is_none_or(|node| node["kind"] != "type")
+                    .is_none_or(|node| !packaged_web_type_target_matches(occurrence_kind, node))
             })
         {
-            bail!("packaged Web type-use site {site_id} has a non-type concrete target");
+            bail!("packaged Web type-use site {site_id} has an incompatible concrete target");
         }
         if kind == "call" {
             let source = site["source"]
@@ -7043,6 +7056,23 @@ fn verify_packaged_web_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_type_queries_preserve_value_target_validation() {
+        let symbol = serde_json::json!({"kind":"symbol"});
+        let interface = serde_json::json!({"kind":"type", "properties":{"type_kind":"interface"}});
+        let class = serde_json::json!({"kind":"type", "properties":{"type_kind":"class"}});
+        let enumeration = serde_json::json!({"kind":"type", "properties":{"type_kind":"enum"}});
+        assert!(packaged_web_type_target_matches("type_query", &symbol));
+        assert!(packaged_web_type_target_matches("type_query", &class));
+        assert!(packaged_web_type_target_matches("type_query", &enumeration));
+        assert!(!packaged_web_type_target_matches("type_query", &interface));
+        assert!(!packaged_web_type_target_matches("type_reference", &symbol));
+        assert!(packaged_web_type_target_matches(
+            "type_reference",
+            &interface
+        ));
+    }
 
     #[test]
     fn framework_unit_ledger_requires_matching_features_and_complete_capabilities() -> Result<()> {

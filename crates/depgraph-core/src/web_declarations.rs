@@ -19,7 +19,7 @@ pub(crate) fn fingerprint(
     inventory: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<String> {
     let root = root.canonicalize()?;
-    let mut roots = BTreeSet::from([root.join("node_modules")]);
+    let mut roots = BTreeSet::new();
     for relative in inventory {
         if !is_web_input(relative.as_ref()) {
             continue;
@@ -118,12 +118,12 @@ impl Witness<'_> {
                 .to_string_lossy()
                 .as_bytes(),
         );
-        if !self.visited.insert(canonical.clone()) {
-            self.field(b"already-visited");
-            return Ok(());
-        }
         let metadata = fs::metadata(&canonical)?;
         if metadata.is_dir() {
+            if !self.visited.insert(canonical.clone()) {
+                self.field(b"already-visited");
+                return Ok(());
+            }
             self.field(b"directory");
             let mut children = fs::read_dir(&canonical)?
                 .take(MAX_ENTRIES.saturating_sub(self.entries) + 1)
@@ -136,7 +136,7 @@ impl Witness<'_> {
             for child in children {
                 self.visit(&child, depth + 1)?;
             }
-        } else if metadata.is_file() && is_input(&canonical) {
+        } else if metadata.is_file() && (is_input(candidate) || is_input(&canonical)) {
             self.read_input(&canonical, &metadata)?;
         } else {
             self.field(b"non-declaration");
@@ -208,6 +208,35 @@ mod tests {
             "export declare function create(): number;",
         )?;
         assert_ne!(first, fingerprint(root.path(), ["src/index.ts"])?);
+        Ok(())
+    }
+
+    #[test]
+    fn non_web_inputs_do_not_scan_installed_declarations() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let inputs = ["main.go", "Cargo.toml"];
+        let before = fingerprint(root.path(), inputs)?;
+        let package = root.path().join("node_modules/library");
+        fs::create_dir_all(&package)?;
+        fs::File::create(package.join("index.d.ts"))?.set_len(MAX_FILE_BYTES + 1)?;
+        assert_eq!(before, fingerprint(root.path(), inputs)?);
+        assert!(fingerprint(root.path(), ["index.ts"]).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_symlinks_hash_content_even_after_a_non_input_alias_was_visited() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let package = root.path().join("node_modules/library");
+        fs::create_dir_all(&package)?;
+        for (alias, target) in [("index.d.ts", "a.snapshot"), ("package.json", "b.snapshot")] {
+            fs::write(package.join(target), "one")?;
+            std::os::unix::fs::symlink(target, package.join(alias))?;
+            let before = fingerprint(root.path(), ["index.ts"])?;
+            fs::write(package.join(target), "two")?;
+            assert_ne!(before, fingerprint(root.path(), ["index.ts"])?);
+        }
         Ok(())
     }
 
