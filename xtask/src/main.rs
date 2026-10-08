@@ -191,7 +191,7 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.6.2";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.6.3";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
