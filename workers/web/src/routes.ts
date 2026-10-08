@@ -6,6 +6,7 @@ import type { PackageRecord, Workspace } from "./workspace";
 export interface RouteEntry {
   framework: "next" | "astro" | "tanstack-router" | "tanstack-start";
   pattern: string;
+  routeId?: string;
   absoluteFile: string;
   relativeFile: string;
   entryKind: string;
@@ -457,6 +458,14 @@ function tanstackFilesystemPattern(parts: string[]): string {
   return normalizePattern(segments);
 }
 
+function tanstackRouteUrl(routeId: string): string {
+  const segments = routeId.split("/")
+    .filter((segment) => !segment.startsWith("_") && !/^\(.*\)$/u.test(segment))
+    .map((segment) => segment.replace(/_$/u, ""));
+  const pattern = normalizePattern(segments);
+  return pattern !== "/" && routeId.endsWith("/") ? `${pattern}/` : pattern;
+}
+
 function literalGeneratedRoutes(source: string, relativeFile: string): Array<{ pattern: string; evidence: Evidence }> {
   const result: Array<{ pattern: string; evidence: Evidence }> = [];
   function add(startOffset: number, endOffset: number, pattern: string, detail: string): void {
@@ -514,7 +523,8 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
     const explicit = source === null ? [] : literalGeneratedRoutes(source, relativeFile).filter((item) => item.evidence.detail === "source_route_literal");
     const patterns = explicit.length > 0 ? explicit : [{ pattern: tanstackFilesystemPattern(rootMatch), evidence: evidence(relativeFile, "tanstack-filesystem-routes") }];
     for (const item of patterns) {
-      const pattern = withBasePath(config.tanstackBasePath, item.pattern);
+      const routeId = item.evidence.detail === "source_route_literal" ? item.pattern : undefined;
+      const pattern = withBasePath(config.tanstackBasePath, routeId === undefined ? item.pattern : tanstackRouteUrl(routeId));
       const routeEvidence = item.evidence.kind === "build"
         ? { ...item.evidence, kind: "source" as const, extractor: "tanstack-file-route-literal" }
         : item.evidence;
@@ -523,6 +533,7 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
       entries.push({
         framework,
         pattern,
+        ...(routeId === undefined ? {} : { routeId }),
         absoluteFile: file,
         relativeFile,
         entryKind: "file-route",

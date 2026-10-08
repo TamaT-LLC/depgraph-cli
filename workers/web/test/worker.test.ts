@@ -3410,3 +3410,64 @@ test("worker exposes the release and protocol handshake", async () => {
   );
   assert.equal(result.stderr, "");
 });
+
+test("TanStack pathless route IDs remain distinct while URLs and slash navigation agree", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-pathless-navigation-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const contents: Record<string, string> = {
+    "package.json": JSON.stringify({ name: "pathless-navigation", dependencies: { "@tanstack/react-router": "1.170.17" } }),
+    "src/routes/__root.tsx": 'import { createRootRoute } from "@tanstack/react-router"; export const Route = createRootRoute({});',
+    "src/routes/_auth.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth")({});',
+    "src/routes/_auth/index.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth/")({});',
+    "src/routes/_auth/items/index.tsx": [
+      'import { createFileRoute, Link } from "@tanstack/react-router";',
+      'export const Route = createFileRoute("/_auth/items/")({ component: Page });',
+      'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/absent" /></>; }',
+    ].join("\n"),
+    "src/routeTree.gen.ts": "export interface FileRoutesByPath { '/_auth': { fullPath: '/' }; '/_auth/': { fullPath: '/' }; '/_auth/items/': { fullPath: '/items/' } }",
+  };
+  for (const [relative, source] of Object.entries(contents)) {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, source);
+  }
+  const result = await run("pathless-navigation", root);
+  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_route_tree_drift"));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.code.includes("semantic_delta_discarded")));
+  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+  const fileRoutes = nodes.filter((node) => node.properties.route_kind === "tanstack-file-route");
+  assert.equal(fileRoutes.length, 3);
+  assert.equal(new Set(fileRoutes.map((node) => node.id)).size, 3);
+  assert.deepEqual(fileRoutes.map((node) => node.properties.route_id).sort(), ["/_auth", "/_auth/", "/_auth/items/"]);
+  const navigation = result.events.filter((event) => event.event === "dependency_site")
+    .map((event) => event.site).filter((site) => site.kind === "navigates_to");
+  assert.equal(navigation.length, 3);
+  for (const site of navigation) {
+    assert.equal(site.resolution_status, site.specifier === "/absent" ? "unresolved" : "resolved", site.specifier);
+  }
+  await writeFile(path.join(root, "src/routeTree.gen.ts"), contents["src/routeTree.gen.ts"]!.replace("'/items/'", "'/stale/'"));
+  const stale = await run("pathless-navigation-stale", root);
+  assert.ok(stale.events.some((event) => event.event === "diagnostic" && event.diagnostic.code === "web.tanstack_route_tree_drift"));
+});
+
+test("TanStack slash navigation resolves with a base path and either registered spelling", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-route-slashes-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src/routes/items"), { recursive: true });
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "route-slashes", dependencies: { "@tanstack/react-router": "1.170.17" } }));
+  await writeFile(path.join(root, "router.config.ts"), "export default { basepath: '/app', trailingSlash: 'always' };");
+  await writeFile(path.join(root, "src/routes/__root.tsx"), 'import { createRootRoute } from "@tanstack/react-router"; export const Route = createRootRoute({});');
+  for (const registered of ["/items", "/items/"]) {
+    await writeFile(path.join(root, "src/routes/items/index.tsx"), [
+      'import { createFileRoute, Link } from "@tanstack/react-router";',
+      `export const Route = createFileRoute(${JSON.stringify(registered)})({ component: Page });`,
+      'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/app/items/" /></>; }',
+    ].join("\n"));
+    const result = await run("slash-navigation", root);
+    const sites = result.events.filter((event) => event.event === "dependency_site")
+      .map((event) => event.site).filter((site) => site.kind === "navigates_to");
+    assert.equal(sites.length, 3);
+    assert.ok(sites.every((site) => site.resolution_status === "resolved"), registered);
+  }
+});

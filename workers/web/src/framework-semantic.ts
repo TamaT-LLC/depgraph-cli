@@ -3,6 +3,7 @@ import { objectValue, stringValue } from "./semantic-validation-utils";
 import {
   canonicalizeCondition,
   compareUtf8,
+  preferredWebEnvironment,
   LOGICAL_PROFILE_ID,
   PROFILE_ID,
   type Condition,
@@ -16,6 +17,18 @@ import {
   type Precision,
   type ResolutionStatus,
 } from "./types";
+
+export function frameworkEnvironmentCondition(environment: "server" | "browser", properties: Record<string, string> = {}): Condition {
+  return canonicalizeCondition({
+    op: "all",
+    conditions: [
+      { op: "eq", key: "mode", value: "production" },
+      { op: "eq", key: "environment", value: preferredWebEnvironment(environment) },
+      ...Object.entries(properties).map(([key, value]) => ({ op: "eq" as const, key, value })),
+    ],
+  });
+}
+
 
 export const WEB_FRAMEWORK_SEMANTIC_CAPABILITY = "framework-semantic-graph-v1" as const;
 export const WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION = "0.1.0" as const;

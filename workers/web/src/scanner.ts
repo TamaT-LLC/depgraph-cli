@@ -1212,17 +1212,19 @@ class GraphBuilder {
       framework: entry.framework,
       router_instance: owner.id,
       pattern: entry.pattern,
+      ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
       environment,
       profile: LOGICAL_PROFILE_ID,
     });
     return this.addNode({
       id,
       kind: "route",
-      locator: `route://${entry.framework}/${owner.name}${entry.pattern}`,
+      locator: `route://${entry.framework}/${owner.name}${entry.routeId ?? entry.pattern}`,
       display_name: `${entry.framework}:${entry.pattern}`,
       properties: {
         framework: entry.framework,
         pattern: entry.pattern,
+        ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
         router_instance: owner.id,
         package_id: owner.id,
         environment,
