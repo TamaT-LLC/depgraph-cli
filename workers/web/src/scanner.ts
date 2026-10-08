@@ -15,7 +15,7 @@ import {
 } from "./imports";
 import { analysisContentHash } from "./source-fingerprint";
 import { NOOP_PROGRESS, type ProgressReporter } from "./progress";
-import { discoverRoutes, type RouteEntry } from "./routes";
+import { discoverRoutes, routeParentKeys, routeTreeKey, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
   buildFrameworkCompleteness,
@@ -3586,7 +3586,7 @@ export async function scan(
   });
   progress.start("graph_finalize");
 
-  const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
+  const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence; entry: RouteEntry }>>();
   for (const entry of outputRouteEntries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
     const coverage = graph.ensureCoverage(fileNode, entry.relativeFile);
@@ -3638,20 +3638,16 @@ export async function scan(
       evidence: [entry.evidence],
     });
     if (addedRouteSite) graph.countSite(entry.relativeFile, "resolved");
+    // Generated fullPath records describe URLs, not the file-route parent hierarchy.
+    if (entry.framework.startsWith("tanstack-") && entry.generated) continue;
     const groupKey = `${owner.id}\0${entry.framework}`;
     const group = routeNodesByGroup.get(groupKey) ?? new Map();
-    group.set(entry.pattern, { node: routeNode, evidence: entry.evidence });
+    group.set(routeTreeKey(entry), { node: routeNode, evidence: entry.evidence, entry });
     routeNodesByGroup.set(groupKey, group);
   }
   for (const group of routeNodesByGroup.values()) {
-    for (const [patternValue, child] of group) {
-      if (patternValue === "/") continue;
-      const segments = patternValue.split("/").filter(Boolean);
-      let parent: { node: GraphNode; evidence: Evidence } | undefined;
-      while (segments.length > 0 && !parent) {
-        segments.pop();
-        parent = group.get(segments.length === 0 ? "/" : `/${segments.join("/")}`);
-      }
+    for (const child of group.values()) {
+      const parent = routeParentKeys(child.entry).map((key) => group.get(key)).find((candidate) => candidate !== undefined);
       if (parent) graph.structureEdge(child.node, parent.node, "parent_route", child.evidence, child.evidence.kind === "build");
     }
   }

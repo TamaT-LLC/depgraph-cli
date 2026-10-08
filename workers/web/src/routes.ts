@@ -14,6 +14,31 @@ export interface RouteEntry {
   evidence: Evidence;
 }
 
+function routeTreeRootKey(entry: RouteEntry): string {
+  return entry.framework.startsWith("tanstack-") ? "__root__" : "/";
+}
+
+export function routeTreeKey(entry: RouteEntry): string {
+  if (entry.routeId !== undefined) return entry.routeId;
+  if (entry.framework.startsWith("tanstack-") && path.parse(entry.absoluteFile).name === "__root") return "__root__";
+  return entry.pattern;
+}
+
+export function routeParentKeys(entry: RouteEntry): string[] {
+  const key = routeTreeKey(entry);
+  const root = routeTreeRootKey(entry);
+  if (key === root) return [];
+  const segments = key.split("/").filter(Boolean);
+  if (!key.endsWith("/")) segments.pop();
+  const parents: string[] = [];
+  while (segments.length > 0) {
+    parents.push(`/${segments.join("/")}`);
+    segments.pop();
+  }
+  parents.push(root);
+  return parents;
+}
+
 export interface RouteDrift {
   package: PackageRecord;
   missingFromGenerated: string[];
