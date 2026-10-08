@@ -664,7 +664,8 @@ jobs:
                     | $graph.nodes | any(.id == $target and .kind == "symbol")))
                 elif $site.kind == "type_use" then
                   ($site.target_ids | all(. as $target
-                    | $graph.nodes | any(.id == $target and .kind == "type")))
+                    | $graph.nodes | any(.id == $target and (.kind == "type"
+                      or (.kind == "symbol" and $primary.properties.occurrence_kind == "type_query")))))
                 else true end)
                 and (if ((["namespace_import", "side_effect_import", "empty_import", "import_equals",
                     "require_call", "dynamic_import", "import_type", "namespace_reexport", "empty_reexport", "export_star"]
@@ -1187,7 +1188,8 @@ jobs:
                 throw "Unresolved semantic site targeted an invalid sentinel: $target"
               }
               if ($site.kind -eq 'type_use' -and $site.resolution_status -in @('resolved', 'candidates') -and
-                  $nodeKinds[$target] -ne 'type') {
+                  $nodeKinds[$target] -ne 'type' -and
+                  -not ($occurrenceKind -eq 'type_query' -and $nodeKinds[$target] -eq 'symbol')) {
                 throw "Concrete type-use site targeted $($nodeKinds[$target])"
               }
               if ($site.kind -eq 'call' -and $site.resolution_status -in @('resolved', 'candidates') -and
