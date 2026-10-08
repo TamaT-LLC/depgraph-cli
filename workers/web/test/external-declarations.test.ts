@@ -163,3 +163,21 @@ test("declaration issue counters match distinct emitted diagnostics", async (con
   assert.equal(model.diagnostics.filter((diagnostic) => diagnostic.properties?.reason === "external_declaration_reference_unavailable").length, 2);
   assert.ok(!model.coverage.completeness.includes("semantic-complete"));
 });
+
+
+test("relative source imports and duplicate package probes do not exhaust the declaration request budget", async (context) => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "depgraph-external-requests-")));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await fixture(root, true);
+  const files = await walkFiles(root);
+  const workspace = await discoverWorkspace(root, files);
+  const resolver = await ModuleResolver.create(workspace, files);
+  const requests = Array.from({ length: 30 }, (_, index) => [
+    { sourceFile: path.join(root, `source-${index}.ts`), specifier: `./relative-${index}` },
+    { sourceFile: path.join(root, `source-${index}.ts`), specifier: "library" },
+  ]).flat();
+  const loaded = await loadExternalDeclarations(root, resolver, requests, { files: 10, bytes: 4096, fileBytes: 4096, requests: 2 });
+  assert.equal(loaded.files.size, 2);
+  assert.deepEqual(loaded.issues, []);
+  assert.deepEqual(Object.keys(loaded.paths), ["library"]);
+});

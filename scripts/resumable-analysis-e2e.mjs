@@ -459,9 +459,9 @@ try {
   }
   if (includeWeb) {
     const cssSites = expected.sites.filter((site) => site.specifier === "./style.css");
-    assert.ok(cssSites.some((site) => site.kind === "import" && site.resolution_status === "resolved"), "CSS syntax dependency must resolve");
+    assert.ok(cssSites.some((site) => site.kind === "side_effect_import" && site.resolution_status === "resolved"), "CSS syntax dependency must resolve");
     assert.ok(cssSites.some((site) => site.kind === "web_import" && site.reason === "asset_type_declaration_unavailable"), "CSS semantic dependency must report unavailable type information");
-    const valueQuery = expected.sites.find((site) => site.kind === "type_use" && site.evidence.some((evidence) => evidence.properties?.occurrence_kind === "type_query"));
+    const valueQuery = expected.sites.find((site) => site.kind === "type_use" && expected.evidence.some((item) => item.owner_id === site.id && item.evidence.properties?.occurrence_kind === "type_query"));
     assert.ok(valueQuery?.target_ids.some((id) => expected.nodes.some((node) => node.id === id && node.kind === "symbol")), "typeof must retain its value symbol target across the CLI protocol boundary");
     const sharedPackage = expected.nodes.find((node) => (
       node.kind === "package_instance" && node.display_name === "@fixture/shared"

@@ -74,6 +74,11 @@ function commentModuleRequests(text: string): string[] {
   return [...inline, ...tags];
 }
 
+function bareProbeKey(specifier: string, sourceFile: string, parent?: Entry): string {
+  // The lookup directory determines the repository owner; preserve an external parent's identity too.
+  return JSON.stringify(["bare", parent?.locator ?? null, path.dirname(sourceFile), specifier]);
+}
+
 type Limits = { files: number; bytes: number; fileBytes: number; requests: number };
 
 class DeclarationLoader {
@@ -86,6 +91,7 @@ class DeclarationLoader {
   readonly ambiguousFiles = new Set<string>();
   bytes = 0;
   requestCount = 0;
+  readonly probes = new Map<string, Entry | null>();
 
   constructor(readonly root: string, readonly canonicalRoot: string, readonly resolver: ModuleResolver, readonly limits: Limits) {}
 
@@ -110,26 +116,42 @@ class DeclarationLoader {
   }
 
   async request(specifier: string, sourceFile: string, parent?: Entry): Promise<void> {
-    if (++this.requestCount > this.limits.requests) { this.issue(sourceFile, "external_declaration_request_limit"); return; }
+    if (specifier.startsWith(".") && parent === undefined) return;
     if (specifier.startsWith(".")) await this.relativeRequest(specifier, sourceFile, parent);
     else await this.bareRequest(specifier, sourceFile, parent);
   }
 
   async relativeRequest(specifier: string, sourceFile: string, parent?: Entry): Promise<void> {
     if (parent === undefined) return;
-    const file = await this.resolver.relativeDeclaration(specifier, sourceFile, parent.packageRoot);
-    if (file === null) { this.issue(sourceFile, "external_declaration_reference_unavailable"); return; }
-    this.enqueue({ ...parent, file });
+    const key = JSON.stringify(["relative", parent.locator, parent.packageRoot, path.dirname(sourceFile), specifier]);
+    const entry = await this.probe(key, sourceFile, async () => {
+      const file = await this.resolver.relativeDeclaration(specifier, sourceFile, parent.packageRoot);
+      return file === null ? null : { ...parent, file };
+    });
+    if (entry === undefined) return;
+    if (entry === null) { this.issue(sourceFile, "external_declaration_reference_unavailable"); return; }
+    this.enqueue(entry);
   }
 
   async bareRequest(specifier: string, sourceFile: string, parent?: Entry): Promise<void> {
-    const entry = await this.resolver.externalDeclaration(specifier, sourceFile);
+    const key = bareProbeKey(specifier, sourceFile, parent);
+    const entry = await this.probe(key, sourceFile, () => this.resolver.externalDeclaration(specifier, sourceFile));
+    if (entry === undefined) return;
     if (entry === null) {
       this.block(specifier);
       if (parent !== undefined) this.issue(sourceFile, "external_declaration_dependency_unavailable");
       return;
     }
     this.admitMapping(specifier, sourceFile, entry);
+  }
+
+  async probe(key: string, sourceFile: string, resolve: () => Promise<Entry | null>): Promise<Entry | null | undefined> {
+    if (this.probes.has(key)) return this.probes.get(key)!;
+    if (this.requestCount >= this.limits.requests) { this.issue(sourceFile, "external_declaration_request_limit"); return undefined; }
+    this.requestCount++;
+    const entry = await resolve();
+    this.probes.set(key, entry);
+    return entry;
   }
 
   block(specifier: string): void {
@@ -155,10 +177,7 @@ class DeclarationLoader {
 
   async loadRequests(requests: readonly TypeScriptPathRequest[]): Promise<void> {
     const sorted = [...requests].sort((left, right) => compareUtf8(left.sourceFile, right.sourceFile) || compareUtf8(left.specifier, right.specifier));
-    for (const item of sorted) {
-      if (this.requestCount >= this.limits.requests) { this.issue(item.sourceFile, "external_declaration_request_limit"); break; }
-      await this.request(item.specifier, item.sourceFile);
-    }
+    for (const item of sorted) await this.request(item.specifier, item.sourceFile);
   }
 
   async loadEntry(entry: Entry): Promise<void> {
