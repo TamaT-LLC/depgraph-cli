@@ -107,7 +107,7 @@ findingの`suppressions`はv1ではwire互換性のため保持するoutput-only
 tag後の現行`main`／評価用RCの監査では、before/afterがschema 19に保存したpolicy digest、analyzer version、finding contract versionを比較する。
 provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
 公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
-次のpatch release `v0.6.2` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
+次のpatch release `v0.6.3` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
 sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
@@ -139,7 +139,7 @@ sourceは自動変更しない。
 
 ## 公式パッケージの導入
 
-次のpatch release `v0.6.2` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
+次のpatch release `v0.6.3` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
 公式 Release と公開後証跡を確認した版を使用する。
 
 ### Homebrew（macOS Apple Silicon / Linux）
@@ -167,7 +167,7 @@ Go / Rust の解析には対象プロジェクトのツールチェーンとオ�
 `v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
 npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
 
-`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。`v0.6.2` では Intel macOS 向けパッケージを提供しない。
+`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。`v0.6.3` では Intel macOS 向けパッケージを提供しない。
 インストールスクリプトによる外部ダウンロードは行わない。
 npm版のランチャーにはNode.js 24以上が必要である。
 `depgraph` CLIはnpmから導入したパッケージだけで実行できる。
@@ -186,7 +186,7 @@ npm版のランチャーにはNode.js 24以上が必要である。
 公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
 
 ```sh
-VERSION=0.6.2
+VERSION=0.6.3
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -241,11 +241,11 @@ target/debug/depgraph --version
 
 ## リリースと互換性
 
-次のstable `v0.6.2` artifactは、[`v0.6.2`リリースノート](docs/releases/v0.6.2.md)に記載した契約を実装している。
-`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.2)と公開後証跡が一致するときに限り有効である。
+次のstable `v0.6.3` artifactは、[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)に記載した契約を実装している。
+`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.3)と公開後証跡が一致するときに限り有効である。
 MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
 
-次のpatch release `v0.6.2`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
+次のpatch release `v0.6.3`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
 `depgraph-health-finding-v1`、CLIの`health`／`cleanup`／`audit`／`hotspots`、および対応するMCP APIがこの境界に含まれる。
 v0.6.0から新たな保存形式の移行はない。
 
@@ -258,13 +258,13 @@ current `main`はStore schema `19`を使用し、schema 19へ移行したStore�
 履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
 過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
 
-次のリリースの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.2`リリースノート](docs/releases/v0.6.2.md)を参照する。
+次のリリースの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)を参照する。
 過去のschema 17の契約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に保持する。
-`v0.6.2`の移行条件とAPI差分は、[`v0.6.2`リリースノート](docs/releases/v0.6.2.md)に記載する。
+`v0.6.3`の移行条件とAPI差分は、[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)に記載する。
 
 ## プロジェクトの状況と公開コラボレーション
 
-現在のサポート対象は、公開済み`v0.6.1`リリースである。
+現在のサポート対象は、公開済み`v0.6.2`リリースである。
 その tag より後の `main` の変更は開発版として扱う。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
 

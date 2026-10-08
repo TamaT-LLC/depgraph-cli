@@ -116,7 +116,7 @@ the default scan and use `doctor` and `unresolved` to inspect coverage.
 | Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, available, and total fields; confidence is capped at `probable` |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
-**Confidence** on `health` findings reserves `confirmed` for `unused-file`, `unused-export`, `unused-type`, and `unused-dependency`. It means the subject is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains. `test-only-dependency`, `manifest-mismatch`, audit, and hotspot findings are not proof of unusedness and are capped at `probable`. For unused findings, `probable` means there is no observed usage and no hard blocker, but applicable profiles are only syntax-complete. `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. For audits on the post-tag current `main` / evaluation RC, before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. The published stable `v0.5.4` artifact uses Store schema 17 and is outside this code-health audit provenance contract. The next patch release `v0.6.2` retains the v0.6.0 Store schema 19 and code-health contract/API. Source is never changed automatically.
+**Confidence** on `health` findings reserves `confirmed` for `unused-file`, `unused-export`, `unused-type`, and `unused-dependency`. It means the subject is unused across every applicable analyzed profile, those profiles are semantic-complete, and no hard blocker remains. `test-only-dependency`, `manifest-mismatch`, audit, and hotspot findings are not proof of unusedness and are capped at `probable`. For unused findings, `probable` means there is no observed usage and no hard blocker, but applicable profiles are only syntax-complete. `indeterminate` is blocked by incomplete or missing coverage/surface evidence, public surface, entry points, dynamic loading, candidates, unresolved sites, unanalyzed profiles, manifest drift, or a missing/mismatched audit base. Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`, `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding `suppressions` remain a wire-compatible output-only/deferred field in v1: there is no CLI, MCP, or policy input path, and built-in analyzers always return an empty array. For audits on the post-tag current `main` / evaluation RC, before/after pairs compare the schema-18 policy digest, analyzer version, and finding-contract version; missing or mismatched provenance fails closed as `incomparable-policy` or `incomparable-contract`. The published stable `v0.5.4` artifact uses Store schema 17 and is outside this code-health audit provenance contract. The next patch release `v0.6.3` retains the v0.6.0 Store schema 19 and code-health contract/API. Source is never changed automatically.
 
 A **selector** identifies a graph node on the CLI. The accepted prefixes are
 `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:`. If more than one
@@ -152,7 +152,7 @@ evaluated separately.
 
 ## Install official packages
 
-The next patch release `v0.6.2` targets Linux x86-64, Linux ARM64,
+The next patch release `v0.6.3` targets Linux x86-64, Linux ARM64,
 macOS Apple Silicon, and Windows x86-64.
 Use a version with its official Release and public post-publish evidence.
 
@@ -187,7 +187,7 @@ under TamaT LLC's `@tamat-llc` organization scope.
 `npm i -g @tamat-llc/depgraph` installs verified native packages for macOS Apple
 Silicon, Linux x86-64 / ARM64, and Windows x86-64 without an install-time
 external download. Intel macOS
-packages are not provided for `v0.6.2`. The npm launcher
+packages are not provided for `v0.6.3`. The npm launcher
 requires Node.js 24 or later. The `depgraph` CLI runs entirely from the npm
 package. `depgraph-mcp` is included as well, but starting the MCP server also
 requires the compiler pack for the same version and target from the GitHub
@@ -208,7 +208,7 @@ environment below.
 After publication, use GitHub CLI on macOS or Linux to download the archive and checksum.
 
 ```sh
-VERSION=0.6.2
+VERSION=0.6.3
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
@@ -266,15 +266,15 @@ tests together. Development workflow and command details are in
 
 ## Releases and compatibility
 
-The planned stable `v0.6.2` artifact implements the contract documented in the
-[`v0.6.2` release notes](docs/releases/v0.6.2.md). `main` may contain
+The planned stable `v0.6.3` artifact implements the contract documented in the
+[`v0.6.3` release notes](docs/releases/v0.6.3.md). `main` may contain
 post-tag development changes that are not part of that published artifact. A
 stable release is valid only when the
-[`v0.6.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.2)
+[`v0.6.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.3)
 and its post-publish evidence exist and agree.
 The MVP implements the architecture described in [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md).
 
-The next patch release `v0.6.2` retains the v0.6.0
+The next patch release `v0.6.3` retains the v0.6.0
 Store schema `19` together with the `depgraph-health-finding-v1` code-health
 contract, the CLI `health` / `cleanup` / `audit` / `hotspots` APIs, and their MCP
 projections. No new storage migration is introduced from v0.6.0.
@@ -297,16 +297,16 @@ documented as [`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md),
 [`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md), and
 [`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md).
 
-See the [`v0.6.2` release notes](docs/releases/v0.6.2.md) for the planned release
+See the [`v0.6.3` release notes](docs/releases/v0.6.3.md) for the planned release
 compatibility tuple, Store migrations, rollback procedure, and known limits.
 The historical schema-17 contract remains in the
 [`v0.5.4` release notes](docs/releases/v0.5.4.md).
-The `v0.6.2` fixes and compatibility guarantees are recorded in the
-[`v0.6.2` release notes](docs/releases/v0.6.2.md).
+The `v0.6.3` fixes and compatibility guarantees are recorded in the
+[`v0.6.3` release notes](docs/releases/v0.6.3.md).
 
 ## Project status and public collaboration
 
-The supported line is currently anchored by the published `v0.6.1` Release. `main` changes after that tag remain development changes.
+The supported line is currently anchored by the published `v0.6.2` Release. `main` changes after that tag remain development changes.
 Product support is best effort, without response-time or resolution-time SLAs.
 
 Follow [SUPPORT.md](SUPPORT.md) for usage questions and bug reports. Read
@@ -569,15 +569,15 @@ gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
 ```
 
 ```sh
-/absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE/bin/depgraph agent-config \
+/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph agent-config \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
-  --release-archive /absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE.tar.gz \
-  --release-checksum /absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-archive /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE.tar.gz.sha256 \
   --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
   --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --release-manifest /absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE/release-manifest.json \
-  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.6.2-TARGET_TRIPLE.requirement.json \
+  --release-manifest /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.6.3-TARGET_TRIPLE.requirement.json \
   --host codex
 ```
 
@@ -592,7 +592,7 @@ profiles are selected explicitly with `--profile store-write`,
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -608,7 +608,7 @@ form to copy unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.6.2-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -1150,13 +1150,13 @@ distribution and its `unsupported-no-fallback` policy.
 
 Download the four assets for the depgraph version and host target from the
 same [GitHub release](https://github.com/TamaT-LLC/depgraph-cli/releases). The
-release tag may be the stable tag or its matching release candidate. The v0.6.2
+release tag may be the stable tag or its matching release candidate. The v0.6.3
 example below becomes downloadable only after that candidate is published;
 the normal depgraph archive and compiler pack must come from one release run.
 
 ```bash
-version=0.6.2
-release_tag=v0.6.2
+version=0.6.3
+release_tag=v0.6.3
 target=x86_64-unknown-linux-gnu # doctor --json reports compiler_pack.host_target
 name="depgraph-compiler-pack-${version}-${target}"
 
