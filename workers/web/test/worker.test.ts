@@ -3010,11 +3010,11 @@ test("Next compound pageExtensions remove the full suffix in App and Pages route
     assert.equal(ledger?.skipped_sites, 1, unsupportedPath);
     assert.equal(ledger?.discovered_sites, ledger?.emitted_sites + ledger?.skipped_sites, unsupportedPath);
     assert.ok(result.events.some((event) => (
-      event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === unsupportedPath
+      event.diagnostic?.code === "web.unsupported_file_kind" && event.diagnostic?.path === unsupportedPath
     )), unsupportedPath);
   }
   assert.equal(result.events.at(-1)?.coverage.files_skipped, unsupportedPaths.length);
-  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, unsupportedPaths.length);
+  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
   assert.ok(!result.events.some((event) => event.site?.kind === "unsupported_route_source"));
 });
@@ -3042,11 +3042,11 @@ test("Astro Markdown and MDX routes report unsupported dependency inventory with
     assert.equal(ledger?.skipped_sites, 1, unsupportedPath);
     assert.equal(ledger?.discovered_sites, ledger?.emitted_sites + ledger?.skipped_sites, unsupportedPath);
     assert.ok(result.events.some((event) => (
-      event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === unsupportedPath
+      event.diagnostic?.code === "web.unsupported_file_kind" && event.diagnostic?.path === unsupportedPath
     )), unsupportedPath);
   }
   assert.equal(result.events.at(-1)?.coverage.files_skipped, 2);
-  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 2);
+  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
 });
 

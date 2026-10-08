@@ -518,3 +518,41 @@ test("semantic source batches retain transitive workspace dependency context", a
   assert.equal(transfer?.detail.source_files, 2);
   assert.equal(transfer?.detail.ast_retained_source_files, 2);
 });
+
+test("unsupported README inventory remains a skipped file in both stages, not syntax failures", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-unsupported-file-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "README.md"), "# Documentation\n");
+  for (const stage of ["syntax", "semantic"]) {
+    const request = parseAnalysisUnitRequest({
+      contract_version: "depgraph-analysis-unit-v2", unit_id: "web:readme", adapter: "web", unit_root: ".",
+      source_paths: ["README.md"], context_paths: ["README.md"], auxiliary_paths: [],
+      stage, chunk_id: "chunk-0", chunk_index: 0, chunk_count: 1, context_fingerprint: "a".repeat(64),
+    });
+    const model = await scan(root, [path.join(root, "README.md")], [], undefined, request);
+    assert.equal(model.coverage.files_discovered, 1);
+    assert.equal(model.coverage.files_skipped, 1);
+    assert.equal(model.coverage.unsupported_syntax, 0);
+    assert.equal(model.files[0]?.skip_reason, "unsupported_file_kind");
+    assert.ok(model.coverage.reasons.includes("unsupported_file_kind"));
+    assert.deepEqual(model.coverage.completeness, []);
+    if (stage === "syntax") assert.ok(model.diagnostics.some((diagnostic) => diagnostic.code === "web.unsupported_file_kind"));
+  }
+});
+
+test("isolated TypeScript diagnostics identify their environment and omitted count", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-diagnostic-environment-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "index.ts"), Array.from({ length: 270 }, (_, index) => `const value${index}: string = ${index};`).join("\n"));
+  const model = await scan(root, [path.join(root, "index.ts")]);
+  const diagnostics = model.diagnostics.filter((diagnostic) => diagnostic.code === "web.typescript_semantic_scaffold_diagnostic");
+  assert.equal(diagnostics.length, 256);
+  for (const diagnostic of diagnostics) {
+    assert.match(diagnostic.message, /Isolated analysis environment \(not the project typecheck\)/u);
+    assert.equal(diagnostic.properties?.project_typecheck, false);
+  }
+  const truncated = model.diagnostics.find((diagnostic) => diagnostic.code === "web.typescript_semantic_scaffold_diagnostics_truncated");
+  assert.equal(truncated?.properties?.omitted_diagnostics, 14);
+  assert.match(truncated?.message ?? "", /omitted 14/u);
+  assert.ok(!model.coverage.completeness.includes("semantic-complete"));
+});

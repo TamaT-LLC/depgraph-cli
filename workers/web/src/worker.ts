@@ -227,7 +227,7 @@ function eventsFor(
       emitted_sites: file.produced_sites,
       skipped_sites: file.skipped_sites,
       skipped: file.skipped_sites > 0,
-      reason: file.skipped_sites > 0 ? "file_or_site_skipped" : null,
+      reason: file.skipped_sites > 0 ? file.skip_reason ?? "file_or_site_skipped" : null,
     });
   }
   events.push({ ...common("profile_completed"), profile_id: PROFILE_ID, coverage: model.coverage });

@@ -418,7 +418,7 @@ function fileCoverage(model: ScanModel): DeltaCoverage[] {
       emitted_sites: file.produced_sites,
       skipped_sites: file.skipped_sites,
       skipped: file.skipped_sites > 0,
-      ...(file.skipped_sites > 0 ? { reason: "file_or_site_skipped" } : {}),
+      ...(file.skipped_sites > 0 ? { reason: file.skip_reason ?? "file_or_site_skipped" } : {}),
     },
   }));
 }

@@ -3165,7 +3165,7 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
             scan.scan_id, scan.status, scan.root
         );
         println!(
-            "coverage: {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} skipped, {} unsupported",
+            "coverage: {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} skipped files, {} unsupported syntax observations across analysis stages",
             scan.coverage.dependency_sites,
             scan.coverage.resolved,
             scan.coverage.candidates,
@@ -3606,7 +3606,7 @@ fn display_list(values: &[String]) -> String {
 
 fn coverage_summary(coverage: &CoverageRecord) -> String {
     format!(
-        "coverage: {}/{} files analyzed ({} skipped), {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} unsupported; completeness={}; reasons={}; project_code_executed={}",
+        "coverage: {}/{} files analyzed ({} skipped), {} sites ({} resolved, {} candidates, {} external, {} unresolved), {} unsupported syntax observations across analysis stages; completeness={}; reasons={}; project_code_executed={}",
         coverage.files_analyzed,
         coverage.files_discovered,
         coverage.files_skipped,

@@ -212,6 +212,7 @@ export interface Diagnostic {
 }
 
 export interface FileCoverage {
+  skip_reason?: string;
   file_id: string;
   path: string;
   expected_sites: number;

@@ -583,7 +583,7 @@ fn write_coverage_change(output: &mut String, coverage: Option<&ChangedRecord<Co
 
 fn compact_coverage(coverage: &CoverageRecord) -> String {
     format!(
-        "files={}/{} skipped={} sites={} resolved={} candidates={} external={} unresolved={} unsupported={} completeness={} reasons={}",
+        "files={}/{} skipped={} sites={} resolved={} candidates={} external={} unresolved={} unsupported_syntax_observations={} completeness={} reasons={}",
         coverage.files_analyzed,
         coverage.files_discovered,
         coverage.files_skipped,

@@ -2451,7 +2451,8 @@ function projectAnalysisUnitModel(
         ...(semantic.syntaxComplete ? ["syntax-complete"] : []),
         ...(semantic.semanticComplete ? ["semantic-complete"] : []),
       ],
-      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
+      reasons: [...analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
+        ...(files.some((file) => file.skip_reason === "unsupported_file_kind") ? ["unsupported_file_kind"] : [])],
     },
     typeScriptProject: semantic.typeScriptProject,
     frameworkSemantic,
@@ -3170,11 +3171,12 @@ export async function scan(
       const detail = `extension=${extension || "<none>"};frameworks=${frameworks || "unknown"}`;
       coverage.expected_sites += 1;
       coverage.skipped_sites += 1;
-      coverage.unsupported_syntax += 1;
+      coverage.skip_reason = "unsupported_file_kind";
       graph.addDiagnostic({
         severity: "warning",
-        code: "web.unsupported_syntax",
-        message: `Dependency inventory for route source ${relative} was skipped because ${extension || "its extension"} is not supported (${frameworks || "unknown framework"})`,
+        code: "web.unsupported_file_kind",
+        properties: { diagnostic_category: "unsupported_file_kind", extension, frameworks },
+        message: `Dependency inventory for ${relative} was skipped because ${extension || "its extension"} is not supported (${frameworks || "unknown framework"})`,
         path: relative,
         profile_id: PROFILE_ID,
         evidence: [sourceEvidence(relative, "route-source-inventory", detail)],
@@ -3672,7 +3674,8 @@ export async function scan(
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostic",
-      message: `TypeScript TypeChecker TS${diagnostic.code}: ${diagnostic.message}`,
+      message: `Isolated analysis environment (not the project typecheck), TypeScript TS${diagnostic.code}: ${diagnostic.message}`,
+      properties: { diagnostic_category: "analysis_environment", analysis_environment: "isolated-virtual", project_typecheck: false },
       path: diagnostic.relativePath,
       profile_id: PROFILE_ID,
       ...(source === null || diagnostic.relativePath === null ? {} : {
@@ -3689,7 +3692,8 @@ export async function scan(
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostics_truncated",
-      message: `TypeScript TypeChecker retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} deterministic diagnostics`,
+      message: `Isolated analysis environment: retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} diagnostics; omitted ${nativeTypeScript.project.semanticDiagnostics - nativeTypeScript.project.emittedSemanticDiagnostics}`,
+      properties: { diagnostic_category: "analysis_environment", analysis_environment: "isolated-virtual", project_typecheck: false, omitted_diagnostics: nativeTypeScript.project.semanticDiagnostics - nativeTypeScript.project.emittedSemanticDiagnostics },
       path: null,
       profile_id: PROFILE_ID,
     });
@@ -3708,6 +3712,7 @@ export async function scan(
   if (counts.unresolved > 0) reasons.push("unresolved_dependency_sites");
   if (unsupportedSyntax > 0) reasons.push("unsupported_syntax");
   if (skipped > 0) reasons.push("skipped_sites");
+  if (files.some((file) => file.skip_reason === "unsupported_file_kind")) reasons.push("unsupported_file_kind");
   if (nativeTypeScript.project.definitionGraphStatus === "failed") reasons.push("typescript_definition_graph_failure");
   else if (nativeTypeScript.project.semanticIssues > 0) reasons.push("typescript_definition_graph_incomplete");
   if (!semanticGraphEmitted) reasons.push("typescript_semantic_graph_not_emitted");
