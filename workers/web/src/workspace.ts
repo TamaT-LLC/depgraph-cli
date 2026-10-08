@@ -25,6 +25,12 @@ export interface WorkspaceScope {
   manager: string;
   lockfile: string | null;
   lockInstances: Map<string, LockInstance[]>;
+  importerResolutions?: ReadonlyMap<string, PnpmImporterResolution>;
+}
+
+interface PnpmImporterResolution {
+  specifier: string | null;
+  version: string | null;
 }
 
 export interface LockInstance {
@@ -227,6 +233,17 @@ export function selectPackageInstallCandidates(
   const locked = scoped === undefined
     ? workspace.lockInstances.get(name) ?? []
     : scoped.lockInstances.get(name) ?? [];
+  const importer = normalizeRelative(path.relative(owner.workspaceRoot, owner.relativePath));
+  const dependency = owner.dependencies.get(name);
+  const importerKey = JSON.stringify([importer, dependency?.section, name]);
+  const lockedImport = scoped?.importerResolutions?.get(importerKey);
+  const correlated = correlatedImporterInstances(locked, name, declared, lockedImport);
+  if (correlated.length === 1) {
+    return {
+      workspacePackages: [], externalInstances: correlated, precision: "exact",
+      reason: "package_instance_from_lockfile_importer",
+    };
+  }
   const localMatches = declared === null
     ? local
     : local.filter((record) => semverSatisfies(record.version, declared) !== false);
@@ -259,6 +276,16 @@ export function selectPackageInstallCandidates(
       : candidateCount === 0 ? "package_target_not_found"
       : null,
   };
+}
+
+function correlatedImporterInstances(
+  locked: readonly LockInstance[],
+  name: string,
+  declared: string | null,
+  imported: PnpmImporterResolution | undefined,
+): LockInstance[] {
+  if (declared === null || imported === undefined || imported.specifier !== declared) return [];
+  return locked.filter((instance) => instance.locator === `pnpm:${name}@${imported.version}` && semverSatisfies(instance.version, declared) === true);
 }
 
 async function loadManifest(root: string, file: string): Promise<{ manifest: Record<string, unknown> | null; issue?: WorkspaceIssue }> {
@@ -803,7 +830,48 @@ function canonicalYarnDescriptor(value: string, root: string): string {
 
 interface LockLoadResult {
   instances: Map<string, LockInstance[]>;
+  importerResolutions?: ReadonlyMap<string, PnpmImporterResolution>;
   invalidReason: string | null;
+}
+
+function pnpmStaticEntry(line: string, ancestry: string[]): { identity: string; rawValue: string | undefined } | null {
+  const match = line.match(/^( *)(.*?):(?:[ \t]+(.*))?$/u);
+  if (match === null) return null;
+  const depth = match[1]!.length / 2;
+  if (!Number.isInteger(depth) || depth > ancestry.length) return null;
+  const key = parsePnpmPattern(match[2]!);
+  if (key === null) return null;
+  ancestry.length = depth;
+  ancestry.push(key);
+  return { identity: JSON.stringify(ancestry), rawValue: match[3] };
+}
+
+function pnpmStaticValues(source: string): ReadonlyMap<string, string | null> {
+  const values = new Map<string, string | null>();
+  const ancestry: string[] = [];
+  const blocks = new Set<string>();
+  for (const line of source.split(/\r?\n/u)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    const entry = pnpmStaticEntry(line, ancestry);
+    if (entry === null) { ancestry.length = 0; continue; }
+    if (ancestry.length > 1 && !blocks.has(JSON.stringify(ancestry.slice(0, -1)))) continue;
+    if (values.has(entry.identity)) return new Map();
+    if (entry.rawValue === undefined) blocks.add(entry.identity);
+    values.set(entry.identity, entry.rawValue === undefined ? null : parsePnpmPattern(entry.rawValue));
+  }
+  return values;
+}
+
+function parsePnpmImporterResolutions(source: string): ReadonlyMap<string, PnpmImporterResolution> {
+  const values = pnpmStaticValues(source);
+  const result = new Map<string, PnpmImporterResolution>();
+  for (const [key, value] of values) {
+    const parts = JSON.parse(key) as string[];
+    if (parts.length !== 5 || parts[0] !== "importers" || parts[4] !== "version") continue;
+    const specifier = values.get(JSON.stringify([...parts.slice(0, 4), "specifier"])) ?? null;
+    result.set(JSON.stringify(parts.slice(1, 4)), { specifier, version: value });
+  }
+  return result;
 }
 
 async function loadLockInstances(root: string, manager: string, lockfile: string | null): Promise<LockLoadResult> {
@@ -886,6 +954,7 @@ async function loadLockInstances(root: string, manager: string, lockfile: string
   }
   return {
     instances: result,
+    ...(manager === "pnpm" ? { importerResolutions: parsePnpmImporterResolutions(source) } : {}),
     invalidReason: structurallyRecognized ? null : `non-empty ${manager} lockfile has no recognized static structure`,
   };
 }
@@ -1023,7 +1092,7 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
   const scopes: WorkspaceScope[] = [];
   for (const workspaceRoot of [...scopeRootPaths].sort(compareUtf8)) {
     if (workspaceRoot === ".") {
-      scopes.push({ root: ".", manager, lockfile, lockInstances });
+      scopes.push({ root: ".", manager, lockfile, lockInstances, importerResolutions: lockLoad.importerResolutions ?? new Map() });
       continue;
     }
     const scopeFiles = new Set(
@@ -1057,9 +1126,10 @@ export async function discoverWorkspace(root: string, allFiles: string[]): Promi
       manager: detected.manager,
       lockfile: detected.lockfile === null ? null : scopeIssuesPath(detected.lockfile),
       lockInstances: loaded.instances,
+      importerResolutions: loaded.importerResolutions ?? new Map(),
     });
   }
-  if (scopes.length === 0) scopes.push({ root: ".", manager, lockfile, lockInstances });
+  if (scopes.length === 0) scopes.push({ root: ".", manager, lockfile, lockInstances, importerResolutions: lockLoad.importerResolutions ?? new Map() });
   const scopeForPackage = (relative: string): WorkspaceScope => {
     const scopeRoot = packageScopeRoots.get(relative) ?? ".";
     return scopes.find((scope) => scope.root === scopeRoot) ?? scopes[0]!;

@@ -10,3 +10,5 @@ v0.6.1以降の修正と導入案内は [v0.6.2](v0.6.2.md) に収録する。
 - TypeScript の `typeof` と `typeof import(...)` を値の依存として解決し、const tuple・関数・クラスなどの参照先を保持します（#521）。
 
 - 実在する CSS・画像の import をアセット依存として保持し、型宣言不足とファイル不存在を区別します（#523）。
+
+- pnpm lockfile の importer と manifest が一致する場合、依存元ごとにバージョン・peer dependency の組み合わせを絞ります。証拠が不足する場合は候補を維持し、既存の exports 条件評価と併用します（#522）。

@@ -2830,7 +2830,9 @@ export class ModuleResolver {
       return {
         ...resolution,
         precision,
-        reason: resolution.reason ?? (inspectedExternalExact ? null : selection.reason),
+        reason: selection.reason === "package_instance_from_lockfile_importer"
+          ? [selection.reason, resolution.reason].filter(Boolean).join(",")
+          : resolution.reason ?? (inspectedExternalExact ? null : selection.reason),
       };
     }
 

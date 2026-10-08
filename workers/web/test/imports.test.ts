@@ -1919,3 +1919,101 @@ test("dotted extensionless imports preserve TypeScript lookup and asset identity
       .map((target) => path.relative(root, target.absolutePath)), [asset]);
   }
 });
+
+test("pnpm importer proofs select exact peer variants and invalidate with lock metadata", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-pnpm-importer-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const manifest = JSON.stringify({ name: "importer-fixture", version: "1.0.0", packageManager: "pnpm@10.33.0", dependencies: { lib: "^1.0.0" } });
+  const lock = (selected: string) => `lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      lib:
+        specifier: ^1.0.0
+        version: ${selected}
+packages:
+  lib@1.0.0:
+  lib@1.1.0:
+snapshots:
+  lib@1.0.0(peer@1.0.0):
+  lib@1.0.0(peer@2.0.0):
+  lib@1.1.0(peer@2.0.0):
+`;
+  const sources = { "package.json": manifest, "pnpm-lock.yaml": lock("1.0.0(peer@1.0.0)"), "index.ts": "import { value } from 'lib';" };
+  const files: string[] = [];
+  for (const [relative, source] of Object.entries(sources)) {
+    const file = path.join(root, relative);
+    await writeFile(file, source);
+    files.push(file);
+  }
+  const resolve = async () => {
+    const workspace = await discoverWorkspace(root, files);
+    const resolver = await ModuleResolver.create(workspace, files);
+    return await resolver.resolve(rawDependency("lib", { useTypesCondition: true }), path.join(root, "index.ts"), workspace.packages[0]!);
+  };
+  const first = await resolve();
+  assert.deepEqual(first.targets.map((target) => target.kind === "external_package" ? target.locator : null), ["pnpm:lib@1.0.0(peer@1.0.0)"]);
+  assert.match(first.reason ?? "", /package_instance_from_lockfile_importer/u);
+  await writeFile(path.join(root, "pnpm-lock.yaml"), lock("1.1.0(peer@2.0.0)"));
+  const second = await resolve();
+  assert.deepEqual(second.targets.map((target) => target.kind === "external_package" ? target.locator : null), ["pnpm:lib@1.1.0(peer@2.0.0)"]);
+  await writeFile(path.join(root, "pnpm-lock.yaml"), lock("9.0.0(peer@1.0.0)"));
+  assert.equal((await resolve()).status, "candidates");
+  await writeFile(path.join(root, "pnpm-lock.yaml"), lock("1.0.0(peer@1.0.0)").replace("specifier: ^1.0.0", "specifier: ^2.0.0"));
+  assert.equal((await resolve()).status, "candidates");
+  await writeFile(path.join(root, "pnpm-lock.yaml"), lock("1.0.0(peer@1.0.0)").replace("version: 1.0.0(peer@1.0.0)", "version: 1.0.0(peer@1.0.0)\n        version: 1.1.0(peer@2.0.0)"));
+  assert.equal((await resolve()).status, "candidates");
+});
+
+test("pnpm importers separate workspace owners and preserve export conditions", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-pnpm-owners-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const sources: Record<string, string> = {
+    "package.json": JSON.stringify({ name: "root", packageManager: "pnpm@10.33.0", workspaces: ["packages/*"] }),
+    "pnpm-workspace.yaml": "packages:\n  - packages/*\n",
+    "pnpm-lock.yaml": `lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      lib:
+        specifier: ^1.0.0
+        version: 1.0.0(peer@1.0.0)
+  packages/b:
+    dependencies:
+      lib:
+        specifier: ^1.0.0
+        version: 1.1.0(peer@2.0.0)
+packages:
+  lib@1.0.0:
+  lib@1.1.0:
+snapshots:
+  lib@1.0.0(peer@1.0.0):
+  lib@1.0.0(peer@2.0.0):
+  lib@1.1.0(peer@2.0.0):
+`,
+  };
+  for (const [owner, version] of [["a", "1.0.0"], ["b", "1.1.0"]]) {
+    sources[`packages/${owner}/package.json`] = JSON.stringify({ name: owner, version: "1.0.0", dependencies: { lib: "^1.0.0" } });
+    sources[`packages/${owner}/index.ts`] = "import 'lib';";
+    sources[`packages/${owner}/node_modules/lib/package.json`] = JSON.stringify({ name: "lib", version, exports: { ".": { types: "./index.d.ts", import: "./index.mjs", require: "./index.cjs" } } });
+    for (const suffix of ["d.ts", "mjs", "cjs"]) sources[`packages/${owner}/node_modules/lib/index.${suffix}`] = "export {};";
+  }
+  for (const [relative, source] of Object.entries(sources)) {
+    await mkdir(path.dirname(path.join(root, relative)), { recursive: true });
+    await writeFile(path.join(root, relative), source);
+  }
+  const files = Object.keys(sources).filter((file) => !file.includes("node_modules")).map((file) => path.join(root, file));
+  const workspace = await discoverWorkspace(root, files);
+  const resolver = await ModuleResolver.create(workspace, files);
+  for (const [ownerName, locator] of [["a", "pnpm:lib@1.0.0(peer@1.0.0)"], ["b", "pnpm:lib@1.1.0(peer@2.0.0)"]]) {
+    const owner = workspace.packages.find((record) => record.name === ownerName)!;
+    for (const options of [{ resolutionMode: "import" as const }, { resolutionMode: "require" as const }, { useTypesCondition: true }]) {
+      const result = await resolver.resolve(rawDependency("lib", options), path.join(owner.absolutePath, "index.ts"), owner);
+      assert.equal(result.status, "external", JSON.stringify(result));
+      assert.deepEqual(result.targets.map((target) => target.kind === "external_package" ? target.locator : null), [locator]);
+      assert.match(result.reason ?? "", /package_instance_from_lockfile_importer/u);
+      const selectedCondition = "useTypesCondition" in options ? "types" : options.resolutionMode;
+      assert.match(result.reason ?? "", new RegExp(`package_exports_conditions=${selectedCondition}`, "u"));
+    }
+  }
+});
