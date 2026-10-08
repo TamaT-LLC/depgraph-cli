@@ -8,7 +8,7 @@ profiles for the same repository as an accidental privilege fallback.
 
 The examples use the planned stable `v0.6.3` package. `v0.6.3` is a patch
 release retaining the v0.6.0 Store schema `19` and code-health contract/API.
-The current supported stable is `v0.6.1` until the v0.6.3 Release and matching
+The current supported stable is `v0.6.2` until the v0.6.3 Release and matching
 post-publish evidence are public. Use these versioned examples only after that
 publication. The published `v0.5.4` package is an immutable historical
 schema-17 baseline. Keep binaries, workers, and compiler packs from the same
