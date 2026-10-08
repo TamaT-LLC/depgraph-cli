@@ -2104,6 +2104,11 @@ export class ModuleResolver {
     return parents;
   }
 
+  #isInventoryAsset(file: string): boolean {
+    if (!isWithinRoot(this.#root, file) || !this.#fileSet.has(file)) return false;
+    return [".css", ".scss", ".sass", ".less", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf"].includes(path.extname(file).toLowerCase());
+  }
+
   #resolveFileBase(
     base: string,
     seen: ReadonlySet<string> = new Set(),
@@ -2716,6 +2721,9 @@ export class ModuleResolver {
         !useTypesCondition,
         useTypesCondition,
       );
+      if (files.length === 0 && this.#isInventoryAsset(base)) {
+        return { status: "resolved", precision: "exact", targets: [{ kind: "file", absolutePath: base }], reason: "asset_type_declaration_unavailable" };
+      }
       if (files.length === 0) return { status: "unresolved", precision: "heuristic", targets: [], reason: "relative_target_not_found" };
       return {
         status: "resolved",

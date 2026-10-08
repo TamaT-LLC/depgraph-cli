@@ -2593,6 +2593,7 @@ function validateTypeScriptDependencyBindingClosure(
 function validateTypeScriptDependencySites(
   delta: Readonly<TypeScriptRawDependencyDelta>,
   context: Readonly<TypeScriptDependencyBindingValidationContext>,
+  repositoryModulePaths: ReadonlySet<string>,
 ): void {
   const {
     definitions,
@@ -2720,7 +2721,7 @@ function validateTypeScriptDependencySites(
         if (site.kind === "type_use" && !isTypeUseTargetKind(definition.graphKind, definition.semanticKind, site.evidence.occurrenceKind)) throw new DependencyContractError("raw type-use target is not a type");
       } else if (target.kind === "file") {
         if (!isCanonicalRelativePath(target.relativePath)) throw new DependencyContractError("raw dependency target file path is not canonical");
-        if (!sourceLengths.has(target.relativePath)) throw new DependencyContractError("raw dependency target file is missing");
+        if (!sourceLengths.has(target.relativePath) && !repositoryModulePaths.has(target.relativePath)) throw new DependencyContractError("raw dependency target file is missing");
         if (!moduleLevelOccurrences.has(site.evidence.occurrenceKind)) throw new DependencyContractError("raw named binding target cannot fall back to a file");
       } else if (target.kind === "external") {
         if (
@@ -3019,6 +3020,7 @@ export function validateTypeScriptRawDependencyDelta(
   delta: TypeScriptRawDependencyDelta,
   definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
   sources: readonly TypeScriptDependencyValidationSource[],
+  repositoryModulePaths: ReadonlySet<string> = new Set(),
 ): void {
   validateTypeScriptDependencyPreflight(delta);
   const sourceContext = buildTypeScriptDependencyValidationContext(sources);
@@ -3031,7 +3033,7 @@ export function validateTypeScriptRawDependencyDelta(
   const bindingContext = buildTypeScriptDependencyBindingValidationContext(delta, ledgerContext);
   validateTypeScriptDependencySiteAttestations(delta, bindingContext);
   validateTypeScriptDependencyBindingClosure(delta, bindingContext);
-  validateTypeScriptDependencySites(delta, bindingContext);
+  validateTypeScriptDependencySites(delta, bindingContext, repositoryModulePaths);
   validateTypeScriptCallLedger(delta, ledgerContext);
   validateTypeScriptDependencyClosure(delta, bindingContext);
 }

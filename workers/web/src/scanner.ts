@@ -1441,6 +1441,7 @@ async function refineTypeScriptDependencyDelta(
   root: string,
   sources: ReadonlyMap<string, string>,
   validationSources: readonly TypeScriptDependencyValidationSource[],
+  repositoryModulePaths: ReadonlySet<string>,
 ): Promise<TypeScriptRawDependencyDelta> {
   const definitionByKey = new Map(definitions.definitions.map((definition) => [definition.key, definition]));
   const moduleExportProofs = new Map(delta.moduleExports.map((proof) => [
@@ -1683,7 +1684,7 @@ async function refineTypeScriptDependencyDelta(
     const hasRepository = targets.some((target) => target.kind === "definition" || target.kind === "file");
     const hasExternal = targets.some((target) => target.kind === "external");
     if (targets.length === 0 || (hasRepository && hasExternal) || (hasExternal && targets.length !== 1)) {
-      refined.push(unresolvedSite(targets.length === 0 ? emptyTargetReason : "mixed_or_multiple_external_targets"));
+      refined.push(unresolvedSite(targets.length === 0 ? (resolution.reason === "asset_type_declaration_unavailable" ? resolution.reason : emptyTargetReason) : "mixed_or_multiple_external_targets"));
       continue;
     }
     const condition = aggregateConditions(targetConditions);
@@ -1712,6 +1713,7 @@ async function refineTypeScriptDependencyDelta(
     result,
     definitions,
     validationSources,
+    repositoryModulePaths,
   );
   return result;
 }
@@ -3302,6 +3304,7 @@ export async function scan(
         root,
         compilerSources,
         buildTypeScriptDependencyValidationSources(compilerSources, nativeTypeScript),
+        new Set(allFiles.map((file) => normalizeRelative(path.relative(root, file)))),
       );
       const counts = graph.mergeTypeScriptSemanticGraph(
         nativeTypeScript.definitionGraph,

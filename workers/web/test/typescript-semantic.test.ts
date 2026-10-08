@@ -4126,3 +4126,35 @@ test("scanner preserves typeof value targets through module export refinement", 
     assert.ok(["symbol", "type"].includes(target?.kind ?? ""));
   }
 });
+
+test("semantic asset imports distinguish file dependencies from missing type declarations", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-semantic-assets-"));
+  context.after(async () => await rm(root, { recursive: true, force: true }));
+  const sources = {
+    "package.json": '{"name":"assets-fixture","version":"1.0.0","type":"module"}',
+    "tsconfig.json": '{"compilerOptions":{"module":"preserve","moduleResolution":"bundler","target":"esnext"}}',
+    "index.ts": "import './style.css';\nimport image from './image.png';\nimport './missing.css';\nimport raw from './image.png?raw';\nimport typed from './typed.png';\nexport const images = [image, raw, typed];\n",
+    "style.css": "body { color: red; }",
+    "image.png": "image fixture",
+    "typed.png": "typed image fixture",
+    "typed.png.d.ts": "declare const url: string; export default url;\n",
+  };
+  const files = [];
+  for (const [relativePath, text] of Object.entries(sources)) {
+    const file = path.join(root, relativePath);
+    await writeFile(file, text);
+    files.push(file);
+  }
+  const model = await scan(root, files);
+  const semantic = model.sites.filter((site) => site.evidence.some((evidence) => evidence.kind === "semantic"));
+  const css = semantic.find((site) => site.specifier === "./style.css");
+  assert.equal(css?.resolution_status, "resolved", JSON.stringify(model.diagnostics));
+  assert.ok(css?.target_ids.some((id) => model.nodes.find((node) => node.id === id)?.properties.path === "style.css"));
+  assert.equal(semantic.find((site) => site.specifier === "./image.png")?.reason, "asset_type_declaration_unavailable");
+  assert.equal(semantic.find((site) => site.specifier === "./missing.css")?.reason, "relative_target_not_found");
+  assert.equal(semantic.find((site) => site.specifier === "./image.png?raw")?.resolution_status, "unresolved");
+  assert.equal(semantic.find((site) => site.specifier === "./typed.png")?.resolution_status, "resolved");
+  for (const specifier of ["./style.css", "./image.png"]) {
+    assert.ok(model.sites.some((site) => site.specifier === specifier && site.evidence.every((evidence) => evidence.kind !== "semantic") && site.resolution_status === "resolved"));
+  }
+});
