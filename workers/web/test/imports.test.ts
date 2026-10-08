@@ -1880,3 +1880,42 @@ const lazy = import("./lazy");
   ]);
   assert.equal(result.parseErrors.length, 0);
 });
+
+test("dotted extensionless imports preserve TypeScript lookup and asset identity", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-dotted-import-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const relatives = [
+    "package.json", "index.ts", "data.gen.ts", "auth.callback.tsx", "plain.ts",
+    "directory.gen/index.ts", "style.css", "image.png", "choice.gen.ts", "choice.gen.tsx",
+  ];
+  const files = await Promise.all(relatives.map(async (relative) => {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, relative === "package.json"
+      ? JSON.stringify({ name: "dotted-import", version: "1.0.0" })
+      : "export const value = 1;\n");
+    return file;
+  }));
+  const workspace = await discoverWorkspace(root, files);
+  const resolver = await ModuleResolver.create(workspace, files);
+  const owner = workspace.packages[0]!;
+  for (const useTypesCondition of [false, true]) {
+    for (const [specifier, expected] of [
+      ["./data.gen", "data.gen.ts"], ["./auth.callback", "auth.callback.tsx"],
+      ["./data.gen.ts", "data.gen.ts"], ["./plain", "plain.ts"],
+      ["./directory.gen", "directory.gen/index.ts"], ["./choice.gen", "choice.gen.ts"],
+    ]) {
+      const result = await resolver.resolve(rawDependency(specifier!, { useTypesCondition }), files[1]!, owner);
+      assert.equal(result.status, "resolved", `${specifier} (types=${useTypesCondition})`);
+      assert.deepEqual(result.targets.filter((target) => target.kind === "file")
+        .map((target) => path.relative(root, target.absolutePath).replaceAll("\\", "/")), [expected]);
+    }
+    const missing = await resolver.resolve(rawDependency("./missing.gen", { useTypesCondition }), files[1]!, owner);
+    assert.equal(missing.status, "unresolved");
+  }
+  for (const asset of ["style.css", "image.png"]) {
+    const result = await resolver.resolve(rawDependency(`./${asset}`), files[1]!, owner);
+    assert.deepEqual(result.targets.filter((target) => target.kind === "file")
+      .map((target) => path.relative(root, target.absolutePath)), [asset]);
+  }
+});

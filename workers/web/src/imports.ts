@@ -1716,6 +1716,20 @@ function typeScriptPathPatternCanMatchNodeBuiltin(pattern: string): boolean {
     || NODE_BUILTIN_SPECIFIERS.some((specifier) => typeScriptPathPatternMatches(pattern, specifier));
 }
 
+function extensionlessFileCandidates(clean: string, includeDirectoryIndex: boolean, typeScriptLoadableOnly: boolean): string[] {
+  // Unknown suffixes (for example .gen) remain part of the module basename.
+  // Explicit assets retain their identity in the syntax profile.
+  const extensions = typeScriptLoadableOnly
+    ? [".ts", ".tsx", ".d.ts", ".js", ".jsx"]
+    : [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".json", ".astro"];
+  const exact = typeScriptLoadableOnly ? [] : [clean];
+  return [
+    ...exact.filter((candidate) => path.extname(candidate) !== ""),
+    ...extensions.map((extension) => `${clean}${extension}`),
+    ...(includeDirectoryIndex ? extensions.map((extension) => path.join(clean, `index${extension}`)) : []),
+  ];
+}
+
 function fileBaseCandidates(
   base: string,
   includeDirectoryIndex = true,
@@ -1730,7 +1744,7 @@ function fileBaseCandidates(
   else if (extension === ".jsx") candidates = [`${stem}.tsx`, `${stem}.ts`, `${stem}.d.ts`, clean, `${stem}.js`];
   else if (extension === ".mjs") candidates = [`${stem}.mts`, `${stem}.d.mts`, clean];
   else if (extension === ".cjs") candidates = [`${stem}.cts`, `${stem}.d.cts`, clean];
-  else if (extension !== "") {
+  else if ([".ts", ".tsx", ".mts", ".cts", ".json", ".astro"].includes(extension)) {
     candidates = !typeScriptLoadableOnly || [".ts", ".tsx", ".mts", ".cts"].includes(extension)
       ? [clean]
       : [];
@@ -1738,13 +1752,7 @@ function fileBaseCandidates(
   else {
     // TS extensionless lookup does not synthesize .mts/.cts: those are only
     // substitutions for explicit .mjs/.cjs specifiers.
-    const extensions = typeScriptLoadableOnly
-      ? [".ts", ".tsx", ".d.ts", ".js", ".jsx"]
-      : [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".json", ".astro"];
-    candidates = [
-      ...extensions.map((item) => `${clean}${item}`),
-      ...(includeDirectoryIndex ? extensions.map((item) => path.join(clean, `index${item}`)) : []),
-    ];
+    candidates = extensionlessFileCandidates(clean, includeDirectoryIndex, typeScriptLoadableOnly);
   }
   return [...new Set(candidates.map((item) => path.resolve(item)))];
 }
@@ -2110,7 +2118,8 @@ export class ModuleResolver {
     const direct = fileBaseCandidates(absolute, false, stripSpecifierSuffix, typeScriptLoadableOnly)
       .find((item) => isWithinRoot(this.#root, item) && this.#fileSet.has(item));
     if (direct !== undefined) return [direct];
-    if (path.extname(absolute) !== "") return [];
+    if ([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".astro"]
+      .includes(path.extname(absolute).toLowerCase())) return [];
     for (const entry of this.#directoryPackageEntries.get(absolute) ?? []) {
       const resolved = this.#resolveFileBase(
         entry,
