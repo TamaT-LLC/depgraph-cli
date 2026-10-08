@@ -1003,7 +1003,7 @@ fn web_occurrence_kind_matches_site(site_kind: &str, occurrence_kind: &str) -> b
         ),
         "type_use" => matches!(
             occurrence_kind,
-            "type_reference" | "heritage_type" | "jsdoc_type"
+            "type_reference" | "type_query" | "heritage_type" | "jsdoc_type"
         ),
         "call" => matches!(
             occurrence_kind,
@@ -2851,7 +2851,19 @@ pub(crate) fn validate_web_definition_graph(
                                     .and_then(Value::as_str)
                                     .is_some_and(is_web_callable_symbol_kind)
                         } else if site.kind == "type_use" {
-                            target.kind == "type"
+                            if occurrence_kind == "type_query" {
+                                target.kind == "symbol"
+                                    || (target.kind == "type"
+                                        && matches!(
+                                            target
+                                                .properties
+                                                .get("type_kind")
+                                                .and_then(Value::as_str),
+                                            Some("class" | "enum")
+                                        ))
+                            } else {
+                                target.kind == "type"
+                            }
                         } else {
                             matches!(target.kind.as_str(), "file" | "symbol" | "type")
                         };

@@ -45,6 +45,7 @@ import type {
 import { scanTypeScriptSyntaxTokens } from "./imports";
 import { aggregateConditions, canonicalizeCondition, WEB_CONDITION, type Condition } from "./types";
 import {
+  isTypeUseTargetKind,
   basisForTargets,
   beginQuery,
   bindingScopeSpan,
@@ -378,10 +379,11 @@ function deduplicateTargets(targets: readonly TypeScriptRawDependencyTarget[]): 
 function typeUseTargets(
   targets: readonly TypeScriptRawDependencyTarget[],
   index: DefinitionIndex,
+  occurrenceKind = "type_reference",
 ): TypeScriptRawDependencyTarget[] {
   return targets.filter((target) => (
     target.kind === "external"
-    || (target.kind === "definition" && index.definitions.get(target.key)?.graphKind === "type")
+    || (target.kind === "definition" && isTypeUseTargetKind(index.definitions.get(target.key)?.graphKind, index.definitions.get(target.key)?.semanticKind, occurrenceKind))
   ));
 }
 
@@ -2940,6 +2942,7 @@ async function collectImportType(
   index: DefinitionIndex,
   sourcesByPath: ReadonlyMap<string, TypeScriptSemanticSource>,
 ): Promise<TypeScriptRawDependencySite[]> {
+  const occurrenceKind = node.isTypeOf ? "type_query" : "type_reference";
   const directive = resolutionModeDirective(node.attributes, true);
   const literal = (node.argument as Node & { readonly literal?: Node }).literal;
   const moduleSpecifier = stringLiteralText(literal);
@@ -2957,12 +2960,12 @@ async function collectImportType(
       let targets: TypeScriptRawDependencyTarget[] = [];
       let nonTypeTarget = false;
       if (symbol !== undefined) {
-        const resolved = await compilerSymbolTargets(symbol, checker, counter, index, sourcesByPath, true);
-        targets = typeUseTargets(resolved.targets, index);
+        const resolved = await compilerSymbolTargets(symbol, checker, counter, index, sourcesByPath, !node.isTypeOf);
+        targets = typeUseTargets(resolved.targets, index, occurrenceKind);
         nonTypeTarget = resolved.targets.some((target) => target.kind === "definition") && targets.length === 0;
         if (targets.length === 0 && resolved.external && moduleSpecifier !== null) targets = [externalTarget(moduleSpecifier, symbol.name)];
       }
-      sites.push(createSite(context, "type_use", "type_uses", "type_reference", terminal,
+      sites.push(createSite(context, "type_use", "type_uses", occurrenceKind, terminal,
         moduleSpecifier === null
           ? terminal.text
           : structuredBindingSpecifier(moduleSpecifier, terminal.text, "named"),
@@ -2997,6 +3000,7 @@ async function collectTypeReference(
   // dependency target. Its constraint/default children are visited separately
   // and still produce the named type occurrences this slice promises.
   if (symbol !== undefined && (symbol.flags & SymbolFlags.TypeParameter) !== 0) return [];
+  const graphKind = occurrenceKind === "type_query" ? "symbol" : "type";
   let targets: TypeScriptRawDependencyTarget[] = [];
   let nonTypeTarget = false;
   const importedAlias = symbol !== undefined && (symbol.flags & SymbolFlags.Alias) !== 0;
@@ -3065,9 +3069,9 @@ async function collectTypeReference(
     ?? (root === terminal ? recordedBinding : undefined)
     ?? ((symbol === undefined || importedAlias) ? syntaxBinding : undefined);
   if (symbol !== undefined && !ambiguousBinding) {
-    const resolved = await compilerSymbolTargets(symbol, checker, counter, index, sourcesByPath, true);
+    const resolved = await compilerSymbolTargets(symbol, checker, counter, index, sourcesByPath, graphKind === "type");
     const rawTargets = resolved.targets.filter((target) => target.kind === "definition" || target.kind === "external");
-    targets = typeUseTargets(rawTargets, index);
+    targets = typeUseTargets(rawTargets, index, occurrenceKind);
     if (rawTargets.some((target) => target.kind === "definition") && targets.length === 0) {
       nonTypeTarget = true;
     }
@@ -3081,9 +3085,9 @@ async function collectTypeReference(
   if (targets.length === 0 && !ambiguousBinding) {
     const typeSymbol = await queryTypeSymbol(checker, typeName, counter, "type reference");
     if (typeSymbol !== undefined && (typeSymbol.flags & SymbolFlags.TypeParameter) === 0) {
-      const resolved = await compilerSymbolTargets(typeSymbol, checker, counter, index, sourcesByPath, true);
+      const resolved = await compilerSymbolTargets(typeSymbol, checker, counter, index, sourcesByPath, graphKind === "type");
       const rawTargets = resolved.targets.filter((target) => target.kind === "definition" || target.kind === "external");
-      targets = typeUseTargets(rawTargets, index);
+      targets = typeUseTargets(rawTargets, index, occurrenceKind);
       if (rawTargets.some((target) => target.kind === "definition") && targets.length === 0) {
         nonTypeTarget = true;
       }
@@ -3097,7 +3101,7 @@ async function collectTypeReference(
     provenance = syntaxBinding;
   }
   if (targets.length === 0 && provenance?.targets.length) {
-    const provenTypes = typeUseTargets(provenance.targets, index);
+    const provenTypes = typeUseTargets(provenance.targets, index, occurrenceKind);
     if (
       provenTypes.length === 0
       && provenance.targets.some((target) => target.kind === "definition")
@@ -3411,7 +3415,7 @@ function collectInvalidOccurrences(node: Node, context: CollectionContext): Type
     if (
       terminal !== null
       && nodeEnd(terminal, context.source.sourceFile) > nodeStart(terminal, context.source.sourceFile)
-    ) result.push(unresolved("type_use", "type_uses", "type_reference", terminal, terminal.text));
+    ) result.push(unresolved("type_use", "type_uses", importType.isTypeOf ? "type_query" : "type_reference", terminal, terminal.text));
     return result;
   }
   if (node.kind === SyntaxKind.TypeReference) {
@@ -3426,7 +3430,7 @@ function collectInvalidOccurrences(node: Node, context: CollectionContext): Type
     const terminal = terminalIdentifier((node as TypeQueryNode).exprName);
     return terminal === null || nodeEnd(terminal, context.source.sourceFile) <= nodeStart(terminal, context.source.sourceFile)
       ? []
-      : [unresolved("type_use", "type_uses", "type_reference", terminal, terminal.text)];
+      : [unresolved("type_use", "type_uses", "type_query", terminal, terminal.text)];
   }
   if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
     const terminal = terminalIdentifier((node as Node & { readonly expression: Node }).expression);
@@ -3751,7 +3755,7 @@ export async function extractTypeScriptRawDependencyDelta(
             await addTypeUse(typeReference.typeName, "type_reference");
           }
         } else if (node.kind === SyntaxKind.TypeQuery) {
-          await addTypeUse((node as TypeQueryNode).exprName, "type_reference");
+          await addTypeUse((node as TypeQueryNode).exprName, "type_query");
         } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
           await addTypeUse((node as Node & { readonly expression: Node }).expression, "heritage_type");
         } else if (node.kind === SyntaxKind.JSDocNameReference) {
@@ -3759,7 +3763,7 @@ export async function extractTypeScriptRawDependencyDelta(
         } else if (node.kind === SyntaxKind.ImportType) {
           const importType = node as ImportTypeNode;
           const argument = importType.argument as Node & { readonly literal?: Node };
-          await addTypeUse(importType.qualifier, "type_reference", argument.literal ?? argument);
+          await addTypeUse(importType.qualifier, importType.isTypeOf ? "type_query" : "type_reference", argument.literal ?? argument);
         }
       }
 
@@ -3873,7 +3877,7 @@ export async function extractTypeScriptRawDependencyDelta(
           sites.push(...await collectTypeReference(typeReference.typeName, "type_reference", childContext, checker, counter, index, sourcesByPath));
         }
       } else if (node.kind === SyntaxKind.TypeQuery) {
-        sites.push(...await collectTypeReference((node as TypeQueryNode).exprName, "type_reference", childContext, checker, counter, index, sourcesByPath));
+        sites.push(...await collectTypeReference((node as TypeQueryNode).exprName, "type_query", childContext, checker, counter, index, sourcesByPath));
       } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
         sites.push(...await collectTypeReference(
           (node as Node & { readonly expression: Node }).expression,

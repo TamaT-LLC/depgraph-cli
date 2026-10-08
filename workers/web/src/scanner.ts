@@ -1,3 +1,4 @@
+import { isTypeUseTargetKind } from "./typescript-dependency-contract";
 import path from "node:path";
 import ts from "typescript";
 import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type FileInventoryIssue } from "./fs";
@@ -761,7 +762,7 @@ class GraphBuilder {
         || (raw.status === "external" && (concreteTargets.length !== 1 || !targetKinds.has("external_system") || (raw.precision !== "exact" && raw.precision !== "heuristic")))
         || (raw.status === "unresolved" && (raw.precision !== "heuristic" || concreteTargets.length !== 1 || !targetKinds.has("unknown_target") || !raw.reason))
       ) throw new Error("TypeScript dependency site has an invalid status/precision/target combination");
-      if (raw.kind === "type_use" && concreteTargets.some(({ node }) => node.kind !== "type" && node.kind !== "external_system" && node.kind !== "unknown_target")) {
+      if (raw.kind === "type_use" && concreteTargets.some(({ node }) => !isTypeUseTargetKind(node.kind, node.properties.type_kind, raw.evidence.occurrenceKind) && node.kind !== "external_system" && node.kind !== "unknown_target")) {
         throw new Error("TypeScript type-use target is not a type or sentinel");
       }
       const span = sourceSpan(startsFor(raw.evidence.relativePath), raw.evidence.startOffset, raw.evidence.endOffset);
@@ -1616,7 +1617,7 @@ async function refineTypeScriptDependencyDelta(
       } else if (fileTargets.length > 0 && canonicalImportEqualsRoot) {
         const conditionsByDefinition = new Map<string, Condition[]>();
         let completeProof = true;
-        const preferredGraphKind = site.kind === "type_use" || site.typeOnly ? "type" : "symbol";
+        const preferredGraphKind = site.evidence.occurrenceKind === "type_query" ? "symbol" : site.kind === "type_use" || site.typeOnly ? "type" : "symbol";
         for (const relativePath of fileTargets) {
           const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, []])) ?? [];
           const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
@@ -1641,7 +1642,7 @@ async function refineTypeScriptDependencyDelta(
         const provenByFile: string[][] = [];
         const conditionsByDefinition = new Map<string, Condition[]>();
         let completeProof = true;
-        const preferredGraphKind = compilerGraphKind ?? (site.kind === "type_use" || site.typeOnly ? "type" : "symbol");
+        const preferredGraphKind = compilerGraphKind ?? (site.evidence.occurrenceKind === "type_query" ? "symbol" : site.kind === "type_use" || site.typeOnly ? "type" : "symbol");
         for (const relativePath of fileTargets) {
           const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, site.exportPath])) ?? [];
           const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
