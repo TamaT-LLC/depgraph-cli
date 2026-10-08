@@ -3417,6 +3417,7 @@ test("TanStack pathless route IDs remain distinct while URLs and slash navigatio
   const contents: Record<string, string> = {
     "package.json": JSON.stringify({ name: "pathless-navigation", dependencies: { "@tanstack/react-router": "1.170.17" } }),
     "src/routes/__root.tsx": 'import { createRootRoute } from "@tanstack/react-router"; export const Route = createRootRoute({});',
+    "src/routes/index.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/")({});',
     "src/routes/_auth.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth")({});',
     "src/routes/_auth/index.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth/")({});',
     "src/routes/_auth/items/index.tsx": [
@@ -3424,7 +3425,7 @@ test("TanStack pathless route IDs remain distinct while URLs and slash navigatio
       'export const Route = createFileRoute("/_auth/items/")({ component: Page });',
       'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/absent" /></>; }',
     ].join("\n"),
-    "src/routeTree.gen.ts": "export interface FileRoutesByPath { '/_auth': { fullPath: '/' }; '/_auth/': { fullPath: '/' }; '/_auth/items/': { fullPath: '/items/' } }",
+    "src/routeTree.gen.ts": "export interface FileRoutesByPath { '/': { fullPath: '/' }; '/_auth': { fullPath: '/' }; '/_auth/': { fullPath: '/' }; '/_auth/items/': { fullPath: '/items/' } }",
   };
   for (const [relative, source] of Object.entries(contents)) {
     const file = path.join(root, relative);
@@ -3437,9 +3438,17 @@ test("TanStack pathless route IDs remain distinct while URLs and slash navigatio
   assert.ok(!diagnostics.some((diagnostic) => diagnostic.code.includes("semantic_delta_discarded")));
   const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
   const fileRoutes = nodes.filter((node) => node.properties.route_kind === "tanstack-file-route");
-  assert.equal(fileRoutes.length, 3);
-  assert.equal(new Set(fileRoutes.map((node) => node.id)).size, 3);
-  assert.deepEqual(fileRoutes.map((node) => node.properties.route_id).sort(), ["/_auth", "/_auth/", "/_auth/items/"]);
+  assert.equal(fileRoutes.length, 4);
+  assert.equal(new Set(fileRoutes.map((node) => node.id)).size, 4);
+  assert.deepEqual(fileRoutes.map((node) => node.properties.route_id).sort(), ["/", "/_auth", "/_auth/", "/_auth/items/"]);
+  const syntaxRoutes = nodes.filter((node) => node.kind === "route" && typeof node.properties.pattern === "string");
+  const routeById = (id: string) => syntaxRoutes.find((node) => (node.properties.route_id ?? (node.properties.pattern === "/" ? "__root__" : null)) === id)!;
+  const parents = result.events.filter((event) => event.event === "edge_upsert")
+    .map((event) => event.edge).filter((edge) => edge.kind === "parent_route" && syntaxRoutes.some((node) => node.id === edge.source));
+  assert.equal(parents.length, 4);
+  for (const [child, parent] of [["/", "__root__"], ["/_auth", "__root__"], ["/_auth/", "/_auth"], ["/_auth/items/", "/_auth"]]) {
+    assert.deepEqual(parents.filter((edge) => edge.source === routeById(child!).id).map((edge) => edge.target), [routeById(parent!).id]);
+  }
   const navigation = result.events.filter((event) => event.event === "dependency_site")
     .map((event) => event.site).filter((site) => site.kind === "navigates_to");
   assert.equal(navigation.length, 3);
@@ -3465,6 +3474,12 @@ test("TanStack slash navigation resolves with a base path and either registered 
       'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/app/items/" /></>; }',
     ].join("\n"));
     const result = await run("slash-navigation", root);
+    const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+    const rootRoute = nodes.find((node) => node.kind === "route" && node.properties.pattern === "/app" && node.properties.route_id === undefined)!;
+    const childRoute = nodes.find((node) => node.kind === "route" && node.properties.pattern !== undefined && node.properties.route_id === registered)!;
+    const parentEdges = result.events.filter((event) => event.event === "edge_upsert")
+      .map((event) => event.edge).filter((edge) => edge.kind === "parent_route" && edge.source === childRoute.id);
+    assert.deepEqual(parentEdges.map((edge) => edge.target), [rootRoute.id], registered);
     const sites = result.events.filter((event) => event.event === "dependency_site")
       .map((event) => event.site).filter((site) => site.kind === "navigates_to");
     assert.equal(sites.length, 3);
