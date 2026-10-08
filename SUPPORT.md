@@ -9,9 +9,9 @@ repository.
 The supported stable line is the newest stable version whose official GitHub
 Release and matching `release-post-publish-evidence-<tag>.json` asset exist and
 agree.
-The published [`v0.6.1` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.1)
-is the current stable baseline while `v0.6.2` is prepared.
-`v0.6.2` becomes supported only after its official Release and matching
+The published [`v0.6.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.2)
+is the current stable baseline while `v0.6.3` is prepared.
+`v0.6.3` becomes supported only after its official Release and matching
 post-publish evidence exist. It retains the v0.6.0 Store schema `19` and
 code-health contract/API.
 Release candidates and older stable versions are unsupported.

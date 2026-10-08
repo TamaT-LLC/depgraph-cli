@@ -61,12 +61,12 @@ access review in the same change.
 ## Releases and maintenance
 
 Releases come from immutable reviewed commits and must pass the complete local
-and GitHub Actions quality gates, five-target package verification, SBOM and
+and GitHub Actions quality gates, four-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
 maintainer plus an independent approver. The supported stable line is the
 newest stable version whose official Release and matching post-publish evidence
-exist. The published `v0.6.1` remains supported while `v0.6.2` is prepared.
-`v0.6.2` retains the v0.6.0 Store schema `19` and code-health contract/API.
+exist. The published `v0.6.2` remains supported while `v0.6.3` is prepared.
+`v0.6.3` retains the v0.6.0 Store schema `19` and code-health contract/API.
 
 The signed `v0.5.4` tag, its source, and its Store schema `17` artifact remain
 immutable history. The v0.6.0 release contract is recorded in
