@@ -1,3 +1,5 @@
+import { externalDeclarationRequests, loadExternalDeclarations } from "./external-declarations";
+import { isTypeUseTargetKind } from "./typescript-dependency-contract";
 import path from "node:path";
 import ts from "typescript";
 import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type FileInventoryIssue } from "./fs";
@@ -13,7 +15,7 @@ import {
 } from "./imports";
 import { analysisContentHash } from "./source-fingerprint";
 import { NOOP_PROGRESS, type ProgressReporter } from "./progress";
-import { discoverRoutes, type RouteEntry } from "./routes";
+import { discoverRoutes, routeParentKeys, routeTreeKey, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
   buildFrameworkCompleteness,
@@ -761,7 +763,7 @@ class GraphBuilder {
         || (raw.status === "external" && (concreteTargets.length !== 1 || !targetKinds.has("external_system") || (raw.precision !== "exact" && raw.precision !== "heuristic")))
         || (raw.status === "unresolved" && (raw.precision !== "heuristic" || concreteTargets.length !== 1 || !targetKinds.has("unknown_target") || !raw.reason))
       ) throw new Error("TypeScript dependency site has an invalid status/precision/target combination");
-      if (raw.kind === "type_use" && concreteTargets.some(({ node }) => node.kind !== "type" && node.kind !== "external_system" && node.kind !== "unknown_target")) {
+      if (raw.kind === "type_use" && concreteTargets.some(({ node }) => !isTypeUseTargetKind(node.kind, node.properties.type_kind, raw.evidence.occurrenceKind) && node.kind !== "external_system" && node.kind !== "unknown_target")) {
         throw new Error("TypeScript type-use target is not a type or sentinel");
       }
       const span = sourceSpan(startsFor(raw.evidence.relativePath), raw.evidence.startOffset, raw.evidence.endOffset);
@@ -1212,17 +1214,19 @@ class GraphBuilder {
       framework: entry.framework,
       router_instance: owner.id,
       pattern: entry.pattern,
+      ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
       environment,
       profile: LOGICAL_PROFILE_ID,
     });
     return this.addNode({
       id,
       kind: "route",
-      locator: `route://${entry.framework}/${owner.name}${entry.pattern}`,
+      locator: `route://${entry.framework}/${owner.name}${entry.routeId ?? entry.pattern}`,
       display_name: `${entry.framework}:${entry.pattern}`,
       properties: {
         framework: entry.framework,
         pattern: entry.pattern,
+        ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
         router_instance: owner.id,
         package_id: owner.id,
         environment,
@@ -1438,6 +1442,7 @@ async function refineTypeScriptDependencyDelta(
   root: string,
   sources: ReadonlyMap<string, string>,
   validationSources: readonly TypeScriptDependencyValidationSource[],
+  repositoryModulePaths: ReadonlySet<string>,
 ): Promise<TypeScriptRawDependencyDelta> {
   const definitionByKey = new Map(definitions.definitions.map((definition) => [definition.key, definition]));
   const moduleExportProofs = new Map(delta.moduleExports.map((proof) => [
@@ -1614,7 +1619,7 @@ async function refineTypeScriptDependencyDelta(
       } else if (fileTargets.length > 0 && canonicalImportEqualsRoot) {
         const conditionsByDefinition = new Map<string, Condition[]>();
         let completeProof = true;
-        const preferredGraphKind = site.kind === "type_use" || site.typeOnly ? "type" : "symbol";
+        const preferredGraphKind = site.evidence.occurrenceKind === "type_query" ? "symbol" : site.kind === "type_use" || site.typeOnly ? "type" : "symbol";
         for (const relativePath of fileTargets) {
           const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, []])) ?? [];
           const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
@@ -1639,7 +1644,7 @@ async function refineTypeScriptDependencyDelta(
         const provenByFile: string[][] = [];
         const conditionsByDefinition = new Map<string, Condition[]>();
         let completeProof = true;
-        const preferredGraphKind = compilerGraphKind ?? (site.kind === "type_use" || site.typeOnly ? "type" : "symbol");
+        const preferredGraphKind = compilerGraphKind ?? (site.evidence.occurrenceKind === "type_query" ? "symbol" : site.kind === "type_use" || site.typeOnly ? "type" : "symbol");
         for (const relativePath of fileTargets) {
           const allKeys = moduleExportProofs.get(JSON.stringify([relativePath, site.exportPath])) ?? [];
           const preferredKeys = allKeys.filter((key) => definitionByKey.get(key)?.graphKind === preferredGraphKind);
@@ -1680,7 +1685,7 @@ async function refineTypeScriptDependencyDelta(
     const hasRepository = targets.some((target) => target.kind === "definition" || target.kind === "file");
     const hasExternal = targets.some((target) => target.kind === "external");
     if (targets.length === 0 || (hasRepository && hasExternal) || (hasExternal && targets.length !== 1)) {
-      refined.push(unresolvedSite(targets.length === 0 ? emptyTargetReason : "mixed_or_multiple_external_targets"));
+      refined.push(unresolvedSite(targets.length === 0 ? (resolution.reason === "asset_type_declaration_unavailable" ? resolution.reason : emptyTargetReason) : "mixed_or_multiple_external_targets"));
       continue;
     }
     const condition = aggregateConditions(targetConditions);
@@ -1709,6 +1714,7 @@ async function refineTypeScriptDependencyDelta(
     result,
     definitions,
     validationSources,
+    repositoryModulePaths,
   );
   return result;
 }
@@ -2446,7 +2452,8 @@ function projectAnalysisUnitModel(
         ...(semantic.syntaxComplete ? ["syntax-complete"] : []),
         ...(semantic.semanticComplete ? ["semantic-complete"] : []),
       ],
-      reasons: analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
+      reasons: [...analysisUnitCompletenessReasons(model, request, counts, unsupportedSyntax, skipped, frameworkSemantic),
+        ...(files.some((file) => file.skip_reason === "unsupported_file_kind") ? ["unsupported_file_kind"] : [])].sort(compareUtf8),
     },
     typeScriptProject: semantic.typeScriptProject,
     frameworkSemantic,
@@ -3086,11 +3093,24 @@ export async function scan(
       analysis_stage: analysisUnit.stage,
     });
   }
+  const externalDeclarations = analysisUnit?.stage === "syntax"
+    ? { files: new Map(), paths: {}, issues: [], bytes: 0 }
+    : await loadExternalDeclarations(root, resolver, externalDeclarationRequests(root, compilerSources));
+  for (const issue of externalDeclarations.issues) {
+    graph.addDiagnostic({
+      severity: "info", code: "web.external_declaration_incomplete",
+      message: `External declaration context is incomplete for ${issue.path}: ${issue.reason}`,
+      path: null, profile_id: PROFILE_ID,
+      properties: { typescript_dependency_issue: true, diagnostic_category: "type_information_unavailable", reason: issue.reason, declaration_path: issue.path },
+    });
+  }
+  const staticCompilerConfig = resolver.typeScriptStaticConfig(typeScriptPathRequests);
   const nativeTypeScript = await analyzeTypeScriptProject(
     compilerSources,
-    resolver.typeScriptStaticConfig(typeScriptPathRequests),
+    { ...staticCompilerConfig, paths: { ...externalDeclarations.paths, ...staticCompilerConfig.paths } },
     progress,
     {
+      externalDeclarations: externalDeclarations.files,
       moduleExportPaths: astroEndpointExportPaths(outputRouteEntries),
       frameworkConfigPaths,
       ...(analysisUnit === null ? {} : {
@@ -3102,6 +3122,7 @@ export async function scan(
       }),
     },
   );
+  nativeTypeScript.project.semanticIssues += externalDeclarations.issues.length;
   if (analysisUnit !== null) {
     progress.complete("typescript_context_rebuild", {
       context_source_files: compilerSources.size,
@@ -3165,11 +3186,12 @@ export async function scan(
       const detail = `extension=${extension || "<none>"};frameworks=${frameworks || "unknown"}`;
       coverage.expected_sites += 1;
       coverage.skipped_sites += 1;
-      coverage.unsupported_syntax += 1;
+      coverage.skip_reason = "unsupported_file_kind";
       graph.addDiagnostic({
         severity: "warning",
-        code: "web.unsupported_syntax",
-        message: `Dependency inventory for route source ${relative} was skipped because ${extension || "its extension"} is not supported (${frameworks || "unknown framework"})`,
+        code: "web.unsupported_file_kind",
+        properties: { diagnostic_category: "unsupported_file_kind", extension, frameworks },
+        message: `Dependency inventory for ${relative} was skipped because ${extension || "its extension"} is not supported (${frameworks || "unknown framework"})`,
         path: relative,
         profile_id: PROFILE_ID,
         evidence: [sourceEvidence(relative, "route-source-inventory", detail)],
@@ -3299,6 +3321,7 @@ export async function scan(
         root,
         compilerSources,
         buildTypeScriptDependencyValidationSources(compilerSources, nativeTypeScript),
+        new Set(allFiles.map((file) => normalizeRelative(path.relative(root, file)))),
       );
       const counts = graph.mergeTypeScriptSemanticGraph(
         nativeTypeScript.definitionGraph,
@@ -3563,7 +3586,7 @@ export async function scan(
   });
   progress.start("graph_finalize");
 
-  const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence }>>();
+  const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence; entry: RouteEntry }>>();
   for (const entry of outputRouteEntries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
     const coverage = graph.ensureCoverage(fileNode, entry.relativeFile);
@@ -3615,20 +3638,16 @@ export async function scan(
       evidence: [entry.evidence],
     });
     if (addedRouteSite) graph.countSite(entry.relativeFile, "resolved");
+    // Generated fullPath records describe URLs, not the file-route parent hierarchy.
+    if (entry.framework.startsWith("tanstack-") && entry.generated) continue;
     const groupKey = `${owner.id}\0${entry.framework}`;
     const group = routeNodesByGroup.get(groupKey) ?? new Map();
-    group.set(entry.pattern, { node: routeNode, evidence: entry.evidence });
+    group.set(routeTreeKey(entry), { node: routeNode, evidence: entry.evidence, entry });
     routeNodesByGroup.set(groupKey, group);
   }
   for (const group of routeNodesByGroup.values()) {
-    for (const [patternValue, child] of group) {
-      if (patternValue === "/") continue;
-      const segments = patternValue.split("/").filter(Boolean);
-      let parent: { node: GraphNode; evidence: Evidence } | undefined;
-      while (segments.length > 0 && !parent) {
-        segments.pop();
-        parent = group.get(segments.length === 0 ? "/" : `/${segments.join("/")}`);
-      }
+    for (const child of group.values()) {
+      const parent = routeParentKeys(child.entry).map((key) => group.get(key)).find((candidate) => candidate !== undefined);
       if (parent) graph.structureEdge(child.node, parent.node, "parent_route", child.evidence, child.evidence.kind === "build");
     }
   }
@@ -3666,7 +3685,8 @@ export async function scan(
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostic",
-      message: `TypeScript TypeChecker TS${diagnostic.code}: ${diagnostic.message}`,
+      message: `Isolated analysis environment (not the project typecheck), TypeScript TS${diagnostic.code}: ${diagnostic.message}`,
+      properties: { diagnostic_category: "analysis_environment", analysis_environment: "isolated-virtual", project_typecheck: false },
       path: diagnostic.relativePath,
       profile_id: PROFILE_ID,
       ...(source === null || diagnostic.relativePath === null ? {} : {
@@ -3683,7 +3703,8 @@ export async function scan(
     graph.addDiagnostic({
       severity: "info",
       code: "web.typescript_semantic_scaffold_diagnostics_truncated",
-      message: `TypeScript TypeChecker retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} deterministic diagnostics`,
+      message: `Isolated analysis environment: retained ${nativeTypeScript.project.emittedSemanticDiagnostics} of ${nativeTypeScript.project.semanticDiagnostics} diagnostics; omitted ${nativeTypeScript.project.semanticDiagnostics - nativeTypeScript.project.emittedSemanticDiagnostics}`,
+      properties: { diagnostic_category: "analysis_environment", analysis_environment: "isolated-virtual", project_typecheck: false, omitted_diagnostics: nativeTypeScript.project.semanticDiagnostics - nativeTypeScript.project.emittedSemanticDiagnostics },
       path: null,
       profile_id: PROFILE_ID,
     });
@@ -3702,6 +3723,7 @@ export async function scan(
   if (counts.unresolved > 0) reasons.push("unresolved_dependency_sites");
   if (unsupportedSyntax > 0) reasons.push("unsupported_syntax");
   if (skipped > 0) reasons.push("skipped_sites");
+  if (files.some((file) => file.skip_reason === "unsupported_file_kind")) reasons.push("unsupported_file_kind");
   if (nativeTypeScript.project.definitionGraphStatus === "failed") reasons.push("typescript_definition_graph_failure");
   else if (nativeTypeScript.project.semanticIssues > 0) reasons.push("typescript_definition_graph_incomplete");
   if (!semanticGraphEmitted) reasons.push("typescript_semantic_graph_not_emitted");
@@ -3730,7 +3752,7 @@ export async function scan(
         ...(syntaxComplete ? ["syntax-complete"] : []),
         ...(semanticComplete ? ["semantic-complete"] : []),
       ],
-      reasons,
+      reasons: reasons.sort(compareUtf8),
     },
     repositoryIdentity: workspace.repositoryIdentity,
     packageManager: workspace.manager,

@@ -571,3 +571,11 @@ export async function isModuleLoaderCall(
   const symbol = await querySymbol(checker, node.expression, counter, "call-graph require callee");
   return symbol === undefined || await isAmbientRequireSymbol(symbol, counter);
 }
+
+
+/** Classes and enums have runtime values but use canonical type nodes. */
+export function isTypeUseTargetKind(graphKind: string | undefined, semanticKind: unknown, occurrenceKind: string): boolean {
+  if (occurrenceKind !== "type_query") return graphKind === "type";
+  if (graphKind === "symbol") return true;
+  return graphKind === "type" && ["class", "enum"].includes(String(semanticKind));
+}

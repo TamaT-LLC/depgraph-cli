@@ -1,3 +1,4 @@
+import type { ExternalDeclarationFile } from "./external-declarations";
 import type { ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
@@ -49,7 +50,7 @@ export const TYPESCRIPT_COMPILER_PROFILE_PROPERTIES = Object.freeze({
   typescript_typechecker_status: "definition-import-type-call-graph-emitted",
   typescript_project_model_status: "ready",
   typescript_project_config: "worker-neutral-allowlist",
-  typescript_module_resolution: "inventory-only",
+  typescript_module_resolution: "inventory-and-confined-declarations",
   typescript_standard_library_source: "bundled",
   typescript_standard_library_integrity: TYPESCRIPT_RELEASE_GATE === TYPESCRIPT_RELEASE_GATE_VERIFIED
     ? "core-attested-whole-tree"
@@ -105,6 +106,8 @@ export interface TypeScriptStaticConfig {
 }
 
 export interface TypeScriptAnalysisOptions {
+  /** Confined declaration bytes; context only, never repository definitions or roots. */
+  externalDeclarations?: ReadonlyMap<string, ExternalDeclarationFile>;
   /** Assigned static framework configs; retained for framework collectors only. */
   frameworkConfigPaths?: ReadonlySet<string>;
   /** Bounded export names needed by framework entrypoints without import sites. */
@@ -708,6 +711,37 @@ function semanticDiagnostic(
   };
 }
 
+function externalDeclarationVirtualPath(relative: string): string {
+  // Installed files must never become implicit node_modules lookup candidates.
+  // Only owner-correlated, mode-compatible explicit paths can expose them.
+  return `__depgraph_declarations__/${relative.split("/").map((part) => part === "node_modules" ? "__packages__" : part).join("/")}`;
+}
+
+function compilerPathReplacement(replacement: string, declarations: ReadonlyMap<string, ExternalDeclarationFile> | undefined): string {
+  if (declarations?.has(replacement)) return `./${externalDeclarationVirtualPath(replacement)}`;
+  return replacement.startsWith(".") ? replacement : `./${replacement}`;
+}
+
+function isExternalDeclarationPath(relative: string, sources: ReadonlyMap<string, string>): boolean {
+  return isConfinedTypeScriptInputPath(relative) && /\.d\.[cm]?ts$/u.test(relative) && !sources.has(relative);
+}
+
+function addExternalDeclarations(
+  virtualFiles: Map<string, string>, sources: ReadonlyMap<string, string>, declarations: ReadonlyMap<string, ExternalDeclarationFile>,
+): Map<string, { locator: string; displayName: string }> {
+  const externalDeclarationTargets = new Map<string, { locator: string; displayName: string }>();
+  for (const [relative, declaration] of declarations) {
+    if (!isExternalDeclarationPath(relative, sources)) {
+      throw new Error(`refusing unsafe external declaration input: ${relative}`);
+    }
+    const virtualPath = path.join(VIRTUAL_ROOT, ...externalDeclarationVirtualPath(relative).split("/"));
+    if (virtualFiles.has(virtualPath)) throw new Error("external declaration virtual path collision");
+    virtualFiles.set(virtualPath, declaration.text);
+    externalDeclarationTargets.set(pathKey(virtualPath), { locator: `package:${declaration.locator}`, displayName: declaration.locator });
+  }
+  return externalDeclarationTargets;
+}
+
 /** Run one trusted native TypeScript Program and TypeChecker for one scan. */
 async function analyzeTypeScriptProjectInner(
   sources: ReadonlyMap<string, string>,
@@ -754,6 +788,7 @@ async function analyzeTypeScriptProjectInner(
     result.typeUseSpans.set(portable, []);
     result.callSpans.set(portable, []);
   }
+  const externalDeclarationTargets = addExternalDeclarations(virtualFiles, sources, options.externalDeclarations ?? new Map());
   const internalRoot = path.join(VIRTUAL_ROOT, "__depgraph_empty_project__.d.ts");
   if (configFiles.length === 0) {
     virtualFiles.set(internalRoot, "declare const __depgraph_empty_project__: unique symbol;\n");
@@ -775,7 +810,7 @@ async function analyzeTypeScriptProjectInner(
       ...(options.stage === "syntax" ? { noResolve: true } : {}),
       paths: Object.fromEntries(Object.entries(staticConfig.paths).map(([pattern, replacements]) => [
         pattern,
-        replacements.map((replacement) => replacement.startsWith(".") ? replacement : `./${replacement}`),
+        replacements.map((replacement) => compilerPathReplacement(replacement, options.externalDeclarations)),
       ])),
       plugins: [],
       skipLibCheck: true,
@@ -888,7 +923,7 @@ async function analyzeTypeScriptProjectInner(
       }
       const standardLibraryKeys = new Set([...standardLibrary.files.keys()].map(pathKey));
       const workerOwnedKeys = new Set([internalRootKey, pathKey(VIRTUAL_CONFIG)]);
-      const allowedCompilerFiles = new Set([...standardLibraryKeys, ...workerOwnedKeys]);
+      const allowedCompilerFiles = new Set([...standardLibraryKeys, ...workerOwnedKeys, ...externalDeclarationTargets.keys()]);
       const programFiles = await project.program.getSourceFileNames();
       for (const file of programFiles) {
         const key = pathKey(file);
@@ -1006,7 +1041,7 @@ async function analyzeTypeScriptProjectInner(
             result.definitionGraph,
             result.definitionGraph.typeCheckerQueries,
             result,
-            options,
+            { ...options, externalDeclarationTargets },
           );
           progress.complete("typescript_dependency_graph", {
             dependency_sites: result.dependencyGraph.sites.length,

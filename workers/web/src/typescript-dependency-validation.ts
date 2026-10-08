@@ -25,6 +25,7 @@ import type { TypeScriptRawDefinitionDelta } from "./typescript-semantic";
 import { scanTypeScriptSyntaxTokens } from "./imports";
 import { aggregateConditions, canonicalizeCondition, type Condition } from "./types";
 import {
+  isTypeUseTargetKind,
   basisForTargets,
   bindingScopeSpan,
   callOccurrenceKind,
@@ -112,7 +113,7 @@ export interface TypeScriptModuleCallValidationSpan {
 export interface TypeScriptTypeUseValidationSpan {
   startOffset: number;
   endOffset: number;
-  occurrenceKind: "type_reference" | "heritage_type" | "jsdoc_type";
+  occurrenceKind: "type_reference" | "type_query" | "heritage_type" | "jsdoc_type";
   /** Exact terminal identifier value attested by the parser-owned AST. */
   terminalName: string;
   /** Exact parent ImportType module span, or null for non-inline type uses. */
@@ -527,7 +528,7 @@ async function typeUseValidationSpansWithCounter(
     if (node.kind === SyntaxKind.TypeReference) {
       await add((node as TypeReferenceNode).typeName, "type_reference");
     } else if (node.kind === SyntaxKind.TypeQuery) {
-      await add((node as TypeQueryNode).exprName, "type_reference");
+      await add((node as TypeQueryNode).exprName, "type_query");
     } else if (node.kind === SyntaxKind.ExpressionWithTypeArguments) {
       await add((node as Node & { readonly expression: Node }).expression, "heritage_type");
     } else if (node.kind === SyntaxKind.JSDocNameReference) {
@@ -535,7 +536,7 @@ async function typeUseValidationSpansWithCounter(
     } else if (node.kind === SyntaxKind.ImportType) {
       const importType = node as ImportTypeNode;
       const argument = importType.argument as Node & { readonly literal?: Node };
-      await add(importType.qualifier, "type_reference", argument.literal ?? argument);
+      await add(importType.qualifier, importType.isTypeOf ? "type_query" : "type_reference", argument.literal ?? argument);
     }
     const children = new Map<string, Node>();
     node.forEachChild((child) => {
@@ -1862,7 +1863,7 @@ function buildTypeUseSpanIndex(
       || spanValue.startOffset < 0
       || spanValue.endOffset <= spanValue.startOffset
       || spanValue.endOffset > source.text.length
-      || !["type_reference", "heritage_type", "jsdoc_type"].includes(spanValue.occurrenceKind)
+      || !["type_reference", "type_query", "heritage_type", "jsdoc_type"].includes(spanValue.occurrenceKind)
       || typeof spanValue.terminalName !== "string"
       || spanValue.terminalName.length === 0
       || spanValue.terminalName.length > 512
@@ -2050,7 +2051,7 @@ function buildTypeScriptDependencyBindingValidationContext(
       "empty_import", "require_call", "dynamic_import", "import_type",
     ])],
     ["web_reexport", new Set(["named_reexport", "namespace_reexport", "empty_reexport", "export_star"])],
-    ["type_use", new Set(["type_reference", "heritage_type", "jsdoc_type"])],
+    ["type_use", new Set(["type_reference", "type_query", "heritage_type", "jsdoc_type"])],
   ]);
   const namedBindingOccurrences = new Set(["default_import", "named_import", "named_reexport"]);
   const namespaceBindingOccurrences = new Set(["namespace_import", "namespace_reexport"]);
@@ -2592,6 +2593,7 @@ function validateTypeScriptDependencyBindingClosure(
 function validateTypeScriptDependencySites(
   delta: Readonly<TypeScriptRawDependencyDelta>,
   context: Readonly<TypeScriptDependencyBindingValidationContext>,
+  repositoryModulePaths: ReadonlySet<string>,
 ): void {
   const {
     definitions,
@@ -2716,10 +2718,10 @@ function validateTypeScriptDependencySites(
       if (target.kind === "definition") {
         const definition = definitions.get(target.key);
         if (definition === undefined) throw new DependencyContractError("raw dependency target definition is missing");
-        if (site.kind === "type_use" && definition.graphKind !== "type") throw new DependencyContractError("raw type-use target is not a type");
+        if (site.kind === "type_use" && !isTypeUseTargetKind(definition.graphKind, definition.semanticKind, site.evidence.occurrenceKind)) throw new DependencyContractError("raw type-use target is not a type");
       } else if (target.kind === "file") {
         if (!isCanonicalRelativePath(target.relativePath)) throw new DependencyContractError("raw dependency target file path is not canonical");
-        if (!sourceLengths.has(target.relativePath)) throw new DependencyContractError("raw dependency target file is missing");
+        if (!sourceLengths.has(target.relativePath) && !repositoryModulePaths.has(target.relativePath)) throw new DependencyContractError("raw dependency target file is missing");
         if (!moduleLevelOccurrences.has(site.evidence.occurrenceKind)) throw new DependencyContractError("raw named binding target cannot fall back to a file");
       } else if (target.kind === "external") {
         if (
@@ -3018,6 +3020,7 @@ export function validateTypeScriptRawDependencyDelta(
   delta: TypeScriptRawDependencyDelta,
   definitionsDelta: Pick<TypeScriptRawDefinitionDelta, "definitions">,
   sources: readonly TypeScriptDependencyValidationSource[],
+  repositoryModulePaths: ReadonlySet<string> = new Set(),
 ): void {
   validateTypeScriptDependencyPreflight(delta);
   const sourceContext = buildTypeScriptDependencyValidationContext(sources);
@@ -3030,7 +3033,7 @@ export function validateTypeScriptRawDependencyDelta(
   const bindingContext = buildTypeScriptDependencyBindingValidationContext(delta, ledgerContext);
   validateTypeScriptDependencySiteAttestations(delta, bindingContext);
   validateTypeScriptDependencyBindingClosure(delta, bindingContext);
-  validateTypeScriptDependencySites(delta, bindingContext);
+  validateTypeScriptDependencySites(delta, bindingContext, repositoryModulePaths);
   validateTypeScriptCallLedger(delta, ledgerContext);
   validateTypeScriptDependencyClosure(delta, bindingContext);
 }

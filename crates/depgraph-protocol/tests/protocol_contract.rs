@@ -647,6 +647,15 @@ fn web_semantic_completeness_requires_exact_safe_compiler_properties() {
 }
 
 #[test]
+fn web_semantic_completeness_accepts_confined_declaration_resolution() {
+    let mut events = web_semantic_complete_values();
+    events[1]["profile"]["properties"]["typescript_module_resolution"] =
+        json!("inventory-and-confined-declarations");
+    validate_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("confined declaration resolution must be accepted");
+}
+
+#[test]
 fn web_semantic_completeness_accepts_pending_and_verified_release_gates() {
     for (gate, integrity) in [
         (

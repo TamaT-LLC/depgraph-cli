@@ -338,6 +338,64 @@ fn web_import_reexport_and_type_use_follow_the_strict_semantic_contract() {
 }
 
 #[test]
+fn web_type_queries_accept_value_symbols_without_weakening_type_references() {
+    for (occurrence, target_kind, accepted) in [
+        ("type_query", "symbol", true),
+        ("type_reference", "symbol", false),
+        ("type_query", "type", false),
+        ("type_reference", "type", true),
+    ] {
+        let mut events = web_semantic_dependency_values();
+        let target_id = node_id_by_display_name(&events, "WebTargetA");
+        if target_kind == "symbol" {
+            let node = &mut events
+                .iter_mut()
+                .find(|event| event["node"]["id"] == target_id)
+                .unwrap()["node"];
+            node["kind"] = json!("symbol");
+            node["properties"]["symbol_kind"] = json!("function");
+            node["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("type_kind");
+            let identity = &mut node["properties"]["canonical_identity"];
+            identity.as_object_mut().unwrap().remove("type_kind");
+            identity["symbol_kind"] = json!("function");
+            identity["identity_kind"] = json!("named");
+            let new_id = stable_id_from_value("symbol", identity);
+            node["id"] = json!(new_id);
+            node["locator"] = json!(format!("typescript-symbol:{new_id}"));
+            for kind in ["web_import", "web_reexport", "type_use"] {
+                reassign_site_target(&mut events, kind, &new_id);
+            }
+        }
+        let site = &mut events
+            .iter_mut()
+            .find(|event| event["site"]["kind"] == "type_use")
+            .unwrap()["site"];
+        let old_id = site["id"].as_str().unwrap().to_owned();
+        for evidence in site["evidence"].as_array_mut().unwrap() {
+            evidence["properties"]["occurrence_kind"] = json!(occurrence);
+        }
+        let new_id = rehash_json_site(site);
+        let evidence = site["evidence"].clone();
+        let edge = linked_edge_mut(&mut events, &old_id);
+        edge["site_id"] = json!(new_id);
+        edge["evidence"] = evidence;
+        rehash_json_edge(edge);
+        sort_site_events(&mut events);
+        sort_edge_events(&mut events);
+        resequence(&mut events);
+        let result = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)));
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{occurrence}/{target_kind}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn web_import_and_reexport_preserve_valid_empty_module_specifiers() {
     for site_kind in ["web_import", "web_reexport"] {
         let mut events = web_semantic_dependency_values();

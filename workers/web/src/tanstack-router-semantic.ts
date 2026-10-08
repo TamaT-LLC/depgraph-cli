@@ -33,13 +33,13 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
+  frameworkEnvironmentCondition as condition,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
 import type { RouteEntry } from "./routes";
 import type { TypeScriptRawDefinitionDelta } from "./typescript-semantic";
 import {
-  canonicalizeCondition,
   compareUtf8,
   preferredWebEnvironment,
   PROFILE_ID,
@@ -284,16 +284,6 @@ function routeFactory(
   };
 }
 
-function condition(environment: "server" | "browser", properties: Record<string, string> = {}): Condition {
-  return canonicalizeCondition({
-    op: "all",
-    conditions: [
-      { op: "eq", key: "mode", value: "production" },
-      { op: "eq", key: "environment", value: preferredWebEnvironment(environment) },
-      ...Object.entries(properties).map(([key, value]) => ({ op: "eq" as const, key, value })),
-    ],
-  });
-}
 
 function routeNode(
   framework: TanStackRouteFramework,
@@ -312,22 +302,19 @@ function routeNode(
     environment,
     router_instance: routerInstance,
     route_pattern: pattern,
+    ...(typeof properties.route_id === "string" ? { route_id: properties.route_id } : {}),
   };
   const id = stableId("route", canonicalIdentity);
+  const routeLocator = typeof properties.route_id === "string" ? properties.route_id : pattern;
   return {
     id,
     kind: "route",
-    locator: `route://${framework}/${encodeURIComponent(owner.locator)}${pattern}#${encodeURIComponent(routeKind)}`,
+    locator: `route://${framework}/${encodeURIComponent(owner.locator)}${routeLocator}#${encodeURIComponent(routeKind)}`,
     display_name: `${framework}:${routeKind}:${pattern}`,
     properties: {
-      framework,
-      package_locator: owner.locator,
-      route_kind: routeKind,
-      environment,
+      ...canonicalIdentity,
       profile_id: PROFILE_ID,
       canonical_identity: canonicalIdentity,
-      router_instance: routerInstance,
-      route_pattern: pattern,
       source_path: relativePath,
       ...properties,
     },
@@ -625,9 +612,10 @@ export function collectTanStackRouterSemanticDelta(
   const routesByPath = new Map<string, SemanticRoute[]>();
   const appendRoute = (route: SemanticRoute): void => {
     semanticRoutes.set(route.node.id, route);
-    const byPattern = routesByPattern.get(route.pattern) ?? [];
+    const key = normalizeUrl(route.pattern);
+    const byPattern = routesByPattern.get(key) ?? [];
     if (!byPattern.some((candidate) => candidate.node.id === route.node.id)) byPattern.push(route);
-    routesByPattern.set(route.pattern, byPattern);
+    routesByPattern.set(key, byPattern);
     const byPath = routesByPath.get(route.relativePath) ?? [];
     if (!byPath.some((candidate) => candidate.node.id === route.node.id)) byPath.push(route);
     routesByPath.set(route.relativePath, byPath);
@@ -652,7 +640,10 @@ export function collectTanStackRouterSemanticDelta(
       routeKind,
       `${framework}:${owner.locator}:file`,
       entry.relativeFile,
-      { generated_tree_corroborated: generatedByPattern.has(entry.pattern) },
+      {
+        generated_tree_corroborated: generatedByPattern.has(entry.pattern),
+        ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
+      },
     ));
     const semantic = { node, relativePath: entry.relativeFile, declaration, entry, pattern: entry.pattern };
     appendRoute(semantic);
@@ -1006,11 +997,11 @@ export function collectTanStackRouterSemanticDelta(
     });
   }
 
-  const routeTarget = (value: string, relativePath: string): SemanticRoute | null => {
+  const routeTargets = (value: string, relativePath: string): SemanticRoute[] => {
     const owner = input.ownerForPath(relativePath);
     const exact = routesByPattern.get(withBase(packageBaseFor(relativePath), value)) ?? routesByPattern.get(normalizeUrl(value));
     return exact?.filter((candidate) => candidate.node.properties.package_locator === owner.locator)
-      .sort((left, right) => compareUtf8(left.node.id, right.node.id))[0] ?? null;
+      .sort((left, right) => compareUtf8(left.node.id, right.node.id)) ?? [];
   };
   const navigationSource = (relativePath: string, node: Node): GraphNode | null => {
     const definition = definitionFor(relativePath, node);
@@ -1030,7 +1021,9 @@ export function collectTanStackRouterSemanticDelta(
     const values = isConditionalExpression(value)
       ? [literal(value.whenTrue), literal(value.whenFalse)].filter((candidate): candidate is string => candidate !== null)
       : literal(value) === null ? [] : [literal(value)!];
-    const targets = [...new Set(values)].map((value) => routeTarget(value, relativePath)).filter((target): target is SemanticRoute => target !== null).map((target) => target.node);
+    const targets = [...new Map([...new Set(values)]
+      .flatMap((value) => routeTargets(value, relativePath))
+      .map((target) => [target.node.id, target.node])).values()];
     if (targets.length === 0) addRelation(
       source,
       [input.unknownTarget()],
@@ -1071,7 +1064,8 @@ export function collectTanStackRouterSemanticDelta(
   for (const mask of maskCalls) {
     const from = literal(propertyExpression(mask.options, "from"));
     const to = propertyExpression(mask.options, "to");
-    const source = from ? routeTarget(from, mask.relativePath) : null;
+    const sources = from ? routeTargets(from, mask.relativePath) : [];
+    const source = sources.length === 1 ? sources[0] : null;
     if (source && to) addNavigation(mask.relativePath, source.declaration?.node ?? mask.call, to, "masks_to", "tanstack_route_mask");
   }
   for (const [relativePath, sourceFile] of input.sourceFiles) {

@@ -20,6 +20,7 @@ import {
   owningPackage,
   type LockInstance,
   type PackageRecord,
+  type PackageInstallSelection,
   type Workspace,
 } from "./workspace";
 
@@ -1716,6 +1717,20 @@ function typeScriptPathPatternCanMatchNodeBuiltin(pattern: string): boolean {
     || NODE_BUILTIN_SPECIFIERS.some((specifier) => typeScriptPathPatternMatches(pattern, specifier));
 }
 
+function extensionlessFileCandidates(clean: string, includeDirectoryIndex: boolean, typeScriptLoadableOnly: boolean): string[] {
+  // Unknown suffixes (for example .gen) remain part of the module basename.
+  // Explicit assets retain their identity in the syntax profile.
+  const extensions = typeScriptLoadableOnly
+    ? [".ts", ".tsx", ".d.ts", ".js", ".jsx"]
+    : [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".json", ".astro"];
+  const exact = typeScriptLoadableOnly ? [] : [clean];
+  return [
+    ...exact.filter((candidate) => path.extname(candidate) !== ""),
+    ...extensions.map((extension) => `${clean}${extension}`),
+    ...(includeDirectoryIndex ? extensions.map((extension) => path.join(clean, `index${extension}`)) : []),
+  ];
+}
+
 function fileBaseCandidates(
   base: string,
   includeDirectoryIndex = true,
@@ -1730,7 +1745,7 @@ function fileBaseCandidates(
   else if (extension === ".jsx") candidates = [`${stem}.tsx`, `${stem}.ts`, `${stem}.d.ts`, clean, `${stem}.js`];
   else if (extension === ".mjs") candidates = [`${stem}.mts`, `${stem}.d.mts`, clean];
   else if (extension === ".cjs") candidates = [`${stem}.cts`, `${stem}.d.cts`, clean];
-  else if (extension !== "") {
+  else if ([".ts", ".tsx", ".mts", ".cts", ".json", ".astro"].includes(extension)) {
     candidates = !typeScriptLoadableOnly || [".ts", ".tsx", ".mts", ".cts"].includes(extension)
       ? [clean]
       : [];
@@ -1738,13 +1753,7 @@ function fileBaseCandidates(
   else {
     // TS extensionless lookup does not synthesize .mts/.cts: those are only
     // substitutions for explicit .mjs/.cjs specifiers.
-    const extensions = typeScriptLoadableOnly
-      ? [".ts", ".tsx", ".d.ts", ".js", ".jsx"]
-      : [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".json", ".astro"];
-    candidates = [
-      ...extensions.map((item) => `${clean}${item}`),
-      ...(includeDirectoryIndex ? extensions.map((item) => path.join(clean, `index${item}`)) : []),
-    ];
+    candidates = extensionlessFileCandidates(clean, includeDirectoryIndex, typeScriptLoadableOnly);
   }
   return [...new Set(candidates.map((item) => path.resolve(item)))];
 }
@@ -1763,6 +1772,32 @@ interface PackageFileTargets {
   reason: string | null;
 }
 
+function isDeclarationPackageSpecifier(specifier: string): boolean {
+  return /^(?:@[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\/)?[a-zA-Z0-9_-][a-zA-Z0-9_.-]*(?:\/[a-zA-Z0-9_.-]+)*$/u.test(specifier) && !isBuiltin(specifier);
+}
+
+function singlePackageFileSelection(selection: PackageFileTargets): boolean {
+  return selection.reason === null && selection.files.length === 1;
+}
+
+function declarationTypesSpecifier(specifier: string): string | null {
+  const name = packageNameOf(specifier);
+  if (name.startsWith("@types/")) return null;
+  const typesName = name.startsWith("@") ? name.slice(1).replace("/", "__") : name;
+  return `@types/${typesName}${specifier.slice(name.length)}`;
+}
+
+function declarationEntryForFile(file: string | null, packageRoot: string, locator: string): { file: string; packageRoot: string; locator: string } | null {
+  return file !== null && /\.d\.[cm]?ts$/u.test(file) ? { file, packageRoot, locator } : null;
+}
+
+function externalDeclarationLocator(selection: PackageInstallSelection, version: string, manager: string, packageName: string): string | null {
+  if (selection.workspacePackages.length > 0) return null;
+  const locked = selection.externalInstances.filter((instance) => instance.version === version);
+  if (locked.length > 1) return null;
+  return locked.length === 1 ? locked[0]!.locator : `${manager}:${packageName}@${version}`;
+}
+
 export class ModuleResolver {
   readonly #root: string;
   readonly #workspace: Workspace;
@@ -1776,6 +1811,7 @@ export class ModuleResolver {
   readonly #sourceOwnerIds: Set<string>;
   readonly #externalPackages = new Map<string, Promise<ExternalPackageManifest[]>>();
   readonly #externalPackageBoundaries = new Set<string>();
+  readonly #declarationIssues = new Map<string, ResolverIssue>();
   readonly #directoryPackageEntries = new Map<string, string[]>();
   readonly issues: ResolverIssue[] = [];
 
@@ -2096,6 +2132,11 @@ export class ModuleResolver {
     return parents;
   }
 
+  #isInventoryAsset(file: string): boolean {
+    if (!isWithinRoot(this.#root, file) || !this.#fileSet.has(file)) return false;
+    return [".css", ".scss", ".sass", ".less", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf"].includes(path.extname(file).toLowerCase());
+  }
+
   #resolveFileBase(
     base: string,
     seen: ReadonlySet<string> = new Set(),
@@ -2110,7 +2151,8 @@ export class ModuleResolver {
     const direct = fileBaseCandidates(absolute, false, stripSpecifierSuffix, typeScriptLoadableOnly)
       .find((item) => isWithinRoot(this.#root, item) && this.#fileSet.has(item));
     if (direct !== undefined) return [direct];
-    if (path.extname(absolute) !== "") return [];
+    if ([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".astro"]
+      .includes(path.extname(absolute).toLowerCase())) return [];
     for (const entry of this.#directoryPackageEntries.get(absolute) ?? []) {
       const resolved = this.#resolveFileBase(
         entry,
@@ -2415,6 +2457,103 @@ export class ModuleResolver {
     };
   }
 
+  #declarationOwner(specifier: string, sourceFile: string): PackageRecord | null {
+    if (!isDeclarationPackageSpecifier(specifier)) return null;
+    const owner = owningPackage(this.#workspace, sourceFile);
+    // Repository aliases and workspace sources already have their own confined inventory.
+    return this.#resolveAlias(specifier, owner, true) === null ? owner : null;
+  }
+
+  async #installedDeclarationRecord(specifier: string, sourceFile: string, owner: PackageRecord): Promise<ExternalPackageManifest | null> {
+    const lookup = this.#externalPackageLookup(owner, packageNameOf(specifier), path.dirname(sourceFile));
+    if (lookup === null) return null;
+    const installed = await this.#loadExternalPackages(packageNameOf(specifier), lookup);
+    return installed.length === 1 ? installed[0]! : null;
+  }
+
+  async #sharedDeclarationEntry(specifier: string, record: ExternalPackageManifest): Promise<string | null> {
+    const subpath = subpathOf(specifier, packageNameOf(specifier));
+    const imported = await this.#externalPackageFiles(record, subpath, true, "import");
+    const required = await this.#externalPackageFiles(record, subpath, true, "require");
+    if (!singlePackageFileSelection(imported) || !singlePackageFileSelection(required)) return null;
+    return imported.files[0] === required.files[0] ? imported.files[0]! : null;
+  }
+
+  #declarationLocator(specifier: string, sourceFile: string, owner: PackageRecord, record: ExternalPackageManifest): string | null {
+    if (record.version === null) return null;
+    const packageName = packageNameOf(specifier);
+    const declared = this.#fileSet.has(path.resolve(sourceFile)) ? owner.dependencies.get(packageName)?.range ?? null : null;
+    const selection = selectPackageInstallCandidates(this.#workspace, owner, packageName, declared);
+    return externalDeclarationLocator(selection, record.version, owner.manager, packageName);
+  }
+
+  /** Confined declaration entry, admitted only when both neutral resolver modes agree. */
+  async externalDeclaration(specifier: string, sourceFile: string): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const owner = this.#declarationOwner(specifier, sourceFile);
+    if (owner === null) return null;
+    const record = await this.#installedDeclarationRecord(specifier, sourceFile, owner);
+    if (record === null) return null;
+    const entry = await this.#declarationEntry(specifier, sourceFile, owner, record);
+    if (entry === null) this.#recordDeclarationIssue(sourceFile, specifier);
+    return entry;
+  }
+
+  #recordDeclarationIssue(sourceFile: string, specifier: string): void {
+    const relative = normalizeRelative(path.relative(this.#root, sourceFile));
+    if (this.#declarationIssues.size >= 128) return;
+    this.#declarationIssues.set(JSON.stringify([relative, specifier]), { path: relative, reason: "external_declaration_missing_or_ambiguous" });
+  }
+
+  externalDeclarationIssues(): readonly ResolverIssue[] {
+    return [...this.#declarationIssues.values()];
+  }
+
+  async #declarationEntry(specifier: string, sourceFile: string, owner: PackageRecord, record: ExternalPackageManifest): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const locator = this.#declarationLocator(specifier, sourceFile, owner, record);
+    if (locator === null) return null;
+    const file = await this.#sharedDeclarationEntry(specifier, record);
+    if (file === null) return null;
+    if (/\.d\.[cm]?ts$/u.test(file)) return { file, packageRoot: record.root, locator };
+    return await this.#fallbackDeclarationEntry(specifier, sourceFile, owner, locator);
+  }
+
+  async #fallbackDeclarationEntry(specifier: string, sourceFile: string, owner: PackageRecord, locator: string): Promise<{
+    file: string; packageRoot: string; locator: string;
+  } | null> {
+    const typesSpecifier = declarationTypesSpecifier(specifier);
+    if (typesSpecifier === null) return null;
+    const record = await this.#installedDeclarationRecord(typesSpecifier, sourceFile, owner);
+    if (record === null) return null;
+    const file = await this.#sharedDeclarationEntry(typesSpecifier, record);
+    return declarationEntryForFile(file, record.root, locator);
+  }
+
+  async #confinedDeclarationFile(candidate: string, packageRoot: string): Promise<string | null> {
+    if (!/\.d\.[cm]?ts$/u.test(candidate)) return null;
+    const resolved = await resolveWithinRoot(this.#root, candidate);
+    if (resolved === null) return null;
+    return await this.#declarationFileInPackage(resolved, packageRoot);
+  }
+
+  async #declarationFileInPackage(file: string, packageRoot: string): Promise<string | null> {
+    if (!isWithinRoot(packageRoot, file)) return null;
+    return await isFile(this.#root, file) ? file : null;
+  }
+
+  async relativeDeclaration(specifier: string, sourceFile: string, packageRoot: string): Promise<string | null> {
+    const base = path.resolve(path.dirname(sourceFile), specifier);
+    if (!isWithinRoot(packageRoot, base)) return null;
+    for (const candidate of fileBaseCandidates(base, true, false, true)) {
+      const file = await this.#confinedDeclarationFile(candidate, packageRoot);
+      if (file !== null) return file;
+    }
+    return null;
+  }
+
   async #resolveExternalPackage(
     specifier: string,
     packageName: string,
@@ -2707,6 +2846,9 @@ export class ModuleResolver {
         !useTypesCondition,
         useTypesCondition,
       );
+      if (files.length === 0 && this.#isInventoryAsset(base)) {
+        return { status: "unresolved", precision: "heuristic", targets: [], reason: "asset_type_declaration_unavailable" };
+      }
       if (files.length === 0) return { status: "unresolved", precision: "heuristic", targets: [], reason: "relative_target_not_found" };
       return {
         status: "resolved",
@@ -2813,7 +2955,9 @@ export class ModuleResolver {
       return {
         ...resolution,
         precision,
-        reason: resolution.reason ?? (inspectedExternalExact ? null : selection.reason),
+        reason: selection.reason === "package_instance_from_lockfile_importer"
+          ? [selection.reason, resolution.reason].filter(Boolean).join(",")
+          : resolution.reason ?? (inspectedExternalExact ? null : selection.reason),
       };
     }
 

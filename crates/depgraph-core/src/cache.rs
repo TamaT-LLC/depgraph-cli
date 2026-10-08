@@ -568,6 +568,10 @@ fn fingerprint_inventory(
         .cloned()
         .collect::<Vec<_>>();
     let go_dependency_witness = compute_go_dependency_witness(&root, &witness_paths);
+    let declarations = crate::web_declarations::fingerprint(&root, &witness_paths)
+        .map_err(|_| CacheRejection::new("external-declaration-witness-unavailable"))?;
+    all.update(declarations.as_bytes());
+    manifests.update(declarations.as_bytes());
     Ok(InventoryFingerprints {
         all: finish_digest(all),
         manifests: finish_digest(manifests),
@@ -605,6 +609,8 @@ pub(crate) fn fingerprint_scan_inputs(
     let inventory = build_repository_file_inventory(&root)
         .map_err(|_| CacheRejection::new("inventory-unavailable"))?;
     let mut files = Vec::with_capacity(inventory.paths.len());
+    let declarations = crate::web_declarations::fingerprint(&root, &inventory.paths)
+        .map_err(|_| CacheRejection::new("external-declaration-witness-unavailable"))?;
     for relative in inventory.paths {
         let path = root.join(&relative);
         if is_store_artifact(&path, store_path.as_deref()) {
@@ -646,6 +652,7 @@ pub(crate) fn fingerprint_scan_inputs(
         }
         stream_inventory_entry_digest(&mut hasher, &root, file)?;
     }
+    hasher.update(declarations.as_bytes());
     Ok(finish_digest(hasher))
 }
 
@@ -1925,6 +1932,27 @@ mod tests {
                 .dimensions
                 .get("profile_plan"),
             Some(&first_id)
+        );
+    }
+    #[test]
+    fn installed_declarations_invalidate_cache_and_scan_input_proofs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("index.ts"), "import 'library';").unwrap();
+        let package = root.path().join("node_modules/library");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("index.d.ts"), "export type T = string;").unwrap();
+        let before = fingerprint_inventory(root.path(), None).unwrap();
+        assert_eq!(
+            before.all,
+            fingerprint_scan_inputs(root.path(), None).unwrap()
+        );
+        fs::write(package.join("index.d.ts"), "export type T = number;").unwrap();
+        let after = fingerprint_inventory(root.path(), None).unwrap();
+        assert_ne!(before.all, after.all);
+        assert_ne!(before.manifests, after.manifests);
+        assert_eq!(
+            after.all,
+            fingerprint_scan_inputs(root.path(), None).unwrap()
         );
     }
 }

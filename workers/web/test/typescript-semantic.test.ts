@@ -2408,7 +2408,8 @@ test("alias re-exports, empty export names, scoped namespaces, and type queries 
     && site.importedName === "value"
   ));
   assert.equal(valueTypeUses.length, 2, JSON.stringify(dependencies.sites));
-  assert.ok(valueTypeUses.every((site) => (
+  assert.equal(valueTypeUses.find((site) => site.evidence.occurrenceKind === "type_query")?.status, "resolved");
+  assert.ok(valueTypeUses.filter((site) => site.evidence.occurrenceKind === "type_reference").every((site) => (
     site.status === "unresolved"
     && ["value_symbol_is_not_a_type", "typechecker_target_unresolved"].includes(site.reason ?? "")
     && site.targets[0]?.kind === "unknown"
@@ -3908,9 +3909,9 @@ interface Uses {
   );
   assert.deepEqual(dependencies.issues, []);
   const valueUses = dependencies.sites.filter((site) => (
-    site.kind === "type_use" && site.importedName === "ValueOnly"
+    site.kind === "type_use" && site.importedName === "ValueOnly" && site.evidence.occurrenceKind === "type_reference"
   ));
-  assert.ok(valueUses.length >= 2);
+  assert.equal(valueUses.length, 1);
   assert.ok(valueUses.every((site) => (
     site.status === "unresolved"
     && ["value_symbol_is_not_a_type", "typechecker_target_unresolved"].includes(site.reason ?? "")
@@ -4062,4 +4063,98 @@ test("spoofed compiler declaration spans fail atomically instead of being clampe
   assert.equal(dependencies.issues.length, 1);
   assert.equal(dependencies.issues[0]?.fatal, true);
   assert.match(dependencies.issues[0]?.message ?? "", /offset is outside its confined source/u);
+});
+
+
+test("typeof tuple, object, function, and imported values resolve to their value definitions", async () => {
+  const { definitions, dependencies } = await extractDependencyFixture({
+    "src/values.ts": `
+export const steps = ['queued', 'done'] as const;
+export const options = { enabled: true };
+export function factory() { return options; }
+`,
+    "src/use.ts": `
+import { steps, options, factory } from './values';
+export type Step = (typeof steps)[number];
+export type Options = typeof options;
+export type Factory = typeof factory;
+export type InlineStep = (typeof import('./values').steps)[number];
+const local = { ready: true };
+export type Local = typeof local;
+`,
+  }, "__depgraph_type_query_values__");
+  assert.deepEqual(dependencies.issues, []);
+  const sites = dependencies.sites.filter((site) => site.evidence.occurrenceKind === "type_query");
+  assert.equal(sites.length, 5);
+  for (const site of sites) {
+    assert.equal(site.status, "resolved", JSON.stringify(site));
+    assert.equal(site.reason, null);
+    assert.equal(site.targets.length, 1);
+    const target = site.targets[0];
+    assert.ok(target);
+    assert.equal(target.kind, "definition");
+    const definition = target.kind === "definition"
+      ? definitions.definitions.find((item) => item.key === target.key)
+      : undefined;
+    assert.equal(definition?.graphKind, "symbol");
+    assert.equal(definition?.displayName, site.importedName);
+  }
+});
+
+test("scanner preserves typeof value targets through module export refinement", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-typeof-refinement-"));
+  context.after(async () => await rm(root, { recursive: true, force: true }));
+  const sources = {
+    "package.json": '{"name":"typeof-fixture","version":"1.0.0","type":"module"}',
+    "tsconfig.json": '{"compilerOptions":{"module":"preserve","moduleResolution":"bundler","target":"esnext"}}',
+    "values.ts": "export const steps = ['queued', 'done'] as const;\nexport class Item {}\nexport enum State { Ready, Done }\n",
+    "use.ts": "import { steps, Item, State } from './values';\nexport type Step = (typeof steps)[number];\nexport type Constructor = typeof Item;\nexport type States = typeof State;\nexport type Inline = typeof import('./values').steps;\n",
+  };
+  const files = [];
+  for (const [relativePath, text] of Object.entries(sources)) {
+    const file = path.join(root, relativePath);
+    await writeFile(file, text);
+    files.push(file);
+  }
+  const model = await scan(root, files);
+  const queries = model.sites.filter((site) => site.evidence.some((evidence) => evidence.properties?.occurrence_kind === "type_query"));
+  assert.equal(queries.length, 4, JSON.stringify(model));
+  for (const site of queries) {
+    assert.equal(site.resolution_status, "resolved", JSON.stringify(site));
+    assert.equal(site.target_ids.length, 1);
+    const target = model.nodes.find((node) => node.id === site.target_ids[0]);
+    assert.ok(["symbol", "type"].includes(target?.kind ?? ""));
+  }
+});
+
+test("semantic asset imports distinguish file dependencies from missing type declarations", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-semantic-assets-"));
+  context.after(async () => await rm(root, { recursive: true, force: true }));
+  const sources = {
+    "package.json": '{"name":"assets-fixture","version":"1.0.0","type":"module"}',
+    "tsconfig.json": '{"compilerOptions":{"module":"preserve","moduleResolution":"bundler","target":"esnext"}}',
+    "index.ts": "import './style.css';\nimport image from './image.png';\nimport './missing.css';\nimport raw from './image.png?raw';\nimport typed from './typed.png';\nexport const images = [image, raw, typed];\n",
+    "style.css": "body { color: red; }",
+    "image.png": "image fixture",
+    "typed.png": "typed image fixture",
+    "typed.png.d.ts": "declare const url: string; export default url;\n",
+  };
+  const files = [];
+  for (const [relativePath, text] of Object.entries(sources)) {
+    const file = path.join(root, relativePath);
+    await writeFile(file, text);
+    files.push(file);
+  }
+  const model = await scan(root, files);
+  const semantic = model.sites.filter((site) => site.evidence.some((evidence) => evidence.kind === "semantic"));
+  const css = semantic.find((site) => site.specifier === "./style.css");
+  assert.equal(css?.resolution_status, "unresolved", JSON.stringify(model.diagnostics));
+  assert.equal(css?.reason, "asset_type_declaration_unavailable");
+  assert.equal(semantic.find((site) => site.specifier === "./image.png")?.reason, "asset_type_declaration_unavailable");
+  assert.equal(semantic.find((site) => site.specifier === "./missing.css")?.reason, "relative_target_not_found");
+  assert.equal(semantic.find((site) => site.specifier === "./image.png?raw")?.resolution_status, "unresolved");
+  assert.equal(semantic.find((site) => site.specifier === "./typed.png")?.resolution_status, "resolved");
+  for (const specifier of ["./style.css", "./image.png"]) {
+    assert.ok(model.sites.some((site) => site.specifier === specifier && site.evidence.every((evidence) => evidence.kind !== "semantic") && site.resolution_status === "resolved"));
+  }
 });

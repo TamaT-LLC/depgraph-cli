@@ -25,6 +25,7 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
+  frameworkEnvironmentCondition as condition,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -33,7 +34,6 @@ import { collectTanStackRouterSemanticDelta } from "./tanstack-router-semantic";
 import type { TypeScriptRawDefinition, TypeScriptRawDefinitionDelta } from "./typescript-semantic";
 import type { TypeScriptRawDependencyDelta } from "./typescript-dependencies";
 import {
-  canonicalizeCondition,
   compareUtf8,
   preferredWebEnvironment,
   PROFILE_ID,
@@ -249,16 +249,6 @@ function hasModifier(node: Node, kind: SyntaxKind): boolean {
   return modifiers?.some((modifier) => modifier.kind === kind) ?? false;
 }
 
-function condition(environment: "server" | "browser", properties: Record<string, string> = {}): Condition {
-  return canonicalizeCondition({
-    op: "all",
-    conditions: [
-      { op: "eq", key: "mode", value: "production" },
-      { op: "eq", key: "environment", value: preferredWebEnvironment(environment) },
-      ...Object.entries(properties).map(([key, value]) => ({ op: "eq" as const, key, value })),
-    ],
-  });
-}
 
 function serverFunctionNode(
   owner: PackageRecord,
@@ -876,7 +866,9 @@ export function collectTanStackStartSemanticDelta(
     });
     directMiddlewareByPath.set(site.evidence[0]!.path, values);
   }
-  const rootRoutes = routeRecords.filter((record) => record.node.properties.route_pattern === "/");
+  const rootRoutes = routeRecords.filter((record) => (
+    ["tanstack-file-root-route", "tanstack-code-root-route"].includes(String(record.node.properties.route_kind))
+  ));
   for (const record of routeRecords) {
     const source = input.sources.get(record.relativePath) ?? "";
     const sourceFile = input.sourceFiles.get(record.relativePath);

@@ -111,7 +111,7 @@ test("worker emits deterministic protocol graph without executing project code",
       typescript_definition_graph_status: "ready",
       typescript_project_model_status: "ready",
       typescript_project_config: "worker-neutral-allowlist",
-      typescript_module_resolution: "inventory-only",
+      typescript_module_resolution: "inventory-and-confined-declarations",
       typescript_standard_library_source: "bundled",
       typescript_standard_library_integrity: "build-produced-pending-core-attestation",
       typescript_release_gate: "release-gate-pending",
@@ -1764,7 +1764,7 @@ test("native TypeScript 7 parser covers every TS and JS extension without loadin
   await assert.rejects(import("node:fs/promises").then(({ stat }) => stat(marker)));
 });
 
-test("TypeChecker definition graph resolves inventory modules and bundled stdlib without reading project packages", async (context) => {
+test("TypeChecker resolves inventory, bundled stdlib, and bounded package declarations without executing packages", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-worker-typechecker-scaffold-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const packageRoot = path.join(root, "node_modules", "ambient-secret");
@@ -1835,7 +1835,7 @@ test("TypeChecker definition graph resolves inventory modules and bundled stdlib
     2,
   );
   assert.equal(Number(profile?.properties.typescript_emitted_semantic_diagnostics), semanticDiagnostics.length);
-  assert.ok(semanticDiagnostics.some((diagnostic) => diagnostic.path === "main.ts" && /TS2307.*ambient-secret/u.test(diagnostic.message)));
+  assert.ok(!semanticDiagnostics.some((diagnostic) => diagnostic.path === "main.ts" && /TS2307.*ambient-secret/u.test(diagnostic.message)));
   assert.ok(!semanticDiagnostics.some((diagnostic) => /TS2307.*@models\/model/u.test(diagnostic.message)));
   assert.ok(!semanticDiagnostics.some((diagnostic) => /Cannot find global type|Promise only refers to a type/u.test(diagnostic.message)));
   assert.ok(semanticDiagnostics.every((diagnostic) => (
@@ -3010,11 +3010,11 @@ test("Next compound pageExtensions remove the full suffix in App and Pages route
     assert.equal(ledger?.skipped_sites, 1, unsupportedPath);
     assert.equal(ledger?.discovered_sites, ledger?.emitted_sites + ledger?.skipped_sites, unsupportedPath);
     assert.ok(result.events.some((event) => (
-      event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === unsupportedPath
+      event.diagnostic?.code === "web.unsupported_file_kind" && event.diagnostic?.path === unsupportedPath
     )), unsupportedPath);
   }
   assert.equal(result.events.at(-1)?.coverage.files_skipped, unsupportedPaths.length);
-  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, unsupportedPaths.length);
+  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
   assert.ok(!result.events.some((event) => event.site?.kind === "unsupported_route_source"));
 });
@@ -3042,11 +3042,11 @@ test("Astro Markdown and MDX routes report unsupported dependency inventory with
     assert.equal(ledger?.skipped_sites, 1, unsupportedPath);
     assert.equal(ledger?.discovered_sites, ledger?.emitted_sites + ledger?.skipped_sites, unsupportedPath);
     assert.ok(result.events.some((event) => (
-      event.diagnostic?.code === "web.unsupported_syntax" && event.diagnostic?.path === unsupportedPath
+      event.diagnostic?.code === "web.unsupported_file_kind" && event.diagnostic?.path === unsupportedPath
     )), unsupportedPath);
   }
   assert.equal(result.events.at(-1)?.coverage.files_skipped, 2);
-  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 2);
+  assert.equal(result.events.at(-1)?.coverage.unsupported_syntax, 0);
   assert.deepEqual(result.events.at(-1)?.coverage.completeness, []);
 });
 
@@ -3409,4 +3409,80 @@ test("worker exposes the release and protocol handshake", async () => {
     "depgraph-web-worker 0.6.2 (protocol 1.0; typescript 7.0.2; capabilities analysis-source-batch-v1,astro-component-render-hydration-v1,framework-semantic-completeness-v1,framework-semantic-graph-v1,next-route-component-boundary-v1,tanstack-router-typed-route-v1,tanstack-start-rpc-middleware-v1,typescript-definition-import-type-call-graph-v2,worker-delta-v1)\n",
   );
   assert.equal(result.stderr, "");
+});
+
+test("TanStack pathless route IDs remain distinct while URLs and slash navigation agree", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-pathless-navigation-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const contents: Record<string, string> = {
+    "package.json": JSON.stringify({ name: "pathless-navigation", dependencies: { "@tanstack/react-router": "1.170.17" } }),
+    "src/routes/__root.tsx": 'import { createRootRoute } from "@tanstack/react-router"; export const Route = createRootRoute({});',
+    "src/routes/index.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/")({});',
+    "src/routes/_auth.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth")({});',
+    "src/routes/_auth/index.tsx": 'import { createFileRoute } from "@tanstack/react-router"; export const Route = createFileRoute("/_auth/")({});',
+    "src/routes/_auth/items/index.tsx": [
+      'import { createFileRoute, Link } from "@tanstack/react-router";',
+      'export const Route = createFileRoute("/_auth/items/")({ component: Page });',
+      'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/absent" /></>; }',
+    ].join("\n"),
+    "src/routeTree.gen.ts": "export interface FileRoutesByPath { '/': { fullPath: '/' }; '/_auth': { fullPath: '/' }; '/_auth/': { fullPath: '/' }; '/_auth/items/': { fullPath: '/items/' } }",
+  };
+  for (const [relative, source] of Object.entries(contents)) {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, source);
+  }
+  const result = await run("pathless-navigation", root);
+  const diagnostics = result.events.filter((event) => event.event === "diagnostic").map((event) => event.diagnostic);
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.code === "web.tanstack_route_tree_drift"));
+  assert.ok(!diagnostics.some((diagnostic) => diagnostic.code.includes("semantic_delta_discarded")));
+  const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+  const fileRoutes = nodes.filter((node) => node.properties.route_kind === "tanstack-file-route");
+  assert.equal(fileRoutes.length, 4);
+  assert.equal(new Set(fileRoutes.map((node) => node.id)).size, 4);
+  assert.deepEqual(fileRoutes.map((node) => node.properties.route_id).sort(), ["/", "/_auth", "/_auth/", "/_auth/items/"]);
+  const syntaxRoutes = nodes.filter((node) => node.kind === "route" && typeof node.properties.pattern === "string");
+  const routeById = (id: string) => syntaxRoutes.find((node) => (node.properties.route_id ?? (node.properties.pattern === "/" ? "__root__" : null)) === id)!;
+  const parents = result.events.filter((event) => event.event === "edge_upsert")
+    .map((event) => event.edge).filter((edge) => edge.kind === "parent_route" && syntaxRoutes.some((node) => node.id === edge.source));
+  assert.equal(parents.length, 4);
+  for (const [child, parent] of [["/", "__root__"], ["/_auth", "__root__"], ["/_auth/", "/_auth"], ["/_auth/items/", "/_auth"]]) {
+    assert.deepEqual(parents.filter((edge) => edge.source === routeById(child!).id).map((edge) => edge.target), [routeById(parent!).id]);
+  }
+  const navigation = result.events.filter((event) => event.event === "dependency_site")
+    .map((event) => event.site).filter((site) => site.kind === "navigates_to");
+  assert.equal(navigation.length, 3);
+  for (const site of navigation) {
+    assert.equal(site.resolution_status, site.specifier === "/absent" ? "unresolved" : "resolved", site.specifier);
+  }
+  await writeFile(path.join(root, "src/routeTree.gen.ts"), contents["src/routeTree.gen.ts"]!.replace("'/items/'", "'/stale/'"));
+  const stale = await run("pathless-navigation-stale", root);
+  assert.ok(stale.events.some((event) => event.event === "diagnostic" && event.diagnostic.code === "web.tanstack_route_tree_drift"));
+});
+
+test("TanStack slash navigation resolves with a base path and either registered spelling", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-route-slashes-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src/routes/items"), { recursive: true });
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "route-slashes", dependencies: { "@tanstack/react-router": "1.170.17" } }));
+  await writeFile(path.join(root, "router.config.ts"), "export default { basepath: '/app', trailingSlash: 'always' };");
+  await writeFile(path.join(root, "src/routes/__root.tsx"), 'import { createRootRoute } from "@tanstack/react-router"; export const Route = createRootRoute({});');
+  for (const registered of ["/items", "/items/"]) {
+    await writeFile(path.join(root, "src/routes/items/index.tsx"), [
+      'import { createFileRoute, Link } from "@tanstack/react-router";',
+      `export const Route = createFileRoute(${JSON.stringify(registered)})({ component: Page });`,
+      'function Page() { return <><Link to="/items" /><Link to="/items/" /><Link to="/app/items/" /></>; }',
+    ].join("\n"));
+    const result = await run("slash-navigation", root);
+    const nodes = result.events.filter((event) => event.event === "node_upsert").map((event) => event.node);
+    const rootRoute = nodes.find((node) => node.kind === "route" && node.properties.pattern === "/app" && node.properties.route_id === undefined)!;
+    const childRoute = nodes.find((node) => node.kind === "route" && node.properties.pattern !== undefined && node.properties.route_id === registered)!;
+    const parentEdges = result.events.filter((event) => event.event === "edge_upsert")
+      .map((event) => event.edge).filter((edge) => edge.kind === "parent_route" && edge.source === childRoute.id);
+    assert.deepEqual(parentEdges.map((edge) => edge.target), [rootRoute.id], registered);
+    const sites = result.events.filter((event) => event.event === "dependency_site")
+      .map((event) => event.site).filter((site) => site.kind === "navigates_to");
+    assert.equal(sites.length, 3);
+    assert.ok(sites.every((site) => site.resolution_status === "resolved"), registered);
+  }
 });

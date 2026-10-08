@@ -964,7 +964,7 @@ fn typescript_import_type_protocol(root: &Path, gate: &str) -> Result<Vec<u8>> {
                     imported_name: Option<&str>| {
         let type_only = matches!(
             occurrence_kind,
-            "type_reference" | "heritage_type" | "jsdoc_type" | "import_type"
+            "type_reference" | "type_query" | "heritage_type" | "jsdoc_type" | "import_type"
         );
         let mut primary = serde_json::json!({
                 "kind":"semantic",

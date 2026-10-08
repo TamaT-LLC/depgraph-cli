@@ -6,11 +6,37 @@ import type { PackageRecord, Workspace } from "./workspace";
 export interface RouteEntry {
   framework: "next" | "astro" | "tanstack-router" | "tanstack-start";
   pattern: string;
+  routeId?: string;
   absoluteFile: string;
   relativeFile: string;
   entryKind: string;
   generated: boolean;
   evidence: Evidence;
+}
+
+function routeTreeRootKey(entry: RouteEntry): string {
+  return entry.framework.startsWith("tanstack-") ? "__root__" : "/";
+}
+
+export function routeTreeKey(entry: RouteEntry): string {
+  if (entry.routeId !== undefined) return entry.routeId;
+  if (entry.framework.startsWith("tanstack-") && path.parse(entry.absoluteFile).name === "__root") return "__root__";
+  return entry.pattern;
+}
+
+export function routeParentKeys(entry: RouteEntry): string[] {
+  const key = routeTreeKey(entry);
+  const root = routeTreeRootKey(entry);
+  if (key === root) return [];
+  const segments = key.split("/").filter(Boolean);
+  if (!key.endsWith("/")) segments.pop();
+  const parents: string[] = [];
+  while (segments.length > 0) {
+    parents.push(`/${segments.join("/")}`);
+    segments.pop();
+  }
+  parents.push(root);
+  return parents;
 }
 
 export interface RouteDrift {
@@ -457,6 +483,14 @@ function tanstackFilesystemPattern(parts: string[]): string {
   return normalizePattern(segments);
 }
 
+function tanstackRouteUrl(routeId: string): string {
+  const segments = routeId.split("/")
+    .filter((segment) => !segment.startsWith("_") && !/^\(.*\)$/u.test(segment))
+    .map((segment) => segment.replace(/_$/u, ""));
+  const pattern = normalizePattern(segments);
+  return pattern !== "/" && routeId.endsWith("/") ? `${pattern}/` : pattern;
+}
+
 function literalGeneratedRoutes(source: string, relativeFile: string): Array<{ pattern: string; evidence: Evidence }> {
   const result: Array<{ pattern: string; evidence: Evidence }> = [];
   function add(startOffset: number, endOffset: number, pattern: string, detail: string): void {
@@ -514,7 +548,8 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
     const explicit = source === null ? [] : literalGeneratedRoutes(source, relativeFile).filter((item) => item.evidence.detail === "source_route_literal");
     const patterns = explicit.length > 0 ? explicit : [{ pattern: tanstackFilesystemPattern(rootMatch), evidence: evidence(relativeFile, "tanstack-filesystem-routes") }];
     for (const item of patterns) {
-      const pattern = withBasePath(config.tanstackBasePath, item.pattern);
+      const routeId = item.evidence.detail === "source_route_literal" ? item.pattern : undefined;
+      const pattern = withBasePath(config.tanstackBasePath, routeId === undefined ? item.pattern : tanstackRouteUrl(routeId));
       const routeEvidence = item.evidence.kind === "build"
         ? { ...item.evidence, kind: "source" as const, extractor: "tanstack-file-route-literal" }
         : item.evidence;
@@ -523,6 +558,7 @@ async function discoverTanStack(record: PackageRecord, allFiles: string[], root:
       entries.push({
         framework,
         pattern,
+        ...(routeId === undefined ? {} : { routeId }),
         absoluteFile: file,
         relativeFile,
         entryKind: "file-route",
