@@ -581,7 +581,7 @@ jobs:
                     (["named_reexport", "namespace_reexport", "empty_reexport", "export_star"]
                       | index($primary.properties.occurrence_kind))
                   else
-                    (["type_reference", "heritage_type", "jsdoc_type"]
+                    (["type_reference", "type_query", "heritage_type", "jsdoc_type"]
                       | index($primary.properties.occurrence_kind))
                   end)
                   and (if $site.kind == "type_use"
@@ -1067,7 +1067,7 @@ jobs:
             $allowedOccurrences = switch ($site.kind) {
               'web_import' { @('named_import', 'default_import', 'namespace_import', 'side_effect_import', 'empty_import', 'import_equals', 'require_call', 'dynamic_import', 'import_type') }
               'web_reexport' { @('named_reexport', 'namespace_reexport', 'empty_reexport', 'export_star') }
-              'type_use' { @('type_reference', 'heritage_type', 'jsdoc_type') }
+              'type_use' { @('type_reference', 'type_query', 'heritage_type', 'jsdoc_type') }
               'call' { @('call_expression', 'new_expression', 'tagged_template') }
               default { @() }
             }
