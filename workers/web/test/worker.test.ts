@@ -320,8 +320,53 @@ test("worker emits deterministic protocol graph without executing project code",
   );
   assert.deepEqual(
     [...new Set(frameworkEdges.map((edge) => edge.kind))].sort(),
-    ["client_boundary", "parent_route", "renders", "route_entry", "server_boundary"],
+    ["client_boundary", "declared_in", "implemented_by", "parent_route", "renders", "route_entry", "server_boundary"],
   );
+  const codeLinkOccurrence = (node: Record<string, any>, suffix: "implementation" | "declaration"): string => {
+    const framework = node.properties.framework;
+    if (node.kind === "server_function") return `tanstack_start_server_function_${suffix}`;
+    if (framework === "next") return `next_component_${suffix}`;
+    if (framework === "astro") return `astro_component_${suffix}`;
+    return `tanstack_component_${suffix}`;
+  };
+  const implementationSources = allFrameworkNodes.filter((node) => node.kind === "component" || node.kind === "server_function");
+  assert.ok(implementationSources.some((node) => node.properties.framework === "next"));
+  assert.ok(implementationSources.some((node) => node.properties.framework === "astro" && node.properties.typescript_definition_id === undefined));
+  assert.ok(implementationSources.some((node) => node.properties.framework === "astro" && typeof node.properties.typescript_definition_id === "string"));
+  assert.ok(implementationSources.some((node) => node.properties.framework === "tanstack-router"));
+  assert.ok(implementationSources.some((node) => node.kind === "server_function"));
+  const assertAnchoredLink = (node: Record<string, any>, site: Record<string, any>, kind: string, suffix: "implementation" | "declaration") => {
+    assert.equal(site.resolution_status, "resolved", node.id);
+    assert.equal(site.precision, "exact", node.id);
+    assert.equal(site.target_ids.length, 1, node.id);
+    assert.equal(site.evidence[0]?.path, node.properties.source_path, node.id);
+    assert.equal(site.evidence[0]?.start_line, node.properties.source_span?.start_line, node.id);
+    assert.equal(site.evidence[0]?.properties.occurrence_kind, codeLinkOccurrence(node, suffix), node.id);
+    const linkEdges = allFrameworkEdges.filter((edge) => edge.site_id === site.id);
+    assert.equal(linkEdges.length, 1, node.id);
+    assert.equal(linkEdges[0]?.kind, kind, node.id);
+    assert.equal(linkEdges[0]?.environment, node.properties.environment, node.id);
+  };
+  for (const node of implementationSources) {
+    const definitionId = node.properties.typescript_definition_id;
+    const implementationSites = allFrameworkSites.filter((site) => site.kind === "implemented_by" && site.source === node.id);
+    assert.equal(implementationSites.length, typeof definitionId === "string" ? 1 : 0, node.id);
+    for (const site of implementationSites) {
+      const target = nodeById.get(site.target_ids[0]);
+      assert.equal(target?.id, definitionId, node.id);
+      assert.equal(target?.kind, "symbol", node.id);
+      assert.equal(site.specifier, target?.display_name, node.id);
+      assertAnchoredLink(node, site, "implemented_by", "implementation");
+    }
+    const declarationSites = allFrameworkSites.filter((site) => site.kind === "declared_in" && site.source === node.id);
+    assert.equal(declarationSites.length, 1, node.id);
+    const declaration = declarationSites[0]!;
+    const file = nodeById.get(declaration.target_ids[0]);
+    assert.equal(file?.kind, "file", node.id);
+    assert.equal(file?.properties.path, node.properties.source_path, node.id);
+    assert.equal(declaration.specifier, node.properties.source_path, node.id);
+    assertAnchoredLink(node, declaration, "declared_in", "declaration");
+  }
   const productRoute = frameworkNodes.find((node) => (
     node.kind === "route"
     && node.properties.canonical_identity?.router_instance?.endsWith(":app")
@@ -427,7 +472,7 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.deepEqual([...new Set(astroNodes.map((node) => node.kind))].sort(), ["component", "route"]);
   assert.deepEqual(
     [...new Set(astroEdges.map((edge) => edge.kind))].sort(),
-    ["client_boundary", "handled_by", "hydrates", "loads", "renders", "route_entry", "server_boundary"],
+    ["client_boundary", "declared_in", "handled_by", "hydrates", "implemented_by", "loads", "renders", "route_entry", "server_boundary"],
   );
   const astroPage = astroNodes.find((node) => (
     node.kind === "component"
@@ -534,7 +579,7 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.deepEqual([...new Set(tanstackNodes.map((node) => node.kind))].sort(), ["component", "route"]);
   assert.deepEqual(
     [...new Set(tanstackEdges.map((edge) => edge.kind))].sort(),
-    ["before_load", "loads", "masks_to", "navigates_to", "parent_route", "renders", "route_entry"],
+    ["before_load", "declared_in", "implemented_by", "loads", "masks_to", "navigates_to", "parent_route", "renders", "route_entry"],
   );
   const tanstackRoute = (pattern: string, routeKind: string) => tanstackNodes.find((node) => (
     node.kind === "route"

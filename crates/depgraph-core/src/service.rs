@@ -754,7 +754,9 @@ pub enum DepgraphServiceError {
         #[source]
         source: anyhow::Error,
     },
-    #[error("graph query is invalid: {source}")]
+    // The source is exposed through `#[source]`; interpolating it here as well
+    // would print the selector diagnostic twice in `{error:#}` chains.
+    #[error("graph query is invalid")]
     GraphQuery {
         #[source]
         source: anyhow::Error,

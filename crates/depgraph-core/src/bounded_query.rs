@@ -1892,7 +1892,7 @@ mod tests {
     fn parses_the_normative_single_statement_into_a_closed_canonical_ast() {
         let ast = parse_bounded_query(
             r#"
-            match p = (source:"route")-["renders"|"calls"|"imports"*1..4]->(target:"external_system")
+            match p = (source:"route")-["renders"|"implemented_by"|"calls"|"imports"*1..5]->(target:"external_system")
             where source.locator starts with "route:"
               and every edge in edges(p) satisfies
                   edge.phase in ["semantic", "build", "runtime"]
@@ -1914,10 +1914,10 @@ mod tests {
         );
         assert_eq!(
             ast.match_clause.relationship.kinds,
-            ["calls", "imports", "renders"]
+            ["calls", "implemented_by", "imports", "renders"]
         );
         assert_eq!(ast.match_clause.relationship.min_depth, 1);
-        assert_eq!(ast.match_clause.relationship.max_depth, 4);
+        assert_eq!(ast.match_clause.relationship.max_depth, 5);
         assert_eq!(ast.return_clause.projections.len(), 3);
         assert_eq!(ast.order_by.len(), 3);
         assert_eq!(ast.limit, 200);

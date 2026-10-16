@@ -5983,7 +5983,10 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
         .code(2)
         .stderr(predicate::str::contains("is ambiguous"))
         .stderr(predicate::str::contains("file://src/shared-one.go"))
-        .stderr(predicate::str::contains("file://src/shared-two.go"));
+        .stderr(predicate::str::contains("file://src/shared-two.go"))
+        .stderr(predicate::function(|stderr: &str| {
+            stderr.matches("is ambiguous").count() == 1
+        }));
 
     let explicit = Command::cargo_bin("depgraph")
         .unwrap()
@@ -6045,7 +6048,10 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("did not match any node"));
+        .stderr(predicate::str::contains("did not match any node"))
+        .stderr(predicate::function(|stderr: &str| {
+            stderr.matches("did not match any node").count() == 1
+        }));
 }
 
 #[cfg(unix)]
@@ -7762,4 +7768,169 @@ fn issue_438_health_audit_cli_missing_base_keeps_placeholders_blast_and_digest_s
             .iter()
             .any(|finding| finding["kind"] == "wide-blast-radius")
     );
+}
+
+/// The bundled Web worker and a Node.js >= 24 runtime are build products of
+/// `workers/web`; `cargo test` alone does not produce them.
+fn web_worker_for_e2e() -> Option<PathBuf> {
+    let worker = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/web/dist/worker.mjs");
+    if !worker.is_file() {
+        eprintln!("skipping Web E2E: {} is not built", worker.display());
+        return None;
+    }
+    let version = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let major = version
+        .as_deref()
+        .and_then(|value| value.strip_prefix('v'))
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u32>().ok());
+    if major.is_none_or(|major| major < 24) {
+        eprintln!("skipping Web E2E: Node.js >= 24 is required, found {version:?}");
+        return None;
+    }
+    Some(worker)
+}
+
+fn write_next_checkout_project(root: &Path) {
+    fs::create_dir_all(root.join("src/lib")).unwrap();
+    fs::create_dir_all(root.join("src/app/checkout")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"checkout-e2e","version":"0.1.0","private":true,"dependencies":{"next":"15.0.0","react":"19.0.0","react-dom":"19.0.0","stripe":"18.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"target":"ES2022","module":"esnext","moduleResolution":"bundler","jsx":"preserve","strict":true},"include":["src/**/*.ts","src/**/*.tsx"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib/payment.ts"),
+        "import Stripe from \"stripe\";\n\nconst stripe = new Stripe(\"\");\n\nexport async function charge(amount: number): Promise<string> {\n  const intent = await stripe.paymentIntents.create({ amount, currency: \"jpy\" });\n  return intent.id;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib/cart.ts"),
+        "import { charge } from \"./payment\";\n\nexport async function checkout(total: number): Promise<string> {\n  return charge(total);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/app/checkout/page.tsx"),
+        "import { checkout } from \"../../lib/cart\";\n\nexport default async function CheckoutPage() {\n  const id = await checkout(1000);\n  return <main>Payment {id}</main>;\n}\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn next_semantic_route_reaches_and_is_impacted_by_implementation_symbols() {
+    let Some(worker) = web_worker_for_e2e() else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_next_checkout_project(root.path());
+    let store = cache.path().join("graph.sqlite");
+    let depgraph = |arguments: &[&str]| {
+        let mut command = Command::cargo_bin("depgraph").unwrap();
+        command
+            .env("DEPGRAPH_WEB_WORKER", &worker)
+            .arg("--store")
+            .arg(&store)
+            .args(arguments);
+        command.assert().success().get_output().stdout.clone()
+    };
+    depgraph(&["scan", root.path().to_str().unwrap()]);
+
+    let why: serde_json::Value = serde_json::from_slice(&depgraph(&[
+        "why",
+        "route:next:app:page:/checkout",
+        "symbol:charge",
+        "--json",
+    ]))
+    .unwrap();
+    let path = &why["data"];
+    assert_eq!(path["path_found"], true, "{why:#}");
+    let kinds: Vec<&str> = path["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["edge"]["kind"].as_str().unwrap())
+        .collect();
+    // implemented_by -> calls and declared_in -> imports are equally short.
+    assert_eq!(kinds.len(), 4, "{why:#}");
+    assert_eq!(kinds[0], "renders", "{why:#}");
+    assert!(
+        matches!(kinds[1], "implemented_by" | "declared_in"),
+        "{why:#}"
+    );
+
+    let why_definition: serde_json::Value = serde_json::from_slice(&depgraph(&[
+        "why",
+        "route:next:app:page:/checkout",
+        "symbol:CheckoutPage",
+        "--json",
+    ]))
+    .unwrap();
+    let definition_kinds: Vec<&str> = why_definition["data"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["edge"]["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        definition_kinds,
+        ["renders", "implemented_by"],
+        "{why_definition:#}"
+    );
+
+    let impact: serde_json::Value =
+        serde_json::from_slice(&depgraph(&["impact", "symbol:charge", "--json"])).unwrap();
+    let impacted_kinds: Vec<&str> = impact["data"]["impacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["node"]["kind"].as_str())
+        .collect();
+    assert!(impacted_kinds.contains(&"component"), "{impact:#}");
+    assert!(impacted_kinds.contains(&"route"), "{impact:#}");
+
+    // A module-level import is file-sourced; declared_in links the component
+    // to its declaring file so the route reaches the external package.
+    let why_package: serde_json::Value = serde_json::from_slice(&depgraph(&[
+        "why",
+        "route:next:app:page:/checkout",
+        "package:stripe",
+        "--json",
+    ]))
+    .unwrap();
+    let package_path = &why_package["data"];
+    assert_eq!(package_path["path_found"], true, "{why_package:#}");
+    let package_kinds: Vec<&str> = package_path["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["edge"]["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(package_kinds.first(), Some(&"renders"), "{why_package:#}");
+    assert!(package_kinds.contains(&"declared_in"), "{why_package:#}");
+
+    let file_impact: serde_json::Value =
+        serde_json::from_slice(&depgraph(&["impact", "path:src/lib/payment.ts", "--json"]))
+            .unwrap();
+    let file_impacted_kinds: Vec<&str> = file_impact["data"]["impacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["node"]["kind"].as_str())
+        .collect();
+    assert!(
+        file_impacted_kinds.contains(&"component"),
+        "{file_impact:#}"
+    );
+    assert!(file_impacted_kinds.contains(&"route"), "{file_impact:#}");
 }

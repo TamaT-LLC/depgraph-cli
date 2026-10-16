@@ -131,7 +131,7 @@ const FRAMEWORK_SITE_KINDS = new Set([
   "renders", "hydrates", "client_boundary", "server_boundary",
   "route_entry", "parent_route", "loads", "before_load",
   "navigates_to", "masks_to", "rpc_call", "client_stub_for",
-  "handled_by", "uses_middleware",
+  "handled_by", "uses_middleware", "implemented_by", "declared_in",
 ]);
 const CANDIDATE_SITE_KINDS = new Set([
   "renders", "parent_route", "loads", "before_load", "navigates_to",
@@ -143,6 +143,229 @@ const EXTRACTOR_BY_FRAMEWORK = new Map([
   ["tanstack-router", "tanstack-router-static-adapter"],
   ["tanstack-start", "tanstack-start-static-adapter"],
 ] as const);
+
+export const FRAMEWORK_IMPLEMENTATION_KIND = "implemented_by" as const;
+export const FRAMEWORK_DECLARATION_KIND = "declared_in" as const;
+/** Framework abstraction -> code links (system design §7.5.1). */
+export type FrameworkCodeLinkKind = typeof FRAMEWORK_IMPLEMENTATION_KIND | typeof FRAMEWORK_DECLARATION_KIND;
+const CODE_LINK_SOURCE_KINDS = new Set(["component", "server_function"]);
+const CODE_LINK_OCCURRENCE_SUFFIX: Readonly<Record<FrameworkCodeLinkKind, string>> = {
+  [FRAMEWORK_IMPLEMENTATION_KIND]: "implementation",
+  [FRAMEWORK_DECLARATION_KIND]: "declaration",
+};
+
+function isCodeLinkKind(kind: string): kind is FrameworkCodeLinkKind {
+  return kind === FRAMEWORK_IMPLEMENTATION_KIND || kind === FRAMEWORK_DECLARATION_KIND;
+}
+
+type FrameworkSpan = FrameworkSemanticRelationInput["span"];
+
+const CODE_LINK_OCCURRENCE_PREFIX: ReadonlyMap<string, string> = new Map([
+  ["server_function:tanstack-start", "tanstack_start_server_function"],
+  ["component:next", "next_component"],
+  ["component:astro", "astro_component"],
+  ["component:tanstack-router", "tanstack_component"],
+  ["component:tanstack-start", "tanstack_component"],
+]);
+
+/** Fixed primary occurrence kind for an implemented_by / declared_in site (system design §7.5.1). */
+export function frameworkCodeLinkOccurrenceKind(source: GraphNode, kind: FrameworkCodeLinkKind): string | null {
+  const prefix = CODE_LINK_OCCURRENCE_PREFIX.get(`${source.kind}:${String(source.properties.framework)}`);
+  return prefix === undefined ? null : `${prefix}_${CODE_LINK_OCCURRENCE_SUFFIX[kind]}`;
+}
+
+const SPAN_FIELDS = ["start_line", "start_column", "end_line", "end_column"] as const;
+
+function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPositiveInteger(value: JsonValue | undefined): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 1;
+}
+
+export function frameworkNodeSpan(source: GraphNode): FrameworkSpan | null {
+  const raw = source.properties.source_span;
+  if (!isJsonObject(raw)) return null;
+  if (!SPAN_FIELDS.every((field) => isPositiveInteger(raw[field]))) return null;
+  return {
+    start_line: Number(raw.start_line),
+    start_column: Number(raw.start_column),
+    end_line: Number(raw.end_line),
+    end_column: Number(raw.end_column),
+  };
+}
+
+function codeLinkCondition(environment: string): Condition {
+  return canonicalizeCondition({
+    op: "all",
+    conditions: [
+      { op: "eq", key: "mode", value: "production" },
+      { op: "eq", key: "environment", value: environment },
+    ],
+  });
+}
+
+export interface FrameworkCodeLinkRelation {
+  readonly kind: FrameworkCodeLinkKind;
+  readonly specifier: string;
+  readonly relativePath: string;
+  readonly span: FrameworkSpan;
+  readonly condition: Condition;
+  readonly environment: string;
+  readonly occurrenceKind: string;
+}
+
+/**
+ * Derive a code link of a component or server function: implemented_by targets
+ * its typescript_definition_id symbol (present only when that property is a
+ * string), declared_in targets the repository file at its source_path.
+ */
+export function frameworkCodeLinkRelation(
+  kind: FrameworkCodeLinkKind,
+  source: GraphNode,
+  target: GraphNode,
+): FrameworkCodeLinkRelation {
+  const problem = codeLinkProblem(kind, source, target);
+  if (problem !== null) throw new Error(`${source.id} ${kind} ${problem}`);
+  const sourcePath = source.properties.source_path as string;
+  const environment = source.properties.environment as string;
+  return {
+    kind,
+    specifier: kind === FRAMEWORK_DECLARATION_KIND ? sourcePath : target.display_name,
+    relativePath: sourcePath,
+    span: frameworkNodeSpan(source)!,
+    condition: codeLinkCondition(environment),
+    environment,
+    occurrenceKind: frameworkCodeLinkOccurrenceKind(source, kind)!,
+  };
+}
+
+type CodeLinkCheck = readonly [(source: GraphNode) => boolean, string];
+
+const SOURCE_CHECKS: readonly CodeLinkCheck[] = [
+  [(source) => CODE_LINK_SOURCE_KINDS.has(source.kind), "source must be a component or server_function"],
+  [(source) => {
+    const sourcePath = source.properties.source_path;
+    return typeof sourcePath === "string" && sourcePath.length > 0;
+  }, "source lacks source_path"],
+  [(source) => frameworkNodeSpan(source) !== null, "source lacks a complete source_span"],
+  [(source) => typeof source.properties.environment === "string", "source lacks environment"],
+];
+
+function sourceProblem(source: GraphNode): string | null {
+  return SOURCE_CHECKS.find(([passes]) => !passes(source))?.[1] ?? null;
+}
+
+function implementationTargetProblem(source: GraphNode, target: GraphNode): string | null {
+  const definitionId = source.properties.typescript_definition_id;
+  if (typeof definitionId !== "string") return "requires a string typescript_definition_id on its source";
+  if (target.kind === "symbol" && target.id === definitionId) return null;
+  return `target ${target.id} must be the typescript_definition_id symbol ${definitionId}`;
+}
+
+function declarationTargetProblem(source: GraphNode, target: GraphNode): string | null {
+  const sourcePath = String(source.properties.source_path);
+  if (target.kind === "file" && target.properties.path === sourcePath) return null;
+  return `target ${target.id} must be the declaring file ${sourcePath}`;
+}
+
+function targetProblem(kind: FrameworkCodeLinkKind, source: GraphNode, target: GraphNode): string | null {
+  return kind === FRAMEWORK_IMPLEMENTATION_KIND
+    ? implementationTargetProblem(source, target)
+    : declarationTargetProblem(source, target);
+}
+
+function occurrenceProblem(kind: FrameworkCodeLinkKind, source: GraphNode): string | null {
+  if (frameworkCodeLinkOccurrenceKind(source, kind) !== null) return null;
+  return `has no occurrence_kind for ${String(source.properties.framework)} ${source.kind}`;
+}
+
+function codeLinkProblem(kind: FrameworkCodeLinkKind, source: GraphNode, target: GraphNode): string | null {
+  return sourceProblem(source) ?? targetProblem(kind, source, target) ?? occurrenceProblem(kind, source);
+}
+
+/** How a collector emits code links into its own site / edge maps. */
+export interface FrameworkCodeLinkEmitter {
+  readonly store: FrameworkSemanticRelationStore;
+  readonly profileId: string;
+  readonly fileNode: (relativePath: string) => GraphNode | null;
+  readonly evidence: (relativePath: string, span: FrameworkSpan, occurrenceKind: string) => Evidence[];
+  readonly subject: string;
+}
+
+export function frameworkCodeLinkEmitter(
+  store: FrameworkSemanticRelationStore,
+  profileId: string,
+  fileNode: FrameworkCodeLinkEmitter["fileNode"],
+  evidence: FrameworkCodeLinkEmitter["evidence"],
+  subject: string,
+): FrameworkCodeLinkEmitter {
+  return { store, profileId, fileNode, evidence, subject };
+}
+
+/**
+ * Emit the code links of a component / server function: implemented_by to its
+ * definition symbol when there is one, and always declared_in to its file.
+ */
+export function emitFrameworkCodeLinks(emitter: FrameworkCodeLinkEmitter, source: GraphNode, symbol: GraphNode | null): void {
+  for (const [kind, target] of codeLinkTargets(symbol, inventoryFileFor(emitter, source))) {
+    const relation = frameworkCodeLinkRelation(kind, source, target);
+    emitFrameworkSemanticRelation(
+      emitter.store,
+      {
+        source, targets: [target], kind, specifier: relation.specifier,
+        relativePath: relation.relativePath, span: relation.span, condition: relation.condition,
+        environment: relation.environment, profileId: emitter.profileId, resolutionStatus: "resolved",
+        precision: null, reason: null,
+        evidence: emitter.evidence(relation.relativePath, relation.span, relation.occurrenceKind), generated: false,
+      },
+      { conflictSubject: emitter.subject, emptyTargetSubject: `${emitter.subject} ${kind}` },
+    );
+  }
+}
+
+function inventoryFileFor(emitter: FrameworkCodeLinkEmitter, source: GraphNode): GraphNode {
+  const sourcePath = source.properties.source_path;
+  const file = typeof sourcePath === "string" ? emitter.fileNode(sourcePath) : null;
+  if (!file) throw new Error(`${emitter.subject} ${source.id} has no inventory file ${String(sourcePath)}`);
+  return file;
+}
+
+function codeLinkTargets(symbol: GraphNode | null, file: GraphNode): Array<[FrameworkCodeLinkKind, GraphNode]> {
+  const links: Array<[FrameworkCodeLinkKind, GraphNode]> = [[FRAMEWORK_DECLARATION_KIND, file]];
+  if (symbol) links.unshift([FRAMEWORK_IMPLEMENTATION_KIND, symbol]);
+  return links;
+}
+
+function isAnchoredAt(primary: Evidence, expected: FrameworkCodeLinkRelation): boolean {
+  return primary.path === expected.relativePath && SPAN_FIELDS.every((field) => primary[field] === expected.span[field]);
+}
+
+function codeLinkSiteMismatch(site: DependencySite, primary: Evidence, expected: FrameworkCodeLinkRelation): string | null {
+  const mismatches: ReadonlyArray<readonly [boolean, string]> = [
+    [primary.properties?.occurrence_kind !== expected.occurrenceKind, `occurrence_kind must be ${expected.occurrenceKind}`],
+    [site.specifier !== expected.specifier, `specifier must be ${expected.specifier}`],
+    [!isAnchoredAt(primary, expected), "must be anchored at the source declaration"],
+    [
+      JSON.stringify(canonicalizeCondition(site.condition)) !== JSON.stringify(expected.condition),
+      "condition must be the source environment",
+    ],
+  ];
+  return mismatches.find(([mismatched]) => mismatched)?.[1] ?? null;
+}
+
+function codeLinkSiteFailure(site: DependencySite & { kind: FrameworkCodeLinkKind }, source: GraphNode, target: GraphNode, primary: Evidence): string | null {
+  if (site.resolution_status !== "resolved") return "must be resolved";
+  const problem = codeLinkProblem(site.kind, source, target);
+  if (problem !== null) return problem;
+  return codeLinkSiteMismatch(site, primary, frameworkCodeLinkRelation(site.kind, source, target));
+}
+
+function validateCodeLinkSite(site: DependencySite & { kind: FrameworkCodeLinkKind }, source: GraphNode, target: GraphNode, primary: Evidence): void {
+  const failure = codeLinkSiteFailure(site, source, target, primary);
+  if (failure !== null) throw new Error(`${site.id} ${site.kind} ${failure}`);
+}
 
 export interface FrameworkSemanticDelta {
   nodes: GraphNode[];
@@ -388,6 +611,7 @@ function validSourceKind(kind: string, source: GraphNode): boolean {
   if (["navigates_to", "masks_to", "rpc_call"].includes(kind)) return ["component", "route", "symbol"].includes(source.kind);
   if (kind === "client_stub_for") return source.kind === "symbol";
   if (kind === "handled_by" || kind === "uses_middleware") return source.kind === "route" || source.kind === "server_function";
+  if (isCodeLinkKind(kind)) return CODE_LINK_SOURCE_KINDS.has(source.kind);
   return false;
 }
 
@@ -399,6 +623,8 @@ function validTargetKind(kind: string, target: GraphNode): boolean {
   if (kind === "rpc_call" || kind === "client_stub_for") return target.kind === "server_function";
   if (kind === "handled_by") return target.kind === "symbol";
   if (kind === "uses_middleware") return target.kind === "middleware";
+  if (kind === FRAMEWORK_IMPLEMENTATION_KIND) return target.kind === "symbol";
+  if (kind === FRAMEWORK_DECLARATION_KIND) return target.kind === "file";
   return false;
 }
 
@@ -422,6 +648,7 @@ function validateSite(site: DependencySite, nodes: ReadonlyMap<string, GraphNode
     if (site.resolution_status === "external" ? target.kind !== "external_system"
       : site.resolution_status === "unresolved" ? target.kind !== "unknown_target"
         : !validTargetKind(site.kind, target)) throw new Error(`${site.id} has an incompatible target ${targetId}`);
+    if (isCodeLinkKind(site.kind)) validateCodeLinkSite(site as DependencySite & { kind: FrameworkCodeLinkKind }, source, target, primary);
   }
   const expectedId = stableId("site", {
     condition: canonicalizeCondition(site.condition), kind: site.kind, path: primary.path,
@@ -438,6 +665,9 @@ function validateEdge(edge: GraphEdge, site: DependencySite, nodes: ReadonlyMap<
   if (edge.resolution_status !== site.resolution_status || edge.precision !== site.precision) throw new Error(`${edge.id} resolution does not match its site`);
   if (JSON.stringify(canonicalizeCondition(edge.condition)) !== JSON.stringify(canonicalizeCondition(site.condition))) throw new Error(`${edge.id} condition does not match its site`);
   if (edge.environment === "any" || !conditionAllowsEnvironment(edge.condition, edge.environment)) throw new Error(`${edge.id} environment is not allowed by its condition`);
+  if (isCodeLinkKind(edge.kind) && edge.environment !== nodes.get(edge.source)?.properties.environment) {
+    throw new Error(`${edge.id} ${edge.kind} environment must match its source`);
+  }
   if (JSON.stringify(edge.evidence) !== JSON.stringify(site.evidence)) throw new Error(`${edge.id} evidence does not match its site`);
   validateEvidence(edge.evidence, options.profileId, edge.id);
   for (const endpointId of [edge.source, edge.target]) {
@@ -449,6 +679,46 @@ function validateEdge(edge: GraphEdge, site: DependencySite, nodes: ReadonlyMap<
   }
   const expectedId = stableId("edge", { kind: edge.kind, site_id: site.id, target: edge.target });
   if (edge.id !== expectedId) throw new Error(`${edge.id} does not match edge identity ${expectedId}`);
+}
+
+/**
+ * Every component / server_function in the delta has exactly one declared_in
+ * site, and exactly one implemented_by site iff it has a typescript_definition_id.
+ */
+function countCodeLinkSites(sites: ReadonlyMap<string, DependencySite>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const site of sites.values()) {
+    if (!isCodeLinkKind(site.kind)) continue;
+    const key = `${site.kind}\0${site.source}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function expectedCodeLinkCounts(delta: FrameworkSemanticDelta, counts: ReadonlyMap<string, number>): Map<string, number> {
+  const expected = new Map<string, number>();
+  for (const key of counts.keys()) expected.set(key, 1);
+  for (const node of delta.nodes.filter((candidate) => CODE_LINK_SOURCE_KINDS.has(candidate.kind))) {
+    expected.set(`${FRAMEWORK_DECLARATION_KIND}\0${node.id}`, 1);
+    expected.set(
+      `${FRAMEWORK_IMPLEMENTATION_KIND}\0${node.id}`,
+      typeof node.properties.typescript_definition_id === "string" ? 1 : 0,
+    );
+  }
+  return expected;
+}
+
+function codeLinkClosureError(key: string, expectedCount: number, found: number): Error {
+  const [kind, source] = key.split("\0");
+  return new Error(`${source} must have exactly ${expectedCount === 1 ? "one" : "zero"} ${kind} site, found ${found}`);
+}
+
+function validateCodeLinkClosure(delta: FrameworkSemanticDelta, sites: ReadonlyMap<string, DependencySite>): void {
+  const counts = countCodeLinkSites(sites);
+  for (const [key, count] of expectedCodeLinkCounts(delta, counts)) {
+    const found = counts.get(key) ?? 0;
+    if (found !== count) throw codeLinkClosureError(key, count, found);
+  }
 }
 
 /** Validate a complete framework semantic delta before swapping cloned maps into the live graph. */
@@ -490,5 +760,6 @@ export function mergeFrameworkSemanticDelta(
       throw new Error(`${site.id} target set does not match its edge closure`);
     }
   }
+  validateCodeLinkClosure(delta, sites);
   return { nodes, sites, edges };
 }
