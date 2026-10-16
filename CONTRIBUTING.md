@@ -86,6 +86,40 @@ approval. The organization owner's recorded emergency bypass does not waive
 required CI or history protection. All required CI must be green and every
 review conversation resolved before merge.
 
+## Performance benchmark
+
+The reproducible performance gate uses pinned toolchains and deterministically
+generated fixtures.
+
+```sh
+scripts/benchmark-mvp.sh
+```
+
+The benchmark creates fixtures with 100, 1,000, and 10,000 source files plus a
+31-source-file Rust HIR fixture. Results are written to
+`dist/benchmark-report.json` and `dist/cache-hit-benchmark-report.json`. It
+measures cold scans, one-file incremental scans, impact queries, semantic cache
+hits, and cold and warm Rust HIR runs. Each fixture must preserve canonical
+graph and coverage equivalence, and the median cache hit must be at least 5%
+faster.
+
+## Documentation layout
+
+The README files are short entry points. User guides live in `docs/guide/` as
+Japanese (`*.md`) and English (`*.en.md`) pairs, and detailed contracts live in
+`docs/reference/`. Every `depgraph` command line in `docs/guide/usage.md` must
+also appear in `docs/guide/usage.en.md`; `cargo xtask test` checks this and
+the other shared release metadata.
+
+## Repository layout
+
+- `crates/depgraph-protocol`: typed protocol, canonical conditions/IDs, JSON Schema, and state-machine validation
+- `crates/depgraph-store`: SQLite migrations, immutable scan staging, ledger, and evidence persistence
+- `crates/depgraph-rustc-wrapper`: attested all-unit rustc wrapper and bounded start/terminal ledger emitter
+- `crates/depgraph-core` / `crates/depgraph-cli`: worker supervision, queries, export, doctor, and CLI UX
+- `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
+- `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
+
 ## Developer Certificate of Origin
 
 This project uses the [Developer Certificate of Origin 1.1](https://developercertificate.org/)
