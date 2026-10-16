@@ -26,6 +26,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
   frameworkEnvironmentCondition as condition,
+  emitFrameworkCodeLinks,
+  frameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -258,6 +260,7 @@ function serverFunctionNode(
   method: string,
   handler: GraphNode | null,
   validator: GraphNode | null,
+  declarationSpan: Span,
 ): GraphNode | null {
   const semanticResolver = symbol?.properties.resolver_identity;
   const resolverIdentity = typeof semanticResolver === "string" && semanticResolver.length > 0
@@ -287,7 +290,9 @@ function serverFunctionNode(
       canonical_identity: canonicalIdentity,
       resolver_identity: resolverIdentity,
       source_path: relativePath,
-      source_span: symbol?.properties.source_span ?? null,
+      // Static identities have no TypeScript symbol span; the declaration
+      // anchors their declared_in site instead.
+      source_span: symbol?.properties.source_span ?? declarationSpan,
       typescript_definition_id: symbol?.id ?? null,
       static_definition_identity: symbol === null,
       http_method: method,
@@ -489,6 +494,7 @@ export function collectTanStackStartSemanticDelta(
     );
   };
 
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), evidence, "TanStack Start collector");
   const definitionsByPath = new Map<string, TypeScriptRawDefinition[]>();
   for (const definition of input.definitions.definitions) {
     if (definition.graphKind !== "symbol") continue;
@@ -611,7 +617,9 @@ export function collectTanStackStartSemanticDelta(
         const handler = handlerDefinition ? input.definitionNode(handlerDefinition.key) : null;
         const validator = validatorDefinition ? input.definitionNode(validatorDefinition.key) : null;
         const method = (literal(propertyExpression(options, "method")) ?? "GET").toUpperCase();
-        const semanticNode = serverFunctionNode(owner, symbol, relativePath, declaration.name.text, method, handler, validator);
+        const semanticNode = serverFunctionNode(
+          owner, symbol, relativePath, declaration.name.text, method, handler, validator, spanFor(source, declaration),
+        );
         if (!semanticNode) continue;
         const middlewareReferences: ServerFunctionDeclaration["middleware"] = [];
         const middlewareArgument = middlewareStep?.arguments[0];
@@ -633,6 +641,7 @@ export function collectTanStackStartSemanticDelta(
           middleware: middlewareReferences,
           node: addNode(semanticNode),
         };
+        emitFrameworkCodeLinks(codeLinks, item.node, symbol);
         serverFunctions.set(`${relativePath}\0${item.name}`, item);
       }
     }

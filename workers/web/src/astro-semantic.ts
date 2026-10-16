@@ -11,6 +11,9 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
+  emitFrameworkCodeLinks,
+  frameworkCodeLinkEmitter,
+  frameworkNodeSpan,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import {
@@ -157,21 +160,6 @@ function entrySpan(entry: RouteEntry): Span {
     start_column: entry.evidence.start_column,
     end_line: entry.evidence.end_line,
     end_column: entry.evidence.end_column,
-  };
-}
-
-function spanFromNode(node: GraphNode): Span | null {
-  const raw = node.properties.source_span;
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const value = raw as Record<string, JsonValue>;
-  if (!["start_line", "start_column", "end_line", "end_column"].every((field) => (
-    Number.isSafeInteger(value[field]) && Number(value[field]) >= 1
-  ))) return null;
-  return {
-    start_line: Number(value.start_line),
-    start_column: Number(value.start_column),
-    end_line: Number(value.end_line),
-    end_column: Number(value.end_column),
   };
 }
 
@@ -681,6 +669,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
     );
   };
 
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), evidence, "Astro semantic collector");
   const componentCache = new Map<string, GraphNode>();
   const componentForFile = (relativePath: string, environment: string): GraphNode => {
     const key = `file\0${relativePath}\0${environment}`;
@@ -692,6 +681,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
       environment,
       input.sources.get(relativePath),
     ));
+    emitFrameworkCodeLinks(codeLinks, component, null);
     componentCache.set(key, component);
     return component;
   };
@@ -704,6 +694,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
     const component = symbolComponent(symbol, environment);
     if (!component) return null;
     const added = addNode(component);
+    emitFrameworkCodeLinks(codeLinks, added, symbol);
     componentCache.set(cacheKey, added);
     return added;
   };
@@ -736,7 +727,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
       for (const { method, key } of handlers) {
         const symbol = input.definitionNode(key);
         if (!symbol) continue;
-        const span = spanFromNode(symbol) ?? entrySpan(entry);
+        const span = frameworkNodeSpan(symbol) ?? entrySpan(entry);
         const condition = astroCondition(preferredWebEnvironment("server"), null, { "astro.method": method });
         addRelation(
           symbol, [route], "route_entry", entry.pattern, entry.relativeFile, span,

@@ -7,7 +7,7 @@ status: Active
 upstream: []
 downstream: []
 owner: TakehiroT
-updated: 2026-09-13
+updated: 2026-10-16
 ---
 
 > 2026-08-13: Issue #355として、GitHub上で公開済みなのは
@@ -408,6 +408,7 @@ terminal attemptとdelta staging rowは既存GCでcascade削除する。1-file d
 | UI | `renders`, `hydrates`, `client_boundary`, `server_boundary` |
 | Routing | `route_entry`, `parent_route`, `loads`, `before_load`, `navigates_to`, `masks_to` |
 | RPC | `rpc_call`, `client_stub_for`, `handled_by`, `uses_middleware` |
+| Implementation | `implemented_by`, `declared_in` |
 | Build | `expands`, `generates`, `links`, `emits`, `bundles` |
 | Resource | `reads_env`, `reads_content`, `consumes_asset` |
 
@@ -548,6 +549,31 @@ framework dependency siteとedgeは同じkindを使用し、semantic site 1件�
 | `client_stub_for` | `symbol` | `server_function` | 不可 |
 | `handled_by` | `route` / `server_function` | `symbol` | 可 |
 | `uses_middleware` | `route` / `server_function` | `middleware` | 可 |
+| `implemented_by` | `component` / `server_function` | `symbol`（`typescript_definition_id`） | 不可 |
+| `declared_in` | `component` / `server_function` | 宣言`file`（`source_path`） | 不可 |
+
+`implemented_by`と`declared_in`は、framework抽象ノードをコード上の宣言へ結ぶ正規エッジ（以下code link）である。`component` / `server_function`は`properties.typescript_definition_id` / `source_path`で実装symbolと宣言fileを指すが、propertyはtraversal対象ではないため、edgeとして明示しなければ`route -renders-> component`より先へ進めない。2つのkindを分けるのは、site IDのcanonical input（source、kind、profile、condition、path、span）が同じanchorを共有するためで、同一kindではsite IDが衝突する。規約は次のとおりとする。
+
+- `implemented_by`のtargetは`typescript_definition_id`が指す`symbol`だけとする。sourceの`typescript_definition_id`が文字列ならちょうど1件、nullまたは欠落なら0件とし、fileへのfallbackは持たない。
+- `declared_in`のtargetは、sourceの`source_path`と同じnormalized pathを持つrepository `file`とする。全`component` / `server_function`がちょうど1件持つ。
+- 当初の`implemented_by`はsymbolを持たないsource（Astroの`.astro` / Markdown file component、TanStack Startのstatic identity `server_function`）に限り宣言fileをtargetにしていた。`declared_in`が常に宣言fileを指すため、このfallbackは同じ`component -> file`関係を別kindで重複させるだけになる。「implemented_byはsymbol、declared_inはfile」と1 kind 1 target kindに揃え、file fallbackを廃止した。
+- どちらもtargetをsourceから決定的に導出するため、`resolution_status=resolved`・`precision=exact`だけを許可し、`candidates` / `external` / `unresolved`は使用しない。
+- siteのanchorはsourceの`source_path` / `source_span`、conditionは`mode=production`とsourceの`environment`の`eq` predicateの`all`、edge `environment`はsourceの`environment`とする。specifierは`implemented_by`がtarget symbolの`display_name`、`declared_in`がnormalized `source_path`である。static identityの`server_function`はTypeScript symbolのspanを持たないため、`source_span`に`createServerFn`宣言のspanを保持してanchorに使う。
+- 検証は二段で行う。Web workerのframework semantic delta validatorは、delta内の全`component` / `server_function`について`declared_in`がちょうど1件、`implemented_by`が`typescript_definition_id`の有無に応じて1件または0件であることまで検査する。Rust protocol validatorはsite単位の規約（source / target kind、`typescript_definition_id`との一致と存在、`source_path`との一致、`resolved / exact`、specifier、anchor、`occurrence_kind`、edge environment）と、同一kind・同一profile・同一sourceのcode linkが2件以上ないことを検査する。存在（0件でないこと）はstream単位の再構成を跨ぐため、Rust側では要求しない。
+- primary evidenceの`occurrence_kind`は次に固定する。frameworkはsource nodeの`framework`と一致させる。
+
+| Source | framework | `implemented_by` | `declared_in` |
+| --- | --- | --- | --- |
+| `component` | `next` | `next_component_implementation` | `next_component_declaration` |
+| `component` | `astro` | `astro_component_implementation` | `astro_component_declaration` |
+| `component` | `tanstack-router` / `tanstack-start` | `tanstack_component_implementation` | `tanstack_component_declaration` |
+| `server_function` | `tanstack-start` | `tanstack_start_server_function_implementation` | `tanstack_start_server_function_declaration` |
+
+命名は既存の`next_route_entry` / `astro_route_entry` / `tanstack_route_component` / `tanstack_start_server_handler`に合わせ、kindごとに`_implementation` / `_declaration`を付ける。TanStack Routerのroute componentはStart packageでも同じcollectorが生成するため、既存と同じく`tanstack_`接頭辞を共有する。
+
+既存の`route_entry`（`component` / `server_function` -> `route`）の向きは互換性のため変更しない。code linkの追加により、`route -renders-> component -implemented_by-> symbol -calls|references|type_uses-> ... -> external_system`と`route -renders-> component -declared_in-> file -imports-> ... -> external_system`の前向き経路が成立する。Webの`imports`はsourceが`file`であるため、module-level import（`import Stripe from "stripe"`、side-effect importなど）だけを根拠とする外部依存へは`declared_in`経由で到達する。逆向きのimpactも、changed fileからは`imports`・`declared_in`・`renders`を、changed symbolからは`implemented_by`・`renders`を逆にたどってrouteへ至る。
+
+`implemented_by`は§7.6 Cross-language Contractのrelation vocabularyと同名であり、意味は「抽象ノード -> それを実装するコード上の宣言」で一致する（cross-languageでは`operation -> symbol / server_function`）。framework semantic contractでは上記の行列だけを許可する。`declared_in`は既存の`declares`（`file -> symbol`）の逆向きの語で、他のcontractのvocabularyとは衝突しない。
 
 resolution / precisionは共通semantic contractと同じく、`resolved / exact`、`candidates / overapprox`、`external / exact|heuristic`、`unresolved / heuristic + reason`に固定する。candidateを許可するkindではprimary evidenceに非空の`algorithm`も必須とする。site target IDはuniqueな昇順とし、site IDはcanonical condition、kind、normalized path、profile ID、source ID、1-origin source span、edge IDはkind、site ID、target IDから作る。
 
@@ -1001,6 +1027,7 @@ safe scan では、App / Pages Router の filesystem convention、special file�
 - App / Pages Routerのpage、layout、template、loading、error、special component、route handlerをcanonical `component` / `route`へ昇格する。route identityはframework、package locator、router instance、route kind、environment、canonical route patternに加え、存在するroute group、parallel slot、intercepting segmentを含める。dynamic / catch-all / optional catch-allはcanonical patternへ正規化する。
 - TypeCheckerのmodule export proofとinventory AST上のexport declaration spanを照合し、表示名やファイル名だけではcomponent identityを作らない。component identityはTypeCheckerのportable resolver identityを使用する。
 - `route_entry`、routeからcomponentへの`renders`、最深layoutへの`parent_route`をsemantic primary evidenceと同一anchorのsource supporting evidence付きで出力する。source-phase filesystem route graphは互換性のため別に保持する。
+- 全componentからTypeChecker definition symbolへの`implemented_by`（`next_component_implementation`）と、宣言fileへの`declared_in`（`next_component_declaration`）を出力する。
 - source prologueの`use client` / `use server`だけをboundary evidenceとして採用し、静的importのTypeChecker targetとJSX useが一致したときだけcross-component `client_boundary` / `server_boundary`を生成する。directiveのない既定Server/Client境界を推測しない。`use cache`とliteral `runtime` exportは`next.cache` / `next.runtime` conditionへ保持する。
 - `next/dynamic(() => import("literal"))`とstatic component importは既存TypeChecker import graphのcanonical targetへ相関する。完全かつ有限なtarget集合だけを`resolved`またはalgorithm付き`candidates`とし、computed specifier、unsupported callback shape、default exportを証明できないtargetはreason付き`unresolved`とdiagnosticへ残す。
 - collector delta全体をframework semantic graph v1 validatorへ通してからsyntax / TypeScript graphへatomic unionし、profileのstatusとnode/site/edge countを実測値で申告する。失敗時はNext.js deltaだけを`discarded`とし、既存graphを保持する。
@@ -1015,7 +1042,7 @@ observerは既存`modifyConfig`後のfinal configから固定allowlistのboolean
 
 Issue #51でAstroのsafe-scan sliceを実装済みである。`@astrojs/compiler` 4.0.0のASTとinventory済みbytesだけを使用し、project-local compiler、integration、configをload / executeせず次のgraphを生成する。
 
-- `.astro` fileをcanonical server `component`へ昇格し、filesystem pageをcanonical `route`と双方向の`route_entry` / `renders`で結ぶ。`.ts` / `.js` endpointはbundled TypeScript TypeCheckerのmodule export proofからHTTP method symbolを選び、`handled_by`へ結ぶ。source-phase filesystem route graphは互換性のため別に保持する。
+- `.astro` fileをcanonical server `component`へ昇格し、filesystem pageをcanonical `route`と双方向の`route_entry` / `renders`で結ぶ。全componentは宣言fileへの`declared_in`（`astro_component_declaration`）を持ち、TS / JS componentだけがsymbolへの`implemented_by`（`astro_component_implementation`）も持つ。`.astro` / Markdown componentはTypeScript symbolを持たないため`implemented_by`を持たない。`.ts` / `.js` endpointはbundled TypeScript TypeCheckerのmodule export proofからHTTP method symbolを選び、`handled_by`へ結ぶ。source-phase filesystem route graphは互換性のため別に保持する。
 - frontmatter importは既存source import graphへ一度だけ保持する。template component tagはfrontmatterのdefault / named / namespace bindingと相関し、`.astro` / Markdown componentまたはTypeChecker-confirmed TS / JS exportをcanonical component targetにする。immutable `const`の静的なternary、`||`、`??`だけは有限な`candidates`としてalgorithm付きで保持し、open / missing / computed flowはreason付き`unresolved`とdiagnosticへ残す。
 - `client:load`、`client:idle`、`client:visible`、`client:media`、`client:only`をbrowser condition付き`hydrates` / `client_boundary`として保持する。`client:only`のrender自体もbrowser environmentとし、`server:defer`はserver condition付き`server_boundary`にする。複数environment directiveや候補集合をexact hydrationへ昇格しない。
 - static asset importをcomponent-to-file `loads`として保持する。`getCollection` / `getEntry`のliteral collection / entryを`src/content` inventoryへ結び、collectionは有限なfile candidate集合、entryはexact fileとする。非literal、unsafe path、missing entryはunknown targetとreasonを持つ`unresolved`にする。このためframework semantic graph v1の`loads`は`component` / `route` sourceと`file` / `symbol` / `server_function` targetを許可する。
@@ -1031,7 +1058,7 @@ Issue #52でTanStack Routerのsafe-scan sliceを実装済みである。bundled 
 - code-based routeでは`createRootRoute` / `createRoute`宣言と`addChildren`登録を分離する。静的に閉じた登録から到達できるrouteだけをactual routeに昇格し、`getParentRoute`の宣言親と`addChildren`の実登録親を異なるcondition / occurrence evidenceを持つ`parent_route`として出力する。未登録宣言はroute nodeを作らずdiagnosticへ残す。
 - immutableな配列要素とliteral conditionalだけをexact / finite `candidates`登録として扱う。loop、`.map`、runtime data由来のchildrenはrouteを捏造せず、unknown targetへのreason付き`unresolved parent_route`とdiagnosticへ残す。
 - literal `virtualRouteConfig`をcanonical virtual root / child routeへ正規化し、configured fileを`loads`、階層を`parent_route`として保持する。config code、plugin、環境変数は実行しない。
-- route optionの`component`、`loader`、`beforeLoad`、`context`をTypeChecker definitionへ相関し、`renders` / `loads` / `before_load`へ昇格する。lazy componentは専用component kindで保持する。
+- route optionの`component`、`loader`、`beforeLoad`、`context`をTypeChecker definitionへ相関し、`renders` / `loads` / `before_load`へ昇格する。lazy componentは専用component kindで保持する。全componentはTypeChecker definition symbolへの`implemented_by`（`tanstack_component_implementation`）と宣言fileへの`declared_in`（`tanstack_component_declaration`）を持つ。
 - `useNavigate`由来call、router `.navigate`、`Link` / `Navigate` JSX、navigation mask、`createRouteMask`のliteral targetを`navigates_to` / `masks_to`へ結ぶ。有限literal conditionalはcandidate、non-literalまたはmissing targetはreason付きunresolvedにする。
 - collector delta全体をframework semantic graph v1 validatorへ通してからsource / TypeScript graphへatomic unionし、profileのnode / site / edge countはNext.js / Astroを含む全emitted frameworkの実測合計を申告する。
 
@@ -1039,7 +1066,7 @@ Issue #52でTanStack Routerのsafe-scan sliceを実装済みである。bundled 
 
 Issue #53でTanStack Start v1のsafe-scan sliceを実装済みである。TanStack Router collectorをStart packageに限定して再利用し、bundled TypeScript AST / TypeChecker definition graphとinventory済みbytesだけから次のgraphを生成する。
 
-- `createServerFn`のimmutable fluent chainをcanonical `server_function`へ正規化し、HTTP method、validator definition、handler definitionをpropertyへ保持する。handlerはserver condition付き`handled_by`、route loader / component / hook内のimport済みserver function callはbrowser condition付き`rpc_call`へ昇格し、`why`でclient componentからserver functionを経由してhandlerまで説明できる。
+- `createServerFn`のimmutable fluent chainをcanonical `server_function`へ正規化し、HTTP method、validator definition、handler definitionをpropertyへ保持する。宣言fileへの`declared_in`（`tanstack_start_server_function_declaration`）を常に出力し、宣言symbolを得られた場合だけsymbolへの`implemented_by`（`tanstack_start_server_function_implementation`）も出力する。static identityは`implemented_by`を持たない。handlerはserver condition付き`handled_by`、route loader / component / hook内のimport済みserver function callはbrowser condition付き`rpc_call`へ昇格し、`why`でclient componentからserver functionを経由してhandlerまで説明できる。
 - `createMiddleware(...).server(...)`をcanonical `middleware`へ正規化する。server functionの`.middleware([...])`はhandler-level、route optionの`server.middleware`はroute-levelの`uses_middleware`として、それぞれ異なるcondition / occurrence evidenceを保持する。
 - root route middlewareとpathless layout middlewareをdescendant routeへ継承する。`_authenticated_.public.tsx`のようなunderscore suffixによるbreak-outはsynthetic canonical middleware boundaryとして明示し、遮断されたpathless middlewareを継承させず、`tanstack.start.middleware_inheritance=break-out` conditionを持つ`uses_middleware`を残す。
 - project-local declaration fileがなくTypeCheckerからframework APIの返却symbolを得られない場合でも、認識済みStart API import、immutable declaration、owner locator、source path、宣言名からcheckout非依存のstatic identityを作る。mutable declarationはdiagnosticへ残して昇格しない。handler / validator / callerは取得できたrepository TypeScript definitionと相関し、package外のsourceをcollectorへ混入させない。
@@ -2024,6 +2051,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-10-16: framework semantic graph v1へcode link `implemented_by`（`component` / `server_function` -> `typescript_definition_id`の`symbol`、0または1件）と`declared_in`（同 -> 宣言`file`、ちょうど1件）を追加した。semantic routeから`renders`の先が実装symbolにも宣言fileにもつながらず、`why route:... -> external_system`が経路なしになり、`impact path:<file>`にrouteが出なかったため。site IDの衝突を避けるため別kindとし、`implemented_by`のfile fallbackは`declared_in`と重複するため廃止した。`resolved / exact`のみ、`route_entry`の向きは不変、occurrence kindはframework別に固定した（§7.5.1）。
 - 2026-09-07: Issue #467としてsnapshot-scoped health（`health` / `health list` / `cleanup` / `health_summary_get` / `health_findings_list`）の読み込み・集計をStore range単位へ事前分割した。
   plain入力（単一scan層）は`Store::resolve_health_input`と`Store::health_range_plan`が集計値だけで対象IDをrangeへ切り、range毎の読み込み・index構築・解析を従来どおりの1,000,000 step budgetで実行し、超過rangeは中央値で最大4回再分割する。
   cross-range参照は対象rangeへinbound row全部を読み込むことで保証し、profile / condition / evidence / missing-profile / coverage / layer意味論はsnapshot全体で共有するcontextから同一に付与する。層のある入力（build delta / runtime session / semantic no-op）はwhole-snapshot経路を維持する。

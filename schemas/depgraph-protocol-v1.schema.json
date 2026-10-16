@@ -865,7 +865,7 @@
                         "renders", "hydrates", "client_boundary", "server_boundary",
                         "route_entry", "parent_route", "loads", "before_load",
                         "navigates_to", "masks_to", "rpc_call", "client_stub_for",
-                        "handled_by", "uses_middleware"
+                        "handled_by", "uses_middleware", "implemented_by", "declared_in"
                       ]
                     }
                   },
@@ -985,7 +985,9 @@
                 "rpc_call",
                 "client_stub_for",
                 "handled_by",
-                "uses_middleware"
+                "uses_middleware",
+                "implemented_by",
+                "declared_in"
               ]
             },
             "target_ids": { "type": "array", "minItems": 1 }
@@ -1040,7 +1042,8 @@
             "properties": {
               "kind": {
                 "enum": [
-                  "hydrates", "client_boundary", "server_boundary", "route_entry", "client_stub_for"
+                  "hydrates", "client_boundary", "server_boundary", "route_entry", "client_stub_for",
+                  "implemented_by", "declared_in"
                 ]
               }
             },

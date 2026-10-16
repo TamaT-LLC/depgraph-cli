@@ -34,6 +34,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
   frameworkEnvironmentCondition as condition,
+  emitFrameworkCodeLinks,
+  frameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -868,6 +870,7 @@ export function collectTanStackRouterSemanticDelta(
     );
   }
 
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), semanticEvidence, "TanStack Router semantic collector");
   const componentCache = new Map<string, GraphNode>();
   const componentFor = (relativePath: string, expression: Expression, kind: string): GraphNode | null => {
     const reference = isIdentifier(unwrap(expression)) ? unwrap(expression) : expression;
@@ -879,7 +882,9 @@ export function collectTanStackRouterSemanticDelta(
     const component = componentNode(framework, symbol, kind);
     if (!component) return null;
     componentCache.set(cacheKey, component);
-    return addNode(component);
+    const added = addNode(component);
+    emitFrameworkCodeLinks(codeLinks, added, symbol);
+    return added;
   };
   for (const route of semanticRoutes.values()) {
     const declaration = route.declaration;
