@@ -715,15 +715,29 @@ pub(crate) fn resolve_selector_bounded_cancellable(
         bail!("selector must not be empty");
     }
 
+    // Why: a full locator such as `package://npm:stripe@18.0.0#...` also splits
+    // as prefix `package` + query `//npm:...`, which never matches the
+    // kind-scoped values. Whole-selector locator equality is checked in the
+    // same scan and wins before the prefix interpretation is applied.
+    let locator_selector =
+        (kind != "bare" && kind != "id" && query.starts_with("//")).then(|| selector.trim());
+
     let mut work = SelectorWork::new(maximum_work);
     let mut exact = SelectorCandidates::default();
     let mut partial = SelectorCandidates::default();
+    let mut locator_exact = SelectorCandidates::default();
     for (ordinal, node) in snapshot.nodes.iter().enumerate() {
         work.step(is_cancelled)?;
         #[cfg(test)]
         SELECTOR_NODE_SCAN_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if locator_selector.is_some_and(|locator| node.locator == locator) {
+            work.step(is_cancelled)?;
+            locator_exact.insert(node, ordinal)?;
+            #[cfg(test)]
+            SELECTOR_CANDIDATE_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let kind_matches = match kind {
-            "package" => node.kind == "package_instance",
+            "package" => node.kind == "package_instance" || is_external_package_node(node),
             "route" => node.kind == "route",
             "path" => node.kind == "file",
             "symbol" => node.kind == "symbol",
@@ -747,11 +761,13 @@ pub(crate) fn resolve_selector_bounded_cancellable(
                 .and_then(|identity| identity.get("resolver_identity"))
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|identity| identity == query);
+        let package_identity_matches = kind == "package" && package_identity_matches(node, query);
         let exact_match = if kind == "id" {
             node.id == query
         } else {
             path_matches
                 || resolver_identity_matches
+                || package_identity_matches
                 || values.iter().any(|value| value.as_str() == query)
         };
         if exact_match {
@@ -766,16 +782,49 @@ pub(crate) fn resolve_selector_bounded_cancellable(
             SELECTOR_CANDIDATE_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    choose_unique_bounded_cancellable(
-        selector,
-        if exact.is_empty() && kind != "id" {
-            partial
-        } else {
-            exact
-        },
-        &mut work,
-        is_cancelled,
-    )
+    let candidates = if !locator_exact.is_empty() {
+        locator_exact
+    } else if exact.is_empty() && kind != "id" {
+        partial
+    } else {
+        exact
+    };
+    choose_unique_bounded_cancellable(selector, candidates, &mut work, is_cancelled)
+}
+
+/// Whether `node` is an external dependency package (for example an npm
+/// package under `node_modules`) rather than any other `external_system`.
+///
+/// Why: `external_system` is shared by semantic compiler boundaries
+/// (`external://typescript/...`), OpenAPI authorities, and Rust/Go externals.
+/// Only package-manager dependency nodes carry both `name` and
+/// `package_manager` properties, so requiring them keeps `package:` from
+/// becoming ambiguous with same-named semantic externals.
+fn is_external_package_node(node: &NodeRecord) -> bool {
+    node.kind == "external_system"
+        && ["name", "package_manager"].iter().all(|key| {
+            node.properties
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+}
+
+/// Exact `package:` match on the package `name` or `name@version`.
+fn package_identity_matches(node: &NodeRecord, query: &str) -> bool {
+    let property = |key: &str| node.properties.get(key).and_then(serde_json::Value::as_str);
+    let Some(name) = property("name") else {
+        return false;
+    };
+    if name == query {
+        return true;
+    }
+    // `rsplit_once` keeps scoped names such as `@scope/pkg@1.0.0` intact.
+    query
+        .rsplit_once('@')
+        .is_some_and(|(query_name, query_version)| {
+            query_name == name && property("version") == Some(query_version)
+        })
 }
 
 fn choose_unique_bounded_cancellable(
@@ -2110,6 +2159,139 @@ mod tests {
             "route:id"
         );
         Ok(())
+    }
+
+    fn external_package_selector_graph() -> GraphSnapshot {
+        let mut graph = snapshot();
+        let mut workspace_package = node(
+            "package:workspace-demo",
+            "package_instance",
+            "package://web:demo",
+            "demo",
+        );
+        workspace_package.properties = json!({"name": "demo", "workspace": true});
+        let mut stripe = node(
+            "package:sha256:stripe",
+            "external_system",
+            "package://npm:stripe@18.0.0#node_modules/stripe",
+            "stripe",
+        );
+        stripe.properties = json!({
+            "name": "stripe",
+            "version": "18.0.0",
+            "package_manager": "npm",
+            "locator": "npm:stripe@18.0.0#node_modules/stripe",
+            "workspace": false,
+            "external": true,
+        });
+        let mut semantic_external = node(
+            "external:sha256:stripe",
+            "external_system",
+            "external://typescript/stripe",
+            "stripe",
+        );
+        semantic_external.properties = json!({
+            "language": "typescript",
+            "external": true,
+            "canonical_identity": {"language": "typescript", "locator": "stripe"},
+        });
+        let mut scoped = node(
+            "package:sha256:scoped",
+            "external_system",
+            "package://npm:@scope/pkg@2.0.0#node_modules/@scope/pkg",
+            "@scope/pkg",
+        );
+        scoped.properties = json!({
+            "name": "@scope/pkg",
+            "version": "2.0.0",
+            "package_manager": "npm",
+        });
+        graph.nodes = vec![
+            workspace_package,
+            stripe,
+            scoped,
+            semantic_external,
+            node(
+                "symbol:stripe",
+                "symbol",
+                "ts://src/pay.ts#stripe",
+                "stripe",
+            ),
+            node(
+                "route:id",
+                "route",
+                "route:///products/$id",
+                "/products/$id",
+            ),
+        ];
+        graph
+    }
+
+    #[test]
+    fn package_selector_resolves_external_dependency_packages() -> Result<()> {
+        let graph = external_package_selector_graph();
+
+        assert_eq!(
+            resolve_selector(&graph, "package:stripe")?.id,
+            "package:sha256:stripe"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "package:stripe@18.0.0")?.id,
+            "package:sha256:stripe"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "package:@scope/pkg@2.0.0")?.id,
+            "package:sha256:scoped"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "package:demo")?.id,
+            "package:workspace-demo"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_locator_selector_with_known_scheme_resolves_before_prefix_split() -> Result<()> {
+        let graph = external_package_selector_graph();
+
+        assert_eq!(
+            resolve_selector(&graph, "package://npm:stripe@18.0.0#node_modules/stripe")?.id,
+            "package:sha256:stripe"
+        );
+        assert_eq!(
+            resolve_selector(&graph, "route:///products/$id")?.id,
+            "route:id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_selector_excludes_semantic_external_systems() {
+        let graph = external_package_selector_graph();
+
+        let error = resolve_selector(&graph, "package:typescript")
+            .expect_err("semantic external systems are not packages");
+        assert_eq!(
+            error.to_string(),
+            "selector \"package:typescript\" did not match any node"
+        );
+    }
+
+    #[test]
+    fn bare_selector_shared_by_package_symbol_and_semantic_external_stays_ambiguous() {
+        let graph = external_package_selector_graph();
+
+        let message = resolve_selector(&graph, "stripe")
+            .expect_err("bare selector must stay ambiguous")
+            .to_string();
+        assert!(message.contains("is ambiguous"), "{message}");
+        for id in [
+            "package:sha256:stripe",
+            "external:sha256:stripe",
+            "symbol:stripe",
+        ] {
+            assert!(message.contains(&format!("id:{id}")), "{message}");
+        }
     }
 
     #[test]
