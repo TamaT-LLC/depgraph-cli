@@ -16,10 +16,11 @@ A dependency edge alone is not enough to judge the impact of a change.
 profiles, and unresolved reasons so you can ask both why a dependency exists
 and how much of the codebase was analyzed.
 
-Introduction video (about 39 seconds). The narration and on-screen text are in
-English.
+Introduction video (about 56 seconds). It walks through three use cases:
+checking impact before review, investigating dependency paths, and working
+with AI agents. The narration and on-screen text are in English.
 
-https://github.com/user-attachments/assets/97462d47-e954-4582-8205-056c1ab4a836
+https://github.com/user-attachments/assets/e9a34a03-5d62-4902-b735-a2d8639833fe
 
 ## Find what you need
 
