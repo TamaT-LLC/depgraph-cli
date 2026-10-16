@@ -7904,7 +7904,7 @@ fn next_semantic_route_reaches_and_is_impacted_by_implementation_symbols() {
     let why_package: serde_json::Value = serde_json::from_slice(&depgraph(&[
         "why",
         "route:next:app:page:/checkout",
-        "stripe",
+        "package:stripe",
         "--json",
     ]))
     .unwrap();
