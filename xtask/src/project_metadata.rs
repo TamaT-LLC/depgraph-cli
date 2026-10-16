@@ -1362,7 +1362,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         bail!("English README release note link is not synchronized with {VERSION}");
     }
     for required in [
-        "updated: 2026-09-13",
+        "updated: 2026-10-16",
         "| Product / Rust / Go / Web adapter | `0.6.0` (planned stable) |",
         "| SQLite store / scan cache / impact query cache | `19` / `2` / `1` |",
         "| Operation journal / MCP tool / operation DTO | `6` / `depgraph-mcp-tools-v1` / `depgraph-operation-v2` |",
