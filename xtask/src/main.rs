@@ -5687,66 +5687,71 @@ mod tests {
 
     #[test]
     fn japanese_readme_shared_contract_drift_is_rejected() -> Result<()> {
-        let readme = super::read_lf_normalized_text(&workspace_root().join("README.md"))?;
-        let english_readme =
-            super::read_lf_normalized_text(&workspace_root().join("README.en.md"))?;
-        super::project_metadata::verify_japanese_readme_contract(&readme, &english_readme)?;
+        use super::project_metadata::{
+            JapaneseDocumentation, readme_cli_examples, verify_japanese_documentation_contract,
+        };
+
+        let docs = JapaneseDocumentation::load(&workspace_root())?;
+        verify_japanese_documentation_contract(&docs)?;
 
         let store_schema = format!(
             "current `main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             depgraph_store::STORE_SCHEMA_VERSION
         );
-        let drifted_schema = readme.replacen(
+        let mut drifted_schema = docs.clone();
+        drifted_schema.compatibility = docs.compatibility.replacen(
             &store_schema,
             "current `main`はStore schema `999`を使用し、schema 999へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
             1,
         );
-        assert_ne!(drifted_schema, readme);
-        assert!(
-            super::project_metadata::verify_japanese_readme_contract(
-                &drifted_schema,
-                &english_readme
-            )
-            .is_err()
-        );
+        assert_ne!(drifted_schema.compatibility, docs.compatibility);
+        assert!(verify_japanese_documentation_contract(&drifted_schema).is_err());
 
-        for example in super::project_metadata::readme_cli_examples(&readme) {
-            let drifted_example = format!("{example} --invalid-readme-contract");
-            let drifted_readme = readme.replacen(example, &drifted_example, 1);
-            assert_ne!(drifted_readme, readme);
+        for example in readme_cli_examples(&docs.usage) {
+            let mut drifted = docs.clone();
+            drifted.usage =
+                docs.usage
+                    .replacen(example, &format!("{example} --invalid-readme-contract"), 1);
+            assert_ne!(drifted.usage, docs.usage);
             assert!(
-                super::project_metadata::verify_japanese_readme_contract(
-                    &drifted_readme,
-                    &english_readme
-                )
-                .is_err(),
+                verify_japanese_documentation_contract(&drifted).is_err(),
+                "Japanese usage guide CLI drift was accepted: {example}"
+            );
+        }
+        for example in readme_cli_examples(&docs.readme) {
+            let mut drifted = docs.clone();
+            drifted.readme =
+                docs.readme
+                    .replacen(example, &format!("{example} --invalid-readme-contract"), 1);
+            assert_ne!(drifted.readme, docs.readme);
+            assert!(
+                verify_japanese_documentation_contract(&drifted).is_err(),
                 "Japanese README CLI drift was accepted: {example}"
             );
         }
 
-        let drifted_exit_code = readme.replacen(
+        let mut drifted_exit_code = docs.clone();
+        drifted_exit_code.usage = docs.usage.replacen(
             "| 0 | ポリシー違反なしで処理が完了した |",
             "| 0 | 常に失敗する |",
             1,
         );
-        assert_ne!(drifted_exit_code, readme);
-        assert!(
-            super::project_metadata::verify_japanese_readme_contract(
-                &drifted_exit_code,
-                &english_readme
-            )
-            .is_err()
-        );
+        assert_ne!(drifted_exit_code.usage, docs.usage);
+        assert!(verify_japanese_documentation_contract(&drifted_exit_code).is_err());
 
-        let drifted_target = readme.replacen("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu", 1);
-        assert_ne!(drifted_target, readme);
-        assert!(
-            super::project_metadata::verify_japanese_readme_contract(
-                &drifted_target,
-                &english_readme
-            )
-            .is_err()
-        );
+        let mut drifted_readme_target = docs.clone();
+        drifted_readme_target.readme = docs
+            .readme
+            .replace("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu");
+        assert_ne!(drifted_readme_target.readme, docs.readme);
+        assert!(verify_japanese_documentation_contract(&drifted_readme_target).is_err());
+
+        let mut drifted_install_target = docs.clone();
+        drifted_install_target.install = docs
+            .install
+            .replace("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu");
+        assert_ne!(drifted_install_target.install, docs.install);
+        assert!(verify_japanese_documentation_contract(&drifted_install_target).is_err());
         Ok(())
     }
 

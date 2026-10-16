@@ -75,8 +75,8 @@ Example package.json fragment:
 \"timeout_seconds\": 900 } }
 
 A Next.js entrypoint example lives at docs/examples/next-depgraph-build.mjs. \
-Missing plans fail with a copyable template. Full contract: README.en.md \
-build-mode consent boundary.
+Missing plans fail with a copyable template. Full contract: \
+docs/reference/build-mode.md.
 ";
 
 #[derive(Debug, Parser)]
