@@ -26,6 +26,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
+  emitFrameworkCodeLinks,
+  type FrameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -533,6 +535,13 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
       { conflictSubject: "Next semantic collector", emptyTargetSubject: "Next semantic relation" },
     );
   };
+  const codeLinks: FrameworkCodeLinkEmitter = {
+    store: { sites, edges },
+    profileId: PROFILE_ID,
+    fileNode: (relativePath) => input.fileNode(relativePath),
+    evidence: (relativePath, span, occurrenceKind) => evidence(relativePath, span, occurrenceKind),
+    subject: "Next semantic collector",
+  };
   const componentByKey = new Map<string, GraphNode>();
   const componentFor = (
     definitionKey: string,
@@ -552,7 +561,9 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
     );
     if (!component) return null;
     componentByKey.set(cacheKey, component);
-    return addNode(component);
+    const added = addNode(component);
+    emitFrameworkCodeLinks(codeLinks, added, symbol);
+    return added;
   };
 
   const contexts: RouteContext[] = [];

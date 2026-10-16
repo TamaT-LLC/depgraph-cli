@@ -169,6 +169,245 @@ fn framework_semantic_contract_rejects_invalid_endpoints_and_provenance() {
 }
 
 #[test]
+fn framework_implemented_by_links_component_to_its_definition_symbol() {
+    let events = framework_implementation_values();
+    let input = values_to_ndjson(events);
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("implemented_by to the definition symbol must validate");
+    let site = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "implemented_by")
+        .expect("implemented_by site");
+    assert_eq!(site.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(
+        validated
+            .edges
+            .values()
+            .filter(|edge| edge.kind == "implemented_by")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn framework_implemented_by_never_targets_a_file() {
+    let mut definition_less = framework_semantic_values();
+    prepare_code_link_source(&mut definition_less);
+    insert_declaration_file(&mut definition_less);
+    append_code_link(
+        &mut definition_less,
+        "implemented_by",
+        IMPLEMENTATION_FILE_ID,
+        "app/products/page.tsx",
+        "next_component_implementation",
+    );
+    set_code_link_source_framework(&mut definition_less, "astro");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(definition_less)))
+        .expect_err("implemented_by has no file fallback; declared_in covers the file");
+    assert!(
+        error.to_string().contains("implemented_by")
+            && error.to_string().contains("incompatible target"),
+        "{error}"
+    );
+
+    let mut file_with_definition = framework_implementation_values();
+    insert_declaration_file(&mut file_with_definition);
+    retarget_code_link(
+        &mut file_with_definition,
+        "implemented_by",
+        IMPLEMENTATION_FILE_ID,
+        "app/products/page.tsx",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(file_with_definition)))
+        .expect_err("a source with a definition must not be weakened to its file");
+    assert!(
+        error.to_string().contains("implemented_by")
+            && error.to_string().contains("incompatible target"),
+        "{error}"
+    );
+}
+
+#[test]
+fn framework_implemented_by_requires_a_definition_on_its_source() {
+    let mut events = framework_implementation_values();
+    set_component_property(&mut events, "typescript_definition_id", Value::Null);
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect_err("a definition-less source has no implemented_by");
+    assert!(
+        error.to_string().contains("implemented_by")
+            && error.to_string().contains("typescript_definition_id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn framework_implemented_by_rejects_mismatched_targets_and_shapes() {
+    let mut other_symbol = framework_implementation_values();
+    let other = insert_typescript_symbol(
+        &mut other_symbol,
+        "npm:workspace:web-app@1.0.0#.::app/other.tsx#default",
+    );
+    set_component_property(&mut other_symbol, "typescript_definition_id", json!(other));
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(other_symbol)))
+        .expect_err("implemented_by must target typescript_definition_id");
+    assert!(error.to_string().contains("implemented_by"), "{error}");
+
+    let mut candidates = framework_implementation_values();
+    make_code_link_candidates(&mut candidates, "implemented_by");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(candidates)))
+        .expect_err("implemented_by cannot use candidates");
+    assert!(error.to_string().contains("candidates"), "{error}");
+
+    let mut wrong_occurrence = framework_implementation_values();
+    set_code_link_occurrence(
+        &mut wrong_occurrence,
+        "implemented_by",
+        "astro_component_implementation",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_occurrence)))
+        .expect_err("implemented_by occurrence kind is fixed per framework");
+    assert!(error.to_string().contains("occurrence_kind"), "{error}");
+
+    let mut wrong_environment = framework_implementation_values();
+    set_component_property(&mut wrong_environment, "environment", json!("browser"));
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_environment)))
+        .expect_err("implemented_by environment follows its source");
+    assert!(error.to_string().contains("environment"), "{error}");
+}
+
+#[test]
+fn framework_implemented_by_is_unique_per_source() {
+    let mut events = framework_implementation_values();
+    duplicate_code_link(&mut events, "implemented_by");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect_err("a source has a single implemented_by site");
+    assert!(error.to_string().contains("implemented_by"), "{error}");
+}
+
+#[test]
+fn framework_declared_in_links_source_to_its_declaring_file() {
+    let input = values_to_ndjson(framework_declaration_values());
+    assert!(schema_accepts_stream(&input));
+    assert!(semantic_schema_accepts_stream(&input));
+    let validated = validate_safe_semantic_ndjson(Cursor::new(input))
+        .expect("implemented_by and declared_in from one component must validate");
+    let declaration = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "declared_in")
+        .expect("declared_in site");
+    let implementation = validated
+        .sites
+        .values()
+        .find(|site| site.kind == "implemented_by")
+        .expect("implemented_by site");
+    assert_eq!(declaration.resolution_status, ResolutionStatus::Resolved);
+    assert_eq!(declaration.target_ids, [IMPLEMENTATION_FILE_ID]);
+    assert_ne!(declaration.id, implementation.id);
+    let edge = validated
+        .edges
+        .values()
+        .find(|edge| edge.kind == "declared_in")
+        .expect("declared_in edge");
+    assert_eq!(edge.target, IMPLEMENTATION_FILE_ID);
+
+    let mut definition_less = framework_semantic_values();
+    prepare_code_link_source(&mut definition_less);
+    insert_declaration_file(&mut definition_less);
+    append_code_link(
+        &mut definition_less,
+        "declared_in",
+        IMPLEMENTATION_FILE_ID,
+        "app/products/page.tsx",
+        "next_component_declaration",
+    );
+    set_code_link_source_framework(&mut definition_less, "astro");
+    validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(definition_less)))
+        .expect("a definition-less Astro component has only declared_in");
+}
+
+#[test]
+fn framework_declared_in_rejects_mismatched_targets_and_shapes() {
+    let mut symbol_target = framework_declaration_values();
+    retarget_code_link(
+        &mut symbol_target,
+        "declared_in",
+        &implementation_symbol_id(),
+        "ProductsPage",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(symbol_target)))
+        .expect_err("declared_in targets a file");
+    assert!(error.to_string().contains("declared_in"), "{error}");
+
+    let mut other_file = framework_declaration_values();
+    let other_file_id = "file:sha256:other-page";
+    insert_plain_framework_node(&mut other_file, other_file_id, "file", "app/other.tsx");
+    for event in &mut other_file {
+        if event["event"] == "node_upsert" && event["node"]["id"] == other_file_id {
+            event["node"]["properties"]["path"] = json!("app/other.tsx");
+        }
+    }
+    retarget_code_link(
+        &mut other_file,
+        "declared_in",
+        other_file_id,
+        "app/products/page.tsx",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(other_file)))
+        .expect_err("declared_in targets the source_path file");
+    assert!(error.to_string().contains("declared_in"), "{error}");
+
+    let mut candidates = framework_declaration_values();
+    make_code_link_candidates(&mut candidates, "declared_in");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(candidates)))
+        .expect_err("declared_in cannot use candidates");
+    assert!(error.to_string().contains("candidates"), "{error}");
+
+    let mut wrong_occurrence = framework_declaration_values();
+    set_code_link_occurrence(
+        &mut wrong_occurrence,
+        "declared_in",
+        "next_component_implementation",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_occurrence)))
+        .expect_err("declared_in occurrence kind is fixed per framework");
+    assert!(error.to_string().contains("occurrence_kind"), "{error}");
+
+    let mut wrong_specifier = framework_declaration_values();
+    retarget_code_link(
+        &mut wrong_specifier,
+        "declared_in",
+        IMPLEMENTATION_FILE_ID,
+        "page.tsx",
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_specifier)))
+        .expect_err("declared_in specifier is the source_path");
+    assert!(error.to_string().contains("specifier"), "{error}");
+
+    let mut wrong_anchor = framework_declaration_values();
+    set_component_property(
+        &mut wrong_anchor,
+        "source_span",
+        json!({"start_line":2,"start_column":1,"end_line":2,"end_column":32}),
+    );
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(wrong_anchor)))
+        .expect_err("declared_in is anchored at the source declaration");
+    assert!(error.to_string().contains("anchored"), "{error}");
+}
+
+#[test]
+fn framework_declared_in_is_unique_per_source() {
+    let mut events = framework_declaration_values();
+    duplicate_code_link(&mut events, "declared_in");
+    let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect_err("a source has a single declared_in site");
+    assert!(error.to_string().contains("declared_in"), "{error}");
+}
+
+#[test]
 fn rust_semantic_fixture_remains_protocol_v1_compatible() {
     let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema must be valid JSON");
     let validator = jsonschema::draft202012::new(&schema).expect("schema must compile");
@@ -2092,6 +2331,7 @@ fn go_value_reference_values() -> Vec<Value> {
     rehash_json_edge(edge);
     sort_site_events(&mut events);
     sort_edge_events(&mut events);
+    refresh_framework_coverage(&mut events);
     resequence(&mut events);
     events
 }
@@ -2383,6 +2623,369 @@ fn framework_semantic_values() -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("framework semantic golden line"))
         .collect()
+}
+
+/// Recount dependency-site coverage after a test edits the framework stream.
+fn refresh_framework_coverage(events: &mut [Value]) {
+    let statuses: Vec<String> = events
+        .iter()
+        .filter(|event| event["event"] == "dependency_site")
+        .map(|event| {
+            event["site"]["resolution_status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let count = |status: &str| statuses.iter().filter(|value| *value == status).count();
+    for event in events.iter_mut() {
+        match event["event"].as_str() {
+            Some("file_completed") => {
+                event["discovered_sites"] = json!(statuses.len());
+                event["emitted_sites"] = json!(statuses.len());
+            }
+            Some("profile_completed" | "scan_completed") => {
+                let coverage = &mut event["coverage"];
+                coverage["dependency_sites"] = json!(statuses.len());
+                for status in ["resolved", "candidates", "external", "unresolved"] {
+                    coverage[status] = json!(count(status));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+const IMPLEMENTATION_FILE_ID: &str = "file:sha256:products-page";
+
+fn set_component_property(events: &mut [Value], key: &str, value: Value) {
+    let component = events
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["kind"] == "component")
+        .expect("framework component");
+    component["node"]["properties"][key] = value;
+}
+
+fn typescript_symbol_id(resolver: &str) -> String {
+    stable_id_from_value("symbol", &typescript_symbol_identity(resolver))
+}
+
+fn typescript_symbol_identity(resolver: &str) -> Value {
+    json!({
+        "identity_kind":"named",
+        "language":"typescript",
+        "package_locator":"npm:workspace:web-app@1.0.0#.",
+        "resolver_identity":resolver,
+        "symbol_kind":"function",
+    })
+}
+
+fn implementation_symbol_id() -> String {
+    typescript_symbol_id("npm:workspace:web-app@1.0.0#.::app/products/page.tsx#default")
+}
+
+fn insert_plain_framework_node(events: &mut Vec<Value>, id: &str, kind: &str, display_name: &str) {
+    insert_plain_node(events, id, kind);
+    let node = events
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["id"] == id)
+        .expect("inserted node");
+    node["scan_id"] = json!("scan-framework-semantic-golden");
+    node["adapter"] = json!("web");
+    node["node"]["display_name"] = json!(display_name);
+    if kind == "file" {
+        node["node"]["properties"] =
+            json!({"path":"app/products/page.tsx","language":"typescript"});
+    }
+}
+
+fn insert_typescript_symbol(events: &mut Vec<Value>, resolver: &str) -> String {
+    let id = typescript_symbol_id(resolver);
+    insert_plain_framework_node(events, &id, "symbol", "ProductsPage");
+    let node = events
+        .iter_mut()
+        .find(|event| event["event"] == "node_upsert" && event["node"]["id"] == id.as_str())
+        .expect("inserted symbol");
+    let identity = typescript_symbol_identity(resolver);
+    node["node"]["properties"] = json!({
+        "language":"typescript",
+        "package_locator":identity["package_locator"],
+        "symbol_kind":"function",
+        "canonical_identity":identity,
+    });
+    id
+}
+
+fn insert_implementation_symbol(events: &mut Vec<Value>) {
+    insert_typescript_symbol(
+        events,
+        "npm:workspace:web-app@1.0.0#.::app/products/page.tsx#default",
+    );
+}
+
+fn insert_declaration_file(events: &mut Vec<Value>) {
+    insert_plain_framework_node(
+        events,
+        IMPLEMENTATION_FILE_ID,
+        "file",
+        "app/products/page.tsx",
+    );
+}
+
+/// Payload key ("site" / "edge") of a code-link event of `kind`.
+fn code_link_payload(event: &Value, kind: &str) -> Option<&'static str> {
+    match event["event"].as_str() {
+        Some("dependency_site") if event["site"]["kind"] == kind => Some("site"),
+        Some("edge_upsert") if event["edge"]["kind"] == kind => Some("edge"),
+        _ => None,
+    }
+}
+
+/// Recompute site IDs and the edges that reference them after an edit.
+fn rehash_framework_stream(events: &mut [Value]) {
+    let mut site_ids = std::collections::BTreeMap::new();
+    for event in events.iter_mut() {
+        if event["event"] == "dependency_site" {
+            let old = event["site"]["id"].as_str().unwrap().to_owned();
+            let new = rehash_json_site(&mut event["site"]);
+            site_ids.insert(old, new);
+        }
+    }
+    for event in events.iter_mut() {
+        if event["event"] == "edge_upsert" {
+            let old = event["edge"]["site_id"].as_str().unwrap().to_owned();
+            if let Some(new) = site_ids.get(&old) {
+                event["edge"]["site_id"] = json!(new);
+            }
+            rehash_json_edge(&mut event["edge"]);
+        }
+    }
+    sort_site_events(events);
+    sort_edge_events(events);
+    refresh_framework_coverage(events);
+    resequence(events);
+}
+
+fn set_code_link_occurrence(events: &mut [Value], kind: &str, occurrence_kind: &str) {
+    for event in events.iter_mut() {
+        let Some(payload) = code_link_payload(event, kind) else {
+            continue;
+        };
+        for evidence in event[payload]["evidence"].as_array_mut().unwrap() {
+            evidence["properties"]["occurrence_kind"] = json!(occurrence_kind);
+        }
+    }
+    rehash_framework_stream(events);
+}
+
+fn retarget_code_link(events: &mut [Value], kind: &str, target_id: &str, specifier: &str) {
+    for event in events.iter_mut() {
+        match code_link_payload(event, kind) {
+            Some("site") => {
+                event["site"]["target_ids"] = json!([target_id]);
+                event["site"]["specifier"] = json!(specifier);
+            }
+            Some(_) => event["edge"]["target"] = json!(target_id),
+            None => {}
+        }
+    }
+    rehash_framework_stream(events);
+}
+
+fn make_code_link_candidates(events: &mut [Value], kind: &str) {
+    for event in events.iter_mut() {
+        let Some(payload) = code_link_payload(event, kind) else {
+            continue;
+        };
+        event[payload]["resolution_status"] = json!("candidates");
+        event[payload]["precision"] = json!("overapprox");
+        event[payload]["evidence"][0]["properties"]["algorithm"] = json!("fixture");
+    }
+    rehash_framework_stream(events);
+}
+
+/// Add a second site/edge of `kind` from the same source at another span.
+fn duplicate_code_link(events: &mut Vec<Value>, kind: &str) {
+    let site_index = events
+        .iter()
+        .position(|event| code_link_payload(event, kind) == Some("site"))
+        .expect("code-link site");
+    let mut duplicate_site = events[site_index].clone();
+    let old_site_id = duplicate_site["site"]["id"].as_str().unwrap().to_owned();
+    for evidence in duplicate_site["site"]["evidence"].as_array_mut().unwrap() {
+        evidence["start_line"] = json!(9);
+        evidence["end_line"] = json!(9);
+    }
+    let new_site_id = rehash_json_site(&mut duplicate_site["site"]);
+    let mut duplicate_edge = events
+        .iter()
+        .find(|event| event["event"] == "edge_upsert" && event["edge"]["site_id"] == old_site_id)
+        .expect("code-link edge")
+        .clone();
+    duplicate_edge["edge"]["site_id"] = json!(new_site_id);
+    duplicate_edge["edge"]["evidence"] = duplicate_site["site"]["evidence"].clone();
+    rehash_json_edge(&mut duplicate_edge["edge"]);
+    events.insert(site_index, duplicate_site);
+    let edge_index = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("edge events");
+    events.insert(edge_index, duplicate_edge);
+    sort_site_events(events);
+    sort_edge_events(events);
+    refresh_framework_coverage(events);
+    resequence(events);
+}
+
+/// Re-label the golden component (and its code-link evidence) as another
+/// framework, keeping only the component, its code links, and their targets so
+/// that only the code-link rules decide the outcome. Occurrence kinds keep
+/// their `<framework>_component_` prefix rewritten to the new framework.
+fn set_code_link_source_framework(events: &mut Vec<Value>, framework: &str) {
+    let extractor = format!("{framework}-static-adapter");
+    let mut component_ids = None;
+    for event in events.iter_mut() {
+        if event["event"] == "node_upsert" && event["node"]["kind"] == "component" {
+            let node = &mut event["node"];
+            node["properties"]["framework"] = json!(framework);
+            node["properties"]["canonical_identity"]["framework"] = json!(framework);
+            let old_id = node["id"].as_str().unwrap().to_owned();
+            let new_id =
+                stable_id_from_value("component", &node["properties"]["canonical_identity"]);
+            node["id"] = json!(new_id);
+            component_ids = Some((old_id, new_id));
+        }
+    }
+    let (old_id, new_id) = component_ids.expect("framework component");
+    events.retain(|event| match event["event"].as_str() {
+        Some("node_upsert") => event["node"]["kind"] != "route",
+        Some("dependency_site") => {
+            matches!(
+                event["site"]["kind"].as_str(),
+                Some("implemented_by" | "declared_in")
+            )
+        }
+        Some("edge_upsert") => {
+            matches!(
+                event["edge"]["kind"].as_str(),
+                Some("implemented_by" | "declared_in")
+            )
+        }
+        _ => true,
+    });
+    for event in events.iter_mut() {
+        let payload = match event["event"].as_str() {
+            Some("dependency_site") => "site",
+            Some("edge_upsert") => "edge",
+            _ => continue,
+        };
+        if event[payload]["source"] == old_id.as_str() {
+            event[payload]["source"] = json!(new_id);
+        }
+        for evidence in event[payload]["evidence"].as_array_mut().unwrap() {
+            evidence["extractor"] = json!(extractor);
+            evidence["properties"]["framework"] = json!(framework);
+            let occurrence = evidence["properties"]["occurrence_kind"]
+                .as_str()
+                .unwrap()
+                .replacen("next_", &format!("{framework}_"), 1);
+            evidence["properties"]["occurrence_kind"] = json!(occurrence);
+        }
+    }
+    for event in events.iter_mut() {
+        if event["event"] == "profile_declared" {
+            event["profile"]["features"] = json!([framework]);
+        }
+    }
+    rehash_framework_stream(events);
+}
+
+/// Give the golden component the declaration anchor that code links use.
+fn prepare_code_link_source(events: &mut [Value]) {
+    let span = json!({"start_line":1,"start_column":1,"end_line":1,"end_column":32});
+    set_component_property(events, "source_path", json!("app/products/page.tsx"));
+    set_component_property(events, "source_span", span);
+}
+
+/// Append one resolved code-link site/edge from the golden component, cloned
+/// from the golden route_entry so it shares its anchor and condition.
+fn append_code_link(
+    events: &mut Vec<Value>,
+    kind: &str,
+    target_id: &str,
+    specifier: &str,
+    occurrence_kind: &str,
+) {
+    let site_index = events
+        .iter()
+        .position(|event| {
+            event["event"] == "dependency_site" && event["site"]["kind"] == "route_entry"
+        })
+        .expect("framework route_entry site");
+    let mut site = events[site_index].clone();
+    let template_site_id = site["site"]["id"].as_str().unwrap().to_owned();
+    site["site"]["kind"] = json!(kind);
+    site["site"]["specifier"] = json!(specifier);
+    site["site"]["target_ids"] = json!([target_id]);
+    for evidence in site["site"]["evidence"].as_array_mut().unwrap() {
+        evidence["properties"]["occurrence_kind"] = json!(occurrence_kind);
+    }
+    let site_id = rehash_json_site(&mut site["site"]);
+    let mut edge = events
+        .iter()
+        .find(|event| {
+            event["event"] == "edge_upsert" && event["edge"]["site_id"] == template_site_id
+        })
+        .expect("framework route_entry edge")
+        .clone();
+    edge["edge"]["kind"] = json!(kind);
+    edge["edge"]["target"] = json!(target_id);
+    edge["edge"]["site_id"] = json!(site_id);
+    edge["edge"]["evidence"] = site["site"]["evidence"].clone();
+    rehash_json_edge(&mut edge["edge"]);
+    events.insert(site_index, site);
+    let edge_index = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("framework edge");
+    events.insert(edge_index, edge);
+    sort_site_events(events);
+    sort_edge_events(events);
+    refresh_framework_coverage(events);
+    resequence(events);
+}
+
+/// Golden framework stream plus one implemented_by site/edge from the
+/// component to its typescript_definition_id symbol.
+fn framework_implementation_values() -> Vec<Value> {
+    let mut events = framework_semantic_values();
+    prepare_code_link_source(&mut events);
+    let symbol_id = implementation_symbol_id();
+    set_component_property(&mut events, "typescript_definition_id", json!(symbol_id));
+    insert_implementation_symbol(&mut events);
+    append_code_link(
+        &mut events,
+        "implemented_by",
+        &symbol_id,
+        "ProductsPage",
+        "next_component_implementation",
+    );
+    events
+}
+
+/// framework_implementation_values plus the component's declared_in site/edge
+/// to its declaring file.
+fn framework_declaration_values() -> Vec<Value> {
+    let mut events = framework_implementation_values();
+    insert_declaration_file(&mut events);
+    append_code_link(
+        &mut events,
+        "declared_in",
+        IMPLEMENTATION_FILE_ID,
+        "app/products/page.tsx",
+        "next_component_declaration",
+    );
+    events
 }
 
 fn rust_semantic_candidate_values() -> Vec<Value> {
@@ -2941,6 +3544,8 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
                             | "client_stub_for"
                             | "handled_by"
                             | "uses_middleware"
+                            | "implemented_by"
+                            | "declared_in"
                     )
                 )
                 && event["site"]["evidence"][0]["kind"] == "semantic"
@@ -2979,6 +3584,8 @@ fn semantic_schema_accepts_stream(input: &str) -> bool {
                         | "client_stub_for"
                         | "handled_by"
                         | "uses_middleware"
+                        | "implemented_by"
+                        | "declared_in"
                 )
             ) || (matches!(
                 event["edge"]["kind"].as_str(),

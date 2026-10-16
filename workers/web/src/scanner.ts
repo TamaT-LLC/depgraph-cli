@@ -2333,7 +2333,7 @@ function analysisUnitCompletenessReasons(
 const ANALYSIS_UNIT_FRAMEWORK_SITE_KINDS = new Set([
   "renders", "hydrates", "client_boundary", "server_boundary", "route_entry", "parent_route",
   "loads", "before_load", "navigates_to", "masks_to", "rpc_call", "client_stub_for",
-  "handled_by", "uses_middleware",
+  "handled_by", "uses_middleware", "implemented_by", "declared_in",
 ]);
 const ANALYSIS_UNIT_FRAMEWORK_NODE_KINDS = new Set(["component", "route", "server_function", "middleware"]);
 

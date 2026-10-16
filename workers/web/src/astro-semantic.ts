@@ -11,6 +11,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_CAPABILITY,
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
+  emitFrameworkCodeLinks,
+  type FrameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import {
@@ -681,6 +683,13 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
     );
   };
 
+  const codeLinks: FrameworkCodeLinkEmitter = {
+    store: { sites, edges },
+    profileId: PROFILE_ID,
+    fileNode: (relativePath) => input.fileNode(relativePath),
+    evidence: (relativePath, span, occurrenceKind) => evidence(relativePath, span, occurrenceKind),
+    subject: "Astro semantic collector",
+  };
   const componentCache = new Map<string, GraphNode>();
   const componentForFile = (relativePath: string, environment: string): GraphNode => {
     const key = `file\0${relativePath}\0${environment}`;
@@ -692,6 +701,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
       environment,
       input.sources.get(relativePath),
     ));
+    emitFrameworkCodeLinks(codeLinks, component, null);
     componentCache.set(key, component);
     return component;
   };
@@ -704,6 +714,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
     const component = symbolComponent(symbol, environment);
     if (!component) return null;
     const added = addNode(component);
+    emitFrameworkCodeLinks(codeLinks, added, symbol);
     componentCache.set(cacheKey, added);
     return added;
   };
