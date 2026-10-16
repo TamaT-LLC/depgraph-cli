@@ -1035,10 +1035,88 @@ pub(crate) fn readme_cli_examples(readme: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str) -> Result<()> {
+/// User guides and reference pages that replaced the long README sections.
+/// Every page must exist and contain only resolvable repository links.
+pub(crate) const USER_DOCUMENTATION_PATHS: &[&str] = &[
+    "docs/guide/usage.md",
+    "docs/guide/usage.en.md",
+    "docs/guide/install.md",
+    "docs/guide/install.en.md",
+    "docs/guide/compatibility.md",
+    "docs/guide/compatibility.en.md",
+    "docs/reference/analysis-completeness.md",
+    "docs/reference/architecture-policy.md",
+    "docs/reference/build-mode.md",
+    "docs/reference/build-mode.ja.md",
+    "docs/reference/cli-behavior.md",
+    "docs/reference/compiler-pack-and-release-verification.md",
+    "docs/reference/runtime-trace.md",
+    "docs/reference/safe-scan-boundary.md",
+    "docs/reference/safe-scan-boundary.ja.md",
+];
+pub(crate) const JAPANESE_README_PATH: &str = "README.md";
+pub(crate) const ENGLISH_README_PATH: &str = "README.en.md";
+pub(crate) const JAPANESE_USAGE_GUIDE_PATH: &str = "docs/guide/usage.md";
+pub(crate) const ENGLISH_USAGE_GUIDE_PATH: &str = "docs/guide/usage.en.md";
+pub(crate) const JAPANESE_INSTALL_GUIDE_PATH: &str = "docs/guide/install.md";
+pub(crate) const JAPANESE_COMPATIBILITY_GUIDE_PATH: &str = "docs/guide/compatibility.md";
+
+/// The Japanese user-facing documents and the English documents they must stay
+/// synchronized with. The README is the entry point; detailed shared contract
+/// text lives in the `docs/guide/` pages.
+#[derive(Clone)]
+pub(crate) struct JapaneseDocumentation {
+    pub(crate) readme: String,
+    pub(crate) english_readme: String,
+    pub(crate) usage: String,
+    pub(crate) english_usage: String,
+    pub(crate) install: String,
+    pub(crate) compatibility: String,
+}
+
+impl JapaneseDocumentation {
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            readme: read_lf_normalized_text(&root.join(JAPANESE_README_PATH))?,
+            english_readme: read_lf_normalized_text(&root.join(ENGLISH_README_PATH))?,
+            usage: read_lf_normalized_text(&root.join(JAPANESE_USAGE_GUIDE_PATH))?,
+            english_usage: read_lf_normalized_text(&root.join(ENGLISH_USAGE_GUIDE_PATH))?,
+            install: read_lf_normalized_text(&root.join(JAPANESE_INSTALL_GUIDE_PATH))?,
+            compatibility: read_lf_normalized_text(&root.join(JAPANESE_COMPATIBILITY_GUIDE_PATH))?,
+        })
+    }
+}
+
+fn require_document_markers(path: &str, content: &str, markers: &[&str]) -> Result<()> {
+    for required in markers {
+        if !content.contains(required) {
+            bail!("{path} shared contract metadata is missing {required:?}");
+        }
+    }
+    Ok(())
+}
+
+fn verify_cli_examples_synchronized(
+    path: &str,
+    content: &str,
+    english_path: &str,
+    english_content: &str,
+) -> Result<()> {
+    let japanese_examples = readme_cli_examples(content);
+    let english_examples = readme_cli_examples(english_content);
+    if japanese_examples.is_empty() {
+        bail!("{path} must contain CLI examples");
+    }
+    if let Some(example) = japanese_examples.difference(&english_examples).next() {
+        bail!("{path} CLI example is not synchronized with {english_path}: {example:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_japanese_documentation_contract(docs: &JapaneseDocumentation) -> Result<()> {
     let release_note = format!("[`v{VERSION}`リリースノート](docs/releases/v{VERSION}.md)");
     let release_package = format!(
-        "次のpatch release `v{VERSION}` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。"
+        "`v{VERSION}`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64向けの4ターゲットを提供します。"
     );
     let release_version_assignment = format!("VERSION={VERSION}");
     let compatibility = format!(
@@ -1052,55 +1130,88 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
         "current `main`はStore schema `{0}`を使用し、schema {0}へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。",
         depgraph_store::STORE_SCHEMA_VERSION,
     );
-    for required in [
-        "日本語 | [English](README.en.md)",
-        "Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0",
-        release_note.as_str(),
-        release_package.as_str(),
-        release_version_assignment.as_str(),
-        "`npm i -g @tamat-llc/depgraph`",
-        "すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。",
-        compatibility.as_str(),
-        "公開済み`v0.5.4` artifactのStore schemaは`17`である。",
-        current_store_contract.as_str(),
-        "`v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。",
-        "[`v0.4.0`の契約](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
-        "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
-        "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
-        "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
-        "depgraph scan /path/to/repository --strict",
-        "depgraph profiles plan /path/to/repository --profiles-file profiles.json --json",
-        "depgraph resolve --build /path/to/repository --allow-project-code",
-        "depgraph runtime validate --file runtime-trace.json --json",
-        "depgraph export --format graphml --output graph.graphml",
-        "`project_code_executed`は`false`",
-        "[コンパイラーパックとリリース検証](README.en.md#compiler-pack-and-release-verification)",
-        "[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)",
+    require_document_markers(
+        JAPANESE_README_PATH,
+        &docs.readme,
+        &[
+            "日本語 | [English](README.en.md)",
+            "Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0",
+            release_note.as_str(),
+            release_package.as_str(),
+            "`npm i -g @tamat-llc/depgraph`",
+            "`project_code_executed`は`false`",
+            "[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)",
+        ],
+    )?;
+    require_document_markers(
+        JAPANESE_INSTALL_GUIDE_PATH,
+        &docs.install,
+        &[
+            "日本語 | [English](install.en.md)",
+            "Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0",
+            release_version_assignment.as_str(),
+            "`npm i -g @tamat-llc/depgraph`",
+            "[コンパイラーパックとリリース検証](../reference/compiler-pack-and-release-verification.md)",
+        ],
+    )?;
+    require_document_markers(
+        JAPANESE_COMPATIBILITY_GUIDE_PATH,
+        &docs.compatibility,
+        &[
+            "日本語 | [English](compatibility.en.md)",
+            "すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。",
+            compatibility.as_str(),
+            "公開済み`v0.5.4` artifactのStore schemaは`17`である。",
+            current_store_contract.as_str(),
+            "`v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。",
+            "[`v0.4.0`の契約](../releases/v0.4.0.md)",
+            "[`v0.4.0-rc.6`](../releases/v0.4.0-rc.6.md)",
+            "[`v0.4.0-rc.2`](../releases/v0.4.0-rc.2.md)",
+            "[`v0.4.0-rc.1`](../releases/v0.4.0-rc.1.md)",
+            "[`v0.2.0-rc.1`](../releases/v0.2.0-rc.1.md)",
+        ],
+    )?;
+    require_document_markers(
+        JAPANESE_USAGE_GUIDE_PATH,
+        &docs.usage,
+        &[
+            "日本語 | [English](usage.en.md)",
+            "depgraph scan /path/to/repository --strict",
+            "depgraph profiles plan /path/to/repository --profiles-file profiles.json --json",
+            "depgraph resolve --build /path/to/repository --allow-project-code",
+            "depgraph runtime validate --file runtime-trace.json --json",
+            "depgraph export --format graphml --output graph.graphml",
+        ],
+    )?;
+    for (path, content) in [
+        (JAPANESE_README_PATH, &docs.readme),
+        (JAPANESE_INSTALL_GUIDE_PATH, &docs.install),
     ] {
-        if !readme.contains(required) {
-            bail!("Japanese README shared contract metadata is missing {required:?}");
-        }
-    }
-    for (target, _) in RELEASE_TARGETS {
-        if !readme.contains(target) {
-            bail!("Japanese README release target matrix is missing {target:?}");
+        for (target, _) in RELEASE_TARGETS {
+            if !content.contains(target) {
+                bail!("{path} release target matrix is missing {target:?}");
+            }
         }
     }
 
-    let japanese_examples = readme_cli_examples(readme);
-    let english_examples = readme_cli_examples(english_readme);
-    if japanese_examples.is_empty() {
-        bail!("Japanese README must contain CLI examples");
-    }
-    if let Some(example) = japanese_examples.difference(&english_examples).next() {
-        bail!("Japanese README CLI example is not synchronized with English README: {example:?}");
-    }
+    verify_cli_examples_synchronized(
+        JAPANESE_README_PATH,
+        &docs.readme,
+        ENGLISH_README_PATH,
+        &docs.english_readme,
+    )?;
+    verify_cli_examples_synchronized(
+        JAPANESE_USAGE_GUIDE_PATH,
+        &docs.usage,
+        ENGLISH_USAGE_GUIDE_PATH,
+        &docs.english_usage,
+    )?;
 
-    let exit_code_section = readme
+    let exit_code_section = docs
+        .usage
         .split_once("## 厳格ポリシーと終了コード\n")
         .map(|(_, section)| section)
-        .context("Japanese README is missing the strict policy and exit codes section")?;
+        .context("Japanese usage guide is missing the strict policy and exit codes section")?;
     let exit_code_section = exit_code_section
         .split_once("\n## ")
         .map_or(exit_code_section, |(section, _)| section);
@@ -1119,7 +1230,7 @@ pub(crate) fn verify_japanese_readme_contract(readme: &str, english_readme: &str
         "| 4 | プロジェクトコード実行権限またはセキュリティポリシーの失敗 |",
     ];
     if actual_exit_code_table != expected_exit_code_table {
-        bail!("Japanese README exit code table is not synchronized with the CLI contract");
+        bail!("Japanese usage guide exit code table is not synchronized with the CLI contract");
     }
     Ok(())
 }
@@ -1136,6 +1247,11 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     let mcp_operations_path = "docs/50_test/mcp-agent-host-operations.md";
     let mcp_operations = read_lf_normalized_text(&root.join(mcp_operations_path))?;
     verify_local_markdown_links(root, mcp_operations_path, &mcp_operations)?;
+    for path in USER_DOCUMENTATION_PATHS {
+        let content = read_lf_normalized_text(&root.join(path))
+            .with_context(|| format!("user documentation is missing {path}"))?;
+        verify_local_markdown_links(root, path, &content)?;
+    }
     let agent_dogfood_path = "docs/50_test/agent-dogfood-benchmark.md";
     let agent_dogfood = read_lf_normalized_text(&root.join(agent_dogfood_path))?;
     verify_local_markdown_links(root, agent_dogfood_path, &agent_dogfood)?;
@@ -1273,9 +1389,17 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         );
     }
 
-    let english_readme = read_lf_normalized_text(&root.join("README.en.md"))?;
-    let japanese_readme = read_lf_normalized_text(&root.join("README.md"))?;
-    verify_japanese_readme_contract(&japanese_readme, &english_readme)?;
+    let japanese_documentation = JapaneseDocumentation::load(root)?;
+    verify_japanese_documentation_contract(&japanese_documentation)?;
+    let english_readme = &japanese_documentation.english_readme;
+    let english_usage = &japanese_documentation.english_usage;
+    let english_compatibility_path = "docs/guide/compatibility.en.md";
+    let english_compatibility = read_lf_normalized_text(&root.join(english_compatibility_path))?;
+    let build_mode_reference_path = "docs/reference/build-mode.md";
+    let build_mode_reference = read_lf_normalized_text(&root.join(build_mode_reference_path))?;
+    let compiler_pack_reference_path = "docs/reference/compiler-pack-and-release-verification.md";
+    let compiler_pack_reference =
+        read_lf_normalized_text(&root.join(compiler_pack_reference_path))?;
     let rc1_release = read_lf_normalized_text(&root.join("docs/releases/v0.4.0-rc.1.md"))?;
     let design = read_lf_normalized_text(
         &root.join("docs/40_arch_design/arch-dependency-graph-cli-system-design.md"),
@@ -1327,32 +1451,52 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     let english_runner_contract = format!(
         "binds the MCP server and runner digests to `rmcp 3.1.0`, MCP revision `2026-07-28`, `{MCP_TOOL_CONTRACT_VERSION}`, and `{MCP_OPERATION_CONTRACT_VERSION}`",
     );
-    for required in [
-        "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
-        "TypeScript/JavaScript symbol/type/import/re-export/type-use",
-        "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
-        "[`v0.4.0` contract](docs/releases/v0.4.0.md)",
-        "[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)",
-        "[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)",
-        "[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)",
-        "[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)",
-        "dynamic-framework-evidence-release-gate-v1",
-        "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
-        "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
-        "depgraph runtime validate --file runtime-trace.json --json",
-        "## Compiler pack and release verification",
-        "gh release download \"$release_tag\" \\\n  --repo TamaT-LLC/depgraph-cli",
-        "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
-        english_runner_contract.as_str(),
-        "no `v0.4.0` stable GitHub",
-        "The published `v0.5.4` artifact uses Store schema `17`.",
-        english_current_store_contract.as_str(),
-        english_current_compatibility.as_str(),
-    ] {
-        if !english_readme.contains(required) {
-            bail!("English README release metadata is missing {required:?}");
-        }
-    }
+    require_document_markers(
+        ENGLISH_README_PATH,
+        english_readme,
+        &[
+            "Rust 1.93.1, Go 1.26.1, Node.js 24.18.0, and pnpm 10.33.0",
+            "TypeScript/JavaScript symbol/type/import/re-export/type-use",
+            "[the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)",
+            "[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)",
+        ],
+    )?;
+    require_document_markers(
+        ENGLISH_USAGE_GUIDE_PATH,
+        english_usage,
+        &["depgraph runtime validate --file runtime-trace.json --json"],
+    )?;
+    require_document_markers(
+        english_compatibility_path,
+        &english_compatibility,
+        &[
+            "[`v0.4.0` contract](../releases/v0.4.0.md)",
+            "[`v0.4.0-rc.6`](../releases/v0.4.0-rc.6.md)",
+            "[`v0.4.0-rc.2`](../releases/v0.4.0-rc.2.md)",
+            "[`v0.4.0-rc.1`](../releases/v0.4.0-rc.1.md)",
+            "[`v0.2.0-rc.1`](../releases/v0.2.0-rc.1.md)",
+            "Every v0.5 archive includes the native MCP server, durable\noperation runner, and versioned Agent tool/operation schema.",
+            "no `v0.4.0` stable GitHub",
+            "The published `v0.5.4` artifact uses Store schema `17`.",
+            english_current_store_contract.as_str(),
+            english_current_compatibility.as_str(),
+        ],
+    )?;
+    require_document_markers(
+        build_mode_reference_path,
+        &build_mode_reference,
+        &["dynamic-framework-evidence-release-gate-v1"],
+    )?;
+    require_document_markers(
+        compiler_pack_reference_path,
+        &compiler_pack_reference,
+        &[
+            "# Compiler pack and release verification",
+            "rust-stdlib-source@1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+            "gh release download \"$release_tag\" \\\n  --repo TamaT-LLC/depgraph-cli",
+            english_runner_contract.as_str(),
+        ],
+    )?;
     if !rc1_release.contains("depgraph runtime validate --file runtime-trace.json --json") {
         bail!("v0.4.0-rc.1 runtime validate example is not synchronized with the CLI");
     }
@@ -2592,7 +2736,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "日本語 | [English](README.en.md)",
                 "## プロジェクトの状況と公開コラボレーション",
-                "現在のサポート対象は、公開済み`v0.6.2`リリースである。",
+                "現在のサポート対象は、公開済み`v0.6.3`リリースです。",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -2605,7 +2749,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
-                "The supported line is currently anchored by the published `v0.6.2` Release.",
+                "The supported line is currently anchored by the published `v0.6.3` Release.",
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
