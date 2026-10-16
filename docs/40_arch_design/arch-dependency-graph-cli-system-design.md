@@ -1411,7 +1411,7 @@ depgraph audit --changed <GIT_REF> [--base-snapshot SELECTOR] [--max-items N] [-
 depgraph hotspots [--churn-commit-limit N] [--weight-fan-in N] [--weight-fan-out N] [--weight-reverse-impact N] [--weight-git-churn N] [--weight-runtime N] [--max-items N] [--max-bytes BYTES] [--cursor TOKEN|--all]
 ```
 
-selector は path、stable ID、package、symbol、route pattern を受け付ける。曖昧な selector は候補を返し、暗黙に先頭を選択しない。
+selector は path、stable ID、package、symbol、route pattern を受け付ける。曖昧な selector は候補を返し、暗黙に先頭を選択しない。`package:` は workspace の package instance と、`package_manager`/`name` を持つ外部依存 package の `external_system`（`external://` の semantic boundary は除く）を対象とし、既知 prefix の locator 完全一致（`package://...` 等）は prefix 解釈より優先する。
 
 ### 14.1 `why`
 

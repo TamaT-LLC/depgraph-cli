@@ -5983,7 +5983,10 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
         .code(2)
         .stderr(predicate::str::contains("is ambiguous"))
         .stderr(predicate::str::contains("file://src/shared-one.go"))
-        .stderr(predicate::str::contains("file://src/shared-two.go"));
+        .stderr(predicate::str::contains("file://src/shared-two.go"))
+        .stderr(predicate::function(|stderr: &str| {
+            stderr.matches("is ambiguous").count() == 1
+        }));
 
     let explicit = Command::cargo_bin("depgraph")
         .unwrap()
@@ -6045,7 +6048,10 @@ fn ambiguous_bare_selector_lists_candidates_and_explicit_selector_works() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("did not match any node"));
+        .stderr(predicate::str::contains("did not match any node"))
+        .stderr(predicate::function(|stderr: &str| {
+            stderr.matches("did not match any node").count() == 1
+        }));
 }
 
 #[cfg(unix)]

@@ -112,6 +112,9 @@ sourceは自動変更しない。
 
 **セレクター**は、グラフ内のノードをCLIから指定するための表現である。
 `id:`、`path:`、`package:`、`route:`、`symbol:`、`type:`を受け付ける。
+`package:`はworkspaceパッケージとnpmなどの外部依存パッケージの両方を指し、`package:stripe`、`package:stripe@18.0.0`、`package://npm:stripe@18.0.0#node_modules/stripe`のようなlocator完全指定も使える。
+Next.js App Routerではsource版（`next:/checkout`）とsemantic版（`next:app:page:/checkout`）のrouteノードがあるため、`route:/checkout`は曖昧になる。
+`route:next:app:page:/checkout`のように表示名で指定するか、エラーの候補にある`id:`を使う。
 候補が複数ある場合は、コマンドが返した完全な安定IDを`id:<stable-id>`として指定する。
 
 ## 対応するコードとグラフ
