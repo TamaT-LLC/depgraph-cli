@@ -164,10 +164,10 @@ depgraph deps path:src/app.ts --transitive --max-items 100 --max-bytes 1048576
 depgraph deps path:src/app.ts --transitive --cursor "$NEXT_CURSOR" --json
 depgraph deps path:src/app.ts --transitive --all --json
 depgraph dependents package:example
-depgraph why path:src/app.ts route:/products/$id
+depgraph why path:src/app.ts 'route:/products/$id'
 depgraph impact path:src/app.ts
 depgraph impact package:example --changed origin/main --depth 4
-depgraph impact route:/products/$id --changed HEAD~1 --profile web:production:server --json
+depgraph impact 'route:/products/$id' --changed HEAD~1 --profile web:production:server --json
 depgraph cycles --level file
 
 # Goのセマンティックグラフでは正規リゾルバーIDを使います。
