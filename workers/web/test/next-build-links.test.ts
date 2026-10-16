@@ -18,7 +18,8 @@ const packagePath = "node_modules/.pnpm/pkg@1/node_modules/pkg";
 const hash = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(path.join(tmpdir(), "depgraph-next-links-"));
+  // macOS の tmpdir はシンボリックリンクのため、observer が扱う canonical パスと揃える
+  const root = await fs.realpath(await mkdtemp(path.join(tmpdir(), "depgraph-next-links-")));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const target = path.join(root, packagePath);
   const main = path.join(root, ".next/server/app/page.js");
