@@ -12,6 +12,10 @@ Next.js、Astro、TanStack Router、TanStack Startが持つルート、コンポ
 依存関係の有無だけでは、変更の影響を判断できない。
 `depgraph`は、依存箇所、解析根拠、成立条件、解析精度、プロファイル、未解決理由を保存し、「なぜ依存しているか」と「どこまで解析できたか」を問い合わせ可能にする。
 
+`depgraph`の紹介動画（約40秒、日本語ナレーション付き）。
+
+https://github.com/user-attachments/assets/38f65f65-7792-49c2-9836-2b98f5565ea9
+
 ## 目的別の案内
 
 | 目的 | 読む場所 |
