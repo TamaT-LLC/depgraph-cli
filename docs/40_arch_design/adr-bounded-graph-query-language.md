@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-25
+- Amended: 2026-10-16 (framework `implemented_by` / `declared_in` reachability)
 - Decision ID: `PROJ-ARC-001-ADR-005`
 - Issue: `PROJ-ARC-001-TASK-084` / #152
 - Contract: `bounded-graph-query-v1`
@@ -198,7 +199,7 @@ tokens are invalid. `LIMIT` is required and must be `1..=10,000`.
 An example is:
 
 ```text
-MATCH p = (source:"route")-["renders"|"calls"|"imports"*1..4]->(target:"external_system")
+MATCH p = (source:"route")-["renders"|"implemented_by"|"calls"|"imports"*1..5]->(target:"external_system")
 WHERE source.locator STARTS WITH "route:"
   AND EVERY edge IN EDGES(p) SATISFIES
       edge.phase IN ["semantic", "build", "runtime"]
@@ -578,6 +579,46 @@ semantics.
 Implementation requires new parser, typed plan, snapshot statistics, executor,
 CLI, fuzz, and package-gate work. Until those staged slices land, the existing
 commands are the only product contract.
+
+## Amendment 2026-10-16: framework `implemented_by` / `declared_in` reachability
+
+The first and second use cases in Context (route sets reaching an external
+system; route → component → symbol → package paths) were not satisfiable on
+framework semantic graphs. A semantic `route` reached `component` through
+`renders`, but `component` and `server_function` pointed to their
+implementation and declaring file only through the `typescript_definition_id`
+and `source_path` properties, which are not traversable.
+`why route:next:app:page:/checkout <package>` therefore reported that no
+dependency path exists, `impact path:<file>` did not list the route, and the
+MVP grammar example above could not match.
+
+`framework-semantic-graph-v1` now adds two code-link edge kinds (system design
+§7.5.1):
+
+| Kind | Source | Target | Cardinality |
+| --- | --- | --- | --- |
+| `implemented_by` | `component` / `server_function` | the `symbol` named by `typescript_definition_id` | 1 when that property is a string, otherwise 0 |
+| `declared_in` | `component` / `server_function` | the repository `file` at `source_path` | exactly 1 |
+
+Both are `resolved / exact` only. They are separate kinds because they share
+the source declaration anchor, and a site ID is derived from source, kind,
+profile, condition, path, and span. `implemented_by` no longer falls back to the
+declaring file for definition-less sources, since `declared_in` always carries
+that relation.
+
+This makes `route -renders-> component -implemented_by-> symbol
+-calls|references|type_uses-> ... -> external_system` and `route -renders->
+component -declared_in-> file -imports-> ... -> external_system` valid paths.
+Web `imports` remain file-sourced, so a dependency that rests only on a
+module-level import is reached through `declared_in`. Reverse traversal
+(`impact`, `dependents`) reaches routes from a changed file through
+`imports`, `declared_in`, and `renders`, and from a changed symbol through
+`implemented_by` and `renders`. The existing `route_entry` direction
+(`component` / `server_function` → `route`) is unchanged for compatibility.
+
+The MVP grammar example now lists `implemented_by` and uses `*1..5`. The
+query language itself is unchanged: edge labels are matched as opaque
+strings, and no grammar, type system, or planner rule depends on these kinds.
 
 ## References
 

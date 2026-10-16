@@ -1215,10 +1215,23 @@ fn validate_semantic_maps(
         }
     }
 
+    let mut code_link_sources = BTreeSet::new();
     for site in sites.values() {
         let strict_dependency_site = strict_dependency_sites.contains(site.id.as_str());
         let logical_profile_id = semantic_identity_profile_id(&site.profile_id, profiles)?;
         validate_semantic_site(site, strict_dependency_site, &logical_profile_id)?;
+        if is_framework_code_link_kind(&site.kind)
+            && !code_link_sources.insert((
+                site.kind.as_str(),
+                site.profile_id.as_str(),
+                site.source.as_str(),
+            ))
+        {
+            return invariant(format!(
+                "framework semantic source {} must have at most one {} site",
+                site.source, site.kind
+            ));
+        }
         if source_fallback_edge_kind_for_site(site).is_some() {
             validate_source_fallback_site(nodes, site)?;
             continue;
@@ -1468,6 +1481,20 @@ fn is_framework_semantic_site_kind(kind: &str) -> bool {
             | "client_stub_for"
             | "handled_by"
             | "uses_middleware"
+            | "implemented_by"
+            | "declared_in"
+    )
+}
+
+/// Framework abstraction -> implementing symbol (system design §7.5.1).
+const FRAMEWORK_IMPLEMENTATION_KIND: &str = "implemented_by";
+/// Framework abstraction -> declaring repository file (system design §7.5.1).
+const FRAMEWORK_DECLARATION_KIND: &str = "declared_in";
+
+fn is_framework_code_link_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        FRAMEWORK_IMPLEMENTATION_KIND | FRAMEWORK_DECLARATION_KIND
     )
 }
 
@@ -1701,6 +1728,8 @@ fn semantic_edge_kind_for_site(
                 "client_stub_for" => "client_stub_for",
                 "handled_by" => "handled_by",
                 "uses_middleware" => "uses_middleware",
+                "implemented_by" => "implemented_by",
+                "declared_in" => "declared_in",
                 _ => unreachable!("framework site kind checked above"),
             })
         }
@@ -2795,6 +2824,9 @@ fn validate_framework_site_endpoints(
         "client_stub_for" => source.kind == "symbol",
         "handled_by" => matches!(source.kind.as_str(), "route" | "server_function"),
         "uses_middleware" => matches!(source.kind.as_str(), "route" | "server_function"),
+        "implemented_by" | "declared_in" => {
+            matches!(source.kind.as_str(), "component" | "server_function")
+        }
         _ => false,
     };
     if !valid_source {
@@ -2804,6 +2836,15 @@ fn validate_framework_site_endpoints(
         ));
     }
 
+    if is_framework_code_link_kind(&site.kind)
+        && (site.resolution_status != ResolutionStatus::Resolved
+            || site.precision != Precision::Exact)
+    {
+        return invariant(format!(
+            "framework semantic {} site {} must be resolved and exact",
+            site.kind, site.id
+        ));
+    }
     if matches!(
         site.resolution_status,
         ResolutionStatus::External | ResolutionStatus::Unresolved
@@ -2828,6 +2869,8 @@ fn validate_framework_site_endpoints(
             "rpc_call" | "client_stub_for" => target.kind == "server_function",
             "handled_by" => target.kind == "symbol",
             "uses_middleware" => target.kind == "middleware",
+            "implemented_by" => target.kind == "symbol",
+            "declared_in" => target.kind == "file",
             _ => false,
         };
         if !valid_target {
@@ -2835,6 +2878,122 @@ fn validate_framework_site_endpoints(
                 "framework semantic site {} of kind {} has incompatible target {} ({})",
                 site.id, site.kind, target.id, target.kind
             ));
+        }
+        if is_framework_code_link_kind(&site.kind) {
+            validate_framework_code_link_site(site, source, target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fixed primary occurrence kind of an implemented_by / declared_in site.
+fn framework_code_link_occurrence_kind(source: &GraphNode, kind: &str) -> Option<String> {
+    let suffix = match kind {
+        FRAMEWORK_IMPLEMENTATION_KIND => "implementation",
+        FRAMEWORK_DECLARATION_KIND => "declaration",
+        _ => return None,
+    };
+    let framework = source.properties.get("framework").and_then(Value::as_str)?;
+    let prefix = match (source.kind.as_str(), framework) {
+        ("server_function", "tanstack-start") => "tanstack_start_server_function",
+        ("component", "next") => "next_component",
+        ("component", "astro") => "astro_component",
+        ("component", "tanstack-router" | "tanstack-start") => "tanstack_component",
+        _ => return None,
+    };
+    Some(format!("{prefix}_{suffix}"))
+}
+
+/// implemented_by targets the `typescript_definition_id` symbol and exists only
+/// when that property is a string; declared_in targets the repository file at
+/// `source_path`. Both are anchored at the source declaration.
+fn validate_framework_code_link_site(
+    site: &DependencySite,
+    source: &GraphNode,
+    target: &GraphNode,
+) -> Result<(), ProtocolError> {
+    let fail = |detail: String| {
+        invariant::<()>(format!(
+            "framework semantic {} site {} {detail}",
+            site.kind, site.id
+        ))
+    };
+    let Some(source_path) = source
+        .properties
+        .get("source_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return fail(format!("source {} lacks source_path", source.id));
+    };
+    if site.kind == FRAMEWORK_IMPLEMENTATION_KIND {
+        let Some(Value::String(definition_id)) = source.properties.get("typescript_definition_id")
+        else {
+            return fail(format!(
+                "requires a string typescript_definition_id on source {}",
+                source.id
+            ));
+        };
+        if target.kind != "symbol" || &target.id != definition_id {
+            return fail(format!(
+                "must target typescript_definition_id symbol {definition_id}, found {}",
+                target.id
+            ));
+        }
+    } else if target.kind != "file"
+        || target.properties.get("path").and_then(Value::as_str) != Some(source_path)
+    {
+        return fail(format!(
+            "must target the declaring file {source_path}, found {}",
+            target.id
+        ));
+    }
+    let expected_specifier = if site.kind == FRAMEWORK_DECLARATION_KIND {
+        source_path
+    } else {
+        target.display_name.as_deref().unwrap_or_default()
+    };
+    if site.specifier != expected_specifier {
+        return fail(format!("specifier must be {expected_specifier:?}"));
+    }
+    let primary = &site.evidence[0];
+    let Some(expected_occurrence) = framework_code_link_occurrence_kind(source, &site.kind) else {
+        return fail(format!(
+            "has no occurrence_kind for {} {}",
+            source
+                .properties
+                .get("framework")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            source.kind
+        ));
+    };
+    if primary
+        .properties
+        .get("occurrence_kind")
+        .and_then(Value::as_str)
+        != Some(expected_occurrence.as_str())
+    {
+        return fail(format!("occurrence_kind must be {expected_occurrence}"));
+    }
+    if primary.path.as_deref() != Some(source_path) {
+        return fail(format!("must be anchored at source_path {source_path}"));
+    }
+    if let Some(span) = source
+        .properties
+        .get("source_span")
+        .filter(|span| !span.is_null())
+    {
+        let anchored = [
+            ("start_line", primary.start_line),
+            ("start_column", primary.start_column),
+            ("end_line", primary.end_line),
+            ("end_column", primary.end_column),
+        ]
+        .into_iter()
+        .all(|(field, value)| span.get(field).and_then(Value::as_u64) == value.map(u64::from));
+        if !anchored {
+            return fail("must be anchored at the source source_span".into());
         }
     }
     Ok(())
@@ -2866,6 +3025,18 @@ fn validate_framework_edge_contract(
             "framework semantic edge {} evidence must match dependency site {}",
             edge.id, site.id
         ));
+    }
+    if is_framework_code_link_kind(&edge.kind) {
+        let source_environment = nodes
+            .get(&edge.source)
+            .and_then(|source| source.properties.get("environment"))
+            .and_then(Value::as_str);
+        if source_environment != Some(environment) {
+            return invariant(format!(
+                "framework semantic {} edge {} environment {environment:?} must match its source environment",
+                edge.kind, edge.id
+            ));
+        }
     }
     validate_framework_semantic_evidence(
         &format!("framework semantic edge {}", edge.id),

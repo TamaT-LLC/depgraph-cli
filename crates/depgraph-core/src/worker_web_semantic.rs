@@ -104,6 +104,8 @@ pub(crate) fn is_web_framework_semantic_site_kind(kind: &str) -> bool {
             | "client_stub_for"
             | "handled_by"
             | "uses_middleware"
+            | "implemented_by"
+            | "declared_in"
     )
 }
 
