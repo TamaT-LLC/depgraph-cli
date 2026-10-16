@@ -6,122 +6,110 @@
 [![GitHub Release](https://img.shields.io/github/v/release/TamaT-LLC/depgraph-cli)](https://github.com/TamaT-LLC/depgraph-cli/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-`depgraph`は、Rust、Go、TypeScript、JavaScriptのコードから、説明可能な依存グラフを構築するローカルファーストのCLIである。
-Next.js、Astro、TanStack Router、TanStack Startが持つルート、コンポーネント、サーバー関数の関係も、言語の依存関係と同じグラフへ統合する。
+`depgraph`は、コードの依存関係をグラフにして、「この変更でどこが壊れうるか」「なぜこのファイルがあのファイルに依存しているか」を根拠付きで答えるCLIです。
+Rust・Go・TypeScript/JavaScriptと、Next.js・Astro・TanStackのルートを1つのグラフで扱います。
+手元のマシンで動き、プロジェクトのコードは実行しません。
 
-依存関係の有無だけでは、変更の影響を判断できない。
-`depgraph`は、依存箇所、解析根拠、成立条件、解析精度、プロファイル、未解決理由を保存し、「なぜ依存しているか」と「どこまで解析できたか」を問い合わせ可能にする。
+## こんなときに役立ちます
 
-`depgraph`の紹介動画（約60秒、日本語ナレーション付き）。レビュー前の影響確認、依存経路の調査、AIエージェント連携という3つの使い方を紹介する。
+**レビュー前に変更の影響を確認する**
+
+`main`から変更したファイルに依存している箇所を一覧にします。
+
+```sh
+depgraph impact path:src/lib/cart.ts --changed main
+```
+
+**依存している理由を調べる**
+
+2つのファイルを結ぶ依存経路と、それぞれの段を生むimportや呼び出しの位置を表示します。
+
+```sh
+depgraph why path:src/app/checkout/page.tsx path:src/lib/cart.ts
+```
+
+**AIエージェントからも同じ質問をする**
+
+Claude Code、Codex、Cursor、Grokに、読み取り専用のMCPサーバーとして登録します。
+
+```sh
+depgraph mcp setup --host claude
+```
+
+## 紹介動画
+
+上の3つの使い方を約60秒で紹介しています（日本語ナレーション付き）。
 
 https://github.com/user-attachments/assets/255258db-3527-47a4-b675-cd907a6ca34e
 
-## 目的別の案内
+## 30秒で試す
 
-| 目的 | 読む場所 |
+```sh
+# インストール（macOS Apple Silicon / Linux）
+brew install tamat-llc/tap/depgraph
+# npmでも導入できます（Node.js 24以上）
+npm i -g @tamat-llc/depgraph
+
+# 調べたいリポジトリの中で実行します
+cd /path/to/your-repository
+depgraph scan .
+depgraph impact path:src/lib/cart.ts --changed main
+depgraph why path:src/app/checkout/page.tsx path:src/lib/cart.ts
+```
+
+`src/lib/cart.ts`などのパスは、お使いのリポジトリにあるファイルに置き換えてください。
+
+- `scan`はファイルを読むだけです。ビルドスクリプト、プラグイン、パッケージマネージャーは実行しません。
+- 解析結果は、リポジトリごとにOSのキャッシュディレクトリ内のデータベースへ保存されます。リポジトリ自体は変更しません。
+- どこまで解析できたかは`depgraph doctor`で確認できます。
+
+## よく使うコマンド
+
+| 知りたいこと | コマンド |
 | --- | --- |
-| まず動かす | [最初のスキャン](#最初のスキャン) |
-| 対応言語と抽出範囲を確認する | [対応するコードとグラフ](#対応するコードとグラフ) |
-| バイナリを導入する | [公式パッケージの導入](#公式パッケージの導入) |
-| CLIの実行例を探す | [CLIコマンド例](#cliコマンド例) |
-| エージェントホストから使う | [MCP stdioサーバー](#mcp-stdioサーバー) |
-| 安全な静的解析の境界を確認する | [安全なスキャンの境界](#安全なスキャンの境界) |
-| プロジェクトコードを実行する条件を確認する | [ビルドモードの同意境界](#ビルドモードの同意境界) |
-| 詳細な技術契約を確認する | [英語版の詳細仕様](#英語版の詳細仕様) |
-| 開発へ参加する | [プロジェクトの状況と公開コラボレーション](#プロジェクトの状況と公開コラボレーション) |
+| このファイルが使っているもの | `depgraph deps path:src/app.ts --transitive` |
+| このファイルを使っているもの | `depgraph dependents path:src/app.ts --transitive` |
+| AがBに依存している理由 | `depgraph why path:src/app.ts path:src/lib/db.ts` |
+| 変更の影響範囲 | `depgraph impact path:src/app.ts --changed origin/main` |
+| 解析できなかった箇所 | `depgraph unresolved` |
+| 解析の状態 | `depgraph doctor` |
+| グラフの共有 | `depgraph export --format mermaid > graph.mmd` |
 
-## 最初のスキャン
+コマンドには、調べたい対象を指定する「セレクター」を渡します。
 
-公式パッケージを展開して`depgraph`を`PATH`へ追加したら、対象リポジトリを**安全な静的解析**でスキャンする。
-このモードは、対象リポジトリの設定、プラグイン、ビルドスクリプト、パッケージマネージャーを実行しない。
+- `path:src/app.ts`は、リポジトリ内のパスでファイルを指定します。
+- `package:example`は、workspaceのパッケージを名前で指定します。
+- `id:<stable-id>`は、depgraphが表示したIDでそのまま指定します。名前が複数の対象に当てはまるときに使います。
 
-```sh
-depgraph scan /path/to/repository
-depgraph doctor
-```
+すべてのコマンド、スキャンの設定、終了コード、実行例は[使い方ガイド](docs/guide/usage.md)にまとめています。
 
-解析結果は、正規化したリポジトリルートごとにOSのキャッシュディレクトリ内のSQLiteストアへ保存される。
-保存先を固定する場合は、`depgraph --store /path/to/depgraph.sqlite scan /path/to/repository`のようにグローバルオプションを指定する。
-設定ファイルは必須ではなく、`depgraph init /path/to/repository`を実行した場合だけ`.depgraph.toml`を書き込む。
+## AIエージェントから使う（MCP）
 
-Go・Web のスキャンは、先にディレクトリと workspace を調べ、解析単位と source batch ごとに処理する。
-同じ保存先で `scan` を再実行すると、入力と worker の互換性を検証して完了済みの処理を再利用する。
-既定では全体の時間制限はなく、個々の worker の無進捗時間、メモリ、出力量と同時実行数を制限する。
-`.depgraph.toml` の `[scan]` で `max_unit_source_files`（既定 2,048）、`max_unit_source_bytes`（8 MiB）、`max_context_source_bytes`（64 MiB）、`max_concurrent_units`（2）、`max_worker_memory_bytes`（2 GiB）、`worker_timeout_seconds`（無進捗 300 秒）を指定できる。
-全体の時間予算が必要な場合は `total_budget_seconds` を指定する。
-`scan --split-plan [--json]` は worker を起動せずに、各実行単位の所有範囲・ローダーが実際に読む範囲・参照のみの入力・処理量の見積もり・分割理由・並列度の決定を表示する（[事前分割計画 ADR](docs/40_arch_design/adr-presplit-analysis-planning.md)）。
-分割・中断・再開・依存変更の検証方法は[統合検証](docs/40_arch_design/resumable-analysis-validation.md)に記載している。
+`depgraph mcp setup`は、対応する公式リリースを取得して検証し、安全なスキャンで最初のsnapshotを作ってから、ホストの設定に`depgraph`のエントリーを追加します。
+エージェントに調べさせたいGitリポジトリの中で実行してください。
 
-未完了の試行を調べる場合は、`scan --json` の `scan_id` を使い、`depgraph --scan-id "attempt:$SCAN_ID" deps path:src/app.ts --json` のように明示する。
-結果には未完了であることと解析範囲が含まれ、既存の完了 snapshot は置き換わらない。
-`deps`、`dependents`、`why`、`impact`、`cycles`、`unresolved`、health と graph export で利用できる。
-名前付き snapshot、diff、policy、bounded query、runtime validation は完了 snapshot を使用する。
-
-スキャン後は、ファイルやパッケージをセレクターで指定してグラフを調べる。
-次の例にある`src/app.ts`は、対象リポジトリ内の実際のパスへ置き換える。
-
-```sh
-# このファイルが利用している依存先
-depgraph deps path:src/app.ts --transitive
-
-# このファイルを利用している依存元
-depgraph dependents path:src/app.ts --transitive
-
-# 二つのノードを結ぶ依存経路と根拠
-depgraph why path:src/app.ts package:example
-
-# 変更による影響範囲
-depgraph impact path:src/app.ts --changed origin/main
-
-# 共有用のMermaidグラフ
-depgraph export --format mermaid > graph.mmd
-```
-
-`depgraph scan --strict`は、スキップ、未対応構文、未解決箇所を許容しないCI向けの実行である。
-通常の探索では、まず既定のスキャンを実行し、`doctor`と`unresolved`で解析範囲を確認する。
-
-## 調査目的とコマンド
-
-| 調べたいこと | コマンド | 得られる情報 |
+| `--host` | エージェント | プロジェクトの設定ファイル |
 | --- | --- | --- |
-| 依存先 | `deps <SELECTOR>` | 選択したノードから出る依存関係 |
-| 依存元 | `dependents <SELECTOR>` | 選択したノードへ入る依存関係 |
-| 依存理由 | `why <FROM> <TO>` | 二つのノードを結ぶ経路、条件、ソース位置 |
-| 変更影響 | `impact <SELECTOR>` | 逆向きの依存経路と影響を受けるノード |
-| 循環依存 | `cycles` | パッケージ、ファイル、シンボル単位の循環 |
-| 解析できなかった箇所 | `unresolved` | 理由とソース位置を含む未解決台帳 |
-| 解析状態 | `doctor` | ワーカー、ツールチェーン、カバレッジ、キャッシュの状態 |
-| スナップショット差分 | `snapshot`、`diff` | 完了済みグラフ間の追加、削除、変更、名前変更 |
-| アーキテクチャ規則 | `policy` | 禁止依存、境界違反、公開API変更 |
-| 実行時依存 | `runtime validate`、`runtime import` | 検証済みトレースと静的グラフの統合結果 |
-| グラフ出力 | `export` | JSON、DOT、Mermaid、GraphML |
-| 未使用のfile / export / type / dependency | `health`、`health list`、`cleanup` | snapshot-scoped finding、confidence、blocker。summaryはaudit / hotspotを含まない |
-| 変更差分のリスク | `audit --changed <GIT_REF>` | `merge-base(GIT_REF, HEAD)..HEAD` の新規cycle、境界違反、公開API変更、blast radius。`changed_oid`は監査対象HEADを示す。base snapshotが無い場合は3つの比較検査をindeterminateとし、blast radiusは引き続き評価する |
-| グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、available、totalを構造化して出力し、confidenceは`probable`上限 |
-| エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolは上と同じ判定限界を共有する |
+| `claude` | Claude Code | `.mcp.json` |
+| `codex` | Codex | `.codex/config.toml` |
+| `cursor` | Cursor | `.cursor/mcp.json` |
+| `grok` | Grok | `.grok/config.toml` |
 
-`health` の **confidence** は次の意味である。
-`confirmed` は`unused-file`、`unused-export`、`unused-type`、`unused-dependency`にだけ使用する。
-適用対象の解析済みprofileすべてで未使用かつsemantic-completeであり、hard blockerがないことを表す。
-`test-only-dependency`、`manifest-mismatch`、audit、hotspotは未使用の証明ではないため`probable`を上限とする。
-unused findingの`probable`は使用とhard blockerがないものの、適用対象profileがsyntax-completeまでの状態である。
-`indeterminate`はcoverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない。
-hotspotの層の充足は`hotspot_scores.available`で確認する。
-findingの`suppressions`はv1ではwire互換性のため保持するoutput-only/deferred fieldであり、CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返す。
-tag後の現行`main`／評価用RCの監査では、before/afterがschema 19に保存したpolicy digest、analyzer version、finding contract versionを比較する。
-provenanceの欠落や差異は、fail-closedで`incomparable-policy`または`incomparable-contract`へ劣化させる。
-公開済みstable `v0.5.4` artifactのStoreはschema 17であり、このcode-health audit provenance契約の適用対象外である。
-次のpatch release `v0.6.3` は、v0.6.0のschema 19とcode-health契約／APIを維持する。
-sourceは自動変更しない。
+ユーザー単位の設定に書き込む場合は`--scope user`を付けます。
+設定後は、エージェントを再起動または再読み込みしてください。
+エントリーの管理には、同じ`--host`（と`--scope`）を付けて次のコマンドを使います。
 
-**セレクター**は、グラフ内のノードをCLIから指定するための表現である。
-`id:`、`path:`、`package:`、`route:`、`symbol:`、`type:`を受け付ける。
-`package:`はworkspaceパッケージとnpmなどの外部依存パッケージの両方を指し、`package:stripe`、`package:stripe@18.0.0`、`package://npm:stripe@18.0.0#node_modules/stripe`のようなlocator完全指定も使える。
-Next.js App Routerではsource版（`next:/checkout`）とsemantic版（`next:app:page:/checkout`）のrouteノードがあるため、`route:/checkout`は曖昧になる。
-`route:next:app:page:/checkout`のように表示名で指定するか、エラーの候補にある`id:`を使う。
-候補が複数ある場合は、コマンドが返した完全な安定IDを`id:<stable-id>`として指定する。
+```sh
+depgraph mcp status --host claude
+depgraph mcp update --host claude
+depgraph mcp uninstall --host claude
+```
 
-## 対応するコードとグラフ
+登録されるサーバーは読み取り専用です。
+解析結果の保存先の変更、リポジトリへの書き込み、プロジェクトコードの実行はできません。
+権限付きのプロファイル、`agent-config`による手動設定、トラブルシューティングは[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)（英語）を参照してください。
+
+## 対応する言語とフレームワーク
 
 | 対象 | 抽出する主な要素 |
 | --- | --- |
@@ -133,55 +121,17 @@ Next.js App Routerではsource版（`next:/checkout`）とsemantic版（`next:ap
 | TanStack Router | ファイルルート、コードルート、仮想ルート、生成済みルートツリー、ローダー、`beforeLoad`、遅延ルート、コンテキスト、ルートマスク |
 | TanStack Start | サーバー関数、RPC関係、サーバールート、ミドルウェアチェーン |
 
-静的解析で認識した依存箇所は、次のいずれかに分類される。
+depgraphは依存先を推測で決めません。
+1つに特定できない依存は、候補の集合または未解決として理由付きで報告します（[依存箇所の分類](docs/guide/usage.md#依存箇所の分類)）。
 
-- **`resolved`**：根拠から依存先を一意に特定できた。
-- **`candidates`**：有限の候補集合までは絞り込めたが、一意性を証明できない。
-- **`external`**：標準ライブラリや外部パッケージなど、リポジトリ外の依存先である。
-- **`unresolved`**：依存箇所は認識したが、依存先を安全に特定できない。
+## インストール
 
-この分類は「未解決の依存を推測で`resolved`へ昇格する」ことを避けるためにある。
-スキップした入力と未対応の入力はカバレッジ台帳へ記録する。
-利用者は、抽出したグラフと解析範囲の完全性を分けて評価できる。
+`v0.6.3`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64向けの4ターゲットを提供します。
+Intel macOSには対応していません。
 
-## 公式パッケージの導入
-
-次のpatch release `v0.6.3` は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64 向けの4ターゲットを提供する。
-公式 Release と公開後証跡を確認した版を使用する。
-
-### Homebrew（macOS Apple Silicon / Linux）
-
-```sh
-brew install tamat-llc/tap/depgraph
-```
-
-初回の導入後は tap 名を省略できる。
-
-```sh
-brew install depgraph
-brew upgrade depgraph
-```
-
-tap を追加済みで信頼設定がない場合は、先に `brew trust --formula tamat-llc/tap/depgraph` を実行する。
-Node.js 24 系と、ワーカー・schema・ライセンスを含む公式パッケージが入る。
-Homebrew の Node.js が検証済みの `24.18.0` と異なる場合、Web 解析は診断を伴う best-effort になる。
-Go / Rust の解析には対象プロジェクトのツールチェーンとオフライン依存関係が必要である。
-`depgraph-mcp` の起動には、後述の同じ版・ターゲットの compiler pack も必要である。
-公開・更新の手順は [Homebrew リリース手順](docs/50_test/homebrew-release-procedure.md) を参照する。
-
-### npm / GitHub Release
-
-`v0.5.0`はGitHub Releaseのみで配布し、npm版は`v0.5.1`から提供する。
-npm版はTamaT LLCの組織スコープ`@tamat-llc`から公開する。
-
-`npm i -g @tamat-llc/depgraph`により、macOS Apple Silicon、Linux x86-64 / ARM64、Windows x86-64 の4ターゲットに検証済みネイティブパッケージを導入できる。`v0.6.3` では Intel macOS 向けパッケージを提供しない。
-インストールスクリプトによる外部ダウンロードは行わない。
-npm版のランチャーにはNode.js 24以上が必要である。
-`depgraph` CLIはnpmから導入したパッケージだけで実行できる。
-`depgraph-mcp`も同じnpmパッケージから導入されるが、MCPサーバーの起動には同じバージョンとターゲットのGitHub Releaseにあるコンパイラーパックを検証して展開し、その要件ファイルを追加で指定する。
-公開状態と初回導入は[npmリリース手順](docs/50_test/npm-release-procedure.md)で確認する。
-
-対象に対応する`TARGET`は次の値から選ぶ。
+- **Homebrew**（macOS Apple Silicon / Linux）：`brew install tamat-llc/tap/depgraph`
+- **npm**（Node.js 24以上）：`npm i -g @tamat-llc/depgraph`
+- **GitHub Release**：[Releasesページ](https://github.com/TamaT-LLC/depgraph-cli/releases)から`TARGET`に合うアーカイブを取得します。
 
 | 環境 | `TARGET` |
 | --- | --- |
@@ -190,381 +140,55 @@ npm版のランチャーにはNode.js 24以上が必要である。
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x86-64 | `x86_64-pc-windows-msvc` |
 
-公開完了後、macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できる。
+チェックサムの検証、Windowsでの手順、`depgraph-mcp`が使うcompiler packは[インストールガイド](docs/guide/install.md)で説明しています。
 
-```sh
-VERSION=0.6.3
-TARGET=aarch64-apple-darwin
-ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
+## 安全性について
 
-gh release download "v${VERSION}" \
-  --repo TamaT-LLC/depgraph-cli \
-  --pattern "${ARCHIVE}" \
-  --pattern "${ARCHIVE}.sha256"
-```
+既定のスキャンは、ソース、マニフェスト、ロックファイル、静的な設定ファイルを読むだけです。
+プロジェクトの設定、プラグイン、パッケージマネージャー、ジェネレーター、ビルドスクリプト、手続きマクロは実行しません。
+既定のスキャンでは、`project_code_executed`は`false`と記録されます。
 
-ダウンロード後にチェックサムを検証してから展開する。
-macOSでは`shasum`、Linuxでは`sha256sum`を使う。
+プロジェクトのコードを実行しうるのは`depgraph resolve --build PATH --allow-project-code`だけです。
+実行のたびにこのフラグが必要で、付いていなければ何も処理せずに終了コード`4`で終了します。
+詳しくは[安全なスキャンの境界](docs/reference/safe-scan-boundary.ja.md)と[ビルドモードの同意境界](docs/reference/build-mode.ja.md)を参照してください。
 
-```sh
-# macOS
-shasum -a 256 --check "${ARCHIVE}.sha256"
+## ドキュメント案内
 
-# Linux
-sha256sum --check "${ARCHIVE}.sha256"
-
-tar -xzf "${ARCHIVE}"
-"./depgraph-${VERSION}-${TARGET}/bin/depgraph" --version
-```
-
-配布物がその環境で正しく動くかは、リポジトリのルートから次の1コマンドで確認できる。
-チェックサムは`<archive>.sha256`から自動で読み取る。
-
-```sh
-cargo xtask verify-release-archive --archive "/absolute/path/to/${ARCHIVE}"
-```
-
-このコマンドは同じバージョンのネイティブアーカイブだけを受け付ける。
-manifestで宣言された必須成果物の整合性、`doctor`、Web / Rust / Go scan、query / export、MCP onboardingとoperationを一時ディレクトリで検証する。
-追跡対象のソースや通常のStoreは変更しない。
-完全なnative package gateを実行するため、環境によっては完了まで30分以上かかる。
-対象は通常アーカイブ単体であり、RC tag、公開後証跡、compiler pack archiveの真正性は公開後検証で別途確認する。
-
-Windowsでは同じリリースから`.zip`と`.zip.sha256`を取得し、`Get-FileHash -Algorithm SHA256`で照合してから`Expand-Archive`で展開する。
-リリースのSBOM、ライセンス一覧、互換性情報はアーカイブに同梱される。
-
-## ソースからのビルド
-
-開発用の固定ツールチェーンは、Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0である。
-リポジトリのルートで次を実行すると、CLIとRust、Go、Webの各ワーカーをビルドする。
-
-```sh
-cargo xtask build
-target/debug/depgraph --version
-```
-
-フォーマット、リント、契約テスト、ワーカーテスト、フィクスチャーテストをまとめて実行する場合は`cargo xtask test`を使う。
-開発手順と必要なコマンドは[CONTRIBUTING.md](CONTRIBUTING.md)に記載している。
-
-## リリースと互換性
-
-次のstable `v0.6.3` artifactは、[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)に記載した契約を実装している。
-`main`にはtag後の開発変更が含まれる場合があり、公開済みartifactの契約を自動的に更新しない。正式版は、[`v0.6.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.3)と公開後証跡が一致するときに限り有効である。
-MVPは[システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md)に記載したアーキテクチャを実装している。
-
-次のpatch release `v0.6.3`は、v0.6.0のStore schema `19`と説明可能なcode-health契約／APIを維持する。
-`depgraph-health-finding-v1`、CLIの`health`／`cleanup`／`audit`／`hotspots`、および対応するMCP APIがこの境界に含まれる。
-v0.6.0から新たな保存形式の移行はない。
-
-すべてのv0.5アーカイブには、ネイティブMCPサーバー、永続的な操作ランナー、バージョン管理されたエージェント用ツール／操作スキーマが含まれる。
-現行開発版のワーカープロトコルは`1.0`、操作ジャーナルスキーマは`6`であり、`depgraph-mcp-tools-v1`と`depgraph-operation-v2`を使用する。
-公開済み`v0.5.4` artifactのStore schemaは`17`である。
-current `main`はStore schema `19`を使用し、schema 19へ移行したStoreを公開済み`v0.5.4` binaryで開くことはできない。
-
-`v0.4.0`は予約済みベースラインの履歴記録であり、正式版は公開されなかった。
-履歴上の契約は[`v0.4.0`の契約](docs/releases/v0.4.0.md)に残している。
-過去のリリース候補は[`v0.4.0-rc.6`](docs/releases/v0.4.0-rc.6.md)、[`v0.4.0-rc.2`](docs/releases/v0.4.0-rc.2.md)、[`v0.4.0-rc.1`](docs/releases/v0.4.0-rc.1.md)、[`v0.2.0-rc.1`](docs/releases/v0.2.0-rc.1.md)で確認できる。
-
-次のリリースの互換性タプル、ストア移行、ロールバック、既知の制約は[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)を参照する。
-過去のschema 17の契約は[`v0.5.4`リリースノート](docs/releases/v0.5.4.md)に保持する。
-`v0.6.3`の移行条件とAPI差分は、[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)に記載する。
+| やりたいこと | 読む場所 |
+| --- | --- |
+| すべてのコマンド、設定、終了コードを知る | [使い方ガイド](docs/guide/usage.md) |
+| インストール、アーカイブの検証、ソースからのビルド | [インストールガイド](docs/guide/install.md) |
+| リリースの互換性とStore schemaを確認する | [リリースと互換性](docs/guide/compatibility.md) |
+| AIエージェントとの連携を詳しく知る | [MCPエージェントホスト運用手順（英語）](docs/50_test/mcp-agent-host-operations.md) |
+| CLIの詳細な契約を読む | [CLI動作リファレンス（英語）](docs/reference/cli-behavior.md) |
+| アーキテクチャの規則を検査する | [アーキテクチャポリシー契約（英語）](docs/reference/architecture-policy.md) |
+| 実行時トレースを取り込む | [実行時トレースの取り込み契約（英語）](docs/reference/runtime-trace.md) |
+| 設計を理解する | [システム設計](docs/40_arch_design/arch-dependency-graph-cli-system-design.md) |
+| すべての文書を探す | [ドキュメントインデックス](docs/00_index/index.md) |
 
 ## プロジェクトの状況と公開コラボレーション
 
-現在のサポート対象は、公開済み`v0.6.2`リリースである。
-その tag より後の `main` の変更は開発版として扱う。
-製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていない。
-
-利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従う。
-IssueやPull Requestを作成する前に[CONTRIBUTING.md](CONTRIBUTING.md)を確認し、意思決定とメンテナーの役割は[GOVERNANCE.md](GOVERNANCE.md)を参照する。
-参加者には[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)が適用される。
-
-脆弱性の可能性がある内容は公開Issueへ投稿せず、[SECURITY.md](SECURITY.md)に記載した非公開窓口へ報告する。
-ライセンスは[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)から選択できる。
-
-## 解析結果の完全性
-
-**`semantic-complete`**は、プロファイルのセマンティック解析が所定の完全性条件を満たしたことを示す。
-「依存関係を推測で補完した」という印ではない。
-構文解析が完了し、互換性を検証したセマンティックバックエンドがグラフを生成し、セマンティック問題、スキップ、未対応、未解決がすべて0件になったプロファイルだけに付与される。
-`candidates`と`external`は状態が明示されるため、この判定を妨げない。
-
-Rustのセマンティックバックエンドは、隔離したCargoメタデータ、準備済みプロジェクトモデル、検証済みRust `1.93.1`ツールチェーンを使用する。
-`depgraph`は`RUSTUP_AUTO_INSTALL=0`を設定し、必要なツールチェーンがない場合は暗黙にインストールせず、導入手順を診断へ出力する。
-ソースビルドは`rust_hir_enable_gate=release-gate-pending`を報告し、検証済みリリースアーカイブから起動したワーカーだけが`release-gate-verified`を報告できる。
-
-Webの`semantic-complete`は、同梱した隔離済みTypeScriptコンパイラー、生成済みv2グラフ、0件のスキップ、未対応、未解決、セマンティック問題、コンパイラー診断を要求する。
-Next.js、Astro、TanStack Router、TanStack Startを検出した場合は、対応するフレームワーク能力台帳の完了も要求する。
-
-静的グラフに加えて、アーキテクチャポリシー、GitHub注釈、実行時トレース、不変スナップショット、スナップショット差分、Git変更集合の影響分析、GraphML、監視デーモンを利用できる。
-ビルド観測は別の権限境界に置かれ、明示的な同意がある実行だけが対象プロジェクトのコードを起動する。
-
-## 開発時の品質検証
-
-すべてのフォーマット、リント、契約、ワーカー、フィクスチャーテストを実行する。
-
-```sh
-cargo xtask test
-```
-
-再現可能な性能ゲートは、固定ツールチェーンと決定的に生成したフィクスチャーを使用する。
-
-```sh
-scripts/benchmark-mvp.sh
-```
-
-ベンチマークは100、1,000、10,000ソースファイルのフィクスチャーと、31ソースファイルのRust HIRフィクスチャーを生成する。
-結果は`dist/benchmark-report.json`と`dist/cache-hit-benchmark-report.json`へ保存する。
-測定対象にはコールドスキャン、1ファイルの増分スキャン、影響クエリー、セマンティックキャッシュヒット、Rust HIRのコールド実行とウォーム実行を含む。
-各フィクスチャーでは正規グラフとカバレッジの一致を保ち、キャッシュヒットの中央値が5%以上高速であることを検証する。
-
-## CLIコマンド例
-
-```sh
-# 任意の追跡対象設定。設定がなくてもスキャンできる。
-depgraph init .
-
-# 安全な静的解析。対象リポジトリを変更しない。
-depgraph scan /path/to/repository
-depgraph scan /path/to/repository --strict
-depgraph scan /path/to/repository --no-cache
-depgraph scan /path/to/repository --plan --json
-depgraph scan /path/to/repository --split-plan --json
-
-# ワーカーの起動やストアの変更をせず、プロファイル選択を確認する。
-depgraph profiles plan /path/to/repository
-depgraph profiles plan /path/to/repository --profile-budget 8 --json
-depgraph profiles plan /path/to/repository --profiles-file profiles.json --json
-
-# 前景で監視デーモンを起動し、別のプロセスから状態確認と停止を行う。
-depgraph daemon start /path/to/repository
-depgraph daemon status /path/to/repository --json
-depgraph daemon stop /path/to/repository
-
-# 権限を伴うビルド観測。実行ごとに明示的な同意が必要になる。
-depgraph resolve --build /path/to/repository --allow-project-code
-depgraph resolve --build /path/to/repository --allow-project-code --json
-
-depgraph doctor --json
-depgraph doctor --details --json
-depgraph doctor --root /path/to/repository --json
-depgraph deps path:src/app.ts --transitive --max-items 100 --max-bytes 1048576
-depgraph deps path:src/app.ts --transitive --cursor "$NEXT_CURSOR" --json
-depgraph deps path:src/app.ts --transitive --all --json
-depgraph dependents package:example
-depgraph why path:src/app.ts route:/products/$id
-depgraph impact path:src/app.ts
-depgraph impact package:example --changed origin/main --depth 4
-depgraph impact route:/products/$id --changed HEAD~1 --profile web:production:server --json
-depgraph cycles --level file
-
-# Goのセマンティックグラフでは正規リゾルバーIDを使う。
-depgraph deps symbol:example.com/semantic/model.Build --transitive
-depgraph dependents type:example.com/semantic/model.Worker --json
-depgraph why symbol:example.com/semantic/model.Build type:example.com/semantic/model.Input --json
-depgraph cycles --level symbol
-
-# セレクターが曖昧な場合は、候補に含まれる安定IDで再実行する。
-depgraph deps "id:$STABLE_ID" --json
-
-depgraph unresolved --max-items 100 --json
-depgraph unresolved --all --json
-
-# ストアを変更せず、外部の実行時トレースを検証してグラフと照合する。
-depgraph runtime validate --file runtime-trace.json
-depgraph runtime validate --file runtime-trace.json --json
-
-# 完了済みの不変スナップショットに名前を付けて確認する。
-depgraph snapshot create baseline
-depgraph snapshot list --json
-depgraph snapshot show baseline
-depgraph snapshot show snapshot:sha256:... --json
-
-# 名前または安定IDで完了済みスナップショットを比較する。
-depgraph diff baseline current
-depgraph diff baseline current --json
-depgraph diff baseline current --kind symbol --profile web:production:server
-depgraph diff baseline current --phase semantic --status unresolved
-
-depgraph export --format json --output graph.json
-depgraph export --format dot > graph.dot
-depgraph export --format mermaid > graph.mmd
-depgraph export --format graphml --output graph.graphml
-```
-
-## MCP stdioサーバー
-
-`depgraph-mcp`は、ネイティブパッケージに含まれるMCP stdioサーバーである。
-既定の`read`権限では、ストアの変更、リポジトリへの書き込み、デーモン制御、プロジェクトコードの実行を許可しない。
-固定したリポジトリルート、絶対パスで指定したストア、検証済みコンパイラーパックの要件ファイルが必要になる。
-
-公式stable版の`depgraph`を導入した後、対象Gitリポジトリ内で次を実行すると、artifactの取得と検証、安全な初回スキャン、package/MCP preflight、ホスト設定のatomic mergeまでを一括して行える。
-
-```sh
-depgraph mcp setup --host codex
-```
-
-`--host`には`codex`、`claude`、`cursor`、`grok`を指定できる。
-既定はproject scopeであり、設定先は順に`.codex/config.toml`、`.mcp.json`、`.cursor/mcp.json`、`.grok/config.toml`となる。
-user scopeへ設定する場合は`--scope user`を付ける。
-
-```sh
-depgraph mcp setup --host cursor --scope user
-```
-
-user scopeの設定先は順に`~/.codex/config.toml`、`~/.claude.json`、`~/.cursor/mcp.json`、`~/.grok/config.toml`となる。
-複数リポジトリを共存させるため、user scopeでは`depgraph-<repository-id>`という決定的なサーバー名を使う。
-project scopeのサーバー名は従来どおり`depgraph`である。
-
-runtimeとcompiler packはversion／target単位で共有し、ストアはcanonical repository rootごとに分離する。
-設定はread-onlyで固定され、既存の無関係な設定を保持する。
-CodexとGrokのTOMLではコメントと書式も保持する。
-完了後は対象ホストを再起動または再読み込みする。
-再実行はidempotentであり、運用には次のコマンドを使う。
-
-```sh
-depgraph mcp status --host codex
-depgraph mcp update --host codex
-depgraph mcp uninstall --host codex
-```
-
-user scopeのbindingには、各コマンドで同じ`--host`と`--scope user`を指定する。
-
-`status`はartifact、Store binding、snapshot、host設定、MCP接続を再検証する。
-`update`は実行中CLIのversionへ整合させてsafe snapshotを更新する。
-`setup`／`update`／`uninstall`は同じrepository lifecycle lockで直列化される。
-user homeの`.depgraph-mcp-locks`にhost設定ファイルごとのlockを置き、異なるリポジトリやCLI versionによるuser scope設定の同時更新を直列化する。
-`uninstall`は管理cache配下の完全なread-only起動tupleを所有権として検証し、state未作成の場合もscan、daemon、durable operation runnerの排他を必ず確立してから指定したhost／scopeの設定だけを削除する。
-同じリポジトリを参照し、実行中CLIのversion／host targetと一致する所有済みのhost／scope設定が残っている場合だけ、repository固有のstateを保持する。
-過去releaseや、同名でも起動tupleが一致しない設定は残存bindingとして扱わない。
-最後の設定を削除した時点でstateを削除し、共有artifactと安全な再利用に必要な空のlock sentinelを残す。
-中断後は同じ`setup`を再実行する。
-root判定、公開Release、cache、設定、再起動の問題は[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)のtroubleshootingを参照する。
-
-リリース証跡の検証、`agent-config`によるホスト設定、権限プロファイル、再接続、キャンセルの詳細は、[英語版のMCP stdioサーバー節](README.en.md#mcp-stdio-server)と[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)を参照する。
-
-## 安全なスキャンの境界
-
-既定のスキャンは、ソース、マニフェスト、ロックファイル、静的なJSON／JSONC設定、既存の生成済みファイルを読み取る。
-プロジェクト設定、プラグイン、パッケージマネージャー、ジェネレーター、ビルドスクリプト、手続きマクロ、プロジェクト内のTypeScriptは実行しない。
-Webワーカーは同梱したTypeScriptを使用し、GoとCargoの解析もネットワークやリポジトリ書き込みを無効にしたオフライン境界内で行う。
-
-ワーカーとツールチェーンの探索には正規化した絶対`PATH`を使い、相対要素、スキャンルート、そのルートを指すシンボリックリンクを除外する。
-リリースマニフェスト、ワーカー、スキーマ、実行時部品、宣言済み成果物は、パッケージ済みワーカーを起動する前にチェックサムを検証する。
-
-実行形式または未対応の設定は、診断か未解決箇所として記録する。
-ワーカープロファイル、カバレッジ、保存済みスキャン、`doctor`の`project_code_executed`は`false`のままである。
-完全な境界は[英語版の安全なスキャン節](README.en.md#safe-scan-boundary)を参照する。
-
-## ビルドモードの同意境界
-
-`depgraph resolve --build [PATH]`は、ビルドツール、実行可能な設定、プラグイン、ライフサイクルスクリプト、Rustのビルドスクリプトや手続きマクロが任意のプロジェクトコードを実行し得るため、独立した特権モードとして扱う。
-対話的な確認は行わず、実行のたびに`--allow-project-code`を明示しなければならない。
-設定、環境変数、`CI=true`、TTYの状態、過去の同意によって権限を付与することはできない。
-同意がない場合は、パス、設定、ストア、ツールチェーンを処理する前に終了コード`4`で拒否する。
-一時ワークスペースにコピーするとき、`node_modules` 配下のリポジトリ内シンボリックリンクは保持し、正規化したリンク先をコピー先内部の相対パスに置き換える。
-pnpm の isolated layout で複数バージョンが共存しても、Node が実体パスを起点に依存を解決できる。パッケージマネージャーや `.npmrc` の検出は不要。
-それ以外のリポジトリ内リンクは従来どおり実体化する。シンボリックリンクを作成できない環境で依存を実体化するフォールバックは行わない。
-祖先ディレクトリへ戻るリンクと `.git` / `.depgraph` / リポジトリ直下の `target` / `.next` を指すリンクはコピーしない。
-リポジトリ外・存在しない対象・通常ファイルやディレクトリ以外を指すリンクは拒否する。dangling link は黙って省略せず、依存の再インストールなどで修復するか、不要なリンクを明示的に除外する。
-`.depgraph.toml` の `[build] ignored_paths` にリポジトリ相対プレフィックスを書くと、その配下とそこを指すリンクはステージング対象から外れる。未知の `[build]` キーはエラーになる。
-Next の Node.js トレースに含まれる `node_modules` 内のディレクトリリンクは、参照先の範囲と観測前後の同一性を確認し、リンク構造の digest として記録する。
-トレース対象の通常ファイルは別に内容をハッシュし、未観測のパッケージ全体を再帰走査しない。主出力・fallback・Wasm のリンクは引き続き認めない。
-Edge の asset 名がビルド出力ディレクトリ基準の場合も、絶対パスと同じリポジトリ内ファイルを指すことを確認し、記録はリポジトリ相対パスに統一する。
-Next 出力の ID は型と意味上のバリアントごとに検証し、ページと事前生成結果が同じ ID を使う場合も保持する。親参照は一意な主リクエスト経路に限り、同じバリアント内の重複や親の欠落・曖昧さは拒否する。
-サーバーと Edge が共有するトレース済みファイルは、役割を含むノード ID で両方の読み込み関係を保持する。
-Web のビルド証跡変換は入力・標準出力それぞれ 64 MiB、標準エラーの保持量 64 KiB、30 秒の上限を持つ。両出力を同時に読み、保持量を制限し、切り詰め・標準エラー・異常終了・検証失敗があれば全体を拒否する。runtime trace と query の上限は変更しない。
-失敗時は redacted な stderr 末尾と一時ログパスを表示し、`--json` で機械可読な診断を返す。監査記録には raw stderr を残さない。
-
-`Cargo.toml`と`Cargo.lock`を持つRustワークスペースはCargoで実行する。
-Webプロジェクトは`package.json`にバージョン付きの`depgraph.build`実行プランを宣言する。シェルコマンドやnpm/pnpm/yarnのlifecycleは受け付けない。
-
-```json
-{
-  "depgraph": {
-    "build": {
-      "adapter": "next",
-      "entrypoint": "scripts/depgraph-build.mjs",
-      "version": "16.2.3",
-      "timeout_seconds": 900
-    }
-  }
-}
-```
-
-各フィールドは厳格に検証され、未知のフィールドは設定ミスに気づけるよう拒否される。
-
-| フィールド | 型 | 意味 |
-| --- | --- | --- |
-| `adapter` | 文字列 | `next`・`astro`・`tanstack-router`・`tanstack-start`のいずれか。リリースに固定された観測契約を選択する |
-| `entrypoint` | 文字列 | リポジトリ相対パスのNodeスクリプト。`node <entrypoint>`として引数なしで起動される。絶対パスと`..`は拒否され、ファイルが存在しなければならない |
-| `version` | 文字列 | 空でない対象フレームワークのバージョン（例: `"16.2.3"`）。JSON文字列でなければならず、数値は拒否される。AstroとTanStack系アダプターには`DEPGRAPH_ASTRO_VERSION`・`DEPGRAPH_TANSTACK_ROUTER_VERSION`・`DEPGRAPH_TANSTACK_START_VERSION`として渡される |
-| `timeout_seconds` | 整数（省略可） | ビルド全体のタイムアウト（秒）。許容範囲は1〜3600で、既定は`900` |
-
-entrypointの起動規約は次のとおりである。
-
-- ビルドはリポジトリの一時的なステージングコピーの中で、そのルートを作業ディレクトリとして実行される。entrypointはソースを変更してはならない（変更は実行後のソース監査で失敗になる）。
-- `node <entrypoint>`にCLI引数は渡されない。設定は環境変数で渡される。`DEPGRAPH_OBSERVER`はリリース同梱の観測モジュールのパス（Nextには`NEXT_ADAPTER_PATH`としても渡される）、観測結果は`DEPGRAPH_OUTPUT_DIR`へ書き出される。
-- スクリプトは実際のフレームワークビルド（例: `next build`のspawn）を起動し、その終了コードで終了することが期待される。`next.config.ts`やフレームワークのバイナリを直接`entrypoint`に指定しても、観測がビルドライフサイクルへ組み込まれないため動作しない。
-
-最小のNext.js向けentrypointの例:
-
-```js
-// scripts/depgraph-build.mjs
-import { spawnSync } from "node:child_process";
-
-const result = spawnSync(
-  process.execPath,
-  ["node_modules/next/dist/bin/next", "build"],
-  { stdio: "inherit" },
-);
-process.exit(result.status ?? 1);
-```
-
-Next.jsではこの例で完結する。Next.js 16.2以降では、entrypoint自身はobserverをimportせず、`next build`が環境変数`NEXT_ADAPTER_PATH`を読み取ってリリース同梱アダプターのビルドフック（`modifyConfig`・`onBuildComplete`）を呼び出し、観測結果を`DEPGRAPH_OUTPUT_DIR`へ書き出す。この自動組み込みこそが、entrypointに本物の`next build`プロセスの起動を求める理由である。
-
-コピーして使えるNext.js向けスクリプトは[docs/examples/next-depgraph-build.mjs](docs/examples/next-depgraph-build.mjs)にもある。
-プランが無い場合（`depgraph`キー自体が無い、または`{"depgraph":{}}`のように`build`だけが欠ける場合）のエラーは雛形と`depgraph resolve --help`への案内を含む。`depgraph init`は`.depgraph.toml`だけを書き、`package.json`は変更しない。
-
-ビルド監督、隔離、監査記録、フレームワーク観測、コンパイラー精密モードの完全な契約は[英語版のビルドモード節](README.en.md#build-mode-consent-boundary)を参照する。
-
-## 厳格ポリシーと終了コード
-
-既定の`.depgraph.toml`の厳格ポリシーでは、スキップしたファイル、未対応構文、未解決箇所を許容しない。
-候補依存と外部依存だけでは厳格モードの失敗にならない。
-
-| コード | 意味 |
-| ---: | --- |
-| 0 | ポリシー違反なしで処理が完了した |
-| 1 | グラフまたはカバレッジのポリシー違反 |
-| 2 | CLIの使用方法、セレクター、設定のエラー |
-| 3 | ワーカー、ツールチェーン、グラフ検証、プロトコルの失敗 |
-| 4 | プロジェクトコード実行権限またはセキュリティポリシーの失敗 |
-
-失敗または部分的なスキャンと診断は保存されるが、`latest successful`が指す先を更新するのは、ポリシーを通過した完全なスキャンだけである。
-
-## リポジトリ構成
-
-- `crates/depgraph-protocol`：型付きプロトコル、正規条件／ID、JSON Schema、状態機械の検証
-- `crates/depgraph-store`：SQLite移行、不変スキャンのステージング、台帳、根拠の永続化
-- `crates/depgraph-rustc-wrapper`：検証済みの全ユニット用rustcラッパーと有界な開始／終了台帳の出力
-- `crates/depgraph-core`、`crates/depgraph-cli`：ワーカー監督、クエリー、出力、診断、CLI操作
-- `workers/rust`、`workers/go`、`workers/web`：各エコシステム向けの安全な静的解析アダプター
-- `xtask`：再現可能なビルド、全品質検証、リリースアーカイブ、チェックサム、SBOM、ライセンス一覧
-
-## 英語版の詳細仕様
-
-言語ごとのREADMEを混在させないため、長い技術契約と運用手順は英語版へ集約している。
-
-- [アーキテクチャポリシー契約](README.en.md#architecture-policy-contract)
-- [実行時トレースの取り込み契約](README.en.md#runtime-trace-import-contract)
-- [安全なスキャンの完全な境界](README.en.md#safe-scan-boundary)
-- [ビルドモードの完全な同意境界](README.en.md#build-mode-consent-boundary)
-- [コンパイラーパックとリリース検証](README.en.md#compiler-pack-and-release-verification)
+現在のサポート対象は、公開済み`v0.6.3`リリースです。
+そのtagより後の`main`の変更は開発版として扱います。
+含まれる変更は[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)を参照してください。
+製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていません。
+
+利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従ってください。
+IssueやPull Requestを作成する前に[CONTRIBUTING.md](CONTRIBUTING.md)を確認してください。
+意思決定とメンテナーの役割は[GOVERNANCE.md](GOVERNANCE.md)にあります。
+参加者には[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)が適用されます。
+
+脆弱性の可能性がある内容は公開Issueへ投稿せず、[SECURITY.md](SECURITY.md)に記載した非公開窓口へ報告してください。
+
+## 開発に参加する
+
+開発用の固定ツールチェーンは、Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0です。
+`cargo xtask build`でCLIとワーカーをビルドし、`cargo xtask test`ですべての検査を実行します。
+開発の流れは[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
 
 <a id="license"></a>
 ## ライセンス
 
-[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)のいずれかを選択できる。
+[MIT](LICENSE-MIT)または[Apache-2.0](LICENSE-APACHE)のいずれかを選択できます。
 
 Copyright (c) 2026 TamaT LLC.

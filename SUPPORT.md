@@ -9,29 +9,28 @@ repository.
 The supported stable line is the newest stable version whose official GitHub
 Release and matching `release-post-publish-evidence-<tag>.json` asset exist and
 agree.
-The published [`v0.6.2` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.2)
-is the current stable baseline while `v0.6.3` is prepared.
-`v0.6.3` becomes supported only after its official Release and matching
-post-publish evidence exist. It retains the v0.6.0 Store schema `19` and
-code-health contract/API.
+The published [`v0.6.3` GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases/tag/v0.6.3)
+and its post-publish evidence are the current stable baseline. `v0.6.3`
+retains the v0.6.0 Store schema `19` and code-health contract/API.
 Release candidates and older stable versions are unsupported.
 Fixes land on `main` first.
 For a stable patch release, the maintenance ref matching that minor line
 advances by fast-forward to the exact reviewed `main` commit that passed Full
 CI; it is not advanced by cherry-pick. The v0.5 and v0.6 refs are
 `release/0.5` and `release/0.6`, respectively.
-The pinned toolchains, five native archive targets, compatibility contract,
+The pinned toolchains, four native archive targets, compatibility contract,
 known limitations, and verified release links are listed in the
-[English README](README.en.md).
+[installation guide](docs/guide/install.en.md) and the
+[compatibility guide](docs/guide/compatibility.en.md).
 
 ## Where to ask
 
 - For a reproducible defect in a supported release, use the bug report form.
 - For a scoped enhancement, use the feature request form.
-- For usage help, first search the [English README](README.en.md), release
-  notes, and existing issues. If the documentation is insufficient, file a bug
-  when the documented behavior is wrong or a feature request when new behavior
-  is needed.
+- For usage help, first search the [English README](README.en.md), the
+  [usage guide](docs/guide/usage.en.md), release notes, and existing issues. If
+  the documentation is insufficient, file a bug when the documented behavior is
+  wrong or a feature request when new behavior is needed.
 - For suspected vulnerabilities, use the private route in
   [SECURITY.md](SECURITY.md). Never use a public issue.
 - For conduct or moderation concerns, follow
