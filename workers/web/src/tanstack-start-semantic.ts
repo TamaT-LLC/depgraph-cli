@@ -27,7 +27,7 @@ import {
   emitFrameworkSemanticRelation,
   frameworkEnvironmentCondition as condition,
   emitFrameworkCodeLinks,
-  type FrameworkCodeLinkEmitter,
+  frameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -494,13 +494,7 @@ export function collectTanStackStartSemanticDelta(
     );
   };
 
-  const codeLinks: FrameworkCodeLinkEmitter = {
-    store: { sites, edges },
-    profileId: PROFILE_ID,
-    fileNode: (relativePath) => input.fileNode(relativePath),
-    evidence: (relativePath, span, occurrenceKind) => evidence(relativePath, span, occurrenceKind),
-    subject: "TanStack Start collector",
-  };
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), evidence, "TanStack Start collector");
   const definitionsByPath = new Map<string, TypeScriptRawDefinition[]>();
   for (const definition of input.definitions.definitions) {
     if (definition.graphKind !== "symbol") continue;

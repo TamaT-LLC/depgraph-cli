@@ -35,7 +35,7 @@ import {
   emitFrameworkSemanticRelation,
   frameworkEnvironmentCondition as condition,
   emitFrameworkCodeLinks,
-  type FrameworkCodeLinkEmitter,
+  frameworkCodeLinkEmitter,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -870,13 +870,7 @@ export function collectTanStackRouterSemanticDelta(
     );
   }
 
-  const codeLinks: FrameworkCodeLinkEmitter = {
-    store: { sites, edges },
-    profileId: PROFILE_ID,
-    fileNode: (relativePath) => input.fileNode(relativePath),
-    evidence: (relativePath, span, occurrenceKind) => semanticEvidence(relativePath, span, occurrenceKind),
-    subject: "TanStack Router semantic collector",
-  };
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), semanticEvidence, "TanStack Router semantic collector");
   const componentCache = new Map<string, GraphNode>();
   const componentFor = (relativePath: string, expression: Expression, kind: string): GraphNode | null => {
     const reference = isIdentifier(unwrap(expression)) ? unwrap(expression) : expression;

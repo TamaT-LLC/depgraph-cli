@@ -27,7 +27,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
   emitFrameworkCodeLinks,
-  type FrameworkCodeLinkEmitter,
+  frameworkCodeLinkEmitter,
+  frameworkNodeSpan,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import { stableId } from "./ids";
@@ -254,20 +255,6 @@ function evidence(
       properties: sharedProperties,
     },
   ];
-}
-
-function spanFromNode(node: GraphNode): Span | null {
-  const value = node.properties.source_span;
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const result = value as Record<string, JsonValue>;
-  const fields = ["start_line", "start_column", "end_line", "end_column"] as const;
-  if (!fields.every((field) => Number.isSafeInteger(result[field]) && Number(result[field]) >= 1)) return null;
-  return {
-    start_line: Number(result.start_line),
-    start_column: Number(result.start_column),
-    end_line: Number(result.end_line),
-    end_column: Number(result.end_column),
-  };
 }
 
 function defaultEntrySpan(entry: RouteEntry): Span {
@@ -535,13 +522,7 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
       { conflictSubject: "Next semantic collector", emptyTargetSubject: "Next semantic relation" },
     );
   };
-  const codeLinks: FrameworkCodeLinkEmitter = {
-    store: { sites, edges },
-    profileId: PROFILE_ID,
-    fileNode: (relativePath) => input.fileNode(relativePath),
-    evidence: (relativePath, span, occurrenceKind) => evidence(relativePath, span, occurrenceKind),
-    subject: "Next semantic collector",
-  };
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), evidence, "Next semantic collector");
   const componentByKey = new Map<string, GraphNode>();
   const componentFor = (
     definitionKey: string,
@@ -592,7 +573,7 @@ export function collectNextSemanticDelta(input: NextSemanticInput): NextSemantic
     const routeHandler = entry.entryKind === "route" || entry.entryKind === "api-route";
     if (uniqueComponents.length === 1 || (routeHandler && uniqueComponents.length > 0)) {
       for (const component of uniqueComponents) {
-        const componentSpan = spanFromNode(component) ?? defaultEntrySpan(entry);
+        const componentSpan = frameworkNodeSpan(component) ?? defaultEntrySpan(entry);
         const componentCondition = nextCondition(
           component.properties.environment as string,
           entryMetadata,

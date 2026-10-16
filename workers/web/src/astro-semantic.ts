@@ -12,7 +12,8 @@ import {
   WEB_FRAMEWORK_SEMANTIC_EXTRACTOR_VERSION,
   emitFrameworkSemanticRelation,
   emitFrameworkCodeLinks,
-  type FrameworkCodeLinkEmitter,
+  frameworkCodeLinkEmitter,
+  frameworkNodeSpan,
   type FrameworkSemanticDelta,
 } from "./framework-semantic";
 import {
@@ -159,21 +160,6 @@ function entrySpan(entry: RouteEntry): Span {
     start_column: entry.evidence.start_column,
     end_line: entry.evidence.end_line,
     end_column: entry.evidence.end_column,
-  };
-}
-
-function spanFromNode(node: GraphNode): Span | null {
-  const raw = node.properties.source_span;
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const value = raw as Record<string, JsonValue>;
-  if (!["start_line", "start_column", "end_line", "end_column"].every((field) => (
-    Number.isSafeInteger(value[field]) && Number(value[field]) >= 1
-  ))) return null;
-  return {
-    start_line: Number(value.start_line),
-    start_column: Number(value.start_column),
-    end_line: Number(value.end_line),
-    end_column: Number(value.end_column),
   };
 }
 
@@ -683,13 +669,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
     );
   };
 
-  const codeLinks: FrameworkCodeLinkEmitter = {
-    store: { sites, edges },
-    profileId: PROFILE_ID,
-    fileNode: (relativePath) => input.fileNode(relativePath),
-    evidence: (relativePath, span, occurrenceKind) => evidence(relativePath, span, occurrenceKind),
-    subject: "Astro semantic collector",
-  };
+  const codeLinks = frameworkCodeLinkEmitter({ sites, edges }, PROFILE_ID, (relativePath) => input.fileNode(relativePath), evidence, "Astro semantic collector");
   const componentCache = new Map<string, GraphNode>();
   const componentForFile = (relativePath: string, environment: string): GraphNode => {
     const key = `file\0${relativePath}\0${environment}`;
@@ -747,7 +727,7 @@ export async function collectAstroSemanticDelta(input: AstroSemanticInput): Prom
       for (const { method, key } of handlers) {
         const symbol = input.definitionNode(key);
         if (!symbol) continue;
-        const span = spanFromNode(symbol) ?? entrySpan(entry);
+        const span = frameworkNodeSpan(symbol) ?? entrySpan(entry);
         const condition = astroCondition(preferredWebEnvironment("server"), null, { "astro.method": method });
         addRelation(
           symbol, [route], "route_entry", entry.pattern, entry.relativeFile, span,
