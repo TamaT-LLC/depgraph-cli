@@ -88,11 +88,15 @@ runs:
             *) echo "::error::${pair%%=*} must be true or false" >&2; exit 2 ;;
           esac
         done
-        out_dir="${RUNNER_TEMP}/depgraph-pr-impact"
-        mkdir -p "$out_dir"
+        # A job may call this Action more than once (for example one scan root
+        # per monorepo package), so each call gets its own directory instead of
+        # sharing a fixed path that a later call would overwrite.
+        out_dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/depgraph-pr-impact.XXXXXX")"
         {
           echo "out-dir=${out_dir}"
           echo "store=${out_dir}/store.db"
+          echo "scan-path=${out_dir}/scan.json"
+          echo "scan-stderr-path=${out_dir}/scan.stderr"
           echo "report-path=${out_dir}/report.json"
           echo "comment-path=${out_dir}/comment.md"
         } >>"$GITHUB_OUTPUT"
@@ -133,7 +137,8 @@ runs:
       env:
         DEPGRAPH_BIN: ${{ steps.binary.outputs.path }}
         DEPGRAPH_STORE: ${{ steps.paths.outputs.store }}
-        OUT_DIR: ${{ steps.paths.outputs.out-dir }}
+        SCAN_OUTPUT_PATH: ${{ steps.paths.outputs.scan-path }}
+        SCAN_STDERR_PATH: ${{ steps.paths.outputs.scan-stderr-path }}
         INPUT_STRICT: ${{ inputs.strict }}
       run: |
         set -euo pipefail
@@ -142,13 +147,13 @@ runs:
           args+=(--strict)
         fi
         set +e
-        "$DEPGRAPH_BIN" "${args[@]}" >"${OUT_DIR}/scan.json" 2>"${OUT_DIR}/scan.stderr"
+        "$DEPGRAPH_BIN" "${args[@]}" >"$SCAN_OUTPUT_PATH" 2>"$SCAN_STDERR_PATH"
         code=$?
         set -e
         echo "exit-code=${code}" >>"$GITHUB_OUTPUT"
         echo "depgraph scan exited with ${code}"
         if [[ "$code" -ne 0 ]]; then
-          tail -n 40 "${OUT_DIR}/scan.stderr" >&2 || true
+          tail -n 40 "$SCAN_STDERR_PATH" >&2 || true
         fi
 
     - name: Collect impact for changed files
@@ -160,7 +165,7 @@ runs:
         DEPGRAPH_VERSION: ${{ steps.binary.outputs.version }}
         DEPGRAPH_STORE: ${{ steps.paths.outputs.store }}
         REPORT_PATH: ${{ steps.paths.outputs.report-path }}
-        SCAN_OUTPUT_PATH: ${{ steps.paths.outputs.out-dir }}/scan.json
+        SCAN_OUTPUT_PATH: ${{ steps.paths.outputs.scan-path }}
         SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
         BASE_REF: ${{ inputs.base-ref }}
         PROFILES: ${{ inputs.profiles }}

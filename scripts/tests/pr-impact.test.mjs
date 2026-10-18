@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -892,4 +896,70 @@ test("isOwnComment requires the marker and the expected bot identity", () => {
   assert.equal(isOwnComment(botComment(1, "no marker")), false);
   assert.equal(isOwnComment({ id: 1, body: COMMENT_MARKER, user: { login: "github-actions[bot]", type: "User" } }), false);
   assert.equal(isOwnComment({ id: 1, body: COMMENT_MARKER, user: { login: "mallory", type: "User" } }), false);
+});
+
+// --- per-call output directory ---------------------------------------------
+
+const ACTION_YML = new URL("../../.github/actions/pr-impact/action.yml", import.meta.url);
+const WORKFLOW_YML = new URL("../../.github/workflows/depgraph-pr-impact.yml", import.meta.url);
+const STEP_RUN_INDENT = "        ";
+
+// Pull the `run: |` block of the step with the given id out of the composite
+// action, so the test exercises the shell the runner actually executes.
+function compositeStepScript(actionText, stepId) {
+  const lines = actionText.split("\n");
+  const idIndex = lines.findIndex((line) => line.trim() === `id: ${stepId}`);
+  assert.notEqual(idIndex, -1, `step ${stepId} not found`);
+  const runIndex = lines.findIndex((line, index) => index > idIndex && line.trim() === "run: |");
+  assert.notEqual(runIndex, -1, `step ${stepId} has no run block`);
+  const body = [];
+  for (const line of lines.slice(runIndex + 1)) {
+    if (line !== "" && !line.startsWith(STEP_RUN_INDENT)) break;
+    body.push(line.slice(STEP_RUN_INDENT.length));
+  }
+  return body.join("\n");
+}
+
+function readOutputs(text) {
+  return Object.fromEntries(
+    text
+      .split("\n")
+      .filter((line) => line.includes("="))
+      .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+}
+
+test("each Action call in a job gets its own output directory", () => {
+  const script = compositeStepScript(readFileSync(ACTION_YML, "utf8"), "paths");
+  const runnerTemp = mkdtempSync(join(tmpdir(), "pr-impact-runner-"));
+  try {
+    const runOnce = (index) => {
+      const outputFile = join(runnerTemp, `github-output-${index}`);
+      writeFileSync(outputFile, "");
+      execFileSync("bash", ["-c", script], {
+        env: { PATH: process.env.PATH, RUNNER_TEMP: runnerTemp, GITHUB_OUTPUT: outputFile, INPUT_STRICT: "false", INPUT_POST_COMMENT: "false" },
+      });
+      return readOutputs(readFileSync(outputFile, "utf8"));
+    };
+    const first = runOnce(1);
+    const second = runOnce(2);
+    for (const outputs of [first, second]) {
+      assert.ok(outputs["out-dir"].startsWith(join(runnerTemp, "depgraph-pr-impact.")));
+      for (const key of ["store", "scan-path", "scan-stderr-path", "report-path", "comment-path"]) {
+        assert.ok(outputs[key].startsWith(`${outputs["out-dir"]}/`), `${key} is outside out-dir`);
+      }
+    }
+    assert.notEqual(first["out-dir"], second["out-dir"]);
+    assert.notEqual(first["report-path"], second["report-path"]);
+    assert.notEqual(first["comment-path"], second["comment-path"]);
+  } finally {
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("the dry-run workflow uploads the paths the Action reports instead of a fixed directory", () => {
+  const workflow = readFileSync(WORKFLOW_YML, "utf8");
+  assert.match(workflow, /^\s+\$\{\{ steps\.impact\.outputs\.report-path \}\}$/m);
+  assert.match(workflow, /^\s+\$\{\{ steps\.impact\.outputs\.comment-path \}\}$/m);
+  assert.doesNotMatch(workflow, /depgraph-pr-impact\//);
 });

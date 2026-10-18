@@ -136,7 +136,9 @@ warm impact は 1 回数十 ms と測定されている（`docs/releases/v0.4.0-
 | `working-directory` | monorepo の解析ルート |
 
 出力は `report-path`、`comment-path`、`scan-exit-code`、`impacted-count` である。
-成果物（`store.db`、`scan.json`、`report.json`、`comment.md`）は `$RUNNER_TEMP/depgraph-pr-impact/` に置く。
+成果物（`store.db`、`scan.json`、`report.json`、`comment.md`）は、呼び出しごとに `mktemp -d` で作る `$RUNNER_TEMP/depgraph-pr-impact.XXXXXX/` に置く。
+同じジョブで Action を複数回呼んでも（monorepo で解析ルートごとに呼ぶ場合など）、後の呼び出しが前の成果物を上書きしない。
+場所は固定でないため、後続のステップは `report-path` と `comment-path` の出力から参照する。
 
 checkout は head.sha を指定する。
 `refs/pull/N/merge` を checkout すると、コメントの根拠リンクが指すコミットが PR 上から消えてしまうためである。
