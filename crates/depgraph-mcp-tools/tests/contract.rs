@@ -10,21 +10,22 @@ use depgraph_mcp_tools::{
     AgentEdgeCommon, AgentEdgeSummary, AgentError, AgentErrorCategory, AgentErrorCode,
     AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
     AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
-    AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
-    AgentPolicyApiChange, AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision,
-    AgentQueryRow, AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome,
-    AgentRepositoryList, AgentRepositorySummary, AgentResolutionStatus, AgentResourceLimit,
-    AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite,
-    AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
-    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier, AgentLocator,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
+    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryRow,
+    AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRepositorySummary, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
+    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS,
-    MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES, MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES,
-    MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools,
-    Page, PageByteLimit, PageRequest, PageSize, PortableTerminalOutputContract,
-    RepositoryRelativePath, SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
-    TaskAccepted, TasksNegotiation, canonical_json_bytes,
+    MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
+    MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
+    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
+    SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -64,6 +65,27 @@ fn evidence() -> AgentEvidence {
         parse("0.0.330"),
         Some(source_span()),
     )
+}
+
+fn import_evidence() -> AgentImportEvidence {
+    AgentImportEvidence::new(
+        parse("@/lib/foo"),
+        Some(AgentImportBindingKind::Named),
+        Some(parse("fooHelper")),
+        None,
+        false,
+    )
+    .expect("bounded import evidence")
+}
+
+fn evidence_with_import() -> AgentEvidence {
+    AgentEvidence::new(
+        AgentEvidenceKind::Semantic,
+        parse("typescript-native-typechecker"),
+        parse("7.0.2"),
+        Some(source_span()),
+    )
+    .with_import(import_evidence())
 }
 
 fn node() -> AgentNode {
@@ -813,6 +835,14 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
     assert_unknown_field_rejected::<AgentEvidence>(
         "AgentEvidence",
         serde_json::to_value(evidence()).expect("serialize evidence"),
+    );
+    assert_unknown_field_rejected::<AgentEvidence>(
+        "AgentEvidence with import",
+        serde_json::to_value(evidence_with_import()).expect("serialize evidence"),
+    );
+    assert_unknown_field_rejected::<AgentImportEvidence>(
+        "AgentImportEvidence",
+        serde_json::to_value(import_evidence()).expect("serialize import"),
     );
     assert_unknown_field_rejected::<AgentNode>(
         "AgentNode",
@@ -1942,6 +1972,7 @@ fn contract_samples() -> Value {
         "agent_build_outcome": build_outcome(),
         "agent_edge": edge(),
         "agent_evidence": evidence(),
+        "agent_evidence_import": evidence_with_import(),
         "agent_impact": impact(),
         "agent_impact_response": impact_response(),
         "agent_cycle": cycle(),
@@ -2217,4 +2248,169 @@ fn issue_542_dependency_output_deserializes_each_detail_to_one_variant() {
         serde_json::to_value(AgentDependencyDetail::default()).unwrap(),
         json!("full")
     );
+}
+
+// Issue #544: import evidence carries the specifier and the imported binding.
+
+#[test]
+fn evidence_without_import_keeps_the_legacy_bytes() {
+    let value = serde_json::to_value(evidence()).expect("serialize evidence");
+    assert!(value.get("import").is_none());
+    assert_eq!(
+        value,
+        json!({
+            "kind":"semantic",
+            "extractor":"rust-analyzer",
+            "extractor_version":"0.0.330",
+            "span":{"path":"src/lib.rs","start":{"line":1,"column":2},"end":{"line":3,"column":4}}
+        })
+    );
+}
+
+#[test]
+fn import_evidence_serializes_only_present_fields_and_round_trips() {
+    let value = serde_json::to_value(evidence_with_import()).expect("serialize evidence");
+    assert_eq!(
+        value["import"],
+        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper"})
+    );
+    let parsed: AgentEvidence = serde_json::from_value(value).expect("round trip");
+    assert_eq!(parsed, evidence_with_import());
+    assert_eq!(
+        parsed.import().map(|import| import.specifier().as_str()),
+        Some("@/lib/foo")
+    );
+
+    let full = AgentImportEvidence::new(
+        parse("crate::domain::Named"),
+        Some(AgentImportBindingKind::Named),
+        Some(parse("Named")),
+        Some(parse("NameContract")),
+        true,
+    )
+    .expect("full import evidence");
+    assert_eq!(
+        serde_json::to_value(&full).unwrap(),
+        json!({
+            "specifier":"crate::domain::Named",
+            "binding_kind":"named",
+            "imported_name":"Named",
+            "local_name":"NameContract",
+            "type_only":true
+        })
+    );
+    let specifier_only: AgentImportEvidence =
+        serde_json::from_value(json!({"specifier":"example.com/pkg/util"}))
+            .expect("specifier only");
+    assert_eq!(specifier_only.binding_kind(), None);
+    assert_eq!(
+        serde_json::to_value(&specifier_only).unwrap(),
+        json!({"specifier":"example.com/pkg/util"})
+    );
+}
+
+#[test]
+fn import_binding_kind_is_a_closed_enum() {
+    for kind in [
+        "default",
+        "named",
+        "namespace",
+        "import_equals",
+        "side_effect",
+        "require",
+        "dynamic",
+        "import_type",
+        "named_reexport",
+        "namespace_reexport",
+        "export_star",
+        "reexport",
+        "glob",
+        "glob_reexport",
+        "extern_crate",
+    ] {
+        let parsed: AgentImportBindingKind =
+            serde_json::from_value(json!(kind)).unwrap_or_else(|_| panic!("{kind} is valid"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(kind));
+    }
+    for invalid in ["Named", "wildcard", "", "named_import"] {
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(
+                json!({"specifier":"./a","binding_kind":invalid})
+            )
+            .is_err(),
+            "binding_kind {invalid:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn import_specifier_and_names_are_bounded_and_credential_free() {
+    let at_limit = "a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES);
+    assert!(AgentImportSpecifier::parse(&at_limit).is_ok());
+    assert!(AgentImportSpecifier::parse("a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES + 1)).is_err());
+    assert!(AgentImportSpecifier::parse("").is_err());
+    assert!(AgentImportSpecifier::parse("./a\u{7}b").is_err());
+    assert!(AgentImportSpecifier::parse("./a\nb").is_err());
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES + 1)})
+        )
+        .is_err()
+    );
+
+    for credential in [
+        "https://cdn.example.test/mod.js?token=abc123",
+        "ghp_0123456789abcdef0123456789abcdef",
+        "Bearer abcdefghijklmnop",
+    ] {
+        assert_eq!(
+            AgentImportEvidence::new(parse(credential), None, None, None, false),
+            Err(ContractBuildError::ImportEvidence),
+            "{credential}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":credential})).is_err(),
+            "{credential}"
+        );
+    }
+    assert_eq!(
+        AgentImportEvidence::new(
+            parse("./auth"),
+            Some(AgentImportBindingKind::Named),
+            Some(parse("apiKey")),
+            None,
+            false
+        ),
+        Err(ContractBuildError::ImportEvidence)
+    );
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"./auth","local_name":"clientSecret"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"./a","imported_name":"x".repeat(257)})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn import_evidence_rejects_raw_properties_and_detail() {
+    for field in [
+        "properties",
+        "detail",
+        "raw",
+        "occurrence_kind",
+        "module_specifier",
+    ] {
+        let mut value = serde_json::to_value(import_evidence()).expect("serialize import");
+        value[field] = json!("raw");
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(value).is_err(),
+            "AgentImportEvidence accepted {field}"
+        );
+    }
 }

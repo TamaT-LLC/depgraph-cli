@@ -45,6 +45,7 @@ additive extensionとして採用するかを決定する。
 | Repository discovery | `repository_list`, optional `repository_id` | Issue #540 implemented: omitted `repository_id` binds to the server repository; mismatches return `INVALID_ARGUMENT` with the valid IDs |
 | Hotspot result filters | `health_hotspots_list` `path_prefixes` / `node_kinds`, CLI `hotspots --path-prefix` / `--node-kind` | Issue #543 implemented: filters apply after scoring, so scores and finding IDs are unchanged |
 | Dependency list output detail | `graph_dependencies_list` / `graph_dependents_list` `detail` (`paths` / `summary` / `full`) | Issue #542 implemented: `full` stays the default and byte-identical; `summary` and `paths` shrink the response without changing the traversal |
+| Import evidence detail | `AgentEvidence.import` (`specifier`, `binding_kind`, `imported_name`, `local_name`, `type_only`) | Issue #544 implemented: allowlisted from evidence properties or the import site specifier; evidence without import facts stays byte-identical |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -857,6 +858,21 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | Cursor | `full`以外では正規化入力に`detail`を含める。`full`は従来の正規化入力のままでcursorも同じbytesになる。粒度の違うcursorは`CURSOR_MISMATCH` |
 | Extension | 粒度の選択は`DependencyProjectionRequest`に閉じているため、edge kindの絞り込み（Issue #541）は同じ要求型と正規化入力へ追加できる。`graph_impact_get`と`agent_edges_list`への展開は今後の候補とする |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する。既存の`$defs`と`agent_dependencies_response` sampleは変化せず、新しい定義だけが増える |
+
+## Issue #544 import evidence detail
+
+Agentがファイルを開かずに「なぜ依存しているか」を説明できるよう、import根拠のevidenceにspecifierと取り込んだbindingを含める。`AgentEvidence`を返す全経路（`agent_evidence_list`、`agent_sites_list`、`agent_edges_list`、`graph_dependencies_list` / `graph_dependents_list`の`full`、`graph_path_get`、`graph_impact_get`、`graph_unresolved_list`）に効く。
+
+| Area | Evidence |
+| --- | --- |
+| Output | `AgentEvidence`へ任意field `import`（`AgentImportEvidence`）を追加する。`specifier`（必須、`AgentImportSpecifier`、1〜1024 UTF-8 bytes、制御文字禁止）、`binding_kind?`、`imported_name?`、`local_name?`（`AgentLabel`）、`type_only`（`true`のときだけ出力）を持つ。import根拠を持たないevidenceは`import`を出さず、変更前とbyte単位で同一 |
+| `binding_kind` | closed enum `default` / `named` / `namespace` / `import_equals` / `side_effect` / `require` / `dynamic` / `import_type` / `named_reexport` / `namespace_reexport` / `export_star` / `reexport` / `glob` / `glob_reexport` / `extern_crate`。抽出器が区別を記録していない場合は省略する |
+| Allowlist | core `import_evidence::project_import_evidence`がevidence propertiesのうちTypeScriptの`occurrence_kind` / `module_specifier` / `imported_name` / `type_only`、Rust HIRの`target_specifier` / `glob` / `reexport` / `alias`だけを読む。importでない`occurrence_kind`（`type_reference`、`call_expression`など）は投影しない。その他のproperties、raw detailは従来どおり公開しない |
+| Site fallback | propertiesにimportの記述がないとき、siteが分かる経路（site evidence、siteを持つedge evidence、unresolved）ではimport系site kind（`import`、`side_effect_import`、`dynamic_import`、`require`、`type_import`、`type_import_equals`、`reexport`、`type_reexport`）の`specifier`を使う。TypeScriptの補助syntax evidence（`occurrence_kind`だけを持つ）もsite specifierで補う。path stepはedge evidenceだけを持つため、propertiesから組み立てられる場合に限る |
+| Disclosure bounds | specifierは1024 bytes、名前は256 bytesを上限とし、超過・制御文字・core `contains_credential_shape`に当たる値は省略する。specifierが省略された場合は`import`全体を出さず、名前だけが該当した場合はその名前だけを省く。constructorとdeserializerも同じ判定で拒否し、出力時の`redact_public_value`も従来どおり適用される。field名にtoken / secret / passwordを含めない |
+| Language coverage | TypeScript semantic: specifier、binding_kind、imported_name、type_only。TypeScript syntax-only: specifierとsite kindから分かるbinding_kind（`side_effect` / `dynamic` / `require` / `reexport`、通常のimportは省略）。Rust HIR: use pathをspecifierとし、末尾segmentをimported_name、`as`別名をlocal_name、glob / re-export / extern crateを区別する。Go: import pathだけ（シンボル名の概念がなく、workerはaliasを記録しない）。TypeScriptのlocal別名はworkerが記録しないため出さない |
+| CLI | CLIのJSON出力とstore recordは変えない。`EvidenceProjection`はMCP内部専用の射影で、`PathStep`へもfieldを追加しない |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する。schemaは`AgentEvidence`に`import`が増え、`AgentImportEvidence` / `AgentImportBindingKind` / `AgentImportSpecifier`が追加されるだけで、他の`$defs`と既存sampleは変化しない。contract goldenには`agent_evidence_import` sampleを追加する |
 
 ## Issue #292 acceptance mapping
 

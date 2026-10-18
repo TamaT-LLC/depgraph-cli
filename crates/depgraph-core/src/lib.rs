@@ -30,6 +30,7 @@ pub mod graphql;
 pub mod health;
 pub mod http_operation_correlation;
 pub mod impact;
+pub mod import_evidence;
 pub mod incremental;
 pub mod openapi;
 pub mod policy;

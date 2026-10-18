@@ -8,11 +8,13 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest as _, Sha256};
 
+use depgraph_core::import_evidence::{ImportEvidence, ImportSiteHint, project_import_evidence};
+
 use crate::{
-    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
-    AgentLocator, AgentPolicyText, AgentToken, AnalysisInputDigest, ContractBuildError,
-    MAX_AGENT_CONDITION_BYTES, Page, PolicyApiChangeId, PolicyConfigDigest,
-    PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
+    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId,
+    AgentImportEvidence, AgentLabel, AgentLocator, AgentPolicyText, AgentToken,
+    AnalysisInputDigest, ContractBuildError, MAX_AGENT_CONDITION_BYTES, Page, PolicyApiChangeId,
+    PolicyConfigDigest, PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
     RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
@@ -556,6 +558,9 @@ pub struct AgentEvidence {
     extractor_version: AgentLabel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span: Option<AgentSourceSpan>,
+    /// Import specifier and binding (Issue #544); absent for non-import evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<AgentImportEvidence>,
 }
 
 impl AgentEvidence {
@@ -571,12 +576,24 @@ impl AgentEvidence {
             extractor,
             extractor_version,
             span,
+            import: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_import(mut self, import: AgentImportEvidence) -> Self {
+        self.import = Some(import);
+        self
     }
 
     #[must_use]
     pub const fn span(&self) -> Option<&AgentSourceSpan> {
         self.span.as_ref()
+    }
+
+    #[must_use]
+    pub const fn import(&self) -> Option<&AgentImportEvidence> {
+        self.import.as_ref()
     }
 }
 
@@ -3283,6 +3300,7 @@ fn agent_site_from_core_cancellable(
         return Err(ContractBuildError::TooManyEvidenceItems.into());
     }
     let mut evidence = Vec::with_capacity(source.evidence.len());
+    let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
     for record in &source.evidence {
         if is_cancelled() {
             return Err(ImpactProjectionFailure::Cancelled);
@@ -3296,6 +3314,7 @@ fn agent_site_from_core_cancellable(
             record.start_column,
             record.end_line,
             record.end_column,
+            project_import_evidence(&record.properties, Some(hint)).as_ref(),
         )?);
     }
     let span = source.evidence.first().and_then(|record| {
@@ -3376,6 +3395,8 @@ impl AgentEdge {
             if is_cancelled() {
                 return Err(ImpactProjectionFailure::Cancelled);
             }
+            // Path steps carry edge evidence only; without the site record the
+            // projection relies on the allowlisted evidence properties.
             evidence.push(agent_evidence(
                 &record.kind,
                 &record.extractor,
@@ -3385,6 +3406,7 @@ impl AgentEdge {
                 record.start_column,
                 record.end_line,
                 record.end_column,
+                project_import_evidence(&record.properties, None).as_ref(),
             )?);
         }
         if is_cancelled() {
@@ -3484,6 +3506,7 @@ impl TryFrom<&depgraph_core::service::EvidenceProjection> for AgentEvidence {
             source.start_column(),
             source.end_line(),
             source.end_column(),
+            source.import(),
         )
     }
 }
@@ -3676,6 +3699,7 @@ fn agent_evidence(
     start_column: u64,
     end_line: u64,
     end_column: u64,
+    import: Option<&ImportEvidence>,
 ) -> Result<AgentEvidence, ContractBuildError> {
     let kind = match kind {
         "source" => AgentEvidenceKind::Source,
@@ -3685,12 +3709,16 @@ fn agent_evidence(
         _ => return Err(ContractBuildError::AgentDtoValue),
     };
     let span = safe_source_span(path, start_line, start_column, end_line, end_column);
-    Ok(AgentEvidence::new(
+    let evidence = AgentEvidence::new(
         kind,
         parse_agent_value(extractor)?,
         parse_agent_value(extractor_version)?,
         span,
-    ))
+    );
+    Ok(match import.and_then(AgentImportEvidence::project) {
+        Some(import) => evidence.with_import(import),
+        None => evidence,
+    })
 }
 
 fn agent_phase(value: &str) -> Result<AgentPhase, ContractBuildError> {
@@ -5066,9 +5094,9 @@ mod impact_projection_tests {
     use serde_json::json;
 
     use super::{
-        AgentCycle, AgentEdge, AgentImpactProjection, AgentUnresolved, IMPACT_LOOKUP_BUILDS,
-        ImpactProjectionFailure, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_EVIDENCE_ITEMS,
-        MAX_AGENT_PHASES, agent_site_from_core_cancellable,
+        AgentCycle, AgentEdge, AgentImpactProjection, AgentSite, AgentUnresolved,
+        IMPACT_LOOKUP_BUILDS, ImpactProjectionFailure, MAX_AGENT_CORRELATION_REASONS,
+        MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PHASES, agent_site_from_core_cancellable,
     };
     use crate::ContractBuildError;
 
@@ -5414,5 +5442,90 @@ mod impact_projection_tests {
             checks >= 3
         });
         assert!(matches!(projected, Err(ImpactProjectionFailure::Cancelled)));
+    }
+
+    fn path_step_with_properties(properties: serde_json::Value) -> depgraph_core::query::PathStep {
+        let mut step = core_path_step(1, "semantic");
+        step.evidence[0].properties = properties;
+        step
+    }
+
+    #[test]
+    fn path_step_evidence_projects_typescript_import_properties() {
+        let step = path_step_with_properties(json!({
+            "occurrence_kind": "default_import",
+            "module_specifier": "@/components/Button",
+            "imported_name": "default",
+            "type_only": false,
+            "compiler_version": "7.0.2",
+            "secret": "PRIVATE"
+        }));
+        let edge = AgentEdge::try_from(&step).expect("edge projection");
+        let value = serde_json::to_value(&edge.evidence()[0]).expect("serialize evidence");
+        assert_eq!(
+            value["import"],
+            json!({"specifier":"@/components/Button","binding_kind":"default","imported_name":"default"})
+        );
+        assert!(value.get("properties").is_none());
+    }
+
+    #[test]
+    fn path_step_evidence_projects_rust_use_properties() {
+        let step = path_step_with_properties(json!({
+            "target_specifier": "crate::domain::Named",
+            "glob": false,
+            "reexport": false,
+            "namespaces": ["types"],
+            "alias": "NameContract"
+        }));
+        let edge = AgentEdge::try_from(&step).expect("edge projection");
+        let value = serde_json::to_value(&edge.evidence()[0]).expect("serialize evidence");
+        assert_eq!(
+            value["import"],
+            json!({
+                "specifier":"crate::domain::Named",
+                "binding_kind":"named",
+                "imported_name":"Named",
+                "local_name":"NameContract"
+            })
+        );
+    }
+
+    #[test]
+    fn path_step_evidence_omits_credential_shaped_or_absent_import_facts() {
+        for properties in [
+            json!({}),
+            json!({"secret": "PRIVATE", "module_specifier": "./a"}),
+            json!({"occurrence_kind": "named_import", "module_specifier": "https://x.test/m.js?token=abc"}),
+            json!({"occurrence_kind": "type_reference", "imported_name": "Foo"}),
+        ] {
+            let step = path_step_with_properties(properties.clone());
+            let edge = AgentEdge::try_from(&step).expect("edge projection");
+            let value = serde_json::to_value(&edge.evidence()[0]).expect("serialize evidence");
+            assert!(value.get("import").is_none(), "{properties}");
+        }
+        let step = path_step_with_properties(json!({
+            "occurrence_kind": "named_import",
+            "module_specifier": "./auth",
+            "imported_name": "accessToken"
+        }));
+        let edge = AgentEdge::try_from(&step).expect("edge projection");
+        let value = serde_json::to_value(&edge.evidence()[0]).expect("serialize evidence");
+        assert_eq!(
+            value["import"],
+            json!({"specifier":"./auth","binding_kind":"named"}),
+            "credential-shaped names are omitted without dropping the specifier"
+        );
+    }
+
+    #[test]
+    fn unresolved_site_evidence_falls_back_to_the_import_site_specifier() {
+        let unresolved = core_unresolved(1, "source", Vec::new());
+        let site = AgentSite::try_from(&unresolved).expect("site projection");
+        let value = serde_json::to_value(&site).expect("serialize site");
+        assert_eq!(
+            value["evidence"][0]["import"],
+            json!({"specifier":"id:node:missing"})
+        );
     }
 }

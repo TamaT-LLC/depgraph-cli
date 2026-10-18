@@ -955,8 +955,8 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // Issue #540 adds AgentRepositorySummary, AgentRepositoryList, its success envelope,
     // and the AgentErrorDetails::Repository branch. Issue #542 adds the summary and paths
     // responses, AgentEdgeCommon, AgentEdgeSummary, AgentDependencyPath, their two pages,
-    // and the AgentDependenciesOutput success envelope.
-    assert_eq!(objects, 202, "review newly added object schemas explicitly");
+    // and the AgentDependenciesOutput success envelope. Issue #544 adds AgentImportEvidence.
+    assert_eq!(objects, 203, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -1380,4 +1380,81 @@ fn issue_542_shared_schema_publishes_closed_dependency_detail_shapes() {
     assert!(!summary_item.is_valid(&json!({
         "id":"edge:1","source_id":"node:src","target_id":"node:b","kind":"imports","evidence_count":65
     })));
+}
+
+#[test]
+fn issue_544_shared_schema_publishes_closed_import_evidence() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    let import = definitions
+        .get("AgentImportEvidence")
+        .expect("AgentImportEvidence definition");
+    assert_eq!(import["additionalProperties"], false);
+    assert_eq!(import["required"], json!(["specifier"]));
+    let binding = definitions
+        .get("AgentImportBindingKind")
+        .expect("AgentImportBindingKind definition");
+    assert_eq!(binding["enum"].as_array().map(Vec::len), Some(15));
+    for name in definitions["AgentEvidence"]["properties"]
+        .as_object()
+        .expect("evidence properties")
+        .keys()
+        .chain(
+            import["properties"]
+                .as_object()
+                .expect("import properties")
+                .keys(),
+        )
+    {
+        let lower = name.to_ascii_lowercase();
+        assert!(
+            !["token", "secret", "password"]
+                .iter()
+                .any(|word| lower.contains(word)),
+            "{name} would be redacted as a sensitive field"
+        );
+    }
+
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentEvidence",
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).expect("evidence schema compiles");
+    let base = json!({"kind":"semantic","extractor":"typescript-native-typechecker","extractor_version":"7.0.2"});
+    assert!(validator.is_valid(&base));
+    let mut with_import = base.clone();
+    with_import["import"] = json!({
+        "specifier":"@/lib/foo",
+        "binding_kind":"named",
+        "imported_name":"fooHelper",
+        "local_name":"foo",
+        "type_only":true
+    });
+    assert!(validator.is_valid(&with_import));
+    let mut specifier_only = base.clone();
+    specifier_only["import"] = json!({"specifier":"example.com/pkg/util"});
+    assert!(validator.is_valid(&specifier_only));
+    for invalid in [
+        json!({}),
+        json!({"specifier":""}),
+        json!({"specifier":"a\nb"}),
+        json!({"specifier":"./a","binding_kind":"wildcard"}),
+        json!({"specifier":"./a","properties":{"secret":"x"}}),
+        json!({"specifier":"./a","imported_name":""}),
+        json!({"specifier":"./a","type_only":"yes"}),
+    ] {
+        let mut value = base.clone();
+        value["import"] = invalid.clone();
+        assert!(
+            !validator.is_valid(&value),
+            "schema accepted import {invalid}"
+        );
+    }
+    assert_definition_rejects_unknown(
+        &schema,
+        "AgentImportEvidence",
+        "AgentImportEvidence",
+        json!({"specifier":"./a"}),
+    );
 }

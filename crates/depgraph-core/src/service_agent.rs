@@ -7,6 +7,7 @@ use depgraph_store::{
 use serde::Serialize;
 
 use crate::CancellationToken;
+use crate::import_evidence::{ImportEvidence, ImportSiteHint, project_import_evidence};
 use crate::service::{
     DepgraphCapability, DepgraphService, DepgraphServiceError, DepgraphServiceResult,
     ResolvedSnapshotId, SnapshotLocator,
@@ -346,9 +347,15 @@ pub struct EvidenceProjection {
     start_column: u64,
     end_line: u64,
     end_column: u64,
+    import: Option<ImportEvidence>,
 }
 
 impl EvidenceProjection {
+    /// Allowlisted import facts (Issue #544); `None` for non-import evidence.
+    #[must_use]
+    pub const fn import(&self) -> Option<&ImportEvidence> {
+        self.import.as_ref()
+    }
     #[must_use]
     pub fn kind(&self) -> &str {
         &self.kind
@@ -842,7 +849,8 @@ impl DepgraphService {
             .into_iter()
             .filter(|site| node_id.is_none_or(|id| site.source == id))
             .map(|site| {
-                let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id);
+                let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
+                let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id, Some(hint));
                 evidence.sort_by(evidence_order);
                 SiteProjection {
                     id: site.id,
@@ -872,6 +880,11 @@ impl DepgraphService {
     ) -> DepgraphServiceResult<GraphEdgesPageResult> {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
+        let sites = snapshot
+            .sites
+            .iter()
+            .map(|site| (site.id.as_str(), site))
+            .collect::<BTreeMap<_, _>>();
         let mut items = snapshot
             .edges
             .into_iter()
@@ -881,7 +894,12 @@ impl DepgraphService {
                 EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
             })
             .map(|edge| {
-                let mut evidence = site_evidence(&snapshot.evidence, "edge", &edge.id);
+                let hint = edge
+                    .site_id
+                    .as_deref()
+                    .and_then(|site_id| sites.get(site_id))
+                    .map(|site| ImportSiteHint::new(&site.kind, site.specifier.as_deref()));
+                let mut evidence = site_evidence(&snapshot.evidence, "edge", &edge.id, hint);
                 evidence.sort_by(evidence_order);
                 EdgeProjection {
                     id: edge.id,
@@ -912,10 +930,11 @@ impl DepgraphService {
     ) -> DepgraphServiceResult<GraphEvidencePageResult> {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
-        if !snapshot.sites.iter().any(|site| site.id == site_id) {
+        let Some(site) = snapshot.sites.iter().find(|site| site.id == site_id) else {
             return Err(DepgraphServiceError::NotFound);
-        }
-        let mut items = site_evidence(&snapshot.evidence, "site", site_id);
+        };
+        let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
+        let mut items = site_evidence(&snapshot.evidence, "site", site_id, Some(hint));
         items.sort_by(evidence_order);
         graph_page_from_items(
             snapshot_id,
@@ -956,8 +975,12 @@ impl DepgraphService {
     }
 }
 
-fn evidence_projection(record: &depgraph_store::EvidenceRecord) -> EvidenceProjection {
+fn evidence_projection(
+    record: &depgraph_store::EvidenceRecord,
+    site: Option<ImportSiteHint<'_>>,
+) -> EvidenceProjection {
     EvidenceProjection {
+        import: project_import_evidence(&record.properties, site),
         kind: record.kind.clone(),
         extractor: record.extractor.clone(),
         extractor_version: record.extractor_version.clone(),
@@ -973,11 +996,12 @@ fn site_evidence(
     records: &[depgraph_store::EvidenceRecord],
     owner_type: &str,
     owner_id: &str,
+    site: Option<ImportSiteHint<'_>>,
 ) -> Vec<EvidenceProjection> {
     records
         .iter()
         .filter(|record| record.owner_type == owner_type && record.owner_id == owner_id)
-        .map(evidence_projection)
+        .map(|record| evidence_projection(record, site))
         .collect()
 }
 

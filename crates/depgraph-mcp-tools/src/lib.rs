@@ -6,6 +6,7 @@ mod dependency_detail;
 mod dto;
 mod health_dto;
 mod host_config;
+mod import_evidence;
 mod lifecycle;
 mod operation;
 mod repository;
@@ -71,6 +72,7 @@ pub use host_config::{
     MCP_PROTOCOL_REVISION, MCP_SDK_NAME, MCP_SDK_VERSION, agent_host_capability_name,
     agent_host_launch_arguments, render_agent_host_configuration,
 };
+pub use import_evidence::{AgentImportBindingKind, AgentImportEvidence};
 pub use lifecycle::{
     AgentDaemonAttempt, AgentDaemonChange, AgentDaemonChangeKind, AgentDaemonControlAction,
     AgentDaemonControlOutcome, AgentDaemonControlPhase, AgentDaemonInvalidationSummary,
@@ -97,10 +99,11 @@ pub use response::{
     project_unresolved_page_cancellable,
 };
 pub use scalar::{
-    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
-    AgentLocator, AgentPolicyText, AgentToken, AnalysisInputDigest, ContractValueError, Cursor,
-    IdempotencyKey, LogicalRepositoryId, MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_CONDITION_BYTES,
-    MAX_AGENT_FIELD_NAME_BYTES, MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES, MAX_AGENT_ID_BYTES,
+    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId,
+    AgentImportSpecifier, AgentLabel, AgentLocator, AgentPolicyText, AgentToken,
+    AnalysisInputDigest, ContractValueError, Cursor, IdempotencyKey, LogicalRepositoryId,
+    MAX_AGENT_ARTIFACT_ID_BYTES, MAX_AGENT_CONDITION_BYTES, MAX_AGENT_FIELD_NAME_BYTES,
+    MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES, MAX_AGENT_ID_BYTES, MAX_AGENT_IMPORT_SPECIFIER_BYTES,
     MAX_AGENT_LABEL_BYTES, MAX_AGENT_LOCATOR_BYTES, MAX_AGENT_POLICY_TEXT_BYTES,
     MAX_AGENT_TOKEN_BYTES, MAX_CURSOR_BYTES, MAX_IDEMPOTENCY_KEY_CHARS,
     MAX_LOGICAL_REPOSITORY_ID_BYTES, MAX_OPERATION_ID_HEX_BYTES, OperationId, PolicyApiChangeId,

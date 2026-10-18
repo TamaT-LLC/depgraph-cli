@@ -8322,3 +8322,246 @@ fn issue_542_dependency_detail_shrinks_responses_and_binds_cursors_to_the_detail
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
+
+// Issue #544: import evidence carries the specifier and the imported binding.
+
+fn issue_544_evidence(path: &str, line: u64, kind: &str, properties: Value) -> Value {
+    json!({
+        "kind": kind,
+        "extractor": "fixture",
+        "extractor_version": "1.0",
+        "path": path,
+        "start_line": line,
+        "start_column": 1,
+        "end_line": line,
+        "end_column": 30,
+        "detail": "PROCESS_544_DETAIL_SECRET",
+        "properties": properties
+    })
+}
+
+fn seed_issue_544_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-544", root, false, Some("revision-544"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 2,
+        "resolved": 2,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-544",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (offset, (id, path)) in [
+        ("node:app", "src/app.ts"),
+        ("node:foo", "src/lib/foo.ts"),
+        ("node:main", "main.go"),
+        ("node:util", "pkg/util/util.go"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut node = common("node_upsert", offset as u64 + 3);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://{path}"),
+            "display_name": path,
+            "properties": {"path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let typescript = issue_544_evidence(
+        "src/app.ts",
+        1,
+        "semantic",
+        json!({
+            "backend": "typescript-native-compiler",
+            "occurrence_kind": "named_import",
+            "target_basis": "typechecker",
+            "type_only": false,
+            "module_specifier": "@/lib/foo",
+            "imported_name": "fooHelper",
+            "secret": "PROCESS_544_PROPERTY_SECRET"
+        }),
+    );
+    let go = issue_544_evidence("main.go", 3, "source", json!({}));
+    for (offset, (site_id, edge_id, source, target, kind, specifier, evidence)) in [
+        (
+            "site:ts",
+            "edge:ts",
+            "node:app",
+            "node:foo",
+            "web_import",
+            "@/lib/foo",
+            typescript,
+        ),
+        (
+            "site:go",
+            "edge:go",
+            "node:main",
+            "node:util",
+            "import",
+            "example.com/pkg/util",
+            go,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = offset as u64 * 2 + 7;
+        let mut site = common("dependency_site", seq);
+        site["site"] = json!({
+            "id": site_id,
+            "source": source,
+            "kind": kind,
+            "specifier": specifier,
+            "resolution_status": "resolved",
+            "target_ids": [target],
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": [evidence.clone()]
+        });
+        store.ingest_event(&site).unwrap();
+        let mut edge = common("edge_upsert", seq + 1);
+        edge["edge"] = json!({
+            "id": edge_id,
+            "site_id": site_id,
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [evidence]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", 11);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 12);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-544", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+#[test]
+fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_544_store(&store_path, &root);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common =
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "repository"});
+    let with = |extra: Value| {
+        let mut arguments = common.clone();
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+
+    let typescript = interactive_tool_call(
+        &mut mcp,
+        2,
+        "agent_evidence_list",
+        with(json!({"site_id": "site:ts"})),
+    );
+    assert_eq!(typescript["isError"], false, "{typescript}");
+    assert_tool_text_matches_structured(&typescript);
+    let item = &typescript["structuredContent"]["result"]["items"][0];
+    assert_eq!(
+        item["import"],
+        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper"})
+    );
+    assert!(item.get("properties").is_none());
+    assert!(item.get("detail").is_none());
+
+    let go = interactive_tool_call(
+        &mut mcp,
+        3,
+        "agent_evidence_list",
+        with(json!({"site_id": "site:go"})),
+    );
+    assert_eq!(go["isError"], false, "{go}");
+    assert_eq!(
+        go["structuredContent"]["result"]["items"][0]["import"],
+        json!({"specifier":"example.com/pkg/util"})
+    );
+
+    let dependencies = interactive_tool_call(
+        &mut mcp,
+        4,
+        "graph_dependencies_list",
+        with(json!({"selector": "id:node:app", "detail": "full"})),
+    );
+    assert_eq!(dependencies["isError"], false, "{dependencies}");
+    assert_eq!(
+        dependencies["structuredContent"]["result"]["edges"]["items"][0]["evidence"][0]["import"]["specifier"],
+        "@/lib/foo"
+    );
+
+    let summary = interactive_tool_call(
+        &mut mcp,
+        5,
+        "graph_dependencies_list",
+        with(json!({"selector": "id:node:app", "detail": "summary"})),
+    );
+    assert_eq!(summary["isError"], false, "{summary}");
+    let summary_edge = &summary["structuredContent"]["result"]["edges"]["items"][0];
+    assert_eq!(summary_edge["evidence_count"], 1);
+    assert!(summary_edge.get("evidence").is_none());
+
+    mcp.finish();
+    for response in [&typescript, &go, &dependencies, &summary] {
+        let text = response.to_string();
+        assert!(!text.contains("PROCESS_544_PROPERTY_SECRET"), "{text}");
+        assert!(!text.contains("PROCESS_544_DETAIL_SECRET"), "{text}");
+    }
+}

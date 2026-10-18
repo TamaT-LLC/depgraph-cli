@@ -695,4 +695,6 @@ pub enum ContractBuildError {
     RepositorySet,
     #[error("Agent dependency detail projection is inconsistent with its detail level")]
     DependencyDetailState,
+    #[error("Agent import evidence contains a value outside the public disclosure contract")]
+    ImportEvidence,
 }
