@@ -24,8 +24,8 @@ use crate::{
     analysis_execution::{
         AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisInputValidation,
         AnalysisWorkItem, TypedReferenceFingerprint, execute_analysis_units,
-        execute_analysis_units_with_retained_typed, observe_analysis_unit_slot,
-        publish_unit_progress,
+        execute_analysis_units_with_retained_typed, observe_analysis_replacement_units,
+        observe_analysis_unit_slot, publish_progress, publish_unit_progress,
     },
     analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
     analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
@@ -1288,13 +1288,19 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                     current,
                     &resplit_plan.retained_execution_unit_ids,
                 );
-                let replacement_progress = execute_analysis_units_with_retained_typed(
-                    store,
-                    &execution_context,
-                    replacement_work,
-                    &mut consume,
-                    &validate,
-                    &retained_typed,
+                // Replacements are observed after every unit of the attempt,
+                // where they are appended below, so observed indices keep
+                // matching `analysis.units`.
+                let replacement_progress = observe_analysis_replacement_units(
+                    &analysis,
+                    execute_analysis_units_with_retained_typed(
+                        store,
+                        &execution_context,
+                        replacement_work,
+                        &mut consume,
+                        &validate,
+                        &retained_typed,
+                    ),
                 )
                 .await?;
                 ledger_records.extend(replacement_records);
@@ -1311,6 +1317,8 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 if replacement_progress.stop_reason.is_some() {
                     analysis.stop_reason = replacement_progress.stop_reason;
                 }
+                // The observer has the replacements, but not their tags.
+                publish_progress(&analysis);
             }
         }
         // A repository-scope Rust unit cannot be re-split, so a memory-limit
