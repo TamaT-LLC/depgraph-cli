@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# vdg: drive the locally built depgraph CLI in an isolated sandbox and keep proof.
+#
+# Every run gets:
+#   scratch  : $TMPDIR/verify-depgraph.<run>.XXXXXX  (fake HOME, Store, fixture repo) -> removed by cleanup
+#   evidence : $VDG_EVIDENCE_ROOT/<run>/              (default <repo>/target/verify-depgraph/evidence) -> kept
+# The user's real Store (OS cache dir) is never read or written: HOME points into scratch,
+# every depgraph call gets an explicit --store, and doctor proves the real cache has no entry.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(git -C "$SKILL_DIR" rev-parse --show-toplevel)"
+STATE_ROOT="$REPO_ROOT/target/verify-depgraph"
+RUNS_DIR="$STATE_ROOT/runs"
+CURRENT_FILE="$STATE_ROOT/current"
+EVIDENCE_ROOT="${VDG_EVIDENCE_ROOT:-$STATE_ROOT/evidence}"
+BIN="$REPO_ROOT/target/debug/depgraph"
+REAL_HOME="${VDG_REAL_HOME:-$HOME}"
+
+die() { echo "vdg: error: $*" >&2; exit 1; }
+log() { echo "vdg: $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  vdg launch [--all-workers] [--no-build]   build, create sandbox + fixture, run baseline scan
+  vdg doctor                                read-only health check of the current run
+  vdg run <label> [--expect-exit N] -- <depgraph args...>
+                                            run depgraph (with --store injected) inside the fixture,
+                                            record cmd/stdout/stderr/exit as evidence/<label>.*
+  vdg fixture-change                        commit a change to src/cart.rs on branch feat (for impact --changed)
+  vdg note <label> <text...>                append a free-form observation to evidence/NOTES.md
+  vdg env                                   print the run's exported variables (eval-able)
+  vdg evidence-dir                          print the evidence directory of the current run
+  vdg cleanup [--run ID]                    remove the sandbox of the run; evidence is kept
+Select a run other than the current one with VDG_RUN=<id>.
+EOF
+}
+
+current_run() {
+  if [[ -n "${VDG_RUN:-}" ]]; then echo "$VDG_RUN"; return; fi
+  [[ -f "$CURRENT_FILE" ]] || die "no current run; run 'vdg launch' first"
+  cat "$CURRENT_FILE"
+}
+
+load_run() {
+  local run="$1" file="$RUNS_DIR/$1.env"
+  [[ -f "$file" ]] || die "unknown run '$run' (no $file)"
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+workspace_version() {
+  sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' "$REPO_ROOT/Cargo.toml" | head -n1
+}
+
+write_fixture() {
+  local repo="$1"
+  mkdir -p "$repo/src"
+  cat >"$repo/Cargo.toml" <<'EOF'
+[package]
+name = "vdg-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+EOF
+  cat >"$repo/src/lib.rs" <<'EOF'
+pub mod cart;
+pub mod checkout;
+EOF
+  cat >"$repo/src/cart.rs" <<'EOF'
+pub fn total(items: &[u32]) -> u32 { items.iter().sum() }
+EOF
+  cat >"$repo/src/checkout.rs" <<'EOF'
+use crate::cart::total;
+pub fn pay(items: &[u32]) -> u32 { total(items) }
+EOF
+  git -C "$repo" init -q -b main
+  git -C "$repo" add -A
+  git -C "$repo" -c user.name=vdg -c user.email=vdg@example.invalid commit -qm "vdg fixture"
+}
+
+# Run a command with the sandboxed environment. RUSTUP_HOME/CARGO_HOME keep pointing at the
+# real toolchain (read-only use) because a fake HOME otherwise hides rustup and disables HIR.
+sandboxed() {
+  env HOME="$VDG_HOME" \
+    RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
+    CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
+    XDG_CACHE_HOME="$VDG_HOME/.cache" \
+    "$@"
+}
+
+cmd_launch() {
+  local all_workers=0 build=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all-workers) all_workers=1 ;;
+      --no-build) build=0 ;;
+      *) die "launch: unknown option $1" ;;
+    esac
+    shift
+  done
+  if [[ $build -eq 1 ]]; then
+    if [[ $all_workers -eq 1 ]]; then
+      log "building CLI + all workers (cargo xtask build)"
+      (cd "$REPO_ROOT" && cargo xtask build)
+    else
+      log "building CLI + rust worker"
+      (cd "$REPO_ROOT" && cargo build --locked -p depgraph-cli -p depgraph-rust-worker)
+    fi
+  fi
+  [[ -x "$BIN" ]] || die "missing $BIN after build"
+
+  local run scratch
+  run="$(date +%Y%m%d-%H%M%S)-$$"
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/verify-depgraph.$run.XXXXXX")"
+  scratch="$(cd "$scratch" && pwd -P)"
+  mkdir -p "$RUNS_DIR" "$EVIDENCE_ROOT/$run" "$scratch/home" "$scratch/state"
+  write_fixture "$scratch/repo"
+
+  cat >"$RUNS_DIR/$run.env" <<EOF
+VDG_RUN_ID=$run
+VDG_SCRATCH=$scratch
+VDG_HOME=$scratch/home
+VDG_FIXTURE=$scratch/repo
+VDG_STORE=$scratch/state/graph.db
+VDG_EVIDENCE=$EVIDENCE_ROOT/$run
+VDG_BIN=$BIN
+VDG_HEAD=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
+EOF
+  echo "$run" >"$CURRENT_FILE"
+  load_run "$run"
+  {
+    echo "# verify-depgraph run $run"
+    echo
+    echo "- repo HEAD: $VDG_HEAD ($(git -C "$REPO_ROOT" status --porcelain | wc -l | tr -d ' ') uncommitted paths)"
+    echo "- binary: $VDG_BIN ($("$VDG_BIN" --version))"
+    echo "- fixture: $VDG_FIXTURE"
+    echo "- store: $VDG_STORE"
+    echo
+  } >"$VDG_EVIDENCE/NOTES.md"
+
+  VDG_RUN="$run" cmd_run 00-baseline-scan --expect-exit 0 -- scan . --json >/dev/null
+  log "ready run=$run fixture=$VDG_FIXTURE evidence=$VDG_EVIDENCE"
+  echo "$run"
+}
+
+cmd_env() {
+  load_run "$(current_run)"
+  sed 's/^/export /' "$RUNS_DIR/$VDG_RUN_ID.env"
+}
+
+real_cache_entry() {
+  # Mirrors depgraph_core::config::default_store_path: <cache>/repositories/<sha256(canonical root)>
+  local identity cache
+  identity="$(printf '%s' "$VDG_FIXTURE" | shasum -a 256 | cut -d' ' -f1)"
+  case "$(uname -s)" in
+    Darwin) cache="$REAL_HOME/Library/Caches/com.TamaT.depgraph" ;;
+    *) cache="${XDG_CACHE_HOME:-$REAL_HOME/.cache}/depgraph" ;;
+  esac
+  echo "$cache/repositories/$identity"
+}
+
+cmd_doctor() {
+  load_run "$(current_run)"
+  local failures=0
+  check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; failures=$((failures + 1)); fi; }
+
+  check "run $VDG_RUN_ID sandbox exists ($VDG_SCRATCH)" '[[ -d "$VDG_FIXTURE/.git" ]]'
+  check "binary present ($VDG_BIN)" '[[ -x "$VDG_BIN" ]]'
+  local want got
+  want="$(workspace_version)"
+  got="$("$VDG_BIN" --version 2>/dev/null | awk '{print $2}')"
+  check "binary version $got == workspace $want" '[[ "$got" == "$want" ]]'
+  local stale
+  stale="$(find "$REPO_ROOT/crates/depgraph-cli/src" "$REPO_ROOT/crates/depgraph-core/src" \
+    "$REPO_ROOT/crates/depgraph-store/src" "$REPO_ROOT/workers/rust/src" -name '*.rs' -newer "$VDG_BIN" | head -n 3)"
+  check "binary newer than CLI/core/store/rust-worker sources${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
+  check "store inside sandbox ($VDG_STORE)" '[[ -f "$VDG_STORE" && "$VDG_STORE" == "$VDG_SCRATCH"/* ]]'
+  local entry
+  entry="$(real_cache_entry)"
+  check "real OS cache has no entry for the fixture ($entry)" '[[ ! -e "$entry" ]]'
+
+  local report
+  if report="$(cd "$VDG_FIXTURE" && sandboxed "$VDG_BIN" --store "$VDG_STORE" doctor --json 2>&1)"; then
+    echo "ok   depgraph doctor --json exit 0"
+    local rust_ok scan_id
+    rust_ok="$(jq -r '.workers[] | select(.adapter=="rust") | .available' <<<"$report")"
+    scan_id="$(jq -r '.latest_successful_scan_id // empty' <<<"$report")"
+    check "rust worker available ($(jq -r '.workers[] | select(.adapter=="rust") | .integrity' <<<"$report"))" '[[ "$rust_ok" == "true" ]]'
+    check "latest successful scan recorded (${scan_id:-none})" '[[ -n "$scan_id" ]]'
+    echo "info workers: $(jq -c '[.workers[] | {adapter, available}]' <<<"$report")"
+  else
+    echo "FAIL depgraph doctor --json: $report"
+    failures=$((failures + 1))
+  fi
+  if [[ $failures -gt 0 ]]; then
+    echo "vdg doctor: $failures check(s) failed; do not drive this run" >&2
+    return 1
+  fi
+  echo "vdg doctor: run $VDG_RUN_ID is worth driving"
+}
+
+cmd_run() {
+  [[ $# -ge 1 ]] || die "run: missing <label>"
+  local label="$1" expect=""
+  shift
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    case "$1" in
+      --expect-exit) expect="$2"; shift ;;
+      *) die "run: unknown option $1 (put depgraph args after --)" ;;
+    esac
+    shift
+  done
+  [[ "${1:-}" == "--" ]] || die "run: missing -- before depgraph args"
+  shift
+  [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "run: label must match [A-Za-z0-9._-]+"
+  load_run "$(current_run)"
+  local base="$VDG_EVIDENCE/$label" status=0
+  printf 'cwd: %s\ncmd: depgraph --store %q' "$VDG_FIXTURE" "$VDG_STORE" >"$base.cmd"
+  printf ' %q' "$@" >>"$base.cmd"
+  echo >>"$base.cmd"
+  (cd "$VDG_FIXTURE" && sandboxed "$VDG_BIN" --store "$VDG_STORE" "$@") >"$base.stdout" 2>"$base.stderr" || status=$?
+  echo "$status" >"$base.exit"
+  echo "- \`$label\`: exit $status — $(tail -n1 "$base.cmd" | cut -c6-)" >>"$VDG_EVIDENCE/NOTES.md"
+  cat "$base.stdout"
+  log "$label exit=$status evidence=$base.{cmd,stdout,stderr,exit}"
+  if [[ -n "$expect" && "$status" != "$expect" ]]; then
+    sed 's/^/stderr: /' "$base.stderr" | head -n 20 >&2
+    die "$label: expected exit $expect, got $status"
+  fi
+  return 0
+}
+
+cmd_fixture_change() {
+  load_run "$(current_run)"
+  local git_cmd=(git -C "$VDG_FIXTURE" -c user.name=vdg -c user.email=vdg@example.invalid)
+  "${git_cmd[@]}" switch -q -c feat
+  echo 'pub fn tax(amount: u32) -> u32 { amount }' >>"$VDG_FIXTURE/src/cart.rs"
+  "${git_cmd[@]}" commit -qam "vdg: change cart"
+  "${git_cmd[@]}" log --oneline -n 2 >"$VDG_EVIDENCE/fixture-change.git-log"
+  echo "- fixture-change: branch feat, src/cart.rs gained fn tax" >>"$VDG_EVIDENCE/NOTES.md"
+  log "fixture now on branch feat with one commit ahead of main"
+}
+
+cmd_note() {
+  [[ $# -ge 2 ]] || die "note: usage vdg note <label> <text...>"
+  load_run "$(current_run)"
+  local label="$1"
+  shift
+  echo "- note \`$label\`: $*" >>"$VDG_EVIDENCE/NOTES.md"
+}
+
+cmd_cleanup() {
+  local run=""
+  if [[ "${1:-}" == "--run" ]]; then run="$2"; fi
+  [[ -n "$run" ]] || run="$(current_run)"
+  load_run "$run"
+  # Only the sandbox this run created; depgraph scans are short-lived and leave no daemon.
+  # If a recipe started `depgraph daemon start`, it must stop it before cleanup (see features/).
+  case "$VDG_SCRATCH" in
+    */verify-depgraph."$run".*) rm -rf "$VDG_SCRATCH" ;;
+    *) die "refusing to remove unexpected path $VDG_SCRATCH" ;;
+  esac
+  rm -f "$RUNS_DIR/$run.env"
+  if [[ -f "$CURRENT_FILE" && "$(cat "$CURRENT_FILE")" == "$run" ]]; then rm -f "$CURRENT_FILE"; fi
+  echo "- cleanup: removed $VDG_SCRATCH" >>"$VDG_EVIDENCE/NOTES.md"
+  log "removed sandbox $VDG_SCRATCH; evidence kept at $VDG_EVIDENCE"
+}
+
+cmd_evidence_dir() {
+  load_run "$(current_run)"
+  echo "$VDG_EVIDENCE"
+}
+
+main() {
+  local sub="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor ;;
+    run) cmd_run "$@" ;;
+    fixture-change) cmd_fixture_change ;;
+    note) cmd_note "$@" ;;
+    env) cmd_env ;;
+    evidence-dir) cmd_evidence_dir ;;
+    cleanup) cmd_cleanup "$@" ;;
+    -h | --help | help | "") usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
