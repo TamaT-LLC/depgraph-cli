@@ -8,6 +8,21 @@
 # every depgraph call gets an explicit --store, and doctor proves the real cache has no entry.
 set -euo pipefail
 
+# Scrub inherited environment before the first git call. Every GIT_* variable is dropped:
+# GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY / GIT_COMMON_DIR /
+# GIT_NAMESPACE / GIT_CEILING_DIRECTORIES / GIT_CONFIG_* ... would otherwise redirect fixture
+# git operations (or depgraph's own `git` calls) into the caller's real repository, which is
+# exactly what happens when vdg runs from a git hook or a `git rebase --exec`.
+# DEPGRAPH_<ADAPTER>_WORKER overrides beat the locally built worker in
+# depgraph_core::worker::locate_worker, so they are dropped too and re-pinned below.
+SCRUBBED_ENV=()
+while IFS= read -r name; do
+  if [[ "$name" =~ ^GIT_ || "$name" =~ ^DEPGRAPH_[A-Z0-9]+_WORKER$ ]]; then
+    SCRUBBED_ENV+=("$name")
+    unset "$name"
+  fi
+done < <(compgen -e)
+
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(git -C "$SKILL_DIR" rev-parse --show-toplevel)"
 STATE_ROOT="$REPO_ROOT/target/verify-depgraph"
@@ -15,7 +30,28 @@ RUNS_DIR="$STATE_ROOT/runs"
 CURRENT_FILE="$STATE_ROOT/current"
 EVIDENCE_ROOT="${VDG_EVIDENCE_ROOT:-$STATE_ROOT/evidence}"
 BIN="$REPO_ROOT/target/debug/depgraph"
+RUST_WORKER="$REPO_ROOT/target/debug/depgraph-rust-worker"
+GO_WORKER="$REPO_ROOT/workers/go/bin/depgraph-go-worker"
+WEB_WORKER="$REPO_ROOT/workers/web/dist/worker.mjs"
 REAL_HOME="${VDG_REAL_HOME:-$HOME}"
+# Sources compiled into each binary doctor checks for staleness (path deps of the crate).
+CLI_SOURCES=(crates/depgraph-cli crates/depgraph-core crates/depgraph-store crates/depgraph-protocol
+  crates/depgraph-operation crates/depgraph-mcp-tools)
+RUST_WORKER_SOURCES=(workers/rust crates/depgraph-protocol)
+
+# Git environment for the fixture and for depgraph runs: no user/system config, no hooks,
+# no signing and a fixed identity, so fixture commits stay local and reproducible.
+SANDBOX_GIT_ENV=(
+  GIT_CONFIG_GLOBAL=/dev/null
+  GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_COUNT=4
+  GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+  GIT_CONFIG_KEY_1=commit.gpgsign GIT_CONFIG_VALUE_1=false
+  GIT_CONFIG_KEY_2=tag.gpgsign GIT_CONFIG_VALUE_2=false
+  GIT_CONFIG_KEY_3=init.defaultBranch GIT_CONFIG_VALUE_3=main
+  GIT_AUTHOR_NAME=vdg GIT_AUTHOR_EMAIL=vdg@example.invalid
+  GIT_COMMITTER_NAME=vdg GIT_COMMITTER_EMAIL=vdg@example.invalid
+)
 
 die() { echo "vdg: error: $*" >&2; exit 1; }
 log() { echo "vdg: $*" >&2; }
@@ -76,20 +112,37 @@ EOF
 use crate::cart::total;
 pub fn pay(items: &[u32]) -> u32 { total(items) }
 EOF
-  git -C "$repo" init -q -b main
-  git -C "$repo" add -A
-  git -C "$repo" -c user.name=vdg -c user.email=vdg@example.invalid commit -qm "vdg fixture"
+  fixture_git "$repo" init -q -b main
+  fixture_git "$repo" add -A
+  fixture_git "$repo" commit -qm "vdg fixture"
+}
+
+# git against the fixture only: GIT_* already scrubbed, config/hooks/signing/identity pinned.
+fixture_git() {
+  local repo="$1"
+  shift
+  env "${SANDBOX_GIT_ENV[@]}" git -C "$repo" "$@"
 }
 
 # Run a command with the sandboxed environment. RUSTUP_HOME/CARGO_HOME keep pointing at the
 # real toolchain (read-only use) because a fake HOME otherwise hides rustup and disables HIR.
+# Workers are pinned to this checkout's builds (Go/Web only when built here).
 sandboxed() {
+  [[ -n "${VDG_RUST_WORKER:-}" ]] || die "run $VDG_RUN_ID predates worker pinning; vdg cleanup and relaunch"
+  local workers=(DEPGRAPH_RUST_WORKER="$VDG_RUST_WORKER")
+  [[ -n "${VDG_GO_WORKER:-}" ]] && workers+=(DEPGRAPH_GO_WORKER="$VDG_GO_WORKER")
+  [[ -n "${VDG_WEB_WORKER:-}" ]] && workers+=(DEPGRAPH_WEB_WORKER="$VDG_WEB_WORKER")
   env HOME="$VDG_HOME" \
     RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
     CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
     XDG_CACHE_HOME="$VDG_HOME/.cache" \
+    "${SANDBOX_GIT_ENV[@]}" \
+    "${workers[@]}" \
     "$@"
 }
+
+# Write KEY=VALUE lines that `source` reads back byte-exact (spaces, $, quotes, backticks).
+write_state_var() { printf '%s=%q\n' "$1" "$2"; }
 
 cmd_launch() {
   local all_workers=0 build=1
@@ -111,6 +164,10 @@ cmd_launch() {
     fi
   fi
   [[ -x "$BIN" ]] || die "missing $BIN after build"
+  [[ -x "$RUST_WORKER" ]] || die "missing $RUST_WORKER after build"
+  local go_worker="" web_worker=""
+  [[ -x "$GO_WORKER" ]] && go_worker="$GO_WORKER"
+  [[ -f "$WEB_WORKER" ]] && web_worker="$WEB_WORKER"
 
   local run scratch
   run="$(date +%Y%m%d-%H%M%S)-$$"
@@ -119,16 +176,19 @@ cmd_launch() {
   mkdir -p "$RUNS_DIR" "$EVIDENCE_ROOT/$run" "$scratch/home" "$scratch/state"
   write_fixture "$scratch/repo"
 
-  cat >"$RUNS_DIR/$run.env" <<EOF
-VDG_RUN_ID=$run
-VDG_SCRATCH=$scratch
-VDG_HOME=$scratch/home
-VDG_FIXTURE=$scratch/repo
-VDG_STORE=$scratch/state/graph.db
-VDG_EVIDENCE=$EVIDENCE_ROOT/$run
-VDG_BIN=$BIN
-VDG_HEAD=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
-EOF
+  {
+    write_state_var VDG_RUN_ID "$run"
+    write_state_var VDG_SCRATCH "$scratch"
+    write_state_var VDG_HOME "$scratch/home"
+    write_state_var VDG_FIXTURE "$scratch/repo"
+    write_state_var VDG_STORE "$scratch/state/graph.db"
+    write_state_var VDG_EVIDENCE "$EVIDENCE_ROOT/$run"
+    write_state_var VDG_BIN "$BIN"
+    write_state_var VDG_RUST_WORKER "$RUST_WORKER"
+    write_state_var VDG_GO_WORKER "$go_worker"
+    write_state_var VDG_WEB_WORKER "$web_worker"
+    write_state_var VDG_HEAD "$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  } >"$RUNS_DIR/$run.env"
   echo "$run" >"$CURRENT_FILE"
   load_run "$run"
   {
@@ -136,6 +196,9 @@ EOF
     echo
     echo "- repo HEAD: $VDG_HEAD ($(git -C "$REPO_ROOT" status --porcelain | wc -l | tr -d ' ') uncommitted paths)"
     echo "- binary: $VDG_BIN ($("$VDG_BIN" --version))"
+    echo "- rust worker (pinned via DEPGRAPH_RUST_WORKER): $VDG_RUST_WORKER"
+    echo "- go/web worker: ${VDG_GO_WORKER:-not built} / ${VDG_WEB_WORKER:-not built}"
+    echo "- scrubbed inherited env: ${SCRUBBED_ENV[*]:-none}"
     echo "- fixture: $VDG_FIXTURE"
     echo "- store: $VDG_STORE"
     echo
@@ -162,6 +225,17 @@ real_cache_entry() {
   echo "$cache/repositories/$identity"
 }
 
+# Print up to 3 source files (*.rs, Cargo.toml) under the given crate dirs newer than $1.
+# A missing binary makes every source "newer" so the check fails instead of passing silently.
+newer_sources() {
+  local binary="$1" dirs=() dir
+  shift
+  for dir in "$@"; do dirs+=("$REPO_ROOT/$dir"); done
+  if [[ ! -e "$binary" ]]; then echo "(missing $binary)"; return; fi
+  find "${dirs[@]}" -path '*/target' -prune -o \( -name '*.rs' -o -name Cargo.toml \) \
+    -newer "$binary" -print | head -n 3 | tr '\n' ' ' | sed 's/ $//'
+}
+
 cmd_doctor() {
   load_run "$(current_run)"
   local failures=0
@@ -174,9 +248,11 @@ cmd_doctor() {
   got="$("$VDG_BIN" --version 2>/dev/null | awk '{print $2}')"
   check "binary version $got == workspace $want" '[[ "$got" == "$want" ]]'
   local stale
-  stale="$(find "$REPO_ROOT/crates/depgraph-cli/src" "$REPO_ROOT/crates/depgraph-core/src" \
-    "$REPO_ROOT/crates/depgraph-store/src" "$REPO_ROOT/workers/rust/src" -name '*.rs' -newer "$VDG_BIN" | head -n 3)"
-  check "binary newer than CLI/core/store/rust-worker sources${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
+  stale="$(newer_sources "$VDG_BIN" "${CLI_SOURCES[@]}")"
+  check "CLI binary newer than its sources (${CLI_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
+  check "rust worker present ($VDG_RUST_WORKER)" '[[ -x "$VDG_RUST_WORKER" ]]'
+  stale="$(newer_sources "$VDG_RUST_WORKER" "${RUST_WORKER_SOURCES[@]}")"
+  check "rust worker binary newer than its sources (${RUST_WORKER_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
   check "store inside sandbox ($VDG_STORE)" '[[ -f "$VDG_STORE" && "$VDG_STORE" == "$VDG_SCRATCH"/* ]]'
   local entry
   entry="$(real_cache_entry)"
@@ -235,11 +311,10 @@ cmd_run() {
 
 cmd_fixture_change() {
   load_run "$(current_run)"
-  local git_cmd=(git -C "$VDG_FIXTURE" -c user.name=vdg -c user.email=vdg@example.invalid)
-  "${git_cmd[@]}" switch -q -c feat
+  fixture_git "$VDG_FIXTURE" switch -q -c feat
   echo 'pub fn tax(amount: u32) -> u32 { amount }' >>"$VDG_FIXTURE/src/cart.rs"
-  "${git_cmd[@]}" commit -qam "vdg: change cart"
-  "${git_cmd[@]}" log --oneline -n 2 >"$VDG_EVIDENCE/fixture-change.git-log"
+  fixture_git "$VDG_FIXTURE" commit -qam "vdg: change cart"
+  fixture_git "$VDG_FIXTURE" log --oneline -n 2 >"$VDG_EVIDENCE/fixture-change.git-log"
   echo "- fixture-change: branch feat, src/cart.rs gained fn tax" >>"$VDG_EVIDENCE/NOTES.md"
   log "fixture now on branch feat with one commit ahead of main"
 }

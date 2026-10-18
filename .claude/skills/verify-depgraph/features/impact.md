@@ -29,7 +29,7 @@ Preconditions:
 
 ## Gotchas
 
-- `--changed` reads Git from the current directory. Run from anywhere other than the fixture root (for example `/`) and it fails with exit 2, `PATH contains no safe absolute directories outside the scan root`. `vdg run` always runs in the fixture; manual calls must `cd "$VDG_FIXTURE"`.
+- `--changed` reads Git from the current directory. Run from anywhere other than the fixture root (for example `/`) and it fails with exit 2, `PATH contains no safe absolute directories outside the scan root`. `vdg run` always runs in the fixture; manual calls must `cd "$VDG_FIXTURE"`. An exported `GIT_DIR` / `GIT_WORK_TREE` would make depgraph's `git` read another repository; `vdg` unsets them, a manual call must too.
 - `--changed` answers "is the selected node affected by the change", so selecting the changed file itself yields `impacted=false`. Select a dependent (`src/checkout.rs`) to see a hit.
 - File-level `impact path:src/cart.rs` does not list `src/checkout.rs`, because checkout imports the `cart` module node; it lists `file:src/lib.rs`, the module, the crate target, package and workspace.
 - After `fixture-change` the fixture is no longer at baseline; relaunch before running other features' recipes.

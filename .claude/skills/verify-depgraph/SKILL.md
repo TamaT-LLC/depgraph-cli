@@ -35,7 +35,11 @@ What launch does:
 
 Ready means launch printed `vdg: ready run=<id> fixture=<path> evidence=<path>` and printed the run id as its last stdout line. The id is written to `target/verify-depgraph/current`; every later `vdg` call uses that run unless `VDG_RUN=<id>` is set.
 
-Isolation: every `depgraph` call made through `vdg` gets an explicit `--store` inside the sandbox, `HOME` and `XDG_CACHE_HOME` inside the sandbox, and runs with cwd = fixture repo. `RUSTUP_HOME`/`CARGO_HOME` keep pointing at the real toolchain because a fake `HOME` otherwise hides rustup and silently disables HIR analysis. Several runs can coexist (distinct run ids, sandboxes and Stores). Never point `--store` at the default OS cache (`~/Library/Caches/com.TamaT.depgraph/` on macOS, `~/.cache/depgraph/` on Linux): that is the user's real data.
+Isolation: every `depgraph` call made through `vdg` gets an explicit `--store` inside the sandbox, `HOME` and `XDG_CACHE_HOME` inside the sandbox, and runs with cwd = fixture repo. `RUSTUP_HOME`/`CARGO_HOME` keep pointing at the real toolchain because a fake `HOME` otherwise hides rustup and silently disables HIR analysis.
+
+- Git: `vdg` unsets every inherited `GIT_*` variable at startup (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`, ...), so running it from a git hook or `git rebase --exec` cannot redirect fixture commits into the real repository. Fixture git commands and `depgraph` runs get `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`, `commit.gpgsign=false`, `tag.gpgsign=false` and the fixed identity `vdg <vdg@example.invalid>`.
+- Workers: inherited `DEPGRAPH_<ADAPTER>_WORKER` overrides (`DEPGRAPH_RUST_WORKER`, `DEPGRAPH_GO_WORKER`, `DEPGRAPH_WEB_WORKER`) are unset because the CLI prefers them over the local build. Every `depgraph` run then gets `DEPGRAPH_RUST_WORKER=<checkout>/target/debug/depgraph-rust-worker`, plus `DEPGRAPH_GO_WORKER` / `DEPGRAPH_WEB_WORKER` pointing at `workers/go/bin/depgraph-go-worker` / `workers/web/dist/worker.mjs` when those were built in this checkout. `NOTES.md` records the pinned workers and the names of the scrubbed variables.
+- State: `target/verify-depgraph/runs/<id>.env` is written with `printf %q`, so paths with spaces, `$` or quotes (for example in `TMPDIR` or `VDG_EVIDENCE_ROOT`) round-trip exactly and are never executed when sourced. Several runs can coexist (distinct run ids, sandboxes and Stores). Never point `--store` at the default OS cache (`~/Library/Caches/com.TamaT.depgraph/` on macOS, `~/.cache/depgraph/` on Linux): that is the user's real data.
 
 Teardown is `vdg cleanup` (see Cleanup).
 
@@ -49,7 +53,8 @@ Read-only. It checks, and exits non-zero with `FAIL` lines if any fails:
 
 - the run's sandbox and fixture git repo exist;
 - `target/debug/depgraph --version` equals `[workspace.package] version` in `Cargo.toml`;
-- the binary is newer than every `.rs` file under `crates/depgraph-cli/src`, `crates/depgraph-core/src`, `crates/depgraph-store/src`, `workers/rust/src` (otherwise you are driving a stale build: rerun `$V launch`);
+- `target/debug/depgraph` is newer than every `.rs` / `Cargo.toml` of the crates it is built from (`crates/depgraph-{cli,core,store,protocol,operation,mcp-tools}`);
+- the pinned Rust worker `target/debug/depgraph-rust-worker` exists and is newer than every `.rs` / `Cargo.toml` under `workers/rust` and `crates/depgraph-protocol`. Each binary is compared against its own sources, so a fresh CLI does not hide a stale worker. If either check fails you are driving a stale build: rerun `$V launch` (without `--no-build`);
 - the Store file is inside the sandbox;
 - the real OS cache has no `repositories/<sha256(fixture path)>` entry (proof that nothing leaked into the user's Store);
 - `depgraph --store <store> doctor --json` exits 0, its Rust worker is `available: true` (integrity `development-unverified` is expected for dev builds), and `latest_successful_scan_id` is set.
@@ -121,8 +126,8 @@ Removes only the sandbox directory that run created (refuses any path not matchi
   - `vdg run <label> [--expect-exit N] -- <depgraph args...>`
   - `vdg fixture-change`
   - `vdg note <label> <text...>`
-  - `vdg env` (prints `export VDG_*=...` lines; `eval "$($V env)"` gives `$VDG_FIXTURE`, `$VDG_STORE`, `$VDG_EVIDENCE`, `$VDG_HOME`, `$VDG_BIN` for manual inspection)
+  - `vdg env` (prints `export VDG_*=...` lines, shell-quoted; `eval "$($V env)"` gives `$VDG_FIXTURE`, `$VDG_STORE`, `$VDG_EVIDENCE`, `$VDG_HOME`, `$VDG_BIN`, `$VDG_RUST_WORKER` for manual inspection)
   - `vdg evidence-dir`
   - `vdg cleanup [--run ID]`
 
-If you must run something `vdg run` cannot express (for example `sqlite3` on the Store), `eval "$($V env)"` first and keep `HOME=$VDG_HOME`, `--store "$VDG_STORE"` and cwd `$VDG_FIXTURE`.
+If you must run something `vdg run` cannot express (for example `sqlite3` on the Store), `eval "$($V env)"` first and keep `HOME=$VDG_HOME`, `--store "$VDG_STORE"`, cwd `$VDG_FIXTURE` and `DEPGRAPH_RUST_WORKER="$VDG_RUST_WORKER"`, with no `GIT_DIR`/`GIT_WORK_TREE` exported in your shell. Run cleanup before relaunching a run created by an older `vdg` (its state file has no `VDG_RUST_WORKER`; `vdg run` refuses it).
