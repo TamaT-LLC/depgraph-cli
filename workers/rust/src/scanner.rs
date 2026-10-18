@@ -75,7 +75,11 @@ struct SourceUnit {
     rel_path: String,
     package_index: Option<usize>,
     text: Option<String>,
-    syntax: Option<syn::File>,
+    /// Only these facts outlive the syntax tree: each tree is dropped right
+    /// after its occurrences are collected so a scan never holds every tree.
+    parsed: bool,
+    no_std: bool,
+    no_implicit_prelude: bool,
     occurrences: Vec<Occurrence>,
 }
 
@@ -941,12 +945,27 @@ impl State {
                     }
                 },
             };
-            let occurrences = syntax.as_ref().map(collect_occurrences).unwrap_or_default();
+            let parsed = syntax.is_some();
+            let no_std = syntax
+                .as_ref()
+                .is_some_and(|syntax| syntax_mentions_attribute(syntax, "no_std"));
+            let no_implicit_prelude = syntax
+                .as_ref()
+                .is_some_and(|syntax| syntax_mentions_attribute(syntax, "no_implicit_prelude"));
+            let mut occurrences = syntax.as_ref().map(collect_occurrences).unwrap_or_default();
+            occurrences.shrink_to_fit();
+            drop(syntax);
+            // proc-macro2 keeps a per-thread copy of every parsed source for
+            // span locations. Occurrences store plain line/column spans, and
+            // the tree holding proc-macro2 spans is gone, so the copy is dead.
+            proc_macro2::extra::invalidate_current_thread_spans();
             sources.push(SourceUnit {
                 rel_path,
                 package_index,
                 text: source,
-                syntax,
+                parsed,
+                no_std,
+                no_implicit_prelude,
                 occurrences,
             });
         }
@@ -1258,12 +1277,8 @@ impl State {
             let contexts = self.semantic_crate_contexts(packages, model)?;
             let occurrences_by_path = sources
                 .iter()
-                .filter_map(|source| {
-                    source
-                        .syntax
-                        .as_ref()
-                        .map(|_| (source.rel_path.as_str(), source.occurrences.as_slice()))
-                })
+                .filter(|source| source.parsed)
+                .map(|source| (source.rel_path.as_str(), source.occurrences.as_slice()))
                 .collect();
             let delta =
                 semantic_extractor(model, &contexts, &occurrences_by_path, &self.profile.id)?;
@@ -1923,8 +1938,7 @@ impl State {
         loop {
             let mut additions = Vec::new();
             for source in sources {
-                let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
-                else {
+                let (Some(package_index), true) = (source.package_index, source.parsed) else {
                     continue;
                 };
                 let Some(contexts) = self
@@ -1996,8 +2010,7 @@ impl State {
     fn index_modules(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         self.prepare_module_contexts(packages, sources);
         for source in sources {
-            let (Some(package_index), Some(_)) = (source.package_index, source.syntax.as_ref())
-            else {
+            let (Some(package_index), true) = (source.package_index, source.parsed) else {
                 continue;
             };
             let package = &packages[package_index];
@@ -2078,17 +2091,15 @@ impl State {
 
     fn index_syntax_types(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         for source in sources {
-            let (Some(package_index), Some(syntax)) =
-                (source.package_index, source.syntax.as_ref())
-            else {
+            let (Some(package_index), true) = (source.package_index, source.parsed) else {
                 continue;
             };
             let package = &packages[package_index];
             let prelude_policy = self.rust_prelude_policies.entry(package_index).or_default();
-            if syntax_mentions_attribute(syntax, "no_implicit_prelude") {
+            if source.no_implicit_prelude {
                 prelude_policy.implicit = false;
             }
-            if syntax_mentions_attribute(syntax, "no_std") {
+            if source.no_std {
                 prelude_policy.std = false;
             }
             let package_locator = package_locator(package);
@@ -2191,7 +2202,7 @@ impl State {
         sources: &[SourceUnit],
     ) -> Result<()> {
         for source in sources {
-            if source.syntax.is_none() {
+            if !source.parsed {
                 continue;
             }
             let source_node = self.file_nodes[&source.rel_path].clone();
@@ -5370,7 +5381,7 @@ pub fn scoped() {
                     .iter()
                     .any(|reason| reason == "rust-hir-unsupported")
             );
-            crate::emit::build_events("semantic-complete-contract", &result).unwrap();
+            crate::emit::build_events("semantic-complete-contract", result).unwrap();
             return;
         }
         assert_eq!(
@@ -5388,7 +5399,7 @@ pub fn scoped() {
                 .iter()
                 .any(|reason| reason == "rust-hir-sysroot-unavailable")
         );
-        crate::emit::build_events("semantic-complete-contract", &result).unwrap();
+        crate::emit::build_events("semantic-complete-contract", result).unwrap();
     }
 
     #[test]
