@@ -15,7 +15,16 @@ export const REPORT_SCHEMA_VERSION = "depgraph-pr-impact-report-v0";
 const SCAN_EXIT_OK = 0;
 const SCAN_EXIT_POLICY_VIOLATION = 1;
 const SCAN_EXIT_WORKER_FAILURE = 3;
-const IMPACT_EXIT_SELECTOR = 2;
+// depgraph exits 2 for every input or not-found error, not only selector
+// misses: an out-of-range bound, a missing snapshot, or a bad git ref share it.
+const IMPACT_EXIT_INPUT = 2;
+// Only these first-line diagnostics (query.rs `choose_unique_bounded_cancellable`)
+// mean the changed file has no graph node; any other exit 2 is a failure.
+const SELECTOR_MISS_PATTERN = /^(?:graph query is invalid: )?selector ".*" did not match any node$/;
+const SELECTOR_AMBIGUOUS_PATTERN = /^(?:graph query is invalid: )?selector ".*" is ambiguous;/;
+// `MAX_INTERACTIVE_QUERY_TRAVERSAL` in depgraph-core; `ImpactRequest::try_new`
+// rejects larger --max-nodes / --max-edges as "invalid service input".
+const MAX_TRAVERSAL_LIMIT = 1_000_000;
 const MESSAGE_LIMIT = 300;
 const SKIPPED_PATH_LIMIT = 50;
 const MAX_BUFFER_BYTES = 256 * 1024 * 1024;
@@ -65,12 +74,16 @@ export function buildImpactArgs({ store, path, selector, profiles = [], maxNodes
   return args;
 }
 
-function messageHead(text) {
+function firstLine(text) {
   const line = String(text ?? "")
     .split(/\r?\n/)
     .map((part) => part.trim())
     .find((part) => part.length > 0);
-  const head = (line ?? "").replace(/^error:\s*/i, "");
+  return (line ?? "").replace(/^error:\s*/i, "");
+}
+
+function messageHead(text) {
+  const head = firstLine(text);
   return head.length > MESSAGE_LIMIT ? `${head.slice(0, MESSAGE_LIMIT - 1)}…` : head;
 }
 
@@ -108,15 +121,16 @@ export function classifyImpactResult({ exitCode, stdout, stderr }, { path } = {}
     return { status: "ok", data: envelope.data };
   }
   const head = messageHead(stderr) || messageHead(stdout) || `exit ${exitCode}`;
-  if (exitCode === IMPACT_EXIT_SELECTOR) {
-    let message = head;
-    if (/did not match any node/.test(head)) {
-      message = "no graph node for this path";
-    } else if (/is ambiguous/.test(head)) {
-      const candidates = String(stderr ?? "").match(/\(file, id:/g)?.length ?? 0;
-      message = `no graph node for this path (${candidates} other files share its suffix)`;
+  if (exitCode === IMPACT_EXIT_INPUT) {
+    // Match the untruncated line: a long path would cut the head short.
+    const line = firstLine(stderr);
+    if (SELECTOR_MISS_PATTERN.test(line)) {
+      return { status: "unmapped", exitCode, message: "no graph node for this path" };
     }
-    return { status: "unmapped", exitCode, message };
+    if (SELECTOR_AMBIGUOUS_PATTERN.test(line)) {
+      const candidates = String(stderr ?? "").match(/\(file, id:/g)?.length ?? 0;
+      return { status: "unmapped", exitCode, message: `no graph node for this path (${candidates} other files share its suffix)` };
+    }
   }
   return { status: "error", exitCode, message: head };
 }
@@ -124,7 +138,7 @@ export function classifyImpactResult({ exitCode, stdout, stderr }, { path } = {}
 /** From an ambiguous-selector error, the id of the candidate that is exactly `path`. */
 export function ambiguousCandidateId(stderr, path) {
   const text = String(stderr ?? "");
-  if (!/is ambiguous/.test(text)) return undefined;
+  if (!SELECTOR_AMBIGUOUS_PATTERN.test(firstLine(text))) return undefined;
   const pattern = /(file:\/\/|file:)([^\s()]+) \(file, id:([^\s(),]+)\)/g;
   for (const match of text.matchAll(pattern)) {
     if (match[2] === path && ATTEMPT_ID_PATTERN.test(match[3])) return match[3];
@@ -268,11 +282,13 @@ function scanAttemptId(scanExitCode, scanOutput) {
   return typeof id === "string" && ATTEMPT_ID_PATTERN.test(id) ? id : undefined;
 }
 
-function positiveInteger(name, value) {
+function positiveInteger(name, value, maximum) {
   if (value === undefined || value === null || value === "") return undefined;
   const text = String(value).trim();
   if (!/^[1-9][0-9]{0,8}$/.test(text)) throw new Error(`${name} must be a positive integer`);
-  return Number(text);
+  const number = Number(text);
+  if (maximum !== undefined && number > maximum) throw new Error(`${name} must be at most ${maximum}`);
+  return number;
 }
 
 const HISTORY_HINT = "use actions/checkout with fetch-depth: 0, or fetch the base commit before this step";
@@ -313,8 +329,8 @@ export async function collectReport({
     throw new Error(`base ref is not a plain revision: ${JSON.stringify(baseRef)}`);
   }
   const fileLimit = positiveInteger("max-files", maxFiles) ?? 200;
-  const nodeLimit = positiveInteger("max-nodes", maxNodes);
-  const edgeLimit = positiveInteger("max-edges", maxEdges);
+  const nodeLimit = positiveInteger("max-nodes", maxNodes, MAX_TRAVERSAL_LIMIT);
+  const edgeLimit = positiveInteger("max-edges", maxEdges, MAX_TRAVERSAL_LIMIT);
 
   const baseSha = await resolveHistory(runGit, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], `cannot resolve base ref ${baseRef}`);
   const headSha = (await runGit(["rev-parse", "--verify", "--quiet", headRef])).trim();
@@ -349,7 +365,7 @@ export async function collectReport({
     queried += 1;
     const options = { store, profiles, maxNodes: nodeLimit, maxEdges: edgeLimit, attemptId };
     let processResult = await runDepgraph(buildImpactArgs({ ...options, path: entry.path }));
-    const candidate = processResult.exitCode === IMPACT_EXIT_SELECTOR ? ambiguousCandidateId(processResult.stderr, entry.path) : undefined;
+    const candidate = processResult.exitCode === IMPACT_EXIT_INPUT ? ambiguousCandidateId(processResult.stderr, entry.path) : undefined;
     if (candidate) processResult = await runDepgraph(buildImpactArgs({ ...options, selector: `id:${candidate}` }));
     files.push({ ...entry, result: classifyImpactResult(processResult, { path: entry.path }) });
   }

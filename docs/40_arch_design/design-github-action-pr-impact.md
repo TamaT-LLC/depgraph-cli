@@ -103,6 +103,7 @@ runner のチェックアウト先が変わっても Store の中身は再利用
 実データで試すと、素朴な呼び出しでは足りず、`collect.mjs` に次の補正を入れた。
 
 - `path:` セレクターは完全一致ではなく、見つからないときにサフィックス一致へフォールバックする。別ファイルの impact が exit 0 で返りうるので、`data.root` が変更ファイル自身かを確認し、違えば unmapped にする。exit 2 の ambiguous のときは、候補から完全一致を探して `id:` で再試行する。ファイルノードの locator は Go が `file:<path>`、web が `file://<path>` で、形が揃っていない。
+- impact の exit 2 はセレクターの不一致に限らず、入力検証エラーや snapshot が無いときにも返る。stderr の 1 行目が `selector "..." did not match any node` か `selector "..." is ambiguous;` のときだけ unmapped にし、それ以外の exit 2 は error として終了コードとメッセージ先頭を残す。error があると report は不完全扱いになり、コメントは「影響は見つかりませんでした」と断定しない。
 - strict 違反（status `policy_failed`、exit 1）や部分結果（status `partial`、exit 3）の scan は completed として保存されず、既定の impact は exit 2 になり、全ファイルが unmapped に見える。このため `scan.json` の `scan_id` を使い、`--scan-id=attempt:<scan_id>` でその scan を明示して照会する。
 - impact の envelope には `partial` が加わっている。`impacts` には変更ファイル自身が depth 0 で入るので除く。`dependency_path` は影響ノードから変更ファイルへ向かう順である。同じ位置の evidence が重複して返るので、表示時に取り除く。
 
@@ -128,7 +129,7 @@ warm impact は 1 回数十 ms と測定されている（`docs/releases/v0.4.0-
 | `strict` | true で `scan --strict`。exit 1 はコメントで報告するだけで、ジョブは落とさない |
 | `profiles` | 改行区切りで `impact` の `--profile` に渡す。scan 側のプロファイル指定は CLI の不足機能（後述） |
 | `version` / `depgraph-path` | 使う CLI のバージョン（既定 `0.6.4`）、または用意済みバイナリのパス。後者を指定すると取得しない |
-| `max-files` / `max-nodes` / `max-edges` | 呼び出し回数（既定 200）と、`impact` の探索上限 |
+| `max-files` / `max-nodes` / `max-edges` | 呼び出し回数（既定 200）と、`impact` の探索上限。探索上限は CLI と同じ 1〜1,000,000 で、範囲外は collect の開始前に失敗させる |
 | `post-comment` / `github-token` | 同一リポジトリの PR で、同じジョブからコメントするとき（既定は false）。トークンに `pull-requests: write` が要る。`github-token` はリリース取得にも使う |
 | `pr-number` | コメント先の PR 番号。既定は `github.event.pull_request.number` |
 | `comment-author` | 更新対象にするコメントの投稿者。`github-actions[bot]` に加えて指定できる |

@@ -260,8 +260,12 @@ export function renderComment(report, { repository, maxLength = DEFAULT_MAX_LENG
     const deleted = report.changed_files.filter((file) => file.status === "deleted").length;
     const onlyDeleted = deleted > 0 && deleted === report.changed_files.length && report.skipped.count === 0;
     const scope = deleted > 0 ? "削除されたファイルを除く変更では、" : "";
+    const failed = report.changed_files.some((file) => file.status === "error");
     if (onlyDeleted) {
       // Nothing but deletions: there is no surviving change to make a claim about.
+    } else if (failed && routes.length === 0 && packages.length === 0) {
+      // A file whose impact query failed may hide impacts; do not claim none.
+      head.push("影響範囲を照会できなかったファイルがあるため、影響がないとは判断できません。", "");
     } else if (report.impacted.length === 0) {
       head.push(`${scope}影響を受けるノードは見つかりませんでした。`, "");
     } else if (routes.length === 0 && packages.length === 0) {

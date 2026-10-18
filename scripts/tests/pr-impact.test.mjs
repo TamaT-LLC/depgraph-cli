@@ -118,9 +118,60 @@ test("classifyImpactResult maps exit 0 envelopes to ok", () => {
   assert.deepEqual(result.data, { impacts: [] });
 });
 
-test("classifyImpactResult maps exit 2 to unmapped and keeps the message head", () => {
-  const result = classifyImpactResult({ exitCode: 2, stdout: "", stderr: "selector did not match\nmore detail" });
-  assert.deepEqual(result, { status: "unmapped", exitCode: 2, message: "selector did not match" });
+test("classifyImpactResult maps an ambiguous selector exit 2 to unmapped and counts the candidates", () => {
+  const stderr =
+    'error: graph query is invalid: selector "path:README.md" is ambiguous; select a candidate with id:<stable-id>. candidates: ' +
+    "file://docs/README.md (file, id:file:sha256:bb), file://web/README.md (file, id:file:sha256:cc)\n";
+  const result = classifyImpactResult({ exitCode: 2, stdout: "", stderr });
+  assert.deepEqual(result, { status: "unmapped", exitCode: 2, message: "no graph node for this path (2 other files share its suffix)" });
+});
+
+test("classifyImpactResult maps exit 2 input errors that are not selector misses to error", () => {
+  assert.deepEqual(classifyImpactResult({ exitCode: 2, stdout: "", stderr: "error: invalid service input\n" }), {
+    status: "error",
+    exitCode: 2,
+    message: "invalid service input",
+  });
+  const noSnapshot = classifyImpactResult({ exitCode: 2, stdout: "", stderr: "error: no current completed snapshot\n" });
+  assert.equal(noSnapshot.status, "error");
+  assert.equal(noSnapshot.exitCode, 2);
+  // A selector miss mentioned only below the first line must not reclassify the failure.
+  const later = classifyImpactResult({ exitCode: 2, stdout: "", stderr: 'error: invalid service input\nselector "x" did not match any node\n' });
+  assert.equal(later.status, "error");
+});
+
+test("collectReport marks the report incomplete when impact rejects its input with exit 2", async () => {
+  const report = await collectReport({
+    ...collectFixture(),
+    runDepgraph: async () => ({ exitCode: 2, stdout: "", stderr: "error: invalid service input\n" }),
+  });
+  assert.equal(report.changed_files[0].status, "error");
+  assert.equal(report.changed_files[0].exit_code, 2);
+  assert.equal(report.incomplete, true);
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.doesNotMatch(body, /影響を受けるノードは見つかりませんでした/);
+  assert.doesNotMatch(body, /影響は見つかりませんでした/);
+  assert.match(body, /invalid service input/);
+});
+
+test("collectReport rejects max-nodes and max-edges above the depgraph traversal limit before running git", async () => {
+  for (const [key, name] of [["maxNodes", "max-nodes"], ["maxEdges", "max-edges"]]) {
+    let gitCalls = 0;
+    await assert.rejects(
+      collectReport({
+        ...collectFixture(),
+        [key]: "2000000",
+        runGit: async () => {
+          gitCalls += 1;
+          return "";
+        },
+      }),
+      new RegExp(`${name} must be at most 1000000`),
+    );
+    assert.equal(gitCalls, 0);
+  }
+  const report = await collectReport({ ...collectFixture(), maxNodes: "1000000", maxEdges: "1000000" });
+  assert.equal(report.changed_files[0].status, "ok");
 });
 
 test("classifyImpactResult maps other failures and unparsable output to error", () => {
@@ -323,6 +374,21 @@ function fakeGit(diff) {
     throw new Error(`unexpected git ${args.join(" ")}`);
   };
   return { runGit, calls };
+}
+
+function collectFixture() {
+  const { runGit } = fakeGit(["M", "src/a.ts", ""].join("\0"));
+  const envelope = { schema_version: "1.0", command: "impact", scan_id: "s", data: okResult([]).data };
+  return {
+    baseRef: "main",
+    store: "/s",
+    profiles: [],
+    scanExitCode: 0,
+    strict: false,
+    depgraphVersion: "0.6.4",
+    runGit,
+    runDepgraph: async () => ({ exitCode: 0, stdout: JSON.stringify(envelope), stderr: "" }),
+  };
 }
 
 test("collectReport impacts each surviving file, skips deletes, and caps the file count", async () => {

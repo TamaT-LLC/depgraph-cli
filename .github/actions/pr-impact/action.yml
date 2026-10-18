@@ -29,11 +29,11 @@ inputs:
     required: false
     default: "200"
   max-nodes:
-    description: Optional `depgraph impact --max-nodes` bound.
+    description: Optional `depgraph impact --max-nodes` bound (1 to 1000000).
     required: false
     default: ""
   max-edges:
-    description: Optional `depgraph impact --max-edges` bound.
+    description: Optional `depgraph impact --max-edges` bound (1 to 1000000).
     required: false
     default: ""
   post-comment:
