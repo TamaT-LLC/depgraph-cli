@@ -25,7 +25,7 @@ use crate::{
         analyze_changed_code_with_boundary_ids_cancellable, analyze_dependencies_cancellable,
         analyze_unused_cancellable, collection_digest,
         contract::collection_digest_with_policy,
-        finding_fingerprint,
+        finding_fingerprint, is_hotspot_subject_kind,
         range_checkpoint::HealthRangeCheckpointStore,
         ranged::{
             HealthRangeDiagnostics, RangeOrder, RangedHealthError, RangedUnusedOptions,
@@ -468,6 +468,40 @@ pub struct HealthHotspotsRequest {
     churn_commit_limit: u32,
     churn_path_filter: Vec<String>,
     weights: HotspotWeights,
+    path_prefixes: Vec<String>,
+    node_kinds: Vec<String>,
+}
+
+/// Longest accepted hotspot path (churn filter or result prefix), in bytes.
+const MAX_HOTSPOT_PATH_BYTES: usize = 512;
+
+/// Validate repository-relative hotspot paths and return them sorted and
+/// deduplicated so equivalent requests share one identity.
+fn normalize_hotspot_paths(paths: Vec<String>) -> DepgraphServiceResult<Vec<String>> {
+    if paths.len() > MAX_HEALTH_FILTER_ITEMS {
+        return Err(DepgraphServiceError::InvalidInput);
+    }
+    let mut normalized = paths
+        .into_iter()
+        .map(|path| {
+            if path.len() > MAX_HOTSPOT_PATH_BYTES || path.chars().any(char::is_control) {
+                return Err(DepgraphServiceError::InvalidInput);
+            }
+            RepositoryRelativePath::parse(&path)
+                .map(|normalized| normalized.as_str().to_owned())
+                .map_err(|_| DepgraphServiceError::InvalidInput)
+        })
+        .collect::<DepgraphServiceResult<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+/// Directory-boundary prefix match: `src/lib` matches `src/lib` and
+/// `src/lib/a.rs`, never `src/library.rs`.
+fn path_has_directory_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl HealthHotspotsRequest {
@@ -478,28 +512,39 @@ impl HealthHotspotsRequest {
     ) -> DepgraphServiceResult<Self> {
         if weights.validate().is_err()
             || !(1..=MAX_HEALTH_CHURN_COMMITS).contains(&churn_commit_limit)
-            || churn_path_filter.len() > MAX_HEALTH_FILTER_ITEMS
         {
             return Err(DepgraphServiceError::InvalidInput);
         }
-        let mut churn_path_filter = churn_path_filter
-            .into_iter()
-            .map(|path| {
-                if path.len() > 512 || path.chars().any(char::is_control) {
-                    return Err(DepgraphServiceError::InvalidInput);
-                }
-                RepositoryRelativePath::parse(&path)
-                    .map(|normalized| normalized.as_str().to_owned())
-                    .map_err(|_| DepgraphServiceError::InvalidInput)
-            })
-            .collect::<DepgraphServiceResult<Vec<_>>>()?;
-        churn_path_filter.sort();
-        churn_path_filter.dedup();
         Ok(Self {
             churn_commit_limit,
-            churn_path_filter,
+            churn_path_filter: normalize_hotspot_paths(churn_path_filter)?,
             weights,
+            path_prefixes: Vec::new(),
+            node_kinds: Vec::new(),
         })
+    }
+
+    /// Restrict the returned findings without changing how they are scored.
+    ///
+    /// Unlike `churn_path_filter`, which only narrows the Git churn input,
+    /// these filters apply after every candidate is scored, so normalization,
+    /// finding IDs, and fingerprints stay those of the complete ranking. An
+    /// empty list means "no restriction" for that dimension.
+    pub fn with_result_filter(
+        mut self,
+        path_prefixes: Vec<String>,
+        mut node_kinds: Vec<String>,
+    ) -> DepgraphServiceResult<Self> {
+        if node_kinds.len() > MAX_HEALTH_FILTER_ITEMS
+            || node_kinds.iter().any(|kind| !is_hotspot_subject_kind(kind))
+        {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        node_kinds.sort();
+        node_kinds.dedup();
+        self.path_prefixes = normalize_hotspot_paths(path_prefixes)?;
+        self.node_kinds = node_kinds;
+        Ok(self)
     }
 
     #[must_use]
@@ -515,6 +560,28 @@ impl HealthHotspotsRequest {
     #[must_use]
     pub const fn weights(&self) -> HotspotWeights {
         self.weights
+    }
+
+    #[must_use]
+    pub fn path_prefixes(&self) -> &[String] {
+        &self.path_prefixes
+    }
+
+    #[must_use]
+    pub fn node_kinds(&self) -> &[String] {
+        &self.node_kinds
+    }
+
+    fn keeps(&self, finding: &HealthFinding) -> bool {
+        let kind_matches =
+            self.node_kinds.is_empty() || self.node_kinds.contains(&finding.subject_kind);
+        let path_matches = self.path_prefixes.is_empty()
+            || finding.location.as_ref().is_some_and(|location| {
+                self.path_prefixes
+                    .iter()
+                    .any(|prefix| path_has_directory_prefix(&location.path, prefix))
+            });
+        kind_matches && path_matches
     }
 }
 
@@ -575,6 +642,8 @@ impl DepgraphService {
                 churn_commit_limit: None,
                 churn_path_filter: Vec::new(),
                 hotspot_weights: None,
+                hotspot_path_prefixes: Vec::new(),
+                hotspot_node_kinds: Vec::new(),
                 partial_ranges: collected.diagnostics.partial_range_status(),
             },
             cancellation,
@@ -627,6 +696,8 @@ impl DepgraphService {
                 churn_commit_limit: None,
                 churn_path_filter: Vec::new(),
                 hotspot_weights: None,
+                hotspot_path_prefixes: Vec::new(),
+                hotspot_node_kinds: Vec::new(),
                 partial_ranges: collected.diagnostics.partial_range_status(),
             },
             &ids,
@@ -901,6 +972,8 @@ impl DepgraphService {
                     churn_commit_limit: None,
                     churn_path_filter: Vec::new(),
                     hotspot_weights: None,
+                    hotspot_path_prefixes: Vec::new(),
+                    hotspot_node_kinds: Vec::new(),
                     partial_ranges: None,
                 },
                 &ids,
@@ -948,7 +1021,14 @@ impl DepgraphService {
             HotspotAnalysisError::Cancelled => DepgraphServiceError::Cancelled,
             HotspotAnalysisError::ResourceExhausted => DepgraphServiceError::ResourceExhausted,
         })?;
-        let findings = bound_findings(findings)?;
+        // Filter only after the complete ranking is scored so normalized
+        // layers, IDs, and fingerprints do not depend on the filter.
+        let findings = bound_findings(
+            findings
+                .into_iter()
+                .filter(|finding| request.keeps(finding))
+                .collect(),
+        )?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
@@ -969,6 +1049,8 @@ impl DepgraphService {
                     churn_commit_limit: Some(request.churn_commit_limit),
                     churn_path_filter: request.churn_path_filter.clone(),
                     hotspot_weights: Some(request.weights.as_map()),
+                    hotspot_path_prefixes: request.path_prefixes.clone(),
+                    hotspot_node_kinds: request.node_kinds.clone(),
                     partial_ranges: None,
                 },
                 &ids,
@@ -1997,6 +2079,81 @@ libc = "1"
         )
         .expect("valid hotspot request");
         assert_eq!(request.churn_path_filter(), ["src/lib.rs"]);
+    }
+
+    fn issue_543_unfiltered_request() -> HealthHotspotsRequest {
+        HealthHotspotsRequest::try_new(8, Vec::new(), DEFAULT_HOTSPOT_WEIGHTS)
+            .expect("valid hotspot request")
+    }
+
+    #[test]
+    fn issue_543_hotspot_result_filter_rejects_invalid_path_prefixes() {
+        for prefix in [
+            "",
+            "../outside",
+            "/absolute",
+            "src/lib/",
+            "src//lib",
+            "./src",
+            "src\\lib",
+            "C:/src",
+            "src/\u{7}lib",
+        ] {
+            assert!(
+                issue_543_unfiltered_request()
+                    .with_result_filter(vec![prefix.to_owned()], Vec::new())
+                    .is_err(),
+                "{prefix:?} must be rejected"
+            );
+        }
+        assert!(
+            issue_543_unfiltered_request()
+                .with_result_filter(vec!["a".repeat(513)], Vec::new())
+                .is_err()
+        );
+        assert!(
+            issue_543_unfiltered_request()
+                .with_result_filter(
+                    vec!["src".to_owned(); MAX_HEALTH_FILTER_ITEMS + 1],
+                    Vec::new()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn issue_543_hotspot_result_filter_rejects_unknown_node_kinds() {
+        for kind in ["", "package", "File", "unused-file", "external"] {
+            assert!(
+                issue_543_unfiltered_request()
+                    .with_result_filter(Vec::new(), vec![kind.to_owned()])
+                    .is_err(),
+                "{kind:?} must be rejected"
+            );
+        }
+        assert!(
+            issue_543_unfiltered_request()
+                .with_result_filter(
+                    Vec::new(),
+                    vec!["file".to_owned(); MAX_HEALTH_FILTER_ITEMS + 1]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn issue_543_hotspot_result_filter_is_sorted_and_deduplicated() {
+        let request = issue_543_unfiltered_request()
+            .with_result_filter(
+                vec!["src/lib".to_owned(), "app".to_owned(), "src/lib".to_owned()],
+                vec!["symbol".to_owned(), "file".to_owned(), "symbol".to_owned()],
+            )
+            .expect("valid result filter");
+        assert_eq!(request.path_prefixes(), ["app", "src/lib"]);
+        assert_eq!(request.node_kinds(), ["file", "symbol"]);
+        let unfiltered = issue_543_unfiltered_request();
+        assert!(unfiltered.path_prefixes().is_empty());
+        assert!(unfiltered.node_kinds().is_empty());
     }
 
     #[test]

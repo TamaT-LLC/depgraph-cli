@@ -409,6 +409,13 @@ pub struct CollectionIdentity {
     pub churn_path_filter: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotspot_weights: Option<BTreeMap<String, u32>>,
+    /// Result-only hotspot filters (Issue #543). Empty for every unfiltered
+    /// collection, so its digest keeps the pre-filter identity bytes while a
+    /// filtered view never shares a digest with the complete one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotspot_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotspot_node_kinds: Vec<String>,
     /// Range status of an opt-in partial collection (`ranges:<done>/<total>
     /// failed:<n> interrupted:<n>`). `None` for every complete collection, so
     /// a complete collection's digest is unchanged and a partial view never
@@ -882,6 +889,8 @@ mod tests {
             churn_commit_limit: None,
             churn_path_filter: Vec::new(),
             hotspot_weights: None,
+            hotspot_path_prefixes: Vec::new(),
+            hotspot_node_kinds: Vec::new(),
             partial_ranges: None,
         };
         let first = collection_digest(&identity, &["finding:2".to_owned(), "finding:1".to_owned()]);
@@ -902,6 +911,8 @@ mod tests {
             churn_commit_limit: None,
             churn_path_filter: Vec::new(),
             hotspot_weights: None,
+            hotspot_path_prefixes: Vec::new(),
+            hotspot_node_kinds: Vec::new(),
             partial_ranges: None,
         };
         let findings = ["finding:a".to_owned()];

@@ -75,6 +75,24 @@ semantic-complete, and no hard blocker remains.
   unresolved sites, unanalyzed profiles, manifest drift, or a
   missing/mismatched audit base.
 
+To inspect only some directories or node kinds, narrow the hotspot results
+with `--path-prefix` and `--node-kind`. Both flags are repeatable.
+
+```bash
+depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --json
+```
+
+- `--path-prefix` matches repository-relative paths at a directory boundary:
+  `src/lib` matches `src/lib/a.ts` but not `src/library.ts`. Findings without
+  a path never match.
+- `--node-kind` accepts `file`, `module`, `symbol`, `type`, or `route`.
+- Filters apply after scoring, so normalized scores and finding IDs equal the
+  unfiltered ranking. The `collection_digest` differs per filter.
+- `--churn-path` only narrows the Git churn input and never removes findings.
+
+The MCP `health_hotspots_list` tool accepts the same filters as `path_prefixes`
+and `node_kinds`.
+
 Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`,
 `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding
 `suppressions` remain a wire-compatible output-only/deferred field in v1: there

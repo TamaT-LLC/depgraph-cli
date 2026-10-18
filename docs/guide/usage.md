@@ -69,6 +69,24 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 - `indeterminate`は、coverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない状態です。
 
 hotspotの層の充足は`hotspot_scores.available`で確認します。
+
+特定のディレクトリや種類のhotspotだけを見たい場合は、`--path-prefix`と`--node-kind`で結果を絞り込みます。
+どちらも複数回指定できます。
+
+```bash
+depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --json
+```
+
+- `--path-prefix`はリポジトリ相対パスにディレクトリ境界で前方一致します。
+  `src/lib`は`src/lib/a.ts`に一致し、`src/library.ts`には一致しません。
+  パスを持たないfindingは一致しません。
+- `--node-kind`は`file`、`module`、`symbol`、`type`、`route`のいずれかです。
+- 絞り込みは採点の後にかけます。
+  そのため、スコアの正規化とfinding IDは絞り込まない場合と同じ値になります。
+  `collection_digest`は絞り込み条件ごとに変わります。
+- `--churn-path`はGit churnの入力だけを絞り、結果のfindingは減らしません。
+
+MCPの`health_hotspots_list`では、同じ意味の`path_prefixes`と`node_kinds`を使います。
 findingの`suppressions`は、v1ではwire互換性のために残している出力専用のfieldです。
 CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返します。
 auditは、Store schema 18以降が保存するpolicy digest、analyzer version、finding contract versionを比較します。

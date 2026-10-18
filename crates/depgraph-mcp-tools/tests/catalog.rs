@@ -183,6 +183,68 @@ fn issue_540_repository_list_is_an_immediate_read_only_tool_with_a_closed_output
 }
 
 #[test]
+fn issue_543_health_hotspots_list_advertises_result_filters() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let hotspots = catalog.tool("health_hotspots_list").unwrap();
+    let input = hotspots.input_schema();
+    let properties = input["properties"].as_object().unwrap();
+
+    let prefixes = &properties["path_prefixes"];
+    assert_eq!(prefixes["type"], "array");
+    assert_eq!(prefixes["maxItems"], 1024);
+    assert_eq!(prefixes["items"]["type"], "string");
+    assert_eq!(prefixes["items"]["minLength"], 1);
+    assert_eq!(prefixes["items"]["maxLength"], 512);
+    let description = prefixes["description"].as_str().unwrap();
+    for expected in ["directory boundary", "src/library.rs", "churn_path_filter"] {
+        assert!(
+            description.contains(expected),
+            "path_prefixes description lacks {expected}: {description}"
+        );
+    }
+
+    let kinds = &properties["node_kinds"];
+    assert_eq!(kinds["type"], "array");
+    assert_eq!(
+        kinds["items"]["enum"],
+        serde_json::json!(["file", "module", "symbol", "type", "route"])
+    );
+    assert!(
+        kinds["description"]
+            .as_str()
+            .unwrap()
+            .contains("after scoring")
+    );
+
+    let churn = properties["churn_path_filter"]["description"]
+        .as_str()
+        .expect("churn_path_filter documents that it does not filter results");
+    assert!(churn.contains("path_prefixes"), "{churn}");
+    assert!(
+        hotspots.description().contains("path_prefixes")
+            && hotspots.description().contains("node_kinds"),
+        "{}",
+        hotspots.description()
+    );
+    let required = input["required"].as_array().unwrap();
+    assert!(!required.contains(&Value::String("path_prefixes".to_owned())));
+    assert!(!required.contains(&Value::String("node_kinds".to_owned())));
+
+    let validator = jsonschema::draft202012::new(&Value::Object(input.clone())).unwrap();
+    let mut arguments = serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "path_prefixes": ["src/lib"],
+        "node_kinds": ["file", "symbol"]
+    });
+    assert!(validator.is_valid(&arguments));
+    arguments["node_kinds"] = serde_json::json!(["package"]);
+    assert!(!validator.is_valid(&arguments));
+    arguments["node_kinds"] = serde_json::json!([]);
+    arguments["path_prefixes"] = serde_json::json!([""]);
+    assert!(!validator.is_valid(&arguments));
+}
+
+#[test]
 fn idempotency_key_catalog_limit_matches_the_validated_scalar() {
     let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
     for tool_name in [

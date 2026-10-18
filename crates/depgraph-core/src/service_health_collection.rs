@@ -398,6 +398,8 @@ mod tests {
             churn_commit_limit: None,
             churn_path_filter: Vec::new(),
             hotspot_weights: None,
+            hotspot_path_prefixes: Vec::new(),
+            hotspot_node_kinds: Vec::new(),
             partial_ranges: None,
         }
     }

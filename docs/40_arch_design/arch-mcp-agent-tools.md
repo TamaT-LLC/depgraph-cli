@@ -43,6 +43,7 @@ additive extensionとして採用するかを決定する。
 | Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
 | Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
 | Repository discovery | `repository_list`, optional `repository_id` | Issue #540 implemented: omitted `repository_id` binds to the server repository; mismatches return `INVALID_ARGUMENT` with the valid IDs |
+| Hotspot result filters | `health_hotspots_list` `path_prefixes` / `node_kinds`, CLI `hotspots --path-prefix` / `--node-kind` | Issue #543 implemented: filters apply after scoring, so scores and finding IDs are unchanged |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -824,6 +825,19 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | Operation tools | `operation_get` / `operation_result` / `operation_cancel`は省略を許可する。明示した別repositoryは従来どおり`CAPABILITY_DENIED`のまま |
 | `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
+
+## Issue #543 hotspot result filter evidence
+
+`health_hotspots_list`の応答を必要な範囲に絞れるよう、次の境界を固定する。
+
+| Area | Evidence |
+| --- | --- |
+| Input | `path_prefixes`（repository相対path、最大1024件、各512 byte以下、`RepositoryRelativePath`で検証し昇順・重複なしに正規化）と`node_kinds`（closed enum `file`/`module`/`symbol`/`type`/`route`、hotspot analyzerの対象種別と同じ定数）を任意入力として追加する。不正値は`INVALID_ARGUMENT` |
+| Matching | path prefixはディレクトリ境界で一致させる。`src/lib`は`src/lib`と`src/lib/a.ts`に一致し`src/library.ts`には一致しない。pathを持たないfindingは一致しない。二つの条件はANDで、各リスト内はOR |
+| Score stability | 全候補を採点した後に絞り込むため、正規化score、finding ID、fingerprintは絞り込まない場合と同じ。`churn_path_filter`はGit churnの入力だけを絞り、結果は絞らないことをdescriptionに明記する |
+| Identity | `CollectionIdentity`に`hotspot_path_prefixes` / `hotspot_node_kinds`を`skip_serializing_if`付きで追加する。空の場合のdigestは従来と同じbytesになり、絞り込んだ集合はcomplete集合とdigestを共有しない。cursorの正規化入力にも条件を含め、条件が違うcursorは`CURSOR_MISMATCH` |
+| CLI parity | AC-006/AC-015に従い`depgraph hotspots`へ繰り返し指定できる`--path-prefix` / `--node-kind`を追加し、stdio process testでCLIとMCPのdigest、ID、scoreの一致を検証する |
+| Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |
 
 ## Issue #292 acceptance mapping
 

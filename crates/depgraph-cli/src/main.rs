@@ -482,8 +482,20 @@ enum Commands {
     Hotspots {
         #[arg(long, value_name = "N", default_value_t = MAX_HEALTH_CHURN_COMMITS as u32)]
         churn_commit_limit: u32,
+        /// Narrow only the Git churn input to these repository-relative paths
+        /// (repeatable). Findings are not removed; use --path-prefix for that.
         #[arg(long, value_name = "PATH")]
         churn_path: Vec<String>,
+        /// Return only findings under this repository-relative path at a
+        /// directory boundary (repeatable): src/lib matches src/lib/a.ts but
+        /// not src/library.ts. Applied after scoring, so scores and IDs are
+        /// unchanged.
+        #[arg(long, value_name = "PATH")]
+        path_prefix: Vec<String>,
+        /// Return only findings of this node kind (repeatable): file, module,
+        /// symbol, type, or route. Applied after scoring.
+        #[arg(long, value_name = "KIND")]
+        node_kind: Vec<String>,
         #[arg(long, default_value_t = 2500)]
         weight_fan_in: u32,
         #[arg(long, default_value_t = 1500)]
@@ -2326,6 +2338,8 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Hotspots {
             churn_commit_limit,
             churn_path,
+            path_prefix,
+            node_kind,
             weight_fan_in,
             weight_fan_out,
             weight_reverse_impact,
@@ -2344,7 +2358,8 @@ async fn run(cli: Cli) -> Result<u8> {
             .map_err(|_| DepgraphServiceError::InvalidInput)?;
             let (service, mut snapshot) =
                 health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
-            let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?;
+            let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?
+                .with_result_filter(path_prefix, node_kind)?;
             let result =
                 service.health_hotspots(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -2372,6 +2387,8 @@ async fn run(cli: Cli) -> Result<u8> {
                         "collection_digest": result.collection_digest(),
                         "churn_commit_limit": request.churn_commit_limit(),
                         "churn_path_filter": request.churn_path_filter(),
+                        "path_prefixes": request.path_prefixes(),
+                        "node_kinds": request.node_kinds(),
                         "weights": request.weights().as_map(),
                     }),
                     &output,

@@ -1,7 +1,9 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
-use depgraph_core::service::{MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES};
-use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
+use depgraph_core::service::{
+    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, MAX_HEALTH_FILTER_ITEMS,
+};
+use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet, HOTSPOT_SUBJECT_KINDS};
 use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -628,11 +630,13 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_hotspots_list",
-        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights.",
+        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights. path_prefixes and node_kinds narrow the returned findings after scoring, so scores and finding IDs equal the unfiltered ranking; churn_path_filter only narrows the Git churn input.",
         [
             "snapshot",
             "churn_commit_limit",
             "churn_path_filter",
+            "path_prefixes",
+            "node_kinds",
             "weight_fan_in",
             "weight_fan_out",
             "weight_reverse_impact",
@@ -1180,8 +1184,26 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": 1024,
             "items": scalar_schema::<AgentLocator>()
         }),
+        "churn_path_filter" => json!({
+            "type": "array",
+            "maxItems": 1024,
+            "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "description": "Repository-relative paths that narrow only the Git churn input (the git_churn layer). It does not remove findings from the result; use path_prefixes for that."
+        }),
+        "path_prefixes" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": {"type": "string", "minLength": 1, "maxLength": 512},
+            "description": "Return only findings whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Findings without a path never match. Applied after scoring, unlike churn_path_filter which only narrows the Git churn input. Empty or omitted means no restriction."
+        }),
+        "node_kinds" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": {"type": "string", "enum": HOTSPOT_SUBJECT_KINDS},
+            "description": "Return only findings whose subject is one of these hotspot node kinds. Applied after scoring, so scores and finding IDs are unchanged. Empty or omitted means every kind."
+        }),
         "kinds" | "profiles" | "conditions" | "phases" | "sessions" | "environments"
-        | "severities" | "confidences" | "churn_path_filter" => json!({
+        | "severities" | "confidences" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}

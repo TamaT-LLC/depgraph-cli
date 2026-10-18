@@ -7667,6 +7667,322 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
     assert_eq!(source_tree_digest(&root), source_before);
 }
 
+fn seed_issue_543_hotspot_store(path: &Path, root: &Path, revision: &str) {
+    let scan_id = "issue-543-hotspots";
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision(scan_id, root, false, Some(revision))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    let mut seq = 3_u64;
+    for (id, kind, path) in [
+        ("file:src/lib/a.rs", "file", Some("src/lib/a.rs")),
+        ("file:src/lib/b.rs", "file", Some("src/lib/b.rs")),
+        ("file:src/library.rs", "file", Some("src/library.rs")),
+        ("symbol:src/lib/a.rs#run", "symbol", Some("src/lib/a.rs")),
+        ("route:/health", "route", None),
+    ] {
+        let mut node = common("node_upsert", seq);
+        let properties = path.map_or_else(
+            || json!({"language": "rust"}),
+            |path| json!({"path": path, "language": "rust"}),
+        );
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("repo://{id}"),
+            "display_name": id,
+            "properties": properties
+        });
+        store.ingest_event(&node).unwrap();
+        seq += 1;
+    }
+    for (index, (source, target)) in [
+        ("file:src/library.rs", "file:src/lib/a.rs"),
+        ("file:src/lib/b.rs", "file:src/lib/a.rs"),
+        ("file:src/lib/a.rs", "symbol:src/lib/a.rs#run"),
+        ("route:/health", "symbol:src/lib/a.rs#run"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edge = common("edge_upsert", seq);
+        edge["edge"] = json!({
+            "id": format!("edge:issue-543:{index}"),
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge).unwrap();
+        seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", seq);
+    profile_completed["profile_id"] = json!("fixture:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", seq + 1);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
+#[test]
+fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir_all(root.join("src/lib")).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "health")
+            .env("GIT_AUTHOR_EMAIL", "health@example.test")
+            .env("GIT_COMMITTER_NAME", "health")
+            .env("GIT_COMMITTER_EMAIL", "health@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "health"]);
+    run(&["config", "user.email", "health@example.test"]);
+    fs::write(root.join("src/lib/a.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(root.join("src/lib/b.rs"), "pub fn b() {}\n").unwrap();
+    fs::write(root.join("src/library.rs"), "pub fn library() {}\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "seed"]);
+    let revision = run(&["rev-parse", "HEAD"]);
+    seed_issue_543_hotspot_store(&store_path, &root, &revision);
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        (output.status.code(), output.stdout, output.stderr)
+    };
+    let cli_json = |arguments: &[&str]| {
+        let (status, stdout, stderr) = cli(arguments);
+        assert_eq!(
+            status,
+            Some(0),
+            "CLI stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        serde_json::from_slice::<Value>(&stdout).unwrap()
+    };
+    let cli_all = cli_json(&["hotspots", "--all", "--json"]);
+    let cli_filtered = cli_json(&[
+        "hotspots",
+        "--all",
+        "--json",
+        "--path-prefix",
+        "src/lib",
+        "--path-prefix",
+        "src/lib",
+        "--node-kind",
+        "file",
+    ]);
+    let filtered_subjects = |findings: &Value| {
+        let mut subjects = findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|finding| finding["subject_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        subjects.sort_unstable();
+        subjects
+    };
+    assert_eq!(
+        filtered_subjects(&cli_filtered["data"]["findings"]),
+        ["file:src/lib/a.rs", "file:src/lib/b.rs"]
+    );
+    assert_ne!(
+        cli_filtered["data"]["collection_digest"],
+        cli_all["data"]["collection_digest"]
+    );
+    let (status, _, _) = cli(&["hotspots", "--json", "--node-kind", "package"]);
+    assert_ne!(status, Some(0), "unknown --node-kind must be rejected");
+    let (status, _, _) = cli(&["hotspots", "--json", "--path-prefix", "../outside"]);
+    assert_ne!(
+        status,
+        Some(0),
+        "non-relative --path-prefix must be rejected"
+    );
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "snapshot": "current"
+    });
+    let call = |mcp: &mut InteractiveMcp, id: u64, extra: Value| {
+        let mut arguments = common.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        interactive_tool_call(mcp, id, "health_hotspots_list", arguments)
+    };
+    let all = call(&mut mcp, 2, json!({"limit": 100}));
+    let filtered = call(
+        &mut mcp,
+        3,
+        json!({"limit": 100, "path_prefixes": ["src/lib"], "node_kinds": ["file"]}),
+    );
+    assert_eq!(all["isError"], false, "{all}");
+    assert_eq!(filtered["isError"], false, "{filtered}");
+    let all_result = &all["structuredContent"]["result"];
+    let filtered_result = &filtered["structuredContent"]["result"];
+    assert_eq!(
+        all_result["collection_digest"],
+        cli_all["data"]["collection_digest"]
+    );
+    assert_eq!(
+        filtered_result["collection_digest"], cli_filtered["data"]["collection_digest"],
+        "CLI --path-prefix/--node-kind and MCP path_prefixes/node_kinds share one meaning"
+    );
+    assert_eq!(
+        filtered_subjects(&filtered_result["findings"]["items"]),
+        ["file:src/lib/a.rs", "file:src/lib/b.rs"]
+    );
+    // Scores and IDs are computed over every candidate before filtering.
+    for kept in filtered_result["findings"]["items"].as_array().unwrap() {
+        let original = all_result["findings"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["subject_id"] == kept["subject_id"])
+            .unwrap();
+        assert_eq!(kept["id"], original["id"]);
+        assert_eq!(kept["fingerprint"], original["fingerprint"]);
+        assert_eq!(kept["hotspot_scores"], original["hotspot_scores"]);
+        let cli_kept = cli_filtered["data"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["subject_id"] == kept["subject_id"])
+            .unwrap();
+        assert_eq!(kept["id"], cli_kept["id"]);
+        assert_eq!(kept["hotspot_scores"], cli_kept["hotspot_scores"]);
+    }
+
+    // A cursor is bound to its filter: replaying it under another filter is
+    // CURSOR_MISMATCH, while the same filter continues the page.
+    let first_page = call(
+        &mut mcp,
+        4,
+        json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file"]}),
+    );
+    assert_eq!(first_page["isError"], false, "{first_page}");
+    let cursor = first_page["structuredContent"]["result"]["findings"]["next_cursor"]
+        .as_str()
+        .expect("filtered hotspot page has a continuation cursor")
+        .to_owned();
+    let continued = call(
+        &mut mcp,
+        5,
+        json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file"], "cursor": cursor}),
+    );
+    assert_eq!(continued["isError"], false, "{continued}");
+    for (id, extra) in [
+        (6, json!({"limit": 1, "cursor": cursor})),
+        (
+            7,
+            json!({"limit": 1, "path_prefixes": ["src"], "node_kinds": ["file"], "cursor": cursor}),
+        ),
+        (
+            8,
+            json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file", "symbol"], "cursor": cursor}),
+        ),
+    ] {
+        let mismatched = call(&mut mcp, id, extra);
+        assert_eq!(mismatched["isError"], true, "{mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{mismatched}"
+        );
+    }
+
+    let oversized = vec!["src"; 1_025];
+    for (id, extra) in [
+        (9, json!({"path_prefixes": oversized})),
+        (10, json!({"node_kinds": vec!["file"; 1_025]})),
+        (11, json!({"path_prefixes": ["../outside"]})),
+        (12, json!({"path_prefixes": ["src/lib/"]})),
+        (13, json!({"node_kinds": ["package"]})),
+    ] {
+        let rejected = call(&mut mcp, id, extra);
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"], "INVALID_ARGUMENT",
+            "{rejected}"
+        );
+    }
+    for result in [&all, &filtered, &first_page, &continued] {
+        assert_tool_text_matches_structured(result);
+    }
+    mcp.finish();
+}
+
 #[test]
 fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic() {
     let temporary = tempfile::tempdir().unwrap();

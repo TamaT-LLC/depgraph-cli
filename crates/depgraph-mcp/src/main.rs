@@ -706,6 +706,10 @@ struct HealthHotspotsArguments {
     #[serde(default)]
     churn_path_filter: Vec<String>,
     #[serde(default)]
+    path_prefixes: Vec<String>,
+    #[serde(default)]
+    node_kinds: Vec<String>,
+    #[serde(default)]
     weight_fan_in: Option<u32>,
     #[serde(default)]
     weight_fan_out: Option<u32>,
@@ -3865,7 +3869,10 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "health_hotspots_list" => {
-            validate_array_argument_lengths(&arguments, &["churn_path_filter"])?;
+            validate_array_argument_lengths(
+                &arguments,
+                &["churn_path_filter", "path_prefixes", "node_kinds"],
+            )?;
             let arguments = decode_arguments::<HealthHotspotsArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
@@ -3889,7 +3896,8 @@ fn execute_catalog_read_tool(
                     .unwrap_or(MAX_HEALTH_CHURN_COMMITS),
                 arguments.churn_path_filter,
                 weights,
-            )?;
+            )?
+            .with_result_filter(arguments.path_prefixes, arguments.node_kinds)?;
             let locator =
                 SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
             let mut snapshot_request =
@@ -3899,6 +3907,8 @@ fn execute_catalog_read_tool(
             let normalized = serde_json::json!({
                 "churn_commit_limit": request.churn_commit_limit(),
                 "churn_path_filter": request.churn_path_filter(),
+                "path_prefixes": request.path_prefixes(),
+                "node_kinds": request.node_kinds(),
                 "weights": request.weights().as_map(),
                 "collection_digest": found.collection_digest(),
             });
