@@ -1,18 +1,16 @@
 # MCP Agent host operations
 
 This runbook is for an Agent host that launches the packaged `depgraph-mcp`
-stdio server. Start with the read-only example in the
-[English README](../../README.en.md#mcp-stdio-server). Copy one privileged
-profile below only when its effects are required; do not register several
-profiles for the same repository as an accidental privilege fallback.
+stdio server. Start with the [read-only default profile](#read-only-default-profile)
+below. Copy one privileged profile only when its effects are required; do not
+register several profiles for the same repository as an accidental privilege
+fallback.
 
-The examples use the planned stable `v0.6.3` package. `v0.6.3` is a patch
+The examples use the published stable `v0.6.3` package. `v0.6.3` is a patch
 release retaining the v0.6.0 Store schema `19` and code-health contract/API.
-The current supported stable is `v0.6.2` until the v0.6.3 Release and matching
-post-publish evidence are public. Use these versioned examples only after that
-publication. The published `v0.5.4` package is an immutable historical
-schema-17 baseline. Keep binaries, workers, and compiler packs from the same
-release; a schema-19 Store must never be opened by the v0.5.4 binary.
+The published `v0.5.4` package is an immutable historical schema-17 baseline.
+Keep binaries, workers, and compiler packs from the same release; a schema-19
+Store must never be opened by the v0.5.4 binary.
 
 ## Scoped Agent host onboarding
 
@@ -113,6 +111,137 @@ scope in clean temporary homes on macOS arm64/x86_64, Linux arm64/x86_64, and
 Windows x86_64 after the public post-publish evidence is available. It also
 runs repeated setup, status, update, shared-state retention, and final cleanup.
 
+## Low-level host configuration generation
+
+`agent-config` remains the low-level workflow for custom capability profiles or
+operators who manage host files themselves. It prints
+a verified entry to stdout and never edits a host file or creates/migrates the
+Store. Replace the path placeholders below with canonical absolute paths and
+`TARGET_TRIPLE` with the release host target; Agent hosts must not rely on shell
+or environment expansion.
+
+The command authenticates the supplied inputs against
+the official release's closed post-publish evidence, verifies the archive and
+exact checksum sidecar, binds the extracted manifest to that archive, checks
+every MCP/runner/schema/worker sibling, validates the compiler pack and fixed
+root/Store snapshot, and performs `initialize`, `tools/list`, and `get_context`
+before printing a host entry. The default profile is `read`; stdout contains
+only the requested configuration and no host file is edited. Diagnostics and
+the exact capability closure and effect summary go to stderr.
+
+Download `release-post-publish-evidence-RELEASE_TAG.json` from the same
+[official GitHub Release](https://github.com/TamaT-LLC/depgraph-cli/releases),
+then obtain that asset's SHA-256 independently from GitHub's release-asset API
+over HTTPS. Strip the `sha256:` prefix and pass the remaining 64 lowercase hex
+characters below. Do not calculate this trusted value from the downloaded
+evidence file or any local archive/sidecar: that would make a forged local set
+self-authenticating. For example, the API field can be read with
+
+```sh
+gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
+  --jq '.assets[] | select(.name == "release-post-publish-evidence-RELEASE_TAG.json") | .digest | sub("^sha256:"; "")'
+```
+
+```sh
+/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph agent-config \
+  --root /absolute/path/to/repository \
+  --store /absolute/path/to/state/depgraph.sqlite \
+  --release-archive /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
+  --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --release-manifest /absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.6.3-TARGET_TRIPLE.requirement.json \
+  --host codex
+```
+
+Use the matching `.zip` and `.zip.sha256` paths on Windows. `--host` accepts
+`codex`, `claude-desktop`, or `vscode`. A missing current snapshot fails before
+server launch and reports an exact argv array for a separate safe scan; the
+onboarding command itself never creates or migrates the Store. Non-read
+profiles are selected explicitly with `--profile store-write`,
+`repository-write`, `daemon-control`, `project-exec`, or `full` and require
+`--acknowledge-privileged-effects`. `project-exec`/`full` also require
+`--acknowledge-project-exec-human-confirmation`.
+
+## Read-only default profile
+
+This is the default read-only launch command. `agent-config` generates this
+profile unless another one is requested, and `mcp setup` installs the same
+read-only capability. Start every Agent host with this profile.
+
+<!-- depgraph-mcp-package-smoke:command -->
+```sh
+/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph-mcp \
+  --root /absolute/path/to/repository \
+  --store /absolute/path/to/state/depgraph.sqlite \
+  --capability read \
+  --compiler-pack-requirement /absolute/path/to/compiler-pack-requirement.json \
+  --log-level warn
+```
+
+The equivalent Claude Desktop entry is read-only. This is also the generic JSON
+form to copy unless an operator has approved a narrower privileged use case.
+
+<!-- depgraph-mcp-package-smoke:read -->
+```json
+{
+  "mcpServers": {
+    "depgraph": {
+      "command": "/absolute/path/to/depgraph-0.6.3-TARGET_TRIPLE/bin/depgraph-mcp",
+      "args": [
+        "--root", "/absolute/path/to/repository",
+        "--store", "/absolute/path/to/state/depgraph.sqlite",
+        "--capability", "read",
+        "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json",
+        "--log-level", "warn"
+      ]
+    }
+  }
+}
+```
+
+The fixed root and store form a trust boundary: use a separate private store per
+repository, keep it outside the repository when possible, and launch the MCP
+server, sibling operation runner, schema, manifest, and workers from one
+official-evidence-bound release archive. stdout is reserved for
+newline-delimited MCP JSON-RPC; bounded diagnostics go to stderr.
+
+Privileged profiles are explicit replacements for the read-only entry, not a
+runtime elevation mechanism. Complete Agent host examples for `store-write`,
+`repository-write`, `daemon-control`, `project-exec`, and `full`, together with
+human-confirmation rules, durable polling/reconnect/cancel, timeout and TTL
+values, upgrade/rollback steps, and troubleshooting, are in the
+sections below.
+In particular, `acknowledgement: true` on `resolve_build_submit` only records an
+independent host decision; it does not grant `project-exec` or replace human
+confirmation. Only enforced isolation plus a successful source postflight can
+claim source non-mutation; best-effort isolation cannot.
+
+The [packaged MCP Agent dogfood benchmark](agent-dogfood-benchmark.md)
+compares the same fixed code-investigation corpus with and without this MCP
+server. The checked-in `v0.5.0-rc.7` evidence records all three samples per arm,
+91.67% MCP accuracy, 100% major-claim recall, zero false exact claims, and a
+side-effect-free read-only run.
+
+## Protocol budgets and message limits
+
+Modern protocol `2026-07-28` can negotiate MCP Tasks. Its `taskId` is the same
+durable ID exposed by `operation_get`, `operation_result`, and
+`operation_cancel`; legacy `2025-11-25` and Tasks-unaware hosts use those
+portable tools directly. stdio disconnect does not cancel work. Reconnect with
+the same root, store, capability profile, and compiler-pack requirement, then
+poll the saved ID. Read calls have a 30-second budget, durable submission has a
+2-second handle-return budget, and an accepted operation has a one-hour
+execution deadline. Follow the returned `pollIntervalMs`,
+`execution_deadline_ms`, and `retain_until_ms` rather than guessing locally.
+
+Inbound MCP JSON messages are limited to 1 MiB before JSON deserialization;
+the server fails closed when that bound is exceeded. The requirement file must
+be a regular non-symlink file no larger than 1 MiB; its manifest, closed tree,
+host/target, checksum reference, and artifact integrity are verified by
+`depgraph-core` before the server accepts MCP input.
+
 ## Fixed trust boundary
 
 Treat the release directory, official post-publish evidence, repository root,
@@ -150,12 +279,15 @@ tuple.
 - Server authorization is static. Changing a host allow option requires a new
   server process; an MCP tool request cannot grant a capability to itself.
 
-The read-only README entry is the default. The following examples are complete
+The read-only entry in [Read-only default profile](#read-only-default-profile)
+is the default. The following examples are complete
 replacement entries, not arguments to append to that running entry.
 
 ## Generated host quickstarts
 
-Run the packaged `depgraph agent-config` command from the README with one of
+Run the packaged `depgraph agent-config` command from
+[Low-level host configuration generation](#low-level-host-configuration-generation)
+with one of
 the following `--host` values and redirect stdout only after reviewing stderr.
 The command never discovers or writes a host configuration path. A successful
 diagnostic names the authenticated official release tag and evidence digest.
@@ -179,7 +311,7 @@ default_tools_approval_mode = "approve"
 ```
 
 For Claude Desktop, use `--host claude-desktop`; the exact read-only output is
-the `mcpServers` JSON in the README. For VS Code, use `--host vscode` and merge
+the read-only `mcpServers` JSON above. For VS Code, use `--host vscode` and merge
 the following entry into the user or workspace `mcp.json` `servers` object.
 
 <!-- depgraph-agent-config:vscode -->
@@ -501,7 +633,7 @@ an older package or copy individual SQLite tables between versions.
 | Upgrade rejects schema or manifest data | Stop and use the documented migration path or restore the full backup with its matching package. Do not delete compatibility fields or downgrade in place. |
 | Unexpected stdout bytes | stdout belongs only to newline-delimited MCP JSON-RPC. Move host diagnostics to stderr and reject the session if any non-message bytes remain. |
 
-The package gate parses every marked configuration above and the README default,
+The package gate parses every marked configuration in this runbook, including the read-only default,
 substitutes temporary canonical paths, and launches only the extracted native
 `depgraph-mcp`. It verifies all six capability catalogs, legacy/modern
 initialization, durable reconnect, cancellation authorization, and clean stdio

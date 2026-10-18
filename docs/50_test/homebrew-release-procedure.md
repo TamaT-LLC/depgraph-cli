@@ -35,7 +35,7 @@ already tapped without trust, run `brew trust --formula tamat-llc/tap/depgraph`.
 `brew test` uses a temporary repository/store; it performs a Web scan, checks
 that the scan completed, and authenticates the release and all three workers
 through `doctor`. Go/Rust toolchains and the optional compiler pack are
-configured separately as described in the README. Test macOS ARM64 and Ubuntu 24.04 ARM64/x86-64 before claiming Homebrew support
+configured separately as described in the [installation guide](../guide/install.en.md). Test macOS ARM64 and Ubuntu 24.04 ARM64/x86-64 before claiming Homebrew support
 for its three installation targets. On Intel macOS, verify that installation
 is rejected by the ARM64 requirement.
 
