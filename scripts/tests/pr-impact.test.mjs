@@ -562,6 +562,27 @@ test("escapeMarkdown neutralizes table, HTML, code, link, and mention syntax", (
   assert.equal(escapeMarkdown("plain/path.ts"), "plain/path.ts");
 });
 
+test("escapeMarkdown keeps bare URLs from becoming GitHub autolinks", () => {
+  const escaped = escapeMarkdown("see https://evil.example/x or HTTP://a.b and www.evil.example / WWW.Evil.example");
+  // GFM autolinks scheme URLs only through a literal ":" and www links only through a literal "www.".
+  assert.ok(!escaped.includes(":"), `still contains ":": ${escaped}`);
+  assert.ok(!/www\./i.test(escaped), `still contains "www.": ${escaped}`);
+  assert.ok(escaped.includes("https&#58;//evil.example/x"));
+  assert.ok(escaped.includes("www&#46;evil.example"));
+  assert.ok(escaped.includes("WWW&#46;Evil.example"));
+  assert.equal(escapeMarkdown("a.b.c/d.ts"), "a.b.c/d.ts");
+});
+
+test("renderComment keeps URLs in display names from autolinking", () => {
+  const report = reportFixture({
+    files: [{ change: "M", path: "a", result: okResult([impact(node("r", "route", "https://evil.example/x www.evil.example"), 1)]) }],
+  });
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.ok(!body.includes("https://evil.example"));
+  assert.ok(!body.includes("www.evil.example"));
+  assert.ok(body.includes("https&#58;//evil.example/x"));
+});
+
 test("blobUrl builds a line-anchored link and encodes path segments", () => {
   assert.equal(
     blobUrl({ repository: REPOSITORY, headSha: HEAD_SHA, path: "src/a b#.ts", startLine: 3, endLine: 5 }),
@@ -596,7 +617,7 @@ test("renderComment starts with the marker and summarizes routes and packages", 
   assert.match(body, /影響ルート 1 件/);
   assert.match(body, /影響パッケージ 1 件/);
   assert.match(body, /その他ノード 1 件/);
-  assert.match(body, /\/users\/:id/);
+  assert.match(body, /\/users\/&#58;id/);
   assert.match(body, /<details>/);
   assert.ok(body.includes(`https://github.com/${REPOSITORY}/blob/${HEAD_SHA}/app/users/page.tsx#L10-L12`));
   assert.match(body, /route_handler/);

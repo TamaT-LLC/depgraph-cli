@@ -34,13 +34,20 @@ const ENTITY = {
   "@": "&#64;",
   "#": "&#35;",
   "!": "&#33;",
+  ":": "&#58;",
 };
+
+// GFM autolinks scheme URLs (https://, mailto:, ...) only through a literal ":"
+// and www links only through a literal "www."; escaping those is enough, so
+// other dots stay readable.
+const WWW_PREFIX = /(www)\./gi;
 
 /** Escape text for use in Markdown prose, table cells, and HTML summaries. */
 export function escapeMarkdown(value) {
   return String(value ?? "")
     .replace(/[\r\n\t]+/g, " ")
-    .replace(/[&<>"|`[\]*_~\\@#!]/g, (character) => ENTITY[character]);
+    .replace(/[&<>"|`[\]*_~\\@#!:]/g, (character) => ENTITY[character])
+    .replace(WWW_PREFIX, "$1&#46;");
 }
 
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9_.:-]+$/;
