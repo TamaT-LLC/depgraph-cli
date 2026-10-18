@@ -567,9 +567,9 @@ test("escapeMarkdown keeps bare URLs from becoming GitHub autolinks", () => {
   // GFM autolinks scheme URLs only through a literal ":" and www links only through a literal "www.".
   assert.ok(!escaped.includes(":"), `still contains ":": ${escaped}`);
   assert.ok(!/www\./i.test(escaped), `still contains "www.": ${escaped}`);
-  assert.ok(escaped.includes("https&#58;//evil.example/x"));
-  assert.ok(escaped.includes("www&#46;evil.example"));
-  assert.ok(escaped.includes("WWW&#46;Evil.example"));
+  assert.match(escaped, /https&#58;\/\/evil\.example\/x/);
+  assert.match(escaped, /www&#46;evil\.example/);
+  assert.match(escaped, /WWW&#46;Evil\.example/);
   assert.equal(escapeMarkdown("a.b.c/d.ts"), "a.b.c/d.ts");
 });
 
@@ -578,9 +578,9 @@ test("renderComment keeps URLs in display names from autolinking", () => {
     files: [{ change: "M", path: "a", result: okResult([impact(node("r", "route", "https://evil.example/x www.evil.example"), 1)]) }],
   });
   const body = renderComment(report, { repository: REPOSITORY });
-  assert.ok(!body.includes("https://evil.example"));
-  assert.ok(!body.includes("www.evil.example"));
-  assert.ok(body.includes("https&#58;//evil.example/x"));
+  assert.doesNotMatch(body, /https:\/\/evil\.example/i);
+  assert.doesNotMatch(body, /www\.evil\.example/i);
+  assert.match(body, /https&#58;\/\/evil\.example\/x/);
 });
 
 test("blobUrl builds a line-anchored link and encodes path segments", () => {
@@ -619,7 +619,10 @@ test("renderComment starts with the marker and summarizes routes and packages", 
   assert.match(body, /その他ノード 1 件/);
   assert.match(body, /\/users\/&#58;id/);
   assert.match(body, /<details>/);
-  assert.ok(body.includes(`https://github.com/${REPOSITORY}/blob/${HEAD_SHA}/app/users/page.tsx#L10-L12`));
+  assert.match(
+    body,
+    /https:\/\/github\.com\/TamaT-LLC\/depgraph-cli\/blob\/0123456789abcdef0123456789abcdef01234567\/app\/users\/page\.tsx#L10-L12/,
+  );
   assert.match(body, /route_handler/);
   assert.match(body, /depgraph 0\.6\.4/);
   assert.match(body, /実行していません/);
