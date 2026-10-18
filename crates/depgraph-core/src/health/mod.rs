@@ -26,9 +26,10 @@ pub use contract::{
 };
 pub use dependency::{ManifestIdentity, analyze_dependencies, analyze_dependencies_cancellable};
 pub use hotspot::{
-    DEFAULT_HOTSPOT_WEIGHTS, HotspotAnalysisError, HotspotFindingScores, HotspotLayer,
-    HotspotLayerAvailability, HotspotLayerScore, HotspotLayerScores, HotspotScores, HotspotWeights,
-    hotspot_weighted_total, score_hotspots, score_hotspots_cancellable,
+    DEFAULT_HOTSPOT_WEIGHTS, HOTSPOT_SUBJECT_KINDS, HotspotAnalysisError, HotspotFindingScores,
+    HotspotLayer, HotspotLayerAvailability, HotspotLayerScore, HotspotLayerScores, HotspotScores,
+    HotspotWeights, hotspot_weighted_total, is_hotspot_subject_kind, score_hotspots,
+    score_hotspots_cancellable,
 };
 pub use surface::{SurfaceClassification, SurfaceRole, classify_surface};
 pub use unused::{analyze_unused, analyze_unused_cancellable, analyze_unused_measured};

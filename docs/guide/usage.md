@@ -58,6 +58,27 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 | グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、available、totalを構造化して出力します。confidenceの上限は`probable`です |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolも上と同じ判定の限界を持ちます |
 
+### 依存一覧の辺種別を絞り込む
+
+`deps`と`dependents`は、既定では依存の辺だけを辿り、構造上の辺を除きます。
+構造上の辺は`contains`（パッケージがファイルを含む）、`declares`（ファイルがシンボルを宣言する）、`generated_from`（生成ファイルが元のファイルから作られる）の3種類です。
+そのため既定の件数は、依存しているファイルの数になります。
+v0.6.4までと同じく構造上の辺も辿りたい場合は、`--structural-edges include`を指定します。
+
+```bash
+depgraph dependents path:src/a.ts --json
+depgraph dependents path:src/a.ts --structural-edges include --json
+depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_uses --json
+```
+
+- `--edge-kind`は辿る辺の種類を指定します。複数回指定でき、指定した種類の辺だけを辿ります。
+- 絞り込みは走査の段階でかけます。そのため、件数と走査数（CLIのページ出力では`traversed_items`、MCPの応答では`traversed_edges`）は選んだ辺だけを数えます。
+- `--edge-kind`を指定した場合は、指定した種類だけで辿る辺が決まります。`--structural-edges`を省略していれば、`--edge-kind contains`のように構造上の辺も指定できます。
+- `--structural-edges exclude`を明示し、構造上の辺を`--edge-kind`にも指定すると、矛盾する指定としてエラーになります。
+- 絞り込み条件を変えた場合、前の`--cursor`は使えません。v0.6.4までに取得したcursorは、`--structural-edges include`を指定したときだけ使えます。
+
+MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`edge_kinds`と`structural_edges`を使います。
+
 ## health の confidence の読み方
 
 `health`の結果には、どこまで確信できるかを示すconfidenceが付きます。
@@ -69,6 +90,24 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 - `indeterminate`は、coverageやsurface証拠の不足、公開surface、entry point、動的ロード、candidate、unresolved、profile未走査、manifest driftなどのblockerにより断定できない状態です。
 
 hotspotの層の充足は`hotspot_scores.available`で確認します。
+
+特定のディレクトリや種類のhotspotだけを見たい場合は、`--path-prefix`と`--node-kind`で結果を絞り込みます。
+どちらも複数回指定できます。
+
+```bash
+depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --json
+```
+
+- `--path-prefix`はリポジトリ相対パスにディレクトリ境界で前方一致します。
+  `src/lib`は`src/lib/a.ts`に一致し、`src/library.ts`には一致しません。
+  パスを持たないfindingは一致しません。
+- `--node-kind`は`file`、`module`、`symbol`、`type`、`route`のいずれかです。
+- 絞り込みは採点の後にかけます。
+  そのため、スコアの正規化とfinding IDは絞り込まない場合と同じ値になります。
+  `collection_digest`は絞り込み条件ごとに変わります。
+- `--churn-path`はGit churnの入力だけを絞り、結果のfindingは減らしません。
+
+MCPの`health_hotspots_list`では、同じ意味の`path_prefixes`と`node_kinds`を使います。
 findingの`suppressions`は、v1ではwire互換性のために残している出力専用のfieldです。
 CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返します。
 auditは、Store schema 18以降が保存するpolicy digest、analyzer version、finding contract versionを比較します。

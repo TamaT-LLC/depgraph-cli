@@ -59,6 +59,37 @@ completed snapshots.
 | Where are the graph hotspots? | `hotspots` | Integer basis-point ranks from fan-in, fan-out, reverse impact, Git churn, and runtime observation. Each finding exposes `hotspot_scores` with raw, normalized, weight, available, and total fields; confidence is capped at `probable` |
 | How can an Agent inspect it? | `agent-config`, `depgraph-mcp` | MCP host configuration bound to a verified package. The `health_*` tools share the same confidence limits |
 
+### Selecting edge kinds in dependency lists
+
+By default, `deps` and `dependents` follow only dependency edges and drop
+structural edges. The structural edges are `contains` (a package contains a
+file), `declares` (a file declares a symbol), and `generated_from` (a
+generated file comes from its source). The default count is therefore the
+number of files that actually depend on a node. To follow structural edges as
+well, as through v0.6.4, pass `--structural-edges include`.
+
+```bash
+depgraph dependents path:src/a.ts --json
+depgraph dependents path:src/a.ts --structural-edges include --json
+depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_uses --json
+```
+
+- `--edge-kind` selects the edge kinds to follow. It is repeatable, and only
+  edges of the listed kinds are followed.
+- The selection applies during traversal, so item counts and the
+  traversal counter (`traversed_items` in CLI page output,
+  `traversed_edges` in MCP responses) cover only the selected edges.
+- With `--edge-kind`, the listed kinds alone decide which edges are
+  followed. When `--structural-edges` is omitted, structural kinds such as
+  `--edge-kind contains` may be listed.
+- Combining an explicit `--structural-edges exclude` with a structural
+  `--edge-kind` is contradictory and fails.
+- A `--cursor` from a different selection is rejected. A cursor obtained
+  through v0.6.4 is accepted only with `--structural-edges include`.
+
+The MCP `graph_dependencies_list` and `graph_dependents_list` tools accept the
+same selection as `edge_kinds` and `structural_edges`.
+
 ## Reading code-health confidence
 
 Confidence on `health` findings reserves `confirmed` for `unused-file`,
@@ -74,6 +105,24 @@ semantic-complete, and no hard blocker remains.
   evidence, public surface, entry points, dynamic loading, candidates,
   unresolved sites, unanalyzed profiles, manifest drift, or a
   missing/mismatched audit base.
+
+To inspect only some directories or node kinds, narrow the hotspot results
+with `--path-prefix` and `--node-kind`. Both flags are repeatable.
+
+```bash
+depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --json
+```
+
+- `--path-prefix` matches repository-relative paths at a directory boundary:
+  `src/lib` matches `src/lib/a.ts` but not `src/library.ts`. Findings without
+  a path never match.
+- `--node-kind` accepts `file`, `module`, `symbol`, `type`, or `route`.
+- Filters apply after scoring, so normalized scores and finding IDs equal the
+  unfiltered ranking. The `collection_digest` differs per filter.
+- `--churn-path` only narrows the Git churn input and never removes findings.
+
+The MCP `health_hotspots_list` tool accepts the same filters as `path_prefixes`
+and `node_kinds`.
 
 Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`,
 `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding

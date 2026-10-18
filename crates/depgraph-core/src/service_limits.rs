@@ -67,6 +67,9 @@ pub const MAX_HEALTH_SUPPRESSIONS_PER_FINDING: usize = 8;
 /// Maximum values accepted by one health request filter.
 pub const MAX_HEALTH_FILTER_ITEMS: usize = 1_024;
 
+/// Longest accepted hotspot path (churn filter or result prefix), in bytes.
+pub const MAX_HOTSPOT_PATH_BYTES: usize = 512;
+
 /// Maximum Git commits admitted into one hotspot churn window.
 pub const MAX_HEALTH_CHURN_COMMITS: u32 = 512;
 

@@ -1282,6 +1282,8 @@ fn service_summarizes_more_than_one_response_of_findings_and_gets_ids_past_the_f
         churn_commit_limit: None,
         churn_path_filter: Vec::new(),
         hotspot_weights: None,
+        hotspot_path_prefixes: Vec::new(),
+        hotspot_node_kinds: Vec::new(),
         partial_ranges: None,
     };
     assert_eq!(

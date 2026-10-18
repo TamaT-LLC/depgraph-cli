@@ -1509,6 +1509,141 @@ fn issue_300_catalog_tools_call_real_handlers_and_leave_the_store_unchanged() {
 }
 
 #[test]
+fn issue_540_repository_id_defaults_to_the_bound_repository_and_errors_list_valid_ids() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_300_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let output_validator = |name: &str| {
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))["outputSchema"]
+            .clone();
+        jsonschema::draft202012::new(&schema).unwrap()
+    };
+
+    let omitted = json!({"contract_version": "depgraph-mcp-tools-v1"});
+    let context = interactive_tool_call(&mut mcp, 3, "get_context", omitted.clone());
+    assert_eq!(context["isError"], false, "{context}");
+    assert_eq!(context["structuredContent"]["repository_id"], "repository");
+    assert_eq!(
+        context["structuredContent"]["result"]["repository_id"],
+        "repository"
+    );
+    output_validator("get_context")
+        .validate(&context["structuredContent"])
+        .unwrap();
+
+    let nodes = interactive_tool_call(
+        &mut mcp,
+        4,
+        "agent_nodes_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "current",
+            "query": "fixture",
+            "match_mode": "contains",
+            "limit": 10
+        }),
+    );
+    assert_eq!(nodes["isError"], false, "{nodes}");
+    assert_eq!(nodes["structuredContent"]["repository_id"], "repository");
+
+    let operation = interactive_tool_call(
+        &mut mcp,
+        5,
+        "operation_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "operation_id": "op_00000000000000000000000000000000"
+        }),
+    );
+    assert_ne!(
+        operation["structuredContent"]["error"]["code"], "CAPABILITY_DENIED",
+        "omitted repository_id must bind operation tools to the server repository: {operation}"
+    );
+
+    let wrong = interactive_tool_call(
+        &mut mcp,
+        6,
+        "get_context",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "default"}),
+    );
+    assert_eq!(wrong["isError"], true, "{wrong}");
+    let error = &wrong["structuredContent"]["error"];
+    assert_eq!(error["code"], "INVALID_ARGUMENT");
+    assert_eq!(error["category"], "input");
+    assert_eq!(error["remediation"], "correct_input");
+    assert_eq!(
+        error["details"],
+        json!({"kind": "repository", "available_repository_ids": ["repository"]})
+    );
+    assert_eq!(wrong["structuredContent"]["repository_id"], "repository");
+    output_validator("get_context")
+        .validate(&wrong["structuredContent"])
+        .unwrap();
+    shared.validate(&wrong["structuredContent"]).unwrap();
+    assert_tool_text_matches_structured(&wrong);
+
+    for (id, arguments) in [
+        (7, omitted),
+        (
+            8,
+            json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "repository"}),
+        ),
+    ] {
+        let listed = interactive_tool_call(&mut mcp, id, "repository_list", arguments);
+        assert_eq!(listed["isError"], false, "{listed}");
+        assert_tool_text_matches_structured(&listed);
+        output_validator("repository_list")
+            .validate(&listed["structuredContent"])
+            .unwrap();
+        shared.validate(&listed["structuredContent"]).unwrap();
+        let structured = &listed["structuredContent"];
+        assert_eq!(structured["repository_id"], "repository");
+        let repositories = structured["result"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["repository_id"], "repository");
+        assert_eq!(repositories[0]["snapshot"]["available"], true);
+        assert_eq!(
+            repositories[0]["snapshot"]["details"]["snapshot_id"],
+            snapshot_id
+        );
+        let encoded = structured.to_string();
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(store_path.to_string_lossy().as_ref()));
+    }
+
+    let wrong_list = interactive_tool_call(
+        &mut mcp,
+        9,
+        "repository_list",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "default"}),
+    );
+    assert_eq!(
+        wrong_list["structuredContent"]["error"]["details"]["available_repository_ids"],
+        json!(["repository"])
+    );
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
 fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_exhaustion() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -5383,7 +5518,7 @@ fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
     let store_write_tools = {
         let mut command = command(&root, &store_path, requirement().path());
         command.args(["--capability", "store-write"]);
-        tools_list(command, 33)
+        tools_list(command, 34)
     };
     assert!(!store_write_tools.contains(&"daemon_start_submit".to_owned()));
     assert!(!store_write_tools.contains(&"daemon_stop".to_owned()));
@@ -6186,6 +6321,7 @@ const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[
     "operation_result",
     "policy_evaluate",
     "profile_plan_get",
+    "repository_list",
     "runtime_trace_validate",
     "snapshot_diff_get",
     "snapshot_get",
@@ -6621,6 +6757,11 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                 "profile_plan_get",
                 json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
                 None,
+            ),
+            (
+                "repository_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                Some(false),
             ),
             (
                 "runtime_trace_validate",
@@ -7526,12 +7667,116 @@ fn issue_423_health_tools_are_read_only_redacted_and_match_cli_parity() {
     assert_eq!(source_tree_digest(&root), source_before);
 }
 
+fn seed_issue_543_hotspot_store(path: &Path, root: &Path, revision: &str) {
+    let scan_id = "issue-543-hotspots";
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision(scan_id, root, false, Some(revision))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    let mut seq = 3_u64;
+    for (id, kind, path) in [
+        ("file:src/lib/a.rs", "file", Some("src/lib/a.rs")),
+        ("file:src/lib/b.rs", "file", Some("src/lib/b.rs")),
+        ("file:src/library.rs", "file", Some("src/library.rs")),
+        ("symbol:src/lib/a.rs#run", "symbol", Some("src/lib/a.rs")),
+        ("route:/health", "route", None),
+    ] {
+        let mut node = common("node_upsert", seq);
+        let properties = path.map_or_else(
+            || json!({"language": "rust"}),
+            |path| json!({"path": path, "language": "rust"}),
+        );
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("repo://{id}"),
+            "display_name": id,
+            "properties": properties
+        });
+        store.ingest_event(&node).unwrap();
+        seq += 1;
+    }
+    for (index, (source, target)) in [
+        ("file:src/library.rs", "file:src/lib/a.rs"),
+        ("file:src/lib/b.rs", "file:src/lib/a.rs"),
+        ("file:src/lib/a.rs", "symbol:src/lib/a.rs#run"),
+        ("route:/health", "symbol:src/lib/a.rs#run"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edge = common("edge_upsert", seq);
+        edge["edge"] = json!({
+            "id": format!("edge:issue-543:{index}"),
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge).unwrap();
+        seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", seq);
+    profile_completed["profile_id"] = json!("fixture:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", seq + 1);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
 #[test]
-fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic() {
+fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
     let store_path = temporary.path().join("store.sqlite");
-    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("src/lib")).unwrap();
     let run = |arguments: &[&str]| {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -7555,6 +7800,323 @@ fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic()
     run(&["init"]);
     run(&["config", "user.name", "health"]);
     run(&["config", "user.email", "health@example.test"]);
+    fs::write(root.join("src/lib/a.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(root.join("src/lib/b.rs"), "pub fn b() {}\n").unwrap();
+    fs::write(root.join("src/library.rs"), "pub fn library() {}\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "seed"]);
+    let revision = run(&["rev-parse", "HEAD"]);
+    seed_issue_543_hotspot_store(&store_path, &root, &revision);
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        let output = Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap();
+        (output.status.code(), output.stdout, output.stderr)
+    };
+    let cli_json = |arguments: &[&str]| {
+        let (status, stdout, stderr) = cli(arguments);
+        assert_eq!(
+            status,
+            Some(0),
+            "CLI stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        serde_json::from_slice::<Value>(&stdout).unwrap()
+    };
+    let cli_all = cli_json(&["hotspots", "--all", "--json"]);
+    let cli_filtered = cli_json(&[
+        "hotspots",
+        "--all",
+        "--json",
+        "--path-prefix",
+        "src/lib",
+        "--path-prefix",
+        "src/lib",
+        "--node-kind",
+        "file",
+    ]);
+    let filtered_subjects = |findings: &Value| {
+        let mut subjects = findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|finding| finding["subject_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        subjects.sort_unstable();
+        subjects
+    };
+    assert_eq!(
+        filtered_subjects(&cli_filtered["data"]["findings"]),
+        ["file:src/lib/a.rs", "file:src/lib/b.rs"]
+    );
+    assert_ne!(
+        cli_filtered["data"]["collection_digest"],
+        cli_all["data"]["collection_digest"]
+    );
+    // An unfiltered CLI page keeps the pre-#543 page context, so its cursor
+    // bytes are unchanged; a filtered page binds its cursor to the filter.
+    let cli_first_page = |extra: &[&str]| {
+        let mut arguments = vec!["hotspots", "--json", "--max-items", "1"];
+        arguments.extend_from_slice(extra);
+        let page = cli_json(&arguments);
+        page["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("hotspot page has a continuation cursor: {page}"))
+            .to_owned()
+    };
+    let legacy_context_digest = format!(
+        "interactive-query-context:sha256:{}",
+        depgraph_mcp_tools::canonical_json_sha256(&json!({
+            "contract_version": depgraph_core::INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION,
+            "command": "hotspots",
+            "scan_id": cli_all["scan_id"],
+            "snapshot_id": cli_all["data"]["snapshot_id"],
+            "context": {
+                "collection_digest": cli_all["data"]["collection_digest"],
+                "churn_commit_limit": depgraph_core::service::MAX_HEALTH_CHURN_COMMITS,
+                "churn_path_filter": [],
+                "weights": depgraph_core::DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+            },
+        }))
+        .unwrap()
+    );
+    let legacy_cli_cursor = format!(
+        "depgraph-query-cursor-v1.1.{}",
+        depgraph_mcp_tools::canonical_json_sha256(
+            &json!({"context_digest": legacy_context_digest, "offset": 1})
+        )
+        .unwrap()
+    );
+    let unfiltered_cli_cursor = cli_first_page(&[]);
+    assert_eq!(
+        unfiltered_cli_cursor, legacy_cli_cursor,
+        "an unfiltered hotspots cursor keeps its pre-#543 bytes"
+    );
+    let filtered_cli_cursor = cli_first_page(&["--path-prefix", "src/lib"]);
+    assert_ne!(filtered_cli_cursor, unfiltered_cli_cursor);
+    let (status, _, _) = cli(&[
+        "hotspots",
+        "--json",
+        "--max-items",
+        "1",
+        "--cursor",
+        &filtered_cli_cursor,
+    ]);
+    assert_ne!(status, Some(0), "a filtered cursor is bound to its filter");
+    let (status, _, _) = cli(&[
+        "hotspots",
+        "--json",
+        "--max-items",
+        "1",
+        "--node-kind",
+        "file",
+        "--cursor",
+        &unfiltered_cli_cursor,
+    ]);
+    assert_ne!(
+        status,
+        Some(0),
+        "an unfiltered cursor is bound to no filter"
+    );
+    let (status, _, _) = cli(&["hotspots", "--json", "--node-kind", "package"]);
+    assert_ne!(status, Some(0), "unknown --node-kind must be rejected");
+    let (status, _, _) = cli(&["hotspots", "--json", "--path-prefix", "../outside"]);
+    assert_ne!(
+        status,
+        Some(0),
+        "non-relative --path-prefix must be rejected"
+    );
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "snapshot": "current"
+    });
+    let call = |mcp: &mut InteractiveMcp, id: u64, extra: Value| {
+        let mut arguments = common.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        interactive_tool_call(mcp, id, "health_hotspots_list", arguments)
+    };
+    let all = call(&mut mcp, 2, json!({"limit": 100}));
+    let filtered = call(
+        &mut mcp,
+        3,
+        json!({"limit": 100, "path_prefixes": ["src/lib"], "node_kinds": ["file"]}),
+    );
+    assert_eq!(all["isError"], false, "{all}");
+    assert_eq!(filtered["isError"], false, "{filtered}");
+    let all_result = &all["structuredContent"]["result"];
+    let filtered_result = &filtered["structuredContent"]["result"];
+    assert_eq!(
+        all_result["collection_digest"],
+        cli_all["data"]["collection_digest"]
+    );
+    assert_eq!(
+        filtered_result["collection_digest"], cli_filtered["data"]["collection_digest"],
+        "CLI --path-prefix/--node-kind and MCP path_prefixes/node_kinds share one meaning"
+    );
+    assert_eq!(
+        filtered_subjects(&filtered_result["findings"]["items"]),
+        ["file:src/lib/a.rs", "file:src/lib/b.rs"]
+    );
+    // Scores and IDs are computed over every candidate before filtering.
+    for kept in filtered_result["findings"]["items"].as_array().unwrap() {
+        let original = all_result["findings"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["subject_id"] == kept["subject_id"])
+            .unwrap();
+        assert_eq!(kept["id"], original["id"]);
+        assert_eq!(kept["fingerprint"], original["fingerprint"]);
+        assert_eq!(kept["hotspot_scores"], original["hotspot_scores"]);
+        let cli_kept = cli_filtered["data"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["subject_id"] == kept["subject_id"])
+            .unwrap();
+        assert_eq!(kept["id"], cli_kept["id"]);
+        assert_eq!(kept["hotspot_scores"], cli_kept["hotspot_scores"]);
+    }
+
+    // A cursor is bound to its filter: replaying it under another filter is
+    // CURSOR_MISMATCH, while the same filter continues the page.
+    let first_page = call(
+        &mut mcp,
+        4,
+        json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file"]}),
+    );
+    assert_eq!(first_page["isError"], false, "{first_page}");
+    let cursor = first_page["structuredContent"]["result"]["findings"]["next_cursor"]
+        .as_str()
+        .expect("filtered hotspot page has a continuation cursor")
+        .to_owned();
+    let continued = call(
+        &mut mcp,
+        5,
+        json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file"], "cursor": cursor}),
+    );
+    assert_eq!(continued["isError"], false, "{continued}");
+    for (id, extra) in [
+        (6, json!({"limit": 1, "cursor": cursor})),
+        (
+            7,
+            json!({"limit": 1, "path_prefixes": ["src"], "node_kinds": ["file"], "cursor": cursor}),
+        ),
+        (
+            8,
+            json!({"limit": 1, "path_prefixes": ["src/lib"], "node_kinds": ["file", "symbol"], "cursor": cursor}),
+        ),
+    ] {
+        let mismatched = call(&mut mcp, id, extra);
+        assert_eq!(mismatched["isError"], true, "{mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{mismatched}"
+        );
+    }
+
+    // Without a filter the cursor keeps the legacy normalized input: empty
+    // filters equal omitted ones, and any filter rejects that cursor.
+    let unfiltered_page = call(&mut mcp, 20, json!({"limit": 1}));
+    let unfiltered_cursor =
+        unfiltered_page["structuredContent"]["result"]["findings"]["next_cursor"]
+            .as_str()
+            .expect("unfiltered hotspot page has a continuation cursor")
+            .to_owned();
+    let explicit_empty = call(
+        &mut mcp,
+        21,
+        json!({"limit": 1, "path_prefixes": [], "node_kinds": []}),
+    );
+    assert_eq!(
+        explicit_empty["structuredContent"]["result"]["findings"]["next_cursor"],
+        unfiltered_cursor
+    );
+    let resumed = call(
+        &mut mcp,
+        22,
+        json!({"limit": 1, "path_prefixes": [], "cursor": unfiltered_cursor}),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    for (id, extra) in [
+        (
+            23,
+            json!({"limit": 1, "path_prefixes": ["src/lib"], "cursor": unfiltered_cursor}),
+        ),
+        (
+            24,
+            json!({"limit": 1, "node_kinds": ["file"], "cursor": unfiltered_cursor}),
+        ),
+    ] {
+        let mismatched = call(&mut mcp, id, extra);
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{mismatched}"
+        );
+    }
+
+    let oversized = vec!["src"; 1_025];
+    for (id, extra) in [
+        (9, json!({"path_prefixes": oversized})),
+        (10, json!({"node_kinds": vec!["file"; 1_025]})),
+        (11, json!({"path_prefixes": ["../outside"]})),
+        (12, json!({"path_prefixes": ["src/lib/"]})),
+        (13, json!({"node_kinds": ["package"]})),
+    ] {
+        let rejected = call(&mut mcp, id, extra);
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        assert_eq!(
+            rejected["structuredContent"]["error"]["code"], "INVALID_ARGUMENT",
+            "{rejected}"
+        );
+    }
+    for result in [&all, &filtered, &first_page, &continued] {
+        assert_tool_text_matches_structured(result);
+    }
+    mcp.finish();
+}
+
+#[test]
+fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "health")
+            .env("GIT_AUTHOR_EMAIL", "health@example.invalid")
+            .env("GIT_COMMITTER_NAME", "health")
+            .env("GIT_COMMITTER_EMAIL", "health@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "health"]);
+    run(&["config", "user.email", "health@example.invalid"]);
     fs::write(root.join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
     fs::write(root.join("src/used.rs"), "pub fn used() {}\n").unwrap();
     fs::write(root.join("src/lib.rs"), "mod used;\n").unwrap();
@@ -7659,4 +8221,1203 @@ fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic()
             .any(|finding| finding["kind"] == "wide-blast-radius")
     );
     mcp.finish();
+}
+
+#[test]
+fn issue_542_dependency_detail_shrinks_responses_and_binds_cursors_to_the_detail() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let output_validator = |name: &str| {
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))["outputSchema"]
+            .clone();
+        jsonschema::draft202012::new(&schema).unwrap()
+    };
+    let arguments = |detail: Option<&str>, limit: u64, cursor: Option<&Value>| {
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "selector": "id:node:a",
+            "transitive": true,
+            "max_traversal": 100,
+            "limit": limit
+        });
+        if let Some(detail) = detail {
+            arguments["detail"] = json!(detail);
+        }
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.clone();
+        }
+        arguments
+    };
+    let mut next_id = 10;
+    let mut call = |name: &str, arguments: Value| {
+        next_id += 1;
+        let result = interactive_tool_call(&mut mcp, next_id, name, arguments);
+        assert_tool_text_matches_structured(&result);
+        result
+    };
+    let text_bytes = |result: &Value| result["content"][0]["text"].as_str().unwrap().len();
+
+    let omitted = call("graph_dependencies_list", arguments(None, 100, None));
+    let full = call(
+        "graph_dependencies_list",
+        arguments(Some("full"), 100, None),
+    );
+    let summary = call(
+        "graph_dependencies_list",
+        arguments(Some("summary"), 100, None),
+    );
+    let paths = call(
+        "graph_dependencies_list",
+        arguments(Some("paths"), 100, None),
+    );
+    for (detail, result) in [
+        ("omitted", &omitted),
+        ("full", &full),
+        ("summary", &summary),
+        ("paths", &paths),
+    ] {
+        assert_eq!(result["isError"], false, "{detail}: {result}");
+        assert_eq!(result["structuredContent"]["snapshot_id"], snapshot_id);
+        output_validator("graph_dependencies_list")
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{detail} advertised schema: {error}"));
+        shared
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{detail} shared schema: {error}"));
+    }
+    assert_eq!(
+        omitted["content"][0]["text"], full["content"][0]["text"],
+        "detail=full must be byte-identical to the legacy response"
+    );
+    assert!(full["structuredContent"]["result"].get("detail").is_none());
+
+    let summary_result = &summary["structuredContent"]["result"];
+    assert_eq!(summary_result["detail"], "summary");
+    assert_eq!(
+        summary_result["common"],
+        json!({
+            "phase": "semantic",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "profile_id": "fixture:safe",
+            "condition": "true"
+        })
+    );
+    assert_eq!(summary_result["edges"]["total_items"], 4);
+    for item in summary_result["edges"]["items"].as_array().unwrap() {
+        assert!(item.get("evidence").is_none());
+        assert!(item.get("profile_id").is_none());
+        assert_eq!(item["evidence_count"], 1);
+    }
+
+    let paths_result = &paths["structuredContent"]["result"];
+    assert_eq!(paths_result["detail"], "paths");
+    assert_eq!(paths_result["traversed_edges"], 4);
+    let mut items = paths_result["paths"]["items"].as_array().unwrap().clone();
+    items.sort_by_key(Value::to_string);
+    assert_eq!(
+        items,
+        [
+            json!({"source_path": "src/a.rs", "target_path": "src/b.rs", "kind": "imports"}),
+            json!({"source_path": "src/a.rs", "target_path": "src/c.rs", "kind": "imports"}),
+            json!({"source_path": "src/b.rs", "target_path": "src/d.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/d.rs", "kind": "imports"}),
+        ]
+    );
+    let full_bytes = text_bytes(&full);
+    let summary_bytes = text_bytes(&summary);
+    let paths_bytes = text_bytes(&paths);
+    eprintln!(
+        "issue #542 response bytes: full={full_bytes} summary={summary_bytes} paths={paths_bytes}"
+    );
+    assert!(summary_bytes < full_bytes);
+    assert!(paths_bytes < summary_bytes);
+
+    let dependents = call(
+        "graph_dependents_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "selector": "id:node:d",
+            "max_traversal": 100,
+            "detail": "paths"
+        }),
+    );
+    assert_eq!(dependents["isError"], false, "{dependents}");
+    output_validator("graph_dependents_list")
+        .validate(&dependents["structuredContent"])
+        .unwrap();
+    let mut dependent_paths = dependents["structuredContent"]["result"]["paths"]["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    dependent_paths.sort_by_key(Value::to_string);
+    assert_eq!(
+        dependent_paths,
+        [
+            json!({"source_path": "src/b.rs", "target_path": "src/d.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/d.rs", "kind": "imports"}),
+        ]
+    );
+
+    let first_full = call("graph_dependencies_list", arguments(Some("full"), 1, None));
+    let full_cursor = first_full["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(full_cursor.is_string(), "{first_full}");
+    for detail in ["summary", "paths"] {
+        let mismatched = call(
+            "graph_dependencies_list",
+            arguments(Some(detail), 1, Some(&full_cursor)),
+        );
+        assert_eq!(mismatched["isError"], true, "{detail}: {mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{detail}"
+        );
+    }
+    let first_paths = call("graph_dependencies_list", arguments(Some("paths"), 1, None));
+    let paths_cursor = first_paths["structuredContent"]["result"]["paths"]["next_cursor"].clone();
+    assert!(paths_cursor.is_string(), "{first_paths}");
+    let rejected_by_full = call(
+        "graph_dependencies_list",
+        arguments(None, 1, Some(&paths_cursor)),
+    );
+    assert_eq!(
+        rejected_by_full["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+    let resumed = call(
+        "graph_dependencies_list",
+        arguments(Some("paths"), 100, Some(&paths_cursor)),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    assert_eq!(
+        resumed["structuredContent"]["result"]["paths"]["returned_items"],
+        3
+    );
+
+    let invalid = call(
+        "graph_dependencies_list",
+        arguments(Some("brief"), 100, None),
+    );
+    assert_eq!(invalid["isError"], true);
+    assert_eq!(
+        invalid["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+// Issue #544: import evidence carries the specifier and the imported binding.
+
+fn issue_544_evidence(path: &str, line: u64, kind: &str, properties: Value) -> Value {
+    json!({
+        "kind": kind,
+        "extractor": "fixture",
+        "extractor_version": "1.0",
+        "path": path,
+        "start_line": line,
+        "start_column": 1,
+        "end_line": line,
+        "end_column": 30,
+        "detail": "PROCESS_544_DETAIL_SECRET",
+        "properties": properties
+    })
+}
+
+fn seed_issue_544_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-544", root, false, Some("revision-544"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 2,
+        "resolved": 2,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-544",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (offset, (id, path)) in [
+        ("node:app", "src/app.ts"),
+        ("node:foo", "src/lib/foo.ts"),
+        ("node:main", "main.go"),
+        ("node:util", "pkg/util/util.go"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut node = common("node_upsert", offset as u64 + 3);
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("repo://{path}"),
+            "display_name": path,
+            "properties": {"path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let typescript = issue_544_evidence(
+        "src/app.ts",
+        1,
+        "semantic",
+        json!({
+            "backend": "typescript-native-compiler",
+            "occurrence_kind": "named_import",
+            "target_basis": "typechecker",
+            "type_only": false,
+            "module_specifier": "@/lib/foo",
+            "imported_name": "fooHelper",
+            "secret": "PROCESS_544_PROPERTY_SECRET"
+        }),
+    );
+    let go = issue_544_evidence("main.go", 3, "source", json!({}));
+    for (offset, (site_id, edge_id, source, target, kind, specifier, evidence)) in [
+        (
+            "site:ts",
+            "edge:ts",
+            "node:app",
+            "node:foo",
+            "web_import",
+            "@/lib/foo",
+            typescript,
+        ),
+        (
+            "site:go",
+            "edge:go",
+            "node:main",
+            "node:util",
+            "import",
+            "example.com/pkg/util",
+            go,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = offset as u64 * 2 + 7;
+        let mut site = common("dependency_site", seq);
+        site["site"] = json!({
+            "id": site_id,
+            "source": source,
+            "kind": kind,
+            "specifier": specifier,
+            "resolution_status": "resolved",
+            "target_ids": [target],
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": [evidence.clone()]
+        });
+        store.ingest_event(&site).unwrap();
+        let mut edge = common("edge_upsert", seq + 1);
+        edge["edge"] = json!({
+            "id": edge_id,
+            "site_id": site_id,
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [evidence]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", 11);
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 12);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-544", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+#[test]
+fn issue_544_import_evidence_is_listed_by_agent_tools_but_not_dependency_lists() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_544_store(&store_path, &root);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let common =
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "repository"});
+    let with = |extra: Value| {
+        let mut arguments = common.clone();
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+
+    let typescript = interactive_tool_call(
+        &mut mcp,
+        2,
+        "agent_evidence_list",
+        with(json!({"site_id": "site:ts"})),
+    );
+    assert_eq!(typescript["isError"], false, "{typescript}");
+    assert_tool_text_matches_structured(&typescript);
+    let item = &typescript["structuredContent"]["result"]["items"][0];
+    assert_eq!(
+        item["import"],
+        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper"})
+    );
+    assert!(item.get("properties").is_none());
+    assert!(item.get("detail").is_none());
+
+    let go = interactive_tool_call(
+        &mut mcp,
+        3,
+        "agent_evidence_list",
+        with(json!({"site_id": "site:go"})),
+    );
+    assert_eq!(go["isError"], false, "{go}");
+    assert_eq!(
+        go["structuredContent"]["result"]["items"][0]["import"],
+        json!({"specifier":"example.com/pkg/util"})
+    );
+
+    let sites = interactive_tool_call(
+        &mut mcp,
+        6,
+        "agent_sites_list",
+        with(json!({"node_id": "node:app"})),
+    );
+    assert_eq!(sites["isError"], false, "{sites}");
+    assert_eq!(
+        sites["structuredContent"]["result"]["items"][0]["evidence"][0]["import"]["specifier"],
+        "@/lib/foo"
+    );
+
+    let edges = interactive_tool_call(
+        &mut mcp,
+        7,
+        "agent_edges_list",
+        with(json!({"node_id": "node:app", "direction": "outgoing"})),
+    );
+    assert_eq!(edges["isError"], false, "{edges}");
+    assert_eq!(
+        edges["structuredContent"]["result"]["items"][0]["evidence"][0]["import"]["specifier"],
+        "@/lib/foo"
+    );
+
+    // #542 keeps the dependency list `full` (and the other PathStep-derived
+    // responses) in their previous shape: edge evidence never gains `import`.
+    let dependencies = interactive_tool_call(
+        &mut mcp,
+        4,
+        "graph_dependencies_list",
+        with(json!({"selector": "id:node:app", "detail": "full"})),
+    );
+    assert_eq!(dependencies["isError"], false, "{dependencies}");
+    let full_evidence =
+        &dependencies["structuredContent"]["result"]["edges"]["items"][0]["evidence"][0];
+    assert_eq!(full_evidence["kind"], "semantic", "{dependencies}");
+    assert!(full_evidence.get("import").is_none(), "{dependencies}");
+
+    let path = interactive_tool_call(
+        &mut mcp,
+        8,
+        "graph_path_get",
+        with(json!({"from": "id:node:app", "to": "id:node:foo", "max_traversal": 100})),
+    );
+    assert_eq!(path["isError"], false, "{path}");
+    assert_eq!(
+        path["structuredContent"]["result"]["path_found"], true,
+        "{path}"
+    );
+
+    let impact = interactive_tool_call(
+        &mut mcp,
+        9,
+        "graph_impact_get",
+        with(json!({"selector": "id:node:foo", "max_nodes": 100, "max_edges": 100})),
+    );
+    assert_eq!(impact["isError"], false, "{impact}");
+    for response in [&dependencies, &path, &impact] {
+        let text = response["structuredContent"].to_string();
+        assert!(text.contains("\"evidence\":[{"), "{text}");
+        assert!(!text.contains("\"import\":"), "{text}");
+    }
+
+    let summary = interactive_tool_call(
+        &mut mcp,
+        5,
+        "graph_dependencies_list",
+        with(json!({"selector": "id:node:app", "detail": "summary"})),
+    );
+    assert_eq!(summary["isError"], false, "{summary}");
+    let summary_edge = &summary["structuredContent"]["result"]["edges"]["items"][0];
+    assert_eq!(summary_edge["evidence_count"], 1);
+    assert!(summary_edge.get("evidence").is_none());
+
+    mcp.finish();
+    for response in [
+        &typescript,
+        &go,
+        &sites,
+        &edges,
+        &dependencies,
+        &path,
+        &impact,
+        &summary,
+    ] {
+        let text = response.to_string();
+        assert!(!text.contains("PROCESS_544_PROPERTY_SECRET"), "{text}");
+        assert!(!text.contains("PROCESS_544_DETAIL_SECRET"), "{text}");
+    }
+}
+
+// Issue #541: dependency lists can drop structural edges and select edge kinds.
+
+fn seed_issue_541_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-541", root, false, Some("revision-541"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-541",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, kind, path) in [
+        ("package:app", "package", None),
+        ("node:a", "module", Some("src/a.rs")),
+        ("node:b", "module", Some("src/b.rs")),
+        ("node:c", "module", Some("src/c.rs")),
+        ("node:gen", "module", Some("src/gen.rs")),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("id:{id}"),
+            "display_name": id,
+            "properties": path.map_or_else(|| json!({}), |path| json!({"path": path}))
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut workspace = next("node_upsert");
+    workspace["node"] = json!({
+        "id": "workspace:repository",
+        "kind": "workspace",
+        "locator": "workspace:repository",
+        "display_name": "repository",
+        "properties": {"repository_identity": "workspace:repository"}
+    });
+    store.ingest_event(&workspace).unwrap();
+    for (id, source, target, kind) in [
+        ("edge:contains-a", "package:app", "node:a", "contains"),
+        ("edge:contains-b", "package:app", "node:b", "contains"),
+        ("edge:generated-a", "node:gen", "node:a", "generated_from"),
+        ("edge:import-b", "node:b", "node:a", "imports"),
+        ("edge:import-c", "node:c", "node:a", "imports"),
+    ] {
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": id,
+            "source": source,
+            "target": target,
+            "kind": kind,
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-541", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+struct Issue541Fixture {
+    _temporary: tempfile::TempDir,
+    root: PathBuf,
+    store_path: PathBuf,
+    snapshot_id: String,
+    before: StoreInvariant,
+}
+
+fn issue_541_fixture() -> Issue541Fixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_541_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    Issue541Fixture {
+        _temporary: temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    }
+}
+
+/// One MCP process for the #541 probes. Each test starts its own process and
+/// keeps its tool calls within the product's fixed read burst, so no test has
+/// to wait for the read rate limit to refill.
+struct Issue541Mcp {
+    mcp: InteractiveMcp,
+    tools: Vec<Value>,
+    shared_schema: Value,
+    snapshot_id: String,
+    next_id: u64,
+    read_calls: u64,
+}
+
+impl Issue541Mcp {
+    fn start(root: &Path, store_path: &Path, snapshot_id: &str) -> Self {
+        let mut mcp = InteractiveMcp::start(root, store_path);
+        initialize_interactive_mcp(&mut mcp, 1);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let shared_schema: Value = serde_json::from_slice(include_bytes!(
+            "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+        ))
+        .unwrap();
+        Self {
+            mcp,
+            tools,
+            shared_schema,
+            snapshot_id: snapshot_id.to_owned(),
+            next_id: 10,
+            read_calls: 0,
+        }
+    }
+
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.read_calls += 1;
+        assert!(
+            self.read_calls <= depgraph_mcp::runtime::READ_RATE_BURST,
+            "split the #541 probes across MCP processes to stay within the read burst"
+        );
+        self.next_id += 1;
+        let result = interactive_tool_call(&mut self.mcp, self.next_id, name, arguments);
+        assert_tool_text_matches_structured(&result);
+        if result["isError"] == false {
+            assert_eq!(result["structuredContent"]["snapshot_id"], self.snapshot_id);
+            let advertised =
+                &self.tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"];
+            jsonschema::draft202012::new(advertised)
+                .unwrap()
+                .validate(&result["structuredContent"])
+                .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+            jsonschema::draft202012::new(&self.shared_schema)
+                .unwrap()
+                .validate(&result["structuredContent"])
+                .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+        }
+        result
+    }
+
+    fn finish(self) {
+        self.mcp.finish();
+    }
+}
+
+fn issue_541_dependents(selection: Value) -> Value {
+    let mut arguments = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "selector": "id:node:a",
+        "max_traversal": 100,
+        "limit": 100
+    });
+    for (key, value) in selection.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    arguments
+}
+
+fn issue_541_edge_ids(result: &Value) -> Vec<String> {
+    let mut ids = result["structuredContent"]["result"]["edges"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("edge page: {result}"))
+        .iter()
+        .map(|edge| edge["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn issue_541_error_code(result: &Value) -> Value {
+    assert_eq!(result["isError"], true, "{result}");
+    result["structuredContent"]["error"]["code"].clone()
+}
+
+#[test]
+fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_cli() {
+    let Issue541Fixture {
+        _temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    } = issue_541_fixture();
+    let dependents = issue_541_dependents;
+    let edge_ids = issue_541_edge_ids;
+    let error_code = issue_541_error_code;
+    let mut session = Issue541Mcp::start(&root, &store_path, &snapshot_id);
+    let mut call = |name: &str, arguments: Value| session.call(name, arguments);
+
+    let default = call("graph_dependents_list", dependents(json!({})));
+    let legacy = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "include"})),
+    );
+    assert_eq!(
+        edge_ids(&legacy),
+        [
+            "edge:contains-a",
+            "edge:generated-a",
+            "edge:import-b",
+            "edge:import-c"
+        ]
+    );
+    assert_eq!(
+        legacy["structuredContent"]["result"]["edges"]["total_items"],
+        4
+    );
+    assert_eq!(legacy["structuredContent"]["result"]["traversed_edges"], 4);
+
+    let excluded = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude"})),
+    );
+    assert_eq!(
+        default["content"][0]["text"], excluded["content"][0]["text"],
+        "the default excludes structural edges"
+    );
+    assert_eq!(default["structuredContent"], excluded["structuredContent"]);
+    assert_eq!(edge_ids(&excluded), ["edge:import-b", "edge:import-c"]);
+    assert_eq!(
+        excluded["structuredContent"]["result"]["edges"]["total_items"],
+        2
+    );
+    assert_eq!(
+        excluded["structuredContent"]["result"]["traversed_edges"],
+        2
+    );
+    let allowlisted = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["imports"], "structural_edges": "exclude"})),
+    );
+    assert_eq!(edge_ids(&allowlisted), ["edge:import-b", "edge:import-c"]);
+    let contains_only = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["contains"], "structural_edges": "include"})),
+    );
+    assert_eq!(edge_ids(&contains_only), ["edge:contains-a"]);
+    let contains_omitted = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["contains"]})),
+    );
+    assert_eq!(
+        contains_omitted["content"][0]["text"], contains_only["content"][0]["text"],
+        "an allowlist decides when structural_edges is omitted"
+    );
+    let package = call(
+        "graph_dependencies_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "selector": "id:package:app",
+            "max_traversal": 100
+        }),
+    );
+    assert_eq!(package["isError"], false, "{package}");
+    assert_eq!(
+        package["structuredContent"]["result"]["edges"]["total_items"], 0,
+        "the default does not follow contains from a package"
+    );
+    let package_included = call(
+        "graph_dependencies_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "selector": "id:package:app",
+            "max_traversal": 100,
+            "structural_edges": "include"
+        }),
+    );
+    assert_eq!(package_included["isError"], false, "{package_included}");
+    assert_ne!(
+        package_included["structuredContent"]["result"]["edges"]["total_items"],
+        0
+    );
+
+    let paths = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude", "detail": "paths"})),
+    );
+    let mut path_items = paths["structuredContent"]["result"]["paths"]["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    path_items.sort_by_key(Value::to_string);
+    assert_eq!(
+        path_items,
+        [
+            json!({"source_path": "src/b.rs", "target_path": "src/a.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/a.rs", "kind": "imports"}),
+        ]
+    );
+    assert_eq!(paths["structuredContent"]["result"]["traversed_edges"], 2);
+    let summary = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude", "detail": "summary"})),
+    );
+    assert_eq!(
+        summary["structuredContent"]["result"]["edges"]["total_items"],
+        2
+    );
+    assert_eq!(
+        summary["structuredContent"]["result"]["common"]["phase"],
+        "semantic"
+    );
+
+    for selection in [
+        json!({"edge_kinds": ["contains"], "structural_edges": "exclude"}),
+        json!({"structural_edges": null}),
+        json!({"edge_kinds": ["imports", "generated_from"], "structural_edges": "exclude"}),
+        json!({"edge_kinds": ["Imports"]}),
+        json!({"edge_kinds": [""]}),
+        json!({"edge_kinds": "imports"}),
+        json!({"structural_edges": "none"}),
+        json!({"structural_edges": true}),
+    ] {
+        let rejected = call("graph_dependents_list", dependents(selection.clone()));
+        assert_eq!(error_code(&rejected), "INVALID_ARGUMENT", "{selection}");
+    }
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    let rejected = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": too_many})),
+    );
+    assert_eq!(error_code(&rejected), "INVALID_ARGUMENT");
+
+    session.finish();
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let cli_edge_ids = |arguments: &[&str]| {
+        let output = cli(arguments);
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut ids = document["data"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        cli_edge_ids(&["dependents", "id:node:a", "--all", "--json"]),
+        edge_ids(&excluded),
+        "the CLI default excludes structural edges"
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "include",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&legacy)
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "exclude",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&excluded)
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--structural-edges",
+            "include",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&contains_only)
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&contains_only),
+        "a CLI allowlist decides when --structural-edges is omitted"
+    );
+    assert!(cli_edge_ids(&["deps", "id:package:app", "--all", "--json"]).is_empty());
+    for arguments in [
+        &[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--structural-edges",
+            "exclude",
+            "--json",
+        ][..],
+        &[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "none",
+            "--json",
+        ][..],
+        &[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "Imports",
+            "--json",
+        ][..],
+    ] {
+        assert!(!cli(arguments).status.success(), "{arguments:?}");
+    }
+
+    let cli_page = |arguments: &[&str]| {
+        let output = cli(arguments);
+        (
+            output.status.success(),
+            serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null),
+        )
+    };
+    let (succeeded, first) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "include",
+        "--max-items",
+        "1",
+        "--json",
+    ]);
+    assert!(succeeded, "{first}");
+    let legacy_cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--max-items",
+        "1",
+        "--cursor",
+        &legacy_cli_cursor,
+        "--json",
+    ]);
+    assert!(
+        !succeeded,
+        "a pre-v0.7.0 CLI cursor is rejected by the default"
+    );
+    let (succeeded, first) = cli_page(&["dependents", "id:node:a", "--max-items", "1", "--json"]);
+    assert!(succeeded, "{first}");
+    let cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    assert_ne!(cli_cursor, legacy_cli_cursor);
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "exclude",
+        "--max-items",
+        "1",
+        "--cursor",
+        &cli_cursor,
+        "--json",
+    ]);
+    assert!(succeeded, "explicit exclude resumes the default CLI cursor");
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "include",
+        "--max-items",
+        "1",
+        "--cursor",
+        &cli_cursor,
+        "--json",
+    ]);
+    assert!(!succeeded, "a CLI cursor is bound to the edge selection");
+    let (succeeded, first) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--edge-kind",
+        "imports",
+        "--max-items",
+        "1",
+        "--json",
+    ]);
+    assert!(succeeded, "{first}");
+    let allowlist_cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    for mode in ["include", "exclude"] {
+        let (succeeded, _) = cli_page(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "imports",
+            "--structural-edges",
+            mode,
+            "--max-items",
+            "1",
+            "--cursor",
+            &allowlist_cli_cursor,
+            "--json",
+        ]);
+        assert!(
+            succeeded,
+            "the CLI allowlist alone binds the cursor ({mode})"
+        );
+    }
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_541_dependency_list_cursors_bind_the_edge_selection() {
+    let Issue541Fixture {
+        _temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    } = issue_541_fixture();
+    let edge_ids = issue_541_edge_ids;
+    let error_code = issue_541_error_code;
+    // A cursor is sealed with a per-process random key, so the cursor probes
+    // run in their own MCP process instead of restarting one mid-test.
+    let mut session = Issue541Mcp::start(&root, &store_path, &snapshot_id);
+    let mut call = |name: &str, arguments: Value| session.call(name, arguments);
+
+    // Cursor binding: every-kind traversal (include without edge_kinds) keeps
+    // the pre-#541 normalized input and cursor bytes. The exclude default is
+    // bound to its selection, so cursors issued before v0.7.0 (legacy bytes)
+    // are rejected by a default request and must be re-fetched.
+    let page = |selection: Value, cursor: Option<&Value>| {
+        let mut arguments = issue_541_dependents(selection);
+        arguments["limit"] = json!(1);
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.clone();
+        }
+        arguments
+    };
+    let first_include = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "include"}), None),
+    );
+    let legacy_cursor =
+        first_include["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(legacy_cursor.is_string(), "{first_include}");
+    let resumed_include = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "include"}), Some(&legacy_cursor)),
+    );
+    assert_eq!(resumed_include["isError"], false, "{resumed_include}");
+    for selection in [
+        json!({}),
+        json!({"structural_edges": "exclude"}),
+        json!({"edge_kinds": ["imports"]}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&legacy_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_default = call("graph_dependents_list", page(json!({}), None));
+    let default_cursor =
+        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(default_cursor.is_string(), "{first_default}");
+    assert_ne!(default_cursor, legacy_cursor);
+    let first_excluded = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "exclude"}), None),
+    );
+    let excluded_cursor =
+        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert_eq!(
+        excluded_cursor, default_cursor,
+        "the default and an explicit exclude share one binding"
+    );
+    for selection in [
+        json!({"structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&default_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_allowlisted = call(
+        "graph_dependents_list",
+        page(json!({"edge_kinds": ["imports"]}), None),
+    );
+    let allowlist_cursor =
+        first_allowlisted["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(allowlist_cursor.is_string(), "{first_allowlisted}");
+    assert_ne!(allowlist_cursor, default_cursor);
+    for selection in [
+        json!({"edge_kinds": ["imports"]}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let resumed = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&allowlist_cursor)),
+        );
+        assert_eq!(
+            resumed["isError"], false,
+            "the allowlist alone binds the cursor: {selection}: {resumed}"
+        );
+    }
+    for selection in [json!({}), json!({"structural_edges": "exclude"})] {
+        let resumed = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&default_cursor)),
+        );
+        assert_eq!(resumed["isError"], false, "{selection}: {resumed}");
+        assert_eq!(edge_ids(&resumed).len(), 1);
+    }
+    session.finish();
+    assert_eq!(before, store_invariant(&store_path));
 }

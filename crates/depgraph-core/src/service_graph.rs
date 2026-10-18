@@ -10,6 +10,7 @@ use depgraph_store::{
 
 use crate::{
     CancellationToken,
+    edge_kind_selection::{EdgeKindFilter, StructuralEdgeSelection},
     impact::{
         ChangedSetImpactResult, GitChangedSet, ImpactFilters, ImpactResult, impact_cancellable,
         impact_changed_set_cancellable, read_git_changed_set_cancellable,
@@ -313,6 +314,7 @@ pub struct DependenciesRequest {
     transitive: bool,
     filter: GraphQueryFilter,
     max_traversal: usize,
+    edge_kind_filter: EdgeKindFilter,
 }
 
 impl DependenciesRequest {
@@ -333,7 +335,32 @@ impl DependenciesRequest {
             transitive,
             filter,
             max_traversal,
+            edge_kind_filter: EdgeKindFilter::default(),
         })
+    }
+
+    /// Choose which edge kinds the traversal follows (Issue #541).
+    ///
+    /// The selection is applied while the adjacency is built, so items,
+    /// nodes, and `traversed_edges` count only the selected edges. An empty
+    /// `edge_kinds` allows every kind; `structural_edges` (omitted means
+    /// `DEFAULT_STRUCTURAL_EDGE_SELECTION`) then decides whether structural
+    /// edges are followed. A non-empty allowlist alone decides the traversal;
+    /// only an explicit exclude combined with a structural kind is
+    /// contradictory and rejected.
+    pub fn with_edge_kind_filter(
+        mut self,
+        edge_kinds: Vec<String>,
+        structural_edges: Option<StructuralEdgeSelection>,
+    ) -> DepgraphServiceResult<Self> {
+        self.edge_kind_filter = EdgeKindFilter::try_new(edge_kinds, structural_edges)
+            .map_err(|_| DepgraphServiceError::InvalidInput)?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn edge_kind_filter(&self) -> &EdgeKindFilter {
+        &self.edge_kind_filter
     }
 
     #[must_use]
@@ -514,6 +541,7 @@ impl DepgraphService {
             request.transitive(),
             request.direction().is_incoming(),
             request.filter(),
+            request.edge_kind_filter(),
             request.max_traversal(),
             || cancellation.is_cancelled(),
         )
@@ -1870,6 +1898,7 @@ mod tests {
             true,
             false,
             &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
             100,
             1,
             || false,

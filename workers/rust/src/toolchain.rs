@@ -487,9 +487,13 @@ fn parse_verbose_version(name: &str, output: &str) -> Result<ToolVersion> {
 fn digest_tool(path: &Path) -> Result<String> {
     use std::fmt::Write as _;
 
-    let bytes = fs::read(path).context("read tool executable for attestation")?;
+    // Stream the executable through the hasher: rustc alone is tens of MB,
+    // and reading it whole would make every scan's peak heap carry a copy.
+    let mut executable = fs::File::open(path).context("read tool executable for attestation")?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut executable, &mut hasher).context("read tool executable for attestation")?;
     let mut digest = String::from("sha256:");
-    for byte in Sha256::digest(bytes) {
+    for byte in hasher.finalize() {
         write!(&mut digest, "{byte:02x}").expect("writing a digest to String cannot fail");
     }
     Ok(digest)

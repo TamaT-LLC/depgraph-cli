@@ -7,6 +7,11 @@ use std::{
 
 use depgraph_store::Store;
 
+pub use crate::edge_kind_selection::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, EdgeKindFilter, EdgeKindFilterError,
+    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, STRUCTURAL_EDGE_KINDS,
+    StructuralEdgeSelection, is_structural_edge_kind,
+};
 pub use crate::service_agent::{
     CompletedSnapshotView, CompletedSnapshotsPage, CoverageRecord, CurrentSnapshot,
     CurrentSnapshotAvailability, DepgraphContext, EdgeDirection, EdgeProjection,
@@ -52,7 +57,7 @@ pub use crate::service_limits::{
     MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, MAX_HEALTH_MANIFEST_BYTES, MAX_HEALTH_MANIFESTS,
     MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
     MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
-    MAX_HEALTH_TOTAL_MANIFEST_BYTES, MAX_IMPACT_MATERIALIZED_PATH_STEPS,
+    MAX_HEALTH_TOTAL_MANIFEST_BYTES, MAX_HOTSPOT_PATH_BYTES, MAX_IMPACT_MATERIALIZED_PATH_STEPS,
     MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
 };
 pub use crate::service_repository::{

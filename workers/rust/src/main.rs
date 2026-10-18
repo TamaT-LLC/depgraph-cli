@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use depgraph_rust_worker::{
-    ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, build_events, scan,
+    ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_SALSA_VERSION, ScanPhaseMetric, emit_events, scan_with_options,
 };
 use std::{
     io::{BufWriter, Write},
@@ -19,6 +19,25 @@ struct Args {
     scan_id: String,
     #[arg(long)]
     inventory_file: Option<PathBuf>,
+    /// `syntax-only` skips the rust-analyzer HIR backend; the core requests it
+    /// only to retry a full analysis that exceeded the worker memory budget.
+    #[arg(long, value_enum, default_value_t = HirModeArg::Full)]
+    hir_mode: HirModeArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HirModeArg {
+    Full,
+    SyntaxOnly,
+}
+
+impl From<HirModeArg> for HirMode {
+    fn from(value: HirModeArg) -> Self {
+        match value {
+            HirModeArg::Full => Self::Full,
+            HirModeArg::SyntaxOnly => Self::SyntaxOnly,
+        }
+    }
 }
 
 fn main() {
@@ -41,30 +60,38 @@ fn run() -> Result<()> {
         anyhow::bail!("--scan-id requires a non-empty identifier");
     }
 
-    let result = match args.inventory_file {
-        Some(inventory_file) => {
-            depgraph_rust_worker::scan_with_inventory_file(&args.root, &inventory_file)?
-        }
-        None => scan(&args.root)?,
-    };
-    let protocol_build_started = Instant::now();
-    let events = build_events(&args.scan_id, &result)?;
-    let protocol_build_ms = elapsed_ms(protocol_build_started);
-    let protocol_event_count = events.len() as u64;
+    let mut result = scan_with_options(
+        &args.root,
+        args.inventory_file.as_deref(),
+        args.hir_mode.into(),
+    )?;
+    let performance = std::mem::take(&mut result.performance);
     let stdout = std::io::stdout();
     let mut writer = CountingWriter::new(BufWriter::new(stdout.lock()));
+    // Events are built and written one at a time from the owned scan result,
+    // so the result and a second copy of it as events are never both resident.
+    #[cfg(debug_assertions)]
+    let mut validator = depgraph_protocol::ProtocolValidator::new();
     let protocol_write_started = Instant::now();
-    for event in events {
+    let protocol_event_count = emit_events(&args.scan_id, result, |event| {
+        #[cfg(debug_assertions)]
+        validator
+            .push(event.clone())
+            .context("Rust worker generated an invalid protocol event")?;
         serde_json::to_writer(&mut writer, &event).context("serialize protocol event")?;
         writer.write_all(b"\n").context("write protocol event")?;
-    }
+        Ok(())
+    })?;
+    #[cfg(debug_assertions)]
+    validator
+        .finish()
+        .context("Rust worker generated an incomplete protocol stream")?;
     writer.flush().context("flush protocol output")?;
     let protocol_write_ms = elapsed_ms(protocol_write_started);
     let protocol_bytes = writer.bytes_written();
     if scan_profile_enabled() {
         emit_performance(
-            &result,
-            protocol_build_ms,
+            &performance,
             protocol_event_count,
             protocol_write_ms,
             protocol_bytes,
@@ -74,21 +101,17 @@ fn run() -> Result<()> {
 }
 
 fn emit_performance(
-    result: &depgraph_rust_worker::ScanResult,
-    protocol_build_ms: u64,
+    performance: &[ScanPhaseMetric],
     protocol_event_count: u64,
     protocol_write_ms: u64,
     protocol_bytes: u64,
 ) {
-    for metric in &result.performance {
+    for metric in performance {
         eprintln!(
             "depgraph-progress phase={} status=completed duration_ms={} items={} bytes={}",
             metric.phase, metric.duration_ms, metric.items, metric.bytes
         );
     }
-    eprintln!(
-        "depgraph-progress phase=rust_protocol_build status=completed duration_ms={protocol_build_ms} items={protocol_event_count} bytes=0"
-    );
     eprintln!(
         "depgraph-progress phase=rust_protocol_write status=completed duration_ms={protocol_write_ms} items={protocol_event_count} bytes={protocol_bytes}"
     );
