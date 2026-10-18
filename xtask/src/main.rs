@@ -5755,6 +5755,22 @@ mod tests {
             .replace("x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu");
         assert_ne!(drifted_install_target.install, docs.install);
         assert!(verify_japanese_documentation_contract(&drifted_install_target).is_err());
+
+        for english in [false, true] {
+            let mut drifted = docs.clone();
+            let install = if english {
+                &mut drifted.english_install
+            } else {
+                &mut drifted.install
+            };
+            let assignment = install
+                .lines()
+                .find(|line| line.starts_with("VERSION="))
+                .expect("installation guide has a published version assignment")
+                .to_owned();
+            *install = install.replacen(&assignment, "VERSION=999.0.0", 1);
+            assert!(verify_japanese_documentation_contract(&drifted).is_err());
+        }
         Ok(())
     }
 
