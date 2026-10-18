@@ -323,6 +323,7 @@ impl AnalysisProgressObserver {
 }
 
 tokio::task_local! { static ANALYSIS_PROGRESS: AnalysisProgressObserver; }
+tokio::task_local! { static ANALYSIS_PROGRESS_SLOT: usize; }
 
 pub async fn observe_analysis_progress<F: std::future::Future>(
     observer: AnalysisProgressObserver,
@@ -331,31 +332,71 @@ pub async fn observe_analysis_progress<F: std::future::Future>(
     ANALYSIS_PROGRESS.scope(observer, future).await
 }
 
+/// Runs a nested single-unit executor that re-attempts the unit at `index` of
+/// the enclosing executor. Its progress then updates only that unit of the
+/// observed progress instead of replacing every unit of the scan.
+pub(crate) async fn observe_analysis_unit_slot<F: std::future::Future>(
+    index: usize,
+    future: F,
+) -> F::Output {
+    ANALYSIS_PROGRESS_SLOT.scope(index, future).await
+}
+
 fn publish_progress(progress: &AnalysisExecutionProgress) {
     let _ = ANALYSIS_PROGRESS.try_with(|observer| {
-        *observer
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = progress.clone();
+        {
+            let mut observed = observer
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match ANALYSIS_PROGRESS_SLOT.try_with(|slot| *slot) {
+                Ok(slot) => merge_unit_slot_progress(&mut observed, progress, 0, slot),
+                Err(_) => *observed = progress.clone(),
+            }
+        }
         observer
             .1
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     });
 }
 
-fn publish_unit_progress(progress: &AnalysisExecutionProgress, index: usize) {
+pub(crate) fn publish_unit_progress(progress: &AnalysisExecutionProgress, index: usize) {
     let _ = ANALYSIS_PROGRESS.try_with(|observer| {
-        let mut observed = observer
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(unit) = observed.units.get_mut(index) {
-            *unit = progress.units[index].clone();
+        {
+            let mut observed = observer
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = ANALYSIS_PROGRESS_SLOT
+                .try_with(|slot| *slot)
+                .unwrap_or(index);
+            merge_unit_slot_progress(&mut observed, progress, index, slot);
         }
         observer
             .1
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     });
+}
+
+/// Copies one unit into the observed progress only where the observed unit
+/// is the same unit, so a nested executor or a stale index cannot overwrite
+/// another unit's progress.
+fn merge_unit_slot_progress(
+    observed: &mut AnalysisExecutionProgress,
+    progress: &AnalysisExecutionProgress,
+    index: usize,
+    slot: usize,
+) {
+    let (Some(unit), Some(target)) = (progress.units.get(index), observed.units.get_mut(slot))
+    else {
+        return;
+    };
+    if target.unit_id == unit.unit_id {
+        *target = unit.clone();
+    }
+    if progress.stop_reason.is_some() {
+        observed.stop_reason.clone_from(&progress.stop_reason);
+    }
 }
 
 /// The executor uses one monotonic clock for per-unit elapsed time and the
@@ -1084,6 +1125,62 @@ mod tests {
                 .checked_add(self.step.saturating_mul(tick as u32))
                 .expect("test clock must remain representable")
         }
+    }
+
+    fn observed_unit(unit_id: &str, adapter: &str, status: &str) -> AnalysisUnitProgress {
+        AnalysisUnitProgress {
+            unit_id: unit_id.to_owned(),
+            adapter: adapter.to_owned(),
+            status: status.to_owned(),
+            reused: false,
+            stage: "repository".to_owned(),
+            duration_ms: 0,
+            protocol_events: 0,
+            failure_reason: None,
+            loader: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_slot_progress_updates_only_its_unit_of_the_observed_scan() {
+        let observer = AnalysisProgressObserver::default();
+        observe_analysis_progress(observer.clone(), async {
+            publish_progress(&AnalysisExecutionProgress {
+                units: vec![
+                    observed_unit("web-unit", "web", "completed"),
+                    observed_unit("rust-unit", "rust", "failed"),
+                ],
+                stop_reason: None,
+            });
+            let mut retry = AnalysisExecutionProgress {
+                units: vec![observed_unit("rust-unit", "rust", "queued")],
+                stop_reason: None,
+            };
+            observe_analysis_unit_slot(1, async {
+                publish_progress(&retry);
+                assert_eq!(observer.counts(), (1, 2));
+                retry.units[0].status = "completed".to_owned();
+                publish_unit_progress(&retry, 0);
+                assert_eq!(observer.counts(), (2, 2));
+                publish_progress(&retry);
+            })
+            .await;
+            // A progress record for another unit never lands in the slot.
+            observe_analysis_unit_slot(0, async {
+                publish_progress(&AnalysisExecutionProgress {
+                    units: vec![observed_unit("rust-unit", "rust", "running")],
+                    stop_reason: None,
+                });
+            })
+            .await;
+        })
+        .await;
+        let observed = observer.snapshot();
+        assert_eq!(observed.units.len(), 2);
+        assert_eq!(observed.units[0].unit_id, "web-unit");
+        assert_eq!(observed.units[0].status, "completed");
+        assert_eq!(observed.units[1].unit_id, "rust-unit");
+        assert_eq!(observed.units[1].status, "completed");
     }
 
     #[tokio::test]

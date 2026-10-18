@@ -2257,15 +2257,13 @@ fn resolve_manifest_dependency(
                     && unit.locator == raw.specifier
             })
             .filter(|target| {
-                go_resolution
-                    .active_workspace_member_ids
-                    .is_none_or(|member_ids| {
-                        source_id.is_some_and(|source_id| {
-                            source_id == &target.id
-                                || (member_ids.contains(source_id)
-                                    && member_ids.contains(&target.id))
-                        })
-                    })
+                source_id.is_some_and(|source_id| {
+                    go_module_in_local_closure(
+                        go_resolution.active_workspace_member_ids,
+                        source_id,
+                        &target.id,
+                    )
+                })
             })
             .collect::<Vec<_>>();
         if matches.len() == 1 {
@@ -2282,6 +2280,24 @@ fn resolve_manifest_dependency(
         resolution,
         evidence_path: Some(raw.evidence_path.clone()),
     }
+}
+
+/// Whether `target_id` is part of the local module closure that the Go
+/// command would use for `source_id` without consulting a replace directive.
+/// A module is always in its own closure; another local module is only in it
+/// when both are members of the active root go.work. Without an active
+/// go.work, a sibling with a matching module path is fetched from the module
+/// proxy by the Go command, so it must not be resolved locally here; local
+/// replace directives are handled before this check.
+fn go_module_in_local_closure(
+    active_workspace_member_ids: Option<&BTreeSet<String>>,
+    source_id: &str,
+    target_id: &str,
+) -> bool {
+    source_id == target_id
+        || active_workspace_member_ids.is_some_and(|member_ids| {
+            member_ids.contains(source_id) && member_ids.contains(target_id)
+        })
 }
 
 /// Go gives a versioned replacement precedence over a wildcard replacement.
@@ -2722,13 +2738,11 @@ fn resolve_source_import(
             .iter()
             .filter(|unit| unit.adapter == adapter && unit.kind == AnalysisUnitKind::GoModule)
             .filter(|target| {
-                go_resolution
-                    .active_workspace_member_ids
-                    .is_none_or(|member_ids| {
-                        target.id == go_resolution.source_unit_id
-                            || (member_ids.contains(go_resolution.source_unit_id)
-                                && member_ids.contains(&target.id))
-                    })
+                go_module_in_local_closure(
+                    go_resolution.active_workspace_member_ids,
+                    go_resolution.source_unit_id,
+                    &target.id,
+                )
             })
             .filter(|unit| {
                 specifier == unit.locator || specifier.starts_with(&(unit.locator.clone() + "/"))
@@ -4434,6 +4448,97 @@ catalog: {}
         )?;
         assert_eq!(go_work.workspace_members, vec!["./app"]);
         assert_eq!(go_work.go_replacements.len(), 1);
+        Ok(())
+    }
+
+    /// Without a root go.work, the Go command resolves a sibling module only
+    /// through a local replace directive; a matching module path alone is
+    /// fetched from the module proxy. The planner must not hand such a sibling
+    /// to the Go worker as part of the local closure (issue #538).
+    #[test]
+    fn sibling_go_modules_without_root_go_work_resolve_only_through_local_replace() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for directory in [
+            "services/api",
+            "services/shared/pkg",
+            "services/replaced",
+            "services/replacer",
+            "nested",
+        ] {
+            fs::create_dir_all(root.path().join(directory))?;
+        }
+        // A nested go.work is not active for a scan rooted at the repository.
+        fs::write(
+            root.path().join("nested/go.work"),
+            "go 1.26\n\nuse (\n ../services/api\n ../services/shared\n)\n",
+        )?;
+        fs::write(
+            root.path().join("services/api/go.mod"),
+            "module example.test/api\n\ngo 1.26\n\nrequire example.test/shared v0.0.0\n",
+        )?;
+        fs::write(
+            root.path().join("services/api/api.go"),
+            "package api\n\nimport _ \"example.test/shared/pkg\"\n",
+        )?;
+        fs::write(
+            root.path().join("services/shared/go.mod"),
+            "module example.test/shared\n\ngo 1.26\n",
+        )?;
+        fs::write(
+            root.path().join("services/shared/pkg/pkg.go"),
+            "package pkg\n",
+        )?;
+        fs::write(
+            root.path().join("services/replaced/go.mod"),
+            "module example.test/replaced\n\ngo 1.26\n",
+        )?;
+        fs::write(
+            root.path().join("services/replaced/replaced.go"),
+            "package replaced\n",
+        )?;
+        fs::write(
+            root.path().join("services/replacer/go.mod"),
+            "module example.test/replacer\n\ngo 1.26\n\nrequire example.test/replaced v0.0.0\n\nreplace example.test/replaced => ../replaced\n",
+        )?;
+        fs::write(
+            root.path().join("services/replacer/replacer.go"),
+            "package replacer\n\nimport _ \"example.test/replaced\"\n",
+        )?;
+
+        let plan = discover_analysis_plan(root.path(), &Config::default(), &input())?;
+        let unit = |locator: &str| {
+            plan.units
+                .iter()
+                .find(|unit| unit.locator == locator)
+                .unwrap_or_else(|| panic!("{locator} module"))
+        };
+        let api = unit("example.test/api");
+        let shared = unit("example.test/shared");
+        let replacer = unit("example.test/replacer");
+        let replaced = unit("example.test/replaced");
+
+        for specifier in ["example.test/shared", "example.test/shared/pkg"] {
+            let reference = api
+                .dependency_references
+                .iter()
+                .find(|reference| reference.specifier == specifier)
+                .unwrap_or_else(|| panic!("{specifier} reference"));
+            assert_ne!(
+                reference.resolution,
+                AnalysisDependencyResolution::Resolved,
+                "{specifier} must not resolve to a sibling without go.work or replace"
+            );
+            assert_eq!(reference.target_unit_id, None, "{specifier}");
+        }
+        assert!(!api.dependency_ids.contains(&shared.id));
+
+        assert!(replacer.dependency_references.iter().any(|reference| {
+            reference.specifier == "example.test/replaced"
+                && reference.kind == AnalysisDependencyKind::LocalPath
+                && reference.resolution == AnalysisDependencyResolution::Resolved
+                && reference.target_unit_id.as_deref() == Some(replaced.id.as_str())
+        }));
+        assert!(replacer.dependency_ids.contains(&replaced.id));
         Ok(())
     }
 

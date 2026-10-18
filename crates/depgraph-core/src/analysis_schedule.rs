@@ -1425,6 +1425,55 @@ mod tests {
         Ok(())
     }
 
+    /// Issue #538: without a root go.work or a local replace, a sibling module
+    /// with a matching module path is outside the Go worker's local closure.
+    /// Its sources must not be sent as context paths, or the worker rejects
+    /// the request.
+    #[test]
+    fn go_context_excludes_sibling_modules_without_root_go_work_or_replace() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        for name in ["app", "shared", "nested"] {
+            std::fs::create_dir(root.join(name))?;
+        }
+        std::fs::write(
+            root.join("app/go.mod"),
+            "module example.test/app\n\ngo 1.26\nrequire example.test/shared v0.0.0\n",
+        )?;
+        std::fs::write(
+            root.join("app/file.go"),
+            "package app\n\nimport _ \"example.test/shared\"\n",
+        )?;
+        std::fs::write(
+            root.join("shared/go.mod"),
+            "module example.test/shared\n\ngo 1.26\n",
+        )?;
+        std::fs::write(root.join("shared/file.go"), "package shared\n")?;
+        // Only a go.work at the scan root is active.
+        std::fs::write(
+            root.join("nested/go.work"),
+            "go 1.26\n\nuse (\n ../app\n ../shared\n)\n",
+        )?;
+
+        let config = crate::Config::default();
+        let plan = plan_analysis_units(root, &config, None)?;
+        let app = plan
+            .executable_units()
+            .into_iter()
+            .find(|unit| unit.unit_root == "app")
+            .expect("app module");
+        for phase in ["syntax", "typed", "semantic"] {
+            let requests = source_batch_requests(root, &config, &plan, app, phase, None)?;
+            assert_eq!(requests.len(), 1, "{phase}");
+            assert_eq!(
+                requests[0]["context_paths"],
+                json!(["app/file.go"]),
+                "{phase}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn unknown_go_dependencies_keep_worker_context_local_but_fingerprint_conservative() -> Result<()>
     {
@@ -1458,6 +1507,13 @@ mod tests {
         std::fs::write(
             root.join("app/file.go"),
             "package app\n\nimport _ \"example.test/shared\"\n",
+        )?;
+        // The duplicate module path is only a local ambiguity when the
+        // siblings are in the active go.work; without it the Go command would
+        // fetch example.test/shared from the module proxy instead.
+        std::fs::write(
+            root.join("go.work"),
+            "go 1.26\n\nuse (\n ./app\n ./shared-a\n ./shared-b\n)\n",
         )?;
 
         let config = crate::Config::default();

@@ -24,7 +24,8 @@ use crate::{
     analysis_execution::{
         AnalysisExecutionContext, AnalysisExecutionProgress, AnalysisInputValidation,
         AnalysisWorkItem, TypedReferenceFingerprint, execute_analysis_units,
-        execute_analysis_units_with_retained_typed,
+        execute_analysis_units_with_retained_typed, observe_analysis_unit_slot,
+        publish_unit_progress,
     },
     analysis_plan::{ANALYSIS_UNIT_WORKER_CONTRACT_VERSION, AnalysisPlan, plan_analysis_units},
     analysis_schedule::{prepare_analysis_schedule, validate_work_inputs},
@@ -172,6 +173,106 @@ pub(crate) struct PreparedScan {
 // A resource-limited prefix belongs to the attempted loader scope. Publishing
 // it before re-splitting can conflict with a replacement's narrower profile.
 // Spill one prefix at a time so failed units do not accumulate in memory.
+/// Worker arguments that ask the Rust worker to skip the rust-analyzer HIR
+/// backend while keeping its static syntax analysis.
+const RUST_SYNTAX_ONLY_WORKER_ARGS: [&str; 2] = ["--hir-mode", "syntax-only"];
+const RUST_SYNTAX_ONLY_FALLBACK_DIAGNOSTIC: &str = "rust-hir-syntax-only-fallback";
+const RUST_SYNTAX_ONLY_FALLBACK_FAILED_DIAGNOSTIC: &str = "rust-hir-syntax-only-fallback-failed";
+
+/// The inputs needed to rerun a repository-scope Rust work item in
+/// syntax-only mode after it exceeded the worker memory budget (#538).
+/// Rust has no finer execution unit to re-split into, so the one fallback is
+/// to drop the HIR backend that dominates its memory.
+struct RustSyntaxOnlyRetry {
+    request: Option<Value>,
+    spec: WorkerSpec,
+}
+
+impl RustSyntaxOnlyRetry {
+    fn templates(
+        work: &[AnalysisWorkItem],
+        execution_unit_ids: &[Option<String>],
+    ) -> BTreeMap<String, Self> {
+        work.iter()
+            .zip(execution_unit_ids)
+            .filter(|(item, execution_unit_id)| {
+                item.spec.adapter == AdapterKind::Rust && execution_unit_id.is_none()
+            })
+            .map(|(item, _)| {
+                (
+                    item.unit_id.clone(),
+                    Self {
+                        request: item.request.clone(),
+                        spec: item.spec.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The retry never reads or writes a unit checkpoint: a degraded result
+    /// must not satisfy a later full-mode attempt.
+    fn work_item(&self, unit_id: &str) -> AnalysisWorkItem {
+        let mut spec = self.spec.clone();
+        spec.leading_args
+            .extend(RUST_SYNTAX_ONLY_WORKER_ARGS.iter().map(Into::into));
+        AnalysisWorkItem {
+            unit_id: unit_id.to_owned(),
+            request: self.request.clone(),
+            checkpoint_key: None,
+            spec,
+        }
+    }
+}
+
+/// Loader key recording that a failed syntax-only retry left the full-mode
+/// attempt in place.
+const RUST_SYNTAX_ONLY_RETRY_LOADER_KEY: &str = "rust_hir_syntax_only_retry";
+
+/// The failed full-mode attempt of a Rust unit, held aside while its
+/// syntax-only retry runs.
+struct RustFullModeAttempt {
+    failure: Option<ScanFailure>,
+    detail: Option<String>,
+    prefix: Option<DeferredAnalysisFailure>,
+}
+
+/// Puts a failed retry's unit back to its full-mode attempt: the retry's own
+/// staged output is discarded and the full-mode prefix and failure records
+/// return, so the partial result is the one built before the retry existed.
+/// A retry that violated the worker security policy keeps its own failure,
+/// and its unit publishes no worker output.
+fn restore_rust_full_mode_attempt(
+    unit_id: &str,
+    attempt: RustFullModeAttempt,
+    unit_failures: &std::sync::Mutex<BTreeMap<String, ScanFailure>>,
+    analysis_unit_failures: &std::sync::Mutex<BTreeMap<String, String>>,
+    deferred: &std::sync::Mutex<BTreeMap<String, DeferredAnalysisFailure>>,
+) {
+    lock_failures(deferred).remove(unit_id);
+    let mut failures = lock_failures(unit_failures);
+    if failures
+        .get(unit_id)
+        .is_some_and(|failure| failure.security_violation)
+    {
+        return;
+    }
+    match attempt.failure {
+        Some(failure) => failures.insert(unit_id.to_owned(), failure),
+        None => failures.remove(unit_id),
+    };
+    drop(failures);
+    let mut details = lock_failures(analysis_unit_failures);
+    match attempt.detail {
+        Some(detail) => details.insert(unit_id.to_owned(), detail),
+        None => details.remove(unit_id),
+    };
+    drop(details);
+    if let Some(prefix) = attempt.prefix {
+        lock_failures(deferred).insert(unit_id.to_owned(), prefix);
+    }
+}
+
 struct DeferredAnalysisFailure {
     sequence: u64,
     events: tempfile::NamedTempFile,
@@ -903,6 +1004,15 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         std::sync::Mutex::new(BTreeMap::<String, DeferredAnalysisFailure>::new());
     let deferred_sequence = AtomicU64::new(0);
     let defer_resource_prefixes = AtomicBool::new(resplit_context.is_some());
+    let rust_syntax_only_retries =
+        RustSyntaxOnlyRetry::templates(&schedule.work, &execution_unit_ids);
+    // A Rust memory-limit prefix is held back like a re-split prefix so a
+    // successful syntax-only retry replaces it instead of merging with it.
+    let defer_rust_memory_prefixes = AtomicBool::new(!rust_syntax_only_retries.is_empty());
+    // While a syntax-only retry runs, any failed output is held back too: a
+    // failed retry restores the full-mode prefix instead of merging with it.
+    let defer_rust_retry_failures = AtomicBool::new(false);
+    let mut rust_syntax_only_fallback_applied = false;
     let mut consume = |store: &mut Store, unit_id: &str, output: WorkerOutput| -> Result<bool> {
         let ingest_started = Instant::now();
         if profiling {
@@ -912,8 +1022,7 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         let adapter = output.adapter;
         let failure_kind = output.failure_kind;
         let security_violation = output.security_violation;
-        let result = if defer_resource_prefixes.load(Ordering::Relaxed)
-            && !security_violation
+        let deferred_resource_limit = defer_resource_prefixes.load(Ordering::Relaxed)
             && matches!(
                 failure_kind,
                 Some(
@@ -921,7 +1030,18 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                         | WorkerFailureKind::Timeout
                         | WorkerFailureKind::OutputLimit
                 )
-            ) {
+            );
+        let deferred_rust_memory_limit = defer_rust_memory_prefixes.load(Ordering::Relaxed)
+            && adapter == AdapterKind::Rust
+            && failure_kind == Some(WorkerFailureKind::MemoryLimit);
+        let deferred_rust_retry_failure = defer_rust_retry_failures.load(Ordering::Relaxed)
+            && adapter == AdapterKind::Rust
+            && (failure_kind.is_some() || output.error.is_some());
+        let defer_prefix = !security_violation
+            && (deferred_resource_limit
+                || deferred_rust_memory_limit
+                || deferred_rust_retry_failure);
+        let result = if defer_prefix {
             store.save_adapter_log(
                 &scan_id,
                 adapter.name(),
@@ -1193,11 +1313,119 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
                 }
             }
         }
+        // A repository-scope Rust unit cannot be re-split, so a memory-limit
+        // failure is retried once without the HIR backend. Only success
+        // withdraws the failure; a failed retry is reported as before.
+        for index in 0..analysis.units.len() {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let progress = &analysis.units[index];
+            let Some(retry) = rust_syntax_only_retries.get(&progress.unit_id) else {
+                continue;
+            };
+            if superseded_indices.contains(&index)
+                || progress.status != "failed"
+                || progress.failure_reason.as_deref()
+                    != Some(WorkerFailureKind::MemoryLimit.as_str())
+                || execution_unit_ids.get(index).is_some_and(Option::is_some)
+                || lock_failures(&unit_failures)
+                    .get(&progress.unit_id)
+                    .is_none_or(|failure| failure.security_violation)
+            {
+                continue;
+            }
+            let unit_id = progress.unit_id.clone();
+            // The full-mode attempt stays staged aside until the retry
+            // succeeds, so a failed retry reports exactly what it did before.
+            let full_mode_attempt = RustFullModeAttempt {
+                failure: lock_failures(&unit_failures).remove(&unit_id),
+                detail: lock_failures(&analysis_unit_failures).remove(&unit_id),
+                prefix: lock_failures(&deferred_failures).remove(&unit_id),
+            };
+            defer_rust_retry_failures.store(true, Ordering::Relaxed);
+            let retried = observe_analysis_unit_slot(
+                index,
+                execute_analysis_units(
+                    store,
+                    &execution_context,
+                    vec![retry.work_item(&unit_id)],
+                    &mut consume,
+                    &validate,
+                ),
+            )
+            .await;
+            defer_rust_retry_failures.store(false, Ordering::Relaxed);
+            let retried_unit = match retried {
+                Ok(retried) => {
+                    if retried.stop_reason.is_some() {
+                        analysis.stop_reason = retried.stop_reason;
+                    }
+                    retried.units.into_iter().next()
+                }
+                Err(error) => {
+                    restore_rust_full_mode_attempt(
+                        &unit_id,
+                        full_mode_attempt,
+                        &unit_failures,
+                        &analysis_unit_failures,
+                        &deferred_failures,
+                    );
+                    return Err(error);
+                }
+            };
+            let succeeded = retried_unit
+                .as_ref()
+                .is_some_and(|unit| unit.status == "completed");
+            if !succeeded {
+                restore_rust_full_mode_attempt(
+                    &unit_id,
+                    full_mode_attempt,
+                    &unit_failures,
+                    &analysis_unit_failures,
+                    &deferred_failures,
+                );
+            }
+            let Some(retried_unit) = retried_unit else {
+                continue;
+            };
+            let (severity, code, message) = rust_syntax_only_fallback_diagnostic(
+                succeeded,
+                config.scan.max_worker_memory_bytes,
+                retried_unit.failure_reason.as_deref(),
+            );
+            add_core_diagnostic(store, &scan_id, severity, code, &message, &unit_id)?;
+            if succeeded {
+                let mut retried_unit = retried_unit;
+                for (key, value) in [
+                    ("rust_hir_mode", "syntax-only"),
+                    ("rust_hir_mode_reason", WorkerFailureKind::MemoryLimit.as_str()),
+                ] {
+                    retried_unit.loader.insert(key.to_owned(), value.to_owned());
+                }
+                rust_syntax_only_fallback_applied = true;
+                analysis.units[index] = retried_unit;
+            } else {
+                // The restored full-mode output and failure describe this
+                // unit, so its progress stays the full-mode attempt.
+                analysis.units[index].loader.insert(
+                    RUST_SYNTAX_ONLY_RETRY_LOADER_KEY.to_owned(),
+                    "failed".to_owned(),
+                );
+            }
+            publish_unit_progress(&analysis, index);
+        }
         Ok(analysis)
     }
     .await;
+    if rust_syntax_only_fallback_applied {
+        // The degraded graph must not answer a later scan from the
+        // whole-snapshot cache; the next attempt tries full HIR again.
+        whole_snapshot_cache_allowed = false;
+    }
     // Restore before propagating execution errors, including cancellation.
     defer_resource_prefixes.store(false, Ordering::Relaxed);
+    defer_rust_memory_prefixes.store(false, Ordering::Relaxed);
     let analysis =
         restore_deferred_analysis_failures(execution, &deferred_failures, |unit_id, output| {
             consume(store, unit_id, output)
@@ -2010,6 +2238,33 @@ fn classify_worker_task_failure(error: &JoinError) -> WorkerFailureKind {
     }
 }
 
+/// Explains a syntax-only Rust retry. Success is a warning, because the
+/// snapshot is published without HIR imports, types, and calls; failure is
+/// informational, because the `worker-failure` diagnostic already reports it.
+fn rust_syntax_only_fallback_diagnostic(
+    succeeded: bool,
+    memory_budget_bytes: u64,
+    retry_failure: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    if succeeded {
+        return (
+            "warning",
+            RUST_SYNTAX_ONLY_FALLBACK_DIAGNOSTIC,
+            format!(
+                "rust worker exceeded the {memory_budget_bytes}-byte worker memory budget, so the Rust graph was rebuilt in syntax-only mode without rust-analyzer HIR imports, types, or calls; raise [scan] max_worker_memory_bytes in .depgraph.toml to restore HIR analysis"
+            ),
+        );
+    }
+    (
+        "info",
+        RUST_SYNTAX_ONLY_FALLBACK_FAILED_DIAGNOSTIC,
+        format!(
+            "rust worker exceeded the {memory_budget_bytes}-byte worker memory budget and its syntax-only retry also failed ({}); raise [scan] max_worker_memory_bytes in .depgraph.toml",
+            retry_failure.unwrap_or("unknown")
+        ),
+    )
+}
+
 fn has_rust_hir_backend_failure(coverage: &CoverageRecord) -> bool {
     coverage
         .reasons
@@ -2022,6 +2277,10 @@ fn violates_strict_policy(coverage: &CoverageRecord, config: &Config) -> bool {
         || coverage.files_skipped > config.strict.max_skipped
         || coverage.unsupported_syntax > config.strict.max_unsupported_syntax
         || has_rust_hir_backend_failure(coverage)
+        || coverage
+            .reasons
+            .iter()
+            .any(|reason| reason == "rust-hir-memory-budget")
 }
 
 #[derive(Clone, Debug)]
@@ -3958,6 +4217,38 @@ mod tests {
             WorkerFailureKind::TaskPanic
         );
         assert!(task_adapters.is_empty());
+    }
+
+    #[test]
+    fn rust_syntax_only_memory_fallback_is_a_strict_policy_violation() {
+        let config = Config::default();
+        let mut coverage = CoverageRecord::default();
+        coverage.reasons.push("rust-hir-memory-budget".into());
+        assert!(violates_strict_policy(&coverage, &config));
+    }
+
+    #[test]
+    fn rust_syntax_only_retry_requests_the_flag_and_never_reuses_checkpoints() {
+        let mut spec = test_worker_spec(AdapterKind::Rust, PathBuf::from("/bin/rust-worker"));
+        spec.leading_args.push("--existing".into());
+        let retry = RustSyntaxOnlyRetry {
+            request: Some(json!({"unit": "rust:repository"})),
+            spec,
+        };
+
+        let item = retry.work_item("rust:repository");
+
+        assert_eq!(item.unit_id, "rust:repository");
+        assert!(item.checkpoint_key.is_none());
+        assert_eq!(item.request, Some(json!({"unit": "rust:repository"})));
+        assert_eq!(
+            item.spec.leading_args,
+            vec![
+                std::ffi::OsString::from("--existing"),
+                "--hir-mode".into(),
+                "syntax-only".into()
+            ]
+        );
     }
 
     #[test]
