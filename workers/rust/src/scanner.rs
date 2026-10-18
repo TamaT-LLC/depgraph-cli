@@ -955,15 +955,25 @@ impl State {
 
     /// Records why HIR was skipped so the degradation stays machine readable
     /// in the profile, the coverage reasons, and a warning diagnostic.
-    fn skip_hir_for_memory_budget(&mut self) {
-        for (property, value) in [
-            ("rust_hir_mode", "syntax-only"),
-            ("rust_hir_project_model", "not-invoked"),
-            ("rust_hir_enable_gate", "memory-budget-syntax-only"),
-        ] {
-            self.profile
-                .properties
-                .insert(property.into(), Value::String(value.into()));
+    ///
+    /// The syntax-only marks are recorded whenever the worker runs in
+    /// `SyntaxOnly` mode, even when an earlier HIR enable gate already
+    /// stopped the project model. `preserve_gate_state` keeps that gate's
+    /// own `rust_hir_project_model` and `rust_hir_enable_gate` values so the
+    /// more specific reason is not overwritten.
+    fn skip_hir_for_memory_budget(&mut self, preserve_gate_state: bool) {
+        self.profile
+            .properties
+            .insert("rust_hir_mode".into(), Value::String("syntax-only".into()));
+        if !preserve_gate_state {
+            for (property, value) in [
+                ("rust_hir_project_model", "not-invoked"),
+                ("rust_hir_enable_gate", "memory-budget-syntax-only"),
+            ] {
+                self.profile
+                    .properties
+                    .insert(property.into(), Value::String(value.into()));
+            }
         }
         self.reasons.insert("rust-hir-memory-budget".into());
         self.add_diagnostic(
@@ -976,27 +986,14 @@ impl State {
         );
     }
 
-    fn build_hir_project_model(
+    /// Applies the HIR enable gates (toolchain, edition, crate graph) and
+    /// records the stopping gate's state. Returns `true` when HIR is blocked.
+    fn apply_hir_enable_gates(
         &mut self,
         packages: &[Package],
-        sources: &[SourceUnit],
         metadata_succeeded: bool,
-        manifest_found: bool,
         hir_toolchain_status: ToolchainProbeStatus,
-        hir_mode: HirMode,
-    ) -> Option<SafeProjectModel> {
-        let crate_graph_source = if metadata_succeeded {
-            "confined-cargo-metadata"
-        } else if manifest_found {
-            "static-manifest-fallback"
-        } else {
-            "none"
-        };
-        self.profile.properties.insert(
-            "crate_graph_source".into(),
-            Value::String(crate_graph_source.into()),
-        );
-
+    ) -> bool {
         if hir_toolchain_status != ToolchainProbeStatus::Compatible {
             self.profile.properties.insert(
                 "rust_hir_project_model".into(),
@@ -1006,7 +1003,7 @@ impl State {
                 "rust_hir_enable_gate".into(),
                 Value::String("toolchain-unsupported".into()),
             );
-            return None;
+            return true;
         }
         if let Some((path, edition)) = packages.iter().find_map(|package| {
             package
@@ -1036,7 +1033,7 @@ impl State {
                 None,
                 &format!("unsupported-edition:{edition}"),
             );
-            return None;
+            return true;
         }
         if !metadata_succeeded {
             self.profile.properties.insert(
@@ -1047,10 +1044,39 @@ impl State {
                 "rust_hir_enable_gate".into(),
                 Value::String("crate-graph-unavailable".into()),
             );
+            return true;
+        }
+        false
+    }
+
+    fn build_hir_project_model(
+        &mut self,
+        packages: &[Package],
+        sources: &[SourceUnit],
+        metadata_succeeded: bool,
+        manifest_found: bool,
+        hir_toolchain_status: ToolchainProbeStatus,
+        hir_mode: HirMode,
+    ) -> Option<SafeProjectModel> {
+        let crate_graph_source = if metadata_succeeded {
+            "confined-cargo-metadata"
+        } else if manifest_found {
+            "static-manifest-fallback"
+        } else {
+            "none"
+        };
+        self.profile.properties.insert(
+            "crate_graph_source".into(),
+            Value::String(crate_graph_source.into()),
+        );
+
+        let gate_blocked =
+            self.apply_hir_enable_gates(packages, metadata_succeeded, hir_toolchain_status);
+        if hir_mode == HirMode::SyntaxOnly {
+            self.skip_hir_for_memory_budget(gate_blocked);
             return None;
         }
-        if hir_mode == HirMode::SyntaxOnly {
-            self.skip_hir_for_memory_budget();
+        if gate_blocked {
             return None;
         }
 
@@ -5424,10 +5450,14 @@ pub fn consume(_: Local) {}
         assert_eq!(properties["rust_hir_mode"], "syntax-only");
         assert_eq!(properties["rust_hir_project_model"], "not-invoked");
         assert_eq!(properties["rust_hir_status"], "not-invoked");
-        assert_eq!(
-            properties["rust_hir_enable_gate"],
+        // Hosts without the baseline toolchain stop at the toolchain gate
+        // first; the syntax-only marks must be recorded either way.
+        let expected_gate = if properties["rust_hir_toolchain_status"] == "compatible" {
             "memory-budget-syntax-only"
-        );
+        } else {
+            "toolchain-unsupported"
+        };
+        assert_eq!(properties["rust_hir_enable_gate"], expected_gate);
         assert!(
             result
                 .coverage
@@ -5466,6 +5496,48 @@ pub fn consume(_: Local) {}
                 .performance
                 .iter()
                 .all(|metric| metric.phase != "rust_hir_semantic")
+        );
+    }
+
+    #[test]
+    fn syntax_only_mode_records_memory_budget_even_when_the_toolchain_gate_stops_hir() {
+        let temp = tempfile::tempdir().unwrap();
+        write_complete_semantic_fixture(temp.path());
+        // A declared channel other than the baseline makes the toolchain gate
+        // fail regardless of the host toolchain.
+        fs::write(
+            temp.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel='1.80.0'\n",
+        )
+        .unwrap();
+
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+
+        let properties = &result.profile.properties;
+        assert_eq!(properties["rust_hir_toolchain_status"], "unsupported");
+        assert_eq!(properties["rust_hir_mode"], "syntax-only");
+        assert_eq!(properties["rust_hir_enable_gate"], "toolchain-unsupported");
+        assert_eq!(properties["rust_hir_project_model"], "not-invoked");
+        assert!(
+            result
+                .coverage
+                .reasons
+                .iter()
+                .any(|reason| reason == "rust-hir-memory-budget")
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "RUST_HIR_MEMORY_BUDGET_SYNTAX_ONLY")
+                .count(),
+            1
         );
     }
 
