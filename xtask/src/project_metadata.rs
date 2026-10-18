@@ -144,6 +144,7 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         "Only the npm publisher receives job-scoped `id-token: write`",
         "The OIDC-capable npm job performs no checkout\nand executes no repository script.",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
+        "The path filter diffs with `--no-renames`",
         "skips their expensive steps only when every changed path",
         "widening what a job may skip requires a reviewed xtask\nchange.",
         "`.github/actions-policy.json` is the canonical allowlist",
@@ -900,6 +901,166 @@ fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
 /// silently miss its last line.
 fn workflow_block_has_line(block: &str, line: &str) -> bool {
     block.lines().any(|candidate| candidate == line)
+}
+
+/// Every pull request path filter in the compiler-precise-hostile job diffs
+/// base..head with this exact command.
+const HOSTILE_PATH_DIFF: &str = concat!(
+    r#"changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "#,
+    r#""${{ github.event.pull_request.head.sha }}")""#,
+);
+
+/// Every path filter feeds `$changed` to `grep -q` through a here-string.
+const HOSTILE_PATH_FILTER_PREFIX: &str = "          if grep -qE '";
+const HOSTILE_PATH_FILTER_SUFFIX: &str = r#"' <<<"$changed"; then"#;
+
+/// The compiler-precise-hostile job reports its required check on every pull
+/// request but runs the hostile steps only when a related path changes.
+fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
+    // A Windows autocrlf checkout reads ci.yml with CRLF endings.
+    let normalized_workflow = ci_workflow.replace("\r\n", "\n").replace('\r', "\n");
+    let ci_workflow = normalized_workflow.as_str();
+    for required in [
+        "compiler-precise-hostile:",
+        "sudo apt-get install --yes --no-install-recommends bubblewrap",
+        "scripts/compiler-precise-hostile-e2e.sh",
+        "compiler-precise-hostile-${{ github.sha }}",
+        "id: decide",
+        "steps.decide.outputs.run",
+        r#"github.event_name }}" = "workflow_dispatch""#,
+        r#"github.event_name }}" = "push""#,
+        "github.event.pull_request.base.sha",
+        "github.event.pull_request.head.sha",
+        r#"Cargo\.(toml|lock)"#,
+        "crates/depgraph-core/",
+        "crates/depgraph-rustc-wrapper/",
+        "crates/depgraph-rustc-query/",
+        "crates/depgraph-cli/",
+        "crates/depgraph-store/",
+        "scripts/compiler-precise-hostile",
+        "docs/50_test/compiler-precise-hostile",
+        r#"\.github/workflows/ci\.yml"#,
+        "if: steps.decide.outputs.run == 'true'",
+        "if: steps.decide.outputs.run != 'true'",
+    ] {
+        if !ci_workflow.contains(required) {
+            bail!("CI is missing compiler-precise hostile gate {required:?}");
+        }
+    }
+    // Rename detection reports a moved file only under its destination, so a
+    // file moved out of a related path would let the path filter skip the run.
+    let hostile = workflow_job_block(ci_workflow, "compiler-precise-hostile")?;
+    let path_diffs = hostile.matches("git diff").count();
+    if path_diffs == 0 || hostile.matches(HOSTILE_PATH_DIFF).count() != path_diffs {
+        bail!("CI compiler-precise hostile path filters must all use {HOSTILE_PATH_DIFF:?}");
+    }
+    // Under pipefail, `grep -q` exiting on the first match can SIGPIPE an
+    // upstream writer and turn a related change into run=false.
+    if hostile
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains("| grep"))
+    {
+        bail!("CI compiler-precise hostile path filters must not pipe into grep under pipefail");
+    }
+    let here_string_filters = hostile
+        .lines()
+        .filter(|line| {
+            line.starts_with(HOSTILE_PATH_FILTER_PREFIX)
+                && line.ends_with(HOSTILE_PATH_FILTER_SUFFIX)
+        })
+        .count();
+    if here_string_filters != path_diffs {
+        bail!("CI compiler-precise hostile path filters must all read $changed via a here-string");
+    }
+    for decision in &HOSTILE_DECISIONS {
+        verify_hostile_decision_step(hostile, decision)?;
+    }
+    Ok(())
+}
+
+/// One path-filtered decision in the compiler-precise-hostile job.
+struct HostileDecision {
+    header: &'static str,
+    id: &'static str,
+    pattern: &'static str,
+}
+
+/// Both decisions are pinned by step so that deleting one, or swapping its
+/// filter, cannot leave the other to balance the job-wide filter counts.
+const HOSTILE_DECISIONS: [HostileDecision; 2] = [
+    HostileDecision {
+        header: "      - name: Decide whether compiler-precise-hostile must run",
+        id: "        id: decide",
+        pattern: concat!(
+            r"^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|",
+            r"crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|",
+            r"crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
+            r"docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)",
+        ),
+    },
+    HostileDecision {
+        header: "      - name: Decide whether the exact Linux compiler-pack smoke must run",
+        id: "        id: compiler-pack-smoke",
+        pattern: concat!(
+            r"^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|",
+            r"crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
+            r"\.github/workflows/ci\.yml)",
+        ),
+    },
+];
+
+const HOSTILE_RUN_TRUE: &str = r#"echo "run=true" >> "$GITHUB_OUTPUT""#;
+const HOSTILE_RUN_FALSE: &str = r#"echo "run=false" >> "$GITHUB_OUTPUT""#;
+const SHELL_ELSE: &str = "else";
+const SHELL_FI: &str = "fi";
+/// The trimmed lines that must follow the path filter, so a match runs the
+/// gated steps and anything else skips them.
+const HOSTILE_FILTER_BRANCHES: [&str; 4] =
+    [HOSTILE_RUN_TRUE, SHELL_ELSE, HOSTILE_RUN_FALSE, SHELL_FI];
+
+fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Result<()> {
+    let (_, step) = workflow_step_block(hostile, decision.header)?;
+    let id = decision.id.trim_start();
+    if !workflow_block_has_line(step, decision.id) {
+        bail!(
+            "CI compiler-precise hostile decision {:?} must carry {id:?}",
+            decision.header
+        );
+    }
+    let diff_line = format!("          {HOSTILE_PATH_DIFF}");
+    if step.lines().filter(|line| *line == diff_line).count() != 1 {
+        bail!("CI compiler-precise hostile step {id:?} must diff with {HOSTILE_PATH_DIFF:?}");
+    }
+    let filter_line = format!(
+        "{HOSTILE_PATH_FILTER_PREFIX}{}{HOSTILE_PATH_FILTER_SUFFIX}",
+        decision.pattern
+    );
+    if step.lines().filter(|line| *line == filter_line).count() != 1 {
+        bail!(
+            "CI compiler-precise hostile step {id:?} must filter with {:?}",
+            decision.pattern
+        );
+    }
+    for output in [HOSTILE_RUN_TRUE, HOSTILE_RUN_FALSE] {
+        if !step.lines().any(|line| line.trim_start() == output) {
+            bail!("CI compiler-precise hostile step {id:?} must write {output:?}");
+        }
+    }
+    let branches: Vec<&str> = step
+        .lines()
+        .skip_while(|line| *line != filter_line)
+        .skip(1)
+        .take(HOSTILE_FILTER_BRANCHES.len())
+        .map(str::trim)
+        .collect();
+    if branches != HOSTILE_FILTER_BRANCHES {
+        bail!(
+            "CI compiler-precise hostile step {id:?} must follow its filter with {HOSTILE_FILTER_BRANCHES:?}"
+        );
+    }
+    Ok(())
 }
 
 fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
@@ -1903,6 +2064,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "`mcp_security_matrix`",
         "| MCP security matrix |",
         "The hostile gate fails if",
+        "The filter diffs base..head with `git diff --no-renames`",
     ] {
         if !rust_compiler_hostile.contains(required) {
             bail!("compiler-precise hostile evidence is missing {required:?}");
@@ -1937,33 +2099,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("compiler-pack release evidence is missing {required:?}");
         }
     }
-    for required in [
-        "compiler-precise-hostile:",
-        "sudo apt-get install --yes --no-install-recommends bubblewrap",
-        "scripts/compiler-precise-hostile-e2e.sh",
-        "compiler-precise-hostile-${{ github.sha }}",
-        "id: decide",
-        "steps.decide.outputs.run",
-        r#"github.event_name }}" = "workflow_dispatch""#,
-        r#"github.event_name }}" = "push""#,
-        "github.event.pull_request.base.sha",
-        "github.event.pull_request.head.sha",
-        r#"Cargo\.(toml|lock)"#,
-        "crates/depgraph-core/",
-        "crates/depgraph-rustc-wrapper/",
-        "crates/depgraph-rustc-query/",
-        "crates/depgraph-cli/",
-        "crates/depgraph-store/",
-        "scripts/compiler-precise-hostile",
-        "docs/50_test/compiler-precise-hostile",
-        r#"\.github/workflows/ci\.yml"#,
-        "if: steps.decide.outputs.run == 'true'",
-        "if: steps.decide.outputs.run != 'true'",
-    ] {
-        if !ci_workflow.contains(required) {
-            bail!("CI is missing compiler-precise hostile gate {required:?}");
-        }
-    }
+    verify_compiler_precise_hostile_ci_gate(&ci_workflow)?;
     for required in [
         "- Status: Accepted",
         "- Decision ID: `PROJ-ARC-001-ADR-003`",
@@ -3277,7 +3413,8 @@ mod tests {
         affected_scope_decide_step, extra_native_package_is_manual_and_bounded,
         integration_job_pins_resource_policy, job_pins_intermediate_state_bound,
         verify_ci_affected_scope_gates, verify_ci_affected_scope_script_text,
-        verify_workflow_policy_text, workflow_job_block,
+        verify_compiler_precise_hostile_ci_gate, verify_workflow_policy_text, workflow_job_block,
+        workflow_step_block,
     };
 
     /// The three jobs that build twice on one runner without reclaiming
@@ -3524,6 +3661,199 @@ mod tests {
                 .expect("drifted windows-smoke job is extractable"),
             "windows-smoke must be rejected once its bound moves to another job"
         );
+    }
+
+    #[test]
+    fn compiler_precise_hostile_gate_accepts_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        verify_compiler_precise_hostile_ci_gate(&ci).unwrap();
+    }
+
+    /// A Windows autocrlf checkout reads ci.yml with CRLF endings.
+    #[test]
+    fn compiler_precise_hostile_gate_accepts_the_checked_in_workflow_with_crlf() {
+        let ci = checked_in_ci_workflow();
+        verify_compiler_precise_hostile_ci_gate(&ci.replace('\n', "\r\n")).unwrap();
+    }
+
+    /// With rename detection a file moved out of a related path shows up only
+    /// under its destination, so the path filter could skip the hostile E2E.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_rename_detecting_path_diffs() {
+        let ci = checked_in_ci_workflow();
+        let no_renames = "git diff --no-renames --name-only ";
+        let renames = "git diff --name-only ";
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        assert_eq!(hostile.matches(no_renames).count(), 2);
+        let (decide, compiler_pack_smoke) = hostile
+            .split_once("id: compiler-pack-smoke")
+            .expect("compiler-pack smoke decision follows the hostile decision");
+        for changed in [
+            format!(
+                "{}id: compiler-pack-smoke{compiler_pack_smoke}",
+                decide.replacen(no_renames, renames, 1)
+            ),
+            format!(
+                "{decide}id: compiler-pack-smoke{}",
+                compiler_pack_smoke.replacen(no_renames, renames, 1)
+            ),
+        ] {
+            let drift = ci.replace(hostile, &changed);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a rename-detecting path diff must be rejected"
+            );
+        }
+    }
+
+    /// Under `set -o pipefail`, `grep -q` exiting on the first match can kill
+    /// the upstream `printf` with SIGPIPE and turn a related change into
+    /// `run=false`, so both path filters must feed grep with a here-string.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_printf_piped_path_filters() {
+        fn pipe_path_filter(block: &str) -> String {
+            let prefix = "          if grep -qE ";
+            let suffix = " <<<\"$changed\"; then";
+            let line = block
+                .lines()
+                .find(|line| line.starts_with(prefix) && line.ends_with(suffix))
+                .expect("path filter uses a here-string");
+            let pattern = &line[prefix.len()..line.len() - suffix.len()];
+            let piped =
+                format!("          if printf '%s\\n' \"$changed\" | grep -qE {pattern}; then");
+            block.replacen(line, &piped, 1)
+        }
+
+        let ci = checked_in_ci_workflow();
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        let (decide, compiler_pack_smoke) = hostile
+            .split_once("id: compiler-pack-smoke")
+            .expect("compiler-pack smoke decision follows the hostile decision");
+        for changed in [
+            format!(
+                "{}id: compiler-pack-smoke{compiler_pack_smoke}",
+                pipe_path_filter(decide)
+            ),
+            format!(
+                "{decide}id: compiler-pack-smoke{}",
+                pipe_path_filter(compiler_pack_smoke)
+            ),
+        ] {
+            let drift = ci.replace(hostile, &changed);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a printf-piped path filter must be rejected"
+            );
+        }
+    }
+
+    const HOSTILE_DECIDE_STEP_HEADER: &str =
+        "      - name: Decide whether compiler-precise-hostile must run";
+    const HOSTILE_SMOKE_STEP_HEADER: &str =
+        "      - name: Decide whether the exact Linux compiler-pack smoke must run";
+
+    /// Replaces one step of the compiler-precise-hostile job and returns the
+    /// drifted workflow.
+    fn drift_hostile_step(ci: &str, step_header: &str, edit: impl Fn(&str) -> String) -> String {
+        let hostile = workflow_job_block(ci, "compiler-precise-hostile").unwrap();
+        let (_, step) = workflow_step_block(hostile, step_header).unwrap();
+        let changed = hostile.replacen(step, &edit(step), 1);
+        let drift = ci.replacen(hostile, &changed, 1);
+        assert_ne!(drift, ci, "drift mutation must change the workflow");
+        drift
+    }
+
+    /// Swaps the here-string path filter regex of one step for `pattern`.
+    fn replace_path_filter(step: &str, pattern: &str) -> String {
+        let prefix = "          if grep -qE '";
+        let line = step
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .expect("step has a here-string path filter");
+        let replaced = format!("{prefix}{pattern}' <<<\"$changed\"; then");
+        step.replacen(line, &replaced, 1)
+    }
+
+    /// Without its own decide step, the remaining diff in the other step still
+    /// balances the filter count, so the job could silently skip that gate.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_removed_decide_step() {
+        let ci = checked_in_ci_workflow();
+        for header in [HOSTILE_DECIDE_STEP_HEADER, HOSTILE_SMOKE_STEP_HEADER] {
+            let drift = drift_hostile_step(&ci, header, |_| String::new());
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "removing {header:?} must be rejected"
+            );
+        }
+    }
+
+    /// A path filter that always matches, or matches another set of paths,
+    /// keeps the here-string shape but changes which pull requests run.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_replaced_path_filter() {
+        let ci = checked_in_ci_workflow();
+        for header in [HOSTILE_DECIDE_STEP_HEADER, HOSTILE_SMOKE_STEP_HEADER] {
+            for pattern in [".*", "^xtask/"] {
+                let drift =
+                    drift_hostile_step(&ci, header, |step| replace_path_filter(step, pattern));
+                assert!(
+                    verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                    "path filter {pattern:?} in {header:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    /// Each decide step must keep writing both outcomes; a constant output
+    /// either always skips or always runs the gated steps.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_constant_decide_output() {
+        let ci = checked_in_ci_workflow();
+        let run_true = r#"echo "run=true" >> "$GITHUB_OUTPUT""#;
+        let run_false = r#"echo "run=false" >> "$GITHUB_OUTPUT""#;
+        for header in [HOSTILE_DECIDE_STEP_HEADER, HOSTILE_SMOKE_STEP_HEADER] {
+            for (from, to) in [(run_true, run_false), (run_false, run_true)] {
+                let drift = drift_hostile_step(&ci, header, |step| step.replace(from, to));
+                assert!(
+                    verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                    "replacing {from:?} with {to:?} in {header:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    /// Swapping the two outputs after the path filter keeps both lines in the
+    /// step but inverts the decision: matching pull requests skip the gate.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_swapped_decide_outputs() {
+        let ci = checked_in_ci_workflow();
+        let branches = concat!(
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+        );
+        let swapped = concat!(
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+        );
+        for header in [HOSTILE_DECIDE_STEP_HEADER, HOSTILE_SMOKE_STEP_HEADER] {
+            let drift = drift_hostile_step(&ci, header, |step| {
+                assert_eq!(
+                    step.matches(branches).count(),
+                    1,
+                    "{header:?} has one filter branch"
+                );
+                step.replacen(branches, swapped, 1)
+            });
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "swapping the filter outputs in {header:?} must be rejected"
+            );
+        }
     }
 
     const CHECKOUT_STEP: &str =

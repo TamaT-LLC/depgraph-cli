@@ -12,6 +12,8 @@ CI path filter: on pull requests the job reports the required check name but
 runs the expensive hostile steps only when related paths change (`Cargo.toml` /
 `Cargo.lock`, compiler, CLI, MCP, operation, and store crates, hostile
 scripts/docs, or `.github/workflows/ci.yml`).
+The filter diffs base..head with `git diff --no-renames`, so a file moved
+out of a related path still counts as a change to its source path.
 `main` push and `workflow_dispatch` always run the full gate; unrelated PRs skip
 heavy steps and still succeed.
 
