@@ -6,7 +6,7 @@ use anyhow::Result;
 use depgraph_core::CancellationToken;
 use depgraph_core::import_evidence::{
     ImportBindingKind, ImportSiteHint, MAX_IMPORT_NAME_BYTES, MAX_IMPORT_SPECIFIER_BYTES,
-    project_import_evidence,
+    is_public_import_specifier, project_import_evidence,
 };
 use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceLimits,
@@ -233,6 +233,52 @@ fn oversized_control_and_credential_shaped_values_are_omitted() {
     let mut non_string = ts_semantic_properties("named_import");
     non_string["module_specifier"] = json!(42);
     assert!(project_import_evidence(&non_string, None).is_none());
+}
+
+#[test]
+fn url_userinfo_specifiers_are_omitted() {
+    for specifier in [
+        "https://alice:s3cr3tvalue@registry.example.test/mod.js",
+        "https://u:p@host/x.js",
+        "git+ssh://user@host/x",
+        "https://token@host",
+        "https://u:p@host?x=1",
+        "https://u:p@host#frag",
+    ] {
+        assert!(!is_public_import_specifier(specifier), "{specifier}");
+        let mut properties = ts_semantic_properties("named_import");
+        properties["module_specifier"] = json!(specifier);
+        assert!(
+            project_import_evidence(&properties, None).is_none(),
+            "{specifier}"
+        );
+        let site = ImportSiteHint::new("import", Some(specifier));
+        assert!(
+            project_import_evidence(&json!({}), Some(site)).is_none(),
+            "{specifier}"
+        );
+    }
+}
+
+#[test]
+fn scoped_package_and_at_in_path_specifiers_stay_public() {
+    for specifier in [
+        "@scope/pkg",
+        "npm:@scope/pkg@1.0.0",
+        "jsr:@std/path",
+        "node:fs",
+        "@/lib/foo",
+        "https://esm.sh/@scope/pkg@1.0.0",
+        "https://cdn.example.test/npm/pkg@2/mod.js",
+        "https://host/x?ref=a@b",
+        "https://host/x#a@b",
+    ] {
+        assert!(is_public_import_specifier(specifier), "{specifier}");
+        let mut properties = ts_semantic_properties("named_import");
+        properties["module_specifier"] = json!(specifier);
+        let import = project_import_evidence(&properties, None).expect(specifier);
+        assert_eq!(import.specifier(), specifier);
+    }
 }
 
 #[test]

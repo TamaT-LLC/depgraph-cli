@@ -2398,6 +2398,40 @@ fn import_specifier_and_names_are_bounded_and_credential_free() {
 }
 
 #[test]
+fn import_specifier_with_url_userinfo_is_rejected_on_build_and_deserialize() {
+    for specifier in [
+        "https://alice:s3cr3tvalue@registry.example.test/mod.js",
+        "https://u:p@host/x.js",
+        "git+ssh://user@host/x",
+    ] {
+        assert_eq!(
+            AgentImportEvidence::new(parse(specifier), None, None, None, false),
+            Err(ContractBuildError::ImportEvidence),
+            "{specifier}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":specifier})).is_err(),
+            "{specifier}"
+        );
+    }
+    for specifier in [
+        "@scope/pkg",
+        "npm:@scope/pkg@1.0.0",
+        "jsr:@std/path",
+        "node:fs",
+    ] {
+        assert!(
+            AgentImportEvidence::new(parse(specifier), None, None, None, false).is_ok(),
+            "{specifier}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":specifier})).is_ok(),
+            "{specifier}"
+        );
+    }
+}
+
+#[test]
 fn import_evidence_rejects_raw_properties_and_detail() {
     for field in [
         "properties",
