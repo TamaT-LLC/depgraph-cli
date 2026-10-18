@@ -189,6 +189,57 @@ fn issue_314_shared_schema_publishes_repository_init_outcome_and_success_envelop
 }
 
 #[test]
+fn issue_540_shared_schema_publishes_repository_list_and_repository_error_details() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in ["AgentRepositoryList", "AgentRepositorySummary"] {
+        let value = definitions
+            .get(definition)
+            .unwrap_or_else(|| panic!("missing {definition} definition"));
+        assert_eq!(value["additionalProperties"], false, "{definition}");
+    }
+    let summary = &definitions["AgentRepositorySummary"];
+    let mut summary_fields = summary["properties"]
+        .as_object()
+        .expect("summary properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    summary_fields.sort_unstable();
+    assert_eq!(summary_fields, ["repository_id", "snapshot"]);
+    let repositories = &definitions["AgentRepositoryList"]["properties"]["repositories"];
+    assert_eq!(repositories["minItems"], 1);
+    assert_eq!(repositories["maxItems"], 64);
+    assert!(definitions.values().any(|definition| {
+        definition["properties"]["result"]["$ref"] == "#/$defs/AgentRepositoryList"
+    }));
+
+    let ids = &definitions["AgentRepositoryIds"];
+    assert_eq!(ids["type"], "array");
+    assert_eq!(ids["minItems"], 1);
+    assert_eq!(ids["maxItems"], 64);
+    assert_eq!(ids["uniqueItems"], true);
+    let details = serde_json::to_string(&definitions["AgentErrorDetails"]).expect("details");
+    assert!(details.contains("available_repository_ids"));
+    assert!(details.contains("#/$defs/AgentRepositoryIds"));
+
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentErrorDetails",
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).expect("details schema compiles");
+    assert!(validator.is_valid(&json!({"kind":"repository","available_repository_ids":["web"]})));
+    for invalid in [
+        json!({"kind":"repository","available_repository_ids":[]}),
+        json!({"kind":"repository","available_repository_ids":["web","web"]}),
+        json!({"kind":"repository","available_repository_ids":["/abs"]}),
+    ] {
+        assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+    }
+}
+
+#[test]
 fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
     let schema = schema_value();
     let definitions = schema["$defs"].as_object().expect("schema definitions");
@@ -673,6 +724,21 @@ fn generated_schema_is_valid_draft_2020_12_and_rejects_unknown_fields() {
             json!({"kind":"operation","operation_id":OPERATION_ID}),
         ),
         (
+            "AgentErrorDetails",
+            "AgentErrorDetails::Repository",
+            json!({"kind":"repository","available_repository_ids":["repo-1"]}),
+        ),
+        (
+            "AgentRepositorySummary",
+            "AgentRepositorySummary",
+            json!({"repository_id":"repo-1","snapshot":{"available":false}}),
+        ),
+        (
+            "AgentRepositoryList",
+            "AgentRepositoryList",
+            json!({"repositories":[{"repository_id":"repo-1","snapshot":{"available":false}}]}),
+        ),
+        (
             "AgentError",
             "AgentError",
             json!({"code":"OPERATION_NOT_READY","category":"state","retryable":true,"remediation":"poll_operation"}),
@@ -886,7 +952,9 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 190, "review newly added object schemas explicitly");
+    // Issue #540 adds AgentRepositorySummary, AgentRepositoryList, its success envelope,
+    // and the AgentErrorDetails::Repository branch.
+    assert_eq!(objects, 194, "review newly added object schemas explicitly");
 }
 
 #[test]

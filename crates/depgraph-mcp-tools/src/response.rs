@@ -26,12 +26,13 @@ use crate::{
     AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse,
-    AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor, DurableSubmitResult,
-    ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, PortableTerminalOutput,
-    SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
+    PageRequest, PortableTerminalOutput, SnapshotId, SuccessEnvelope, TaskAccepted,
+    canonical_json_bytes,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -93,6 +94,7 @@ public_result!(
     AgentHealthHotspots,
     AgentHealthSummary,
     AgentRepositoryInitOutcome,
+    AgentRepositoryList,
     AgentOperation,
     DurableSubmitResult,
     OperationAccepted,

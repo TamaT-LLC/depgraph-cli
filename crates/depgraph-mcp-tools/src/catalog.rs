@@ -12,10 +12,11 @@ use crate::{
     AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
     AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
-    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRuntimeValidationResponse,
-    AgentSite, AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
-    LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
-    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse, AgentUnresolved, Cursor,
+    ErrorEnvelope, IdempotencyKey, LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId,
+    Page, PortableTerminalOutput, RepositoryRelativePath, SnapshotId, SnapshotName,
+    SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -324,7 +325,16 @@ macro_rules! tool_spec {
 const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "get_context",
-        "Get logical repository identity, enabled capabilities, and current snapshot context.",
+        "Get logical repository identity, enabled capabilities, and current snapshot context. repository_id is optional on every tool and defaults to the repository this server is bound to; the returned repository_id, repository_list, and INVALID_ARGUMENT error.details.available_repository_ids all report the valid value.",
+        [],
+        [],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "repository_list",
+        "List the logical repositories this server can address, each with its latest completed snapshot summary. Use the returned repository_id for other tools, or omit repository_id to use the server's default (bound) repository. Host-private root and Store paths are never returned.",
         [],
         [],
         READ,
@@ -784,14 +794,11 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
         "contract_version".to_owned(),
         json!({"type": "string", "const": MCP_TOOLS_CONTRACT_VERSION}),
     );
-    properties.insert(
-        "repository_id".to_owned(),
-        scalar_schema::<LogicalRepositoryId>(),
-    );
+    properties.insert("repository_id".to_owned(), repository_id_schema());
     for field in spec.input_fields {
         properties.insert((*field).to_owned(), field_schema(spec.name, field));
     }
-    let mut required = vec!["contract_version", "repository_id"];
+    let mut required = vec!["contract_version"];
     required.extend_from_slice(required_input_fields(spec.name));
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -838,6 +845,9 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
     match spec.name {
         "get_context" => {
             return exact_success_output_schema::<AgentContext>(spec.name);
+        }
+        "repository_list" => {
+            return exact_success_output_schema::<AgentRepositoryList>(spec.name);
         }
         "agent_node_get" => {
             return exact_success_output_schema::<AgentNode>(spec.name);
@@ -1189,6 +1199,17 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
     }
+}
+
+const REPOSITORY_ID_DESCRIPTION: &str = "Optional logical repository ID. When omitted, the tool uses the repository this server is bound to (the default). Discover valid values with repository_list or get_context; an unknown value fails with INVALID_ARGUMENT whose error.details.available_repository_ids lists the valid IDs.";
+
+fn repository_id_schema() -> Value {
+    let mut schema = scalar_schema::<LogicalRepositoryId>();
+    schema
+        .as_object_mut()
+        .expect("logical repository ID schema is an object")
+        .insert("description".to_owned(), json!(REPOSITORY_ID_DESCRIPTION));
+    schema
 }
 
 fn snapshot_selector_schema() -> Value {

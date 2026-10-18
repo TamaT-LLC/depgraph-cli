@@ -5,7 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
-    ContractValueError, Cursor, LogicalRepositoryId, OperationId, SnapshotId, SnapshotName,
+    AgentRepositoryIds, ContractValueError, Cursor, LogicalRepositoryId, OperationId, SnapshotId,
+    SnapshotName,
 };
 
 pub const MCP_TOOLS_CONTRACT_VERSION: &str = "depgraph-mcp-tools-v1";
@@ -505,6 +506,11 @@ pub enum AgentErrorDetails {
     Operation {
         operation_id: OperationId,
     },
+    /// The requested `repository_id` is not served here; retry with one of these IDs
+    /// or omit `repository_id` to use the server's bound repository.
+    Repository {
+        available_repository_ids: AgentRepositoryIds,
+    },
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
@@ -685,4 +691,6 @@ pub enum ContractBuildError {
     PolicyEvaluationState,
     #[error("Agent graph export state is inconsistent")]
     GraphExportState,
+    #[error("Agent repository identifiers must be non-empty, bounded, unique, and stably ordered")]
+    RepositorySet,
 }

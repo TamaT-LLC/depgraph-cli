@@ -13,11 +13,11 @@ use crate::{
     AgentHealthHotspots, AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot,
     AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
-    AgentRepositoryInitOutcome, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
-    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
-    SuccessEnvelope, TaskAccepted,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary, AgentRuntimeOutcome,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest,
+    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
+    PortableTerminalOutput, SnapshotSelector, SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -55,6 +55,7 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<Page<AgentRuntimeTraceEvent>>(),
             generator.subschema_for::<SuccessEnvelope<AgentNode>>(),
             generator.subschema_for::<SuccessEnvelope<AgentContext>>(),
+            generator.subschema_for::<SuccessEnvelope<AgentRepositoryList>>(),
             generator.subschema_for::<SuccessEnvelope<AgentCompletedSnapshot>>(),
             generator.subschema_for::<SuccessEnvelope<AgentProfilePlan>>(),
             generator.subschema_for::<SuccessEnvelope<AgentDaemonStatus>>(),
@@ -95,6 +96,8 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentNamedSnapshot>(),
             generator.subschema_for::<AgentCurrentSnapshot>(),
             generator.subschema_for::<AgentContext>(),
+            generator.subschema_for::<AgentRepositorySummary>(),
+            generator.subschema_for::<AgentRepositoryList>(),
             generator.subschema_for::<AgentSite>(),
             generator.subschema_for::<AgentEdge>(),
             generator.subschema_for::<AgentEvidence>(),

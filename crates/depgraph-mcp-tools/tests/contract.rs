@@ -10,15 +10,15 @@ use depgraph_mcp_tools::{
     AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
     AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase,
     AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
-    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
-    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
-    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation, AgentRepositoryIds,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary, AgentResolutionStatus,
+    AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
     MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
-    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
+    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
     PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
     SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
@@ -561,6 +561,28 @@ fn context() -> AgentContext {
     .expect("representative context")
 }
 
+fn repository_summary(repository_id: &str) -> AgentRepositorySummary {
+    AgentRepositorySummary::new(
+        parse(repository_id),
+        AgentCurrentSnapshot::available(completed_snapshot()),
+    )
+}
+
+fn repository_list() -> AgentRepositoryList {
+    AgentRepositoryList::new(vec![repository_summary("repo-1")]).expect("representative list")
+}
+
+fn repository_error() -> AgentError {
+    AgentError::new(
+        AgentErrorCode::InvalidArgument,
+        false,
+        AgentRemediation::CorrectInput,
+        Some(AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        }),
+    )
+}
+
 fn named_snapshot() -> AgentNamedSnapshot {
     AgentNamedSnapshot::new(
         parse("baseline"),
@@ -901,6 +923,18 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
     assert_unknown_field_rejected::<AgentErrorDetails>(
         "AgentErrorDetails::Operation",
         json!({"kind":"operation","operation_id":OPERATION_ID}),
+    );
+    assert_unknown_field_rejected::<AgentErrorDetails>(
+        "AgentErrorDetails::Repository",
+        json!({"kind":"repository","available_repository_ids":["repo-1"]}),
+    );
+    assert_unknown_field_rejected::<AgentRepositorySummary>(
+        "AgentRepositorySummary",
+        serde_json::to_value(repository_summary("repo-1")).expect("serialize summary"),
+    );
+    assert_unknown_field_rejected::<AgentRepositoryList>(
+        "AgentRepositoryList",
+        serde_json::to_value(repository_list()).expect("serialize repository list"),
     );
     assert_unknown_field_rejected::<AgentError>(
         "AgentError",
@@ -1633,6 +1667,9 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         AgentErrorDetails::Operation {
             operation_id: parse(OPERATION_ID),
         },
+        AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        },
     ];
     for detail in details {
         let round_trip = serde_json::from_value::<AgentErrorDetails>(
@@ -1641,6 +1678,102 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         .expect("deserialize typed details");
         assert_eq!(round_trip, detail);
     }
+}
+
+#[test]
+fn issue_540_repository_ids_are_bounded_unique_and_canonically_ordered() {
+    let ids = |count: usize| {
+        (0..count)
+            .map(|index| parse::<LogicalRepositoryId>(&format!("repo-{index:03}")))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        AgentRepositoryIds::new(Vec::new()),
+        Err(ContractBuildError::RepositorySet)
+    );
+    assert_eq!(
+        AgentRepositoryIds::new(ids(MAX_AGENT_REPOSITORY_ITEMS + 1)),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let maximum = AgentRepositoryIds::new(ids(MAX_AGENT_REPOSITORY_ITEMS)).expect("maximum ids");
+    assert_eq!(maximum.as_slice().len(), MAX_AGENT_REPOSITORY_ITEMS);
+    let canonical = AgentRepositoryIds::new(vec![parse("web"), parse("api"), parse("web")])
+        .expect("constructor canonicalizes");
+    assert_eq!(
+        serde_json::to_value(&canonical).expect("serialize ids"),
+        json!(["api", "web"])
+    );
+
+    for forged in [
+        json!({"kind":"repository","available_repository_ids":[]}),
+        json!({"kind":"repository","available_repository_ids":["web","api"]}),
+        json!({"kind":"repository","available_repository_ids":["web","web"]}),
+        json!({"kind":"repository","available_repository_ids":["/abs/root"]}),
+        json!({"kind":"repository","available_repository_ids":ids(MAX_AGENT_REPOSITORY_ITEMS + 1)}),
+        json!({"kind":"repository"}),
+    ] {
+        assert!(
+            serde_json::from_value::<AgentErrorDetails>(forged.clone()).is_err(),
+            "accepted forged repository details: {forged}"
+        );
+    }
+    let envelope = ErrorEnvelope::new(parse("web"), repository_error());
+    let round_trip = serde_json::from_value::<ErrorEnvelope>(
+        serde_json::to_value(&envelope).expect("serialize envelope"),
+    )
+    .expect("deserialize envelope");
+    assert_eq!(round_trip, envelope);
+    assert_eq!(
+        round_trip.error().details(),
+        Some(&AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        })
+    );
+}
+
+#[test]
+fn issue_540_repository_list_is_bounded_unique_and_omits_host_paths() {
+    assert_eq!(
+        AgentRepositoryList::new(Vec::new()),
+        Err(ContractBuildError::RepositorySet)
+    );
+    assert_eq!(
+        AgentRepositoryList::new(vec![repository_summary("a"), repository_summary("a")]),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let too_many = (0..=MAX_AGENT_REPOSITORY_ITEMS)
+        .map(|index| repository_summary(&format!("repo-{index:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        AgentRepositoryList::new(too_many),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let ordered =
+        AgentRepositoryList::new(vec![repository_summary("web"), repository_summary("api")])
+            .expect("constructor orders repositories");
+    let ids = ordered
+        .repositories()
+        .iter()
+        .map(|summary| summary.repository_id().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["api", "web"]);
+
+    let value = serde_json::to_value(repository_list()).expect("serialize list");
+    assert_eq!(value["repositories"][0]["repository_id"], "repo-1");
+    assert_eq!(value["repositories"][0]["snapshot"]["available"], true);
+    for forbidden in ["root", "path", "store", "repository_path"] {
+        assert!(value["repositories"][0].get(forbidden).is_none());
+    }
+    let mut unordered = serde_json::to_value(&ordered).expect("serialize ordered list");
+    unordered["repositories"]
+        .as_array_mut()
+        .expect("repositories array")
+        .reverse();
+    assert!(serde_json::from_value::<AgentRepositoryList>(unordered).is_err());
+    assert!(serde_json::from_value::<AgentRepositoryList>(json!({"repositories": []})).is_err());
+    let mut with_root = serde_json::to_value(repository_list()).expect("serialize list");
+    with_root["repositories"][0]["root"] = json!("/home/user/repository");
+    assert!(serde_json::from_value::<AgentRepositoryList>(with_root).is_err());
 }
 
 #[test]
@@ -1817,6 +1950,7 @@ fn contract_samples() -> Value {
         "agent_query_row": query_row(),
         "agent_runtime_validation": runtime_validation(),
         "agent_context": context(),
+        "agent_repository_list": repository_list(),
         "agent_named_snapshot": named_snapshot(),
         "agent_site": site(),
         "agent_snapshot": AgentSnapshot::available(snapshot_id, Some(parse("baseline"))),
@@ -1824,6 +1958,7 @@ fn contract_samples() -> Value {
         "durable_submit_baseline": baseline,
         "durable_submit_task": task,
         "error_envelope": error_envelope,
+        "error_envelope_repository": ErrorEnvelope::new(repository_id.clone(), repository_error()),
         "page": page,
         "page_request": PageRequest::new(
             PageSize::new(25).expect("sample page size"),

@@ -7,6 +7,7 @@ mod health_dto;
 mod host_config;
 mod lifecycle;
 mod operation;
+mod repository;
 mod response;
 mod scalar;
 mod schema;
@@ -78,6 +79,9 @@ pub use operation::{
     PortableTerminalOutputContract, PortableTerminalOutputError, TASK_POLL_INTERVAL_MS,
     TaskAccepted, TaskResultType, TasksNegotiation, UNBOUNDED_SCAN_DEADLINE_MS,
     UNBOUNDED_SCAN_RETAIN_UNTIL_MS,
+};
+pub use repository::{
+    AgentRepositoryIds, AgentRepositoryList, AgentRepositorySummary, MAX_AGENT_REPOSITORY_ITEMS,
 };
 pub use response::{
     CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,

@@ -42,6 +42,7 @@ additive extensionとして採用するかを決定する。
 | Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v3` |
 | Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
 | Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
+| Repository discovery | `repository_list`, optional `repository_id` | Issue #540 implemented: omitted `repository_id` binds to the server repository; mismatches return `INVALID_ARGUMENT` with the valid IDs |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -811,6 +812,18 @@ commandはhost設定fileを変更せず、成功した設定だけをstdoutへ�
 | documentationと生成結果を同期 | shared `depgraph-agent-host-config-v1` renderer、README/runbook marker parser、format/profile mutation tests |
 | dogfood blockerのresolution | runbookのP0/P1/P2分類、safe scan remediation、compiler-pack boundary再評価記録 |
 | repository validation | Rust 1.93.1 format、focused CLI/MCP/xtask suites、native package smoke、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #540 repository discovery evidence
+
+Agentが最初の呼び出しで`repository_id`を推測して失敗しないよう、次の境界を固定する。
+
+| Area | Evidence |
+| --- | --- |
+| Optional input | 全toolのinput schemaで`repository_id`はrequiredから外れ、descriptionに既定値と取得方法を書く。省略時はserverが束縛する単一repositoryを使う。指定した場合のpattern検証は従来どおり |
+| Correctable error | 束縛repositoryと異なる値は`INVALID_ARGUMENT` / `correct_input`になり、`error.details`はclosed variant `{"kind":"repository","available_repository_ids":[...]}`を返す。IDは1〜64件、昇順、重複なしをconstructor、deserializer、schema(`uniqueItems`)で検証する |
+| Operation tools | `operation_get` / `operation_result` / `operation_cancel`は省略を許可する。明示した別repositoryは従来どおり`CAPABILITY_DENIED`のまま |
+| `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
 
 ## Issue #292 acceptance mapping
 

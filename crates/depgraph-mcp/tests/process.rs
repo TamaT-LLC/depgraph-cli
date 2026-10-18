@@ -1509,6 +1509,141 @@ fn issue_300_catalog_tools_call_real_handlers_and_leave_the_store_unchanged() {
 }
 
 #[test]
+fn issue_540_repository_id_defaults_to_the_bound_repository_and_errors_list_valid_ids() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_300_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let output_validator = |name: &str| {
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))["outputSchema"]
+            .clone();
+        jsonschema::draft202012::new(&schema).unwrap()
+    };
+
+    let omitted = json!({"contract_version": "depgraph-mcp-tools-v1"});
+    let context = interactive_tool_call(&mut mcp, 3, "get_context", omitted.clone());
+    assert_eq!(context["isError"], false, "{context}");
+    assert_eq!(context["structuredContent"]["repository_id"], "repository");
+    assert_eq!(
+        context["structuredContent"]["result"]["repository_id"],
+        "repository"
+    );
+    output_validator("get_context")
+        .validate(&context["structuredContent"])
+        .unwrap();
+
+    let nodes = interactive_tool_call(
+        &mut mcp,
+        4,
+        "agent_nodes_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "current",
+            "query": "fixture",
+            "match_mode": "contains",
+            "limit": 10
+        }),
+    );
+    assert_eq!(nodes["isError"], false, "{nodes}");
+    assert_eq!(nodes["structuredContent"]["repository_id"], "repository");
+
+    let operation = interactive_tool_call(
+        &mut mcp,
+        5,
+        "operation_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "operation_id": "op_00000000000000000000000000000000"
+        }),
+    );
+    assert_ne!(
+        operation["structuredContent"]["error"]["code"], "CAPABILITY_DENIED",
+        "omitted repository_id must bind operation tools to the server repository: {operation}"
+    );
+
+    let wrong = interactive_tool_call(
+        &mut mcp,
+        6,
+        "get_context",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "default"}),
+    );
+    assert_eq!(wrong["isError"], true, "{wrong}");
+    let error = &wrong["structuredContent"]["error"];
+    assert_eq!(error["code"], "INVALID_ARGUMENT");
+    assert_eq!(error["category"], "input");
+    assert_eq!(error["remediation"], "correct_input");
+    assert_eq!(
+        error["details"],
+        json!({"kind": "repository", "available_repository_ids": ["repository"]})
+    );
+    assert_eq!(wrong["structuredContent"]["repository_id"], "repository");
+    output_validator("get_context")
+        .validate(&wrong["structuredContent"])
+        .unwrap();
+    shared.validate(&wrong["structuredContent"]).unwrap();
+    assert_tool_text_matches_structured(&wrong);
+
+    for (id, arguments) in [
+        (7, omitted),
+        (
+            8,
+            json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "repository"}),
+        ),
+    ] {
+        let listed = interactive_tool_call(&mut mcp, id, "repository_list", arguments);
+        assert_eq!(listed["isError"], false, "{listed}");
+        assert_tool_text_matches_structured(&listed);
+        output_validator("repository_list")
+            .validate(&listed["structuredContent"])
+            .unwrap();
+        shared.validate(&listed["structuredContent"]).unwrap();
+        let structured = &listed["structuredContent"];
+        assert_eq!(structured["repository_id"], "repository");
+        let repositories = structured["result"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["repository_id"], "repository");
+        assert_eq!(repositories[0]["snapshot"]["available"], true);
+        assert_eq!(
+            repositories[0]["snapshot"]["details"]["snapshot_id"],
+            snapshot_id
+        );
+        let encoded = structured.to_string();
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(store_path.to_string_lossy().as_ref()));
+    }
+
+    let wrong_list = interactive_tool_call(
+        &mut mcp,
+        9,
+        "repository_list",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "repository_id": "default"}),
+    );
+    assert_eq!(
+        wrong_list["structuredContent"]["error"]["details"]["available_repository_ids"],
+        json!(["repository"])
+    );
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
 fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_exhaustion() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -5383,7 +5518,7 @@ fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
     let store_write_tools = {
         let mut command = command(&root, &store_path, requirement().path());
         command.args(["--capability", "store-write"]);
-        tools_list(command, 33)
+        tools_list(command, 34)
     };
     assert!(!store_write_tools.contains(&"daemon_start_submit".to_owned()));
     assert!(!store_write_tools.contains(&"daemon_stop".to_owned()));
@@ -6186,6 +6321,7 @@ const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[
     "operation_result",
     "policy_evaluate",
     "profile_plan_get",
+    "repository_list",
     "runtime_trace_validate",
     "snapshot_diff_get",
     "snapshot_get",
@@ -6621,6 +6757,11 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                 "profile_plan_get",
                 json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
                 None,
+            ),
+            (
+                "repository_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository"}),
+                Some(false),
             ),
             (
                 "runtime_trace_validate",

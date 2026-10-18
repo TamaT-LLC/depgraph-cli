@@ -40,7 +40,8 @@ use depgraph_mcp_tools::{
     AgentOperationStatus, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
     AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
     AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
-    AgentRemediation, AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeTraceEvent,
+    AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRepositorySummary, AgentResourceLimit, AgentRuntimeTraceEvent,
     AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
     AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
     AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
@@ -187,14 +188,16 @@ tokio::task_local! {
 #[serde(deny_unknown_fields)]
 struct ContextArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OperationArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     operation_id: OperationId,
 }
 
@@ -202,7 +205,8 @@ struct OperationArguments {
 #[serde(deny_unknown_fields)]
 struct ScanSubmitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
     #[serde(default)]
     strict: bool,
@@ -214,7 +218,8 @@ struct ScanSubmitArguments {
 #[serde(deny_unknown_fields)]
 struct DaemonStartSubmitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
     #[serde(default)]
     strict: bool,
@@ -224,7 +229,8 @@ struct DaemonStartSubmitArguments {
 #[serde(deny_unknown_fields)]
 struct DaemonStopArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
 }
 
@@ -232,7 +238,8 @@ struct DaemonStopArguments {
 #[serde(deny_unknown_fields)]
 struct ResolveBuildSubmitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
     acknowledgement: bool,
     rust_compiler_precise: bool,
@@ -242,7 +249,8 @@ struct ResolveBuildSubmitArguments {
 #[serde(deny_unknown_fields)]
 struct RepositoryInitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     force: bool,
 }
@@ -251,7 +259,8 @@ struct RepositoryInitArguments {
 #[serde(deny_unknown_fields)]
 struct RuntimeImportSubmitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
     #[serde(default)]
     trace: Option<String>,
@@ -265,7 +274,8 @@ struct RuntimeImportSubmitArguments {
 #[serde(deny_unknown_fields)]
 struct SnapshotNameCreateArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     name: SnapshotName,
     #[serde(default)]
     snapshot: Option<String>,
@@ -293,7 +303,8 @@ impl From<NodeMatchArgument> for NodeMatchMode {
 #[serde(deny_unknown_fields)]
 struct FindNodesArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     query: String,
     match_mode: NodeMatchArgument,
     #[serde(default)]
@@ -310,7 +321,8 @@ struct FindNodesArguments {
 #[serde(deny_unknown_fields)]
 struct AgentNodeGetArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     node_id: String,
     #[serde(default)]
     snapshot: Option<String>,
@@ -320,7 +332,8 @@ struct AgentNodeGetArguments {
 #[serde(deny_unknown_fields)]
 struct AgentSitesListArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default)]
@@ -352,7 +365,8 @@ impl From<AgentEdgesDirection> for EdgeDirection {
 #[serde(deny_unknown_fields)]
 struct AgentEdgesListArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     node_id: String,
     #[serde(default)]
     snapshot: Option<String>,
@@ -371,7 +385,8 @@ fn default_agent_edges_direction() -> AgentEdgesDirection {
 #[serde(deny_unknown_fields)]
 struct AgentEvidenceListArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     site_id: String,
     #[serde(default)]
     snapshot: Option<String>,
@@ -385,7 +400,8 @@ struct AgentEvidenceListArguments {
 #[serde(deny_unknown_fields)]
 struct SnapshotListArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -396,7 +412,8 @@ struct SnapshotListArguments {
 #[serde(deny_unknown_fields)]
 struct SnapshotGetArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     snapshot: String,
 }
 
@@ -404,7 +421,8 @@ struct SnapshotGetArguments {
 #[serde(deny_unknown_fields)]
 struct ProfilesPlanArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     profile_budget: Option<u32>,
     #[serde(default)]
@@ -417,7 +435,8 @@ struct ProfilesPlanArguments {
 #[serde(deny_unknown_fields)]
 struct DoctorArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     details: bool,
 }
@@ -426,14 +445,16 @@ struct DoctorArguments {
 #[serde(deny_unknown_fields)]
 struct DaemonStatusArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphDependenciesArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     selector: AgentLocator,
     #[serde(default)]
     snapshot: Option<String>,
@@ -459,7 +480,8 @@ struct GraphDependenciesArguments {
 #[serde(deny_unknown_fields)]
 struct GraphPathArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     from: AgentLocator,
     to: AgentLocator,
     #[serde(default)]
@@ -480,7 +502,8 @@ struct GraphPathArguments {
 #[serde(deny_unknown_fields)]
 struct GraphImpactArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     selector: AgentLocator,
     #[serde(default)]
     snapshot: Option<String>,
@@ -512,7 +535,8 @@ struct GraphImpactArguments {
 #[serde(deny_unknown_fields)]
 struct GraphCyclesArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default = "default_cycle_level")]
@@ -533,7 +557,8 @@ const fn default_cycle_level() -> AgentCycleLevel {
 #[serde(deny_unknown_fields)]
 struct GraphUnresolvedArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default)]
@@ -550,7 +575,8 @@ struct GraphUnresolvedArguments {
 #[serde(deny_unknown_fields)]
 struct GraphQueryArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
@@ -567,7 +593,8 @@ struct GraphQueryArguments {
 #[serde(deny_unknown_fields)]
 struct RuntimeValidateArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     trace: Option<String>,
     #[serde(default)]
@@ -584,7 +611,8 @@ struct RuntimeValidateArguments {
 #[serde(deny_unknown_fields)]
 struct SnapshotDiffArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     from: String,
     to: String,
     #[serde(default)]
@@ -595,7 +623,8 @@ struct SnapshotDiffArguments {
 #[serde(deny_unknown_fields)]
 struct PolicyEvaluateArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     from: String,
     to: String,
 }
@@ -604,7 +633,8 @@ struct PolicyEvaluateArguments {
 #[serde(deny_unknown_fields)]
 struct HealthSummaryArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default)]
@@ -617,7 +647,8 @@ struct HealthSummaryArguments {
 #[serde(deny_unknown_fields)]
 struct HealthFindingsArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default)]
@@ -638,7 +669,8 @@ struct HealthFindingsArguments {
 #[serde(deny_unknown_fields)]
 struct HealthFindingGetArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     finding_id: String,
@@ -648,7 +680,8 @@ struct HealthFindingGetArguments {
 #[serde(deny_unknown_fields)]
 struct HealthAuditArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     changed: String,
@@ -664,7 +697,8 @@ struct HealthAuditArguments {
 #[serde(deny_unknown_fields)]
 struct HealthHotspotsArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     #[serde(default)]
     snapshot: Option<String>,
     #[serde(default)]
@@ -711,7 +745,8 @@ impl From<GraphExportFormatArgument> for GraphExportFormat {
 #[serde(deny_unknown_fields)]
 struct GraphExportArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     format: GraphExportFormatArgument,
     #[serde(default)]
     snapshot: Option<String>,
@@ -727,7 +762,8 @@ struct GraphExportArguments {
 #[serde(deny_unknown_fields)]
 struct ExportFileSubmitArguments {
     contract_version: ContractVersion,
-    repository_id: LogicalRepositoryId,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
     idempotency_key: IdempotencyKey,
     output_path: RepositoryRelativePath,
     #[serde(default)]
@@ -1354,6 +1390,7 @@ impl ServerHandler for DepgraphMcpServer {
         if !matches!(
             tool.as_str(),
             "get_context"
+                | "repository_list"
                 | "agent_nodes_list"
                 | "agent_node_get"
                 | "agent_sites_list"
@@ -1713,18 +1750,32 @@ fn validate_array_argument_lengths(
     Ok(())
 }
 
+/// An omitted `repository_id` selects the repository this server is bound to.
+/// A mismatching one is rejected with the valid IDs so the Agent can retry
+/// without guessing (Issue #540).
 fn authorize_repository(
     contract_version: ContractVersion,
-    requested: &LogicalRepositoryId,
+    requested: Option<&LogicalRepositoryId>,
     actual: &LogicalRepositoryId,
 ) -> Result<(), ToolExecutionFailure> {
     let _ = contract_version;
-    if requested != actual {
-        return Err(ToolExecutionFailure::Service(
-            DepgraphServiceError::InvalidInput,
-        ));
+    match requested {
+        Some(requested) if requested != actual => Err(ToolExecutionFailure::Agent(
+            unknown_repository_error(actual),
+        )),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+fn unknown_repository_error(actual: &LogicalRepositoryId) -> AgentError {
+    AgentError::new(
+        AgentErrorCode::InvalidArgument,
+        false,
+        AgentRemediation::CorrectInput,
+        Some(AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(actual.clone()),
+        }),
+    )
 }
 
 fn page_request(
@@ -1752,7 +1803,7 @@ fn execute_scan_submit(
     let arguments = decode_arguments::<ScanSubmitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     if cancellation.is_cancelled() {
@@ -1783,7 +1834,7 @@ fn execute_daemon_start_submit(
     let arguments = decode_arguments::<DaemonStartSubmitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     if cancellation.is_cancelled() {
@@ -1809,7 +1860,7 @@ fn execute_daemon_stop_submit(
     let arguments = decode_arguments::<DaemonStopArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     if cancellation.is_cancelled() {
@@ -1836,7 +1887,7 @@ fn execute_resolve_build_submit(
     let arguments = decode_arguments::<ResolveBuildSubmitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     // False acknowledgement and non-exact modes fail before journal, store
@@ -1878,7 +1929,7 @@ fn execute_export_file_submit(
     let arguments = decode_arguments::<ExportFileSubmitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     if cancellation.is_cancelled() {
@@ -2055,7 +2106,7 @@ fn execute_runtime_import_submit(
     let arguments = decode_arguments::<RuntimeImportSubmitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     if cancellation.is_cancelled() {
@@ -2522,7 +2573,7 @@ fn execute_repository_init(
     let arguments = decode_arguments::<RepositoryInitArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     let initialized =
@@ -2542,7 +2593,7 @@ fn execute_snapshot_name_create(
     let arguments = decode_arguments::<SnapshotNameCreateArguments>(arguments)?;
     authorize_repository(
         arguments.contract_version,
-        &arguments.repository_id,
+        arguments.repository_id.as_ref(),
         repository_id,
     )?;
     let selector = SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
@@ -2569,7 +2620,13 @@ fn execute_operation_tool(
 ) -> Result<MappedToolResult, ToolExecutionFailure> {
     let arguments = decode_arguments::<OperationArguments>(arguments)?;
     let _ = arguments.contract_version;
-    if &arguments.repository_id != repository_id {
+    // Operation records are bound to their repository, so a foreign ID stays an
+    // authorization failure rather than an input correction hint.
+    if arguments
+        .repository_id
+        .as_ref()
+        .is_some_and(|requested| requested != repository_id)
+    {
         return Err(ToolExecutionFailure::Agent(AgentError::new(
             AgentErrorCode::CapabilityDenied,
             false,
@@ -2859,7 +2916,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<ContextArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let context = service.get_context_cancellable(cancellation)?;
@@ -2877,11 +2934,35 @@ fn execute_catalog_read_tool(
             ))
             .map_err(Into::into)
         }
+        "repository_list" => {
+            let arguments = decode_arguments::<ContextArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                arguments.repository_id.as_ref(),
+                repository_id,
+            )?;
+            let context = service.get_context_cancellable(cancellation)?;
+            let summary = AgentRepositorySummary::try_from(&context)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            if summary.repository_id() != repository_id {
+                return Err(ToolExecutionFailure::Service(
+                    DepgraphServiceError::Integrity,
+                ));
+            }
+            let result = AgentRepositoryList::new(vec![summary])
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                None,
+                result,
+            ))
+            .map_err(Into::into)
+        }
         "agent_nodes_list" => {
             let arguments = decode_arguments::<FindNodesArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             if arguments.kinds.len() > 1_024 {
@@ -2949,7 +3030,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<AgentNodeGetArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let node_id = AgentId::parse(&arguments.node_id)
@@ -2998,7 +3079,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<AgentSitesListArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             if let Some(node_id) = arguments.node_id.as_deref() {
@@ -3050,7 +3131,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<AgentEdgesListArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             AgentId::parse(&arguments.node_id)
@@ -3102,7 +3183,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<AgentEvidenceListArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             AgentId::parse(&arguments.site_id)
@@ -3151,7 +3232,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<SnapshotListArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let context = service.get_context_cancellable(cancellation)?;
@@ -3197,7 +3278,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<SnapshotGetArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let snapshot = SnapshotLocator::parse(arguments.snapshot)?;
@@ -3216,7 +3297,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<ProfilesPlanArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let result = service.profile_plan_cancellable(
@@ -3238,7 +3319,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<DaemonStatusArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let result =
@@ -3255,7 +3336,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<DoctorArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let result = service.doctor_cancellable(
@@ -3277,7 +3358,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphDependenciesArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             validate_graph_filter_lengths(
@@ -3360,7 +3441,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphPathArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             validate_graph_filter_lengths(
@@ -3408,7 +3489,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphImpactArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             validate_graph_filter_lengths(
@@ -3481,7 +3562,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphCyclesArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let level = match arguments.level {
@@ -3525,7 +3606,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphUnresolvedArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             if arguments.kinds.len() > 1_024 {
@@ -3573,7 +3654,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<SnapshotDiffArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = SnapshotDiffRequest::new(
@@ -3595,7 +3676,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<PolicyEvaluateArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = PolicyEvaluateRequest::new(
@@ -3617,7 +3698,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<HealthSummaryArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let kinds = if arguments.kinds.is_empty() {
@@ -3657,7 +3738,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<HealthFindingsArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = HealthFindingsRequest::try_new(
@@ -3712,7 +3793,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<HealthFindingGetArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = HealthFindingGetRequest::try_new(arguments.finding_id)?;
@@ -3736,7 +3817,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<HealthAuditArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = HealthAuditRequest::try_new(arguments.changed, arguments.base_snapshot)?;
@@ -3788,7 +3869,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<HealthHotspotsArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let defaults = DEFAULT_HOTSPOT_WEIGHTS;
@@ -3848,7 +3929,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphExportArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let request = GraphExportRequest::try_new(
@@ -3879,7 +3960,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<GraphQueryArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let locator =
@@ -3927,7 +4008,7 @@ fn execute_catalog_read_tool(
             let arguments = decode_arguments::<RuntimeValidateArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
-                &arguments.repository_id,
+                arguments.repository_id.as_ref(),
                 repository_id,
             )?;
             let locator =
