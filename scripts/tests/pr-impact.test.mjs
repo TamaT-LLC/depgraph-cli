@@ -436,6 +436,36 @@ test("collectReport reads a strict policy_failed attempt because it is never sto
   assert.equal(report.incomplete, false);
 });
 
+test("collectReport does not query a strict violation whose attempt id is missing", async () => {
+  const { runGit } = fakeGit(["M", "a.ts", "D", "gone.ts", ""].join("\0"));
+  let called = false;
+  const report = await collectReport({
+    baseRef: "main",
+    store: "/s",
+    profiles: [],
+    maxFiles: 10,
+    scanExitCode: 1,
+    scanOutput: { status: "policy_failed", error: "strict policy failed: unresolved=1 (max 0)" },
+    strict: true,
+    runGit,
+    runDepgraph: async () => {
+      called = true;
+      return { exitCode: 0, stdout: JSON.stringify({ data: okResult([]).data }), stderr: "" };
+    },
+  });
+  assert.equal(called, false);
+  assert.equal(report.scan.status, "policy_violation");
+  assert.equal(report.changed_files.find((file) => file.path === "a.ts").status, "not_analyzed");
+  assert.equal(report.changed_files.find((file) => file.path === "gone.ts").status, "deleted");
+  assert.equal(report.incomplete, true);
+
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.match(body, /ポリシー違反/);
+  assert.doesNotMatch(body, /影響を受けるノードは見つかりませんでした/);
+  assert.match(body, /影響範囲は計算していません/);
+  assert.match(body, /a\.ts — scan 結果を照会できないため未解析/);
+});
+
 test("collectReport shortens runner-absolute paths in the scan error", async () => {
   const { runGit } = fakeGit("");
   const report = await collectReport({

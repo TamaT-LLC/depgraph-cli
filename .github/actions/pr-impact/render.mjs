@@ -196,7 +196,7 @@ function fileProblemLines(report) {
         lines.push(`- ${path} — 削除されたファイル（影響範囲は計算していません）`);
         break;
       case "not_analyzed":
-        lines.push(`- ${path} — scan 失敗のため未解析`);
+        lines.push(`- ${path} — scan 結果を照会できないため未解析`);
         break;
       default:
         if (file.complete === false) lines.push(`- ${path} — 上限に達したため結果が不完全です`);
@@ -244,7 +244,10 @@ export function renderComment(report, { repository, maxLength = DEFAULT_MAX_LENG
   const head = [COMMENT_MARKER, "### depgraph: この PR の影響範囲", "", summaryLine(report), ""];
   const notices = scanNotices(report);
   if (notices.length > 0) head.push(...notices, "");
-  if (report.scan.status !== "failed") {
+  const notAnalyzed = report.changed_files.some((file) => file.status === "not_analyzed");
+  if (report.scan.status !== "failed" && notAnalyzed) {
+    head.push("scan 結果を照会できなかったため、影響範囲は計算していません。", "");
+  } else if (report.scan.status !== "failed") {
     if (report.impacted.length === 0) {
       head.push("影響を受けるノードは見つかりませんでした。", "");
     } else if (routes.length === 0 && packages.length === 0) {

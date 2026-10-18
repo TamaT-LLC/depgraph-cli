@@ -10,7 +10,7 @@ inputs:
     required: false
     default: "0.6.4"
   depgraph-path:
-    description: Use this depgraph binary instead of downloading a release.
+    description: Use this depgraph binary instead of downloading a release. A relative path is resolved from the workspace root.
     required: false
     default: ""
   base-ref:
@@ -119,6 +119,9 @@ runs:
           echo "::error::depgraph binary is not executable" >&2
           exit 2
         fi
+        # Later steps run in inputs.working-directory, so pin the binary to an
+        # absolute path resolved from this step's directory (the workspace).
+        binary="$(cd -- "$(dirname -- "$binary")" && pwd -P)/$(basename -- "$binary")"
         version="$("$binary" --version | awk '{ print $2 }')"
         echo "path=${binary}" >>"$GITHUB_OUTPUT"
         echo "version=${version}" >>"$GITHUB_OUTPUT"

@@ -202,6 +202,8 @@ export function aggregateReport({
       entry.exit_code = result.exitCode;
       entry.message = result.message;
       if (result.status === "error") incomplete = true;
+    } else if (result.status === "not_analyzed") {
+      incomplete = true;
     }
     changedFiles.push(entry);
   }
@@ -307,7 +309,9 @@ export async function collectReport({
   const attemptId = scanAttemptId(scanExitCode, scanOutput);
   const message = scanMessage ?? (scanOutput && typeof scanOutput.error === "string" ? messageHead(shortenAbsolutePaths(scanOutput.error)) : undefined);
   const scan = { exitCode: scanExitCode, partial: attemptId !== undefined && scanExitCode === SCAN_EXIT_WORKER_FAILURE, message };
-  const canQuery = scanExitCode === SCAN_EXIT_OK || scanExitCode === SCAN_EXIT_POLICY_VIOLATION || attemptId !== undefined;
+  // A non-zero scan leaves only an attempt behind; without its id an impact
+  // query cannot read what this scan produced, so it must not be issued.
+  const canQuery = scanExitCode === SCAN_EXIT_OK || attemptId !== undefined;
 
   const files = [];
   const skipped = [];
