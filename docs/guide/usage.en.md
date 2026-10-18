@@ -202,7 +202,9 @@ Failed/partial scans and diagnostics remain stored, but only a complete policy-p
 ## Impact of a whole changed file set
 
 Omitting the selector from `impact --changed <GIT_REF>` returns the reverse impact of every changed file in one run.
-The graph is loaded and traversed once, which is faster than running `impact` per file.
+The graph is loaded once, and the combined impact comes from one multi-source reverse traversal, which is faster than running `impact` per file.
+To populate `changed_paths`, depgraph then runs a bounded reverse traversal per changed path within the nodes already reached.
+If this attribution exceeds the service preprocessing work limit, the command fails with exit code 3.
 `--changed` with a selector still uses that selector as the focus.
 
 With `--json`, `data.mode` is `changed_set`. The main fields are:
