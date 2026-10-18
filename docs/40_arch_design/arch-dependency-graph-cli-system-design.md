@@ -106,7 +106,7 @@ Issue #181でpublic `depgraph query`を追加した。`--query` / `--file`をcla
 
 Issue #182で`bounded-query-release-smoke-v1`を追加した。parser / type checker / planner / executorを決定論的byte mutation corpusへ通し、malformed / deep / wide / alternate-path入力がpanic、hang、prefix acceptance、partial resultを起こさないことを固定する。10,000-file benchmarkはexact-sourceのadmitted plan / canonical executionと、同じgraphに対するdepth 8 hostile planの事前拒否を計測し、plan bounds、runtime metrics、result digestを`depgraph-benchmark-report-v7`へ記録する。全5 native packageはmanifestに同一query fixtureとlanguage / type / statistics / plan / limit / result versionを固定し、SBOMとlicense inventoryへfirst-party contractとして含める。各native packageがcheckout-equivalent storeでquery / explainの同一canonical bytesを実行し、target別sidecarのplan / result / output digestをrelease asset集約とstable gateで一致検証する。fixture missing / tamper、capability version drift、sidecar output driftはfail closedである。
 
-Issue #153として`public-readiness-v1`を採用し、repository visibilityの現行判断を`private / reject`へ固定した。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
+Issue #153として`public-readiness-v1`を採用し、repository visibilityの当時の判断を`private / reject`へ固定した（その後公開済み。[ADR-014](#adr-014-private-by-default-public-oss-readiness-gate)参照）。public OSS化は、exact candidate commitと全ref、GitHub surface、governance tree、release closureへ結び付くsecret/history、legal/provenance、security/disclosure、governance/community、repository control、release/support、migration rehearsal、incident readinessの全gateが独立承認され、TamaT-LLC organization ownerが明示的に`allow`した場合だけ候補となる。`stable-release-gate-v1`は必要条件だがpublic readinessの十分条件ではない。visibility変更はADRやreadiness recordから自動実行せず、別途明示承認されたchange windowでのみ行う。
 
 safe scanではcanonical root外へのsymlink readを拒否し、相対PATH・repository内toolchain・Node実行hookを除外する。Goは制限付き`go/packages`からparser fallbackへ移行する。Cargo metadataはpath-bearing inputのpreflight後、admitted manifest、lockfile、target discovery layoutだけを持つworker-owned confined mirrorに対してneutral cwdから`--frozen --offline --no-deps`で実行し、返却されたtemporary pathをinventory IDへ戻す。配布物はmanifest、MIT / Apache-2.0のproject license全文、core、schema、全worker/runtime artifact/component、backend attestationを検証し、欠損・変更・symlink・checked treeへの追加時にworker起動前にfail closedとする。project licenseはrelease manifestで個別にchecksum attestし、依存componentの権利情報を列挙する`THIRD_PARTY_LICENSES.txt`とは明確に分離する。
 
@@ -1854,12 +1854,14 @@ CLI/security-release gateは
 
 ### ADR-014: Private-by-default Public OSS Readiness Gate
 
+**Status: 公開済み（accepted）。** 当初の判定は`private / reject`であった。`SECURITY.md` / `CONTRIBUTING.md` / `GOVERNANCE.md` / `SUPPORT.md` / `CODE_OF_CONDUCT.md`を整備し、[公開候補の最終監査手順](../50_test/public-readiness-final-audit.md)と[公開移行リハーサル](../50_test/public-migration-rehearsal.md)を経て、repositoryは公開された。以下の決定は、公開判断が満たすべきgateとして維持する。
+
 **採用。** repositoryは`public-readiness-v1`の全mandatory gateが同一のexact
 candidate commit / audited refs / GitHub settings / governance tree / release
 closureに対して`allow`となり、security、legal、releaseの独立sign-offを
-TamaT-LLC organization ownerが明示承認するまでprivateを維持する。現状は必要な
-security/community/governance文書と公開前audit evidenceが未完成であるため
-`private / reject`である。productの`stable-release-gate-v1=allow`だけでは
+TamaT-LLC organization ownerが明示承認するまでprivateを維持する。当初は必要な
+security/community/governance文書と公開前audit evidenceが未完成であったため
+`private / reject`であったが、その後これらを整備して公開した。productの`stable-release-gate-v1=allow`だけでは
 history、collaboration record、Actions log、disclosure、maintainer authority、
 post-transition rulesetを保証しないため十分条件にしない。readiness recordは
 evidenceでありvisibility actuatorではない。public化は別途承認されたchange
