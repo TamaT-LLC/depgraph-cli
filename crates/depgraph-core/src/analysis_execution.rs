@@ -323,7 +323,16 @@ impl AnalysisProgressObserver {
 }
 
 tokio::task_local! { static ANALYSIS_PROGRESS: AnalysisProgressObserver; }
-tokio::task_local! { static ANALYSIS_PROGRESS_SLOT: usize; }
+tokio::task_local! { static ANALYSIS_PROGRESS_PLACEMENT: AnalysisProgressPlacement; }
+
+/// Where a nested executor's units sit in the observed progress of the scan.
+#[derive(Clone, Copy)]
+enum AnalysisProgressPlacement {
+    /// The nested executor re-attempts the observed unit at this index.
+    Slot(usize),
+    /// The nested executor's units follow the first `offset` observed units.
+    Append { offset: usize },
+}
 
 pub async fn observe_analysis_progress<F: std::future::Future>(
     observer: AnalysisProgressObserver,
@@ -339,18 +348,43 @@ pub(crate) async fn observe_analysis_unit_slot<F: std::future::Future>(
     index: usize,
     future: F,
 ) -> F::Output {
-    ANALYSIS_PROGRESS_SLOT.scope(index, future).await
+    ANALYSIS_PROGRESS_PLACEMENT
+        .scope(AnalysisProgressPlacement::Slot(index), future)
+        .await
 }
 
-fn publish_progress(progress: &AnalysisExecutionProgress) {
+/// Publishes `base` and runs a nested executor whose units are appended after
+/// it, so re-split replacements are observed in the order the scan result
+/// lists them, after every unit already in `base`.
+pub(crate) async fn observe_analysis_replacement_units<F: std::future::Future>(
+    base: &AnalysisExecutionProgress,
+    future: F,
+) -> F::Output {
+    publish_progress(base);
+    let offset = base.units.len();
+    ANALYSIS_PROGRESS_PLACEMENT
+        .scope(AnalysisProgressPlacement::Append { offset }, future)
+        .await
+}
+
+pub(crate) fn publish_progress(progress: &AnalysisExecutionProgress) {
     let _ = ANALYSIS_PROGRESS.try_with(|observer| {
         {
             let mut observed = observer
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match ANALYSIS_PROGRESS_SLOT.try_with(|slot| *slot) {
-                Ok(slot) => merge_unit_slot_progress(&mut observed, progress, 0, slot),
+            match ANALYSIS_PROGRESS_PLACEMENT.try_with(|placement| *placement) {
+                Ok(AnalysisProgressPlacement::Slot(slot)) => {
+                    merge_unit_slot_progress(&mut observed, progress, 0, slot);
+                }
+                Ok(AnalysisProgressPlacement::Append { offset }) => {
+                    observed.units.truncate(offset);
+                    observed.units.extend_from_slice(&progress.units);
+                    if progress.stop_reason.is_some() {
+                        observed.stop_reason.clone_from(&progress.stop_reason);
+                    }
+                }
                 Err(_) => *observed = progress.clone(),
             }
         }
@@ -367,9 +401,11 @@ pub(crate) fn publish_unit_progress(progress: &AnalysisExecutionProgress, index:
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let slot = ANALYSIS_PROGRESS_SLOT
-                .try_with(|slot| *slot)
-                .unwrap_or(index);
+            let slot = match ANALYSIS_PROGRESS_PLACEMENT.try_with(|placement| *placement) {
+                Ok(AnalysisProgressPlacement::Slot(slot)) => slot,
+                Ok(AnalysisProgressPlacement::Append { offset }) => offset + index,
+                Err(_) => index,
+            };
             merge_unit_slot_progress(&mut observed, progress, index, slot);
         }
         observer
@@ -1181,6 +1217,71 @@ mod tests {
         assert_eq!(observed.units[0].status, "completed");
         assert_eq!(observed.units[1].unit_id, "rust-unit");
         assert_eq!(observed.units[1].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn replacement_progress_appends_after_the_units_of_the_observed_scan() {
+        let observer = AnalysisProgressObserver::default();
+        let mut base = AnalysisExecutionProgress {
+            units: vec![
+                observed_unit("rust-unit", "rust", "completed"),
+                observed_unit("web-batch", "web", "failed"),
+                observed_unit("web-other", "web", "completed"),
+            ],
+            stop_reason: None,
+        };
+        observe_analysis_progress(observer.clone(), async {
+            publish_progress(&base);
+            base.units[1]
+                .loader
+                .insert("analysis_resplit".to_owned(), "superseded".to_owned());
+            let mut replacements = AnalysisExecutionProgress {
+                units: vec![
+                    observed_unit("web-batch-1", "web", "queued"),
+                    observed_unit("web-batch-2", "web", "queued"),
+                ],
+                stop_reason: None,
+            };
+            observe_analysis_replacement_units(&base, async {
+                // The base is published before any replacement runs.
+                assert_eq!(
+                    observer.snapshot().units[1].loader.get("analysis_resplit"),
+                    Some(&"superseded".to_owned())
+                );
+                publish_progress(&replacements);
+                assert_eq!(observer.counts(), (3, 5));
+                replacements.units[1].status = "completed".to_owned();
+                publish_unit_progress(&replacements, 1);
+                assert_eq!(observer.counts(), (4, 5));
+                // A progress record for another unit never lands at its offset.
+                publish_unit_progress(
+                    &AnalysisExecutionProgress {
+                        units: vec![observed_unit("rust-unit", "rust", "running")],
+                        stop_reason: None,
+                    },
+                    0,
+                );
+                replacements.units[0].status = "completed".to_owned();
+                publish_progress(&replacements);
+            })
+            .await;
+        })
+        .await;
+        let observed = observer.snapshot();
+        assert_eq!(
+            observed
+                .units
+                .iter()
+                .map(|unit| (unit.unit_id.as_str(), unit.status.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("rust-unit", "completed"),
+                ("web-batch", "failed"),
+                ("web-other", "completed"),
+                ("web-batch-1", "completed"),
+                ("web-batch-2", "completed"),
+            ]
+        );
     }
 
     #[tokio::test]
