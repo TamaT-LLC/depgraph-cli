@@ -1507,7 +1507,7 @@ pub(crate) const JAPANESE_INSTALL_GUIDE_PATH: &str = "docs/guide/install.md";
 const ENGLISH_INSTALL_GUIDE_PATH: &str = "docs/guide/install.en.md";
 pub(crate) const JAPANESE_COMPATIBILITY_GUIDE_PATH: &str = "docs/guide/compatibility.md";
 // Installation examples and support statements track the verified public release.
-const PUBLISHED_STABLE_RELEASE_VERSION: &str = "0.6.3";
+const PUBLISHED_STABLE_RELEASE_VERSION: &str = "0.6.4";
 
 /// The Japanese user-facing documents and the English documents they must stay
 /// synchronized with. The README is the entry point; detailed shared contract

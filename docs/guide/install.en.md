@@ -6,8 +6,7 @@ The [README](../../README.en.md) shows the shortest install commands. This
 guide covers each distribution channel, archive verification, and building from
 source.
 
-`v0.6.4` is being prepared. The download example below uses the published
-`v0.6.3` package.
+The download example below uses the verified `v0.6.4` release.
 
 ## Supported targets
 
@@ -66,7 +65,7 @@ environment below.
 Use GitHub CLI on macOS or Linux to download the archive and checksum.
 
 ```sh
-VERSION=0.6.3
+VERSION=0.6.4
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
