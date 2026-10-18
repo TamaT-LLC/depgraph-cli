@@ -44,6 +44,7 @@ additive extensionとして採用するかを決定する。
 | Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
 | Repository discovery | `repository_list`, optional `repository_id` | Issue #540 implemented: omitted `repository_id` binds to the server repository; mismatches return `INVALID_ARGUMENT` with the valid IDs |
 | Hotspot result filters | `health_hotspots_list` `path_prefixes` / `node_kinds`, CLI `hotspots --path-prefix` / `--node-kind` | Issue #543 implemented: filters apply after scoring, so scores and finding IDs are unchanged |
+| Dependency list output detail | `graph_dependencies_list` / `graph_dependents_list` `detail` (`paths` / `summary` / `full`) | Issue #542 implemented: `full` stays the default and byte-identical; `summary` and `paths` shrink the response without changing the traversal |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -838,6 +839,24 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | Identity | `CollectionIdentity`に`hotspot_path_prefixes` / `hotspot_node_kinds`を`skip_serializing_if`付きで追加する。空の場合のdigestは従来と同じbytesになり、絞り込んだ集合はcomplete集合とdigestを共有しない。cursorの正規化入力にも条件を含め、条件が違うcursorは`CURSOR_MISMATCH` |
 | CLI parity | AC-006/AC-015に従い`depgraph hotspots`へ繰り返し指定できる`--path-prefix` / `--node-kind`を追加し、stdio process testでCLIとMCPのdigest、ID、scoreの一致を検証する |
 | Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |
+
+## Issue #542 dependency list output detail evidence
+
+依存一覧の応答がAgentのcontextを圧迫しないよう、`graph_dependencies_list`と`graph_dependents_list`へ出力粒度を追加する。走査、filter、件数上限は変えず、射影だけを変える。
+
+| Area | Evidence |
+| --- | --- |
+| Input | 任意入力`detail`（closed enum `paths` / `summary` / `full`、既定`full`）を追加する。不正値は`INVALID_ARGUMENT`。CLI `deps` / `dependents`の意味は変わらないためCLIへは追加しない |
+| `full` | 従来の`AgentDependenciesResponse`をそのまま返す。`detail`を省略した応答と`detail: "full"`の応答、および変更前の射影はbyte単位で同一で、`detail` fieldを持たない |
+| `summary` | `AgentDependenciesSummaryResponse`（`detail: "summary"`）。各edgeは`AgentEdgeSummary`として`id`、`source_id`、`target_id`、`kind`、`site_id?`、`evidence_count`を持ち、evidence本体を含めない。`phase`、`resolution_status`、`precision`、`profile_id`、`condition`のうち走査結果の全edgeで同じ値のものは`common`（`AgentEdgeCommon`）に1回だけ出し、各edgeからは省く。共通でない値だけedgeごとに残す。各fieldが`common`とedgeのどちらか一方だけにあることをconstructorとdeserializerで検証する |
+| `common`の範囲 | ページ内ではなく走査結果全体で計算する。ページごとに`common`が変わらないため、cursorで続きを取ってもedgeの形が揃い、byte予算の固定部分も一度だけ測ればよい |
+| `paths` | `AgentDependencyPathsResponse`（`detail: "paths"`）。各itemは`AgentDependencyPath`で、source / targetのそれぞれに`*_path`（repository相対path）か、pathを持たないnodeでは`*_id`（node ID）のどちらか一方と、edgeの`kind`だけを持つ。(source, target, kind)が同じitemは走査順の最初の1件に重複除去するため、`total_items`は走査edge数以下になる。conditionを射影しないため、condition総byte数の上限は適用しない |
+| Evidence | 根拠が必要なedgeは、`site_id`を使って`agent_sites_list` / `agent_evidence_list`で個別に取得する。tool descriptionに明記する |
+| Output schema | 出力schemaは`AgentDependenciesOutput`の`oneOf`で、`full`は`detail`を持たない従来形、`summary` / `paths`は必須の`detail` const tagを持つ。全objectが`additionalProperties: false`のため、どの応答も一つの分岐にだけ一致する。Rust側も`detail`の有無と値で一つのvariantへdeserializeする |
+| Paging | 三つの粒度とも`WrappedPageByteProjection`で固定部分（root、counter、`summary`では`common`）を一度測り、候補itemのcanonical bytesを足して1 MiB以内のページを選ぶ。cursor digestは粒度ごとの射影済み集合全体を覆う |
+| Cursor | `full`以外では正規化入力に`detail`を含める。`full`は従来の正規化入力のままでcursorも同じbytesになる。粒度の違うcursorは`CURSOR_MISMATCH` |
+| Extension | 粒度の選択は`DependencyProjectionRequest`に閉じているため、edge kindの絞り込み（Issue #541）は同じ要求型と正規化入力へ追加できる。`graph_impact_get`と`agent_edges_list`への展開は今後の候補とする |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する。既存の`$defs`と`agent_dependencies_response` sampleは変化せず、新しい定義だけが増える |
 
 ## Issue #292 acceptance mapping
 

@@ -8,7 +8,7 @@ use depgraph_mcp_tools::{
     ToolAuthorization, ToolCatalog,
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn success_output_schema(output: &serde_json::Map<String, Value>) -> &Value {
     let branches = output
@@ -496,6 +496,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
             [
                 "contract_version",
                 "cursor",
+                "detail",
                 "environments",
                 "limit",
                 "max_traversal",
@@ -511,7 +512,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
         assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
         assert_eq!(
             success_output_schema(tool.output_schema())["properties"]["result"]["$ref"],
-            "#/$defs/AgentDependenciesResponse"
+            "#/$defs/AgentDependenciesOutput"
         );
     }
 
@@ -1224,5 +1225,67 @@ fn assert_closed_object_nodes(value: &Value, tool: &str, kind: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[test]
+fn issue_542_dependency_lists_advertise_detail_and_one_output_shape_per_detail() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for name in ["graph_dependencies_list", "graph_dependents_list"] {
+        let tool = catalog.tool(name).expect("dependency tool");
+        let detail = &tool.input_schema()["properties"]["detail"];
+        assert_eq!(detail["type"], "string", "{name}");
+        assert_eq!(
+            detail["enum"],
+            json!(["paths", "summary", "full"]),
+            "{name}"
+        );
+        assert_eq!(detail["default"], "full", "{name}");
+        let description = detail["description"].as_str().expect("detail description");
+        for expected in ["common", "evidence_count", "paths", "byte-identical"] {
+            assert!(
+                description.contains(expected),
+                "{name} detail description lacks {expected}: {description}"
+            );
+        }
+        assert!(
+            !tool.input_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("detail")),
+            "{name} detail is optional"
+        );
+        for expected in ["agent_evidence_list", "agent_sites_list", "detail"] {
+            assert!(
+                tool.description().contains(expected),
+                "{name} description lacks {expected}: {}",
+                tool.description()
+            );
+        }
+
+        let output = tool.output_schema();
+        let definitions = output["$defs"].as_object().expect("output definitions");
+        let branches = definitions["AgentDependenciesOutput"]["oneOf"]
+            .as_array()
+            .expect("one output branch per detail");
+        assert_eq!(branches.len(), 3, "{name}");
+        for definition in [
+            "AgentDependenciesResponse",
+            "AgentDependenciesSummaryResponse",
+            "AgentDependencyPathsResponse",
+        ] {
+            assert!(
+                branches
+                    .iter()
+                    .any(|branch| branch["$ref"] == format!("#/$defs/{definition}")),
+                "{name} output lacks {definition}"
+            );
+        }
+        assert!(
+            definitions["AgentDependenciesResponse"]["properties"]
+                .get("detail")
+                .is_none(),
+            "{name} full output keeps the legacy shape"
+        );
     }
 }

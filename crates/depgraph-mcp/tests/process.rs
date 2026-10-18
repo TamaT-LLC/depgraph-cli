@@ -8117,3 +8117,208 @@ fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic()
     );
     mcp.finish();
 }
+
+#[test]
+fn issue_542_dependency_detail_shrinks_responses_and_binds_cursors_to_the_detail() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let output_validator = |name: &str| {
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))["outputSchema"]
+            .clone();
+        jsonschema::draft202012::new(&schema).unwrap()
+    };
+    let arguments = |detail: Option<&str>, limit: u64, cursor: Option<&Value>| {
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "selector": "id:node:a",
+            "transitive": true,
+            "max_traversal": 100,
+            "limit": limit
+        });
+        if let Some(detail) = detail {
+            arguments["detail"] = json!(detail);
+        }
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.clone();
+        }
+        arguments
+    };
+    let mut next_id = 10;
+    let mut call = |name: &str, arguments: Value| {
+        next_id += 1;
+        let result = interactive_tool_call(&mut mcp, next_id, name, arguments);
+        assert_tool_text_matches_structured(&result);
+        result
+    };
+    let text_bytes = |result: &Value| result["content"][0]["text"].as_str().unwrap().len();
+
+    let omitted = call("graph_dependencies_list", arguments(None, 100, None));
+    let full = call(
+        "graph_dependencies_list",
+        arguments(Some("full"), 100, None),
+    );
+    let summary = call(
+        "graph_dependencies_list",
+        arguments(Some("summary"), 100, None),
+    );
+    let paths = call(
+        "graph_dependencies_list",
+        arguments(Some("paths"), 100, None),
+    );
+    for (detail, result) in [
+        ("omitted", &omitted),
+        ("full", &full),
+        ("summary", &summary),
+        ("paths", &paths),
+    ] {
+        assert_eq!(result["isError"], false, "{detail}: {result}");
+        assert_eq!(result["structuredContent"]["snapshot_id"], snapshot_id);
+        output_validator("graph_dependencies_list")
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{detail} advertised schema: {error}"));
+        shared
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{detail} shared schema: {error}"));
+    }
+    assert_eq!(
+        omitted["content"][0]["text"], full["content"][0]["text"],
+        "detail=full must be byte-identical to the legacy response"
+    );
+    assert!(full["structuredContent"]["result"].get("detail").is_none());
+
+    let summary_result = &summary["structuredContent"]["result"];
+    assert_eq!(summary_result["detail"], "summary");
+    assert_eq!(
+        summary_result["common"],
+        json!({
+            "phase": "semantic",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "profile_id": "fixture:safe",
+            "condition": "true"
+        })
+    );
+    assert_eq!(summary_result["edges"]["total_items"], 4);
+    for item in summary_result["edges"]["items"].as_array().unwrap() {
+        assert!(item.get("evidence").is_none());
+        assert!(item.get("profile_id").is_none());
+        assert_eq!(item["evidence_count"], 1);
+    }
+
+    let paths_result = &paths["structuredContent"]["result"];
+    assert_eq!(paths_result["detail"], "paths");
+    assert_eq!(paths_result["traversed_edges"], 4);
+    let mut items = paths_result["paths"]["items"].as_array().unwrap().clone();
+    items.sort_by_key(Value::to_string);
+    assert_eq!(
+        items,
+        [
+            json!({"source_path": "src/a.rs", "target_path": "src/b.rs", "kind": "imports"}),
+            json!({"source_path": "src/a.rs", "target_path": "src/c.rs", "kind": "imports"}),
+            json!({"source_path": "src/b.rs", "target_path": "src/d.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/d.rs", "kind": "imports"}),
+        ]
+    );
+    let full_bytes = text_bytes(&full);
+    let summary_bytes = text_bytes(&summary);
+    let paths_bytes = text_bytes(&paths);
+    eprintln!(
+        "issue #542 response bytes: full={full_bytes} summary={summary_bytes} paths={paths_bytes}"
+    );
+    assert!(summary_bytes < full_bytes);
+    assert!(paths_bytes < summary_bytes);
+
+    let dependents = call(
+        "graph_dependents_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "selector": "id:node:d",
+            "max_traversal": 100,
+            "detail": "paths"
+        }),
+    );
+    assert_eq!(dependents["isError"], false, "{dependents}");
+    output_validator("graph_dependents_list")
+        .validate(&dependents["structuredContent"])
+        .unwrap();
+    let mut dependent_paths = dependents["structuredContent"]["result"]["paths"]["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    dependent_paths.sort_by_key(Value::to_string);
+    assert_eq!(
+        dependent_paths,
+        [
+            json!({"source_path": "src/b.rs", "target_path": "src/d.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/d.rs", "kind": "imports"}),
+        ]
+    );
+
+    let first_full = call("graph_dependencies_list", arguments(Some("full"), 1, None));
+    let full_cursor = first_full["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(full_cursor.is_string(), "{first_full}");
+    for detail in ["summary", "paths"] {
+        let mismatched = call(
+            "graph_dependencies_list",
+            arguments(Some(detail), 1, Some(&full_cursor)),
+        );
+        assert_eq!(mismatched["isError"], true, "{detail}: {mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{detail}"
+        );
+    }
+    let first_paths = call("graph_dependencies_list", arguments(Some("paths"), 1, None));
+    let paths_cursor = first_paths["structuredContent"]["result"]["paths"]["next_cursor"].clone();
+    assert!(paths_cursor.is_string(), "{first_paths}");
+    let rejected_by_full = call(
+        "graph_dependencies_list",
+        arguments(None, 1, Some(&paths_cursor)),
+    );
+    assert_eq!(
+        rejected_by_full["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+    let resumed = call(
+        "graph_dependencies_list",
+        arguments(Some("paths"), 100, Some(&paths_cursor)),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    assert_eq!(
+        resumed["structuredContent"]["result"]["paths"]["returned_items"],
+        3
+    );
+
+    let invalid = call(
+        "graph_dependencies_list",
+        arguments(Some("brief"), 100, None),
+    );
+    assert_eq!(invalid["isError"], true);
+    assert_eq!(
+        invalid["structuredContent"]["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}

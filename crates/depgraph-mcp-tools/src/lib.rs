@@ -2,6 +2,7 @@
 
 mod catalog;
 mod contract;
+mod dependency_detail;
 mod dto;
 mod health_dto;
 mod host_config;
@@ -23,6 +24,11 @@ pub use contract::{
     DEFAULT_PAGE_BYTES, DEFAULT_PAGE_ITEMS, ErrorEnvelope, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
     MCP_TOOLS_CONTRACT_VERSION, Page, PageByteLimit, PageRequest, PageSize, SnapshotSelector,
     SuccessEnvelope,
+};
+pub use dependency_detail::{
+    AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
+    AgentDependencyEndpoint, AgentDependencyPath, AgentDependencyPathsResponse, AgentEdgeCommon,
+    AgentEdgeSummary, DependencyProjectionRequest,
 };
 pub use dto::{
     AGENT_SCAN_OUTCOME_CONTRACT_VERSION, AgentAnalysisCoverage, AgentAnalysisProgress,
@@ -86,7 +92,8 @@ pub use repository::{
 pub use response::{
     CanonicalResponseMapper, CursorKey, MappedToolResult, PaginationContext, PublicPageItem,
     PublicToolResult, ResponseMappingError, project_cycles_page_cancellable,
-    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    project_dependencies_output_cancellable, project_dependencies_page_cancellable,
+    project_dependency_items_cancellable, project_impact_response_cancellable,
     project_unresolved_page_cancellable,
 };
 pub use scalar::{

@@ -693,4 +693,6 @@ pub enum ContractBuildError {
     GraphExportState,
     #[error("Agent repository identifiers must be non-empty, bounded, unique, and stably ordered")]
     RepositorySet,
+    #[error("Agent dependency detail projection is inconsistent with its detail level")]
+    DependencyDetailState,
 }

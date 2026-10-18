@@ -2363,6 +2363,11 @@ impl AgentEdge {
     }
 
     #[must_use]
+    pub const fn id(&self) -> &AgentId {
+        &self.id
+    }
+
+    #[must_use]
     pub const fn source_id(&self) -> &AgentId {
         &self.source_id
     }
@@ -2370,6 +2375,46 @@ impl AgentEdge {
     #[must_use]
     pub const fn target_id(&self) -> &AgentId {
         &self.target_id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &AgentToken {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> AgentPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn resolution_status(&self) -> AgentResolutionStatus {
+        self.resolution_status
+    }
+
+    #[must_use]
+    pub const fn precision(&self) -> AgentPrecision {
+        self.precision
+    }
+
+    #[must_use]
+    pub const fn profile_id(&self) -> &AgentId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<&AgentId> {
+        self.site_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> Option<&AgentCondition> {
+        self.condition.as_ref()
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[AgentEvidence] {
+        &self.evidence
     }
 }
 
@@ -3578,7 +3623,7 @@ impl TryFrom<&depgraph_core::service::ExplainPathResult> for AgentPathResponse {
     }
 }
 
-fn agent_node_from_fields(
+pub(crate) fn agent_node_from_fields(
     id: &str,
     kind: &str,
     locator: &str,
@@ -3800,7 +3845,7 @@ fn parse_agent_condition(value: &str) -> Result<AgentCondition, ContractBuildErr
     AgentCondition::parse(value).map_err(|_| ContractBuildError::AgentDtoValue)
 }
 
-fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>
+pub(crate) fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>
 where
     T: std::str::FromStr,
 {

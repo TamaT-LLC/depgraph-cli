@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
+    AgentDependenciesOutput, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
     AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
     AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
@@ -442,7 +442,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependencies_list",
-        "Traverse outgoing dependency edges from one selector.",
+        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id.",
         [
             "selector",
             "snapshot",
@@ -452,6 +452,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "sessions",
             "environments",
             "max_traversal",
+            "detail",
             "cursor",
             "limit"
         ],
@@ -462,7 +463,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependents_list",
-        "Traverse incoming dependency edges from one selector.",
+        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id.",
         [
             "selector",
             "snapshot",
@@ -472,6 +473,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "sessions",
             "environments",
             "max_traversal",
+            "detail",
             "cursor",
             "limit"
         ],
@@ -887,7 +889,7 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
             return exact_success_output_schema::<AgentDoctor>(spec.name);
         }
         "graph_dependencies_list" | "graph_dependents_list" => {
-            return exact_success_output_schema::<AgentDependenciesResponse>(spec.name);
+            return exact_success_output_schema::<AgentDependenciesOutput>(spec.name);
         }
         "graph_path_get" => {
             return exact_success_output_schema::<AgentPathResponse>(spec.name);
@@ -1123,6 +1125,12 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "direction" => {
             json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
         }
+        "detail" => json!({
+            "type": "string",
+            "enum": ["paths", "summary", "full"],
+            "default": "full",
+            "description": "Output granularity. full (default) is byte-identical to the response without detail. summary returns each edge as id, source_id, target_id, kind, site_id and evidence_count, and states phase, resolution_status, precision, profile_id and condition once in common when every traversed edge shares the value. paths returns unique source/target repository paths (the node ID when a node has no path) with the edge kind. A cursor is bound to its detail."
+        }),
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
         "idempotency_key" => scalar_schema::<IdempotencyKey>(),

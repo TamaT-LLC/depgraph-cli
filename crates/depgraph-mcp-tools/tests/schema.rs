@@ -953,8 +953,10 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
     // Issue #540 adds AgentRepositorySummary, AgentRepositoryList, its success envelope,
-    // and the AgentErrorDetails::Repository branch.
-    assert_eq!(objects, 194, "review newly added object schemas explicitly");
+    // and the AgentErrorDetails::Repository branch. Issue #542 adds the summary and paths
+    // responses, AgentEdgeCommon, AgentEdgeSummary, AgentDependencyPath, their two pages,
+    // and the AgentDependenciesOutput success envelope.
+    assert_eq!(objects, 202, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -1285,4 +1287,97 @@ fn schema_fixture_path_is_the_documented_repository_location() {
         std::fs::read(path).expect("read checked-in schema"),
         CHECKED_IN_SCHEMA
     );
+}
+
+#[test]
+fn issue_542_shared_schema_publishes_closed_dependency_detail_shapes() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in [
+        "AgentDependenciesSummaryResponse",
+        "AgentDependencyPathsResponse",
+        "AgentEdgeCommon",
+        "AgentEdgeSummary",
+        "AgentDependencyPath",
+    ] {
+        let value = definitions
+            .get(definition)
+            .unwrap_or_else(|| panic!("missing {definition} definition"));
+        assert_eq!(value["additionalProperties"], false, "{definition}");
+    }
+    let output = &definitions["AgentDependenciesOutput"];
+    assert_eq!(output["oneOf"].as_array().map(Vec::len), Some(3));
+    assert!(definitions.values().any(|definition| {
+        definition["properties"]["result"]["$ref"] == "#/$defs/AgentDependenciesOutput"
+    }));
+
+    let validator = |definition: &str| {
+        let wrapper = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+        });
+        jsonschema::draft202012::new(&wrapper).expect("dependency detail schema compiles")
+    };
+    let root = json!({"id":"node:src","kind":"module","locator":"repo://src/lib.rs"});
+    let full = json!({
+        "root": root,
+        "direction": "outgoing",
+        "transitive": false,
+        "traversal_complete": true,
+        "traversed_edges": 0,
+        "edges": {"items":[],"returned_items":0,"total_items":0,"complete":true}
+    });
+    let summary = json!({
+        "detail": "summary",
+        "root": root,
+        "direction": "outgoing",
+        "transitive": false,
+        "traversal_complete": true,
+        "traversed_edges": 1,
+        "common": {"phase":"semantic","profile_id":"profile:default"},
+        "edges": {
+            "items":[{"id":"edge:1","source_id":"node:src","target_id":"node:b","kind":"imports","resolution_status":"resolved","precision":"exact","evidence_count":0}],
+            "returned_items":1,"total_items":1,"complete":true
+        }
+    });
+    let paths = json!({
+        "detail": "paths",
+        "root": root,
+        "direction": "incoming",
+        "transitive": true,
+        "traversal_complete": true,
+        "traversed_edges": 1,
+        "paths": {
+            "items":[{"source_path":"src/a.rs","target_id":"node:x","kind":"imports"}],
+            "returned_items":1,"total_items":1,"complete":true
+        }
+    });
+    let output_validator = validator("AgentDependenciesOutput");
+    for valid in [&full, &summary, &paths] {
+        assert!(output_validator.is_valid(valid), "rejected {valid}");
+    }
+    let mut tagged_full = full.clone();
+    tagged_full["detail"] = json!("full");
+    let mut summary_as_paths = summary.clone();
+    summary_as_paths["detail"] = json!("paths");
+    let mut paths_with_common = paths.clone();
+    paths_with_common["common"] = json!({});
+    for invalid in [tagged_full, summary_as_paths, paths_with_common] {
+        assert!(!output_validator.is_valid(&invalid), "accepted {invalid}");
+    }
+
+    let path_validator = validator("AgentDependencyPath");
+    for invalid in [
+        json!({"source_path":"src/a.rs","source_id":"node:a","target_id":"node:x","kind":"imports"}),
+        json!({"target_id":"node:x","kind":"imports"}),
+        json!({"source_path":"src/a.rs","target_path":"src/b.rs"}),
+        json!({"source_path":"src/a.rs","target_path":"src/b.rs","kind":"imports","unexpected":true}),
+    ] {
+        assert!(!path_validator.is_valid(&invalid), "accepted {invalid}");
+    }
+    let summary_item = validator("AgentEdgeSummary");
+    assert!(!summary_item.is_valid(&json!({
+        "id":"edge:1","source_id":"node:src","target_id":"node:b","kind":"imports","evidence_count":65
+    })));
 }

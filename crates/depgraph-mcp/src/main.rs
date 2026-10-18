@@ -32,26 +32,26 @@ use depgraph_core::{
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType,
-    AgentGraphExportResponse, AgentHealthAudit, AgentHealthExecution, AgentHealthFinding,
-    AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary,
-    AgentId, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
-    AgentOperationStatus, AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel,
-    AgentPolicyApiChange, AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse,
-    AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan,
-    AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList,
-    AgentRepositorySummary, AgentResourceLimit, AgentRuntimeTraceEvent,
+    AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError,
+    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportFormat,
+    AgentGraphExportMediaType, AgentGraphExportResponse, AgentHealthAudit, AgentHealthExecution,
+    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
+    AgentHealthSummary, AgentId, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
+    AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPolicyAnnotation,
+    AgentPolicyAnnotationLevel, AgentPolicyApiChange, AgentPolicyApiChangeKind,
+    AgentPolicyEvaluationResponse, AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation,
+    AgentProfilePlan, AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome,
+    AgentRepositoryList, AgentRepositorySummary, AgentResourceLimit, AgentRuntimeTraceEvent,
     AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
     AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
     AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
-    ContractVersion, Cursor, CursorKey, DurableSubmitResult, ErrorEnvelope, IdempotencyKey,
-    LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult,
-    OperationAccepted, OperationId, Page, PageByteLimit, PageRequest, PageSize, PaginationContext,
-    PortableTerminalOutputContract, RepositoryRelativePath, ResponseMappingError, SnapshotId,
-    SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS, ToolCatalog,
-    project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
-    project_dependencies_page_cancellable, project_impact_response_cancellable,
+    ContractVersion, Cursor, CursorKey, DependencyProjectionRequest, DurableSubmitResult,
+    ErrorEnvelope, IdempotencyKey, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES,
+    MappedToolResult, OperationAccepted, OperationId, Page, PageByteLimit, PageRequest, PageSize,
+    PaginationContext, PortableTerminalOutputContract, RepositoryRelativePath,
+    ResponseMappingError, SnapshotId, SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
+    ToolCatalog, project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
+    project_dependencies_output_cancellable, project_impact_response_cancellable,
     project_unresolved_page_cancellable,
 };
 use depgraph_operation::{
@@ -470,6 +470,8 @@ struct GraphDependenciesArguments {
     environments: Vec<String>,
     #[serde(default)]
     max_traversal: Option<usize>,
+    #[serde(default)]
+    detail: AgentDependencyDetail,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -3398,7 +3400,7 @@ fn execute_catalog_read_tool(
                 filter,
                 max_traversal,
             )?;
-            let normalized = serde_json::json!({
+            let mut normalized = serde_json::json!({
                 "direction": match direction {
                     DependencyDirection::Outgoing => "outgoing",
                     DependencyDirection::Incoming => "incoming",
@@ -3408,6 +3410,11 @@ fn execute_catalog_read_tool(
                 "selector": request.selector(),
                 "transitive": request.transitive(),
             });
+            // full keeps the legacy cursor binding; other details bind the cursor to
+            // their own projection so a cursor never crosses detail levels.
+            if !arguments.detail.is_full() {
+                normalized["detail"] = serde_json::json!(arguments.detail.as_str());
+            }
             let pagination = PaginationContext::new(
                 cursor_key,
                 tool,
@@ -3417,13 +3424,16 @@ fn execute_catalog_read_tool(
             )?;
             let page_request = page_request(arguments.limit, arguments.cursor)?;
             let found = service.dependencies(&mut snapshot_request, &request, cancellation)?;
-            let result = project_dependencies_page_cancellable(
+            let result = project_dependencies_output_cancellable(
                 &found,
-                match direction {
-                    DependencyDirection::Outgoing => AgentDependencyDirection::Outgoing,
-                    DependencyDirection::Incoming => AgentDependencyDirection::Incoming,
-                },
-                request.transitive(),
+                DependencyProjectionRequest::new(
+                    match direction {
+                        DependencyDirection::Outgoing => AgentDependencyDirection::Outgoing,
+                        DependencyDirection::Incoming => AgentDependencyDirection::Incoming,
+                    },
+                    request.transitive(),
+                    arguments.detail,
+                ),
                 &pagination,
                 &page_request,
                 cancellation,
