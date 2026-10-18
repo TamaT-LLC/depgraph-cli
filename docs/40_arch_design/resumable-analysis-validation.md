@@ -3,8 +3,10 @@
 `cargo xtask resumable-analysis-e2e` builds the CLI and the real Go and Web
 workers, then runs a generated public repository through the shared scheduler
 and Store. CI's existing Web job runs this command on Linux after the Web
-worker gate, without adding a separate integration job to the release evidence
-verifier; it moved there from the Go job because `go test -race` already fills
+worker gate, always on `main` pushes and manual dispatches, and on pull
+requests whenever a change touches a path the Web job's affected-scope check
+treats as relevant, without adding a separate integration job to the release
+evidence verifier; it moved there from the Go job because `go test -race` already fills
 that job's wall clock. The fixture contains no source or configuration copied
 from a private repository.
 

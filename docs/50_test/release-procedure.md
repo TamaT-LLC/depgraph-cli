@@ -7,7 +7,7 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 
 | イベント | Workflow | 実行内容 | 目的 |
 | --- | --- | --- | --- |
-| PR | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile は関連 path 変更時のみ。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
+| PR | CI | Rust、Go、macOS Go、Web、compiler-precise hostile E2E（Rust は常に全ステップ。Go / macOS Go / Web は各ジョブの影響 path 変更時のみ、hostile は関連 path 変更時のみ重いステップを実行。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
 | `main` push | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile 含む4ジョブを常時） | マージ結果の確認 |
 | `workflow_dispatch` | CI | 上記4ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
 | `v*`タグのpush | Release | quality、hostile E2E、benchmark、全4 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
@@ -16,6 +16,10 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 GreptileはGitHub Actionsのジョブではないが、PRをマージする前に未解決の指摘を残さない。
 PRまたは`main` pushでbenchmark、integration、windows-smokeが`skipped`になるのは正常である。
 PRで compiler-precise hostile が関連 path 変更なしにより重いステップを実行しない場合も、ジョブ自体は success を返す（required check を壊さない）。
+PRの go、go-macos、web は`scripts/ci-affected-scope.sh`でbase..headをrename検出なしで比較し、変更pathがすべてそのジョブの無関係pathリストに含まれる場合だけ重いステップを省略する。
+この場合もジョブは起動してsuccessを返すため、docsのみのPRでもrequired checkは揃う。
+workflow、Cargoのmanifestとlockfile、toolchain、xtask、scriptsなどの共有入力やリスト外のpathを変更した場合、diffが空または失敗した場合、PR以外のイベントでは常に全ステップを実行する。
+無関係pathリストは`cargo xtask test`が固定しているため、省略範囲を広げるにはxtaskの変更も必要になる。
 
 ## リリース準備
 

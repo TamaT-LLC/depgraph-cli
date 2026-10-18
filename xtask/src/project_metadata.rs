@@ -122,6 +122,8 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         bail!("GitHub Actions policy contains an unused or unlisted action identity");
     }
 
+    verify_ci_affected_scope_script(root)?;
+
     let dry_run_bytes = fs::read(root.join("security/disclosure-dry-run-v1.json"))?;
     verify_security_disclosure_dry_run(&dry_run_bytes)?;
     let threat_model = fs::read_to_string(
@@ -142,6 +144,8 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         "Only the npm publisher receives job-scoped `id-token: write`",
         "The OIDC-capable npm job performs no checkout\nand executes no repository script.",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
+        "skips their expensive steps only when every changed path",
+        "widening what a job may skip requires a reviewed xtask\nchange.",
         "`.github/actions-policy.json` is the canonical allowlist",
         "A mutable tag or branch is never a temporary fallback.",
         "| Fork changes a workflow to print a secret |",
@@ -293,6 +297,7 @@ pub(crate) fn verify_workflow_policy_text(
                     "CI pull requests must remain read-only, secret-free, and pinned to the full-CI linker/resource policy"
                 );
             }
+            verify_ci_affected_scope_gates(workflow)?;
         }
         "release.yml" => {
             let stable_gate = workflow_job_block(workflow, "stable-gate")?;
@@ -610,6 +615,285 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
 /// free space alone cannot tell a `target/` blowup from a runner image change.
 const INTEGRATION_TARGET_SIZE_REPORT: &str =
     "          du -sh target 2>/dev/null || echo \"target directory is absent\"";
+
+/// The jobs whose pull request steps `scripts/ci-affected-scope.sh` may skip:
+/// (job, scope passed to `decide`, label used in the step names, whether the
+/// job is a required check). A required check must never carry a job-level
+/// `if:`, or a skipped job would leave the check pending.
+const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 3] = [
+    ("go", "go", "go", true),
+    ("go-macos", "go", "go-macos", false),
+    ("web", "web", "web", true),
+];
+
+/// The script and the CI step text that invokes it.
+const CI_AFFECTED_SCOPE_SCRIPT: &str = "scripts/ci-affected-scope.sh";
+const CI_AFFECTED_SCOPE_DECIDE_RUN: &str = "scripts/ci-affected-scope.sh decide ";
+const CI_AFFECTED_SCOPE_TEST: &str = "scripts/tests/ci-affected-scope.test.mjs";
+const CI_DECIDE_GATE: &str = "        if: steps.decide.outputs.run == 'true'";
+const GO_MACOS_JOB_CONDITION: &str = "    if: ${{ !inputs.benchmark_only }}";
+
+/// Web evidence uploads that run whenever their producing step ran. When the
+/// decide step skips that producer, its outcome is `skipped` and the upload is
+/// skipped with it, so these need no decide gate of their own.
+const CI_WEB_OUTCOME_GATED_UPLOADS: [&str; 2] = [
+    "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
+    "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
+];
+
+/// Paths that make every gated job run. Pinned verbatim against the arrays in
+/// `scripts/ci-affected-scope.sh`.
+const CI_SCOPE_FORCE_ALL: &[&str] = &[
+    r"^\.github/workflows/",
+    r"^\.github/actions-policy\.json$",
+    r"^Cargo\.(toml|lock)$",
+    r"/Cargo\.(toml|lock)$",
+    r"^rust-toolchain\.toml$",
+    r"^\.cargo/",
+    r"^\.config/",
+    r"^\.gitattributes$",
+    r"^workspace-hack/",
+    r"^xtask/",
+    r"^scripts/",
+];
+const CI_SCOPE_COMMON_IGNORE: &[&str] = &[
+    r"^docs/",
+    r"^[^/]+\.md$",
+    r"^docs\.config\.toml$",
+    r"^\.github/ISSUE_TEMPLATE/",
+    r"^\.github/PULL_REQUEST_TEMPLATE\.md$",
+    r"^\.github/CODEOWNERS$",
+    r"^\.cursor/",
+    r"^security/",
+];
+const CI_SCOPE_GO_FORCE: &[&str] = &[r"^crates/depgraph-core/tests/fixtures/health/"];
+const CI_SCOPE_GO_IGNORE: &[&str] = &[
+    r"^workers/web/",
+    r"^workers/rust/",
+    r"^crates/",
+    r"^npm/",
+    r"^schemas/",
+    r"^queries/",
+    r"^fixtures/",
+    r"^third_party/",
+    r"^LICENSE-(APACHE|MIT)$",
+];
+const CI_SCOPE_WEB_IGNORE: &[&str] = &[
+    r"^workers/rust/",
+    r"^crates/depgraph-mcp/",
+    r"^crates/depgraph-rustc-wrapper/",
+    r"^crates/depgraph-rustc-query/",
+    r"^npm/",
+];
+
+/// Fragments that keep the decision fail-closed: the rename-free diff, the
+/// pull-request-only branch, the run-everything fallback for other events, the
+/// pipe-free hand-off to `classify` and pattern matches, and the mandatory
+/// step output file. A pipe into `grep -q` can fail under `pipefail` when grep
+/// exits before the writer, which would turn a match into a miss.
+const CI_SCOPE_SCRIPT_REQUIRED: [&str; 7] = [
+    "git diff --no-renames --name-only \"$CI_BASE_SHA\" \"$CI_HEAD_SHA\"",
+    "pull_request)",
+    "*) run=true ;;",
+    "classify \"$job\" <<<\"$changed\"",
+    "grep -Eq -- \"$pattern\" <<<\"$path\"",
+    "grep -Eq '^[0-9a-f]{40}$' <<<\"$1\"",
+    "GITHUB_OUTPUT:?",
+];
+
+fn verify_ci_affected_scope_script(root: &Path) -> Result<()> {
+    let script = fs::read_to_string(root.join(CI_AFFECTED_SCOPE_SCRIPT))
+        .with_context(|| format!("failed to read {CI_AFFECTED_SCOPE_SCRIPT}"))?;
+    verify_ci_affected_scope_script_text(&script)
+}
+
+fn verify_ci_affected_scope_script_text(script: &str) -> Result<()> {
+    let script = script.replace("\r\n", "\n");
+    for (name, expected) in [
+        ("force_all", CI_SCOPE_FORCE_ALL),
+        ("common_ignore", CI_SCOPE_COMMON_IGNORE),
+        ("go_force", CI_SCOPE_GO_FORCE),
+        ("go_ignore", CI_SCOPE_GO_IGNORE),
+        ("web_ignore", CI_SCOPE_WEB_IGNORE),
+    ] {
+        if bash_array_entries(&script, name)? != expected {
+            bail!("{CI_AFFECTED_SCOPE_SCRIPT} {name} differs from the reviewed path list");
+        }
+    }
+    for required in CI_SCOPE_SCRIPT_REQUIRED {
+        if !script.contains(required) {
+            bail!("{CI_AFFECTED_SCOPE_SCRIPT} is missing {required:?}");
+        }
+    }
+    if script
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains("| grep"))
+    {
+        bail!("{CI_AFFECTED_SCOPE_SCRIPT} must not pipe into grep under pipefail");
+    }
+    Ok(())
+}
+
+/// The elements of a bash array declared once as `name=(` followed by one
+/// single-quoted element per line and a closing `)`. Any other shape, an
+/// append, or a second assignment fails closed, because the verifier could no
+/// longer tell which patterns the script will actually use.
+fn bash_array_entries<'a>(script: &'a str, name: &str) -> Result<Vec<&'a str>> {
+    let opener = format!("{name}=(");
+    let assignment = format!("{name}=");
+    let append = format!("{name}+=");
+    let lines = script.lines().collect::<Vec<_>>();
+    let mut openers = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if *line == opener {
+            openers.push(index);
+        } else if line.contains(&assignment) || line.contains(&append) {
+            bail!("{CI_AFFECTED_SCOPE_SCRIPT} reassigns or extends {name}");
+        }
+    }
+    let [start] = openers.as_slice() else {
+        bail!("{CI_AFFECTED_SCOPE_SCRIPT} must declare {name} exactly once");
+    };
+    let mut entries = Vec::new();
+    for line in &lines[start + 1..] {
+        if *line == ")" {
+            return Ok(entries);
+        }
+        let entry = line
+            .strip_prefix("  '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .filter(|entry| !entry.contains('\''))
+            .with_context(|| {
+                format!("{CI_AFFECTED_SCOPE_SCRIPT} {name} has a non-canonical element {line:?}")
+            })?;
+        entries.push(entry);
+    }
+    bail!("{CI_AFFECTED_SCOPE_SCRIPT} {name} is not closed")
+}
+
+/// The canonical decide step for one gated job.
+fn affected_scope_decide_step(job: &str, scope: &str) -> String {
+    format!(
+        concat!(
+            "      - name: Decide whether the {job} checks must run\n",
+            "        id: decide\n",
+            "        working-directory: .\n",
+            "        env:\n",
+            "          CI_EVENT_NAME: ${{{{ github.event_name }}}}\n",
+            "          CI_BASE_SHA: ${{{{ github.event.pull_request.base.sha }}}}\n",
+            "          CI_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}\n",
+            "        run: {run}{scope}\n",
+        ),
+        job = job,
+        run = CI_AFFECTED_SCOPE_DECIDE_RUN,
+        scope = scope,
+    )
+}
+
+/// The canonical skip notice that follows the decide step.
+fn affected_scope_skip_step(job: &str) -> String {
+    format!(
+        concat!(
+            "      - name: Skip the {job} checks when unrelated\n",
+            "        if: steps.decide.outputs.run != 'true'\n",
+            "        run: echo \"Skipping the {job} checks (no relevant path changes)\"\n",
+        ),
+        job = job,
+    )
+}
+
+/// The steps of a job, each without its leading `      - ` and with any
+/// comment lines that follow it.
+fn workflow_job_steps(job: &str) -> Vec<&str> {
+    job.split("\n      - ").skip(1).collect()
+}
+
+/// Whether a step carries exactly one condition and it is one of `allowed`.
+/// A step written as `- if: ...` carries its condition on the first line.
+fn step_condition_is(step: &str, allowed: &[&str]) -> bool {
+    let mut lines = step.lines();
+    let first = lines.next().unwrap_or_default();
+    let inline = first.starts_with("if:").then(|| format!("        {first}"));
+    let conditions = inline
+        .into_iter()
+        .chain(
+            lines
+                .filter(|line| line.starts_with("        if:"))
+                .map(str::to_owned),
+        )
+        .collect::<Vec<_>>();
+    matches!(conditions.as_slice(), [condition] if allowed.contains(&condition.as_str()))
+}
+
+/// Pull request path filtering for the Go, macOS Go, and Web jobs. Each gated
+/// job checks out full history, runs the canonical decide step, prints the
+/// canonical skip notice, and gates every remaining step on the decision (or,
+/// for the Web evidence uploads, on the producing step's outcome). The Rust job
+/// stays unconditional because it owns the document-contract tests.
+fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
+    if workflow.matches(CI_AFFECTED_SCOPE_DECIDE_RUN).count() != CI_AFFECTED_SCOPE_JOBS.len() {
+        bail!("CI must invoke {CI_AFFECTED_SCOPE_SCRIPT} exactly once per gated job");
+    }
+    for (job_name, scope, label, required) in CI_AFFECTED_SCOPE_JOBS {
+        let job = workflow_job_block(workflow, job_name)?;
+        let job_conditions = job
+            .lines()
+            .filter(|line| line.starts_with("    if:"))
+            .collect::<Vec<_>>();
+        let job_condition_holds = if required {
+            job_conditions.is_empty()
+        } else {
+            job_conditions == [GO_MACOS_JOB_CONDITION]
+        };
+        if !job_condition_holds {
+            bail!("CI {job_name} job must not be skipped as a whole");
+        }
+        let steps = workflow_job_steps(job);
+        let [checkout, decide, skip, rest @ ..] = steps.as_slice() else {
+            bail!("CI {job_name} job is missing its affected-scope steps");
+        };
+        if !checkout.starts_with("uses: actions/checkout@")
+            || !workflow_block_has_line(checkout, "          fetch-depth: 0")
+        {
+            bail!("CI {job_name} job must check out full history before deciding its scope");
+        }
+        if format!("      - {decide}\n") != affected_scope_decide_step(label, scope) {
+            bail!("CI {job_name} job must run the canonical affected-scope decide step");
+        }
+        if format!("      - {skip}\n") != affected_scope_skip_step(label) {
+            bail!("CI {job_name} job must print the canonical affected-scope skip notice");
+        }
+        if rest.is_empty() {
+            bail!("CI {job_name} job has no checks behind its affected-scope gate");
+        }
+        let mut allowed = vec![CI_DECIDE_GATE];
+        if job_name == "web" {
+            allowed.extend(CI_WEB_OUTCOME_GATED_UPLOADS);
+        }
+        for step in rest {
+            let outcome_gated = CI_WEB_OUTCOME_GATED_UPLOADS
+                .iter()
+                .any(|condition| workflow_block_has_line(step, condition));
+            if !step_condition_is(step, &allowed)
+                || (outcome_gated && !step.starts_with("uses: actions/upload-artifact@"))
+            {
+                bail!("CI {job_name} job runs a step outside its affected-scope gate");
+            }
+        }
+    }
+
+    let rust = workflow_job_block(workflow, "rust")?;
+    if rust.lines().any(|line| line.starts_with("    if:"))
+        || rust.contains("steps.decide")
+        || !rust.contains(CI_AFFECTED_SCOPE_TEST)
+        || rust
+            .replace(CI_AFFECTED_SCOPE_TEST, "")
+            .contains("ci-affected-scope")
+    {
+        bail!("CI rust job must run every step unconditionally and test the affected-scope script");
+    }
+    Ok(())
+}
 
 /// Whole-line containment. A step block that ends the surrounding job has no
 /// trailing newline of its own, so substring checks that anchor on `\n` would
@@ -2986,10 +3270,14 @@ fn quoted_assignment(source: &str, name: &str) -> Option<String> {
 mod tests {
     use std::{fs, path::Path};
 
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::{
-        BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT,
-        extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
-        job_pins_intermediate_state_bound, workflow_job_block,
+        BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT, GithubActionsPolicy,
+        affected_scope_decide_step, extra_native_package_is_manual_and_bounded,
+        integration_job_pins_resource_policy, job_pins_intermediate_state_bound,
+        verify_ci_affected_scope_gates, verify_ci_affected_scope_script_text,
+        verify_workflow_policy_text, workflow_job_block,
     };
 
     /// The three jobs that build twice on one runner without reclaiming
@@ -3016,6 +3304,14 @@ mod tests {
             .parent()
             .expect("xtask lives directly under the workspace root");
         fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml is readable")
+    }
+
+    fn checked_in_affected_scope_script() -> String {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask lives directly under the workspace root");
+        fs::read_to_string(root.join("scripts/ci-affected-scope.sh"))
+            .expect("ci-affected-scope.sh is readable")
     }
 
     #[test]
@@ -3228,5 +3524,229 @@ mod tests {
                 .expect("drifted windows-smoke job is extractable"),
             "windows-smoke must be rejected once its bound moves to another job"
         );
+    }
+
+    const CHECKOUT_STEP: &str =
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+    const DECIDE_GATE_LINE: &str = "        if: steps.decide.outputs.run == 'true'\n";
+
+    #[test]
+    fn affected_scope_gates_accept_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        verify_ci_affected_scope_gates(&ci).unwrap();
+        // The same check through the full workflow policy, with CRLF endings.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask lives directly under the workspace root");
+        let policy: GithubActionsPolicy =
+            serde_json::from_slice(&fs::read(root.join(".github/actions-policy.json")).unwrap())
+                .unwrap();
+        let pins = policy
+            .actions
+            .iter()
+            .map(|action| (action.identity.as_str(), action.sha.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        verify_workflow_policy_text(
+            "ci.yml",
+            &ci.replace('\n', "\r\n"),
+            &pins,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn affected_scope_gates_reject_workflow_drift() {
+        let ci = checked_in_ci_workflow();
+        let go_decide = affected_scope_decide_step("go", "go");
+        assert_eq!(ci.matches(&go_decide).count(), 1);
+        let rust_checkout_then_node = format!(
+            "{CHECKOUT_STEP}      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n"
+        );
+        assert_eq!(ci.matches(&rust_checkout_then_node).count(), 1);
+        let gated_race =
+            "      - if: steps.decide.outputs.run == 'true'\n        run: go test -race ./...\n";
+        let resumable_upload = format!(
+            "      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n{DECIDE_GATE_LINE}        with:\n          name: resumable-analysis-report\n"
+        );
+        for (label, drift) in [
+            ("go decide removed", ci.replacen(&go_decide, "", 1)),
+            (
+                "web decides with the go scope",
+                ci.replace(
+                    "scripts/ci-affected-scope.sh decide web",
+                    "scripts/ci-affected-scope.sh decide go",
+                ),
+            ),
+            (
+                "go job skipped as a whole",
+                ci.replacen(
+                    "  go:\n    runs-on: ubuntu-24.04\n",
+                    "  go:\n    if: false\n    runs-on: ubuntu-24.04\n",
+                    1,
+                ),
+            ),
+            (
+                "rust job gains a decide step",
+                ci.replacen(
+                    &rust_checkout_then_node,
+                    &format!(
+                        "{CHECKOUT_STEP}{go_decide}      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n"
+                    ),
+                    1,
+                ),
+            ),
+            (
+                "rust job step gated on a decision",
+                ci.replacen(
+                    &rust_checkout_then_node,
+                    &format!(
+                        "{CHECKOUT_STEP}      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n{DECIDE_GATE_LINE}"
+                    ),
+                    1,
+                ),
+            ),
+            (
+                "rust job stops testing the script",
+                ci.replacen(" scripts/tests/ci-affected-scope.test.mjs", "", 1),
+            ),
+            (
+                "go race suite ungated",
+                ci.replacen(gated_race, "      - run: go test -race ./...\n", 1),
+            ),
+            (
+                "web resumable upload ungated",
+                ci.replacen(
+                    &resumable_upload,
+                    &resumable_upload.replacen(DECIDE_GATE_LINE, "", 1),
+                    1,
+                ),
+            ),
+            (
+                "web resumable upload always runs",
+                ci.replacen(
+                    &resumable_upload,
+                    &resumable_upload.replacen(DECIDE_GATE_LINE, "        if: always()\n", 1),
+                    1,
+                ),
+            ),
+            (
+                "go checkout is shallow",
+                ci.replacen("          fetch-depth: 0\n", "", 1),
+            ),
+            (
+                "decide event is pinned",
+                ci.replacen(
+                    "CI_EVENT_NAME: ${{ github.event_name }}",
+                    "CI_EVENT_NAME: push",
+                    1,
+                ),
+            ),
+            (
+                "go skip notice removed",
+                ci.replacen(
+                    "      - name: Skip the go checks when unrelated\n        if: steps.decide.outputs.run != 'true'\n        run: echo \"Skipping the go checks (no relevant path changes)\"\n",
+                    "",
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(drift, ci, "{label}: drift mutation must change the workflow");
+            assert!(
+                verify_ci_affected_scope_gates(&drift).is_err(),
+                "{label}: drifted workflow must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn affected_scope_script_accepts_the_checked_in_lists() {
+        let script = checked_in_affected_scope_script();
+        verify_ci_affected_scope_script_text(&script).unwrap();
+        verify_ci_affected_scope_script_text(&script.replace('\n', "\r\n")).unwrap();
+    }
+
+    #[test]
+    fn affected_scope_script_rejects_list_and_fallback_drift() {
+        let script = checked_in_affected_scope_script();
+        for (label, drift) in [
+            (
+                "web ignores every crate",
+                script.replacen("web_ignore=(\n", "web_ignore=(\n  '^crates/'\n", 1),
+            ),
+            (
+                "scripts no longer force a run",
+                script.replacen("  '^scripts/'\n", "", 1),
+            ),
+            (
+                "rename detection enabled",
+                script.replacen(
+                    "git diff --no-renames --name-only",
+                    "git diff --name-only",
+                    1,
+                ),
+            ),
+            (
+                "go ignore list extended later",
+                script.replacen("\nusage() {", "\ngo_ignore+=('^xtask/')\n\nusage() {", 1),
+            ),
+            (
+                "go ignore list reassigned later",
+                script.replacen("\nusage() {", "\ngo_ignore=('^.*')\n\nusage() {", 1),
+            ),
+            (
+                "double-quoted element",
+                script.replacen(
+                    "  '^crates/depgraph-mcp/'\n",
+                    "  \"^crates/depgraph-mcp/\"\n",
+                    1,
+                ),
+            ),
+            (
+                "non-pull-request events skip",
+                script.replacen("*) run=true ;;", "*) run=false ;;", 1),
+            ),
+            (
+                "pattern match reads from a pipe",
+                script.replacen(
+                    "if grep -Eq -- \"$pattern\" <<<\"$path\"; then",
+                    "if printf '%s\\n' \"$path\" | grep -Eq -- \"$pattern\"; then",
+                    1,
+                ),
+            ),
+            (
+                "commit check reads from a pipe",
+                script.replacen(
+                    "grep -Eq '^[0-9a-f]{40}$' <<<\"$1\"",
+                    "printf '%s\\n' \"$1\" | grep -Eq '^[0-9a-f]{40}$'",
+                    1,
+                ),
+            ),
+            (
+                "an extra grep pipe elsewhere",
+                script.replacen(
+                    "\nusage() {",
+                    "\nprobe() {\n  echo x | grep -q x\n}\n\nusage() {",
+                    1,
+                ),
+            ),
+            (
+                "classify reads from a pipe",
+                script.replacen(
+                    "classify \"$job\" <<<\"$changed\"",
+                    "printf '%s\\n' \"$changed\" | classify \"$job\"",
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(
+                drift, script,
+                "{label}: drift mutation must change the script"
+            );
+            assert!(
+                verify_ci_affected_scope_script_text(&drift).is_err(),
+                "{label}: drifted script must be rejected"
+            );
+        }
     }
 }
