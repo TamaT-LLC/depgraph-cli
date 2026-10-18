@@ -269,6 +269,7 @@ pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH: &str =
     "fixtures/cross-language-release-smoke-v1.json";
 pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
     include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
+pub use crate::service_graph::{ChangedSetImpactRequest, ChangedSetImpactServiceResult};
 pub use cache::{
     BuildCacheInput, COMPILER_PRECISE_CACHE_CONTRACT_VERSION,
     COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION, CompilerPreciseCacheInput,
@@ -373,9 +374,11 @@ pub use http_operation_correlation::{
     HttpOperationCorrelationResult, correlate_http_operations,
 };
 pub use impact::{
-    ChangedNodeMapping, GitChange, GitChangedSet, IMPACT_QUERY_CACHE_SCHEMA_VERSION,
-    ImpactDiagnostic, ImpactFilters, ImpactNode, ImpactResult, impact, impact_query_cache_key,
-    map_changed_set, read_git_changed_set,
+    CHANGED_SET_IMPACT_MODE, ChangedNodeMapping, ChangedSetImpactNode, ChangedSetImpactResult,
+    GitChange, GitChangedSet, IMPACT_QUERY_CACHE_SCHEMA_VERSION, ImpactDiagnostic, ImpactFilters,
+    ImpactNode, ImpactResult, UNMAPPED_REASON_DELETED, UNMAPPED_REASON_NOT_IN_SNAPSHOT,
+    UnmappedChange, impact, impact_changed_set, impact_query_cache_key, map_changed_set,
+    read_git_changed_set,
 };
 pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,

@@ -54,6 +54,10 @@ pub(crate) fn changed_set_preprocessing_exhausted_for_test() -> anyhow::Error {
 #[error("impact adjacency preprocessing exceeded its service bound")]
 struct ImpactAdjacencyPreprocessingExhausted;
 
+#[derive(Debug, thiserror::Error)]
+#[error("impact changed-path attribution exceeded its service bound")]
+struct ImpactChangedPathAttributionExhausted;
+
 pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ImpactPathMaterializationExhausted>()
@@ -66,6 +70,9 @@ pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
             .is_some()
         || error
             .downcast_ref::<ImpactAdjacencyPreprocessingExhausted>()
+            .is_some()
+        || error
+            .downcast_ref::<ImpactChangedPathAttributionExhausted>()
             .is_some()
         || crate::query::is_resource_exhausted(error)
 }
@@ -246,6 +253,53 @@ pub struct ImpactResult {
     pub changed_nodes: Vec<NodeRecord>,
     pub impacts: Vec<ImpactNode>,
     pub diagnostics: Vec<ImpactDiagnostic>,
+}
+
+/// JSON discriminator of [`ChangedSetImpactResult`].
+pub const CHANGED_SET_IMPACT_MODE: &str = "changed_set";
+/// Unmapped reason for a change Git reports as deleted.
+pub const UNMAPPED_REASON_DELETED: &str = "deleted";
+/// Unmapped reason for a change whose paths are absent from the snapshot.
+pub const UNMAPPED_REASON_NOT_IN_SNAPSHOT: &str = "not_in_snapshot";
+const GIT_STATUS_DELETED: &str = "deleted";
+
+/// Reverse impact of a whole Git changed set, computed from every mapped
+/// changed node at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangedSetImpactResult {
+    /// Always [`CHANGED_SET_IMPACT_MODE`].
+    pub mode: String,
+    pub complete: bool,
+    pub filters: ImpactFilters,
+    pub changed_set: GitChangedSet,
+    pub mappings: Vec<ChangedNodeMapping>,
+    pub changed_nodes: Vec<NodeRecord>,
+    pub unmapped: Vec<UnmappedChange>,
+    pub impacts: Vec<ChangedSetImpactNode>,
+    pub diagnostics: Vec<ImpactDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangedSetImpactNode {
+    pub node: NodeRecord,
+    /// Distance from the nearest changed node; changed nodes themselves are 0.
+    pub depth: usize,
+    /// The changed node that ends `dependency_path`.
+    pub changed_node_id: String,
+    /// Every changed path that reaches this node, sorted and deduplicated.
+    pub changed_paths: Vec<String>,
+    pub dependency_path: Vec<PathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmappedChange {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+    /// [`UNMAPPED_REASON_DELETED`] or [`UNMAPPED_REASON_NOT_IN_SNAPSHOT`].
+    pub reason: String,
 }
 
 pub fn impact_query_cache_key(
@@ -1141,6 +1195,14 @@ impl TraversalBudget {
         }
     }
 
+    /// A budget whose sources are admitted by the caller through `admit_node`.
+    fn unseeded() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+
     fn admit_edge(&mut self, edge: &EdgeRecord, filters: &ImpactFilters) -> bool {
         if self.edge_ids.contains(&edge.id) {
             return true;
@@ -1228,19 +1290,7 @@ pub(crate) fn impact_cancellable(
         .transpose()?
         .unwrap_or_default();
     let changed_ids = if changed_set.is_some() {
-        let mut changed_ids = BTreeSet::new();
-        let mut changed_id_work = 0_usize;
-        for mapping in &mappings {
-            for node_id in &mapping.correlated_node_ids {
-                check_cancelled(&mut is_cancelled)?;
-                if changed_id_work >= MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
-                    return Err(ImpactChangedSetPreprocessingExhausted.into());
-                }
-                changed_id_work += 1;
-                changed_ids.insert(node_id.clone());
-            }
-        }
-        changed_ids
+        changed_node_ids_cancellable(&mappings, &mut is_cancelled)?
     } else {
         BTreeSet::from([root.id.clone()])
     };
@@ -1351,7 +1401,222 @@ pub(crate) fn impact_cancellable(
         }
     }
 
-    let mut diagnostics = budget
+    let complete = budget.complete;
+    let mut diagnostics = keyed_budget_diagnostics(budget);
+    if changed_set.is_some() {
+        insert_unmapped_diagnostics(&mappings, &mut diagnostics, &mut is_cancelled)?;
+    }
+    let finalized_diagnostics = finalize_diagnostics(diagnostics, &mut is_cancelled)?;
+
+    Ok(ImpactResult {
+        root,
+        root_impacted,
+        complete,
+        filters,
+        changed_set: changed_set.cloned(),
+        mappings,
+        changed_nodes,
+        impacts,
+        diagnostics: finalized_diagnostics,
+    })
+}
+
+pub fn impact_changed_set(
+    snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
+    filters: ImpactFilters,
+) -> Result<ChangedSetImpactResult> {
+    impact_changed_set_cancellable(snapshot, changed_set, filters, || false)
+}
+
+pub(crate) fn impact_changed_set_cancellable(
+    snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
+    filters: ImpactFilters,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<ChangedSetImpactResult> {
+    check_cancelled(&mut is_cancelled)?;
+    let mut node_map = BTreeMap::new();
+    for node in &snapshot.nodes {
+        check_cancelled(&mut is_cancelled)?;
+        node_map.insert(node.id.clone(), node.clone());
+    }
+    let mut edge_map = BTreeMap::new();
+    for edge in &snapshot.edges {
+        check_cancelled(&mut is_cancelled)?;
+        edge_map.insert(edge.id.clone(), edge);
+    }
+    let mappings = map_changed_set_cancellable(snapshot, changed_set, &mut is_cancelled)?;
+    let changed_ids = changed_node_ids_cancellable(&mappings, &mut is_cancelled)?;
+    let mut changed_nodes = Vec::new();
+    for id in &changed_ids {
+        check_cancelled(&mut is_cancelled)?;
+        if let Some(node) = node_map.get(id).cloned() {
+            changed_nodes.push(node);
+        }
+    }
+
+    // Every changed node is a depth-0 BFS source, so one traversal yields the
+    // distance from the nearest change instead of one traversal per change.
+    let mut budget = TraversalBudget::unseeded();
+    let mut seeds = BTreeSet::new();
+    for node in &changed_nodes {
+        check_cancelled(&mut is_cancelled)?;
+        if !budget.admit_node(&node.id, &filters) {
+            break;
+        }
+        seeds.insert(node.id.clone());
+    }
+    let runtime_contexts =
+        runtime_context_index_cancellable(snapshot, &filters, &mut is_cancelled)?;
+    let reverse = adjacency_cancellable(
+        snapshot,
+        true,
+        &filters,
+        runtime_contexts.as_ref(),
+        &mut is_cancelled,
+    )?;
+    let scoped = reverse_path_index_from_seeds(
+        seeds.iter().map(String::as_str),
+        &reverse,
+        &filters,
+        &mut budget,
+        &mut is_cancelled,
+    )?;
+    let seeds_by_path = changed_path_seeds(&mappings, &seeds, &mut is_cancelled)?;
+    let mut scoped_ids = BTreeSet::new();
+    for node_id in scoped.depths.keys() {
+        check_cancelled(&mut is_cancelled)?;
+        scoped_ids.insert(node_id.clone());
+    }
+    let mut attribution = attribute_changed_paths_with_limit(
+        &seeds_by_path,
+        &scoped_ids,
+        &reverse,
+        &filters,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut is_cancelled,
+    )?;
+
+    preflight_path_materialization(&scoped, 0, &node_map, &mut is_cancelled)?;
+    let evidence_filter = GraphQueryFilter {
+        phases: filters.phases.clone(),
+        profiles: filters.profiles.clone(),
+        sessions: filters.sessions.clone(),
+        environments: filters.environments.clone(),
+    };
+    let mut projection_edges = Vec::new();
+    for edge_id in scoped.successor.values() {
+        check_cancelled(&mut is_cancelled)?;
+        projection_edges.push(
+            edge_map
+                .get(edge_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("impact reverse path edge is unavailable"))?,
+        );
+    }
+    let mut path_steps = PathStepMaterializer::new(
+        snapshot,
+        &evidence_filter,
+        projection_edges.iter().copied(),
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        &mut is_cancelled,
+    )?;
+    let mut impacts = Vec::new();
+    for (node_id, depth) in &scoped.depths {
+        check_cancelled(&mut is_cancelled)?;
+        let Some(node) = node_map.get(node_id).cloned() else {
+            continue;
+        };
+        let mut dependency_path = Vec::with_capacity(*depth);
+        let mut current = node_id.as_str();
+        while let Some(edge_id) = scoped.successor.get(current) {
+            check_cancelled(&mut is_cancelled)?;
+            let edge = edge_map
+                .get(edge_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("impact reverse path edge is unavailable"))?;
+            dependency_path.push(path_steps.materialize(edge, &mut is_cancelled)?);
+            current = edge.target.as_str();
+        }
+        impacts.push(ChangedSetImpactNode {
+            node,
+            depth: *depth,
+            changed_node_id: current.to_owned(),
+            changed_paths: attribution.remove(node_id).unwrap_or_default(),
+            dependency_path,
+        });
+    }
+    impacts.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.node.id.cmp(&right.node.id))
+    });
+
+    let complete = budget.complete;
+    let mut diagnostics = keyed_budget_diagnostics(budget);
+    insert_unmapped_diagnostics(&mappings, &mut diagnostics, &mut is_cancelled)?;
+    let diagnostics = finalize_diagnostics(diagnostics, &mut is_cancelled)?;
+    let mut unmapped = Vec::new();
+    for mapping in &mappings {
+        check_cancelled(&mut is_cancelled)?;
+        if !mapping.correlated_node_ids.is_empty() {
+            continue;
+        }
+        let reason = if mapping.change.status == GIT_STATUS_DELETED {
+            UNMAPPED_REASON_DELETED
+        } else {
+            UNMAPPED_REASON_NOT_IN_SNAPSHOT
+        };
+        unmapped.push(UnmappedChange {
+            status: mapping.change.status.clone(),
+            old_path: mapping.change.old_path.clone(),
+            new_path: mapping.change.new_path.clone(),
+            reason: reason.to_owned(),
+        });
+    }
+
+    Ok(ChangedSetImpactResult {
+        mode: CHANGED_SET_IMPACT_MODE.to_owned(),
+        complete,
+        filters,
+        changed_set: changed_set.clone(),
+        mappings,
+        changed_nodes,
+        unmapped,
+        impacts,
+        diagnostics,
+    })
+}
+
+fn changed_node_ids_cancellable(
+    mappings: &[ChangedNodeMapping],
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeSet<String>> {
+    let mut changed_ids = BTreeSet::new();
+    let mut changed_id_work = 0_usize;
+    for mapping in mappings {
+        for node_id in &mapping.correlated_node_ids {
+            check_cancelled(is_cancelled)?;
+            if changed_id_work >= MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
+                return Err(ImpactChangedSetPreprocessingExhausted.into());
+            }
+            changed_id_work += 1;
+            changed_ids.insert(node_id.clone());
+        }
+    }
+    Ok(changed_ids)
+}
+
+/// The path a change is reported under: the post-change path when it exists.
+fn changed_path_label(change: &GitChange) -> Option<&str> {
+    change.new_path.as_deref().or(change.old_path.as_deref())
+}
+
+type KeyedDiagnostics = BTreeMap<(String, String), ImpactDiagnostic>;
+
+fn keyed_budget_diagnostics(budget: TraversalBudget) -> KeyedDiagnostics {
+    budget
         .diagnostics
         .into_values()
         .map(|diagnostic| {
@@ -1360,46 +1625,137 @@ pub(crate) fn impact_cancellable(
                 diagnostic,
             )
         })
-        .collect::<BTreeMap<_, _>>();
-    if changed_set.is_some() {
-        for mapping in &mappings {
-            check_cancelled(&mut is_cancelled)?;
-            if mapping.correlated_node_ids.is_empty() {
-                let code = "changed_path_unmapped".to_owned();
-                let message = format!(
-                    "changed path {} was not present in the selected snapshot",
-                    mapping
-                        .change
-                        .new_path
-                        .as_deref()
-                        .or(mapping.change.old_path.as_deref())
-                        .unwrap_or("unknown")
-                );
-                diagnostics.insert(
-                    (code.clone(), message.clone()),
-                    ImpactDiagnostic { code, message },
-                );
+        .collect()
+}
+
+fn insert_unmapped_diagnostics(
+    mappings: &[ChangedNodeMapping],
+    diagnostics: &mut KeyedDiagnostics,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    for mapping in mappings {
+        check_cancelled(is_cancelled)?;
+        if mapping.correlated_node_ids.is_empty() {
+            let code = "changed_path_unmapped".to_owned();
+            let message = format!(
+                "changed path {} was not present in the selected snapshot",
+                changed_path_label(&mapping.change).unwrap_or("unknown")
+            );
+            diagnostics.insert(
+                (code.clone(), message.clone()),
+                ImpactDiagnostic { code, message },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn finalize_diagnostics(
+    diagnostics: KeyedDiagnostics,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<ImpactDiagnostic>> {
+    check_cancelled(is_cancelled)?;
+    let mut finalized = Vec::with_capacity(diagnostics.len());
+    for diagnostic in diagnostics.into_values() {
+        check_cancelled(is_cancelled)?;
+        finalized.push(diagnostic);
+    }
+    Ok(finalized)
+}
+
+/// Groups the admitted BFS sources by the changed path that mapped to them.
+fn changed_path_seeds(
+    mappings: &[ChangedNodeMapping],
+    seeds: &BTreeSet<String>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut seeds_by_path = BTreeMap::<String, BTreeSet<String>>::new();
+    for mapping in mappings {
+        let Some(path) = changed_path_label(&mapping.change) else {
+            continue;
+        };
+        for node_id in &mapping.correlated_node_ids {
+            check_cancelled(is_cancelled)?;
+            if seeds.contains(node_id) {
+                seeds_by_path
+                    .entry(path.to_owned())
+                    .or_default()
+                    .insert(node_id.clone());
             }
         }
     }
-    check_cancelled(&mut is_cancelled)?;
-    let mut finalized_diagnostics = Vec::with_capacity(diagnostics.len());
-    for diagnostic in diagnostics.into_values() {
-        check_cancelled(&mut is_cancelled)?;
-        finalized_diagnostics.push(diagnostic);
+    Ok(seeds_by_path)
+}
+
+/// Lists, for every node in `scoped`, each changed path whose own reverse
+/// traversal (with the same depth bound) reaches it. Traversal stays inside
+/// `scoped`, the node set the shared multi-source BFS already admitted.
+fn attribute_changed_paths_with_limit(
+    seeds_by_path: &BTreeMap<String, BTreeSet<String>>,
+    scoped: &BTreeSet<String>,
+    reverse: &BTreeMap<String, Vec<&EdgeRecord>>,
+    filters: &ImpactFilters,
+    maximum_work: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut work = ChangedPathAttributionWork::new(maximum_work);
+    let mut reached = BTreeMap::<String, BTreeSet<&str>>::new();
+    for (path, seeds) in seeds_by_path {
+        let mut queue = VecDeque::new();
+        let mut seen = BTreeSet::new();
+        for seed in seeds {
+            work.step(is_cancelled)?;
+            if scoped.contains(seed) && seen.insert(seed.as_str()) {
+                queue.push_back((seed.as_str(), 0_usize));
+            }
+        }
+        while let Some((node_id, depth)) = queue.pop_front() {
+            work.step(is_cancelled)?;
+            reached
+                .entry(node_id.to_owned())
+                .or_default()
+                .insert(path.as_str());
+            if filters.depth.is_some_and(|limit| depth >= limit) {
+                continue;
+            }
+            for edge in reverse.get(node_id).into_iter().flatten() {
+                work.step(is_cancelled)?;
+                if scoped.contains(&edge.source) && seen.insert(edge.source.as_str()) {
+                    queue.push_back((edge.source.as_str(), depth + 1));
+                }
+            }
+        }
+    }
+    let mut attribution = BTreeMap::new();
+    for (node_id, paths) in reached {
+        let mut materialized = Vec::with_capacity(paths.len());
+        for path in paths {
+            work.step(is_cancelled)?;
+            materialized.push(path.to_owned());
+        }
+        attribution.insert(node_id, materialized);
+    }
+    Ok(attribution)
+}
+
+struct ChangedPathAttributionWork {
+    used: usize,
+    maximum: usize,
+}
+
+impl ChangedPathAttributionWork {
+    const fn new(maximum: usize) -> Self {
+        Self { used: 0, maximum }
     }
 
-    Ok(ImpactResult {
-        root,
-        root_impacted,
-        complete: budget.complete,
-        filters,
-        changed_set: changed_set.cloned(),
-        mappings,
-        changed_nodes,
-        impacts,
-        diagnostics: finalized_diagnostics,
-    })
+    fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+        check_cancelled(is_cancelled)?;
+        if self.used >= self.maximum {
+            return Err(ImpactChangedPathAttributionExhausted.into());
+        }
+        self.used += 1;
+        Ok(())
+    }
 }
 
 fn adjacency_cancellable<'a>(
@@ -1817,10 +2173,29 @@ fn reverse_path_index(
     budget: &mut TraversalBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<ReversePathIndex> {
-    let mut queue = VecDeque::from([(root_id.to_owned(), 0_usize)]);
-    let mut seen = BTreeSet::from([root_id.to_owned()]);
+    reverse_path_index_from_seeds([root_id], adjacency, filters, budget, is_cancelled)
+}
+
+/// Multi-source reverse BFS: every seed starts at depth 0, so each reached
+/// node records the distance to, and a successor chain toward, its nearest
+/// seed. Seeds must already be admitted to `budget`.
+fn reverse_path_index_from_seeds<'s>(
+    seeds: impl IntoIterator<Item = &'s str>,
+    adjacency: &BTreeMap<String, Vec<&EdgeRecord>>,
+    filters: &ImpactFilters,
+    budget: &mut TraversalBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<ReversePathIndex> {
+    let mut queue = VecDeque::new();
+    let mut seen = BTreeSet::new();
     let mut successor = BTreeMap::<String, String>::new();
-    let mut depths = BTreeMap::from([(root_id.to_owned(), 0_usize)]);
+    let mut depths = BTreeMap::new();
+    for seed in seeds {
+        if seen.insert(seed.to_owned()) {
+            depths.insert(seed.to_owned(), 0_usize);
+            queue.push_back((seed.to_owned(), 0_usize));
+        }
+    }
     'search: while let Some((node_id, depth)) = queue.pop_front() {
         check_cancelled(is_cancelled)?;
         if filters.depth.is_some_and(|limit| depth >= limit) {
@@ -2900,6 +3275,342 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("ambiguous"));
+        Ok(())
+    }
+
+    fn changed_set_graph() -> GraphSnapshot {
+        let mut snapshot = graph();
+        snapshot.nodes = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .into_iter()
+            .map(|id| node(id, "file", Some(&format!("src/{id}.ts"))))
+            .collect();
+        snapshot.edges = vec![
+            edge("e-c-a", "c", "a", "prod"),
+            edge("e-b-a", "b", "a", "prod"),
+            edge("e-d-c", "d", "c", "prod"),
+            edge("e-d-b", "d", "b", "prod"),
+            edge("e-e-d", "e", "d", "prod"),
+            edge("e-f-e", "f", "e", "prod"),
+            edge("e-g-b", "g", "b", "prod"),
+        ];
+        snapshot.evidence.clear();
+        snapshot
+    }
+
+    fn git_change(status: &str, path: &str) -> GitChange {
+        GitChange {
+            status: status.to_owned(),
+            similarity: None,
+            old_path: (status == "deleted").then(|| path.to_owned()),
+            new_path: (status != "deleted").then(|| path.to_owned()),
+            sources: vec!["worktree".to_owned()],
+        }
+    }
+
+    fn two_file_changed_set() -> GitChangedSet {
+        GitChangedSet {
+            requested_ref: "main".to_owned(),
+            resolved_ref: "a".repeat(40),
+            merge_base: "a".repeat(40),
+            head: "b".repeat(40),
+            repository_prefix: String::new(),
+            changes: vec![
+                git_change("modified", "src/a.ts"),
+                git_change("modified", "src/b.ts"),
+                git_change("deleted", "src/gone.ts"),
+                git_change("added", "src/missing.ts"),
+            ],
+        }
+    }
+
+    /// Changed-set impact runs the counted preprocessing stages, so it takes
+    /// both counter locks in the same order as the existing tests.
+    fn lock_impact_counters() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let preprocessing = IMPACT_PREPROCESSING_TEST_LOCK
+            .lock()
+            .expect("impact preprocessing test lock");
+        let changed_set = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
+        (preprocessing, changed_set)
+    }
+
+    fn unbounded_filters() -> Result<ImpactFilters> {
+        ImpactFilters::new(None, Vec::new(), Vec::new(), 1_000, 1_000)
+    }
+
+    #[test]
+    fn changed_set_impact_equals_the_union_of_per_node_impacts() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let snapshot = changed_set_graph();
+        let result = impact_changed_set(&snapshot, &two_file_changed_set(), unbounded_filters()?)?;
+
+        let mut expected = BTreeMap::<String, usize>::new();
+        for changed in ["a", "b"] {
+            let single = impact(
+                &snapshot,
+                &format!("id:{changed}"),
+                None,
+                unbounded_filters()?,
+            )?;
+            assert!(single.complete);
+            for item in single.impacts {
+                expected
+                    .entry(item.node.id)
+                    .and_modify(|depth| *depth = (*depth).min(item.depth))
+                    .or_insert(item.depth);
+            }
+        }
+        let actual = result
+            .impacts
+            .iter()
+            .map(|item| (item.node.id.clone(), item.depth))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+        assert!(result.complete);
+        assert_eq!(result.mode, CHANGED_SET_IMPACT_MODE);
+        assert_eq!(
+            result
+                .changed_nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for item in &result.impacts {
+            assert!(["a", "b"].contains(&item.changed_node_id.as_str()));
+            assert_eq!(item.dependency_path.len(), item.depth, "{}", item.node.id);
+            match (item.dependency_path.first(), item.dependency_path.last()) {
+                (Some(first), Some(last)) => {
+                    assert_eq!(first.edge.source, item.node.id);
+                    assert_eq!(last.edge.target, item.changed_node_id);
+                    for pair in item.dependency_path.windows(2) {
+                        assert_eq!(pair[0].edge.target, pair[1].edge.source);
+                    }
+                }
+                _ => assert_eq!(item.changed_node_id, item.node.id),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_attributes_every_reaching_changed_path() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let result = impact_changed_set(
+            &changed_set_graph(),
+            &two_file_changed_set(),
+            unbounded_filters()?,
+        )?;
+        let attribution = result
+            .impacts
+            .iter()
+            .map(|item| (item.node.id.as_str(), item.changed_paths.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let a = vec!["src/a.ts".to_owned()];
+        let both = vec!["src/a.ts".to_owned(), "src/b.ts".to_owned()];
+        assert_eq!(attribution["a"], a);
+        assert_eq!(
+            attribution["b"], both,
+            "a changed node reached from another"
+        );
+        assert_eq!(attribution["c"], a);
+        assert_eq!(attribution["d"], both);
+        assert_eq!(attribution["e"], both);
+        assert_eq!(attribution["f"], both);
+        assert_eq!(attribution["g"], both);
+        assert!(!attribution.contains_key("h"));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_lists_deleted_and_missing_paths_as_unmapped() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let result = impact_changed_set(
+            &changed_set_graph(),
+            &two_file_changed_set(),
+            unbounded_filters()?,
+        )?;
+        assert_eq!(
+            result.unmapped,
+            [
+                UnmappedChange {
+                    status: "deleted".to_owned(),
+                    old_path: Some("src/gone.ts".to_owned()),
+                    new_path: None,
+                    reason: UNMAPPED_REASON_DELETED.to_owned(),
+                },
+                UnmappedChange {
+                    status: "added".to_owned(),
+                    old_path: None,
+                    new_path: Some("src/missing.ts".to_owned()),
+                    reason: UNMAPPED_REASON_NOT_IN_SNAPSHOT.to_owned(),
+                },
+            ]
+        );
+        assert_eq!(result.mappings.len(), 4);
+        let unmapped_diagnostics = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "changed_path_unmapped")
+            .count();
+        assert_eq!(unmapped_diagnostics, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_order_is_depth_then_node_id_and_repeatable() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let snapshot = changed_set_graph();
+        let first = impact_changed_set(&snapshot, &two_file_changed_set(), unbounded_filters()?)?;
+        let order = first
+            .impacts
+            .iter()
+            .map(|item| (item.depth, item.node.id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                (0, "a"),
+                (0, "b"),
+                (1, "c"),
+                (1, "d"),
+                (1, "g"),
+                (2, "e"),
+                (3, "f")
+            ]
+        );
+        let mut reversed = snapshot.clone();
+        reversed.nodes.reverse();
+        reversed.edges.reverse();
+        let mut changes = two_file_changed_set();
+        changes.changes.reverse();
+        let second = impact_changed_set(&reversed, &changes, unbounded_filters()?)?;
+        assert_eq!(
+            serde_json::to_value(&first.impacts)?,
+            serde_json::to_value(&second.impacts)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_depth_and_node_limits_are_explicit() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let snapshot = changed_set_graph();
+        let shallow = impact_changed_set(
+            &snapshot,
+            &two_file_changed_set(),
+            ImpactFilters::new(Some(1), Vec::new(), Vec::new(), 1_000, 1_000)?,
+        )?;
+        assert!(
+            shallow.complete,
+            "a depth bound is a filter, not truncation"
+        );
+        assert_eq!(
+            shallow
+                .impacts
+                .iter()
+                .map(|item| item.node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "g"]
+        );
+        let shallow_attribution = shallow
+            .impacts
+            .iter()
+            .map(|item| (item.node.id.as_str(), item.changed_paths.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            shallow_attribution["d"],
+            ["src/b.ts"],
+            "src/a.ts reaches d only at depth 2"
+        );
+
+        let node_bounded = impact_changed_set(
+            &snapshot,
+            &two_file_changed_set(),
+            ImpactFilters::new(None, Vec::new(), Vec::new(), 3, 1_000)?,
+        )?;
+        assert!(!node_bounded.complete);
+        assert!(node_bounded.impacts.len() <= 3);
+        assert!(
+            node_bounded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "impact_node_limit_reached")
+        );
+
+        let edge_bounded = impact_changed_set(
+            &snapshot,
+            &two_file_changed_set(),
+            ImpactFilters::new(None, Vec::new(), Vec::new(), 1_000, 2)?,
+        )?;
+        assert!(!edge_bounded.complete);
+        assert!(
+            edge_bounded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "impact_edge_limit_reached")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_with_no_changes_is_empty_and_complete() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let mut changes = two_file_changed_set();
+        changes.changes.clear();
+        let result = impact_changed_set(&changed_set_graph(), &changes, unbounded_filters()?)?;
+        assert!(result.complete);
+        assert!(result.impacts.is_empty());
+        assert!(result.unmapped.is_empty());
+        assert!(result.changed_nodes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn changed_set_impact_is_cancellable() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let error = impact_changed_set_cancellable(
+            &changed_set_graph(),
+            &two_file_changed_set(),
+            unbounded_filters()?,
+            || true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancel"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn changed_path_attribution_work_is_bounded() -> Result<()> {
+        let _guards = lock_impact_counters();
+        let snapshot = changed_set_graph();
+        let filters = unbounded_filters()?;
+        let reverse = adjacency_cancellable(&snapshot, true, &filters, None, &mut || false)?;
+        let seeds = BTreeMap::from([
+            ("src/a.ts".to_owned(), BTreeSet::from(["a".to_owned()])),
+            ("src/b.ts".to_owned(), BTreeSet::from(["b".to_owned()])),
+        ]);
+        let scoped = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let attribution = attribute_changed_paths_with_limit(
+            &seeds,
+            &scoped,
+            &reverse,
+            &filters,
+            usize::MAX,
+            &mut || false,
+        )?;
+        assert_eq!(attribution["f"].len(), 2);
+        let error =
+            attribute_changed_paths_with_limit(&seeds, &scoped, &reverse, &filters, 3, &mut || {
+                false
+            })
+            .unwrap_err();
+        assert!(is_resource_exhausted(&error), "{error:#}");
         Ok(())
     }
 }
