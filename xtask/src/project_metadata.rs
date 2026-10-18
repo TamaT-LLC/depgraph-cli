@@ -917,6 +917,9 @@ const HOSTILE_PATH_FILTER_SUFFIX: &str = r#"' <<<"$changed"; then"#;
 /// The compiler-precise-hostile job reports its required check on every pull
 /// request but runs the hostile steps only when a related path changes.
 fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
+    // A Windows autocrlf checkout reads ci.yml with CRLF endings.
+    let normalized_workflow = ci_workflow.replace("\r\n", "\n").replace('\r', "\n");
+    let ci_workflow = normalized_workflow.as_str();
     for required in [
         "compiler-precise-hostile:",
         "sudo apt-get install --yes --no-install-recommends bubblewrap",
@@ -3627,6 +3630,13 @@ mod tests {
     fn compiler_precise_hostile_gate_accepts_the_checked_in_workflow() {
         let ci = checked_in_ci_workflow();
         verify_compiler_precise_hostile_ci_gate(&ci).unwrap();
+    }
+
+    /// A Windows autocrlf checkout reads ci.yml with CRLF endings.
+    #[test]
+    fn compiler_precise_hostile_gate_accepts_the_checked_in_workflow_with_crlf() {
+        let ci = checked_in_ci_workflow();
+        verify_compiler_precise_hostile_ci_gate(&ci.replace('\n', "\r\n")).unwrap();
     }
 
     /// With rename detection a file moved out of a related path shows up only
