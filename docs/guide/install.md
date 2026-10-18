@@ -5,9 +5,11 @@
 [README](../../README.md)には最短の導入コマンドだけを載せています。
 このガイドでは、配布経路ごとの導入方法、アーカイブの検証、ソースからのビルドを説明します。
 
+`v0.6.4` は準備中です。以下のダウンロード例は公開済みの `v0.6.3` を使います。
+
 ## 対応ターゲット
 
-`v0.6.3`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64の4ターゲットを提供します。
+`v0.6.4`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64の4ターゲットを提供します。
 Intel macOSには対応していません。
 公式Releaseと公開後証跡がそろった版を使ってください。
 

@@ -6,9 +6,12 @@ The [README](../../README.en.md) shows the shortest install commands. This
 guide covers each distribution channel, archive verification, and building from
 source.
 
+`v0.6.4` is being prepared. The download example below uses the published
+`v0.6.3` package.
+
 ## Supported targets
 
-`v0.6.3` targets Linux x86-64, Linux ARM64, macOS Apple Silicon, and Windows
+`v0.6.4` targets Linux x86-64, Linux ARM64, macOS Apple Silicon, and Windows
 x86-64. Intel macOS is not supported.
 Use a version with its official Release and public post-publish evidence.
 
@@ -43,7 +46,7 @@ under TamaT LLC's `@tamat-llc` organization scope.
 `npm i -g @tamat-llc/depgraph` installs verified native packages for macOS Apple
 Silicon, Linux x86-64 / ARM64, and Windows x86-64 without an install-time
 external download. Intel macOS
-packages are not provided for `v0.6.3`. The npm launcher
+packages are not provided for `v0.6.4`. The npm launcher
 requires Node.js 24 or later. The `depgraph` CLI runs entirely from the npm
 package. `depgraph-mcp` is included as well, but starting the MCP server also
 requires the compiler pack for the same version and target from the GitHub

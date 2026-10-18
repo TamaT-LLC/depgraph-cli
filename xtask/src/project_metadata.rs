@@ -1343,7 +1343,10 @@ pub(crate) const ENGLISH_README_PATH: &str = "README.en.md";
 pub(crate) const JAPANESE_USAGE_GUIDE_PATH: &str = "docs/guide/usage.md";
 pub(crate) const ENGLISH_USAGE_GUIDE_PATH: &str = "docs/guide/usage.en.md";
 pub(crate) const JAPANESE_INSTALL_GUIDE_PATH: &str = "docs/guide/install.md";
+const ENGLISH_INSTALL_GUIDE_PATH: &str = "docs/guide/install.en.md";
 pub(crate) const JAPANESE_COMPATIBILITY_GUIDE_PATH: &str = "docs/guide/compatibility.md";
+// Installation examples and support statements track the verified public release.
+const PUBLISHED_STABLE_RELEASE_VERSION: &str = "0.6.3";
 
 /// The Japanese user-facing documents and the English documents they must stay
 /// synchronized with. The README is the entry point; detailed shared contract
@@ -1355,6 +1358,7 @@ pub(crate) struct JapaneseDocumentation {
     pub(crate) usage: String,
     pub(crate) english_usage: String,
     pub(crate) install: String,
+    pub(crate) english_install: String,
     pub(crate) compatibility: String,
 }
 
@@ -1366,6 +1370,7 @@ impl JapaneseDocumentation {
             usage: read_lf_normalized_text(&root.join(JAPANESE_USAGE_GUIDE_PATH))?,
             english_usage: read_lf_normalized_text(&root.join(ENGLISH_USAGE_GUIDE_PATH))?,
             install: read_lf_normalized_text(&root.join(JAPANESE_INSTALL_GUIDE_PATH))?,
+            english_install: read_lf_normalized_text(&root.join(ENGLISH_INSTALL_GUIDE_PATH))?,
             compatibility: read_lf_normalized_text(&root.join(JAPANESE_COMPATIBILITY_GUIDE_PATH))?,
         })
     }
@@ -1402,7 +1407,7 @@ pub(crate) fn verify_japanese_documentation_contract(docs: &JapaneseDocumentatio
     let release_package = format!(
         "`v{VERSION}`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64向けの4ターゲットを提供します。"
     );
-    let release_version_assignment = format!("VERSION={VERSION}");
+    let published_version_assignment = format!("VERSION={PUBLISHED_STABLE_RELEASE_VERSION}");
     let compatibility = format!(
         "現行開発版のワーカープロトコルは`{}`、操作ジャーナルスキーマは`{}`であり、`{}`と`{}`を使用する。",
         depgraph_protocol::PROTOCOL_VERSION,
@@ -1433,9 +1438,17 @@ pub(crate) fn verify_japanese_documentation_contract(docs: &JapaneseDocumentatio
         &[
             "日本語 | [English](install.en.md)",
             "Rust 1.93.1、Go 1.26.1、Node.js 24.18.0、pnpm 10.33.0",
-            release_version_assignment.as_str(),
+            published_version_assignment.as_str(),
             "`npm i -g @tamat-llc/depgraph`",
             "[コンパイラーパックとリリース検証](../reference/compiler-pack-and-release-verification.md)",
+        ],
+    )?;
+    require_document_markers(
+        ENGLISH_INSTALL_GUIDE_PATH,
+        &docs.english_install,
+        &[
+            "[日本語](install.md) | English",
+            published_version_assignment.as_str(),
         ],
     )?;
     require_document_markers(
@@ -2264,7 +2277,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "@tamat-llc/depgraph",
         "@tamat-llc/depgraph-win32-x64",
         "npm Trusted Publishing",
-        "release-post-publish-evidence-v0.6.3.json",
+        "release-post-publish-evidence-v0.6.4.json",
         "stable-v0.5.0-packaged-smoke-v1",
         "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
         "| Code-health finding | `depgraph-health-finding-v1` |",
@@ -2646,7 +2659,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
         "name: Bind the stable candidate to main, release/0.6, and exact Full CI",
-        "if [[ \"$GITHUB_REF_NAME\" == \"v0.6.3\" ]]",
+        "if [[ \"$GITHUB_REF_NAME\" == \"v0.6.4\" ]]",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -3014,13 +3027,19 @@ open_questions: 0\n\
 }
 
 pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
+    let published_japanese = format!(
+        "現在のサポート対象は、公開済み`v{PUBLISHED_STABLE_RELEASE_VERSION}`リリースです。"
+    );
+    let published_english = format!(
+        "The supported line is currently anchored by the published `v{PUBLISHED_STABLE_RELEASE_VERSION}` Release."
+    );
     let documents: &[(&str, &[&str])] = &[
         (
             "README.md",
             &[
                 "日本語 | [English](README.en.md)",
                 "## プロジェクトの状況と公開コラボレーション",
-                "現在のサポート対象は、公開済み`v0.6.3`リリースです。",
+                published_japanese.as_str(),
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",
@@ -3033,7 +3052,7 @@ pub(crate) fn verify_public_community_surface(root: &Path) -> Result<()> {
             &[
                 "[Japanese](README.md) | English",
                 "## Project status and public collaboration",
-                "The supported line is currently anchored by the published `v0.6.3` Release.",
+                published_english.as_str(),
                 "[SUPPORT.md](SUPPORT.md)",
                 "[CONTRIBUTING.md](CONTRIBUTING.md)",
                 "[GOVERNANCE.md](GOVERNANCE.md)",

@@ -98,7 +98,7 @@ display name (`route:next:app:page:/checkout`) or an `id:` from the reported
 candidates. If more than one candidate matches, pass the complete Stable ID
 returned by the command as `id:<stable-id>`.
 
-On `main` (unreleased), `package:` also matches external dependency packages
+In the `v0.6.4` release candidate, `package:` also matches external dependency packages
 such as npm packages (`package:stripe`, `package:stripe@18.0.0`, or the full
 locator `package://npm:stripe@18.0.0#node_modules/stripe`). The published
 `v0.6.3` release does not support this form. See the
