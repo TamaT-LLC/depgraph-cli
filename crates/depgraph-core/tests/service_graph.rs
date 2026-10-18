@@ -1299,7 +1299,7 @@ fn issue_541_edge_ids(result: &depgraph_core::service::DependenciesResult) -> Ve
 }
 
 #[test]
-fn issue_541_structural_edge_kinds_are_defined_once_and_default_keeps_them() {
+fn issue_541_structural_edge_kinds_are_defined_once_and_default_excludes_them() {
     assert_eq!(
         STRUCTURAL_EDGE_KINDS,
         ["contains", "declares", "generated_from"]
@@ -1310,12 +1310,21 @@ fn issue_541_structural_edge_kinds_are_defined_once_and_default_keeps_them() {
     for kind in ["imports", "depends_on", "type_uses", "calls", "contain"] {
         assert!(!is_structural_edge_kind(kind), "{kind}");
     }
-    // The compatibility decision on excluding structural edges by default is
-    // pending; flipping DEFAULT_STRUCTURAL_EDGE_SELECTION must update this pin.
+    // v0.7.0 excludes structural edges by default (breaking change); callers
+    // restore the previous traversal with an explicit include.
     assert_eq!(
         DEFAULT_STRUCTURAL_EDGE_SELECTION,
-        StructuralEdgeSelection::Include
+        StructuralEdgeSelection::Exclude
     );
+    assert_eq!(
+        StructuralEdgeSelection::default(),
+        StructuralEdgeSelection::Exclude
+    );
+    assert!(!EdgeKindFilter::default().is_unrestricted());
+    for kind in STRUCTURAL_EDGE_KINDS {
+        assert!(!EdgeKindFilter::default().allows(kind), "{kind}");
+    }
+    assert!(EdgeKindFilter::default().allows("imports"));
     let request = issue_541_request("id:file:a", DependencyDirection::Incoming);
     assert_eq!(request.edge_kind_filter(), &EdgeKindFilter::default());
     assert!(request.edge_kind_filter().edge_kinds().is_empty());
@@ -1351,7 +1360,8 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
 
     let legacy = service.dependencies(
         &mut snapshot,
-        &issue_541_request("id:file:a", DependencyDirection::Incoming),
+        &issue_541_request("id:file:a", DependencyDirection::Incoming)
+            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Include)?,
         &cancellation,
     )?;
     assert_eq!(
@@ -1366,17 +1376,6 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
         ]
     );
     assert_eq!(legacy.traversed_edges(), 6);
-    let explicit_include = service.dependencies(
-        &mut snapshot,
-        &issue_541_request("id:file:a", DependencyDirection::Incoming)
-            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Include)?,
-        &cancellation,
-    )?;
-    assert_eq!(
-        issue_541_edge_ids(&explicit_include),
-        issue_541_edge_ids(&legacy)
-    );
-    assert_eq!(explicit_include.traversed_edges(), legacy.traversed_edges());
 
     let excluded = service.dependencies(
         &mut snapshot,
@@ -1390,6 +1389,17 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
         ["edge:import-b", "edge:import-c", "edge:type-c"]
     );
     assert_eq!(excluded.traversed_edges(), 3);
+    let default = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming),
+        &cancellation,
+    )?;
+    assert_eq!(
+        issue_541_edge_ids(&default),
+        issue_541_edge_ids(&excluded),
+        "the default excludes structural edges"
+    );
+    assert_eq!(default.traversed_edges(), excluded.traversed_edges());
     let mut dependent_nodes = excluded
         .traversal()
         .nodes

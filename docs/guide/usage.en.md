@@ -61,15 +61,16 @@ completed snapshots.
 
 ### Selecting edge kinds in dependency lists
 
-`deps` and `dependents` return structural edges alongside dependency edges.
-The structural edges are `contains` (a package contains a file), `declares`
-(a file declares a symbol), and `generated_from` (a generated file comes from
-its source). To count the files that actually depend on a node, drop them with
-`--structural-edges exclude`. When omitted, the mode is `include` and
-structural edges stay in the result as before.
+By default, `deps` and `dependents` follow only dependency edges and drop
+structural edges. The structural edges are `contains` (a package contains a
+file), `declares` (a file declares a symbol), and `generated_from` (a
+generated file comes from its source). The default count is therefore the
+number of files that actually depend on a node. To follow structural edges as
+well, as through v0.6.4, pass `--structural-edges include`.
 
 ```bash
-depgraph dependents path:src/a.ts --structural-edges exclude --json
+depgraph dependents path:src/a.ts --json
+depgraph dependents path:src/a.ts --structural-edges include --json
 depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_uses --json
 ```
 
@@ -77,9 +78,10 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
   edges of the listed kinds are followed.
 - The selection applies during traversal, so item counts and
   `traversed_items` cover only the selected edges.
-- Combining `--structural-edges exclude` with a structural `--edge-kind` is
-  contradictory and fails.
-- A `--cursor` from a different selection is rejected.
+- A structural `--edge-kind` requires `--structural-edges include`; with the
+  default `exclude` the selection is contradictory and fails.
+- A `--cursor` from a different selection is rejected. A cursor obtained
+  through v0.6.4 is accepted only with `--structural-edges include`.
 
 The MCP `graph_dependencies_list` and `graph_dependents_list` tools accept the
 same selection as `edge_kinds` and `structural_edges`.

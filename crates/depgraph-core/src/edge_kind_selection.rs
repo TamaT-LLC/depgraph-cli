@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 pub const STRUCTURAL_EDGE_KINDS: [&str; 3] = ["contains", "declares", "generated_from"];
 
 /// Whether dependency lists keep structural edges when the caller does not
-/// choose. This is the single switch for the pending compatibility decision
-/// on excluding structural edges by default.
+/// choose. Since v0.7.0 they are excluded by default so counts cover only
+/// dependency edges; an explicit `include` restores the previous traversal.
 pub const DEFAULT_STRUCTURAL_EDGE_SELECTION: StructuralEdgeSelection =
-    StructuralEdgeSelection::Include;
+    StructuralEdgeSelection::Exclude;
 
 /// Largest accepted edge-kind allowlist.
 pub const MAX_DEPENDENCY_EDGE_KINDS: usize = 64;

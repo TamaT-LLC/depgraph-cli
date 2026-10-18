@@ -46,7 +46,7 @@ additive extensionとして採用するかを決定する。
 | Hotspot result filters | `health_hotspots_list` `path_prefixes` / `node_kinds`, CLI `hotspots --path-prefix` / `--node-kind` | Issue #543 implemented: filters apply after scoring, so scores and finding IDs are unchanged |
 | Dependency list output detail | `graph_dependencies_list` / `graph_dependents_list` `detail` (`paths` / `summary` / `full`) | Issue #542 implemented: `full` stays the default and byte-identical; `summary` and `paths` shrink the response without changing the traversal |
 | Import evidence detail | `AgentEvidence.import` (`specifier`, `binding_kind`, `imported_name`, `local_name`, `type_only`) | Issue #544 implemented: allowlisted from evidence properties or the import site specifier; evidence without import facts stays byte-identical |
-| Dependency list edge kind selection | `graph_dependencies_list` / `graph_dependents_list` `edge_kinds` / `structural_edges`, CLI `deps` / `dependents` `--edge-kind` / `--structural-edges` | Issue #541 implemented as opt-in filters: the default stays `include`; switching the default to exclude structural edges awaits the compatibility decision |
+| Dependency list edge kind selection | `graph_dependencies_list` / `graph_dependents_list` `edge_kinds` / `structural_edges`, CLI `deps` / `dependents` `--edge-kind` / `--structural-edges` | Issue #541 implemented; since v0.7.0 the default is `exclude` (breaking change), and `include` restores the previous every-kind traversal |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -862,16 +862,16 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 
 ## Issue #541 dependency list edge kind selection
 
-依存一覧の件数がそのまま依存しているファイル数になるよう、`graph_dependencies_list`と`graph_dependents_list`へ辺種別の選択を追加する。既定の挙動は変えず、構造上の辺の既定除外は互換性の判断を待つ。
+依存一覧の件数がそのまま依存しているファイル数になるよう、`graph_dependencies_list`と`graph_dependents_list`へ辺種別の選択を追加する。v0.7.0で既定を`exclude`へ切り替え、構造上の辺を既定で除外する（破壊的変更）。従来の挙動は`structural_edges: "include"` / `--structural-edges include`で得られる。
 
 | Area | Evidence |
 | --- | --- |
 | Structural edges | core `edge_kind_selection::STRUCTURAL_EDGE_KINDS`（`contains`、`declares`、`generated_from`、システム設計§7.2のStructure分類）に一つだけ定義する。health unusedなど既存の散在箇所は判定対象が異なる（`generated_from`を含まない等）ため、挙動を変えないよう今回は統合しない |
 | Input | 任意入力`edge_kinds`（Agent token形式の許可リスト、最大64件、`uniqueItems`）と`structural_edges`（closed enum `include` / `exclude`）を追加する。`edge_kinds`が空または省略なら全種別を対象にし、`structural_edges`で構造上の辺を残すか決める。`edge_kinds`を指定した場合は列挙した種別だけを辿る |
-| Contradiction | `structural_edges: "exclude"`と構造上の種別を含む`edge_kinds`の同時指定は矛盾として`INVALID_ARGUMENT`。`structural_edges: "include"`と許可リストの同時指定は許可リストだけで決まる。不正な種別文字列、65件以上、未知の`structural_edges`値も`INVALID_ARGUMENT`。存在しない種別は許可し、結果が空になる |
+| Contradiction | `structural_edges: "exclude"`（省略時の既定を含む）と構造上の種別を含む`edge_kinds`の同時指定は矛盾として`INVALID_ARGUMENT`。構造上の種別を許可リストに入れるには`include`の明示が必要。`structural_edges: "include"`と許可リストの同時指定は許可リストだけで決まる。不正な種別文字列、65件以上、未知の`structural_edges`値も`INVALID_ARGUMENT`。存在しない種別は許可し、結果が空になる |
 | Traversal | core `DependenciesRequest::with_edge_kind_filter`で選択を受け取り、`adjacency_cancellable`が隣接表を作る段階で選ばれない種別を除く。そのため`items`、`nodes`、`total_items`、`traversed_edges`、`max_traversal`の消費は選んだ辺だけで数える。`why` / `impact`などほかの走査は`EdgeKindFilter::unrestricted()`を渡し、挙動を変えない |
-| Default | 既定値はcore `DEFAULT_STRUCTURAL_EDGE_SELECTION`（現在`include`）の定数一つで決まる。`StructuralEdgeSelection::default()`、`EdgeKindFilter::default()`、MCPの省略時、CLIの省略時、入力schemaの`default`はすべてこの定数を参照する。既定値の切り替え（構造辺の既定除外）は互換性判断待ち |
-| Cursor | 全種別を辿る選択（`structural_edges: "include"`かつ`edge_kinds`なし）は従来の正規化入力のままで、cursorも同じbytesになる。それ以外では正規化入力に`edge_kinds`と`structural_edges`を含め、選択の違うcursorは`CURSOR_MISMATCH`。既定を`exclude`へ切り替えた場合、既定の要求は正規化入力が変わるため、切り替え前のcursorは`CURSOR_MISMATCH`になる |
+| Default | 既定値はcore `DEFAULT_STRUCTURAL_EDGE_SELECTION`（v0.7.0から`exclude`）の定数一つで決まる。`StructuralEdgeSelection::default()`、`EdgeKindFilter::default()`、MCPの省略時、CLIの省略時、入力schemaの`default`はすべてこの定数を参照する。v0.6.4までの既定（全種別を辿る）からの切り替えは破壊的変更として`docs/releases/unreleased.md`に記載する |
+| Cursor | 全種別を辿る選択（`structural_edges: "include"`かつ`edge_kinds`なし）は従来の正規化入力のままで、cursorも同じbytesになる。それ以外では正規化入力に`edge_kinds`と`structural_edges`を含め、選択の違うcursorは`CURSOR_MISMATCH`。既定の`exclude`は明示した`exclude`と同じ正規化入力・cursorになる。既定の要求は切り替え前と正規化入力が変わるため、v0.6.4までのcursorを既定の要求へ渡すと`CURSOR_MISMATCH`になり、`include`を明示した要求では引き続き使える |
 | Detail | 選択は走査に、#542の`detail`は射影にかかるため独立に組み合わせられる。`paths` / `summary`でも件数と`traversed_edges`は選んだ辺だけを数える |
 | CLI parity | `depgraph deps` / `dependents`へ繰り返し指定できる`--edge-kind`と`--structural-edges`（`include` / `exclude`）を追加する。CLIのページcursorの文脈も同じ規則で選択を含める。stdio process testでCLIとMCPのedge ID集合の一致を検証する |
 | Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |

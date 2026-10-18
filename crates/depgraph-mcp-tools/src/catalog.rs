@@ -445,7 +445,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependencies_list",
-        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are included by default; to count dependent or dependency files, pass structural_edges=exclude. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
+        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
         [
             "selector",
             "snapshot",
@@ -468,7 +468,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependents_list",
-        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are included by default; to count dependent or dependency files, pass structural_edges=exclude. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
+        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence. Evidence of one edge is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
         [
             "selector",
             "snapshot",
@@ -1137,13 +1137,13 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
             "uniqueItems": true,
             "items": scalar_schema::<AgentToken>(),
-            "description": "Follow only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, subject to structural_edges. Listing a structural kind (contains, declares, generated_from) together with structural_edges=exclude is contradictory and returns INVALID_ARGUMENT. Applied during traversal, so total_items and traversed_edges count only the selected edges. A cursor is bound to the selection."
+            "description": "Follow only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, subject to structural_edges. Listing a structural kind (contains, declares, generated_from) requires structural_edges=include; with exclude (the default) it is contradictory and returns INVALID_ARGUMENT. Applied during traversal, so total_items and traversed_edges count only the selected edges. A cursor is bound to the selection."
         }),
         "structural_edges" => json!({
             "type": "string",
             "enum": [StructuralEdgeSelection::Include.as_str(), StructuralEdgeSelection::Exclude.as_str()],
             "default": DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
-            "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Use exclude to count only files that actually depend on (or are depended on by) the selector. A cursor is bound to the selection."
+            "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. A cursor is bound to the selection."
         }),
         "detail" => json!({
             "type": "string",

@@ -60,20 +60,21 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 
 ### 依存一覧の辺種別を絞り込む
 
-`deps`と`dependents`の結果には、依存の辺に加えて構造上の辺が含まれます。
+`deps`と`dependents`は、既定では依存の辺だけを辿り、構造上の辺を除きます。
 構造上の辺は`contains`（パッケージがファイルを含む）、`declares`（ファイルがシンボルを宣言する）、`generated_from`（生成ファイルが元のファイルから作られる）の3種類です。
-依存しているファイルの数を数えたい場合は、`--structural-edges exclude`で構造上の辺を除きます。
-省略時は`include`で、従来どおり構造上の辺も含みます。
+そのため既定の件数は、依存しているファイルの数になります。
+v0.6.4までと同じく構造上の辺も辿りたい場合は、`--structural-edges include`を指定します。
 
 ```bash
-depgraph dependents path:src/a.ts --structural-edges exclude --json
+depgraph dependents path:src/a.ts --json
+depgraph dependents path:src/a.ts --structural-edges include --json
 depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_uses --json
 ```
 
 - `--edge-kind`は辿る辺の種類を指定します。複数回指定でき、指定した種類の辺だけを辿ります。
 - 絞り込みは走査の段階でかけます。そのため、件数と`traversed_items`は選んだ辺だけを数えます。
-- `--structural-edges exclude`と構造上の辺の`--edge-kind`を同時に指定すると、矛盾する指定としてエラーになります。
-- 絞り込み条件を変えた場合、前の`--cursor`は使えません。
+- 構造上の辺を`--edge-kind`に指定するときは、`--structural-edges include`も指定します。既定の`exclude`のままだと矛盾する指定としてエラーになります。
+- 絞り込み条件を変えた場合、前の`--cursor`は使えません。v0.6.4までに取得したcursorは、`--structural-edges include`を指定したときだけ使えます。
 
 MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`edge_kinds`と`structural_edges`を使います。
 

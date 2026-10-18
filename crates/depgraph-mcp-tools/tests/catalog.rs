@@ -1323,6 +1323,7 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
         for expected in [
             "Empty or omitted",
             "structural_edges",
+            "structural_edges=include",
             "INVALID_ARGUMENT",
             "traversed_edges",
         ] {
@@ -1345,7 +1346,8 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
             "contains",
             "declares",
             "generated_from",
-            "exclude",
+            "Defaults to exclude",
+            "include",
             "cursor",
         ] {
             assert!(
@@ -1358,7 +1360,8 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
             "contains",
             "declares",
             "generated_from",
-            "structural_edges=exclude",
+            "excluded by default",
+            "structural_edges=include",
             "edge_kinds",
         ] {
             assert!(
@@ -1367,5 +1370,9 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
                 tool.description()
             );
         }
+        assert!(
+            !tool.description().contains("included by default"),
+            "{name} description still claims the old default"
+        );
     }
 }

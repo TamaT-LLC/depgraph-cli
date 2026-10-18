@@ -8677,7 +8677,7 @@ fn seed_issue_541_store(path: &Path, root: &Path) -> String {
 }
 
 #[test]
-fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
+fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_cli() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
     let store_path = temporary.path().join("store.sqlite");
@@ -8745,7 +8745,11 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
         result["structuredContent"]["error"]["code"].clone()
     };
 
-    let legacy = call("graph_dependents_list", dependents(json!({})));
+    let default = call("graph_dependents_list", dependents(json!({})));
+    let legacy = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "include"})),
+    );
     assert_eq!(
         edge_ids(&legacy),
         [
@@ -8760,19 +8764,16 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
         4
     );
     assert_eq!(legacy["structuredContent"]["result"]["traversed_edges"], 4);
-    let explicit_include = call(
-        "graph_dependents_list",
-        dependents(json!({"structural_edges": "include"})),
-    );
-    assert_eq!(
-        legacy["content"][0]["text"], explicit_include["content"][0]["text"],
-        "the default keeps the legacy response"
-    );
 
     let excluded = call(
         "graph_dependents_list",
         dependents(json!({"structural_edges": "exclude"})),
     );
+    assert_eq!(
+        default["content"][0]["text"], excluded["content"][0]["text"],
+        "the default excludes structural edges"
+    );
+    assert_eq!(default["structuredContent"], excluded["structuredContent"]);
     assert_eq!(edge_ids(&excluded), ["edge:import-b", "edge:import-c"]);
     assert_eq!(
         excluded["structuredContent"]["result"]["edges"]["total_items"],
@@ -8789,7 +8790,7 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
     assert_eq!(edge_ids(&allowlisted), ["edge:import-b", "edge:import-c"]);
     let contains_only = call(
         "graph_dependents_list",
-        dependents(json!({"edge_kinds": ["contains"]})),
+        dependents(json!({"edge_kinds": ["contains"], "structural_edges": "include"})),
     );
     assert_eq!(edge_ids(&contains_only), ["edge:contains-a"]);
     let package = call(
@@ -8797,13 +8798,26 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
         json!({
             "contract_version": "depgraph-mcp-tools-v1",
             "selector": "id:package:app",
-            "max_traversal": 100,
-            "structural_edges": "exclude"
+            "max_traversal": 100
         }),
     );
     assert_eq!(package["isError"], false, "{package}");
     assert_eq!(
-        package["structuredContent"]["result"]["edges"]["total_items"],
+        package["structuredContent"]["result"]["edges"]["total_items"], 0,
+        "the default does not follow contains from a package"
+    );
+    let package_included = call(
+        "graph_dependencies_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "selector": "id:package:app",
+            "max_traversal": 100,
+            "structural_edges": "include"
+        }),
+    );
+    assert_eq!(package_included["isError"], false, "{package_included}");
+    assert_ne!(
+        package_included["structuredContent"]["result"]["edges"]["total_items"],
         0
     );
 
@@ -8839,6 +8853,7 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
 
     for selection in [
         json!({"edge_kinds": ["contains"], "structural_edges": "exclude"}),
+        json!({"edge_kinds": ["contains"]}),
         json!({"edge_kinds": ["imports", "generated_from"], "structural_edges": "exclude"}),
         json!({"edge_kinds": ["Imports"]}),
         json!({"edge_kinds": [""]}),
@@ -8858,8 +8873,10 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
     );
     assert_eq!(error_code(&rejected), "INVALID_ARGUMENT");
 
-    // Cursor binding: the default and an explicit include share the legacy
-    // binding; any other selection is bound to itself.
+    // Cursor binding: every-kind traversal (include without edge_kinds) keeps
+    // the pre-#541 normalized input and cursor bytes. The exclude default is
+    // bound to its selection, so cursors issued before v0.7.0 (legacy bytes)
+    // are rejected by a default request and must be re-fetched.
     let page = |selection: Value, cursor: Option<&Value>| {
         let mut arguments = dependents(selection);
         arguments["limit"] = json!(1);
@@ -8868,29 +8885,47 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
         }
         arguments
     };
-    let first_default = call("graph_dependents_list", page(json!({}), None));
-    let default_cursor =
-        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert!(default_cursor.is_string(), "{first_default}");
     let first_include = call(
         "graph_dependents_list",
         page(json!({"structural_edges": "include"}), None),
     );
-    assert_eq!(
-        first_include["structuredContent"]["result"]["edges"]["next_cursor"], default_cursor,
-        "the default cursor bytes are unchanged"
-    );
+    let legacy_cursor =
+        first_include["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(legacy_cursor.is_string(), "{first_include}");
     let resumed_include = call(
         "graph_dependents_list",
-        page(
-            json!({"structural_edges": "include"}),
-            Some(&default_cursor),
-        ),
+        page(json!({"structural_edges": "include"}), Some(&legacy_cursor)),
     );
     assert_eq!(resumed_include["isError"], false, "{resumed_include}");
     for selection in [
+        json!({}),
         json!({"structural_edges": "exclude"}),
         json!({"edge_kinds": ["imports"]}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&legacy_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_default = call("graph_dependents_list", page(json!({}), None));
+    let default_cursor =
+        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(default_cursor.is_string(), "{first_default}");
+    assert_ne!(default_cursor, legacy_cursor);
+    let first_excluded = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "exclude"}), None),
+    );
+    let excluded_cursor =
+        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert_eq!(
+        excluded_cursor, default_cursor,
+        "the default and an explicit exclude share one binding"
+    );
+    for selection in [
+        json!({"structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
     ] {
         let mismatched = call(
             "graph_dependents_list",
@@ -8898,33 +8933,14 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
         );
         assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
     }
-    let first_excluded = call(
-        "graph_dependents_list",
-        page(json!({"structural_edges": "exclude"}), None),
-    );
-    let excluded_cursor =
-        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert!(excluded_cursor.is_string(), "{first_excluded}");
-    assert_ne!(excluded_cursor, default_cursor);
-    for selection in [
-        json!({}),
-        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
-    ] {
-        let mismatched = call(
+    for selection in [json!({}), json!({"structural_edges": "exclude"})] {
+        let resumed = call(
             "graph_dependents_list",
-            page(selection.clone(), Some(&excluded_cursor)),
+            page(selection.clone(), Some(&default_cursor)),
         );
-        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+        assert_eq!(resumed["isError"], false, "{selection}: {resumed}");
+        assert_eq!(edge_ids(&resumed).len(), 1);
     }
-    let resumed = call(
-        "graph_dependents_list",
-        page(
-            json!({"structural_edges": "exclude"}),
-            Some(&excluded_cursor),
-        ),
-    );
-    assert_eq!(resumed["isError"], false, "{resumed}");
-    assert_eq!(edge_ids(&resumed).len(), 1);
     mcp.finish();
 
     let cli = |arguments: &[&str]| {
@@ -8957,6 +8973,18 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
     };
     assert_eq!(
         cli_edge_ids(&["dependents", "id:node:a", "--all", "--json"]),
+        edge_ids(&excluded),
+        "the CLI default excludes structural edges"
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "include",
+            "--all",
+            "--json"
+        ]),
         edge_ids(&legacy)
     );
     assert_eq!(
@@ -8976,22 +9004,14 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
             "id:node:a",
             "--edge-kind",
             "contains",
+            "--structural-edges",
+            "include",
             "--all",
             "--json"
         ]),
         edge_ids(&contains_only)
     );
-    assert!(
-        cli_edge_ids(&[
-            "deps",
-            "id:package:app",
-            "--structural-edges",
-            "exclude",
-            "--all",
-            "--json"
-        ])
-        .is_empty()
-    );
+    assert!(cli_edge_ids(&["deps", "id:package:app", "--all", "--json"]).is_empty());
     for arguments in [
         &[
             "dependents",
@@ -9000,6 +9020,13 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
             "contains",
             "--structural-edges",
             "exclude",
+            "--json",
+        ][..],
+        &[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
             "--json",
         ][..],
         &[
@@ -9027,26 +9054,51 @@ fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
             serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null),
         )
     };
-    let (succeeded, first) = cli_page(&["dependents", "id:node:a", "--max-items", "1", "--json"]);
-    assert!(succeeded, "{first}");
-    let cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
-    let (succeeded, _) = cli_page(&[
+    let (succeeded, first) = cli_page(&[
         "dependents",
         "id:node:a",
         "--structural-edges",
         "include",
         "--max-items",
         "1",
-        "--cursor",
-        &cli_cursor,
         "--json",
     ]);
-    assert!(succeeded, "explicit include keeps the legacy CLI cursor");
+    assert!(succeeded, "{first}");
+    let legacy_cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--max-items",
+        "1",
+        "--cursor",
+        &legacy_cli_cursor,
+        "--json",
+    ]);
+    assert!(
+        !succeeded,
+        "a pre-v0.7.0 CLI cursor is rejected by the default"
+    );
+    let (succeeded, first) = cli_page(&["dependents", "id:node:a", "--max-items", "1", "--json"]);
+    assert!(succeeded, "{first}");
+    let cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    assert_ne!(cli_cursor, legacy_cli_cursor);
     let (succeeded, _) = cli_page(&[
         "dependents",
         "id:node:a",
         "--structural-edges",
         "exclude",
+        "--max-items",
+        "1",
+        "--cursor",
+        &cli_cursor,
+        "--json",
+    ]);
+    assert!(succeeded, "explicit exclude resumes the default CLI cursor");
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "include",
         "--max-items",
         "1",
         "--cursor",

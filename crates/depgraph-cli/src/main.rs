@@ -252,8 +252,9 @@ enum Commands {
         #[arg(long, value_name = "KIND")]
         edge_kind: Vec<String>,
         /// Follow structural edges (contains, declares, generated_from):
-        /// include or exclude. Omitted keeps them (include). Use exclude to
-        /// count only files that actually depend on each other.
+        /// include or exclude. Omitted drops them (exclude), so counts cover
+        /// only files that actually depend on each other. Use include to
+        /// follow them as well; listing a structural --edge-kind needs include.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
@@ -282,8 +283,9 @@ enum Commands {
         #[arg(long, value_name = "KIND")]
         edge_kind: Vec<String>,
         /// Follow structural edges (contains, declares, generated_from):
-        /// include or exclude. Omitted keeps them (include). Use exclude to
-        /// count only files that actually depend on each other.
+        /// include or exclude. Omitted drops them (exclude), so counts cover
+        /// only files that actually depend on each other. Use include to
+        /// follow them as well; listing a structural --edge-kind needs include.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
