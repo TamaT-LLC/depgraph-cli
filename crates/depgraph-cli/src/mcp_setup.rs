@@ -1499,6 +1499,7 @@ fn run_safe_scan(core: &Path, release_root: &Path, config: &DepgraphServiceConfi
             output.status.code(),
             &output.stdout,
             &output.stderr,
+            core,
             config.store_path(),
             config.canonical_root(),
         )
@@ -1533,6 +1534,7 @@ fn describe_safe_scan_failure(
     status_code: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
+    core: &Path,
     store: &Path,
     root: &Path,
 ) -> String {
@@ -1547,7 +1549,7 @@ fn describe_safe_scan_failure(
     push_output_tail(&mut lines, "stderr", stderr);
     lines.push(format!(
         "reproduce with: {}",
-        safe_scan_reproduction_command(store, root, ShellQuoting::current())
+        safe_scan_reproduction_command(core, store, root, ShellQuoting::current())
     ));
     lines.join("\n")
 }
@@ -1665,11 +1667,19 @@ impl ShellQuoting {
     }
 }
 
-/// Mirrors the arguments `run_safe_scan` passes (including `--json`) so the
-/// rerun prints the same outcome format the failure summary was built from.
-fn safe_scan_reproduction_command(store: &Path, root: &Path, quoting: ShellQuoting) -> String {
+/// Mirrors the executable and arguments `run_safe_scan` uses (including
+/// `--json`) so the rerun prints the same outcome format the failure summary
+/// was built from. The verified release binary is named explicitly because the
+/// `depgraph` on PATH may be a different version.
+fn safe_scan_reproduction_command(
+    core: &Path,
+    store: &Path,
+    root: &Path,
+    quoting: ShellQuoting,
+) -> String {
     format!(
-        "depgraph --store {} scan {} --json",
+        "{} --store {} scan {} --json",
+        quoted_path_for(&core.to_string_lossy(), quoting),
         quoted_path_for(&store.to_string_lossy(), quoting),
         quoted_path_for(&root.to_string_lossy(), quoting)
     )
@@ -3819,6 +3829,7 @@ mod tests {
             status_code,
             stdout,
             stderr,
+            Path::new("/opt/depgraph/bin/depgraph"),
             Path::new("/state/graph.db"),
             Path::new("/work/repo"),
         )
@@ -4001,7 +4012,7 @@ mod tests {
 
         assert!(
             message.contains(
-                "reproduce with: depgraph --store /state/graph.db scan /work/repo --json"
+                "reproduce with: /opt/depgraph/bin/depgraph --store /state/graph.db scan /work/repo --json"
             ),
             "{message}"
         );
@@ -4010,6 +4021,7 @@ mod tests {
     #[test]
     fn posix_reproduction_command_matches_the_safe_scan_invocation() {
         let command = safe_scan_reproduction_command(
+            Path::new("/opt/depgraph/bin/depgraph"),
             Path::new("/state/graph.db"),
             Path::new("/work/repo"),
             ShellQuoting::Posix,
@@ -4017,13 +4029,14 @@ mod tests {
 
         assert_eq!(
             command,
-            "depgraph --store /state/graph.db scan /work/repo --json"
+            "/opt/depgraph/bin/depgraph --store /state/graph.db scan /work/repo --json"
         );
     }
 
     #[test]
     fn posix_reproduction_command_single_quotes_paths_with_spaces() {
         let command = safe_scan_reproduction_command(
+            Path::new("/Users/me/Library/Application Support/depgraph/releases/0.6.4/depgraph"),
             Path::new("/Users/me/Library/Application Support/depgraph/graph.db"),
             Path::new("/work/it's repo"),
             ShellQuoting::Posix,
@@ -4031,13 +4044,14 @@ mod tests {
 
         assert_eq!(
             command,
-            "depgraph --store '/Users/me/Library/Application Support/depgraph/graph.db' scan '/work/it'\\''s repo' --json"
+            "'/Users/me/Library/Application Support/depgraph/releases/0.6.4/depgraph' --store '/Users/me/Library/Application Support/depgraph/graph.db' scan '/work/it'\\''s repo' --json"
         );
     }
 
     #[test]
     fn windows_reproduction_command_double_quotes_paths_with_spaces() {
         let command = safe_scan_reproduction_command(
+            Path::new(r"C:\Program Files\depgraph\depgraph.exe"),
             Path::new(r"C:\Users\me\AppData\Local\depgraph\graph.db"),
             Path::new(r"C:\work\it's repo"),
             ShellQuoting::Windows,
@@ -4045,7 +4059,7 @@ mod tests {
 
         assert_eq!(
             command,
-            r#"depgraph --store C:\Users\me\AppData\Local\depgraph\graph.db scan "C:\work\it's repo" --json"#
+            r#""C:\Program Files\depgraph\depgraph.exe" --store C:\Users\me\AppData\Local\depgraph\graph.db scan "C:\work\it's repo" --json"#
         );
     }
 
