@@ -2,10 +2,12 @@ use std::io;
 
 use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
 use depgraph_mcp_tools::{
-    AgentCapability, AgentContext, AgentCurrentSnapshot, AgentErrorCode, AgentGraphExportFormat,
-    AgentGraphExportMediaType, AgentGraphExportResponse, AgentNode, AgentSnapshot,
-    CanonicalResponseMapper, CursorKey, LogicalRepositoryId, MAX_PAGE_BYTES, OperationAccepted,
-    PageByteLimit, PageRequest, PageSize, PaginationContext, SnapshotId, SuccessEnvelope,
+    AgentCapability, AgentContext, AgentCurrentSnapshot, AgentDependenciesOutput,
+    AgentDependenciesResponse, AgentDependencyDetail, AgentDependencyDirection, AgentEdge,
+    AgentErrorCode, AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse,
+    AgentNode, AgentSnapshot, CanonicalResponseMapper, CursorKey, DependencyProjectionRequest,
+    LogicalRepositoryId, MAX_PAGE_BYTES, OperationAccepted, Page, PageByteLimit, PageRequest,
+    PageSize, PaginationContext, SnapshotId, SuccessEnvelope, project_dependency_items_cancellable,
 };
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -520,4 +522,435 @@ fn ten_item_page_projection_accounts_for_returned_item_digit_growth_exactly() {
         }
         Err(error) => assert_eq!(error.code(), AgentErrorCode::ResourceExhausted),
     }
+}
+
+// Issue #542: output granularity of graph_dependencies_list / graph_dependents_list.
+
+struct DependencyFixtureEdge<'a> {
+    id: &'a str,
+    source: (&'a str, Option<&'a str>),
+    target: (&'a str, Option<&'a str>),
+    kind: &'a str,
+    precision: &'a str,
+    site_id: Option<&'a str>,
+    evidence: usize,
+}
+
+fn dependency_fixture_node(id: &str, path: Option<&str>) -> Value {
+    let properties = path.map_or_else(|| json!({}), |path| json!({"path": path}));
+    json!({
+        "id": id,
+        "kind": "module",
+        "locator": format!("id:{id}"),
+        "display_name": id,
+        "properties": properties
+    })
+}
+
+fn dependency_fixture_item(
+    edge: &DependencyFixtureEdge,
+) -> depgraph_core::query::TraversalPageItem {
+    let evidence = (0..edge.evidence)
+        .map(|ordinal| {
+            json!({
+                "owner_type": "edge",
+                "owner_id": edge.id,
+                "ordinal": ordinal,
+                "kind": "semantic",
+                "extractor": "fixture",
+                "extractor_version": "1.0",
+                "path": "src/a.rs",
+                "start_line": 1,
+                "start_column": 1,
+                "end_line": 1,
+                "end_column": 2,
+                "detail": null,
+                "properties": {}
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::from_value(json!({
+        "source": dependency_fixture_node(edge.source.0, edge.source.1),
+        "target": dependency_fixture_node(edge.target.0, edge.target.1),
+        "step": {
+            "edge": {
+                "id": edge.id,
+                "site_id": edge.site_id,
+                "source": edge.source.0,
+                "target": edge.target.0,
+                "kind": edge.kind,
+                "phase": "semantic",
+                "environment": "host",
+                "profile_id": "profile:default",
+                "resolution_status": "resolved",
+                "precision": edge.precision,
+                "condition": {"op": "all", "conditions": []},
+                "generated": false
+            },
+            "condition_text": "all",
+            "evidence": evidence,
+            "effective_profile_id": null,
+            "correlation_status": null,
+            "observed_difference_reasons": [],
+            "phase_coverage": {}
+        }
+    }))
+    .expect("valid dependency traversal item")
+}
+
+/// Four traversal edges: two share the same file pair and kind (`edge:1`, `edge:3`),
+/// one differs only in kind (`edge:2`) and one targets a node without a repository path.
+fn dependency_fixture_items() -> Vec<depgraph_core::query::TraversalPageItem> {
+    [
+        DependencyFixtureEdge {
+            id: "edge:1",
+            source: ("node:a", Some("src/a.rs")),
+            target: ("node:b", Some("src/b.rs")),
+            kind: "imports",
+            precision: "exact",
+            site_id: Some("site:1"),
+            evidence: 2,
+        },
+        DependencyFixtureEdge {
+            id: "edge:2",
+            source: ("node:a", Some("src/a.rs")),
+            target: ("node:b", Some("src/b.rs")),
+            kind: "calls",
+            precision: "heuristic",
+            site_id: None,
+            evidence: 0,
+        },
+        DependencyFixtureEdge {
+            id: "edge:3",
+            source: ("symbol:a", Some("src/a.rs")),
+            target: ("node:b", Some("src/b.rs")),
+            kind: "imports",
+            precision: "exact",
+            site_id: Some("site:3"),
+            evidence: 1,
+        },
+        DependencyFixtureEdge {
+            id: "edge:4",
+            source: ("node:b", Some("src/b.rs")),
+            target: ("node:x", None),
+            kind: "imports",
+            precision: "exact",
+            site_id: None,
+            evidence: 1,
+        },
+    ]
+    .iter()
+    .map(dependency_fixture_item)
+    .collect()
+}
+
+fn dependency_root() -> AgentNode {
+    AgentNode::new(
+        "node:a".parse().expect("valid root ID"),
+        "module".parse().expect("valid kind"),
+        "id:node:a".parse().expect("valid locator"),
+        None,
+        Some("src/a.rs".parse().expect("valid path")),
+    )
+}
+
+fn dependency_pagination(normalized: &Value) -> PaginationContext {
+    PaginationContext::new(
+        &cursor_key(),
+        "graph_dependencies_list",
+        repository_id(),
+        snapshot_id(),
+        normalized,
+    )
+    .expect("dependency pagination context")
+}
+
+fn project_fixture(
+    detail: AgentDependencyDetail,
+    page: &PageRequest,
+    pagination: &PaginationContext,
+) -> Result<AgentDependenciesOutput, depgraph_mcp_tools::AgentError> {
+    project_items(&dependency_fixture_items(), detail, page, pagination)
+}
+
+/// Twenty edges with distinct file pairs, large enough that one-item pages (which carry a
+/// continuation cursor) stay below the complete response for every detail.
+fn many_dependency_items() -> Vec<depgraph_core::query::TraversalPageItem> {
+    (0..20)
+        .map(|index| {
+            let id = format!("edge:{index:02}");
+            let node = format!("node:s{index:02}");
+            let path = format!("src/s{index:02}.rs");
+            dependency_fixture_item(&DependencyFixtureEdge {
+                id: &id,
+                source: (&node, Some(&path)),
+                target: ("node:b", Some("src/b.rs")),
+                kind: "imports",
+                precision: "exact",
+                site_id: None,
+                evidence: 1,
+            })
+        })
+        .collect()
+}
+
+fn project_items(
+    items: &[depgraph_core::query::TraversalPageItem],
+    detail: AgentDependencyDetail,
+    page: &PageRequest,
+    pagination: &PaginationContext,
+) -> Result<AgentDependenciesOutput, depgraph_mcp_tools::AgentError> {
+    project_dependency_items_cancellable(
+        dependency_root(),
+        items,
+        u64::try_from(items.len()).unwrap(),
+        DependencyProjectionRequest::new(AgentDependencyDirection::Outgoing, true, detail),
+        pagination,
+        page,
+        &depgraph_core::CancellationToken::new(),
+    )
+}
+
+fn large_page() -> PageRequest {
+    PageRequest::new(
+        PageSize::new(100).unwrap(),
+        PageByteLimit::new(MAX_PAGE_BYTES).unwrap(),
+        None,
+    )
+}
+
+fn mapped_bytes<T: depgraph_mcp_tools::PublicToolResult>(result: T) -> Vec<u8> {
+    let mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+        repository_id(),
+        Some(snapshot_id()),
+        result,
+    ))
+    .expect("dependency response maps");
+    text_content(mapped.result()).as_bytes().to_vec()
+}
+
+#[test]
+fn issue_542_full_detail_is_byte_identical_to_the_legacy_edge_projection() {
+    let pagination = dependency_pagination(&json!({"selector": "id:node:a"}));
+    let full = project_fixture(AgentDependencyDetail::Full, &large_page(), &pagination)
+        .expect("full projection");
+    let AgentDependenciesOutput::Full(full) = full else {
+        panic!("full detail must keep the legacy response shape");
+    };
+
+    let legacy_edges = dependency_fixture_items()
+        .iter()
+        .map(|item| AgentEdge::try_from(&item.step).expect("legacy edge projection"))
+        .collect::<Vec<_>>();
+    let legacy = AgentDependenciesResponse::new(
+        dependency_root(),
+        AgentDependencyDirection::Outgoing,
+        true,
+        true,
+        4,
+        Page::new(legacy_edges, 4, true, None).expect("legacy page"),
+    )
+    .expect("legacy response");
+    assert_eq!(full, legacy);
+    let full_bytes = mapped_bytes(AgentDependenciesOutput::Full(full));
+    assert_eq!(full_bytes, mapped_bytes(legacy));
+    let full_value: Value = serde_json::from_slice(&full_bytes).unwrap();
+    assert!(full_value["result"].get("detail").is_none());
+    assert!(full_value["result"].get("common").is_none());
+    assert_eq!(
+        full_value["result"]["edges"]["items"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn issue_542_summary_detail_hoists_shared_edge_fields_into_common_once() {
+    let pagination = dependency_pagination(&json!({"selector": "id:node:a", "detail": "summary"}));
+    let summary = project_fixture(AgentDependencyDetail::Summary, &large_page(), &pagination)
+        .expect("summary projection");
+    assert_eq!(summary.detail(), AgentDependencyDetail::Summary);
+    let bytes = mapped_bytes(summary);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let result = &value["result"];
+    assert_eq!(result["detail"], "summary");
+    assert_eq!(result["root"]["id"], "node:a");
+    assert_eq!(result["traversed_edges"], 4);
+    assert_eq!(
+        result["common"],
+        json!({
+            "phase": "semantic",
+            "resolution_status": "resolved",
+            "profile_id": "profile:default",
+            "condition": "all"
+        }),
+        "precision differs across edges, so it stays per edge"
+    );
+    let items = result["edges"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert_eq!(
+        items[0],
+        json!({
+            "id": "edge:1",
+            "source_id": "node:a",
+            "target_id": "node:b",
+            "kind": "imports",
+            "precision": "exact",
+            "site_id": "site:1",
+            "evidence_count": 2
+        })
+    );
+    assert_eq!(items[1]["precision"], "heuristic");
+    assert_eq!(items[1]["evidence_count"], 0);
+    assert!(items[1].get("site_id").is_none());
+    for item in items {
+        for hoisted in [
+            "phase",
+            "resolution_status",
+            "profile_id",
+            "condition",
+            "evidence",
+        ] {
+            assert!(item.get(hoisted).is_none(), "{hoisted} repeated in {item}");
+        }
+    }
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(text.matches("profile:default").count(), 1);
+    assert_eq!(text.matches("\"semantic\"").count(), 1);
+
+    let full_pagination = dependency_pagination(&json!({"selector": "id:node:a"}));
+    let full = project_fixture(AgentDependencyDetail::Full, &large_page(), &full_pagination)
+        .expect("full projection");
+    assert!(text.len() < mapped_bytes(full).len());
+}
+
+#[test]
+fn issue_542_paths_detail_returns_unique_paths_and_kinds_only() {
+    let pagination = dependency_pagination(&json!({"selector": "id:node:a", "detail": "paths"}));
+    let paths = project_fixture(AgentDependencyDetail::Paths, &large_page(), &pagination)
+        .expect("paths projection");
+    assert_eq!(paths.detail(), AgentDependencyDetail::Paths);
+    let value: Value = serde_json::from_slice(&mapped_bytes(paths)).unwrap();
+    let result = &value["result"];
+    assert_eq!(result["detail"], "paths");
+    assert_eq!(result["traversed_edges"], 4);
+    assert!(result.get("edges").is_none());
+    assert_eq!(
+        result["paths"],
+        json!({
+            "items": [
+                {"source_path": "src/a.rs", "target_path": "src/b.rs", "kind": "imports"},
+                {"source_path": "src/a.rs", "target_path": "src/b.rs", "kind": "calls"},
+                {"source_path": "src/b.rs", "target_id": "node:x", "kind": "imports"}
+            ],
+            "returned_items": 3,
+            "total_items": 3,
+            "complete": true
+        })
+    );
+}
+
+#[test]
+fn issue_542_byte_budget_pages_every_detail_and_reassembles_the_complete_result() {
+    let items = many_dependency_items();
+    for (detail, field) in [
+        (AgentDependencyDetail::Full, "edges"),
+        (AgentDependencyDetail::Summary, "edges"),
+        (AgentDependencyDetail::Paths, "paths"),
+    ] {
+        let pagination = dependency_pagination(&json!({"selector": "id:node:a", "detail": detail}));
+        let complete = project_items(&items, detail, &large_page(), &pagination).expect("complete");
+        let complete_bytes = mapped_bytes(complete);
+        let complete_value: Value = serde_json::from_slice(&complete_bytes).unwrap();
+        let expected_items = complete_value["result"][field]["items"].clone();
+        let expected_count = expected_items.as_array().unwrap().len();
+
+        // The largest one-item page is the smallest budget that always makes progress;
+        // it is below the complete response, so the byte budget alone must split pages.
+        let mut budget = 0_usize;
+        let mut single_cursor = None;
+        loop {
+            let request = PageRequest::new(
+                PageSize::new(1).unwrap(),
+                PageByteLimit::new(MAX_PAGE_BYTES).unwrap(),
+                single_cursor.take(),
+            );
+            let page = project_items(&items, detail, &request, &pagination).expect("one-item page");
+            let mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id(),
+                Some(snapshot_id()),
+                page,
+            ))
+            .unwrap();
+            budget = budget.max(mapped.output_bytes());
+            let value: Value = serde_json::from_str(text_content(mapped.result())).unwrap();
+            match value["result"][field].get("next_cursor") {
+                Some(next) => single_cursor = Some(next.as_str().unwrap().parse().unwrap()),
+                None => break,
+            }
+        }
+        assert!(budget < complete_bytes.len(), "{detail:?}");
+        let budget = u32::try_from(budget).unwrap();
+        let mut collected = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let request = PageRequest::new(
+                PageSize::new(100).unwrap(),
+                PageByteLimit::new(budget).unwrap(),
+                cursor.clone(),
+            );
+            let page = project_items(&items, detail, &request, &pagination).expect("page");
+            let mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id(),
+                Some(snapshot_id()),
+                page,
+            ))
+            .unwrap();
+            assert!(
+                mapped.output_bytes() <= budget as usize,
+                "{detail:?} over budget"
+            );
+            pages += 1;
+            let value: Value = serde_json::from_str(text_content(mapped.result())).unwrap();
+            let page = &value["result"][field];
+            assert!(page["returned_items"].as_u64().unwrap() >= 1);
+            collected.extend(page["items"].as_array().unwrap().iter().cloned());
+            match page.get("next_cursor") {
+                Some(next) => cursor = Some(next.as_str().unwrap().parse().unwrap()),
+                None => break,
+            }
+        }
+        assert!(pages > 1, "{detail:?} was not split by the byte budget");
+        assert_eq!(collected.len(), expected_count, "{detail:?}");
+        assert_eq!(Value::Array(collected), expected_items, "{detail:?}");
+    }
+}
+
+#[test]
+fn issue_542_cursor_from_one_detail_is_rejected_by_another() {
+    let first_page = PageRequest::new(
+        PageSize::new(1).unwrap(),
+        PageByteLimit::new(MAX_PAGE_BYTES).unwrap(),
+        None,
+    );
+    let full_pagination = dependency_pagination(&json!({"selector": "id:node:a"}));
+    let AgentDependenciesOutput::Full(full) =
+        project_fixture(AgentDependencyDetail::Full, &first_page, &full_pagination).unwrap()
+    else {
+        panic!("full shape");
+    };
+    let cursor = full.edges().next_cursor().unwrap().clone();
+    let paths_pagination =
+        dependency_pagination(&json!({"selector": "id:node:a", "detail": "paths"}));
+    let resumed = PageRequest::new(
+        PageSize::new(1).unwrap(),
+        PageByteLimit::new(MAX_PAGE_BYTES).unwrap(),
+        Some(cursor),
+    );
+    let error = project_fixture(AgentDependencyDetail::Paths, &resumed, &paths_pagination)
+        .expect_err("cursor bound to another detail");
+    assert_eq!(error.code(), AgentErrorCode::CursorMismatch);
 }

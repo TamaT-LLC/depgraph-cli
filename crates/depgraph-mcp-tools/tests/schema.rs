@@ -189,6 +189,57 @@ fn issue_314_shared_schema_publishes_repository_init_outcome_and_success_envelop
 }
 
 #[test]
+fn issue_540_shared_schema_publishes_repository_list_and_repository_error_details() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in ["AgentRepositoryList", "AgentRepositorySummary"] {
+        let value = definitions
+            .get(definition)
+            .unwrap_or_else(|| panic!("missing {definition} definition"));
+        assert_eq!(value["additionalProperties"], false, "{definition}");
+    }
+    let summary = &definitions["AgentRepositorySummary"];
+    let mut summary_fields = summary["properties"]
+        .as_object()
+        .expect("summary properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    summary_fields.sort_unstable();
+    assert_eq!(summary_fields, ["repository_id", "snapshot"]);
+    let repositories = &definitions["AgentRepositoryList"]["properties"]["repositories"];
+    assert_eq!(repositories["minItems"], 1);
+    assert_eq!(repositories["maxItems"], 64);
+    assert!(definitions.values().any(|definition| {
+        definition["properties"]["result"]["$ref"] == "#/$defs/AgentRepositoryList"
+    }));
+
+    let ids = &definitions["AgentRepositoryIds"];
+    assert_eq!(ids["type"], "array");
+    assert_eq!(ids["minItems"], 1);
+    assert_eq!(ids["maxItems"], 64);
+    assert_eq!(ids["uniqueItems"], true);
+    let details = serde_json::to_string(&definitions["AgentErrorDetails"]).expect("details");
+    assert!(details.contains("available_repository_ids"));
+    assert!(details.contains("#/$defs/AgentRepositoryIds"));
+
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentErrorDetails",
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).expect("details schema compiles");
+    assert!(validator.is_valid(&json!({"kind":"repository","available_repository_ids":["web"]})));
+    for invalid in [
+        json!({"kind":"repository","available_repository_ids":[]}),
+        json!({"kind":"repository","available_repository_ids":["web","web"]}),
+        json!({"kind":"repository","available_repository_ids":["/abs"]}),
+    ] {
+        assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+    }
+}
+
+#[test]
 fn issue_310_shared_schema_publishes_the_closed_operation_projection() {
     let schema = schema_value();
     let definitions = schema["$defs"].as_object().expect("schema definitions");
@@ -673,6 +724,21 @@ fn generated_schema_is_valid_draft_2020_12_and_rejects_unknown_fields() {
             json!({"kind":"operation","operation_id":OPERATION_ID}),
         ),
         (
+            "AgentErrorDetails",
+            "AgentErrorDetails::Repository",
+            json!({"kind":"repository","available_repository_ids":["repo-1"]}),
+        ),
+        (
+            "AgentRepositorySummary",
+            "AgentRepositorySummary",
+            json!({"repository_id":"repo-1","snapshot":{"available":false}}),
+        ),
+        (
+            "AgentRepositoryList",
+            "AgentRepositoryList",
+            json!({"repositories":[{"repository_id":"repo-1","snapshot":{"available":false}}]}),
+        ),
+        (
             "AgentError",
             "AgentError",
             json!({"code":"OPERATION_NOT_READY","category":"state","retryable":true,"remediation":"poll_operation"}),
@@ -886,7 +952,11 @@ fn every_generated_object_schema_has_additional_properties_false() {
     let schema = schema_value();
     let mut objects = 0;
     assert_all_object_schemas_are_closed(&schema, "#", &mut objects);
-    assert_eq!(objects, 190, "review newly added object schemas explicitly");
+    // Issue #540 adds AgentRepositorySummary, AgentRepositoryList, its success envelope,
+    // and the AgentErrorDetails::Repository branch. Issue #542 adds the summary and paths
+    // responses, AgentEdgeCommon, AgentEdgeSummary, AgentDependencyPath, their two pages,
+    // and the AgentDependenciesOutput success envelope. Issue #544 adds AgentImportEvidence.
+    assert_eq!(objects, 203, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -1216,5 +1286,175 @@ fn schema_fixture_path_is_the_documented_repository_location() {
     assert_eq!(
         std::fs::read(path).expect("read checked-in schema"),
         CHECKED_IN_SCHEMA
+    );
+}
+
+#[test]
+fn issue_542_shared_schema_publishes_closed_dependency_detail_shapes() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    for definition in [
+        "AgentDependenciesSummaryResponse",
+        "AgentDependencyPathsResponse",
+        "AgentEdgeCommon",
+        "AgentEdgeSummary",
+        "AgentDependencyPath",
+    ] {
+        let value = definitions
+            .get(definition)
+            .unwrap_or_else(|| panic!("missing {definition} definition"));
+        assert_eq!(value["additionalProperties"], false, "{definition}");
+    }
+    let output = &definitions["AgentDependenciesOutput"];
+    assert_eq!(output["oneOf"].as_array().map(Vec::len), Some(3));
+    assert!(definitions.values().any(|definition| {
+        definition["properties"]["result"]["$ref"] == "#/$defs/AgentDependenciesOutput"
+    }));
+
+    let validator = |definition: &str| {
+        let wrapper = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+        });
+        jsonschema::draft202012::new(&wrapper).expect("dependency detail schema compiles")
+    };
+    let root = json!({"id":"node:src","kind":"module","locator":"repo://src/lib.rs"});
+    let full = json!({
+        "root": root,
+        "direction": "outgoing",
+        "transitive": false,
+        "traversal_complete": true,
+        "traversed_edges": 0,
+        "edges": {"items":[],"returned_items":0,"total_items":0,"complete":true}
+    });
+    let summary = json!({
+        "detail": "summary",
+        "root": root,
+        "direction": "outgoing",
+        "transitive": false,
+        "traversal_complete": true,
+        "traversed_edges": 1,
+        "common": {"phase":"semantic","profile_id":"profile:default"},
+        "edges": {
+            "items":[{"id":"edge:1","source_id":"node:src","target_id":"node:b","kind":"imports","resolution_status":"resolved","precision":"exact","evidence_count":0}],
+            "returned_items":1,"total_items":1,"complete":true
+        }
+    });
+    let paths = json!({
+        "detail": "paths",
+        "root": root,
+        "direction": "incoming",
+        "transitive": true,
+        "traversal_complete": true,
+        "traversed_edges": 1,
+        "paths": {
+            "items":[{"source_path":"src/a.rs","target_id":"node:x","kind":"imports"}],
+            "returned_items":1,"total_items":1,"complete":true
+        }
+    });
+    let output_validator = validator("AgentDependenciesOutput");
+    for valid in [&full, &summary, &paths] {
+        assert!(output_validator.is_valid(valid), "rejected {valid}");
+    }
+    let mut tagged_full = full.clone();
+    tagged_full["detail"] = json!("full");
+    let mut summary_as_paths = summary.clone();
+    summary_as_paths["detail"] = json!("paths");
+    let mut paths_with_common = paths.clone();
+    paths_with_common["common"] = json!({});
+    for invalid in [tagged_full, summary_as_paths, paths_with_common] {
+        assert!(!output_validator.is_valid(&invalid), "accepted {invalid}");
+    }
+
+    let path_validator = validator("AgentDependencyPath");
+    for invalid in [
+        json!({"source_path":"src/a.rs","source_id":"node:a","target_id":"node:x","kind":"imports"}),
+        json!({"target_id":"node:x","kind":"imports"}),
+        json!({"source_path":"src/a.rs","target_path":"src/b.rs"}),
+        json!({"source_path":"src/a.rs","target_path":"src/b.rs","kind":"imports","unexpected":true}),
+    ] {
+        assert!(!path_validator.is_valid(&invalid), "accepted {invalid}");
+    }
+    let summary_item = validator("AgentEdgeSummary");
+    assert!(!summary_item.is_valid(&json!({
+        "id":"edge:1","source_id":"node:src","target_id":"node:b","kind":"imports","evidence_count":65
+    })));
+}
+
+#[test]
+fn issue_544_shared_schema_publishes_closed_import_evidence() {
+    let schema = schema_value();
+    let definitions = schema["$defs"].as_object().expect("schema definitions");
+    let import = definitions
+        .get("AgentImportEvidence")
+        .expect("AgentImportEvidence definition");
+    assert_eq!(import["additionalProperties"], false);
+    assert_eq!(import["required"], json!(["specifier"]));
+    let binding = definitions
+        .get("AgentImportBindingKind")
+        .expect("AgentImportBindingKind definition");
+    assert_eq!(binding["enum"].as_array().map(Vec::len), Some(15));
+    for name in definitions["AgentEvidence"]["properties"]
+        .as_object()
+        .expect("evidence properties")
+        .keys()
+        .chain(
+            import["properties"]
+                .as_object()
+                .expect("import properties")
+                .keys(),
+        )
+    {
+        let lower = name.to_ascii_lowercase();
+        assert!(
+            !["token", "secret", "password"]
+                .iter()
+                .any(|word| lower.contains(word)),
+            "{name} would be redacted as a sensitive field"
+        );
+    }
+
+    let wrapper = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/AgentEvidence",
+    });
+    let validator = jsonschema::draft202012::new(&wrapper).expect("evidence schema compiles");
+    let base = json!({"kind":"semantic","extractor":"typescript-native-typechecker","extractor_version":"7.0.2"});
+    assert!(validator.is_valid(&base));
+    let mut with_import = base.clone();
+    with_import["import"] = json!({
+        "specifier":"@/lib/foo",
+        "binding_kind":"named",
+        "imported_name":"fooHelper",
+        "local_name":"foo",
+        "type_only":true
+    });
+    assert!(validator.is_valid(&with_import));
+    let mut specifier_only = base.clone();
+    specifier_only["import"] = json!({"specifier":"example.com/pkg/util"});
+    assert!(validator.is_valid(&specifier_only));
+    for invalid in [
+        json!({}),
+        json!({"specifier":""}),
+        json!({"specifier":"a\nb"}),
+        json!({"specifier":"./a","binding_kind":"wildcard"}),
+        json!({"specifier":"./a","properties":{"secret":"x"}}),
+        json!({"specifier":"./a","imported_name":""}),
+        json!({"specifier":"./a","type_only":"yes"}),
+    ] {
+        let mut value = base.clone();
+        value["import"] = invalid.clone();
+        assert!(
+            !validator.is_valid(&value),
+            "schema accepted import {invalid}"
+        );
+    }
+    assert_definition_rejects_unknown(
+        &schema,
+        "AgentImportEvidence",
+        "AgentImportEvidence",
+        json!({"specifier":"./a"}),
     );
 }

@@ -26,12 +26,18 @@ use crate::{
     AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse,
-    AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor, DurableSubmitResult,
-    ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page, PageRequest, PortableTerminalOutput,
-    SnapshotId, SuccessEnvelope, TaskAccepted, canonical_json_bytes,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
+    PageRequest, PortableTerminalOutput, SnapshotId, SuccessEnvelope, TaskAccepted,
+    canonical_json_bytes,
+};
+use crate::{
+    AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
+    AgentDependencyPath, AgentDependencyPathsResponse, AgentEdgeCommon, AgentEdgeSummary,
+    DependencyProjectionRequest,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -67,6 +73,9 @@ macro_rules! public_page_item {
 
 public_result!(
     AgentCompletedSnapshot,
+    AgentDependenciesOutput,
+    AgentDependenciesSummaryResponse,
+    AgentDependencyPathsResponse,
     AgentContext,
     AgentImpactResponse,
     AgentDependenciesResponse,
@@ -93,6 +102,7 @@ public_result!(
     AgentHealthHotspots,
     AgentHealthSummary,
     AgentRepositoryInitOutcome,
+    AgentRepositoryList,
     AgentOperation,
     DurableSubmitResult,
     OperationAccepted,
@@ -100,6 +110,8 @@ public_result!(
 );
 public_page_item!(
     AgentCycle,
+    AgentDependencyPath,
+    AgentEdgeSummary,
     AgentEdge,
     AgentEvidence,
     AgentNamedSnapshot,
@@ -1165,6 +1177,8 @@ pub fn project_impact_response_cancellable(
 }
 
 /// Converts and paginates one complete dependency traversal with cooperative cancellation.
+///
+/// This is the `detail=full` projection; see `project_dependencies_output_cancellable`.
 pub fn project_dependencies_page_cancellable(
     source: &DependenciesResult,
     direction: crate::AgentDependencyDirection,
@@ -1173,65 +1187,217 @@ pub fn project_dependencies_page_cancellable(
     request: &PageRequest,
     cancellation: &CancellationToken,
 ) -> Result<AgentDependenciesResponse, AgentError> {
+    let projection =
+        DependencyProjectionRequest::new(direction, transitive, AgentDependencyDetail::Full);
+    match project_dependencies_output_cancellable(
+        source,
+        projection,
+        pagination,
+        request,
+        cancellation,
+    )? {
+        AgentDependenciesOutput::Full(response) => Ok(response),
+        AgentDependenciesOutput::Summary(_) | AgentDependenciesOutput::Paths(_) => {
+            Err(internal_error(false))
+        }
+    }
+}
+
+/// Converts and paginates one complete dependency traversal at the requested `detail`.
+pub fn project_dependencies_output_cancellable(
+    source: &DependenciesResult,
+    projection: DependencyProjectionRequest,
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<AgentDependenciesOutput, AgentError> {
     if !source.complete() {
         return Err(resource_error(
             AgentResourceLimit::TraversalItems,
             depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL as u64,
         ));
     }
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    let root = AgentNode::try_from(source).map_err(impact_contract_error)?;
+    project_dependency_items_cancellable(
+        root,
+        source.items(),
+        source.traversed_edges(),
+        projection,
+        pagination,
+        request,
+        cancellation,
+    )
+}
+
+/// Projects the items of one complete dependency traversal at the requested `detail`.
+///
+/// Every detail pages under the same byte budget: the fixed part of the response (root,
+/// counters and, for `summary`, the traversal-wide `common` fields) is measured once and
+/// each candidate page adds its canonical item bytes. The cursor digest covers the
+/// complete projected collection of that detail.
+pub fn project_dependency_items_cancellable(
+    root: AgentNode,
+    items: &[depgraph_core::query::TraversalPageItem],
+    traversed_edges: u64,
+    projection: DependencyProjectionRequest,
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<AgentDependenciesOutput, AgentError> {
     let mut is_cancelled = || cancellation.is_cancelled();
     if is_cancelled() {
         return Err(cancelled_error());
     }
-    let root = AgentNode::try_from(source).map_err(impact_contract_error)?;
-    let total_items = u64::try_from(source.items().len()).map_err(|_| internal_error(false))?;
-    let empty_page = empty_projection_page(pagination, total_items)?;
-    let projection_response = AgentDependenciesResponse::new(
-        root.clone(),
-        direction,
-        transitive,
-        source.complete(),
-        source.traversed_edges(),
-        empty_page,
-    )
-    .map_err(impact_contract_error)?;
-    let mut byte_projection =
-        WrappedPageByteProjection::new(pagination, projection_response, "edges")?;
-    if is_cancelled() {
-        return Err(cancelled_error());
-    }
-    validate_aggregate_condition_bytes(
-        source
-            .items()
-            .iter()
-            .map(|item| item.step.condition_text.as_str()),
-    )?;
-    let items = convert_dependency_items_cancellable(
-        source.items(),
-        depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL,
-        &mut is_cancelled,
-    )?;
-    if is_cancelled() {
-        return Err(cancelled_error());
-    }
-    let page = pagination.paginate_cancellable_with_projection(
-        &items,
+    let direction = projection.direction();
+    let transitive = projection.transitive();
+    let wrapped = WrappedPageRequest {
+        pagination,
         request,
         cancellation,
-        &mut byte_projection,
+    };
+    match projection.detail() {
+        AgentDependencyDetail::Full => {
+            let edges = convert_dependency_edges_cancellable(items, &mut is_cancelled)?;
+            wrapped
+                .paginate(&edges, "edges", |page| {
+                    AgentDependenciesResponse::new(
+                        root.clone(),
+                        direction,
+                        transitive,
+                        true,
+                        traversed_edges,
+                        page,
+                    )
+                    .map_err(impact_contract_error)
+                })
+                .map(AgentDependenciesOutput::Full)
+        }
+        AgentDependencyDetail::Summary => {
+            let edges = convert_dependency_edges_cancellable(items, &mut is_cancelled)?;
+            let common = AgentEdgeCommon::from_edges(&edges);
+            let mut summaries = Vec::with_capacity(edges.len());
+            for edge in &edges {
+                if is_cancelled() {
+                    return Err(cancelled_error());
+                }
+                summaries.push(AgentEdgeSummary::project(edge, &common));
+            }
+            wrapped
+                .paginate(&summaries, "edges", |page| {
+                    AgentDependenciesSummaryResponse::new(
+                        root.clone(),
+                        direction,
+                        transitive,
+                        true,
+                        traversed_edges,
+                        common.clone(),
+                        page,
+                    )
+                    .map_err(impact_contract_error)
+                })
+                .map(AgentDependenciesOutput::Summary)
+        }
+        AgentDependencyDetail::Paths => {
+            let paths = convert_dependency_paths_cancellable(items, &mut is_cancelled)?;
+            wrapped
+                .paginate(&paths, "paths", |page| {
+                    AgentDependencyPathsResponse::new(
+                        root.clone(),
+                        direction,
+                        transitive,
+                        true,
+                        traversed_edges,
+                        page,
+                    )
+                    .map_err(impact_contract_error)
+                })
+                .map(AgentDependenciesOutput::Paths)
+        }
+    }
+}
+
+/// Paging inputs shared by every result DTO that nests one `Page` field.
+struct WrappedPageRequest<'a> {
+    pagination: &'a PaginationContext,
+    request: &'a PageRequest,
+    cancellation: &'a CancellationToken,
+}
+
+impl WrappedPageRequest<'_> {
+    /// Selects one byte-bounded page of `items` and wraps it with `build`. `build` is
+    /// called once with an empty page to measure the fixed response bytes, then with the
+    /// selected page.
+    fn paginate<T, R>(
+        &self,
+        items: &[T],
+        page_field: &'static str,
+        build: impl Fn(Page<T>) -> Result<R, AgentError>,
+    ) -> Result<R, AgentError>
+    where
+        T: PublicPageItem,
+        R: Serialize,
+    {
+        let total_items = u64::try_from(items.len()).map_err(|_| internal_error(false))?;
+        let empty_page = empty_projection_page(self.pagination, total_items)?;
+        let mut byte_projection =
+            WrappedPageByteProjection::new(self.pagination, build(empty_page)?, page_field)?;
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let page = self.pagination.paginate_cancellable_with_projection(
+            items,
+            self.request,
+            self.cancellation,
+            &mut byte_projection,
+        )?;
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        build(page)
+    }
+}
+
+fn convert_dependency_edges_cancellable(
+    items: &[depgraph_core::query::TraversalPageItem],
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<AgentEdge>, AgentError> {
+    validate_aggregate_condition_bytes(items.iter().map(|item| item.step.condition_text.as_str()))?;
+    let edges = convert_dependency_items_cancellable(
+        items,
+        depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL,
+        is_cancelled,
     )?;
     if is_cancelled() {
         return Err(cancelled_error());
     }
-    AgentDependenciesResponse::new(
-        root,
-        direction,
-        transitive,
-        source.complete(),
-        source.traversed_edges(),
-        page,
-    )
-    .map_err(impact_contract_error)
+    Ok(edges)
+}
+
+/// Projects unique (source, target, kind) paths in first-seen traversal order. Conditions
+/// are not projected, so the aggregate condition byte bound does not apply here.
+fn convert_dependency_paths_cancellable(
+    items: &[depgraph_core::query::TraversalPageItem],
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<AgentDependencyPath>, AgentError> {
+    validate_dependency_item_count(items.len(), depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL)?;
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    let mut paths = Vec::with_capacity(items.len());
+    for item in items {
+        if is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let path = AgentDependencyPath::try_from_core(item).map_err(impact_contract_error)?;
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    if is_cancelled() {
+        return Err(cancelled_error());
+    }
+    Ok(paths)
 }
 
 fn convert_dependency_items_cancellable(

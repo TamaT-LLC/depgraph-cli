@@ -18,6 +18,15 @@ pub struct HotspotWeights {
     pub runtime: u32,
 }
 
+/// Node kinds the hotspot analyzer scores. Result filters (`node_kinds`)
+/// accept exactly this closed set so CLI and MCP share one vocabulary.
+pub const HOTSPOT_SUBJECT_KINDS: [&str; 5] = ["file", "module", "symbol", "type", "route"];
+
+#[must_use]
+pub fn is_hotspot_subject_kind(kind: &str) -> bool {
+    HOTSPOT_SUBJECT_KINDS.contains(&kind)
+}
+
 pub const DEFAULT_HOTSPOT_WEIGHTS: HotspotWeights = HotspotWeights {
     fan_in: 2_500,
     fan_out: 1_500,
@@ -193,10 +202,7 @@ pub fn score_hotspots_cancellable(
     let mut subjects = Vec::new();
     for node in &snapshot.nodes {
         work.step(&mut is_cancelled)?;
-        if matches!(
-            node.kind.as_str(),
-            "file" | "module" | "symbol" | "type" | "route"
-        ) {
+        if is_hotspot_subject_kind(&node.kind) {
             if subjects.len() >= maximum_subjects {
                 return Err(HotspotAnalysisError::ResourceExhausted);
             }

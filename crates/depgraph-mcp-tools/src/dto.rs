@@ -8,11 +8,13 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest as _, Sha256};
 
+use depgraph_core::import_evidence::ImportEvidence;
+
 use crate::{
-    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId, AgentLabel,
-    AgentLocator, AgentPolicyText, AgentToken, AnalysisInputDigest, ContractBuildError,
-    MAX_AGENT_CONDITION_BYTES, Page, PolicyApiChangeId, PolicyConfigDigest,
-    PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
+    AgentArtifactId, AgentCondition, AgentFieldName, AgentGraphExportContent, AgentId,
+    AgentImportEvidence, AgentLabel, AgentLocator, AgentPolicyText, AgentToken,
+    AnalysisInputDigest, ContractBuildError, MAX_AGENT_CONDITION_BYTES, Page, PolicyApiChangeId,
+    PolicyConfigDigest, PolicyEvaluationCollectionDigest, PolicyEvaluationId, PolicyViolationId,
     RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
@@ -556,6 +558,9 @@ pub struct AgentEvidence {
     extractor_version: AgentLabel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span: Option<AgentSourceSpan>,
+    /// Import specifier and binding (Issue #544); absent for non-import evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<AgentImportEvidence>,
 }
 
 impl AgentEvidence {
@@ -571,12 +576,24 @@ impl AgentEvidence {
             extractor,
             extractor_version,
             span,
+            import: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_import(mut self, import: AgentImportEvidence) -> Self {
+        self.import = Some(import);
+        self
     }
 
     #[must_use]
     pub const fn span(&self) -> Option<&AgentSourceSpan> {
         self.span.as_ref()
+    }
+
+    #[must_use]
+    pub const fn import(&self) -> Option<&AgentImportEvidence> {
+        self.import.as_ref()
     }
 }
 
@@ -2363,6 +2380,11 @@ impl AgentEdge {
     }
 
     #[must_use]
+    pub const fn id(&self) -> &AgentId {
+        &self.id
+    }
+
+    #[must_use]
     pub const fn source_id(&self) -> &AgentId {
         &self.source_id
     }
@@ -2370,6 +2392,46 @@ impl AgentEdge {
     #[must_use]
     pub const fn target_id(&self) -> &AgentId {
         &self.target_id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &AgentToken {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> AgentPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn resolution_status(&self) -> AgentResolutionStatus {
+        self.resolution_status
+    }
+
+    #[must_use]
+    pub const fn precision(&self) -> AgentPrecision {
+        self.precision
+    }
+
+    #[must_use]
+    pub const fn profile_id(&self) -> &AgentId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<&AgentId> {
+        self.site_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> Option<&AgentCondition> {
+        self.condition.as_ref()
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[AgentEvidence] {
+        &self.evidence
     }
 }
 
@@ -3251,6 +3313,9 @@ fn agent_site_from_core_cancellable(
             record.start_column,
             record.end_line,
             record.end_column,
+            // Unresolved results keep their pre-#544 shape (see the PathStep
+            // projection below); agent_sites_list carries the import facts.
+            None,
         )?);
     }
     let span = source.evidence.first().and_then(|record| {
@@ -3331,6 +3396,10 @@ impl AgentEdge {
             if is_cancelled() {
                 return Err(ImpactProjectionFailure::Cancelled);
             }
+            // PathStep-derived responses (dependency list `full`, path, impact)
+            // keep their pre-#544 shape so strict clients that deny unknown
+            // fields still accept them (#542). Import facts are listed by
+            // agent_evidence_list, agent_sites_list and agent_edges_list.
             evidence.push(agent_evidence(
                 &record.kind,
                 &record.extractor,
@@ -3340,6 +3409,7 @@ impl AgentEdge {
                 record.start_column,
                 record.end_line,
                 record.end_column,
+                None,
             )?);
         }
         if is_cancelled() {
@@ -3439,6 +3509,7 @@ impl TryFrom<&depgraph_core::service::EvidenceProjection> for AgentEvidence {
             source.start_column(),
             source.end_line(),
             source.end_column(),
+            source.import(),
         )
     }
 }
@@ -3578,7 +3649,7 @@ impl TryFrom<&depgraph_core::service::ExplainPathResult> for AgentPathResponse {
     }
 }
 
-fn agent_node_from_fields(
+pub(crate) fn agent_node_from_fields(
     id: &str,
     kind: &str,
     locator: &str,
@@ -3631,6 +3702,7 @@ fn agent_evidence(
     start_column: u64,
     end_line: u64,
     end_column: u64,
+    import: Option<&ImportEvidence>,
 ) -> Result<AgentEvidence, ContractBuildError> {
     let kind = match kind {
         "source" => AgentEvidenceKind::Source,
@@ -3640,12 +3712,16 @@ fn agent_evidence(
         _ => return Err(ContractBuildError::AgentDtoValue),
     };
     let span = safe_source_span(path, start_line, start_column, end_line, end_column);
-    Ok(AgentEvidence::new(
+    let evidence = AgentEvidence::new(
         kind,
         parse_agent_value(extractor)?,
         parse_agent_value(extractor_version)?,
         span,
-    ))
+    );
+    Ok(match import.and_then(AgentImportEvidence::project) {
+        Some(import) => evidence.with_import(import),
+        None => evidence,
+    })
 }
 
 fn agent_phase(value: &str) -> Result<AgentPhase, ContractBuildError> {
@@ -3800,7 +3876,7 @@ fn parse_agent_condition(value: &str) -> Result<AgentCondition, ContractBuildErr
     AgentCondition::parse(value).map_err(|_| ContractBuildError::AgentDtoValue)
 }
 
-fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>
+pub(crate) fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>
 where
     T: std::str::FromStr,
 {
@@ -5021,9 +5097,9 @@ mod impact_projection_tests {
     use serde_json::json;
 
     use super::{
-        AgentCycle, AgentEdge, AgentImpactProjection, AgentUnresolved, IMPACT_LOOKUP_BUILDS,
-        ImpactProjectionFailure, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_EVIDENCE_ITEMS,
-        MAX_AGENT_PHASES, agent_site_from_core_cancellable,
+        AgentCycle, AgentEdge, AgentImpactProjection, AgentSite, AgentUnresolved,
+        IMPACT_LOOKUP_BUILDS, ImpactProjectionFailure, MAX_AGENT_CORRELATION_REASONS,
+        MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_PHASES, agent_site_from_core_cancellable,
     };
     use crate::ContractBuildError;
 
@@ -5369,5 +5445,52 @@ mod impact_projection_tests {
             checks >= 3
         });
         assert!(matches!(projected, Err(ImpactProjectionFailure::Cancelled)));
+    }
+
+    fn path_step_with_properties(properties: serde_json::Value) -> depgraph_core::query::PathStep {
+        let mut step = core_path_step(1, "semantic");
+        step.evidence[0].properties = properties;
+        step
+    }
+
+    // PathStep-derived responses (dependency list `full`, path, impact) keep
+    // the pre-#544 shape; import facts are listed by agent_evidence_list,
+    // agent_sites_list and agent_edges_list instead.
+    #[test]
+    fn path_step_evidence_never_carries_import_facts() {
+        let legacy = serde_json::to_value(
+            AgentEdge::try_from(&path_step_with_properties(json!({}))).expect("edge projection"),
+        )
+        .expect("serialize edge");
+        for properties in [
+            json!({
+                "occurrence_kind": "default_import",
+                "module_specifier": "@/components/Button",
+                "imported_name": "default",
+                "type_only": false
+            }),
+            json!({
+                "target_specifier": "crate::domain::Named",
+                "glob": false,
+                "reexport": false,
+                "alias": "NameContract"
+            }),
+        ] {
+            let step = path_step_with_properties(properties.clone());
+            let edge = AgentEdge::try_from(&step).expect("edge projection");
+            let value = serde_json::to_value(&edge).expect("serialize edge");
+            assert!(value["evidence"][0].get("import").is_none(), "{properties}");
+            assert!(value["evidence"][0].get("properties").is_none());
+            assert_eq!(value, legacy, "{properties}");
+        }
+    }
+
+    #[test]
+    fn unresolved_site_evidence_never_carries_import_facts() {
+        let unresolved = core_unresolved(1, "source", Vec::new());
+        let site = AgentSite::try_from(&unresolved).expect("site projection");
+        let value = serde_json::to_value(&site).expect("serialize site");
+        assert!(value["evidence"][0].is_object(), "{value}");
+        assert!(value["evidence"][0].get("import").is_none(), "{value}");
     }
 }

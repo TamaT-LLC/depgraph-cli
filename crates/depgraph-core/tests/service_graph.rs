@@ -2,10 +2,12 @@ use std::{fs, path::Path, process::Command};
 
 use anyhow::Result;
 use depgraph_core::service::{
-    CyclesRequest, DependenciesRequest, DependencyDirection, DepgraphCapabilitySet,
-    DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
-    ExplainPathRequest, ImpactRequest, MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS,
-    MAX_GRAPH_EVIDENCE_ITEMS, UnresolvedRequest,
+    CyclesRequest, DEFAULT_STRUCTURAL_EDGE_SELECTION, DependenciesRequest, DependencyDirection,
+    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
+    DepgraphServiceLimits, EdgeKindFilter, ExplainPathRequest, ImpactRequest, MAX_CYCLE_NODE_IDS,
+    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, MAX_DEPENDENCY_PATH_STEPS,
+    MAX_GRAPH_EVIDENCE_ITEMS, STRUCTURAL_EDGE_KINDS, StructuralEdgeSelection, UnresolvedRequest,
+    is_structural_edge_kind,
 };
 use depgraph_core::{CancellationToken, CycleLevel, GraphQueryFilter, ImpactFilters};
 use depgraph_store::Store;
@@ -1176,4 +1178,458 @@ fn issue_303_service_methods_are_canonical_bounded_and_cancellable() -> Result<(
         0
     );
     Ok(())
+}
+
+// Issue #541: dependency lists can drop structural edges and select edge kinds.
+
+const ISSUE_541_EDGES: &[(&str, &str, &str, &str)] = &[
+    ("edge:contains-a", "package:app", "file:a", "contains"),
+    ("edge:contains-b", "package:app", "file:b", "contains"),
+    ("edge:declares-d", "file:a", "symbol:d", "declares"),
+    ("edge:generated-a", "file:gen", "file:a", "generated_from"),
+    ("edge:import-b", "file:b", "file:a", "imports"),
+    ("edge:import-c", "file:c", "file:a", "imports"),
+    ("edge:type-c", "file:c", "file:a", "type_uses"),
+];
+
+fn seed_issue_541_graph(store: &mut Store, root: &Path) -> Result<String> {
+    store.start_scan_with_revision("issue-541", root, false, Some("revision-541"))?;
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-541",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started)?;
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:issue-541",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile)?;
+    for (id, kind, path) in [
+        ("package:app", "package", None),
+        ("file:a", "file", Some("src/a.rs")),
+        ("file:b", "file", Some("src/b.rs")),
+        ("file:c", "file", Some("src/c.rs")),
+        ("file:gen", "file", Some("src/gen.rs")),
+        ("symbol:d", "symbol", None),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("id:{id}"),
+            "display_name": id,
+            "properties": path.map_or_else(|| json!({}), |path| json!({"path": path}))
+        });
+        store.ingest_event(&node)?;
+    }
+    for (id, source, target, kind) in ISSUE_541_EDGES {
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": id,
+            "source": source,
+            "target": target,
+            "kind": kind,
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:issue-541",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge)?;
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:issue-541");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed)?;
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed)?;
+    store.finish_scan("issue-541", "completed", None, true)?;
+    Ok(store
+        .current_snapshot_id()?
+        .expect("completed issue 541 snapshot is promoted"))
+}
+
+fn issue_541_request(selector: &str, direction: DependencyDirection) -> DependenciesRequest {
+    DependenciesRequest::try_new(selector, direction, true, GraphQueryFilter::default(), 100)
+        .expect("valid dependency request")
+}
+
+fn issue_541_edge_ids(result: &depgraph_core::service::DependenciesResult) -> Vec<String> {
+    let mut ids = result
+        .items()
+        .iter()
+        .map(|item| item.step.edge.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn issue_541_structural_edge_kinds_are_defined_once_and_default_excludes_them() {
+    assert_eq!(
+        STRUCTURAL_EDGE_KINDS,
+        ["contains", "declares", "generated_from"]
+    );
+    for kind in STRUCTURAL_EDGE_KINDS {
+        assert!(is_structural_edge_kind(kind), "{kind}");
+    }
+    for kind in ["imports", "depends_on", "type_uses", "calls", "contain"] {
+        assert!(!is_structural_edge_kind(kind), "{kind}");
+    }
+    // v0.7.0 excludes structural edges by default (breaking change); callers
+    // restore the previous traversal with an explicit include.
+    assert_eq!(
+        DEFAULT_STRUCTURAL_EDGE_SELECTION,
+        StructuralEdgeSelection::Exclude
+    );
+    assert_eq!(
+        StructuralEdgeSelection::default(),
+        StructuralEdgeSelection::Exclude
+    );
+    assert!(!EdgeKindFilter::default().is_unrestricted());
+    for kind in STRUCTURAL_EDGE_KINDS {
+        assert!(!EdgeKindFilter::default().allows(kind), "{kind}");
+    }
+    assert!(EdgeKindFilter::default().allows("imports"));
+    let request = issue_541_request("id:file:a", DependencyDirection::Incoming);
+    assert_eq!(request.edge_kind_filter(), &EdgeKindFilter::default());
+    assert!(request.edge_kind_filter().edge_kinds().is_empty());
+    assert_eq!(
+        request.edge_kind_filter().structural_edges(),
+        DEFAULT_STRUCTURAL_EDGE_SELECTION
+    );
+    assert!(EdgeKindFilter::unrestricted().is_unrestricted());
+    assert_eq!(
+        EdgeKindFilter::unrestricted().structural_edges(),
+        StructuralEdgeSelection::Include
+    );
+    assert_eq!(StructuralEdgeSelection::Include.as_str(), "include");
+    assert_eq!(StructuralEdgeSelection::Exclude.as_str(), "exclude");
+    assert_eq!(
+        StructuralEdgeSelection::parse("exclude"),
+        Some(StructuralEdgeSelection::Exclude)
+    );
+    assert_eq!(StructuralEdgeSelection::parse("Exclude"), None);
+}
+
+#[test]
+fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    seed_issue_541_graph(&mut writer, &root)?;
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut snapshot = service.start_snapshot_request("current")?;
+
+    let legacy = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming)
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Include))?,
+        &cancellation,
+    )?;
+    assert_eq!(
+        issue_541_edge_ids(&legacy),
+        [
+            "edge:contains-a",
+            "edge:contains-b",
+            "edge:generated-a",
+            "edge:import-b",
+            "edge:import-c",
+            "edge:type-c"
+        ]
+    );
+    assert_eq!(legacy.traversed_edges(), 6);
+
+    let excluded = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming)
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
+        &cancellation,
+    )?;
+    assert!(excluded.complete());
+    assert_eq!(
+        issue_541_edge_ids(&excluded),
+        ["edge:import-b", "edge:import-c", "edge:type-c"]
+    );
+    assert_eq!(excluded.traversed_edges(), 3);
+    let default = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming),
+        &cancellation,
+    )?;
+    assert_eq!(
+        issue_541_edge_ids(&default),
+        issue_541_edge_ids(&excluded),
+        "the default excludes structural edges"
+    );
+    assert_eq!(default.traversed_edges(), excluded.traversed_edges());
+    let mut dependent_nodes = excluded
+        .traversal()
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    dependent_nodes.sort_unstable();
+    assert_eq!(dependent_nodes, ["file:b", "file:c"]);
+
+    let outgoing = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Outgoing)
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
+        &cancellation,
+    )?;
+    assert!(outgoing.items().is_empty(), "declares is structural");
+    assert_eq!(outgoing.traversed_edges(), 0);
+
+    let package = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:package:app", DependencyDirection::Outgoing)
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
+        &cancellation,
+    )?;
+    assert!(package.items().is_empty(), "contains is structural");
+    assert!(package.traversal().nodes.is_empty());
+    Ok(())
+}
+
+#[test]
+fn issue_541_edge_kind_allowlist_selects_kinds_and_counts_only_them() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    seed_issue_541_graph(&mut writer, &root)?;
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut snapshot = service.start_snapshot_request("current")?;
+
+    let imports = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
+            vec!["imports".to_owned()],
+            Some(StructuralEdgeSelection::Exclude),
+        )?,
+        &cancellation,
+    )?;
+    assert_eq!(
+        issue_541_edge_ids(&imports),
+        ["edge:import-b", "edge:import-c"]
+    );
+    assert_eq!(imports.traversed_edges(), 2);
+
+    let with_structure = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
+            vec!["imports".to_owned(), "contains".to_owned()],
+            Some(StructuralEdgeSelection::Include),
+        )?,
+        &cancellation,
+    )?;
+    assert_eq!(
+        issue_541_edge_ids(&with_structure),
+        [
+            "edge:contains-a",
+            "edge:contains-b",
+            "edge:import-b",
+            "edge:import-c"
+        ]
+    );
+    assert_eq!(with_structure.traversed_edges(), 4);
+
+    let unknown = service.dependencies(
+        &mut snapshot,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
+            vec!["calls".to_owned()],
+            Some(StructuralEdgeSelection::Include),
+        )?,
+        &cancellation,
+    )?;
+    assert!(unknown.items().is_empty());
+    assert_eq!(unknown.traversed_edges(), 0);
+    Ok(())
+}
+
+#[test]
+fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
+    let request = || issue_541_request("id:file:a", DependencyDirection::Incoming);
+    for structural in STRUCTURAL_EDGE_KINDS {
+        assert!(
+            matches!(
+                request().with_edge_kind_filter(
+                    vec!["imports".to_owned(), structural.to_owned()],
+                    Some(StructuralEdgeSelection::Exclude)
+                ),
+                Err(DepgraphServiceError::InvalidInput)
+            ),
+            "{structural} contradicts structural_edges=exclude"
+        );
+        assert!(
+            request()
+                .with_edge_kind_filter(
+                    vec![structural.to_owned()],
+                    Some(StructuralEdgeSelection::Include)
+                )
+                .is_ok()
+        );
+    }
+    for kind in [
+        String::new(),
+        "Imports".to_owned(),
+        "1imports".to_owned(),
+        "type uses".to_owned(),
+        "imports\n".to_owned(),
+        "a".repeat(MAX_DEPENDENCY_EDGE_KIND_BYTES + 1),
+    ] {
+        assert!(
+            matches!(
+                request().with_edge_kind_filter(
+                    vec![kind.clone()],
+                    Some(StructuralEdgeSelection::Include)
+                ),
+                Err(DepgraphServiceError::InvalidInput)
+            ),
+            "{kind:?} must be rejected"
+        );
+    }
+    assert!(
+        request()
+            .with_edge_kind_filter(
+                vec!["a".repeat(MAX_DEPENDENCY_EDGE_KIND_BYTES)],
+                Some(StructuralEdgeSelection::Include)
+            )
+            .is_ok()
+    );
+    let too_many = (0..=MAX_DEPENDENCY_EDGE_KINDS)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        request().with_edge_kind_filter(too_many, Some(StructuralEdgeSelection::Include)),
+        Err(DepgraphServiceError::InvalidInput)
+    ));
+    let at_limit = (0..MAX_DEPENDENCY_EDGE_KINDS)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    assert!(
+        request()
+            .with_edge_kind_filter(at_limit, Some(StructuralEdgeSelection::Include))
+            .is_ok()
+    );
+
+    let normalized = request()
+        .with_edge_kind_filter(
+            vec![
+                "type_uses".to_owned(),
+                "imports".to_owned(),
+                "type_uses".to_owned(),
+            ],
+            Some(StructuralEdgeSelection::Exclude),
+        )
+        .expect("valid selection");
+    assert_eq!(
+        normalized.edge_kind_filter().edge_kinds(),
+        ["imports", "type_uses"]
+    );
+    // An allowlist alone decides the traversal, so its identity does not
+    // depend on structural_edges once the contradiction check has passed.
+    assert_eq!(
+        normalized.edge_kind_filter().structural_edges(),
+        StructuralEdgeSelection::Include
+    );
+    assert!(!normalized.edge_kind_filter().is_unrestricted());
+    for structural_edges in [None, Some(StructuralEdgeSelection::Include)] {
+        let equivalent = request()
+            .with_edge_kind_filter(
+                vec!["imports".to_owned(), "type_uses".to_owned()],
+                structural_edges,
+            )
+            .expect("valid selection");
+        assert_eq!(
+            equivalent.edge_kind_filter(),
+            normalized.edge_kind_filter(),
+            "{structural_edges:?}"
+        );
+    }
+}
+
+#[test]
+fn issue_541_omitted_structural_edges_lets_an_allowlist_name_structural_kinds() {
+    let request = || issue_541_request("id:file:a", DependencyDirection::Incoming);
+    for structural in STRUCTURAL_EDGE_KINDS {
+        let omitted = request()
+            .with_edge_kind_filter(vec![structural.to_owned()], None)
+            .unwrap_or_else(|error| panic!("{structural} with omitted mode: {error:?}"));
+        assert!(
+            omitted.edge_kind_filter().allows(structural),
+            "{structural}"
+        );
+        assert!(
+            !omitted.edge_kind_filter().allows("imports"),
+            "{structural}"
+        );
+        let included = request()
+            .with_edge_kind_filter(
+                vec![structural.to_owned()],
+                Some(StructuralEdgeSelection::Include),
+            )
+            .expect("explicit include");
+        assert_eq!(omitted.edge_kind_filter(), included.edge_kind_filter());
+        assert!(matches!(
+            request().with_edge_kind_filter(
+                vec![structural.to_owned()],
+                Some(StructuralEdgeSelection::Exclude)
+            ),
+            Err(DepgraphServiceError::InvalidInput)
+        ));
+    }
+    let omitted_without_allowlist = request()
+        .with_edge_kind_filter(Vec::new(), None)
+        .expect("default selection");
+    assert_eq!(
+        omitted_without_allowlist.edge_kind_filter(),
+        &EdgeKindFilter::default()
+    );
+    assert_eq!(
+        omitted_without_allowlist
+            .edge_kind_filter()
+            .structural_edges(),
+        DEFAULT_STRUCTURAL_EDGE_SELECTION
+    );
 }

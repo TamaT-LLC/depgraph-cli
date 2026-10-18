@@ -19,6 +19,7 @@ pub const MAX_AGENT_CONDITION_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_ARTIFACT_ID_BYTES: usize = 1_024;
 pub const MAX_AGENT_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_AGENT_POLICY_TEXT_BYTES: usize = 4_096;
+pub const MAX_AGENT_IMPORT_SPECIFIER_BYTES: usize = 1_024;
 pub const MAX_AGENT_GRAPH_EXPORT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -51,6 +52,8 @@ pub enum ContractValueError {
     AgentFieldName,
     #[error("Agent policy text is outside the closed contract")]
     AgentPolicyText,
+    #[error("Agent import specifier is outside the closed contract")]
+    AgentImportSpecifier,
     #[error("snapshot diff collection digest is outside the closed contract")]
     SnapshotDiffCollectionDigest,
     #[error("policy configuration digest is outside the closed contract")]
@@ -379,6 +382,19 @@ string_newtype!(
         "description": "Policy text is limited to 4096 UTF-8 bytes by the contract; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
         "x-depgraph-maxUtf8Bytes": MAX_AGENT_POLICY_TEXT_BYTES,
         "pattern": r"^[^\u0000-\u001f\u007f]+$"
+    })
+);
+
+string_newtype!(
+    AgentImportSpecifier,
+    ContractValueError::AgentImportSpecifier,
+    valid_agent_import_specifier,
+    json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Import specifiers are limited to 1024 UTF-8 bytes by the contract; JSON Schema maxLength is intentionally omitted because it counts Unicode characters.",
+        "x-depgraph-maxUtf8Bytes": MAX_AGENT_IMPORT_SPECIFIER_BYTES,
+        "pattern": r"^[^\u0000-\u001f\u007f-\u009f]+$"
     })
 );
 
@@ -718,6 +734,12 @@ fn valid_agent_condition(value: &str) -> bool {
 fn valid_agent_artifact_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_AGENT_ARTIFACT_ID_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_agent_import_specifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_IMPORT_SPECIFIER_BYTES
         && !value.chars().any(char::is_control)
 }
 
