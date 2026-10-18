@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{Read as _, Write as _},
+    io::{IsTerminal as _, Read as _, Write as _},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -1002,10 +1002,12 @@ impl CurlClient {
     }
 
     fn download(&self, asset: &ReleaseAsset, destination: &Path) -> Result<()> {
+        let is_terminal = std::io::stderr().is_terminal();
         let mut command = self.command();
         Self::common_arguments(&mut command, asset.size);
         command
-            .args(["--progress-bar", "--output"])
+            .args(download_progress_arguments(is_terminal))
+            .arg("--output")
             .arg(destination)
             .arg(&asset.url)
             .stdin(Stdio::null())
@@ -1017,7 +1019,24 @@ impl CurlClient {
         if !status.success() {
             bail!("official release asset download failed for {}", asset.name);
         }
+        if !is_terminal {
+            eprintln!(
+                "mcp setup: downloaded {} ({} bytes)",
+                asset.name, asset.size
+            );
+        }
         Ok(())
+    }
+}
+
+/// A curl progress bar redraws with carriage returns, which floods logs and
+/// captured output, so it is shown only when stderr is a terminal.
+/// `--show-error` is already a common argument and keeps failures visible.
+fn download_progress_arguments(is_terminal: bool) -> &'static [&'static str] {
+    if is_terminal {
+        &["--progress-bar"]
+    } else {
+        &["--silent"]
     }
 }
 
@@ -1475,21 +1494,247 @@ fn run_safe_scan(core: &Path, release_root: &Path, config: &DepgraphServiceConfi
         .stdin(Stdio::null())
         .output()
         .context("MCP setup could not start the verified depgraph safe scanner")?;
+    let failure = || {
+        describe_safe_scan_failure(
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+            core,
+            config.store_path(),
+            config.canonical_root(),
+        )
+    };
     if !output.status.success() {
-        bail!(
-            "MCP setup safe scan failed: {}",
-            bounded_stderr(&output.stderr)
-        );
+        bail!("{}", failure());
     }
     let outcome: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("MCP setup safe scan returned invalid JSON")?;
-    if outcome["status"] != "completed" || outcome["coverage"]["project_code_executed"] != false {
+    if outcome["status"] != "completed" {
+        bail!("{}", failure());
+    }
+    if outcome["coverage"]["project_code_executed"] != false {
         security_bail("safe scan did not produce a completed non-executing snapshot")?;
     }
     if current_snapshot_if_valid(config)?.is_none() {
         security_bail("safe scan did not publish a current snapshot for this root")?;
     }
     Ok(())
+}
+
+const MAX_SAFE_SCAN_FAILURE_DIAGNOSTICS: usize = 5;
+const MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES: usize = 4096;
+const MAX_SAFE_SCAN_ERROR_BYTES: usize = 1024;
+const MAX_SAFE_SCAN_DIAGNOSTIC_BYTES: usize = 512;
+const TRUNCATION_MARKER: &str = "…";
+
+/// Explains a failed safe scan. `scan --json` reports failures in its stdout
+/// outcome (status, error, diagnostics) and often leaves stderr empty, so the
+/// outcome is summarized when it parses and raw output tails are shown otherwise.
+fn describe_safe_scan_failure(
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    core: &Path,
+    store: &Path,
+    root: &Path,
+) -> String {
+    let mut lines = vec![match status_code {
+        Some(code) => format!("MCP setup safe scan failed with exit code {code}"),
+        None => "MCP setup safe scan failed: the scanner was terminated by a signal".to_owned(),
+    }];
+    match serde_json::from_slice::<JsonValue>(stdout) {
+        Ok(outcome) if outcome.is_object() => describe_safe_scan_outcome(&outcome, &mut lines),
+        _ => push_output_tail(&mut lines, "stdout", stdout),
+    }
+    push_output_tail(&mut lines, "stderr", stderr);
+    lines.push(format!(
+        "reproduce with: {}",
+        safe_scan_reproduction_command(core, store, root, ShellQuoting::current())
+    ));
+    lines.join("\n")
+}
+
+fn describe_safe_scan_outcome(outcome: &JsonValue, lines: &mut Vec<String>) {
+    let status = outcome["status"].as_str().unwrap_or("unknown");
+    lines.push(format!(
+        "status: {}",
+        bounded_line(status, MAX_SAFE_SCAN_DIAGNOSTIC_BYTES)
+    ));
+    if let Some(error) = outcome["error"].as_str() {
+        lines.push(format!(
+            "error: {}",
+            bounded_line(error, MAX_SAFE_SCAN_ERROR_BYTES)
+        ));
+    }
+    let diagnostics = outcome["diagnostics"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if diagnostics.is_empty() {
+        return;
+    }
+    lines.push("diagnostics:".to_owned());
+    for diagnostic in diagnostics.iter().take(MAX_SAFE_SCAN_FAILURE_DIAGNOSTICS) {
+        lines.push(format!("  - {}", describe_scan_diagnostic(diagnostic)));
+    }
+    let remaining = diagnostics
+        .len()
+        .saturating_sub(MAX_SAFE_SCAN_FAILURE_DIAGNOSTICS);
+    if remaining > 0 {
+        lines.push(format!("  …and {remaining} more"));
+    }
+}
+
+fn describe_scan_diagnostic(diagnostic: &JsonValue) -> String {
+    let field = |name: &str| diagnostic[name].as_str().filter(|value| !value.is_empty());
+    let mut summary = format!(
+        "{} [{}] {}",
+        field("severity").unwrap_or("unknown"),
+        field("code").unwrap_or("unknown"),
+        field("message").unwrap_or("")
+    );
+    let location = [("adapter", field("adapter")), ("path", field("path"))]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}: {value}")))
+        .collect::<Vec<_>>();
+    if !location.is_empty() {
+        summary.push_str(&format!(" ({})", location.join(", ")));
+    }
+    bounded_line(&summary, MAX_SAFE_SCAN_DIAGNOSTIC_BYTES)
+}
+
+fn push_output_tail(lines: &mut Vec<String>, label: &str, bytes: &[u8]) {
+    let text = printable_text(&String::from_utf8_lossy(bytes), true);
+    let text = text.trim();
+    if !text.is_empty() {
+        lines.push(format!(
+            "{label}: {}",
+            bounded_tail(text, MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES)
+        ));
+    }
+}
+
+/// Scan output can carry repository-derived text, so control characters are
+/// neutralized before they reach the user's terminal.
+fn printable_text(text: &str, keeps_newlines: bool) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() && !(keeps_newlines && character == '\n') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn bounded_line(text: &str, maximum_bytes: usize) -> String {
+    let text = printable_text(text, false);
+    if text.len() <= maximum_bytes {
+        return text;
+    }
+    let mut end = maximum_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{TRUNCATION_MARKER}", &text[..end])
+}
+
+fn bounded_tail(text: &str, maximum_bytes: usize) -> String {
+    if text.len() <= maximum_bytes {
+        return text.to_owned();
+    }
+    let mut start = text.len() - maximum_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{TRUNCATION_MARKER}{}", &text[start..])
+}
+
+/// Shell dialect used to render a copyable reproduction command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellQuoting {
+    Posix,
+    Windows,
+}
+
+impl ShellQuoting {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+}
+
+/// Mirrors the executable and arguments `run_safe_scan` uses (including
+/// `--json`) so the rerun prints the same outcome format the failure summary
+/// was built from. The verified release binary is named explicitly because the
+/// `depgraph` on PATH may be a different version.
+fn safe_scan_reproduction_command(
+    core: &Path,
+    store: &Path,
+    root: &Path,
+    quoting: ShellQuoting,
+) -> String {
+    format!(
+        "{} --store {} scan {} --json",
+        quoted_path_for(&core.to_string_lossy(), quoting),
+        quoted_path_for(&store.to_string_lossy(), quoting),
+        quoted_path_for(&root.to_string_lossy(), quoting)
+    )
+}
+
+/// Quotes a path only when it needs quoting, so the common case stays
+/// copyable as-is.
+fn quoted_path_for(text: &str, quoting: ShellQuoting) -> String {
+    let plain_punctuation: &[u8] = match quoting {
+        ShellQuoting::Posix => b"/._-+:@,=",
+        // `,` `=` `;` are argument separators for cmd.exe builtins and `@`
+        // `,` are PowerShell operators, so only path-safe punctuation stays bare.
+        ShellQuoting::Windows => b"\\/._-:",
+    };
+    let is_plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || plain_punctuation.contains(&byte));
+    if is_plain {
+        return text.to_owned();
+    }
+    match quoting {
+        ShellQuoting::Posix => format!("'{}'", text.replace('\'', r"'\''")),
+        ShellQuoting::Windows => windows_double_quoted(text),
+    }
+}
+
+/// cmd.exe does not group arguments with single quotes, so Windows paths are
+/// wrapped in double quotes and parsed by the CRT argument rules. Windows file
+/// names cannot contain `"`, but a lossy or synthetic path might; it is escaped
+/// as `\"` rather than dropped so the command never silently targets another
+/// path. Backslashes are doubled only where they precede a `"` (including the
+/// closing quote), since otherwise `C:\dir\` would escape the closing quote.
+fn windows_double_quoted(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    let mut pending_backslashes = 0;
+    for character in text.chars() {
+        match character {
+            '\\' => pending_backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', pending_backslashes * 2 + 1));
+                quoted.push('"');
+                pending_backslashes = 0;
+            }
+            other => {
+                quoted.extend(std::iter::repeat_n('\\', pending_backslashes));
+                quoted.push(other);
+                pending_backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', pending_backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 fn lifecycle_configuration(host: McpHost, server_name: &str, generated: &str) -> Result<String> {
@@ -3577,5 +3822,288 @@ mod tests {
         assert_eq!(remove_repository_state(&binding).unwrap(), 1);
         drop(exclusion);
         assert!(state.path().is_dir());
+    }
+
+    fn describe_failure(status_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
+        describe_safe_scan_failure(
+            status_code,
+            stdout,
+            stderr,
+            Path::new("/opt/depgraph/bin/depgraph"),
+            Path::new("/state/graph.db"),
+            Path::new("/work/repo"),
+        )
+    }
+
+    fn worker_failure_diagnostic(adapter: &str, kind: &str) -> JsonValue {
+        json!({
+            "ordinal": 0,
+            "id": format!("diagnostic-{adapter}-{kind}"),
+            "severity": "error",
+            "code": "worker-failure",
+            "message": format!("worker-failure:{adapter}:{kind}; failure_phase=launch"),
+            "path": null,
+            "adapter": adapter,
+            "start_line": null,
+            "start_column": null,
+            "end_line": null,
+            "end_column": null,
+            "properties": {},
+        })
+    }
+
+    #[test]
+    fn safe_scan_failure_summarizes_json_status_and_diagnostics() {
+        let stdout = json!({
+            "scan_id": "scan-1",
+            "status": "partial",
+            "exit_code": 3,
+            "error": "web: failed to start node: No such file or directory",
+            "diagnostics": [worker_failure_diagnostic("web", "launch")],
+        })
+        .to_string();
+
+        let message = describe_failure(Some(3), stdout.as_bytes(), b"");
+
+        assert!(message.contains("exit code 3"), "{message}");
+        assert!(message.contains("status: partial"), "{message}");
+        assert!(
+            message.contains("web: failed to start node: No such file or directory"),
+            "{message}"
+        );
+        assert!(
+            message.contains("error [worker-failure] worker-failure:web:launch"),
+            "{message}"
+        );
+        assert!(message.contains("adapter: web"), "{message}");
+        assert!(!message.contains("stderr:"), "{message}");
+    }
+
+    #[test]
+    fn safe_scan_failure_lists_only_leading_diagnostics_and_counts_the_rest() {
+        let adapters = ["go", "rust", "web", "python", "java", "ruby", "swift"];
+        let diagnostics = adapters
+            .iter()
+            .map(|adapter| worker_failure_diagnostic(adapter, "timeout"))
+            .collect::<Vec<_>>();
+        let stdout = json!({ "status": "partial", "diagnostics": diagnostics }).to_string();
+
+        let message = describe_failure(Some(3), stdout.as_bytes(), b"");
+
+        for adapter in &adapters[..MAX_SAFE_SCAN_FAILURE_DIAGNOSTICS] {
+            assert!(
+                message.contains(&format!("worker-failure:{adapter}:timeout")),
+                "{message}"
+            );
+        }
+        assert!(
+            !message.contains("worker-failure:ruby:timeout"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("worker-failure:swift:timeout"),
+            "{message}"
+        );
+        assert!(message.contains("…and 2 more"), "{message}");
+    }
+
+    #[test]
+    fn safe_scan_failure_without_json_reports_exit_code_and_output_tails() {
+        let message = describe_failure(Some(2), b"not json at all", b"error: store is locked\n");
+
+        assert!(message.contains("exit code 2"), "{message}");
+        assert!(message.contains("stdout: not json at all"), "{message}");
+        assert!(
+            message.contains("stderr: error: store is locked"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn safe_scan_failure_with_only_stderr_reports_it_without_an_empty_stdout() {
+        let message = describe_failure(Some(1), b"", b"error: the scan root is unavailable");
+
+        assert!(message.contains("exit code 1"), "{message}");
+        assert!(
+            message.contains("stderr: error: the scan root is unavailable"),
+            "{message}"
+        );
+        assert!(!message.contains("stdout:"), "{message}");
+    }
+
+    #[test]
+    fn safe_scan_failure_reports_signal_termination_without_an_exit_code() {
+        let message = describe_failure(None, b"", b"");
+
+        assert!(message.contains("terminated by a signal"), "{message}");
+    }
+
+    #[test]
+    fn safe_scan_failure_bounds_long_output_to_a_utf8_safe_tail() {
+        let mut stderr = "あ".repeat(MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES).into_bytes();
+        stderr.extend_from_slice(b"final line");
+        let stdout = "x".repeat(MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES * 4);
+
+        let message = describe_failure(Some(1), stdout.as_bytes(), &stderr);
+
+        assert!(message.contains("final line"), "{message}");
+        assert!(
+            message.len() < MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES * 3,
+            "message is not bounded: {} bytes",
+            message.len()
+        );
+        assert!(!message.contains('\u{fffd}'), "{message}");
+    }
+
+    #[test]
+    fn safe_scan_failure_bounds_long_json_messages() {
+        let long_error = "e".repeat(MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES * 4);
+        let stdout = json!({
+            "status": "partial",
+            "error": long_error,
+            "diagnostics": [{
+                "severity": "error",
+                "code": "worker-failure",
+                "message": long_error,
+            }],
+        })
+        .to_string();
+
+        let message = describe_failure(Some(3), stdout.as_bytes(), b"");
+
+        assert!(
+            message.len() < MAX_SAFE_SCAN_OUTPUT_TAIL_BYTES * 3,
+            "message is not bounded: {} bytes",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn safe_scan_failure_neutralizes_control_characters_from_scan_output() {
+        let stdout = json!({
+            "status": "partial",
+            "error": "web: \u{1b}[31mred\nsecond line",
+            "diagnostics": [{
+                "severity": "error",
+                "code": "worker-failure",
+                "message": "bad\rpath\u{1b}]0;title\u{7}",
+            }],
+        })
+        .to_string();
+
+        let message = describe_failure(Some(3), stdout.as_bytes(), b"tail\x1b[2Jcleared\nnext");
+
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains('\r'), "{message:?}");
+        assert!(!message.contains('\u{7}'), "{message:?}");
+        assert!(
+            message.contains("error: web:  [31mred second line"),
+            "{message:?}"
+        );
+        assert!(
+            message.contains("stderr: tail [2Jcleared\nnext"),
+            "{message:?}"
+        );
+    }
+
+    #[test]
+    fn safe_scan_failure_includes_a_reproduction_command() {
+        let message = describe_failure(Some(3), b"", b"");
+
+        assert!(
+            message.contains(
+                "reproduce with: /opt/depgraph/bin/depgraph --store /state/graph.db scan /work/repo --json"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn posix_reproduction_command_matches_the_safe_scan_invocation() {
+        let command = safe_scan_reproduction_command(
+            Path::new("/opt/depgraph/bin/depgraph"),
+            Path::new("/state/graph.db"),
+            Path::new("/work/repo"),
+            ShellQuoting::Posix,
+        );
+
+        assert_eq!(
+            command,
+            "/opt/depgraph/bin/depgraph --store /state/graph.db scan /work/repo --json"
+        );
+    }
+
+    #[test]
+    fn posix_reproduction_command_single_quotes_paths_with_spaces() {
+        let command = safe_scan_reproduction_command(
+            Path::new("/Users/me/Library/Application Support/depgraph/releases/0.6.4/depgraph"),
+            Path::new("/Users/me/Library/Application Support/depgraph/graph.db"),
+            Path::new("/work/it's repo"),
+            ShellQuoting::Posix,
+        );
+
+        assert_eq!(
+            command,
+            "'/Users/me/Library/Application Support/depgraph/releases/0.6.4/depgraph' --store '/Users/me/Library/Application Support/depgraph/graph.db' scan '/work/it'\\''s repo' --json"
+        );
+    }
+
+    #[test]
+    fn windows_reproduction_command_double_quotes_paths_with_spaces() {
+        let command = safe_scan_reproduction_command(
+            Path::new(r"C:\Program Files\depgraph\depgraph.exe"),
+            Path::new(r"C:\Users\me\AppData\Local\depgraph\graph.db"),
+            Path::new(r"C:\work\it's repo"),
+            ShellQuoting::Windows,
+        );
+
+        assert_eq!(
+            command,
+            r#""C:\Program Files\depgraph\depgraph.exe" --store C:\Users\me\AppData\Local\depgraph\graph.db scan "C:\work\it's repo" --json"#
+        );
+    }
+
+    #[test]
+    fn windows_quoting_never_uses_single_quotes() {
+        assert_eq!(
+            quoted_path_for(r"C:\Program Files\depgraph", ShellQuoting::Windows),
+            r#""C:\Program Files\depgraph""#
+        );
+        assert_eq!(quoted_path_for("", ShellQuoting::Windows), r#""""#);
+    }
+
+    #[test]
+    fn windows_quoting_keeps_trailing_backslashes_from_escaping_the_closing_quote() {
+        assert_eq!(
+            quoted_path_for(r"C:\my dir\", ShellQuoting::Windows),
+            r#""C:\my dir\\""#
+        );
+    }
+
+    #[test]
+    fn windows_quoting_escapes_embedded_double_quotes() {
+        assert_eq!(
+            quoted_path_for(r#"C:\a"b"#, ShellQuoting::Windows),
+            r#""C:\a\"b""#
+        );
+        assert_eq!(
+            quoted_path_for(r#"C:\a\"b"#, ShellQuoting::Windows),
+            r#""C:\a\\\"b""#
+        );
+    }
+
+    #[test]
+    fn posix_quoting_leaves_plain_paths_unquoted() {
+        assert_eq!(
+            quoted_path_for("/work/repo", ShellQuoting::Posix),
+            "/work/repo"
+        );
+        assert_eq!(quoted_path_for("", ShellQuoting::Posix), "''");
+    }
+
+    #[test]
+    fn download_progress_uses_a_progress_bar_only_on_a_terminal() {
+        assert_eq!(download_progress_arguments(true), ["--progress-bar"]);
+        assert_eq!(download_progress_arguments(false), ["--silent"]);
     }
 }
