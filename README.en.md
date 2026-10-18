@@ -136,7 +136,7 @@ reported as a candidate set or as unresolved, with the reason. See
 
 ## Installation
 
-The `v0.6.4` release candidate provides Linux x86-64, Linux ARM64, macOS Apple Silicon, and Windows
+`v0.6.4` provides Linux x86-64, Linux ARM64, macOS Apple Silicon, and Windows
 x86-64 packages. Intel macOS is not supported.
 
 - **Homebrew** (macOS Apple Silicon / Linux): `brew install tamat-llc/tap/depgraph`
@@ -184,11 +184,10 @@ anything. See the
 
 ## Project status and public collaboration
 
-The supported line is currently anchored by the published `v0.6.3` Release.
+The supported line is currently anchored by the published `v0.6.4` Release.
 Changes on `main` after that tag are development changes. See the
-[`v0.6.3` release notes](docs/releases/v0.6.3.md) (Japanese) for what it
-contains. The next release is described in the
-[`v0.6.4` release notes](docs/releases/v0.6.4.md) (Japanese).
+[`v0.6.4` release notes](docs/releases/v0.6.4.md) (Japanese) for what it
+contains.
 Product support is best effort, without response-time or resolution-time SLAs.
 
 Follow [SUPPORT.md](SUPPORT.md) for usage questions and bug reports. Read

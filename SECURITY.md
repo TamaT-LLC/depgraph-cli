@@ -4,7 +4,8 @@
 
 | Version | Security fixes |
 | --- | --- |
-| `v0.6.3` | Supported; current published stable baseline |
+| `v0.6.4` | Supported; current published stable baseline |
+| `v0.6.3` | Unsupported after the verified `v0.6.4` publication |
 | `v0.6.2` | Unsupported after the verified `v0.6.3` publication |
 | `v0.6.1` | Unsupported after the verified `v0.6.2` publication |
 | `v0.5.4` | Unsupported after the verified `v0.6.0` publication |
@@ -20,7 +21,7 @@ supported. The release and maintenance policy is documented in
 [GOVERNANCE.md](GOVERNANCE.md). Unsupported versions may still receive a
 public advisory, but are not promised a patch.
 
-`v0.6.3` retains the v0.6.0 Store schema `19` and code-health contract/API.
+`v0.6.4` retains the v0.6.0 Store schema `19` and code-health contract/API.
 Security fixes target the current v0.6 stable line. A Store migrated to schema 19 must not be
 opened by the `v0.5.4` binary.
 

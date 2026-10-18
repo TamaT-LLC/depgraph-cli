@@ -126,7 +126,7 @@ depgraphは依存先を推測で決めません。
 
 ## インストール
 
-準備中の`v0.6.4`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64向けの4ターゲットを提供します。
+`v0.6.4`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64向けの4ターゲットを提供します。
 Intel macOSには対応していません。
 
 - **Homebrew**（macOS Apple Silicon / Linux）：`brew install tamat-llc/tap/depgraph`
@@ -168,9 +168,9 @@ Intel macOSには対応していません。
 
 ## プロジェクトの状況と公開コラボレーション
 
-現在のサポート対象は、公開済み`v0.6.3`リリースです。
+現在のサポート対象は、公開済み`v0.6.4`リリースです。
 そのtagより後の`main`の変更は開発版として扱います。
-公開済みの変更は[`v0.6.3`リリースノート](docs/releases/v0.6.3.md)、準備中の変更は[`v0.6.4`リリースノート](docs/releases/v0.6.4.md)を参照してください。
+公開済みの変更は[`v0.6.4`リリースノート](docs/releases/v0.6.4.md)を参照してください。
 製品サポートはベストエフォートであり、応答時間や解決時間のSLAは設けていません。
 
 利用上の質問と不具合報告は[SUPPORT.md](SUPPORT.md)の案内に従ってください。
