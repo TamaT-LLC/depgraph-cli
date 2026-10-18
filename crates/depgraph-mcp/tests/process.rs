@@ -8593,7 +8593,7 @@ fn seed_issue_544_store(path: &Path, root: &Path) -> String {
 }
 
 #[test]
-fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
+fn issue_544_import_evidence_is_listed_by_agent_tools_but_not_dependency_lists() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
     let store_path = temporary.path().join("store.sqlite");
@@ -8640,6 +8640,32 @@ fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
         json!({"specifier":"example.com/pkg/util"})
     );
 
+    let sites = interactive_tool_call(
+        &mut mcp,
+        6,
+        "agent_sites_list",
+        with(json!({"node_id": "node:app"})),
+    );
+    assert_eq!(sites["isError"], false, "{sites}");
+    assert_eq!(
+        sites["structuredContent"]["result"]["items"][0]["evidence"][0]["import"]["specifier"],
+        "@/lib/foo"
+    );
+
+    let edges = interactive_tool_call(
+        &mut mcp,
+        7,
+        "agent_edges_list",
+        with(json!({"node_id": "node:app", "direction": "outgoing"})),
+    );
+    assert_eq!(edges["isError"], false, "{edges}");
+    assert_eq!(
+        edges["structuredContent"]["result"]["items"][0]["evidence"][0]["import"]["specifier"],
+        "@/lib/foo"
+    );
+
+    // #542 keeps the dependency list `full` (and the other PathStep-derived
+    // responses) in their previous shape: edge evidence never gains `import`.
     let dependencies = interactive_tool_call(
         &mut mcp,
         4,
@@ -8647,10 +8673,35 @@ fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
         with(json!({"selector": "id:node:app", "detail": "full"})),
     );
     assert_eq!(dependencies["isError"], false, "{dependencies}");
-    assert_eq!(
-        dependencies["structuredContent"]["result"]["edges"]["items"][0]["evidence"][0]["import"]["specifier"],
-        "@/lib/foo"
+    let full_evidence =
+        &dependencies["structuredContent"]["result"]["edges"]["items"][0]["evidence"][0];
+    assert_eq!(full_evidence["kind"], "semantic", "{dependencies}");
+    assert!(full_evidence.get("import").is_none(), "{dependencies}");
+
+    let path = interactive_tool_call(
+        &mut mcp,
+        8,
+        "graph_path_get",
+        with(json!({"from": "id:node:app", "to": "id:node:foo", "max_traversal": 100})),
     );
+    assert_eq!(path["isError"], false, "{path}");
+    assert_eq!(
+        path["structuredContent"]["result"]["path_found"], true,
+        "{path}"
+    );
+
+    let impact = interactive_tool_call(
+        &mut mcp,
+        9,
+        "graph_impact_get",
+        with(json!({"selector": "id:node:foo", "max_nodes": 100, "max_edges": 100})),
+    );
+    assert_eq!(impact["isError"], false, "{impact}");
+    for response in [&dependencies, &path, &impact] {
+        let text = response["structuredContent"].to_string();
+        assert!(text.contains("\"evidence\":[{"), "{text}");
+        assert!(!text.contains("\"import\":"), "{text}");
+    }
 
     let summary = interactive_tool_call(
         &mut mcp,
@@ -8664,7 +8715,16 @@ fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
     assert!(summary_edge.get("evidence").is_none());
 
     mcp.finish();
-    for response in [&typescript, &go, &dependencies, &summary] {
+    for response in [
+        &typescript,
+        &go,
+        &sites,
+        &edges,
+        &dependencies,
+        &path,
+        &impact,
+        &summary,
+    ] {
         let text = response.to_string();
         assert!(!text.contains("PROCESS_544_PROPERTY_SECRET"), "{text}");
         assert!(!text.contains("PROCESS_544_DETAIL_SECRET"), "{text}");
