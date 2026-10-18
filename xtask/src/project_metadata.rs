@@ -910,6 +910,10 @@ const HOSTILE_PATH_DIFF: &str = concat!(
     r#""${{ github.event.pull_request.head.sha }}")""#,
 );
 
+/// Every path filter feeds `$changed` to `grep -q` through a here-string.
+const HOSTILE_PATH_FILTER_PREFIX: &str = "          if grep -qE '";
+const HOSTILE_PATH_FILTER_SUFFIX: &str = r#"' <<<"$changed"; then"#;
+
 /// The compiler-precise-hostile job reports its required check on every pull
 /// request but runs the hostile steps only when a related path changes.
 fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
@@ -946,6 +950,24 @@ fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
     let path_diffs = hostile.matches("git diff").count();
     if path_diffs == 0 || hostile.matches(HOSTILE_PATH_DIFF).count() != path_diffs {
         bail!("CI compiler-precise hostile path filters must all use {HOSTILE_PATH_DIFF:?}");
+    }
+    // Under pipefail, `grep -q` exiting on the first match can SIGPIPE an
+    // upstream writer and turn a related change into run=false.
+    if hostile
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains("| grep"))
+    {
+        bail!("CI compiler-precise hostile path filters must not pipe into grep under pipefail");
+    }
+    let here_string_filters = hostile
+        .lines()
+        .filter(|line| {
+            line.starts_with(HOSTILE_PATH_FILTER_PREFIX)
+                && line.ends_with(HOSTILE_PATH_FILTER_SUFFIX)
+        })
+        .count();
+    if here_string_filters != path_diffs {
+        bail!("CI compiler-precise hostile path filters must all read $changed via a here-string");
     }
     Ok(())
 }
@@ -3563,6 +3585,48 @@ mod tests {
             assert!(
                 verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
                 "a rename-detecting path diff must be rejected"
+            );
+        }
+    }
+
+    /// Under `set -o pipefail`, `grep -q` exiting on the first match can kill
+    /// the upstream `printf` with SIGPIPE and turn a related change into
+    /// `run=false`, so both path filters must feed grep with a here-string.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_printf_piped_path_filters() {
+        fn pipe_path_filter(block: &str) -> String {
+            let prefix = "          if grep -qE ";
+            let suffix = " <<<\"$changed\"; then";
+            let line = block
+                .lines()
+                .find(|line| line.starts_with(prefix) && line.ends_with(suffix))
+                .expect("path filter uses a here-string");
+            let pattern = &line[prefix.len()..line.len() - suffix.len()];
+            let piped =
+                format!("          if printf '%s\\n' \"$changed\" | grep -qE {pattern}; then");
+            block.replacen(line, &piped, 1)
+        }
+
+        let ci = checked_in_ci_workflow();
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        let (decide, compiler_pack_smoke) = hostile
+            .split_once("id: compiler-pack-smoke")
+            .expect("compiler-pack smoke decision follows the hostile decision");
+        for changed in [
+            format!(
+                "{}id: compiler-pack-smoke{compiler_pack_smoke}",
+                pipe_path_filter(decide)
+            ),
+            format!(
+                "{decide}id: compiler-pack-smoke{}",
+                pipe_path_filter(compiler_pack_smoke)
+            ),
+        ] {
+            let drift = ci.replace(hostile, &changed);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a printf-piped path filter must be rejected"
             );
         }
     }
