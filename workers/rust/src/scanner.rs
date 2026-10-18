@@ -204,6 +204,8 @@ type SemanticExtractor = for<'a> fn(
 const RUST_RELEASE_GATE_ENV: &str = "DEPGRAPH_RUST_RELEASE_GATE";
 const RELEASE_GATE_PENDING: &str = "release-gate-pending";
 const RELEASE_GATE_VERIFIED: &str = "release-gate-verified";
+const MEMORY_BUDGET_REMEDIATION: &str =
+    "raise [scan] max_worker_memory_bytes in .depgraph.toml to restore HIR analysis";
 
 #[derive(Debug)]
 struct State {
@@ -636,7 +638,10 @@ impl State {
 
     fn finish(mut self) -> Result<ScanResult> {
         self.flush_aggregated_diagnostics();
-        let fallback_summary = syntax_fallback_summary(self.sites.values());
+        let fallback_summary = syntax_fallback_summary(
+            self.sites.values(),
+            &hir_required_remediation(&self.profile.properties),
+        );
         let summary_count = |class: &str| {
             fallback_summary
                 .get("resolution_class_counts")
@@ -979,7 +984,9 @@ impl State {
         self.add_diagnostic(
             DiagnosticSeverity::Warning,
             "RUST_HIR_MEMORY_BUDGET_SYNTAX_ONLY",
-            "rust-analyzer HIR semantic analysis was skipped because a full analysis exceeded the worker memory budget; syntax analysis continues without HIR imports, types, or calls; raise [scan] max_worker_memory_bytes in .depgraph.toml to restore HIR analysis",
+            &format!(
+                "rust-analyzer HIR semantic analysis was skipped because a full analysis exceeded the worker memory budget; syntax analysis continues without HIR imports, types, or calls; {MEMORY_BUDGET_REMEDIATION}"
+            ),
             None,
             None,
             "rust-hir-memory-budget",
@@ -4534,7 +4541,32 @@ fn rust_prelude_type(name: &str, edition: &str, policy: RustPreludePolicy) -> bo
     base || edition_2021 || edition_2024 || std_only
 }
 
-fn syntax_fallback_summary<'a>(sites: impl Iterator<Item = &'a DependencySite>) -> Value {
+/// Chooses the `hir_required` remediation from the recorded HIR state.
+///
+/// A syntax-only run needs the memory budget raised before HIR can return;
+/// when the toolchain is also incompatible, both causes must be fixed, so
+/// both remediations are reported with the memory budget first.
+fn hir_required_remediation(properties: &Properties) -> String {
+    let syntax_only =
+        properties.get("rust_hir_mode").and_then(Value::as_str) == Some("syntax-only");
+    if !syntax_only {
+        return TOOLCHAIN_REMEDIATION.to_owned();
+    }
+    let toolchain_compatible = properties
+        .get("rust_hir_toolchain_status")
+        .and_then(Value::as_str)
+        == Some("compatible");
+    if toolchain_compatible {
+        MEMORY_BUDGET_REMEDIATION.to_owned()
+    } else {
+        format!("{MEMORY_BUDGET_REMEDIATION}; also {TOOLCHAIN_REMEDIATION}")
+    }
+}
+
+fn syntax_fallback_summary<'a>(
+    sites: impl Iterator<Item = &'a DependencySite>,
+    hir_required_remediation: &str,
+) -> Value {
     let mut class_counts = BTreeMap::<String, u64>::new();
     let mut site_kind_counts = BTreeMap::<String, u64>::new();
     let mut unresolved_by_kind = BTreeMap::<String, u64>::new();
@@ -4576,7 +4608,7 @@ fn syntax_fallback_summary<'a>(sites: impl Iterator<Item = &'a DependencySite>) 
         "unresolved_by_kind": unresolved_by_kind,
         "hir_refined_site_count": hir_refined_site_count,
         "remediation": {
-            "hir_required": TOOLCHAIN_REMEDIATION,
+            "hir_required": hir_required_remediation,
             "macro_execution_required": "safe scan intentionally does not execute macro, build-script, or project code; inspect the preserved sites or use an explicitly authorized build observation",
         },
     })
@@ -5424,6 +5456,39 @@ pub fn consume(_: Local) {}
         assert!(condition.matches('!').count() >= 2);
     }
 
+    /// Returns the `hir_required` remediation from both the profile summary
+    /// and the RUST_SYNTAX_FALLBACK_SUMMARY diagnostic, asserting they agree.
+    fn hir_required_remediation(result: &ScanResult) -> String {
+        let profile_value = result.profile.properties["rust_syntax_fallback_summary"]
+            ["remediation"]["hir_required"]
+            .as_str()
+            .expect("profile hir_required remediation")
+            .to_owned();
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "RUST_SYNTAX_FALLBACK_SUMMARY")
+            .expect("syntax fallback summary diagnostic");
+        assert_eq!(
+            diagnostic.properties["remediation"]["hir_required"],
+            profile_value.as_str()
+        );
+        profile_value
+    }
+
+    fn assert_memory_then_toolchain_remediation(remediation: &str) {
+        let memory = remediation
+            .find("max_worker_memory_bytes")
+            .expect("memory budget remediation");
+        let toolchain = remediation
+            .find("rustup toolchain install")
+            .expect("toolchain remediation");
+        assert!(
+            memory < toolchain,
+            "memory remediation must come first: {remediation}"
+        );
+    }
+
     fn semantic_extractor_must_not_run(
         _model: &SafeProjectModel,
         _contexts: &BTreeMap<String, SemanticCrateContext>,
@@ -5478,6 +5543,13 @@ pub fn consume(_: Local) {}
             .expect("syntax-only diagnostic");
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
         assert!(diagnostic.message.contains("max_worker_memory_bytes"));
+        let remediation = hir_required_remediation(&result);
+        if properties["rust_hir_toolchain_status"] == "compatible" {
+            assert!(remediation.contains("max_worker_memory_bytes"));
+            assert!(!remediation.contains("rustup"));
+        } else {
+            assert_memory_then_toolchain_remediation(&remediation);
+        }
         assert!(result.nodes.iter().any(|node| node.kind == "module"));
         assert!(
             result
@@ -5539,6 +5611,9 @@ pub fn consume(_: Local) {}
                 .count(),
             1
         );
+        // Fixing only one of the two causes does not restore HIR, so both
+        // remediations are reported, memory budget first.
+        assert_memory_then_toolchain_remediation(&hir_required_remediation(&result));
     }
 
     #[test]
@@ -5562,6 +5637,9 @@ pub fn consume(_: Local) {}
                 .iter()
                 .all(|diagnostic| diagnostic.code != "RUST_HIR_MEMORY_BUDGET_SYNTAX_ONLY")
         );
+        let remediation = hir_required_remediation(&result);
+        assert_eq!(remediation, TOOLCHAIN_REMEDIATION);
+        assert!(!remediation.contains("max_worker_memory_bytes"));
     }
 
     #[test]
