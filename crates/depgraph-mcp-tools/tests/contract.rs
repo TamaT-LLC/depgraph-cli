@@ -2419,6 +2419,9 @@ fn import_specifier_with_url_userinfo_is_rejected_on_build_and_deserialize() {
         concat!("npm:", "@scope/pkg@1.0.0"),
         "jsr:@std/path",
         "node:fs",
+        concat!("https://esm.sh/", "@scope/pkg@1.0.0"),
+        concat!("https://cdn.example.test/mod.js?v", "@1"),
+        concat!("https://cdn.example.test/mod.js#v", "@1"),
     ] {
         assert!(
             AgentImportEvidence::new(parse(specifier), None, None, None, false).is_ok(),
