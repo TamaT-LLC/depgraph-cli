@@ -346,7 +346,7 @@ remain equal.
 | `crate_graph_source_policy` | `confined-cargo-metadata-or-static-manifest` |
 | `crate_graph_source` | `confined-cargo-metadata`, `static-manifest-fallback`, or `none` |
 | `syntax_fallback` | `enabled` |
-| `rust_syntax_fallback_summary` | `rust-syntax-fallback-summary-v1`: deterministic `syntax_proven` / `hir_required` / `macro_execution_required` counts, site-kind counts, unresolved-kind counts, and separate remediation |
+| `rust_syntax_fallback_summary` | `rust-syntax-fallback-summary-v1`: deterministic `syntax_proven` / `hir_required` / `macro_execution_required` counts, site-kind counts, unresolved-kind counts, and separate remediation; `remediation.hir_required` is the toolchain install command in full mode, the `max_worker_memory_bytes` advice in syntax-only mode with a compatible toolchain, and that advice followed by the declaration-specific `rust_hir_toolchain_remediation` in syntax-only mode with an incompatible toolchain |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
 | `proc_macro_expansion` | `disabled` |
@@ -525,7 +525,12 @@ the profile also records `rust_hir_project_model=not-invoked` and
 `rust_hir_enable_gate=memory-budget-syntax-only`. When an earlier gate
 (toolchain, edition, or crate graph) already stops HIR, that gate's own
 `rust_hir_project_model`, `rust_hir_enable_gate`, coverage reason, and
-diagnostic are kept alongside the syntax-only marks.
+diagnostic are kept alongside the syntax-only marks. The
+`rust_syntax_fallback_summary` remediation for `hir_required` then points at
+raising `[scan] max_worker_memory_bytes` instead of the toolchain install
+command; when the toolchain is also incompatible it puts the memory advice
+first and then the profile's declaration-specific
+`rust_hir_toolchain_remediation`, because fixing only one does not restore HIR.
 
 The core requests this mode only once, for a repository-scope Rust unit whose
 full-mode attempt exceeded `[scan] max_worker_memory_bytes`. A successful retry
