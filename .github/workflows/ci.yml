@@ -262,7 +262,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -307,7 +307,7 @@ jobs:
         id: compiler-pack-smoke
         run: |
           set -euo pipefail
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|\.github/workflows/ci\.yml)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else

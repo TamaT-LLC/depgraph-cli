@@ -23,7 +23,8 @@ run the Rust, Go, and Web checks. The compiler-precise hostile job always runs
 on `main` push and `workflow_dispatch`; on pull requests it runs the expensive
 steps only when relevant paths change (compiler crates, hostile scripts/docs,
 or this CI workflow), and otherwise exits successfully without those steps so
-required checks stay green. Benchmark,
+required checks stay green. The path filter diffs with `--no-renames`, so a file
+moved out of a relevant path still triggers the run. Benchmark,
 Linux/macOS integration, and Windows smoke jobs run only on an explicit manual
 dispatch. The verifier binds those expensive jobs to `workflow_dispatch`, so a
 workflow edit cannot silently restore them on every merge. The verifier detects

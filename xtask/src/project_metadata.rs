@@ -142,6 +142,7 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         "Only the npm publisher receives job-scoped `id-token: write`",
         "The OIDC-capable npm job performs no checkout\nand executes no repository script.",
         "Manual dispatches retain the same read-only and\nsecret-free boundary",
+        "The path filter diffs with `--no-renames`",
         "`.github/actions-policy.json` is the canonical allowlist",
         "A mutable tag or branch is never a temporary fallback.",
         "| Fork changes a workflow to print a secret |",
@@ -616,6 +617,53 @@ const INTEGRATION_TARGET_SIZE_REPORT: &str =
 /// silently miss its last line.
 fn workflow_block_has_line(block: &str, line: &str) -> bool {
     block.lines().any(|candidate| candidate == line)
+}
+
+/// Every pull request path filter in the compiler-precise-hostile job diffs
+/// base..head with this exact command.
+const HOSTILE_PATH_DIFF: &str = concat!(
+    r#"changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "#,
+    r#""${{ github.event.pull_request.head.sha }}")""#,
+);
+
+/// The compiler-precise-hostile job reports its required check on every pull
+/// request but runs the hostile steps only when a related path changes.
+fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
+    for required in [
+        "compiler-precise-hostile:",
+        "sudo apt-get install --yes --no-install-recommends bubblewrap",
+        "scripts/compiler-precise-hostile-e2e.sh",
+        "compiler-precise-hostile-${{ github.sha }}",
+        "id: decide",
+        "steps.decide.outputs.run",
+        r#"github.event_name }}" = "workflow_dispatch""#,
+        r#"github.event_name }}" = "push""#,
+        "github.event.pull_request.base.sha",
+        "github.event.pull_request.head.sha",
+        r#"Cargo\.(toml|lock)"#,
+        "crates/depgraph-core/",
+        "crates/depgraph-rustc-wrapper/",
+        "crates/depgraph-rustc-query/",
+        "crates/depgraph-cli/",
+        "crates/depgraph-store/",
+        "scripts/compiler-precise-hostile",
+        "docs/50_test/compiler-precise-hostile",
+        r#"\.github/workflows/ci\.yml"#,
+        "if: steps.decide.outputs.run == 'true'",
+        "if: steps.decide.outputs.run != 'true'",
+    ] {
+        if !ci_workflow.contains(required) {
+            bail!("CI is missing compiler-precise hostile gate {required:?}");
+        }
+    }
+    // Rename detection reports a moved file only under its destination, so a
+    // file moved out of a related path would let the path filter skip the run.
+    let hostile = workflow_job_block(ci_workflow, "compiler-precise-hostile")?;
+    let path_diffs = hostile.matches("git diff").count();
+    if path_diffs == 0 || hostile.matches(HOSTILE_PATH_DIFF).count() != path_diffs {
+        bail!("CI compiler-precise hostile path filters must all use {HOSTILE_PATH_DIFF:?}");
+    }
+    Ok(())
 }
 
 fn workflow_job_block<'a>(workflow: &'a str, job_name: &str) -> Result<&'a str> {
@@ -1606,6 +1654,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "`mcp_security_matrix`",
         "| MCP security matrix |",
         "The hostile gate fails if",
+        "The filter diffs base..head with `git diff --no-renames`",
     ] {
         if !rust_compiler_hostile.contains(required) {
             bail!("compiler-precise hostile evidence is missing {required:?}");
@@ -1640,33 +1689,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
             bail!("compiler-pack release evidence is missing {required:?}");
         }
     }
-    for required in [
-        "compiler-precise-hostile:",
-        "sudo apt-get install --yes --no-install-recommends bubblewrap",
-        "scripts/compiler-precise-hostile-e2e.sh",
-        "compiler-precise-hostile-${{ github.sha }}",
-        "id: decide",
-        "steps.decide.outputs.run",
-        r#"github.event_name }}" = "workflow_dispatch""#,
-        r#"github.event_name }}" = "push""#,
-        "github.event.pull_request.base.sha",
-        "github.event.pull_request.head.sha",
-        r#"Cargo\.(toml|lock)"#,
-        "crates/depgraph-core/",
-        "crates/depgraph-rustc-wrapper/",
-        "crates/depgraph-rustc-query/",
-        "crates/depgraph-cli/",
-        "crates/depgraph-store/",
-        "scripts/compiler-precise-hostile",
-        "docs/50_test/compiler-precise-hostile",
-        r#"\.github/workflows/ci\.yml"#,
-        "if: steps.decide.outputs.run == 'true'",
-        "if: steps.decide.outputs.run != 'true'",
-    ] {
-        if !ci_workflow.contains(required) {
-            bail!("CI is missing compiler-precise hostile gate {required:?}");
-        }
-    }
+    verify_compiler_precise_hostile_ci_gate(&ci_workflow)?;
     for required in [
         "- Status: Accepted",
         "- Decision ID: `PROJ-ARC-001-ADR-003`",
@@ -2970,7 +2993,8 @@ mod tests {
     use super::{
         BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT,
         extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
-        job_pins_intermediate_state_bound, workflow_job_block,
+        job_pins_intermediate_state_bound, verify_compiler_precise_hostile_ci_gate,
+        workflow_job_block,
     };
 
     /// The three jobs that build twice on one runner without reclaiming
@@ -3209,5 +3233,42 @@ mod tests {
                 .expect("drifted windows-smoke job is extractable"),
             "windows-smoke must be rejected once its bound moves to another job"
         );
+    }
+
+    #[test]
+    fn compiler_precise_hostile_gate_accepts_the_checked_in_workflow() {
+        let ci = checked_in_ci_workflow();
+        verify_compiler_precise_hostile_ci_gate(&ci).unwrap();
+    }
+
+    /// With rename detection a file moved out of a related path shows up only
+    /// under its destination, so the path filter could skip the hostile E2E.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_rename_detecting_path_diffs() {
+        let ci = checked_in_ci_workflow();
+        let no_renames = "git diff --no-renames --name-only ";
+        let renames = "git diff --name-only ";
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        assert_eq!(hostile.matches(no_renames).count(), 2);
+        let (decide, compiler_pack_smoke) = hostile
+            .split_once("id: compiler-pack-smoke")
+            .expect("compiler-pack smoke decision follows the hostile decision");
+        for changed in [
+            format!(
+                "{}id: compiler-pack-smoke{compiler_pack_smoke}",
+                decide.replacen(no_renames, renames, 1)
+            ),
+            format!(
+                "{decide}id: compiler-pack-smoke{}",
+                compiler_pack_smoke.replacen(no_renames, renames, 1)
+            ),
+        ] {
+            let drift = ci.replace(hostile, &changed);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a rename-detecting path diff must be rejected"
+            );
+        }
     }
 }
