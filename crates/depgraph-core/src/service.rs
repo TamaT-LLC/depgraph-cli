@@ -33,8 +33,9 @@ pub use crate::service_bounded::{
 };
 pub use crate::service_build::{ResolveBuildRequest, ResolveBuildServiceOutcome};
 pub use crate::service_graph::{
-    CyclesRequest, CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection,
-    ExplainPathRequest, ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
+    ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest, CyclesResult,
+    DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
+    ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
     UnresolvedServiceResult,
 };
 pub use crate::service_health::{

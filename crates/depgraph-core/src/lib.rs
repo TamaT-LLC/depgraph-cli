@@ -269,7 +269,6 @@ pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE_PATH: &str =
     "fixtures/cross-language-release-smoke-v1.json";
 pub const CROSS_LANGUAGE_RELEASE_SMOKE_FIXTURE: &str =
     include_str!("../../../fixtures/cross-language-release-smoke-v1.json");
-pub use crate::service_graph::{ChangedSetImpactRequest, ChangedSetImpactServiceResult};
 pub use cache::{
     BuildCacheInput, COMPILER_PRECISE_CACHE_CONTRACT_VERSION,
     COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION, CompilerPreciseCacheInput,
@@ -495,10 +494,11 @@ pub use scan::{
     run_scan_with_cache_mode_and_cancellation,
 };
 pub use service::{
-    CyclesRequest, CyclesResult, DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES,
-    DEFAULT_SERVICE_MAX_OUTPUT_BYTES, DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS,
-    DEPGRAPH_SERVICE_LIMITS_VERSION, DependenciesRequest, DependenciesResult, DependencyDirection,
-    DepgraphCapability, DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
+    ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest, CyclesResult,
+    DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, DEFAULT_SERVICE_MAX_OUTPUT_BYTES,
+    DEFAULT_SERVICE_MAX_PAGE_ITEMS, DEFAULT_SERVICE_PAGE_ITEMS, DEPGRAPH_SERVICE_LIMITS_VERSION,
+    DependenciesRequest, DependenciesResult, DependencyDirection, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphMutatingContext, DepgraphMutatingUseCase,
     DepgraphMutatingUseCaseKind, DepgraphService, DepgraphServiceConfig,
     DepgraphServiceConfigurationError, DepgraphServiceError, DepgraphServiceErrorCategory,
     DepgraphServiceLimit, DepgraphServiceLimits, DepgraphServiceResult, DoctorRequest,
