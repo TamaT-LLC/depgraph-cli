@@ -140,6 +140,12 @@ warm impact は 1 回数十 ms と測定されている（`docs/releases/v0.4.0-
 checkout は head.sha を指定する。
 `refs/pull/N/merge` を checkout すると、コメントの根拠リンクが指すコミットが PR 上から消えてしまうためである。
 
+このリポジトリの試作 workflow は checkout を 2 回に分ける。
+Action は base.sha から `.depgraph-trusted/` に取り（`.github/actions/pr-impact` だけの sparse checkout）、`uses: ./.depgraph-trusted/.github/actions/pr-impact` で実行する。
+解析対象の head.sha は `pr/` に fetch-depth 0 で取り、`working-directory: pr` として渡す。
+scan と git diff はこの別リポジトリの中で走り、`git rev-parse --show-prefix` は空になるので、blob リンクは head のリポジトリルート基準のパスになる。
+理由は後述の「1 段目で信頼する範囲」に書く。
+
 ## インストール
 
 GitHub Release（`TamaT-LLC/depgraph-cli`）から `gh release download` で次の 2 つを取る。
@@ -275,13 +281,20 @@ PR のコードを書き込み権限つきで checkout する、典型的な脆�
 1 段目は静的解析なので、fork のプロジェクトコードは走らない。
 ただし Action 自身と depgraph バイナリは信頼済みのものを使う必要がある。
 
-`uses: ./` を使うと、PR の head 側の `action.yml` が使われる。
-fork PR の作者は `action.yml` を書き換えて、任意の処理を runner で走らせられる。
+head.sha を workspace ルートに checkout して `uses: ./.github/actions/pr-impact` とすると、PR の head 側の `action.yml` とスクリプトが使われる。
+fork PR の作者は `action.yml` や `collect.mjs` を書き換えて、レポートを作る処理そのものを差し替えられる。
 対策は次のとおり。
 
 - 外部公開版では `TamaT-LLC/depgraph-action@<sha>` のようにコミット SHA で固定して使う。
-- このリポジトリの試作は `pull_request` で書き込み権限が無く、secrets も渡らないので、影響は summary や artifact の改ざん程度にとどまる。
+- このリポジトリの試作は、Action を base.sha から取得し、PR の head は解析対象のデータとして別ディレクトリに置く（「Action の入出力」節の末尾にある 2 回の checkout）。PR が書き換えた `action.yml` やスクリプトは実行されない。manual dispatch はメンテナが選んだ ref なので、その ref の Action を信頼する。
+- base に Action がまだ無いとき（Action を追加する最初の PR がそうである）は、PR 側の Action にフォールバックせず dry-run をスキップする。workflow は `::notice::` を出し、Action と artifact の upload を飛ばして成功で終わる。Action が base に入った後の PR から dry-run が動く。
+- 解析対象側の `.depgraph.toml` などは depgraph の設定として読まれるが、これは解析データとして扱う範囲であり、プロジェクトコードは実行しない。
 - 2 段目の workflow は artifact を信用せず、検証してから投稿する。
+
+この分離で守れるのは「PR の変更を解析する道具」が PR 自身に差し替えられないことである。
+`pull_request` イベントでは workflow 定義自体も PR のマージコミット側のものが使われるので、fork は workflow を書き換えて任意の処理を走らせることはできる。
+その場合でも、ジョブは `contents: read` だけで secrets も渡らないので、他の CI ジョブと同じ境界にとどまる。
+そうして作られた artifact は信頼できないので、2 段目が検証してから使う前提は変わらない。
 
 ### このリポジトリでの導入条件
 

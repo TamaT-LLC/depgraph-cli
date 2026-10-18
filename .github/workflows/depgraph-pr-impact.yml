@@ -4,6 +4,12 @@ name: depgraph PR impact
 # job summary and as an artifact. This workflow never writes to the pull
 # request; a later workflow_run consumer can post the artifact as a comment
 # with a write token that untrusted pull request code never sees.
+#
+# The Action runs from the base revision, never from the pull request head:
+# the head is checked out separately and only read as analysis data, so a pull
+# request cannot rewrite the Action that analyzes it. When the base revision
+# has no Action yet (the pull request that introduces it), the dry run is
+# skipped instead of falling back to the head copy.
 on:
   pull_request:
   workflow_dispatch:
@@ -25,19 +31,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # A manual dispatch runs on a ref the maintainer chose, so that ref is
+      # trusted for both the Action and the analyzed tree.
+      - name: Check out the trusted Action from the base revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .depgraph-trusted
+          sparse-checkout: .github/actions/pr-impact
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the pull request head for analysis
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: pr
           fetch-depth: 0
           persist-credentials: false
+      - name: Find the trusted Action
+        id: trusted
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f .depgraph-trusted/.github/actions/pr-impact/action.yml ]]; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::The base revision has no .github/actions/pr-impact Action, so the depgraph dry run is skipped (the pull request's own copy is not trusted to run)."
+          fi
       - name: Compute the depgraph impact report
         id: impact
-        uses: ./.github/actions/pr-impact
+        if: steps.trusted.outputs.present == 'true'
+        uses: ./.depgraph-trusted/.github/actions/pr-impact
         with:
           base-ref: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
+          working-directory: pr
           post-comment: "false"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.trusted.outputs.present == 'true' }}
         with:
           name: depgraph-pr-impact
           path: |
