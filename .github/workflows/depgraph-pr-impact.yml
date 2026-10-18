@@ -1,0 +1,47 @@
+name: depgraph PR impact
+
+# Dry run: compute the impact report for a pull request and publish it to the
+# job summary and as an artifact. This workflow never writes to the pull
+# request; a later workflow_run consumer can post the artifact as a comment
+# with a write token that untrusted pull request code never sees.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base revision to diff against
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: depgraph-pr-impact-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compute the depgraph impact report
+        id: impact
+        uses: ./.github/actions/pr-impact
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
+          post-comment: "false"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: ${{ !cancelled() }}
+        with:
+          name: depgraph-pr-impact
+          path: |
+            ${{ runner.temp }}/depgraph-pr-impact/report.json
+            ${{ runner.temp }}/depgraph-pr-impact/comment.md
+          if-no-files-found: warn
+          retention-days: 14
