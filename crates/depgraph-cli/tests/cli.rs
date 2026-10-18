@@ -2835,6 +2835,241 @@ fn impact_changed_set_is_read_only_deterministic_and_maps_renames() {
         ));
 }
 
+fn seed_impact_graph_snapshot(
+    store_path: &Path,
+    root: &Path,
+    nodes: &[(&str, Option<&str>)],
+    edges: &[(&str, &str)],
+) {
+    let scan_id = "changed-set-impact";
+    let head = run_git(root, &["rev-parse", "HEAD"]);
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision(scan_id, root, false, Some(&head))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1, "files_discovered": 0, "files_analyzed": 0, "files_skipped": 0,
+        "dependency_sites": 0, "resolved": 0, "candidates": 0, "external": 0,
+        "unresolved": 0, "unsupported_syntax": 0, "project_code_executed": false,
+        "completeness": ["syntax-complete"], "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut event = |name: &str| {
+        seq += 1;
+        json!({
+            "event": name, "protocol_version": "1.0", "scan_id": scan_id,
+            "adapter": "fixture", "adapter_version": "1.0", "seq": seq
+        })
+    };
+    let mut events = Vec::new();
+    let mut started = event("scan_started");
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    events.push(started);
+    let mut profile = event("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:impact", "language": "fixture", "features": [],
+        "environment": {}, "properties": {}
+    });
+    events.push(profile);
+    for (id, path) in nodes {
+        let mut node = event("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": "file", "locator": format!("file:{id}"), "display_name": id,
+            "properties": path.map_or_else(|| json!({}), |path| json!({"path": path}))
+        });
+        events.push(node);
+    }
+    for (source, target) in edges {
+        let mut edge = event("edge_upsert");
+        edge["edge"] = json!({
+            "id": format!("edge:{source}->{target}"), "source": source, "target": target,
+            "kind": "imports", "phase": "source", "environment": "host",
+            "profile_id": "fixture:impact", "resolution_status": "resolved",
+            "precision": "exact", "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        events.push(edge);
+    }
+    let mut profile_completed = event("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:impact");
+    profile_completed["coverage"] = coverage.clone();
+    events.push(profile_completed);
+    let mut completed = event("scan_completed");
+    completed["coverage"] = coverage;
+    events.push(completed);
+    for event in &events {
+        store.ingest_event(event).unwrap();
+    }
+    store.finish_scan(scan_id, "completed", None, true).unwrap();
+}
+
+/// Two changed files with disjoint dependents, a deleted file absent from the
+/// snapshot, and an untracked file.
+fn changed_set_impact_cli_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store_path = cache.path().join("graph.db");
+    run_git(root.path(), &["init", "--quiet"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    run_git(root.path(), &["config", "user.name", "Test"]);
+    fs::create_dir(root.path().join("src")).unwrap();
+    for file in ["src/a.rs", "src/b.rs", "src/c.rs", "src/gone.rs"] {
+        fs::write(root.path().join(file), format!("// {file}\n")).unwrap();
+        run_git(root.path(), &["add", file]);
+    }
+    run_git(root.path(), &["commit", "--quiet", "-m", "base"]);
+    seed_impact_graph_snapshot(
+        &store_path,
+        root.path(),
+        &[
+            ("a", Some("src/a.rs")),
+            ("b", Some("src/b.rs")),
+            ("c", Some("src/c.rs")),
+            ("p", None),
+            ("w", None),
+            ("x", None),
+            ("y", None),
+            ("z", None),
+        ],
+        &[
+            ("x", "a"),
+            ("z", "x"),
+            ("y", "b"),
+            ("w", "y"),
+            ("w", "x"),
+            ("p", "c"),
+        ],
+    );
+    fs::write(root.path().join("src/a.rs"), "// a changed\n").unwrap();
+    fs::write(root.path().join("src/b.rs"), "// b changed\n").unwrap();
+    fs::remove_file(root.path().join("src/gone.rs")).unwrap();
+    fs::write(root.path().join("src/untracked.rs"), "// new\n").unwrap();
+    (root, cache, store_path)
+}
+
+fn impact_json(root: &Path, store_path: &Path, arguments: &[&str]) -> serde_json::Value {
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root)
+        .args(["--store", store_path.to_str().unwrap(), "impact"])
+        .args(arguments)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "impact {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn impacted_ids_beyond_depth_zero(
+    output: &serde_json::Value,
+) -> std::collections::BTreeSet<String> {
+    output["data"]["impacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["depth"].as_u64().unwrap() > 0)
+        .map(|item| item["node"]["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn impact_changed_without_selector_unions_every_changed_file() {
+    let (root, _cache, store_path) = changed_set_impact_cli_fixture();
+
+    let whole = impact_json(root.path(), &store_path, &["--changed", "HEAD"]);
+    assert_eq!(whole["command"], "impact");
+    assert_eq!(whole["scan_id"], "changed-set-impact");
+    assert_eq!(whole["data"]["mode"], "changed_set");
+    assert_eq!(whole["data"]["complete"], true);
+
+    let mut expected = std::collections::BTreeSet::new();
+    for file in ["src/a.rs", "src/b.rs"] {
+        let single = impact_json(root.path(), &store_path, &[&format!("path:{file}")]);
+        expected.extend(impacted_ids_beyond_depth_zero(&single));
+    }
+    assert_eq!(impacted_ids_beyond_depth_zero(&whole), expected);
+    assert_eq!(
+        expected,
+        ["w", "x", "y", "z"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+
+    let impacts = whole["data"]["impacts"].as_array().unwrap();
+    let w = impacts
+        .iter()
+        .find(|item| item["node"]["id"] == "w")
+        .unwrap();
+    assert_eq!(w["depth"], 2);
+    assert_eq!(w["changed_paths"], json!(["src/a.rs", "src/b.rs"]));
+    assert_eq!(w["dependency_path"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        whole["data"]["unmapped"],
+        json!([
+            {"status": "deleted", "old_path": "src/gone.rs", "reason": "deleted"},
+            {"status": "untracked", "new_path": "src/untracked.rs", "reason": "not_in_snapshot"}
+        ])
+    );
+
+    let again = impact_json(root.path(), &store_path, &["--changed", "HEAD"]);
+    assert_eq!(whole, again);
+}
+
+#[test]
+fn impact_changed_without_selector_prints_a_summary() {
+    let (root, _cache, store_path) = changed_set_impact_cli_fixture();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "impact",
+            "--changed",
+            "HEAD",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("impact changed set: ref=HEAD "))
+        .stdout(predicate::str::contains(
+            "paths=4 mapped_paths=2 unmapped=2 changed_nodes=2",
+        ))
+        .stdout(predicate::str::contains(
+            "result: complete=true impacts=6 depth=unbounded",
+        ))
+        .stdout(predicate::str::contains("  0 file file:a id:a from=src/a.rs\n"))
+        .stdout(predicate::str::contains(
+            "  2 file file:w id:w from=src/a.rs,src/b.rs\n",
+        ))
+        .stdout(predicate::str::contains(
+            "unmapped:\n  deleted src/gone.rs (deleted)\n  untracked src/untracked.rs (not_in_snapshot)\n",
+        ));
+}
+
+#[test]
+fn impact_requires_a_selector_or_changed_ref() {
+    let (root, _cache, store_path) = changed_set_impact_cli_fixture();
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(root.path())
+        .args(["--store", store_path.to_str().unwrap(), "impact", "--json"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "impact requires a SELECTOR unless --changed <GIT_REF> is given",
+        ));
+}
+
 #[test]
 fn impact_changed_since_error_never_discloses_raw_git_stderr() {
     let root = tempfile::tempdir().unwrap();
