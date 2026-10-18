@@ -512,6 +512,45 @@ test("collectReport rejects option-like or malformed base refs before running gi
   assert.equal(calls.length, 0);
 });
 
+function failingGit(failOn, { exitCode = 1, stderr = "" } = {}) {
+  const { runGit: base } = fakeGit("");
+  return async (args) => {
+    if (failOn(args)) {
+      const error = new Error(`git ${args[0]} failed: ${stderr}`);
+      error.exitCode = exitCode;
+      error.stderr = stderr;
+      throw error;
+    }
+    return base(args);
+  };
+}
+
+const collectWith = (runGit) =>
+  collectReport({ baseRef: "origin/main", store: "/s", profiles: [], maxFiles: 1, scanExitCode: 0, runGit, runDepgraph: async () => ({}) });
+
+test("collectReport explains an unresolvable base ref and keeps the git error details", async () => {
+  const runGit = failingGit((args) => args[0] === "rev-parse" && args.at(-1) === "origin/main^{commit}", { exitCode: 1 });
+  await assert.rejects(collectWith(runGit), (error) => {
+    assert.match(error.message, /base ref origin\/main/);
+    assert.match(error.message, /fetch-depth: 0/);
+    assert.match(error.message, /exit code 1/);
+    assert.equal(error.cause.exitCode, 1);
+    return true;
+  });
+});
+
+test("collectReport explains a missing merge-base and keeps the git stderr", async () => {
+  const runGit = failingGit((args) => args[0] === "merge-base", { exitCode: 128, stderr: "fatal: bad object" });
+  await assert.rejects(collectWith(runGit), (error) => {
+    assert.match(error.message, /merge-base/);
+    assert.match(error.message, /fetch-depth: 0/);
+    assert.match(error.message, /fatal: bad object/);
+    assert.match(error.message, /exit code 128/);
+    assert.equal(error.cause.stderr, "fatal: bad object");
+    return true;
+  });
+});
+
 // --- rendering -----------------------------------------------------------
 
 test("escapeMarkdown neutralizes table, HTML, code, link, and mention syntax", () => {

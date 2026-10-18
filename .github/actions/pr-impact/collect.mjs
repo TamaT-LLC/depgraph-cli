@@ -275,6 +275,23 @@ function positiveInteger(name, value) {
   return Number(text);
 }
 
+const HISTORY_HINT = "use actions/checkout with fetch-depth: 0, or fetch the base commit before this step";
+
+// `rev-parse --quiet` and a history-less `merge-base` fail without stderr, so
+// the bare git error says nothing; name the likely cause and keep git's details.
+async function resolveHistory(runGit, args, what) {
+  try {
+    return (await runGit(args)).trim();
+  } catch (error) {
+    const details = [];
+    if (error?.exitCode !== undefined) details.push(`exit code ${error.exitCode}`);
+    const stderr = typeof error?.stderr === "string" ? messageHead(error.stderr) : "";
+    if (stderr) details.push(stderr);
+    const suffix = details.length > 0 ? ` (git ${args[0]}: ${details.join(", ")})` : "";
+    throw new Error(`${what}; ${HISTORY_HINT}${suffix}`, { cause: error });
+  }
+}
+
 /** Run the whole collection against injectable git and depgraph runners. */
 export async function collectReport({
   baseRef,
@@ -299,9 +316,9 @@ export async function collectReport({
   const nodeLimit = positiveInteger("max-nodes", maxNodes);
   const edgeLimit = positiveInteger("max-edges", maxEdges);
 
-  const baseSha = (await runGit(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`])).trim();
+  const baseSha = await resolveHistory(runGit, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], `cannot resolve base ref ${baseRef}`);
   const headSha = (await runGit(["rev-parse", "--verify", "--quiet", headRef])).trim();
-  const mergeBase = (await runGit(["merge-base", baseSha, headSha])).trim();
+  const mergeBase = await resolveHistory(runGit, ["merge-base", baseSha, headSha], `cannot find a merge-base between base ref ${baseRef} and ${headRef}`);
   const pathPrefix = (await runGit(["rev-parse", "--show-prefix"])).trim();
   const diff = await runGit(["diff", "--name-status", "-z", "--find-renames", "--relative", mergeBase, headSha, "--"]);
   const entries = parseNameStatusZ(diff);
@@ -383,8 +400,11 @@ async function main() {
 
   const runGit = async (args) => {
     const result = await execFileResult("git", args, {});
-    if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed: ${messageHead(result.stderr)}`);
-    return result.stdout;
+    if (result.exitCode === 0) return result.stdout;
+    const error = new Error(`git ${args[0]} failed (exit code ${result.exitCode}): ${messageHead(result.stderr)}`);
+    error.exitCode = result.exitCode;
+    error.stderr = result.stderr;
+    throw error;
   };
   const runDepgraph = (args) => execFileResult(depgraph, args, {});
 
