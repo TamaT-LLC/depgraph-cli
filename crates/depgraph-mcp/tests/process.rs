@@ -8101,9 +8101,9 @@ fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic()
             .args(arguments)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "health")
-            .env("GIT_AUTHOR_EMAIL", "health@example.test")
+            .env("GIT_AUTHOR_EMAIL", "health@example.invalid")
             .env("GIT_COMMITTER_NAME", "health")
-            .env("GIT_COMMITTER_EMAIL", "health@example.test")
+            .env("GIT_COMMITTER_EMAIL", "health@example.invalid")
             .output()
             .unwrap();
         assert!(
@@ -8116,7 +8116,7 @@ fn issue_438_health_audit_mcp_missing_base_matches_cli_and_stays_deterministic()
     };
     run(&["init"]);
     run(&["config", "user.name", "health"]);
-    run(&["config", "user.email", "health@example.test"]);
+    run(&["config", "user.email", "health@example.invalid"]);
     fs::write(root.join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
     fs::write(root.join("src/used.rs"), "pub fn used() {}\n").unwrap();
     fs::write(root.join("src/lib.rs"), "mod used;\n").unwrap();

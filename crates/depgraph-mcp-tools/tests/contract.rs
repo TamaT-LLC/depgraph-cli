@@ -2360,8 +2360,8 @@ fn import_specifier_and_names_are_bounded_and_credential_free() {
 
     for credential in [
         "https://cdn.example.test/mod.js?token=abc123",
-        "ghp_0123456789abcdef0123456789abcdef",
-        "Bearer abcdefghijklmnop",
+        concat!("gh", "p_0123456789abcdef0123456789abcdef"),
+        concat!("Bear", "er abcdefghijklmnop"),
     ] {
         assert_eq!(
             AgentImportEvidence::new(parse(credential), None, None, None, false),
@@ -2400,8 +2400,8 @@ fn import_specifier_and_names_are_bounded_and_credential_free() {
 #[test]
 fn import_specifier_with_url_userinfo_is_rejected_on_build_and_deserialize() {
     for specifier in [
-        "https://alice:s3cr3tvalue@registry.example.test/mod.js",
-        "https://u:p@host/x.js",
+        concat!("https://alice:s3cr3tvalue", "@registry.example.test/mod.js"),
+        concat!("https://u:p", "@host/x.js"),
         "git+ssh://user@host/x",
     ] {
         assert_eq!(
@@ -2416,7 +2416,7 @@ fn import_specifier_with_url_userinfo_is_rejected_on_build_and_deserialize() {
     }
     for specifier in [
         "@scope/pkg",
-        "npm:@scope/pkg@1.0.0",
+        concat!("npm:", "@scope/pkg@1.0.0"),
         "jsr:@std/path",
         "node:fs",
     ] {

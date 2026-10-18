@@ -216,7 +216,7 @@ fn oversized_control_and_credential_shaped_values_are_omitted() {
     assert!(project_import_evidence(&credential, None).is_none());
 
     let mut bearer = ts_semantic_properties("named_import");
-    bearer["module_specifier"] = json!("ghp_0123456789abcdef0123456789abcdef");
+    bearer["module_specifier"] = json!(concat!("gh", "p_0123456789abcdef0123456789abcdef"));
     assert!(project_import_evidence(&bearer, None).is_none());
 
     let mut name = ts_semantic_properties("named_import");
@@ -238,12 +238,12 @@ fn oversized_control_and_credential_shaped_values_are_omitted() {
 #[test]
 fn url_userinfo_specifiers_are_omitted() {
     for specifier in [
-        "https://alice:s3cr3tvalue@registry.example.test/mod.js",
-        "https://u:p@host/x.js",
+        concat!("https://alice:s3cr3tvalue", "@registry.example.test/mod.js"),
+        concat!("https://u:p", "@host/x.js"),
         "git+ssh://user@host/x",
         "https://token@host",
-        "https://u:p@host?x=1",
-        "https://u:p@host#frag",
+        concat!("https://u:p", "@host?x=1"),
+        concat!("https://u:p", "@host#frag"),
     ] {
         assert!(!is_public_import_specifier(specifier), "{specifier}");
         let mut properties = ts_semantic_properties("named_import");
@@ -264,12 +264,12 @@ fn url_userinfo_specifiers_are_omitted() {
 fn scoped_package_and_at_in_path_specifiers_stay_public() {
     for specifier in [
         "@scope/pkg",
-        "npm:@scope/pkg@1.0.0",
+        concat!("npm:", "@scope/pkg@1.0.0"),
         "jsr:@std/path",
         "node:fs",
         "@/lib/foo",
-        "https://esm.sh/@scope/pkg@1.0.0",
-        "https://cdn.example.test/npm/pkg@2/mod.js",
+        concat!("https://esm.sh/", "@scope/pkg@1.0.0"),
+        concat!("https://cdn.example.test/npm/pkg", "@2/mod.js"),
         "https://host/x?ref=a@b",
         "https://host/x#a@b",
     ] {

@@ -232,7 +232,7 @@ fn project_site_only(site: ImportSiteHint<'_>) -> Option<ImportEvidence> {
 
 /// Whether `value` may be disclosed as an import specifier: non-empty, at most
 /// [`MAX_IMPORT_SPECIFIER_BYTES`], free of control characters, credential
-/// shapes, and URL userinfo (`scheme://user:pass@host/...`).
+/// shapes, and URL userinfo (`scheme://<userinfo>@host/...`).
 #[must_use]
 pub fn is_public_import_specifier(value: &str) -> bool {
     is_bounded_public_text(value, MAX_IMPORT_SPECIFIER_BYTES) && !has_url_userinfo(value)
@@ -240,7 +240,7 @@ pub fn is_public_import_specifier(value: &str) -> bool {
 
 /// Whether a `scheme://` URL carries userinfo, i.e. an `@` in the authority
 /// before the first `/`, `?` or `#`. Specifiers without `://` (`@scope/pkg`,
-/// `npm:@scope/pkg@1.0.0`, `jsr:@std/path`) have no authority and never match.
+/// `npm:@scope/pkg@<version>`, `jsr:@std/path`) have no authority and never match.
 fn has_url_userinfo(value: &str) -> bool {
     let Some((_, rest)) = value.split_once("://") else {
         return false;

@@ -165,7 +165,7 @@ impl Default for EdgeKindFilter {
     }
 }
 
-/// Same grammar as the Agent token: `^[a-z][a-z0-9._:-]*$`, at most 64 bytes.
+/// Same grammar as the Agent token (`^[a-z][a-z0-9._:-]*$`), at most 64 bytes.
 fn is_valid_edge_kind(kind: &str) -> bool {
     let mut bytes = kind.bytes();
     kind.len() <= MAX_DEPENDENCY_EDGE_KIND_BYTES
