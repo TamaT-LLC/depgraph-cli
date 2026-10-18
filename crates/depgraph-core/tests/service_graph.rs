@@ -1361,7 +1361,7 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
     let legacy = service.dependencies(
         &mut snapshot,
         &issue_541_request("id:file:a", DependencyDirection::Incoming)
-            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Include)?,
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Include))?,
         &cancellation,
     )?;
     assert_eq!(
@@ -1380,7 +1380,7 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
     let excluded = service.dependencies(
         &mut snapshot,
         &issue_541_request("id:file:a", DependencyDirection::Incoming)
-            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Exclude)?,
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
         &cancellation,
     )?;
     assert!(excluded.complete());
@@ -1412,7 +1412,7 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
     let outgoing = service.dependencies(
         &mut snapshot,
         &issue_541_request("id:file:a", DependencyDirection::Outgoing)
-            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Exclude)?,
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
         &cancellation,
     )?;
     assert!(outgoing.items().is_empty(), "declares is structural");
@@ -1421,7 +1421,7 @@ fn issue_541_excluding_structural_edges_counts_only_dependency_edges() -> Result
     let package = service.dependencies(
         &mut snapshot,
         &issue_541_request("id:package:app", DependencyDirection::Outgoing)
-            .with_edge_kind_filter(Vec::new(), StructuralEdgeSelection::Exclude)?,
+            .with_edge_kind_filter(Vec::new(), Some(StructuralEdgeSelection::Exclude))?,
         &cancellation,
     )?;
     assert!(package.items().is_empty(), "contains is structural");
@@ -1443,8 +1443,10 @@ fn issue_541_edge_kind_allowlist_selects_kinds_and_counts_only_them() -> Result<
 
     let imports = service.dependencies(
         &mut snapshot,
-        &issue_541_request("id:file:a", DependencyDirection::Incoming)
-            .with_edge_kind_filter(vec!["imports".to_owned()], StructuralEdgeSelection::Exclude)?,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
+            vec!["imports".to_owned()],
+            Some(StructuralEdgeSelection::Exclude),
+        )?,
         &cancellation,
     )?;
     assert_eq!(
@@ -1457,7 +1459,7 @@ fn issue_541_edge_kind_allowlist_selects_kinds_and_counts_only_them() -> Result<
         &mut snapshot,
         &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
             vec!["imports".to_owned(), "contains".to_owned()],
-            StructuralEdgeSelection::Include,
+            Some(StructuralEdgeSelection::Include),
         )?,
         &cancellation,
     )?;
@@ -1474,8 +1476,10 @@ fn issue_541_edge_kind_allowlist_selects_kinds_and_counts_only_them() -> Result<
 
     let unknown = service.dependencies(
         &mut snapshot,
-        &issue_541_request("id:file:a", DependencyDirection::Incoming)
-            .with_edge_kind_filter(vec!["calls".to_owned()], StructuralEdgeSelection::Include)?,
+        &issue_541_request("id:file:a", DependencyDirection::Incoming).with_edge_kind_filter(
+            vec!["calls".to_owned()],
+            Some(StructuralEdgeSelection::Include),
+        )?,
         &cancellation,
     )?;
     assert!(unknown.items().is_empty());
@@ -1491,7 +1495,7 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
             matches!(
                 request().with_edge_kind_filter(
                     vec!["imports".to_owned(), structural.to_owned()],
-                    StructuralEdgeSelection::Exclude
+                    Some(StructuralEdgeSelection::Exclude)
                 ),
                 Err(DepgraphServiceError::InvalidInput)
             ),
@@ -1501,7 +1505,7 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
             request()
                 .with_edge_kind_filter(
                     vec![structural.to_owned()],
-                    StructuralEdgeSelection::Include
+                    Some(StructuralEdgeSelection::Include)
                 )
                 .is_ok()
         );
@@ -1516,8 +1520,10 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
     ] {
         assert!(
             matches!(
-                request()
-                    .with_edge_kind_filter(vec![kind.clone()], StructuralEdgeSelection::Include),
+                request().with_edge_kind_filter(
+                    vec![kind.clone()],
+                    Some(StructuralEdgeSelection::Include)
+                ),
                 Err(DepgraphServiceError::InvalidInput)
             ),
             "{kind:?} must be rejected"
@@ -1527,7 +1533,7 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
         request()
             .with_edge_kind_filter(
                 vec!["a".repeat(MAX_DEPENDENCY_EDGE_KIND_BYTES)],
-                StructuralEdgeSelection::Include
+                Some(StructuralEdgeSelection::Include)
             )
             .is_ok()
     );
@@ -1535,7 +1541,7 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
         .map(|index| format!("kind{index}"))
         .collect::<Vec<_>>();
     assert!(matches!(
-        request().with_edge_kind_filter(too_many, StructuralEdgeSelection::Include),
+        request().with_edge_kind_filter(too_many, Some(StructuralEdgeSelection::Include)),
         Err(DepgraphServiceError::InvalidInput)
     ));
     let at_limit = (0..MAX_DEPENDENCY_EDGE_KINDS)
@@ -1543,7 +1549,7 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
         .collect::<Vec<_>>();
     assert!(
         request()
-            .with_edge_kind_filter(at_limit, StructuralEdgeSelection::Include)
+            .with_edge_kind_filter(at_limit, Some(StructuralEdgeSelection::Include))
             .is_ok()
     );
 
@@ -1554,16 +1560,76 @@ fn issue_541_edge_kind_filter_is_validated_sorted_and_rejects_contradictions() {
                 "imports".to_owned(),
                 "type_uses".to_owned(),
             ],
-            StructuralEdgeSelection::Exclude,
+            Some(StructuralEdgeSelection::Exclude),
         )
         .expect("valid selection");
     assert_eq!(
         normalized.edge_kind_filter().edge_kinds(),
         ["imports", "type_uses"]
     );
+    // An allowlist alone decides the traversal, so its identity does not
+    // depend on structural_edges once the contradiction check has passed.
     assert_eq!(
         normalized.edge_kind_filter().structural_edges(),
-        StructuralEdgeSelection::Exclude
+        StructuralEdgeSelection::Include
     );
     assert!(!normalized.edge_kind_filter().is_unrestricted());
+    for structural_edges in [None, Some(StructuralEdgeSelection::Include)] {
+        let equivalent = request()
+            .with_edge_kind_filter(
+                vec!["imports".to_owned(), "type_uses".to_owned()],
+                structural_edges,
+            )
+            .expect("valid selection");
+        assert_eq!(
+            equivalent.edge_kind_filter(),
+            normalized.edge_kind_filter(),
+            "{structural_edges:?}"
+        );
+    }
+}
+
+#[test]
+fn issue_541_omitted_structural_edges_lets_an_allowlist_name_structural_kinds() {
+    let request = || issue_541_request("id:file:a", DependencyDirection::Incoming);
+    for structural in STRUCTURAL_EDGE_KINDS {
+        let omitted = request()
+            .with_edge_kind_filter(vec![structural.to_owned()], None)
+            .unwrap_or_else(|error| panic!("{structural} with omitted mode: {error:?}"));
+        assert!(
+            omitted.edge_kind_filter().allows(structural),
+            "{structural}"
+        );
+        assert!(
+            !omitted.edge_kind_filter().allows("imports"),
+            "{structural}"
+        );
+        let included = request()
+            .with_edge_kind_filter(
+                vec![structural.to_owned()],
+                Some(StructuralEdgeSelection::Include),
+            )
+            .expect("explicit include");
+        assert_eq!(omitted.edge_kind_filter(), included.edge_kind_filter());
+        assert!(matches!(
+            request().with_edge_kind_filter(
+                vec![structural.to_owned()],
+                Some(StructuralEdgeSelection::Exclude)
+            ),
+            Err(DepgraphServiceError::InvalidInput)
+        ));
+    }
+    let omitted_without_allowlist = request()
+        .with_edge_kind_filter(Vec::new(), None)
+        .expect("default selection");
+    assert_eq!(
+        omitted_without_allowlist.edge_kind_filter(),
+        &EdgeKindFilter::default()
+    );
+    assert_eq!(
+        omitted_without_allowlist
+            .edge_kind_filter()
+            .structural_edges(),
+        DEFAULT_STRUCTURAL_EDGE_SELECTION
+    );
 }

@@ -1137,13 +1137,13 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
             "uniqueItems": true,
             "items": scalar_schema::<AgentToken>(),
-            "description": "Follow only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, subject to structural_edges. Listing a structural kind (contains, declares, generated_from) requires structural_edges=include; with exclude (the default) it is contradictory and returns INVALID_ARGUMENT. Applied during traversal, so total_items and traversed_edges count only the selected edges. A cursor is bound to the selection."
+            "description": "Follow only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, subject to structural_edges. When structural_edges is omitted, the allowlist alone decides, so structural kinds (contains, declares, generated_from) may be listed. Listing a structural kind with an explicit structural_edges=exclude is contradictory and returns INVALID_ARGUMENT. Applied during traversal, so total_items and traversed_edges count only the selected edges. A cursor is bound to the selection."
         }),
         "structural_edges" => json!({
             "type": "string",
             "enum": [StructuralEdgeSelection::Include.as_str(), StructuralEdgeSelection::Exclude.as_str()],
             "default": DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
-            "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. A cursor is bound to the selection."
+            "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. When edge_kinds is given, the allowlist alone decides and omission does not exclude structural kinds. A cursor is bound to the selection."
         }),
         "detail" => json!({
             "type": "string",

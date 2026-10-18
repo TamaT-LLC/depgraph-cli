@@ -253,8 +253,8 @@ enum Commands {
         edge_kind: Vec<String>,
         /// Follow structural edges (contains, declares, generated_from):
         /// include or exclude. Omitted drops them (exclude), so counts cover
-        /// only files that actually depend on each other. Use include to
-        /// follow them as well; listing a structural --edge-kind needs include.
+        /// only files that actually depend on each other; with --edge-kind
+        /// the listed kinds alone decide. Use include to follow them as well.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
@@ -284,8 +284,8 @@ enum Commands {
         edge_kind: Vec<String>,
         /// Follow structural edges (contains, declares, generated_from):
         /// include or exclude. Omitted drops them (exclude), so counts cover
-        /// only files that actually depend on each other. Use include to
-        /// follow them as well; listing a structural --edge-kind needs include.
+        /// only files that actually depend on each other; with --edge-kind
+        /// the listed kinds alone decide. Use include to follow them as well.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
@@ -1641,7 +1641,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
             )?
-            .with_edge_kind_filter(edge_kind, structural_edges.unwrap_or_default())?;
+            .with_edge_kind_filter(edge_kind, structural_edges)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -1695,7 +1695,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
             )?
-            .with_edge_kind_filter(edge_kind, structural_edges.unwrap_or_default())?;
+            .with_edge_kind_filter(edge_kind, structural_edges)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -3307,12 +3307,15 @@ fn interactive_dependencies_page(
         "max_traversal": max_traversal,
     });
     // Following every edge kind keeps the legacy cursor binding; any other
-    // selection binds the cursor to itself (Issue #541).
+    // selection binds the cursor to itself, and an allowlist alone decides
+    // its binding (Issue #541).
     let edge_kind_filter = request.edge_kind_filter();
     if !edge_kind_filter.is_unrestricted() {
         context["edge_kinds"] = serde_json::json!(edge_kind_filter.edge_kinds());
-        context["structural_edges"] =
-            serde_json::json!(edge_kind_filter.structural_edges().as_str());
+        if edge_kind_filter.edge_kinds().is_empty() {
+            context["structural_edges"] =
+                serde_json::json!(edge_kind_filter.structural_edges().as_str());
+        }
     }
     paginate_interactive_query(
         execution.items(),

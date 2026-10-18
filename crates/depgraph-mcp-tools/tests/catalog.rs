@@ -1323,7 +1323,8 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
         for expected in [
             "Empty or omitted",
             "structural_edges",
-            "structural_edges=include",
+            "allowlist alone decides",
+            "explicit structural_edges=exclude",
             "INVALID_ARGUMENT",
             "traversed_edges",
         ] {
@@ -1348,6 +1349,7 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
             "generated_from",
             "Defaults to exclude",
             "include",
+            "edge_kinds",
             "cursor",
         ] {
             assert!(

@@ -73,7 +73,8 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
 
 - `--edge-kind`は辿る辺の種類を指定します。複数回指定でき、指定した種類の辺だけを辿ります。
 - 絞り込みは走査の段階でかけます。そのため、件数と`traversed_items`は選んだ辺だけを数えます。
-- 構造上の辺を`--edge-kind`に指定するときは、`--structural-edges include`も指定します。既定の`exclude`のままだと矛盾する指定としてエラーになります。
+- `--edge-kind`を指定した場合は、指定した種類だけで辿る辺が決まります。`--structural-edges`を省略していれば、`--edge-kind contains`のように構造上の辺も指定できます。
+- `--structural-edges exclude`を明示し、構造上の辺を`--edge-kind`にも指定すると、矛盾する指定としてエラーになります。
 - 絞り込み条件を変えた場合、前の`--cursor`は使えません。v0.6.4までに取得したcursorは、`--structural-edges include`を指定したときだけ使えます。
 
 MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`edge_kinds`と`structural_edges`を使います。

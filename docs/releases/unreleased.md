@@ -9,7 +9,7 @@ MCP の `graph_dependencies_list` / `graph_dependents_list` と CLI の `depgrap
 構造辺は「パッケージがファイルを含む」「ファイルが symbol を宣言する」「生成ファイルが元ファイルから生成される」というグラフの構成を表し、依存関係ではない。
 既定の結果、`total_items`、`traversed_edges` は依存辺だけを数える。
 たとえば `package:` セレクターから `contains` で辿っていた依存一覧は、既定では空になる。
-`edge_kinds` / `--edge-kind` に構造辺の種別を指定するときは、include を明示する。省略すると既定の exclude と矛盾し、`INVALID_ARGUMENT`（CLI はエラー終了）になる。
+`edge_kinds` / `--edge-kind` を指定した場合は、許可リストだけで辿る辺が決まる。`structural_edges` / `--structural-edges` を省略していれば、`contains` などの構造辺も指定できる。exclude を明示して構造辺も許可リストに含めた場合だけ、`INVALID_ARGUMENT`（CLI はエラー終了）になる。
 
 移行手順は次のとおり。
 

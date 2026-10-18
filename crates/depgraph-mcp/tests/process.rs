@@ -8793,6 +8793,14 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
         dependents(json!({"edge_kinds": ["contains"], "structural_edges": "include"})),
     );
     assert_eq!(edge_ids(&contains_only), ["edge:contains-a"]);
+    let contains_omitted = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["contains"]})),
+    );
+    assert_eq!(
+        contains_omitted["content"][0]["text"], contains_only["content"][0]["text"],
+        "an allowlist decides when structural_edges is omitted"
+    );
     let package = call(
         "graph_dependencies_list",
         json!({
@@ -8853,7 +8861,7 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
 
     for selection in [
         json!({"edge_kinds": ["contains"], "structural_edges": "exclude"}),
-        json!({"edge_kinds": ["contains"]}),
+        json!({"structural_edges": null}),
         json!({"edge_kinds": ["imports", "generated_from"], "structural_edges": "exclude"}),
         json!({"edge_kinds": ["Imports"]}),
         json!({"edge_kinds": [""]}),
@@ -8872,6 +8880,11 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
         dependents(json!({"edge_kinds": too_many})),
     );
     assert_eq!(error_code(&rejected), "INVALID_ARGUMENT");
+
+    // The selection probes above spend most of the product's fixed read
+    // burst (240/min, burst READ_RATE_BURST); let it refill before the cursor
+    // probes instead of tripping the read rate limit.
+    std::thread::sleep(Duration::from_secs(8));
 
     // Cursor binding: every-kind traversal (include without edge_kinds) keeps
     // the pre-#541 normalized input and cursor bytes. The exclude default is
@@ -8932,6 +8945,28 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
             page(selection.clone(), Some(&default_cursor)),
         );
         assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_allowlisted = call(
+        "graph_dependents_list",
+        page(json!({"edge_kinds": ["imports"]}), None),
+    );
+    let allowlist_cursor =
+        first_allowlisted["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(allowlist_cursor.is_string(), "{first_allowlisted}");
+    assert_ne!(allowlist_cursor, default_cursor);
+    for selection in [
+        json!({"edge_kinds": ["imports"]}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let resumed = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&allowlist_cursor)),
+        );
+        assert_eq!(
+            resumed["isError"], false,
+            "the allowlist alone binds the cursor: {selection}: {resumed}"
+        );
     }
     for selection in [json!({}), json!({"structural_edges": "exclude"})] {
         let resumed = call(
@@ -9011,6 +9046,18 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
         ]),
         edge_ids(&contains_only)
     );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&contains_only),
+        "a CLI allowlist decides when --structural-edges is omitted"
+    );
     assert!(cli_edge_ids(&["deps", "id:package:app", "--all", "--json"]).is_empty());
     for arguments in [
         &[
@@ -9020,13 +9067,6 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
             "contains",
             "--structural-edges",
             "exclude",
-            "--json",
-        ][..],
-        &[
-            "dependents",
-            "id:node:a",
-            "--edge-kind",
-            "contains",
             "--json",
         ][..],
         &[
@@ -9106,5 +9146,35 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
         "--json",
     ]);
     assert!(!succeeded, "a CLI cursor is bound to the edge selection");
+    let (succeeded, first) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--edge-kind",
+        "imports",
+        "--max-items",
+        "1",
+        "--json",
+    ]);
+    assert!(succeeded, "{first}");
+    let allowlist_cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    for mode in ["include", "exclude"] {
+        let (succeeded, _) = cli_page(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "imports",
+            "--structural-edges",
+            mode,
+            "--max-items",
+            "1",
+            "--cursor",
+            &allowlist_cli_cursor,
+            "--json",
+        ]);
+        assert!(
+            succeeded,
+            "the CLI allowlist alone binds the cursor ({mode})"
+        );
+    }
     assert_eq!(before, store_invariant(&store_path));
 }

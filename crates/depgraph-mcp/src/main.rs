@@ -473,15 +473,27 @@ struct GraphDependenciesArguments {
     max_traversal: Option<usize>,
     #[serde(default)]
     edge_kinds: Vec<String>,
-    /// Omitted means `DEFAULT_STRUCTURAL_EDGE_SELECTION`.
-    #[serde(default)]
-    structural_edges: StructuralEdgeSelection,
+    /// Omitted means `DEFAULT_STRUCTURAL_EDGE_SELECTION` without an
+    /// allowlist; with `edge_kinds` the allowlist alone decides. `null` is
+    /// rejected rather than read as omitted.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    structural_edges: Option<StructuralEdgeSelection>,
     #[serde(default)]
     detail: AgentDependencyDetail,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
     limit: Option<u16>,
+}
+
+/// Deserialize a present value as `Some`, so an explicit `null` fails instead
+/// of being read as an omitted field (`#[serde(default)]` covers omission).
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -3424,12 +3436,15 @@ fn execute_catalog_read_tool(
                 normalized["detail"] = serde_json::json!(arguments.detail.as_str());
             }
             // Following every edge kind keeps the legacy cursor binding; any other
-            // selection binds the cursor to itself (Issue #541).
+            // selection binds the cursor to itself, and an allowlist alone decides
+            // its binding (Issue #541).
             let edge_kind_filter = request.edge_kind_filter();
             if !edge_kind_filter.is_unrestricted() {
                 normalized["edge_kinds"] = serde_json::json!(edge_kind_filter.edge_kinds());
-                normalized["structural_edges"] =
-                    serde_json::json!(edge_kind_filter.structural_edges().as_str());
+                if edge_kind_filter.edge_kinds().is_empty() {
+                    normalized["structural_edges"] =
+                        serde_json::json!(edge_kind_filter.structural_edges().as_str());
+                }
             }
             let pagination = PaginationContext::new(
                 cursor_key,

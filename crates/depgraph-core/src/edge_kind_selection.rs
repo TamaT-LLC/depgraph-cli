@@ -73,7 +73,8 @@ pub enum EdgeKindFilterError {
 ///
 /// An empty allowlist means every kind; `structural_edges` then decides
 /// whether [`STRUCTURAL_EDGE_KINDS`] are followed. A non-empty allowlist
-/// follows only the listed kinds.
+/// follows only the listed kinds, so its identity always records
+/// `structural_edges` as include once the contradiction check has passed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeKindFilter {
     edge_kinds: Vec<String>,
@@ -93,9 +94,14 @@ impl EdgeKindFilter {
 
     /// Validate an allowlist and return it sorted and deduplicated so
     /// equivalent selections share one identity.
+    ///
+    /// An omitted `structural_edges` means [`DEFAULT_STRUCTURAL_EDGE_SELECTION`]
+    /// without an allowlist; with an allowlist the listed kinds alone decide,
+    /// so structural kinds may be listed. Only an explicit exclude combined
+    /// with a structural kind is contradictory.
     pub fn try_new(
         mut edge_kinds: Vec<String>,
-        structural_edges: StructuralEdgeSelection,
+        structural_edges: Option<StructuralEdgeSelection>,
     ) -> Result<Self, EdgeKindFilterError> {
         if edge_kinds.len() > MAX_DEPENDENCY_EDGE_KINDS {
             return Err(EdgeKindFilterError::TooManyKinds);
@@ -103,13 +109,18 @@ impl EdgeKindFilter {
         if !edge_kinds.iter().all(|kind| is_valid_edge_kind(kind)) {
             return Err(EdgeKindFilterError::InvalidKind);
         }
-        if structural_edges == StructuralEdgeSelection::Exclude
+        if structural_edges == Some(StructuralEdgeSelection::Exclude)
             && edge_kinds.iter().any(|kind| is_structural_edge_kind(kind))
         {
             return Err(EdgeKindFilterError::StructuralKindExcluded);
         }
         edge_kinds.sort();
         edge_kinds.dedup();
+        let structural_edges = if edge_kinds.is_empty() {
+            structural_edges.unwrap_or(DEFAULT_STRUCTURAL_EDGE_SELECTION)
+        } else {
+            StructuralEdgeSelection::Include
+        };
         Ok(Self {
             edge_kinds,
             structural_edges,

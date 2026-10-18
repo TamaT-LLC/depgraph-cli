@@ -276,13 +276,15 @@ impl DependenciesRequest {
     ///
     /// The selection is applied while the adjacency is built, so items,
     /// nodes, and `traversed_edges` count only the selected edges. An empty
-    /// `edge_kinds` allows every kind; `structural_edges` then decides whether
-    /// structural edges are followed. Allowlisting a structural kind while
-    /// excluding structural edges is contradictory and rejected.
+    /// `edge_kinds` allows every kind; `structural_edges` (omitted means
+    /// `DEFAULT_STRUCTURAL_EDGE_SELECTION`) then decides whether structural
+    /// edges are followed. A non-empty allowlist alone decides the traversal;
+    /// only an explicit exclude combined with a structural kind is
+    /// contradictory and rejected.
     pub fn with_edge_kind_filter(
         mut self,
         edge_kinds: Vec<String>,
-        structural_edges: StructuralEdgeSelection,
+        structural_edges: Option<StructuralEdgeSelection>,
     ) -> DepgraphServiceResult<Self> {
         self.edge_kind_filter = EdgeKindFilter::try_new(edge_kinds, structural_edges)
             .map_err(|_| DepgraphServiceError::InvalidInput)?;

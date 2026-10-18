@@ -78,8 +78,11 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
   edges of the listed kinds are followed.
 - The selection applies during traversal, so item counts and
   `traversed_items` cover only the selected edges.
-- A structural `--edge-kind` requires `--structural-edges include`; with the
-  default `exclude` the selection is contradictory and fails.
+- With `--edge-kind`, the listed kinds alone decide which edges are
+  followed. When `--structural-edges` is omitted, structural kinds such as
+  `--edge-kind contains` may be listed.
+- Combining an explicit `--structural-edges exclude` with a structural
+  `--edge-kind` is contradictory and fails.
 - A `--cursor` from a different selection is rejected. A cursor obtained
   through v0.6.4 is accepted only with `--structural-edges include`.
 
