@@ -141,4 +141,7 @@ Maintainers evaluate correctness, security, compatibility, test coverage,
 documentation, provenance, and scope. Review does not guarantee acceptance.
 Changes normally merge through a pull request after independent approval,
 green required checks, resolved conversations, and DCO verification. Release
-and maintenance-line changes follow [GOVERNANCE.md](GOVERNANCE.md).
+and maintenance-line changes follow [GOVERNANCE.md](GOVERNANCE.md). A pull
+request that only changes documentation still reports every required check as
+successful, because the Go and Web jobs skip their expensive steps instead of
+the whole job when no relevant path changes.
