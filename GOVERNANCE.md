@@ -65,7 +65,7 @@ and GitHub Actions quality gates, four-target package verification, SBOM and
 license closure, and the stable release gate. A release requires a release
 maintainer plus an independent approver. The supported stable line is the
 newest stable version whose official Release and matching post-publish evidence
-exist. The published `v0.6.2` remains supported while `v0.6.3` is prepared.
+exist. The published `v0.6.3` is the current supported stable release.
 `v0.6.3` retains the v0.6.0 Store schema `19` and code-health contract/API.
 
 The signed `v0.5.4` tag, its source, and its Store schema `17` artifact remain

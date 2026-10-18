@@ -39,7 +39,6 @@ const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSI
 const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const RELEASE_EVIDENCE_CONTRACT_VERSION: &str = "release-post-publish-evidence-v1";
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
-const README_PATH: &str = "README.en.md";
 
 fn packaged_response_deadline(method: Option<&str>) -> Duration {
     if method == Some("initialize") {
@@ -181,7 +180,6 @@ pub fn verify_documentation(workspace: &Path, release_version: &str) -> Result<(
 }
 
 fn verify_host_quickstarts(workspace: &Path, release_version: &str) -> Result<()> {
-    let readme = crate::read_lf_normalized_text(&workspace.join(README_PATH))?;
     let runbook = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
     if runbook.matches(ONBOARDING_MARKER_PREFIX).count() != 2 {
         bail!("Agent onboarding documentation must contain exact Codex and VS Code markers");
@@ -199,8 +197,8 @@ fn verify_host_quickstarts(workspace: &Path, release_version: &str) -> Result<()
         "--acknowledge-privileged-effects",
         "--acknowledge-project-exec-human-confirmation",
     ] {
-        if !readme.contains(required) {
-            bail!("README Agent onboarding workflow is missing {required:?}");
+        if !runbook.contains(required) {
+            bail!("Agent onboarding runbook is missing {required:?}");
         }
     }
     let executable =
@@ -231,10 +229,8 @@ fn documented_launch_profiles(
     workspace: &Path,
     release_version: &str,
 ) -> Result<BTreeMap<String, DocumentedLaunchProfile>> {
-    let readme = crate::read_lf_normalized_text(&workspace.join(README_PATH))?;
     let runbook = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
-    let marker_count = readme.matches(DOCUMENTATION_MARKER_PREFIX).count()
-        + runbook.matches(DOCUMENTATION_MARKER_PREFIX).count();
+    let marker_count = runbook.matches(DOCUMENTATION_MARKER_PREFIX).count();
     if marker_count != CAPABILITY_PROFILES.len() + 1 {
         bail!(
             "packaged MCP documentation must contain one command and exactly six profile markers"
@@ -259,19 +255,18 @@ fn documented_launch_profiles(
         expected_command_lines.push(format!("  {} {}{continuation}", pair[0], pair[1]));
     }
     let expected_command = expected_command_lines.join("\n");
-    let command = marked_code_block(&readme, "command", "sh")?;
+    let command = marked_code_block(&runbook, "command", "sh")?;
     let (command_executable, command_arguments) = documented_shell_command(command)?;
     let command_executable_relative =
         documented_executable_relative(&command_executable, release_version)?;
     if command != expected_command {
-        bail!("README packaged MCP command example differs from the read-only launch contract");
+        bail!("packaged MCP command example differs from the read-only launch contract");
     }
 
     let mut profiles = BTreeMap::new();
     for profile in CAPABILITY_PROFILES.iter().copied() {
         let name = profile.as_str();
-        let document = if name == "read" { &readme } else { &runbook };
-        let block = marked_code_block(document, name, "json")?;
+        let block = marked_code_block(&runbook, name, "json")?;
         let actual: Value = serde_json::from_str(block)
             .with_context(|| format!("packaged MCP {name} documentation is not valid JSON"))?;
         let expected: Value = serde_json::from_str(
@@ -307,7 +302,7 @@ fn documented_launch_profiles(
             && (executable_relative != command_executable_relative
                 || arguments != command_arguments)
         {
-            bail!("README packaged MCP command and Agent host entry differ");
+            bail!("packaged MCP command and read-only Agent host entry differ");
         }
         let launch_profile = if name == "read" {
             DocumentedLaunchProfile {
@@ -330,18 +325,18 @@ fn documented_launch_profiles(
 fn documented_shell_command(command: &str) -> Result<(String, Vec<String>)> {
     let lines = command.lines().collect::<Vec<_>>();
     if lines.len() < 2 {
-        bail!("README packaged MCP command has no arguments");
+        bail!("packaged MCP command has no arguments");
     }
     let executable = lines[0]
         .trim()
         .strip_suffix(" \\")
-        .context("README packaged MCP command has a malformed executable continuation")?;
+        .context("packaged MCP command has a malformed executable continuation")?;
     if executable.is_empty()
         || !executable
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
     {
-        bail!("README packaged MCP executable is not a shell-safe path token");
+        bail!("packaged MCP executable is not a shell-safe path token");
     }
     let mut arguments = Vec::new();
     for (index, line) in lines.iter().enumerate().skip(1) {
@@ -350,7 +345,7 @@ fn documented_shell_command(command: &str) -> Result<(String, Vec<String>)> {
             line
         } else {
             line.strip_suffix(" \\")
-                .context("README packaged MCP command has a malformed continuation")?
+                .context("packaged MCP command has a malformed continuation")?
         };
         arguments.extend(line.split_ascii_whitespace().map(ToOwned::to_owned));
     }
@@ -2063,10 +2058,11 @@ mod tests {
         let workspace = crate::workspace_root();
         let temporary = tempfile::tempdir()?;
         fs::create_dir_all(temporary.path().join("docs/50_test"))?;
-        for path in [README_PATH, DOCUMENTATION_PATH] {
-            let content = crate::read_lf_normalized_text(&workspace.join(path))?;
-            fs::write(temporary.path().join(path), content.replace('\n', "\r\n"))?;
-        }
+        let content = crate::read_lf_normalized_text(&workspace.join(DOCUMENTATION_PATH))?;
+        fs::write(
+            temporary.path().join(DOCUMENTATION_PATH),
+            content.replace('\n', "\r\n"),
+        )?;
         verify_documentation(temporary.path(), crate::VERSION)
     }
 
@@ -2121,20 +2117,24 @@ mod tests {
         let workspace = crate::workspace_root();
         let temporary = tempfile::tempdir()?;
         fs::create_dir_all(temporary.path().join("docs/50_test"))?;
-        let readme = fs::read_to_string(workspace.join(README_PATH))?;
         let runbook = fs::read_to_string(workspace.join(DOCUMENTATION_PATH))?;
+        let read_marker = "<!-- depgraph-mcp-package-smoke:read -->";
+        let (before_read, read_and_after) = runbook
+            .split_once(read_marker)
+            .context("runbook has no read-only profile marker")?;
         fs::write(
-            temporary.path().join(README_PATH),
-            readme.replacen(
-                "\"--capability\", \"read\",",
-                "\"--capability\", \"store-write\",",
-                1,
+            temporary.path().join(DOCUMENTATION_PATH),
+            format!(
+                "{before_read}{read_marker}{}",
+                read_and_after.replacen(
+                    "\"--capability\", \"read\",",
+                    "\"--capability\", \"store-write\",",
+                    1,
+                )
             ),
         )?;
-        fs::write(temporary.path().join(DOCUMENTATION_PATH), &runbook)?;
         assert!(verify_documentation(temporary.path(), crate::VERSION).is_err());
 
-        fs::write(temporary.path().join(README_PATH), &readme)?;
         fs::write(
             temporary.path().join(DOCUMENTATION_PATH),
             format!(

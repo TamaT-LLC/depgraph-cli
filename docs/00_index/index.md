@@ -28,6 +28,24 @@
 - [MCP Agent host operations](../50_test/mcp-agent-host-operations.md)
 - [Packaged MCP Agent dogfood benchmark](../50_test/agent-dogfood-benchmark.md)
 
+## 利用者ガイド
+
+日本語版（`*.md`）と英語版（`*.en.md`）の対で管理する。
+
+- [使い方ガイド](../guide/usage.md)（[English](../guide/usage.en.md)）
+- [インストールガイド](../guide/install.md)（[English](../guide/install.en.md)）
+- [リリースと互換性](../guide/compatibility.md)（[English](../guide/compatibility.en.md)）
+
+## リファレンス
+
+- [CLI behavior reference](../reference/cli-behavior.md)
+- [Analysis completeness](../reference/analysis-completeness.md)
+- [Safe-scan boundary](../reference/safe-scan-boundary.md)（[日本語](../reference/safe-scan-boundary.ja.md)）
+- [Build-mode consent boundary](../reference/build-mode.md)（[日本語](../reference/build-mode.ja.md)）
+- [Architecture policy contract](../reference/architecture-policy.md)
+- [Runtime trace import contract](../reference/runtime-trace.md)
+- [Compiler pack and release verification](../reference/compiler-pack-and-release-verification.md)
+
 ## リリースノート
 
 - [v0.6.0](../releases/v0.6.0.md): current `main`を基にしたminor releaseの準備中。Store schema 19とcode-health契約／APIを含む。
@@ -64,6 +82,7 @@
 
 ## 更新履歴
 
+- 2026-10-16: READMEを入口に絞り、詳細を利用者ガイド（`docs/guide/`）とリファレンス（`docs/reference/`）へ移した。低レベルのAgent host設定生成と読み取り専用の既定プロファイルは[MCP Agent host operations](../50_test/mcp-agent-host-operations.md)へ統合した
 - 2026-09-13: `PROJ-ARC-001-ADR-011`と`v0.6.0`リリース契約を追加。Store schema 19、操作ジャーナル6、操作DTO v2、code-healthと分割・再開解析の互換性を明記。
 
 - 2026-09-08: Issue #482として、元の試験対象での scan / health 完了確認を Epic #464 の必須 closer に戻し、[resumable analysis validation](../40_arch_design/resumable-analysis-validation.md) の「Required private-trial closer」と ADR の完了判定を揃えた。公開合成 fixture は必要だが十分ではない

@@ -4,8 +4,8 @@
 
 | Version | Security fixes |
 | --- | --- |
-| `v0.6.3` | Planned patch release; unsupported until its official GitHub Release and matching post-publish evidence exist |
-| `v0.6.2` | Supported; current published stable baseline |
+| `v0.6.3` | Supported; current published stable baseline |
+| `v0.6.2` | Unsupported after the verified `v0.6.3` publication |
 | `v0.6.1` | Unsupported after the verified `v0.6.2` publication |
 | `v0.5.4` | Unsupported after the verified `v0.6.0` publication |
 | `v0.5.3` | Unsupported after the verified `v0.5.4` publication |
