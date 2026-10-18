@@ -1013,6 +1013,12 @@ const HOSTILE_DECISIONS: [HostileDecision; 2] = [
 
 const HOSTILE_RUN_TRUE: &str = r#"echo "run=true" >> "$GITHUB_OUTPUT""#;
 const HOSTILE_RUN_FALSE: &str = r#"echo "run=false" >> "$GITHUB_OUTPUT""#;
+const SHELL_ELSE: &str = "else";
+const SHELL_FI: &str = "fi";
+/// The trimmed lines that must follow the path filter, so a match runs the
+/// gated steps and anything else skips them.
+const HOSTILE_FILTER_BRANCHES: [&str; 4] =
+    [HOSTILE_RUN_TRUE, SHELL_ELSE, HOSTILE_RUN_FALSE, SHELL_FI];
 
 fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Result<()> {
     let (_, step) = workflow_step_block(hostile, decision.header)?;
@@ -1041,6 +1047,18 @@ fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Re
         if !step.lines().any(|line| line.trim_start() == output) {
             bail!("CI compiler-precise hostile step {id:?} must write {output:?}");
         }
+    }
+    let branches: Vec<&str> = step
+        .lines()
+        .skip_while(|line| *line != filter_line)
+        .skip(1)
+        .take(HOSTILE_FILTER_BRANCHES.len())
+        .map(str::trim)
+        .collect();
+    if branches != HOSTILE_FILTER_BRANCHES {
+        bail!(
+            "CI compiler-precise hostile step {id:?} must follow its filter with {HOSTILE_FILTER_BRANCHES:?}"
+        );
     }
     Ok(())
 }
@@ -3785,6 +3803,37 @@ mod tests {
                     "replacing {from:?} with {to:?} in {header:?} must be rejected"
                 );
             }
+        }
+    }
+
+    /// Swapping the two outputs after the path filter keeps both lines in the
+    /// step but inverts the decision: matching pull requests skip the gate.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_swapped_decide_outputs() {
+        let ci = checked_in_ci_workflow();
+        let branches = concat!(
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+        );
+        let swapped = concat!(
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+        );
+        for header in [HOSTILE_DECIDE_STEP_HEADER, HOSTILE_SMOKE_STEP_HEADER] {
+            let drift = drift_hostile_step(&ci, header, |step| {
+                assert_eq!(
+                    step.matches(branches).count(),
+                    1,
+                    "{header:?} has one filter branch"
+                );
+                step.replacen(branches, swapped, 1)
+            });
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "swapping the filter outputs in {header:?} must be rejected"
+            );
         }
     }
 
