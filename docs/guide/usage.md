@@ -45,7 +45,7 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 | 依存先 | `deps <SELECTOR>` | 選択したノードから出る依存関係 |
 | 依存元 | `dependents <SELECTOR>` | 選択したノードへ入る依存関係 |
 | 依存理由 | `why <FROM> <TO>` | 二つのノードを結ぶ経路、条件、ソース位置 |
-| 変更影響 | `impact <SELECTOR>` | 逆向きの依存経路と影響を受けるノード |
+| 変更影響 | `impact <SELECTOR>`、`impact --changed <GIT_REF>` | 逆向きの依存経路と影響を受けるノード。セレクターを省略すると、変更ファイル全体の影響範囲を 1 回で返す |
 | 循環依存 | `cycles` | パッケージ、ファイル、シンボル単位の循環 |
 | 解析できなかった箇所 | `unresolved` | 理由とソース位置を含む未解決台帳 |
 | 解析状態 | `doctor` | ワーカー、ツールチェーン、カバレッジ、キャッシュの状態 |
@@ -130,6 +130,28 @@ RustとWebの詳しい条件は[解析結果の完全性（英語）](../referen
 失敗または部分的なスキャンと診断も保存されます。
 ただし、`latest successful`が指す先を更新するのは、ポリシーを通過した完全なスキャンだけです。
 
+## 変更ファイル全体の影響範囲
+
+`impact --changed <GIT_REF>` のセレクターを省略すると、変更されたファイル全体を起点に逆向きの影響範囲を返します。
+グラフの読み込みと探索は 1 回だけなので、ファイルごとに `impact` を実行するより速くなります。
+セレクターを付けた `--changed` は従来どおり、そのセレクターを注目点にします。
+
+`--json` では `data.mode` が `changed_set` になります。主なフィールドは次のとおりです。
+
+- `impacts[]`: `node`、`depth`、`changed_node_id`、`changed_paths`、`dependency_path`
+  - `depth` は最も近い変更ノードからの距離で、変更ノード自身は 0 です。
+  - `changed_paths` は、そのノードに届く変更パスのすべてです。
+  - `dependency_path` は、影響ノードから変更ノードの順に並びます。
+- `unmapped[]`: グラフに対応付けられなかった変更です。`status`、`old_path`、`new_path`、`reason` を持ちます。
+  - `reason` は、Git 上で削除された場合の `deleted` か、スナップショットに無い場合の `not_in_snapshot` です。
+- `mappings`、`changed_nodes`、`diagnostics`、`complete`、`filters`、`changed_set`
+
+終了コードは次のとおりです。
+
+- セレクターも `--changed` も無い場合は 2 です。
+- スキャンの `source_revision` が HEAD と一致しない場合は 2 です。
+- 探索の上限を超えた場合は 3 です。
+
 ## CLIコマンド例
 
 ```sh
@@ -168,6 +190,10 @@ depgraph why path:src/app.ts 'route:/products/$id'
 depgraph impact path:src/app.ts
 depgraph impact package:example --changed origin/main --depth 4
 depgraph impact 'route:/products/$id' --changed HEAD~1 --profile web:production:server --json
+
+# セレクターを省略すると、変更されたファイル全体を起点にした影響範囲を返します。
+depgraph impact --changed origin/main
+depgraph impact --changed origin/main --depth 4 --json
 depgraph cycles --level file
 
 # Goのセマンティックグラフでは正規リゾルバーIDを使います。

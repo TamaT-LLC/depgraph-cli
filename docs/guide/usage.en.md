@@ -46,7 +46,7 @@ completed snapshots.
 | What does this node depend on? | `deps <SELECTOR>` | Outgoing dependencies from the selected node |
 | What depends on this node? | `dependents <SELECTOR>` | Incoming dependencies to the selected node |
 | Why does this dependency exist? | `why <FROM> <TO>` | Paths, conditions, and source locations between two nodes |
-| What does a change affect? | `impact <SELECTOR>` | Reverse dependency paths and affected nodes |
+| What does a change affect? | `impact <SELECTOR>`, `impact --changed <GIT_REF>` | Reverse dependency paths and affected nodes. Without a selector, returns the impact of the whole changed file set in one run |
 | Are there dependency cycles? | `cycles` | Package-, file-, or symbol-level cycles |
 | What could not be analyzed? | `unresolved` | The unresolved ledger with reasons and source locations |
 | What is the analysis state? | `doctor` | Worker, toolchain, coverage, and cache state |
@@ -150,6 +150,28 @@ partial with exit code `3`.
 
 Failed/partial scans and diagnostics remain stored, but only a complete policy-passing scan advances the `latest successful` pointer.
 
+## Impact of a whole changed file set
+
+Omitting the selector from `impact --changed <GIT_REF>` returns the reverse impact of every changed file in one run.
+The graph is loaded and traversed once, which is faster than running `impact` per file.
+`--changed` with a selector still uses that selector as the focus.
+
+With `--json`, `data.mode` is `changed_set`. The main fields are:
+
+- `impacts[]`: `node`, `depth`, `changed_node_id`, `changed_paths`, `dependency_path`
+  - `depth` is the distance from the nearest changed node; changed nodes themselves are 0.
+  - `changed_paths` lists every changed path that reaches the node.
+  - `dependency_path` runs from the impacted node to the changed node.
+- `unmapped[]`: changes that could not be mapped to the graph, with `status`, `old_path`, `new_path`, and `reason`.
+  - `reason` is `deleted` (deleted in Git) or `not_in_snapshot` (absent from the snapshot).
+- `mappings`, `changed_nodes`, `diagnostics`, `complete`, `filters`, `changed_set`
+
+Exit codes:
+
+- `2` when neither a selector nor `--changed` is given.
+- `2` when the scan `source_revision` does not match HEAD.
+- `3` when a traversal limit is exceeded.
+
 ## CLI examples
 
 ```sh
@@ -188,6 +210,10 @@ depgraph why path:src/app.ts 'route:/products/$id'
 depgraph impact path:src/app.ts
 depgraph impact package:example --changed origin/main --depth 4
 depgraph impact 'route:/products/$id' --changed HEAD~1 --profile web:production:server --json
+
+# Omit the selector to get the impact of the whole changed file set.
+depgraph impact --changed origin/main
+depgraph impact --changed origin/main --depth 4 --json
 depgraph cycles --level file
 
 # Use canonical resolver identities in the Go semantic graph.
