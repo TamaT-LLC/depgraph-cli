@@ -8841,74 +8841,137 @@ fn seed_issue_541_store(path: &Path, root: &Path) -> String {
     store.current_snapshot_id().unwrap().unwrap()
 }
 
-#[test]
-fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_cli() {
+struct Issue541Fixture {
+    _temporary: tempfile::TempDir,
+    root: PathBuf,
+    store_path: PathBuf,
+    snapshot_id: String,
+    before: StoreInvariant,
+}
+
+fn issue_541_fixture() -> Issue541Fixture {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
     let store_path = temporary.path().join("store.sqlite");
     fs::create_dir(&root).unwrap();
     let snapshot_id = seed_issue_541_store(&store_path, &root);
     let before = store_invariant(&store_path);
-    let shared_schema: Value = serde_json::from_slice(include_bytes!(
-        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
-    ))
-    .unwrap();
-    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    Issue541Fixture {
+        _temporary: temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    }
+}
 
-    let mut mcp = InteractiveMcp::start(&root, &store_path);
-    initialize_interactive_mcp(&mut mcp, 1);
-    let listed = mcp.request(json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
-    }));
-    let tools = listed["result"]["tools"].as_array().unwrap().clone();
-    let output_schema = |name: &str| {
-        jsonschema::draft202012::new(
-            &tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"],
-        )
-        .unwrap()
-    };
-    let mut next_id = 10;
-    let mut call = |name: &str, arguments: Value| {
-        next_id += 1;
-        let result = interactive_tool_call(&mut mcp, next_id, name, arguments);
+/// One MCP process for the #541 probes. Each test starts its own process and
+/// keeps its tool calls within the product's fixed read burst, so no test has
+/// to wait for the read rate limit to refill.
+struct Issue541Mcp {
+    mcp: InteractiveMcp,
+    tools: Vec<Value>,
+    shared_schema: Value,
+    snapshot_id: String,
+    next_id: u64,
+    read_calls: u64,
+}
+
+impl Issue541Mcp {
+    fn start(root: &Path, store_path: &Path, snapshot_id: &str) -> Self {
+        let mut mcp = InteractiveMcp::start(root, store_path);
+        initialize_interactive_mcp(&mut mcp, 1);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let shared_schema: Value = serde_json::from_slice(include_bytes!(
+            "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+        ))
+        .unwrap();
+        Self {
+            mcp,
+            tools,
+            shared_schema,
+            snapshot_id: snapshot_id.to_owned(),
+            next_id: 10,
+            read_calls: 0,
+        }
+    }
+
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.read_calls += 1;
+        assert!(
+            self.read_calls <= depgraph_mcp::runtime::READ_RATE_BURST,
+            "split the #541 probes across MCP processes to stay within the read burst"
+        );
+        self.next_id += 1;
+        let result = interactive_tool_call(&mut self.mcp, self.next_id, name, arguments);
         assert_tool_text_matches_structured(&result);
         if result["isError"] == false {
-            assert_eq!(result["structuredContent"]["snapshot_id"], snapshot_id);
-            output_schema(name)
+            assert_eq!(result["structuredContent"]["snapshot_id"], self.snapshot_id);
+            let advertised =
+                &self.tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"];
+            jsonschema::draft202012::new(advertised)
+                .unwrap()
                 .validate(&result["structuredContent"])
                 .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
-            shared
+            jsonschema::draft202012::new(&self.shared_schema)
+                .unwrap()
                 .validate(&result["structuredContent"])
                 .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
         }
         result
-    };
-    let dependents = |selection: Value| {
-        let mut arguments = json!({
-            "contract_version": "depgraph-mcp-tools-v1",
-            "selector": "id:node:a",
-            "max_traversal": 100,
-            "limit": 100
-        });
-        for (key, value) in selection.as_object().unwrap() {
-            arguments[key] = value.clone();
-        }
-        arguments
-    };
-    let edge_ids = |result: &Value| {
-        let mut ids = result["structuredContent"]["result"]["edges"]["items"]
-            .as_array()
-            .unwrap_or_else(|| panic!("edge page: {result}"))
-            .iter()
-            .map(|edge| edge["id"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids
-    };
-    let error_code = |result: &Value| {
-        assert_eq!(result["isError"], true, "{result}");
-        result["structuredContent"]["error"]["code"].clone()
-    };
+    }
+
+    fn finish(self) {
+        self.mcp.finish();
+    }
+}
+
+fn issue_541_dependents(selection: Value) -> Value {
+    let mut arguments = json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "selector": "id:node:a",
+        "max_traversal": 100,
+        "limit": 100
+    });
+    for (key, value) in selection.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    arguments
+}
+
+fn issue_541_edge_ids(result: &Value) -> Vec<String> {
+    let mut ids = result["structuredContent"]["result"]["edges"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("edge page: {result}"))
+        .iter()
+        .map(|edge| edge["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn issue_541_error_code(result: &Value) -> Value {
+    assert_eq!(result["isError"], true, "{result}");
+    result["structuredContent"]["error"]["code"].clone()
+}
+
+#[test]
+fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_cli() {
+    let Issue541Fixture {
+        _temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    } = issue_541_fixture();
+    let dependents = issue_541_dependents;
+    let edge_ids = issue_541_edge_ids;
+    let error_code = issue_541_error_code;
+    let mut session = Issue541Mcp::start(&root, &store_path, &snapshot_id);
+    let mut call = |name: &str, arguments: Value| session.call(name, arguments);
 
     let default = call("graph_dependents_list", dependents(json!({})));
     let legacy = call(
@@ -9046,102 +9109,7 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
     );
     assert_eq!(error_code(&rejected), "INVALID_ARGUMENT");
 
-    // The selection probes above spend most of the product's fixed read
-    // burst (240/min, burst READ_RATE_BURST); let it refill before the cursor
-    // probes instead of tripping the read rate limit.
-    std::thread::sleep(Duration::from_secs(8));
-
-    // Cursor binding: every-kind traversal (include without edge_kinds) keeps
-    // the pre-#541 normalized input and cursor bytes. The exclude default is
-    // bound to its selection, so cursors issued before v0.7.0 (legacy bytes)
-    // are rejected by a default request and must be re-fetched.
-    let page = |selection: Value, cursor: Option<&Value>| {
-        let mut arguments = dependents(selection);
-        arguments["limit"] = json!(1);
-        if let Some(cursor) = cursor {
-            arguments["cursor"] = cursor.clone();
-        }
-        arguments
-    };
-    let first_include = call(
-        "graph_dependents_list",
-        page(json!({"structural_edges": "include"}), None),
-    );
-    let legacy_cursor =
-        first_include["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert!(legacy_cursor.is_string(), "{first_include}");
-    let resumed_include = call(
-        "graph_dependents_list",
-        page(json!({"structural_edges": "include"}), Some(&legacy_cursor)),
-    );
-    assert_eq!(resumed_include["isError"], false, "{resumed_include}");
-    for selection in [
-        json!({}),
-        json!({"structural_edges": "exclude"}),
-        json!({"edge_kinds": ["imports"]}),
-    ] {
-        let mismatched = call(
-            "graph_dependents_list",
-            page(selection.clone(), Some(&legacy_cursor)),
-        );
-        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
-    }
-    let first_default = call("graph_dependents_list", page(json!({}), None));
-    let default_cursor =
-        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert!(default_cursor.is_string(), "{first_default}");
-    assert_ne!(default_cursor, legacy_cursor);
-    let first_excluded = call(
-        "graph_dependents_list",
-        page(json!({"structural_edges": "exclude"}), None),
-    );
-    let excluded_cursor =
-        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert_eq!(
-        excluded_cursor, default_cursor,
-        "the default and an explicit exclude share one binding"
-    );
-    for selection in [
-        json!({"structural_edges": "include"}),
-        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
-    ] {
-        let mismatched = call(
-            "graph_dependents_list",
-            page(selection.clone(), Some(&default_cursor)),
-        );
-        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
-    }
-    let first_allowlisted = call(
-        "graph_dependents_list",
-        page(json!({"edge_kinds": ["imports"]}), None),
-    );
-    let allowlist_cursor =
-        first_allowlisted["structuredContent"]["result"]["edges"]["next_cursor"].clone();
-    assert!(allowlist_cursor.is_string(), "{first_allowlisted}");
-    assert_ne!(allowlist_cursor, default_cursor);
-    for selection in [
-        json!({"edge_kinds": ["imports"]}),
-        json!({"edge_kinds": ["imports"], "structural_edges": "include"}),
-        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
-    ] {
-        let resumed = call(
-            "graph_dependents_list",
-            page(selection.clone(), Some(&allowlist_cursor)),
-        );
-        assert_eq!(
-            resumed["isError"], false,
-            "the allowlist alone binds the cursor: {selection}: {resumed}"
-        );
-    }
-    for selection in [json!({}), json!({"structural_edges": "exclude"})] {
-        let resumed = call(
-            "graph_dependents_list",
-            page(selection.clone(), Some(&default_cursor)),
-        );
-        assert_eq!(resumed["isError"], false, "{selection}: {resumed}");
-        assert_eq!(edge_ids(&resumed).len(), 1);
-    }
-    mcp.finish();
+    session.finish();
 
     let cli = |arguments: &[&str]| {
         let binary = AssertCommand::cargo_bin("depgraph").unwrap();
@@ -9341,5 +9309,115 @@ fn issue_541_dependency_lists_exclude_structural_edges_by_default_and_match_the_
             "the CLI allowlist alone binds the cursor ({mode})"
         );
     }
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_541_dependency_list_cursors_bind_the_edge_selection() {
+    let Issue541Fixture {
+        _temporary,
+        root,
+        store_path,
+        snapshot_id,
+        before,
+    } = issue_541_fixture();
+    let edge_ids = issue_541_edge_ids;
+    let error_code = issue_541_error_code;
+    // A cursor is sealed with a per-process random key, so the cursor probes
+    // run in their own MCP process instead of restarting one mid-test.
+    let mut session = Issue541Mcp::start(&root, &store_path, &snapshot_id);
+    let mut call = |name: &str, arguments: Value| session.call(name, arguments);
+
+    // Cursor binding: every-kind traversal (include without edge_kinds) keeps
+    // the pre-#541 normalized input and cursor bytes. The exclude default is
+    // bound to its selection, so cursors issued before v0.7.0 (legacy bytes)
+    // are rejected by a default request and must be re-fetched.
+    let page = |selection: Value, cursor: Option<&Value>| {
+        let mut arguments = issue_541_dependents(selection);
+        arguments["limit"] = json!(1);
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.clone();
+        }
+        arguments
+    };
+    let first_include = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "include"}), None),
+    );
+    let legacy_cursor =
+        first_include["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(legacy_cursor.is_string(), "{first_include}");
+    let resumed_include = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "include"}), Some(&legacy_cursor)),
+    );
+    assert_eq!(resumed_include["isError"], false, "{resumed_include}");
+    for selection in [
+        json!({}),
+        json!({"structural_edges": "exclude"}),
+        json!({"edge_kinds": ["imports"]}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&legacy_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_default = call("graph_dependents_list", page(json!({}), None));
+    let default_cursor =
+        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(default_cursor.is_string(), "{first_default}");
+    assert_ne!(default_cursor, legacy_cursor);
+    let first_excluded = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "exclude"}), None),
+    );
+    let excluded_cursor =
+        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert_eq!(
+        excluded_cursor, default_cursor,
+        "the default and an explicit exclude share one binding"
+    );
+    for selection in [
+        json!({"structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&default_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_allowlisted = call(
+        "graph_dependents_list",
+        page(json!({"edge_kinds": ["imports"]}), None),
+    );
+    let allowlist_cursor =
+        first_allowlisted["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(allowlist_cursor.is_string(), "{first_allowlisted}");
+    assert_ne!(allowlist_cursor, default_cursor);
+    for selection in [
+        json!({"edge_kinds": ["imports"]}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "include"}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let resumed = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&allowlist_cursor)),
+        );
+        assert_eq!(
+            resumed["isError"], false,
+            "the allowlist alone binds the cursor: {selection}: {resumed}"
+        );
+    }
+    for selection in [json!({}), json!({"structural_edges": "exclude"})] {
+        let resumed = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&default_cursor)),
+        );
+        assert_eq!(resumed["isError"], false, "{selection}: {resumed}");
+        assert_eq!(edge_ids(&resumed).len(), 1);
+    }
+    session.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
