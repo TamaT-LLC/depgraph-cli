@@ -12,7 +12,7 @@ import (
 const (
 	ProtocolVersion             = "1.0"
 	AdapterName                 = "go"
-	AdapterVersion              = "0.6.3"
+	AdapterVersion              = "0.6.4"
 	AnalysisUnitCapability      = "analysis-source-batch-v1"
 	AnalysisUnitTypedCapability = "analysis-unit-typed-v1"
 )

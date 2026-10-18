@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.6.3";
+const STABLE_RELEASE_VERSION: &str = "0.6.4";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.6";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -688,6 +688,9 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.6.2'",
         "V0_6_2_RELEASE_SOURCE_SHA: 3e5cdda6d1a2ea8904981f52bdc554c9e574307a",
         "historical_source_sha=\"$V0_6_2_RELEASE_SOURCE_SHA\"",
+        "github.event.workflow_run.head_branch == 'v0.6.3'",
+        "V0_6_3_RELEASE_SOURCE_SHA: 21434e0e7a603d866f5fb677b087b9d193dae931",
+        "historical_source_sha=\"$V0_6_3_RELEASE_SOURCE_SHA\"",
         "STABLE_MAINTENANCE_REF: heads/release/0.6",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",

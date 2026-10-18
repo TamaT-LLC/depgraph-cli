@@ -5,9 +5,12 @@
 [README](../../README.md)には最短の導入コマンドだけを載せています。
 このガイドでは、配布経路ごとの導入方法、アーカイブの検証、ソースからのビルドを説明します。
 
+`v0.6.4` は準備中です。公式 Release と一致する公開後証跡が揃うまでは、
+バージョン指定の例を公開済みの `v0.6.3` に読み替えてください。
+
 ## 対応ターゲット
 
-`v0.6.3`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64の4ターゲットを提供します。
+`v0.6.4`は、Linux x86-64、Linux ARM64、macOS Apple Silicon、Windows x86-64の4ターゲットを提供します。
 Intel macOSには対応していません。
 公式Releaseと公開後証跡がそろった版を使ってください。
 
@@ -56,7 +59,7 @@ npm版のランチャーにはNode.js 24以上が必要です。
 macOSまたはLinuxでは、GitHub CLIでアーカイブとチェックサムを取得できます。
 
 ```sh
-VERSION=0.6.3
+VERSION=0.6.4
 TARGET=aarch64-apple-darwin
 ARCHIVE="depgraph-${VERSION}-${TARGET}.tar.gz"
 
