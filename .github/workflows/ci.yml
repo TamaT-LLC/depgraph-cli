@@ -37,7 +37,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
-      - run: node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs scripts/tests/homebrew-tap.test.mjs
+      - run: node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs scripts/tests/homebrew-tap.test.mjs scripts/tests/ci-affected-scope.test.mjs
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -117,17 +117,36 @@ jobs:
         working-directory: workers/go
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so pull_request path filtering can diff base..head.
+          fetch-depth: 0
+      - name: Decide whether the go checks must run
+        id: decide
+        working-directory: .
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-affected-scope.sh decide go
+      - name: Skip the go checks when unrelated
+        if: steps.decide.outputs.run != 'true'
+        run: echo "Skipping the go checks (no relevant path changes)"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.decide.outputs.run == 'true'
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
-      - run: go test -race ./...
+      - if: steps.decide.outputs.run == 'true'
+        run: test -z "$(gofmt -l .)"
+      - if: steps.decide.outputs.run == 'true'
+        run: go vet ./...
+      - if: steps.decide.outputs.run == 'true'
+        run: go test -race ./...
       # syscall.Openat is Linux-only; Darwin shares the openat(O_NOFOLLOW) walk
       # via golang.org/x/sys/unix. Compile that GOOS here so a stub that
       # returns reference-file-nofollow-unavailable cannot land unnoticed.
       - name: Cross-compile the reference fingerprint walk for Darwin and Windows
+        if: steps.decide.outputs.run == 'true'
         run: |
           set -euo pipefail
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-darwin-arm64.test" ./internal/worker
@@ -144,16 +163,34 @@ jobs:
         working-directory: workers/go
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so pull_request path filtering can diff base..head.
+          fetch-depth: 0
+      - name: Decide whether the go-macos checks must run
+        id: decide
+        working-directory: .
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-affected-scope.sh decide go
+      - name: Skip the go-macos checks when unrelated
+        if: steps.decide.outputs.run != 'true'
+        run: echo "Skipping the go-macos checks (no relevant path changes)"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.decide.outputs.run == 'true'
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
+      - if: steps.decide.outputs.run == 'true'
+        run: test -z "$(gofmt -l .)"
+      - if: steps.decide.outputs.run == 'true'
+        run: go vet ./...
       # Issue #479: Darwin must hash confined in-repo sources so package
       # semantic checkpoints bind go_reference_fingerprint. The Linux go job
       # still owns the full ./... race suite.
-      - run: go test -race ./internal/worker -run 'TestGoLoader|TestAnalysisSplit|TestOpenReferenceFile|TestComputeGoReferenceFingerprint|TestGoReferenceFileDigest|TestSupportedUnix' -count=1
+      - if: steps.decide.outputs.run == 'true'
+        run: go test -race ./internal/worker -run 'TestGoLoader|TestAnalysisSplit|TestOpenReferenceFile|TestComputeGoReferenceFingerprint|TestGoReferenceFileDigest|TestSupportedUnix' -count=1
 
   web:
     runs-on: ubuntu-24.04
@@ -162,7 +199,22 @@ jobs:
         working-directory: workers/web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so pull_request path filtering can diff base..head.
+          fetch-depth: 0
+      - name: Decide whether the web checks must run
+        id: decide
+        working-directory: .
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-affected-scope.sh decide web
+      - name: Skip the web checks when unrelated
+        if: steps.decide.outputs.run != 'true'
+        run: echo "Skipping the web checks (no relevant path changes)"
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        if: steps.decide.outputs.run == 'true'
         with:
           version: 10.33.0
           # The default npm bootstrap fetches the small `pnpm` package; the
@@ -170,35 +222,46 @@ jobs:
           # that has stalled this step for minutes on a slow registry.
           standalone: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.decide.outputs.run == 'true'
         with:
           node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: workers/web/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm quality
-      - run: pnpm check
-      - run: pnpm test
+      - if: steps.decide.outputs.run == 'true'
+        run: pnpm install --frozen-lockfile
+      - if: steps.decide.outputs.run == 'true'
+        run: pnpm quality
+      - if: steps.decide.outputs.run == 'true'
+        run: pnpm check
+      - if: steps.decide.outputs.run == 'true'
+        run: pnpm test
       # The resumable-analysis fixture drives the real Go and Web workers
       # through the shared scheduler, so it belongs with a worker gate. It runs
       # here rather than in `go` because `go test -race` already fills that
       # job's wall clock, while this job finishes early; keeping it inside an
       # existing job keeps these integration checks inside the Web job.
-      - run: rustup toolchain install 1.93.1 --profile minimal
-      - run: rustup default 1.93.1
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain install 1.93.1 --profile minimal
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup default 1.93.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.decide.outputs.run == 'true'
         with:
           key: resumable-analysis-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.decide.outputs.run == 'true'
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
       - name: Verify real-worker batching, reuse, and cross-unit queries
+        if: steps.decide.outputs.run == 'true'
         working-directory: .
         env:
           DEPGRAPH_RESUMABLE_REPORT: ${{ runner.temp }}/depgraph-resumable-report.json
         run: cargo xtask resumable-analysis-e2e
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.decide.outputs.run == 'true'
         with:
           name: resumable-analysis-report
           path: ${{ runner.temp }}/depgraph-resumable-report.json
@@ -208,6 +271,7 @@ jobs:
       # package-bounded path completes under the same limit with the same
       # canonical graph (#463).
       - name: Verify package-bounded Go loading completes where the whole-module load fails
+        if: steps.decide.outputs.run == 'true'
         id: go_loader_scope_e2e
         working-directory: .
         env:
@@ -223,6 +287,7 @@ jobs:
       # single work budget while the ranged path completes under the unchanged
       # per-range limit with identical findings (#467).
       - name: Verify ranged health completes where the whole-snapshot budget fails
+        if: steps.decide.outputs.run == 'true'
         id: health_range_e2e
         working-directory: .
         env:

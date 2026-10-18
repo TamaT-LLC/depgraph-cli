@@ -19,7 +19,16 @@ The ordinary CI workflow has only `contents: read`, never uses
 context. Its exact trigger set is `pull_request`, `push`, and
 `workflow_dispatch`. Manual dispatches retain the same read-only and
 secret-free boundary as the other CI events. Pull requests and `main` pushes
-run the Rust, Go, and Web checks. The compiler-precise hostile job always runs
+always start the Rust, Go, and Web jobs under their required check names, and
+the Rust job always runs every step. On pull requests, the Go, macOS Go, and
+Web jobs run `scripts/ci-affected-scope.sh`, which diffs base..head with rename
+detection disabled and skips their expensive steps only when every changed path
+is on that job's reviewed unrelated-path list. A shared input (the workflows,
+Cargo manifests and lockfile, toolchain, xtask, or scripts), an unknown path,
+an empty or failed diff, and every event other than a pull request run the full
+job, and a job that skips its steps still reports success. The verifier pins
+those lists verbatim, so widening what a job may skip requires a reviewed xtask
+change. The compiler-precise hostile job always runs
 on `main` push and `workflow_dispatch`; on pull requests it runs the expensive
 steps only when relevant paths change (compiler crates, hostile scripts/docs,
 or this CI workflow), and otherwise exits successfully without those steps so
