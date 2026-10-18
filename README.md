@@ -105,6 +105,25 @@ depgraph mcp update --host claude
 depgraph mcp uninstall --host claude
 ```
 
+### ツールが取得できないとき
+
+Claude Codeでdepgraphのtoolsが取得できず、次のエラーになることがあります。
+
+```text
+request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities
+```
+
+登録済みの`depgraph-mcp`が古いことが原因の可能性があります。
+v0.6.1で発生を確認し、v0.6.4では接続できることを確認しています。
+`depgraph mcp setup`は、実行中のCLIと同じ版の公式リリースをホストの設定に結び付けます。
+そのため、CLI本体を更新してから`setup`を再実行してください。
+
+1. CLIをv0.6.4以降に更新します（`brew upgrade depgraph`、`npm i -g @tamat-llc/depgraph`など）。
+2. `depgraph --version`で版を確認します。
+3. リポジトリ内で`depgraph mcp setup --host claude`を再実行します（ユーザー単位なら`--scope user`も付けます）。
+4. `depgraph mcp status --host claude`で状態を確認します（ユーザー単位なら`--scope user`も付けます）。
+5. エージェントを再起動または再読み込みします。
+
 登録されるサーバーは読み取り専用です。
 解析結果の保存先の変更、リポジトリへの書き込み、プロジェクトコードの実行はできません。
 権限付きのプロファイル、`agent-config`による手動設定、トラブルシューティングは[MCPエージェントホスト運用手順](docs/50_test/mcp-agent-host-operations.md)（英語）を参照してください。
