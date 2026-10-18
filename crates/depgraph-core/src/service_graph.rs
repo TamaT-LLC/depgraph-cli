@@ -11,7 +11,10 @@ use depgraph_store::{
 use crate::{
     CancellationToken,
     edge_kind_selection::{EdgeKindFilter, StructuralEdgeSelection},
-    impact::{ImpactFilters, ImpactResult, impact_cancellable, read_git_changed_set_cancellable},
+    impact::{
+        ChangedSetImpactResult, GitChangedSet, ImpactFilters, ImpactResult, impact_cancellable,
+        impact_changed_set_cancellable, read_git_changed_set_cancellable,
+    },
     query::{
         BoundedTraversalResult, CycleLevel, CycleResult, GraphQueryFilter, PathStep,
         QueryPageDiagnostic, TraversalPageItem, TraversalResult, UnresolvedResult, WhyResult,
@@ -55,27 +58,7 @@ impl ImpactRequest {
     ) -> DepgraphServiceResult<Self> {
         let selector = selector.into();
         validate_selector(&selector)?;
-        if changed_since.as_deref().is_some_and(|value| {
-            value.is_empty()
-                || value.len() > MAX_GIT_REF_BYTES
-                || value.starts_with('-')
-                || value.chars().any(char::is_control)
-        }) || filters.max_nodes == 0
-            || filters.max_edges == 0
-            || filters.max_nodes > crate::MAX_INTERACTIVE_QUERY_TRAVERSAL
-            || filters.max_edges > crate::MAX_INTERACTIVE_QUERY_TRAVERSAL
-        {
-            return Err(DepgraphServiceError::InvalidInput);
-        }
-        for values in [
-            &filters.profiles,
-            &filters.conditions,
-            &filters.phases,
-            &filters.sessions,
-            &filters.environments,
-        ] {
-            validate_string_filter(values)?;
-        }
+        validate_impact_ref_and_filters(changed_since.as_deref(), &filters)?;
         Ok(Self {
             selector,
             changed_since,
@@ -119,6 +102,90 @@ impl ImpactServiceResult {
 
     #[must_use]
     pub const fn impact(&self) -> &ImpactResult {
+        &self.impact
+    }
+}
+
+fn validate_impact_ref_and_filters(
+    changed_since: Option<&str>,
+    filters: &ImpactFilters,
+) -> DepgraphServiceResult<()> {
+    if changed_since.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_GIT_REF_BYTES
+            || value.starts_with('-')
+            || value.chars().any(char::is_control)
+    }) || filters.max_nodes == 0
+        || filters.max_edges == 0
+        || filters.max_nodes > crate::MAX_INTERACTIVE_QUERY_TRAVERSAL
+        || filters.max_edges > crate::MAX_INTERACTIVE_QUERY_TRAVERSAL
+    {
+        return Err(DepgraphServiceError::InvalidInput);
+    }
+    for values in [
+        &filters.profiles,
+        &filters.conditions,
+        &filters.phases,
+        &filters.sessions,
+        &filters.environments,
+    ] {
+        validate_string_filter(values)?;
+    }
+    Ok(())
+}
+
+/// Reverse impact of every change since the merge-base with a Git ref, with
+/// no selector: all mapped changed nodes are traversal sources at once.
+#[derive(Clone, Debug)]
+pub struct ChangedSetImpactRequest {
+    changed_since: String,
+    filters: ImpactFilters,
+}
+
+impl ChangedSetImpactRequest {
+    pub fn try_new(
+        changed_since: impl Into<String>,
+        filters: ImpactFilters,
+    ) -> DepgraphServiceResult<Self> {
+        let changed_since = changed_since.into();
+        validate_impact_ref_and_filters(Some(&changed_since), &filters)?;
+        Ok(Self {
+            changed_since,
+            filters,
+        })
+    }
+
+    #[must_use]
+    pub fn changed_since(&self) -> &str {
+        &self.changed_since
+    }
+
+    #[must_use]
+    pub const fn filters(&self) -> &ImpactFilters {
+        &self.filters
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChangedSetImpactServiceResult {
+    snapshot_id: ResolvedSnapshotId,
+    scan_id: String,
+    impact: ChangedSetImpactResult,
+}
+
+impl ChangedSetImpactServiceResult {
+    #[must_use]
+    pub const fn snapshot_id(&self) -> &ResolvedSnapshotId {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn scan_id(&self) -> &str {
+        &self.scan_id
+    }
+
+    #[must_use]
+    pub const fn impact(&self) -> &ChangedSetImpactResult {
         &self.impact
     }
 }
@@ -530,18 +597,8 @@ impl DepgraphService {
         preflight_impact_snapshot(&snapshot, cancellation)?;
         let changed_set = request
             .changed_since()
-            .map(|git_ref| {
-                read_git_changed_set_cancellable(self.config().canonical_root(), git_ref, || {
-                    cancellation.is_cancelled()
-                })
-            })
-            .transpose()
-            .map_err(|source| impact_changed_set_service_error(source, cancellation))?;
-        if let Some(changed_set) = changed_set.as_ref()
-            && snapshot.scan.source_revision.as_deref() != Some(changed_set.head.as_str())
-        {
-            return Err(DepgraphServiceError::SnapshotWorktreeMismatch);
-        }
+            .map(|git_ref| self.read_snapshot_changed_set(&snapshot, git_ref, cancellation))
+            .transpose()?;
         let result = impact_cancellable(
             &snapshot,
             request.selector(),
@@ -549,17 +606,7 @@ impl DepgraphService {
             request.filters().clone(),
             || cancellation.is_cancelled(),
         )
-        .map_err(|source| {
-            if cancellation.is_cancelled() {
-                DepgraphServiceError::Cancelled
-            } else if crate::impact::is_resource_exhausted(&source) {
-                DepgraphServiceError::ResourceExhausted
-            } else if crate::impact::is_integrity(&source) {
-                DepgraphServiceError::Integrity
-            } else {
-                DepgraphServiceError::graph_query(source)
-            }
-        })?;
+        .map_err(|source| impact_service_error(source, cancellation))?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
@@ -571,6 +618,60 @@ impl DepgraphService {
             scan_id: snapshot.scan.id,
             impact: result,
         })
+    }
+
+    /// Reverse impact of the whole changed set with one snapshot read and one
+    /// multi-source traversal. Like changed-set `impact`, it bypasses the warm
+    /// query cache and requires the current snapshot to match `HEAD`.
+    pub fn impact_changed_set(
+        &self,
+        snapshot_request: &mut SnapshotReadRequest,
+        request: &ChangedSetImpactRequest,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<ChangedSetImpactServiceResult> {
+        if !snapshot_request.is_current() {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        let snapshot_id = snapshot_request.snapshot_id().clone();
+        let snapshot = load_pinned_snapshot(snapshot_request, cancellation)?;
+        preflight_impact_snapshot(&snapshot, cancellation)?;
+        let changed_set =
+            self.read_snapshot_changed_set(&snapshot, request.changed_since(), cancellation)?;
+        let result = impact_changed_set_cancellable(
+            &snapshot,
+            &changed_set,
+            request.filters().clone(),
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|source| impact_service_error(source, cancellation))?;
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        if !result.complete {
+            return Err(DepgraphServiceError::ResourceExhausted);
+        }
+        Ok(ChangedSetImpactServiceResult {
+            snapshot_id,
+            scan_id: snapshot.scan.id,
+            impact: result,
+        })
+    }
+
+    fn read_snapshot_changed_set(
+        &self,
+        snapshot: &GraphSnapshot,
+        git_ref: &str,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<GitChangedSet> {
+        let changed_set =
+            read_git_changed_set_cancellable(self.config().canonical_root(), git_ref, || {
+                cancellation.is_cancelled()
+            })
+            .map_err(|source| impact_changed_set_service_error(source, cancellation))?;
+        if snapshot.scan.source_revision.as_deref() != Some(changed_set.head.as_str()) {
+            return Err(DepgraphServiceError::SnapshotWorktreeMismatch);
+        }
+        Ok(changed_set)
     }
 
     pub fn cycles(
@@ -609,6 +710,21 @@ impl DepgraphService {
             scan_id: snapshot.scan.id,
             items,
         })
+    }
+}
+
+fn impact_service_error(
+    source: anyhow::Error,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceError {
+    if cancellation.is_cancelled() {
+        DepgraphServiceError::Cancelled
+    } else if crate::impact::is_resource_exhausted(&source) {
+        DepgraphServiceError::ResourceExhausted
+    } else if crate::impact::is_integrity(&source) {
+        DepgraphServiceError::Integrity
+    } else {
+        DepgraphServiceError::graph_query(source)
     }
 }
 

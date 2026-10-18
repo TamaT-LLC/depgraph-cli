@@ -19,6 +19,7 @@ MCP の `graph_dependencies_list` / `graph_dependents_list` と CLI の `depgrap
 
 ## 追加機能
 
+- `depgraph impact --changed <GIT_REF>` をセレクターなしで実行すると、変更されたファイル全体を起点にした逆方向の影響範囲を 1 回で返す。JSON は `data.mode = "changed_set"` で、影響ノードごとの `depth`、届いた変更パス `changed_paths`、対応付けられなかった変更 `unmapped` を含む。セレクター付きの `--changed` は従来どおり。
 - MCP の全ツールで `repository_id` を省略できるようにし、省略時はサーバーが束縛するリポジトリを使う。束縛されたリポジトリと最新スナップショットの要約を返す `repository_list` を追加する（[#540](https://github.com/TamaT-LLC/depgraph-cli/issues/540)）。
 - `graph_dependencies_list` / `graph_dependents_list` に出力粒度 `detail`（`paths` / `summary` / `full`、既定 `full`）を追加する（[#542](https://github.com/TamaT-LLC/depgraph-cli/issues/542)）。
 - `health_hotspots_list` に `path_prefixes` と `node_kinds` の絞り込みを、CLI の `hotspots` に `--path-prefix` と `--node-kind` を追加する。score と finding ID は絞り込み前と変わらない（[#543](https://github.com/TamaT-LLC/depgraph-cli/issues/543)）。

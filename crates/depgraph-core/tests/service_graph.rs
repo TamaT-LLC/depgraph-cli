@@ -9,7 +9,9 @@ use depgraph_core::service::{
     MAX_GRAPH_EVIDENCE_ITEMS, STRUCTURAL_EDGE_KINDS, StructuralEdgeSelection, UnresolvedRequest,
     is_structural_edge_kind,
 };
-use depgraph_core::{CancellationToken, CycleLevel, GraphQueryFilter, ImpactFilters};
+use depgraph_core::{
+    CancellationToken, ChangedSetImpactRequest, CycleLevel, GraphQueryFilter, ImpactFilters,
+};
 use depgraph_store::Store;
 use serde_json::json;
 
@@ -1040,6 +1042,162 @@ fn changed_path_count_is_independent_from_the_impact_node_limit() -> Result<()> 
     assert_eq!(result.impact().changed_nodes.len(), 1);
     assert_eq!(result.impact().impacts.len(), 1);
     assert_eq!(result.impact().impacts[0].node.id, "changed:root");
+    Ok(())
+}
+
+fn init_fixture_repository(root: &Path, files: &[&str]) -> Result<String> {
+    fs::create_dir_all(root.join("src"))?;
+    assert_git_success(root, &["init", "--quiet"]);
+    assert_git_success(root, &["config", "user.email", "test@example.invalid"]);
+    assert_git_success(root, &["config", "user.name", "Test"]);
+    for file in files {
+        fs::write(root.join(file), format!("// {file}\n"))?;
+        assert_git_success(root, &["add", file]);
+    }
+    assert_git_success(root, &["commit", "--quiet", "-m", "base"]);
+    Ok(assert_git_success(root, &["rev-parse", "HEAD"]))
+}
+
+fn changed_set_impact_fixture(root: &Path, store_path: &Path) -> Result<(String, DepgraphService)> {
+    let head = init_fixture_repository(root, &["src/a.rs", "src/b.rs", "src/c.rs"])?;
+    let node =
+        |id: &str, path: Option<&str>| (id.to_owned(), "file".to_owned(), path.map(str::to_owned));
+    let nodes = vec![
+        node("a", Some("src/a.rs")),
+        node("b", Some("src/b.rs")),
+        node("c", Some("src/c.rs")),
+        node("x", None),
+        node("y", None),
+        node("z", None),
+    ];
+    let edge = |id: &str, source: &str, target: &str| {
+        (id.to_owned(), source.to_owned(), target.to_owned())
+    };
+    let edges = vec![
+        edge("x-a", "x", "a"),
+        edge("y-b", "y", "b"),
+        edge("z-x", "z", "x"),
+        edge("z-y", "z", "y"),
+        edge("y-c", "y", "c"),
+    ];
+    let mut writer = Store::open(store_path)?;
+    seed_edge_graph(
+        &mut writer,
+        root,
+        "changed-set-impact",
+        &head,
+        &nodes,
+        &edges,
+        0,
+    )?;
+    drop(writer);
+    fs::write(root.join("src/a.rs"), "// a changed\n")?;
+    fs::write(root.join("src/b.rs"), "// b changed\n")?;
+    fs::write(root.join("src/untracked.rs"), "// new\n")?;
+    Ok((head, service(root, store_path)?))
+}
+
+#[test]
+fn changed_set_impact_returns_the_whole_changed_set_in_one_call() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    let (head, graph_service) = changed_set_impact_fixture(&root, &store_path)?;
+
+    let request = ChangedSetImpactRequest::try_new(
+        "HEAD",
+        ImpactFilters::new(None, Vec::new(), Vec::new(), 100, 100)?,
+    )?;
+    let mut snapshot = graph_service.start_snapshot_request("current")?;
+    let result =
+        graph_service.impact_changed_set(&mut snapshot, &request, &CancellationToken::new())?;
+    let impact = result.impact();
+    assert_eq!(result.scan_id(), "changed-set-impact");
+    assert_eq!(impact.mode, "changed_set");
+    assert!(impact.complete);
+    assert_eq!(impact.changed_set.head, head);
+    let impacts = impact
+        .impacts
+        .iter()
+        .map(|item| {
+            (
+                item.node.id.as_str(),
+                item.depth,
+                item.changed_paths.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let a = vec!["src/a.rs".to_owned()];
+    let b = vec!["src/b.rs".to_owned()];
+    let both = vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()];
+    assert_eq!(
+        impacts,
+        [
+            ("a", 0, a.clone()),
+            ("b", 0, b.clone()),
+            ("x", 1, a),
+            ("y", 1, b),
+            ("z", 2, both),
+        ]
+    );
+    assert_eq!(impact.unmapped.len(), 1);
+    assert_eq!(
+        impact.unmapped[0].new_path.as_deref(),
+        Some("src/untracked.rs")
+    );
+    assert_eq!(impact.unmapped[0].reason, "not_in_snapshot");
+    Ok(())
+}
+
+#[test]
+fn changed_set_impact_rejects_a_snapshot_that_does_not_match_head() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    let (_head, graph_service) = changed_set_impact_fixture(&root, &store_path)?;
+    assert_git_success(
+        &root,
+        &["commit", "--quiet", "--allow-empty", "-m", "ahead"],
+    );
+
+    let request = ChangedSetImpactRequest::try_new(
+        "HEAD~1",
+        ImpactFilters::new(None, Vec::new(), Vec::new(), 100, 100)?,
+    )?;
+    let mut snapshot = graph_service.start_snapshot_request("current")?;
+    let error = graph_service
+        .impact_changed_set(&mut snapshot, &request, &CancellationToken::new())
+        .expect_err("a snapshot older than HEAD must not be compared");
+    assert!(matches!(
+        error,
+        DepgraphServiceError::SnapshotWorktreeMismatch
+    ));
+    Ok(())
+}
+
+#[test]
+fn changed_set_impact_request_and_limits_fail_closed() -> Result<()> {
+    let filters = ImpactFilters::new(None, Vec::new(), Vec::new(), 100, 100)?;
+    for invalid in ["", "-x", "bad\nref"] {
+        assert!(matches!(
+            ChangedSetImpactRequest::try_new(invalid, filters.clone()),
+            Err(DepgraphServiceError::InvalidInput)
+        ));
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    let (_head, graph_service) = changed_set_impact_fixture(&root, &store_path)?;
+    let request = ChangedSetImpactRequest::try_new(
+        "HEAD",
+        ImpactFilters::new(None, Vec::new(), Vec::new(), 3, 100)?,
+    )?;
+    let mut snapshot = graph_service.start_snapshot_request("current")?;
+    assert!(matches!(
+        graph_service.impact_changed_set(&mut snapshot, &request, &CancellationToken::new()),
+        Err(DepgraphServiceError::ResourceExhausted)
+    ));
     Ok(())
 }
 

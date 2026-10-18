@@ -23,14 +23,14 @@ use depgraph_core::service::{
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
-    CancellationToken, CycleLevel, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,
-    DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS, DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus,
-    GraphQueryFilter, HotspotWeights, ImpactFilters, ImpactResult, InteractiveQueryPage,
-    InteractiveQueryPageRequest, PolicyAnnotation, QueryDiagnostic, QueryFailureClass,
-    RepositoryProfilePlanPreview, ScanCacheMode, TraversalPageItem, TypedProjection,
-    UnresolvedResult, default_store_path, paginate_interactive_query,
-    profile_selection_human_summary, read_compiler_pack_requirement, render_condition,
-    render_github_annotations, traversal_summary, unresolved_summary,
+    CancellationToken, ChangedSetImpactRequest, ChangedSetImpactResult, CycleLevel,
+    DEFAULT_INTERACTIVE_QUERY_MAX_BYTES, DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS,
+    DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL, DaemonStatus, GitChange, GraphQueryFilter,
+    HotspotWeights, ImpactFilters, ImpactResult, InteractiveQueryPage, InteractiveQueryPageRequest,
+    PolicyAnnotation, QueryDiagnostic, QueryFailureClass, RepositoryProfilePlanPreview,
+    ScanCacheMode, TraversalPageItem, TypedProjection, UnresolvedResult, default_store_path,
+    paginate_interactive_query, profile_selection_human_summary, read_compiler_pack_requirement,
+    render_condition, render_github_annotations, traversal_summary, unresolved_summary,
     validate_interactive_query_bounds,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
@@ -46,6 +46,9 @@ mod snapshot_diff;
 // Clap builds the complete command graph before handling `--version` or `--help`.
 // Keep that work off Windows' 1 MiB process-main stack, with Unix-sized headroom.
 const CLI_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+const IMPACT_SELECTOR_REQUIRED: &str =
+    "impact requires a SELECTOR unless --changed <GIT_REF> is given";
+const CHANGED_PATH_UNMAPPED_DIAGNOSTIC: &str = "changed_path_unmapped";
 
 use agent_config::{AgentConfigRequest, generate as generate_agent_config};
 use mcp_setup::{McpHost, McpScope, McpWorkflowRequest};
@@ -321,7 +324,9 @@ enum Commands {
     },
     /// Show reverse dependency impact for a selector or Git changed set.
     Impact {
-        selector: String,
+        /// Graph node to focus on. Omit it with `--changed` to report the impact
+        /// of every changed file at once.
+        selector: Option<String>,
         /// Read committed and dirty worktree changes since the merge-base with this Git ref.
         #[arg(long, value_name = "GIT_REF")]
         changed: Option<String>,
@@ -1778,10 +1783,26 @@ async fn run(cli: Cli) -> Result<u8> {
             max_edges,
             json,
         } => {
+            if selector.is_none() && changed.is_none() {
+                anyhow::bail!(IMPACT_SELECTOR_REQUIRED);
+            }
             let filters = ImpactFilters::new(depth, profile, condition, max_nodes, max_edges)?
                 .with_runtime_filters(phase, session, environment)?;
             let (service, mut snapshot) =
                 graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
+            let Some(selector) = selector else {
+                let changed = changed.context(IMPACT_SELECTOR_REQUIRED)?;
+                let result = service.impact_changed_set(
+                    &mut snapshot,
+                    &ChangedSetImpactRequest::try_new(changed, filters)?,
+                    &CancellationToken::new(),
+                )?;
+                print_graph_structured("impact", &snapshot, result.impact(), json)?;
+                if !json {
+                    print_human_changed_set_impact(result.impact());
+                }
+                return Ok(0);
+            };
             let result = service.impact(
                 &mut snapshot,
                 &ImpactRequest::try_new(selector, changed, filters)?,
@@ -3733,6 +3754,82 @@ fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
     }
 }
 
+fn display_change_path(change: &GitChange) -> String {
+    display_old_new_path(change.old_path.as_deref(), change.new_path.as_deref())
+}
+
+fn display_old_new_path(old_path: Option<&str>, new_path: Option<&str>) -> String {
+    match (old_path, new_path) {
+        (Some(old), Some(new)) => format!("{old} -> {new}"),
+        (Some(old), None) => old.to_owned(),
+        (None, Some(new)) => new.to_owned(),
+        (None, None) => "unknown".to_owned(),
+    }
+}
+
+fn display_impact_depth(depth: Option<usize>) -> String {
+    depth
+        .map(|depth| depth.to_string())
+        .unwrap_or_else(|| "unbounded".to_owned())
+}
+
+fn print_human_changed_set_impact(result: &ChangedSetImpactResult) {
+    let changed_set = &result.changed_set;
+    let mapped_paths = result
+        .mappings
+        .iter()
+        .filter(|mapping| !mapping.correlated_node_ids.is_empty())
+        .count();
+    println!(
+        "impact changed set: ref={} resolved={} merge_base={} head={} paths={} mapped_paths={} unmapped={} changed_nodes={}",
+        changed_set.requested_ref,
+        changed_set.resolved_ref,
+        changed_set.merge_base,
+        changed_set.head,
+        changed_set.changes.len(),
+        mapped_paths,
+        result.unmapped.len(),
+        result.changed_nodes.len(),
+    );
+    println!(
+        "result: complete={} impacts={} depth={} profiles={} conditions={}",
+        result.complete,
+        result.impacts.len(),
+        display_impact_depth(result.filters.depth),
+        display_list(&result.filters.profiles),
+        display_list(&result.filters.conditions),
+    );
+    for impact in &result.impacts {
+        println!(
+            "  {} {} {} id:{} from={}",
+            impact.depth,
+            impact.node.kind,
+            impact.node.locator,
+            impact.node.id,
+            display_list(&impact.changed_paths),
+        );
+    }
+    if !result.unmapped.is_empty() {
+        println!("unmapped:");
+        for change in &result.unmapped {
+            println!(
+                "  {} {} ({})",
+                change.status,
+                display_old_new_path(change.old_path.as_deref(), change.new_path.as_deref()),
+                change.reason,
+            );
+        }
+    }
+    // Unmapped paths are listed above; repeating their diagnostics adds noise.
+    for diagnostic in result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code != CHANGED_PATH_UNMAPPED_DIAGNOSTIC)
+    {
+        println!("diagnostic [{}] {}", diagnostic.code, diagnostic.message);
+    }
+}
+
 fn print_human_impact(result: &ImpactResult) {
     println!(
         "impact focus: {} ({}, id:{})",
@@ -3749,15 +3846,7 @@ fn print_human_impact(result: &ImpactResult) {
             result.changed_nodes.len()
         );
         for mapping in &result.mappings {
-            let path = match (
-                mapping.change.old_path.as_deref(),
-                mapping.change.new_path.as_deref(),
-            ) {
-                (Some(old), Some(new)) => format!("{old} -> {new}"),
-                (Some(old), None) => old.to_owned(),
-                (None, Some(new)) => new.to_owned(),
-                (None, None) => "unknown".to_owned(),
-            };
+            let path = display_change_path(&mapping.change);
             println!(
                 "  {} {} sources={} old_nodes={} new_nodes={} correlated_nodes={}",
                 mapping.change.status,
