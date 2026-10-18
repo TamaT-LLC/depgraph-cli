@@ -290,7 +290,8 @@ values are outcome-dependent; fallback paths retain the syntax-only values.
 | `rust_hir_status` | `import-type-call-graph-emitted`, `import-type-call-graph-partial`, `failed`, or `not-invoked` |
 | `rust_hir_scaffold` | `available` |
 | `rust_hir_project_model` | `ready` after deterministic construction; otherwise `not-invoked`, `unavailable`, or `unsupported` |
-| `rust_hir_enable_gate` | `release-gate-pending` after successful source/development emission; `release-gate-verified` only when core has verified the packaged manifest, worker/backend unit, and bundled sysroot data tree; `semantic-backend-failure` on typed failure; otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_enable_gate` | `release-gate-pending` after successful source/development emission; `release-gate-verified` only when core has verified the packaged manifest, worker/backend unit, and bundled sysroot data tree; `semantic-backend-failure` on typed failure; `memory-budget-syntax-only` when the worker ran with `--hir-mode syntax-only` and no earlier HIR gate stopped it (an earlier gate keeps its own value); otherwise `semantic-emission-pending`, `toolchain-unsupported`, `crate-graph-unavailable`, or `input-unsupported` |
+| `rust_hir_mode` | `syntax-only` whenever the worker ran with `--hir-mode syntax-only`, including when an earlier HIR gate stopped it; absent in the default full mode |
 | `rust_hir_project_file_count` | Number of admitted inventory files in the safe VFS; `0` when no model is available |
 | `rust_hir_project_crate_count` | Number of workspace/path local crates in the safe graph; `0` when no model is available |
 | `rust_hir_project_external_count` | Number of external sidecar entries, including sysroot sentinels when no attested sysroot is admitted; `0` when none or no model is available |
@@ -345,7 +346,7 @@ remain equal.
 | `crate_graph_source_policy` | `confined-cargo-metadata-or-static-manifest` |
 | `crate_graph_source` | `confined-cargo-metadata`, `static-manifest-fallback`, or `none` |
 | `syntax_fallback` | `enabled` |
-| `rust_syntax_fallback_summary` | `rust-syntax-fallback-summary-v1`: deterministic `syntax_proven` / `hir_required` / `macro_execution_required` counts, site-kind counts, unresolved-kind counts, and separate remediation |
+| `rust_syntax_fallback_summary` | `rust-syntax-fallback-summary-v1`: deterministic `syntax_proven` / `hir_required` / `macro_execution_required` counts, site-kind counts, unresolved-kind counts, and separate remediation; `remediation.hir_required` is the toolchain install command in full mode, the `max_worker_memory_bytes` advice in syntax-only mode with a compatible toolchain, and that advice followed by the declaration-specific `rust_hir_toolchain_remediation` in syntax-only mode with an incompatible toolchain |
 | `build_script_policy` | `disabled` |
 | `proc_macro_policy` | `disabled` |
 | `proc_macro_expansion` | `disabled` |
@@ -509,3 +510,32 @@ scan boundary:
     `core`/`alloc`/`std` library VFS and crate roots, emit exact
     symbol/type/import/type-use/direct-call edges, and prove fallback plus
     repeated packaged-scan/export determinism.
+
+## Syntax-only retry after a memory-limit failure
+
+`--hir-mode syntax-only` (default `full`) skips the rust-analyzer HIR project
+model and semantic extraction, which dominate worker memory on large
+workspaces. Every static syntax step, including the confined
+`cargo metadata --frozen --offline --no-deps` call, runs unchanged, and no
+project code is executed in either mode. In this mode the profile always
+records `rust_hir_mode=syntax-only`, coverage always carries the reason
+`rust-hir-memory-budget`, and the worker always emits the warning
+`RUST_HIR_MEMORY_BUDGET_SYNTAX_ONLY` once. When every HIR enable gate passes,
+the profile also records `rust_hir_project_model=not-invoked` and
+`rust_hir_enable_gate=memory-budget-syntax-only`. When an earlier gate
+(toolchain, edition, or crate graph) already stops HIR, that gate's own
+`rust_hir_project_model`, `rust_hir_enable_gate`, coverage reason, and
+diagnostic are kept alongside the syntax-only marks. The
+`rust_syntax_fallback_summary` remediation for `hir_required` then points at
+raising `[scan] max_worker_memory_bytes` instead of the toolchain install
+command; when the toolchain is also incompatible it puts the memory advice
+first and then the profile's declaration-specific
+`rust_hir_toolchain_remediation`, because fixing only one does not restore HIR.
+
+The core requests this mode only once, for a repository-scope Rust unit whose
+full-mode attempt exceeded `[scan] max_worker_memory_bytes`. A successful retry
+is published as `completed` with the core warning
+`rust-hir-syntax-only-fallback` (strict scans treat `rust-hir-memory-budget` as
+a policy violation, and the degraded result is not stored in the whole-snapshot
+cache). A failed retry keeps the scan `partial` and adds the informational
+`rust-hir-syntax-only-fallback-failed` diagnostic next to `worker-failure`.
