@@ -1,13 +1,17 @@
 use std::path::PathBuf;
 
-use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
+use depgraph_core::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
+    MAX_DEPENDENCY_EDGE_KINDS,
+};
 use depgraph_mcp_tools::{
-    ALL_CLI_ACTIONS, AgentNamedSnapshot, CapabilityProfile, CliAction, IdempotencyKey,
+    ALL_CLI_ACTIONS, AgentCurrentSnapshot, AgentNamedSnapshot, AgentRepositoryList,
+    AgentRepositorySummary, CapabilityProfile, CliAction, IdempotencyKey,
     MAX_IDEMPOTENCY_KEY_CHARS, OperationAccepted, OperationBehavior, OperationId, SuccessEnvelope,
     ToolAuthorization, ToolCatalog,
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn success_output_schema(output: &serde_json::Map<String, Value>) -> &Value {
     let branches = output
@@ -55,6 +59,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "policy_evaluate",
     "profile_plan_get",
     "repository_init",
+    "repository_list",
     "resolve_build_submit",
     "runtime_trace_import_submit",
     "runtime_trace_validate",
@@ -83,7 +88,220 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
-    assert_eq!(catalog.tools().len(), 38);
+    assert_eq!(catalog.tools().len(), 39);
+}
+
+/// Tools handled by the operation-handle path, which keeps foreign repository IDs as
+/// authorization failures instead of input correction hints.
+const OPERATION_HANDLE_TOOLS: [&str; 3] = ["operation_get", "operation_result", "operation_cancel"];
+
+#[test]
+fn issue_540_repository_id_is_optional_and_documented_for_every_tool() {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    for tool in catalog.tools() {
+        let input = tool.input_schema();
+        let required = input["required"].as_array().unwrap();
+        assert!(
+            !required.contains(&Value::String("repository_id".to_owned())),
+            "{} still requires repository_id",
+            tool.name()
+        );
+        assert!(
+            required.contains(&Value::String("contract_version".to_owned())),
+            "{} must keep contract_version required",
+            tool.name()
+        );
+        let repository_id = &input["properties"]["repository_id"];
+        assert_eq!(repository_id["pattern"], "^[A-Za-z0-9][A-Za-z0-9._:+-]*$");
+        let description = repository_id["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} repository_id has no description", tool.name()));
+        let is_operation_tool = OPERATION_HANDLE_TOOLS.contains(&tool.name());
+        let (expected, forbidden): (&[&str], &[&str]) = if is_operation_tool {
+            (
+                &[
+                    "Optional",
+                    "repository_list",
+                    "CAPABILITY_DENIED",
+                    "without details",
+                ],
+                &["INVALID_ARGUMENT", "available_repository_ids"],
+            )
+        } else {
+            (
+                &[
+                    "Optional",
+                    "repository_list",
+                    "INVALID_ARGUMENT",
+                    "available_repository_ids",
+                ],
+                &["CAPABILITY_DENIED"],
+            )
+        };
+        for expected in expected {
+            assert!(
+                description.contains(expected),
+                "{} repository_id description lacks {expected}: {description}",
+                tool.name()
+            );
+        }
+        for forbidden in forbidden {
+            assert!(
+                !description.contains(forbidden),
+                "{} repository_id description must not mention {forbidden}: {description}",
+                tool.name()
+            );
+        }
+    }
+
+    let operation_description = catalog.tool("operation_get").unwrap().input_schema()["properties"]
+        ["repository_id"]["description"]
+        .clone();
+    let read_description = catalog.tool("get_context").unwrap().input_schema()["properties"]
+        ["repository_id"]["description"]
+        .clone();
+    assert_ne!(operation_description, read_description);
+
+    let context = catalog.tool("get_context").unwrap();
+    let validator =
+        jsonschema::draft202012::new(&Value::Object(context.input_schema().clone())).unwrap();
+    assert!(validator.is_valid(&serde_json::json!({"contract_version": "depgraph-mcp-tools-v1"})));
+    assert!(validator.is_valid(&serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "repository_id": "repository"
+    })));
+    assert!(
+        context.description().contains("repository_list"),
+        "get_context description must point to repository_list"
+    );
+}
+
+#[test]
+fn issue_540_repository_list_is_an_immediate_read_only_tool_with_a_closed_output() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let list = catalog
+        .tool("repository_list")
+        .expect("repository_list is part of the read-only profile");
+    assert_eq!(list.required_capabilities(), &[DepgraphCapability::Read]);
+    assert_eq!(list.authorization(), ToolAuthorization::FixedCapabilities);
+    assert_eq!(list.operation_behavior(), OperationBehavior::Immediate);
+    assert!(list.cli_actions().is_empty());
+    assert_eq!(
+        list.input_schema()["required"],
+        serde_json::json!(["contract_version"])
+    );
+    let mut fields = list.input_schema()["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(fields, ["contract_version", "repository_id"]);
+    for expected in ["repository_id", "default"] {
+        assert!(
+            list.description().contains(expected),
+            "repository_list description lacks {expected}"
+        );
+    }
+    assert_eq!(
+        success_output_schema(list.output_schema())["properties"]["result"]["$ref"],
+        "#/$defs/AgentRepositoryList"
+    );
+
+    let output = Value::Object(list.output_schema().clone());
+    let validator = jsonschema::draft202012::new(&output).unwrap();
+    let result = AgentRepositoryList::new(vec![AgentRepositorySummary::new(
+        "repository".parse().unwrap(),
+        AgentCurrentSnapshot::unavailable(),
+    )])
+    .unwrap();
+    let envelope = SuccessEnvelope::new("repository".parse().unwrap(), None, result);
+    let mut value = serde_json::to_value(envelope).unwrap();
+    assert!(validator.is_valid(&value));
+    value["result"]["repositories"][0]["root"] = Value::String("/abs/path".to_owned());
+    assert!(
+        !validator.is_valid(&value),
+        "repository_list output must not admit an absolute root"
+    );
+}
+
+#[test]
+fn issue_543_health_hotspots_list_advertises_result_filters() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    let hotspots = catalog.tool("health_hotspots_list").unwrap();
+    let input = hotspots.input_schema();
+    let properties = input["properties"].as_object().unwrap();
+
+    let prefixes = &properties["path_prefixes"];
+    assert_eq!(prefixes["type"], "array");
+    assert_eq!(prefixes["maxItems"], 1024);
+    assert_eq!(prefixes["items"]["type"], "string");
+    assert_eq!(prefixes["items"]["minLength"], 1);
+    assert_eq!(prefixes["items"]["maxLength"], 512);
+    let description = prefixes["description"].as_str().unwrap();
+    for expected in ["directory boundary", "src/library.rs", "churn_path_filter"] {
+        assert!(
+            description.contains(expected),
+            "path_prefixes description lacks {expected}: {description}"
+        );
+    }
+
+    let kinds = &properties["node_kinds"];
+    assert_eq!(kinds["type"], "array");
+    assert_eq!(
+        kinds["items"]["enum"],
+        serde_json::json!(["file", "module", "symbol", "type", "route"])
+    );
+    assert!(
+        kinds["description"]
+            .as_str()
+            .unwrap()
+            .contains("after scoring")
+    );
+
+    // Both path lists share the service's 512-byte path bound: maxLength is
+    // the conservative character cap and the extension carries the byte cap.
+    let churn_paths = &properties["churn_path_filter"];
+    for paths in [prefixes, churn_paths] {
+        assert_eq!(paths["maxItems"], 1024, "{paths}");
+        assert_eq!(
+            paths["items"],
+            serde_json::json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "x-depgraph-maxUtf8Bytes": 512
+            }),
+            "{paths}"
+        );
+    }
+    let churn = properties["churn_path_filter"]["description"]
+        .as_str()
+        .expect("churn_path_filter documents that it does not filter results");
+    assert!(churn.contains("path_prefixes"), "{churn}");
+    assert!(
+        hotspots.description().contains("path_prefixes")
+            && hotspots.description().contains("node_kinds"),
+        "{}",
+        hotspots.description()
+    );
+    let required = input["required"].as_array().unwrap();
+    assert!(!required.contains(&Value::String("path_prefixes".to_owned())));
+    assert!(!required.contains(&Value::String("node_kinds".to_owned())));
+
+    let validator = jsonschema::draft202012::new(&Value::Object(input.clone())).unwrap();
+    let mut arguments = serde_json::json!({
+        "contract_version": "depgraph-mcp-tools-v1",
+        "path_prefixes": ["src/lib"],
+        "node_kinds": ["file", "symbol"]
+    });
+    assert!(validator.is_valid(&arguments));
+    arguments["node_kinds"] = serde_json::json!(["package"]);
+    assert!(!validator.is_valid(&arguments));
+    arguments["node_kinds"] = serde_json::json!([]);
+    arguments["path_prefixes"] = serde_json::json!([""]);
+    assert!(!validator.is_valid(&arguments));
 }
 
 #[test]
@@ -120,7 +338,6 @@ fn resolve_build_requires_acknowledgement_exact_mode_and_project_exec_authority(
         build.input_schema()["required"],
         serde_json::json!([
             "contract_version",
-            "repository_id",
             "idempotency_key",
             "acknowledgement",
             "rust_compiler_precise"
@@ -170,11 +387,11 @@ fn daemon_control_inputs_require_a_bounded_idempotency_key_and_remain_closed() {
 
     assert_eq!(
         start.input_schema()["required"],
-        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+        serde_json::json!(["contract_version", "idempotency_key"])
     );
     assert_eq!(
         stop.input_schema()["required"],
-        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+        serde_json::json!(["contract_version", "idempotency_key"])
     );
     assert_eq!(
         start.input_schema()["properties"]
@@ -339,6 +556,8 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
             [
                 "contract_version",
                 "cursor",
+                "detail",
+                "edge_kinds",
                 "environments",
                 "limit",
                 "max_traversal",
@@ -348,13 +567,14 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
                 "selector",
                 "sessions",
                 "snapshot",
+                "structural_edges",
                 "transitive",
             ]
         );
         assert_eq!(tool.operation_behavior(), OperationBehavior::Immediate);
         assert_eq!(
             success_output_schema(tool.output_schema())["properties"]["result"]["$ref"],
-            "#/$defs/AgentDependenciesResponse"
+            "#/$defs/AgentDependenciesOutput"
         );
     }
 
@@ -783,9 +1003,10 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
 
     let path = catalog.tool("graph_path_get").unwrap();
     let required = path.input_schema()["required"].as_array().unwrap();
-    for field in ["contract_version", "repository_id", "from", "to"] {
+    for field in ["contract_version", "from", "to"] {
         assert!(required.contains(&Value::String(field.to_owned())));
     }
+    assert!(!required.contains(&Value::String("repository_id".to_owned())));
 
     let operation = catalog.tool("operation_get").unwrap();
     assert_eq!(
@@ -849,7 +1070,7 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
     let context = catalog.tool("get_context").unwrap();
     assert_eq!(
         context.input_schema()["required"],
-        serde_json::json!(["contract_version", "repository_id"])
+        serde_json::json!(["contract_version"])
     );
 }
 
@@ -875,7 +1096,7 @@ fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered()
     let scan = catalog.tool("scan_submit").unwrap();
     assert_eq!(
         scan.input_schema()["required"],
-        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+        serde_json::json!(["contract_version", "idempotency_key"])
     );
     assert_eq!(
         scan.input_schema()["properties"]["idempotency_key"]["maxLength"],
@@ -921,7 +1142,7 @@ fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered()
     let runtime = catalog.tool("runtime_trace_import_submit").unwrap();
     assert_eq!(
         runtime.input_schema()["required"],
-        serde_json::json!(["contract_version", "repository_id", "idempotency_key"])
+        serde_json::json!(["contract_version", "idempotency_key"])
     );
     let runtime_input = Value::Object(runtime.input_schema().clone());
     let runtime_validator = jsonschema::draft202012::new(&runtime_input).unwrap();
@@ -1066,5 +1287,151 @@ fn assert_closed_object_nodes(value: &Value, tool: &str, kind: &str) {
             }
         }
         _ => {}
+    }
+}
+
+#[test]
+fn issue_542_dependency_lists_advertise_detail_and_one_output_shape_per_detail() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for name in ["graph_dependencies_list", "graph_dependents_list"] {
+        let tool = catalog.tool(name).expect("dependency tool");
+        let detail = &tool.input_schema()["properties"]["detail"];
+        assert_eq!(detail["type"], "string", "{name}");
+        assert_eq!(
+            detail["enum"],
+            json!(["paths", "summary", "full"]),
+            "{name}"
+        );
+        assert_eq!(detail["default"], "full", "{name}");
+        let description = detail["description"].as_str().expect("detail description");
+        for expected in ["common", "evidence_count", "paths", "byte-identical"] {
+            assert!(
+                description.contains(expected),
+                "{name} detail description lacks {expected}: {description}"
+            );
+        }
+        assert!(
+            !tool.input_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("detail")),
+            "{name} detail is optional"
+        );
+        for expected in ["agent_evidence_list", "agent_sites_list", "detail"] {
+            assert!(
+                tool.description().contains(expected),
+                "{name} description lacks {expected}: {}",
+                tool.description()
+            );
+        }
+
+        let output = tool.output_schema();
+        let definitions = output["$defs"].as_object().expect("output definitions");
+        let branches = definitions["AgentDependenciesOutput"]["oneOf"]
+            .as_array()
+            .expect("one output branch per detail");
+        assert_eq!(branches.len(), 3, "{name}");
+        for definition in [
+            "AgentDependenciesResponse",
+            "AgentDependenciesSummaryResponse",
+            "AgentDependencyPathsResponse",
+        ] {
+            assert!(
+                branches
+                    .iter()
+                    .any(|branch| branch["$ref"] == format!("#/$defs/{definition}")),
+                "{name} output lacks {definition}"
+            );
+        }
+        assert!(
+            definitions["AgentDependenciesResponse"]["properties"]
+                .get("detail")
+                .is_none(),
+            "{name} full output keeps the legacy shape"
+        );
+    }
+}
+
+#[test]
+fn issue_541_dependency_lists_advertise_edge_kind_selection() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for name in ["graph_dependencies_list", "graph_dependents_list"] {
+        let tool = catalog.tool(name).expect("dependency tool");
+        let properties = &tool.input_schema()["properties"];
+        let required = tool.input_schema()["required"].as_array().unwrap();
+        for field in ["edge_kinds", "structural_edges"] {
+            assert!(
+                !required.contains(&json!(field)),
+                "{name} {field} is optional"
+            );
+        }
+
+        let edge_kinds = &properties["edge_kinds"];
+        assert_eq!(edge_kinds["type"], "array", "{name}");
+        assert_eq!(edge_kinds["maxItems"], MAX_DEPENDENCY_EDGE_KINDS, "{name}");
+        assert_eq!(edge_kinds["uniqueItems"], true, "{name}");
+        assert_eq!(edge_kinds["items"]["type"], "string", "{name}");
+        assert_eq!(
+            edge_kinds["items"]["pattern"], "^[a-z][a-z0-9._:-]*$",
+            "{name}"
+        );
+        assert_eq!(edge_kinds["items"]["maxLength"], 64, "{name}");
+        let description = edge_kinds["description"].as_str().unwrap();
+        for expected in [
+            "Empty or omitted",
+            "structural_edges",
+            "allowlist alone decides",
+            "explicit structural_edges=exclude",
+            "INVALID_ARGUMENT",
+            "traversed_edges",
+        ] {
+            assert!(
+                description.contains(expected),
+                "{name} edge_kinds description lacks {expected}: {description}"
+            );
+        }
+
+        let structural = &properties["structural_edges"];
+        assert_eq!(structural["type"], "string", "{name}");
+        assert_eq!(structural["enum"], json!(["include", "exclude"]), "{name}");
+        assert_eq!(
+            structural["default"],
+            DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
+            "{name}"
+        );
+        let description = structural["description"].as_str().unwrap();
+        for expected in [
+            "contains",
+            "declares",
+            "generated_from",
+            "Defaults to exclude",
+            "include",
+            "edge_kinds",
+            "cursor",
+        ] {
+            assert!(
+                description.contains(expected),
+                "{name} structural_edges description lacks {expected}: {description}"
+            );
+        }
+
+        for expected in [
+            "contains",
+            "declares",
+            "generated_from",
+            "excluded by default",
+            "structural_edges=include",
+            "edge_kinds",
+        ] {
+            assert!(
+                tool.description().contains(expected),
+                "{name} description lacks {expected}: {}",
+                tool.description()
+            );
+        }
+        assert!(
+            !tool.description().contains("included by default"),
+            "{name} description still claims the old default"
+        );
     }
 }

@@ -1128,6 +1128,7 @@ fn test() -> Result<()> {
         "scripts/tests/release-post-publish-canary.test.mjs",
         "scripts/tests/homebrew-tap.test.mjs",
         "scripts/tests/ci-affected-scope.test.mjs",
+        "scripts/tests/pr-impact.test.mjs",
     ]))?;
     let gofmt = Command::new("gofmt")
         .arg("-l")

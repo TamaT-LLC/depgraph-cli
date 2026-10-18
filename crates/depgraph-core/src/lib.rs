@@ -20,6 +20,7 @@ pub mod compiler_precise_graph;
 pub mod config;
 pub mod cross_language;
 pub mod daemon;
+pub mod edge_kind_selection;
 pub mod export;
 pub mod ffi;
 pub mod ffi_link;
@@ -30,6 +31,7 @@ pub mod graphql;
 pub mod health;
 pub mod http_operation_correlation;
 pub mod impact;
+pub mod import_evidence;
 pub mod incremental;
 pub mod openapi;
 pub mod policy;
@@ -339,6 +341,11 @@ pub use daemon::{
     start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
+pub use edge_kind_selection::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, EdgeKindFilter, EdgeKindFilterError,
+    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, STRUCTURAL_EDGE_KINDS,
+    StructuralEdgeSelection, is_structural_edge_kind,
+};
 pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };
@@ -363,10 +370,10 @@ pub use health::{
     BaselineFindingRecord, BaselineTransition, BlockerKind, CollectionIdentity, Confidence,
     DEFAULT_HOTSPOT_WEIGHTS, FindingBlocker, FindingEvidenceRef, FindingIdentity, FindingKind,
     FindingKindScope, FindingSuppression, HEALTH_ANALYZER_VERSION, HEALTH_FINDING_CONTRACT_VERSION,
-    HealthFinding, HealthFindingDetail, HealthGateConfig, HealthGateDecision, HotspotFindingScores,
-    HotspotLayerScore, HotspotLayerScores, HotspotScores, HotspotWeights, Remediation, Severity,
-    SourceLocation, classify_baseline_transition, collection_digest, evaluate_health_gate,
-    finding_fingerprint, finding_id,
+    HOTSPOT_SUBJECT_KINDS, HealthFinding, HealthFindingDetail, HealthGateConfig,
+    HealthGateDecision, HotspotFindingScores, HotspotLayerScore, HotspotLayerScores, HotspotScores,
+    HotspotWeights, Remediation, Severity, SourceLocation, classify_baseline_transition,
+    collection_digest, evaluate_health_gate, finding_fingerprint, finding_id,
 };
 pub use http_operation_correlation::{
     HTTP_OPERATION_CORRELATION_VERSION, HttpOperationCorrelationOutcome,

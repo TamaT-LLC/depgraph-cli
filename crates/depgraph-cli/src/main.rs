@@ -19,7 +19,7 @@ use depgraph_core::service::{
     RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy, RepositoryRelativePath,
     ResolveBuildRequest, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
-    SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
+    SnapshotNameCreateSelector, SnapshotReadRequest, StructuralEdgeSelection, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
@@ -247,6 +247,16 @@ enum Commands {
         /// Stop traversal after this many visited dependency edges.
         #[arg(long, value_name = "N", conflicts_with = "all")]
         max_traversal: Option<usize>,
+        /// Follow only edges of this kind (repeatable), such as imports or
+        /// depends_on. Counts cover only the selected edges.
+        #[arg(long, value_name = "KIND")]
+        edge_kind: Vec<String>,
+        /// Follow structural edges (contains, declares, generated_from):
+        /// include or exclude. Omitted drops them (exclude), so counts cover
+        /// only files that actually depend on each other; with --edge-kind
+        /// the listed kinds alone decide. Use include to follow them as well.
+        #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
+        structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -268,6 +278,16 @@ enum Commands {
         /// Stop traversal after this many visited dependency edges.
         #[arg(long, value_name = "N", conflicts_with = "all")]
         max_traversal: Option<usize>,
+        /// Follow only edges of this kind (repeatable), such as imports or
+        /// depends_on. Counts cover only the selected edges.
+        #[arg(long, value_name = "KIND")]
+        edge_kind: Vec<String>,
+        /// Follow structural edges (contains, declares, generated_from):
+        /// include or exclude. Omitted drops them (exclude), so counts cover
+        /// only files that actually depend on each other; with --edge-kind
+        /// the listed kinds alone decide. Use include to follow them as well.
+        #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
+        structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -482,8 +502,20 @@ enum Commands {
     Hotspots {
         #[arg(long, value_name = "N", default_value_t = MAX_HEALTH_CHURN_COMMITS as u32)]
         churn_commit_limit: u32,
+        /// Narrow only the Git churn input to these repository-relative paths
+        /// (repeatable). Findings are not removed; use --path-prefix for that.
         #[arg(long, value_name = "PATH")]
         churn_path: Vec<String>,
+        /// Return only findings under this repository-relative path at a
+        /// directory boundary (repeatable): src/lib matches src/lib/a.ts but
+        /// not src/library.ts. Applied after scoring, so scores and IDs are
+        /// unchanged.
+        #[arg(long, value_name = "PATH")]
+        path_prefix: Vec<String>,
+        /// Return only findings of this node kind (repeatable): file, module,
+        /// symbol, type, or route. Applied after scoring.
+        #[arg(long, value_name = "KIND")]
+        node_kind: Vec<String>,
         #[arg(long, default_value_t = 2500)]
         weight_fan_in: u32,
         #[arg(long, default_value_t = 1500)]
@@ -1586,6 +1618,8 @@ async fn run(cli: Cli) -> Result<u8> {
             selector,
             transitive,
             max_traversal,
+            edge_kind,
+            structural_edges,
             phase,
             profile,
             session,
@@ -1606,7 +1640,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
-            )?;
+            )?
+            .with_edge_kind_filter(edge_kind, structural_edges)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -1637,6 +1672,8 @@ async fn run(cli: Cli) -> Result<u8> {
             selector,
             transitive,
             max_traversal,
+            edge_kind,
+            structural_edges,
             phase,
             profile,
             session,
@@ -1657,7 +1694,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
-            )?;
+            )?
+            .with_edge_kind_filter(edge_kind, structural_edges)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -2326,6 +2364,8 @@ async fn run(cli: Cli) -> Result<u8> {
         Commands::Hotspots {
             churn_commit_limit,
             churn_path,
+            path_prefix,
+            node_kind,
             weight_fan_in,
             weight_fan_out,
             weight_reverse_impact,
@@ -2344,7 +2384,8 @@ async fn run(cli: Cli) -> Result<u8> {
             .map_err(|_| DepgraphServiceError::InvalidInput)?;
             let (service, mut snapshot) =
                 health_snapshot_request(cli.store, cli.scan_id.as_deref())?;
-            let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?;
+            let request = HealthHotspotsRequest::try_new(churn_commit_limit, churn_path, weights)?
+                .with_result_filter(path_prefix, node_kind)?;
             let result =
                 service.health_hotspots(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -2368,12 +2409,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.scan_id(),
                     result.snapshot_id().as_str(),
                     result.findings(),
-                    &serde_json::json!({
-                        "collection_digest": result.collection_digest(),
-                        "churn_commit_limit": request.churn_commit_limit(),
-                        "churn_path_filter": request.churn_path_filter(),
-                        "weights": request.weights().as_map(),
-                    }),
+                    &hotspots_page_context(&request, result.collection_digest()),
                     &output,
                     json,
                     Some(&snapshot),
@@ -2852,6 +2888,29 @@ fn run_health_findings(
     }
 }
 
+/// Page context for `depgraph hotspots`.
+///
+/// An unrestricted result keeps the pre-#543 context so its cursor bytes are
+/// unchanged; each result filter binds the cursor only when set.
+fn hotspots_page_context(
+    request: &HealthHotspotsRequest,
+    collection_digest: &str,
+) -> serde_json::Value {
+    let mut context = serde_json::json!({
+        "collection_digest": collection_digest,
+        "churn_commit_limit": request.churn_commit_limit(),
+        "churn_path_filter": request.churn_path_filter(),
+        "weights": request.weights().as_map(),
+    });
+    if !request.path_prefixes().is_empty() {
+        context["path_prefixes"] = serde_json::json!(request.path_prefixes());
+    }
+    if !request.node_kinds().is_empty() {
+        context["node_kinds"] = serde_json::json!(request.node_kinds());
+    }
+    context
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_health_finding_page(
     command: &'static str,
@@ -3235,6 +3294,11 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("details: {}", report.detail_command);
 }
 
+fn parse_structural_edges(value: &str) -> std::result::Result<StructuralEdgeSelection, String> {
+    StructuralEdgeSelection::parse(value)
+        .ok_or_else(|| format!("expected include or exclude, got {value:?}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interactive_dependencies_page(
     execution: &depgraph_core::service::DependenciesResult,
@@ -3251,13 +3315,24 @@ fn interactive_dependencies_page(
         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
     let max_traversal = request.max_traversal();
     validate_interactive_query_bounds(max_items, max_bytes, Some(max_traversal))?;
-    let context = serde_json::json!({
+    let mut context = serde_json::json!({
         "selector": request.selector(),
         "transitive": request.transitive(),
         "reverse": request.direction().is_incoming(),
         "filter": request.filter(),
         "max_traversal": max_traversal,
     });
+    // Following every edge kind keeps the legacy cursor binding; any other
+    // selection binds the cursor to itself, and an allowlist alone decides
+    // its binding (Issue #541).
+    let edge_kind_filter = request.edge_kind_filter();
+    if !edge_kind_filter.is_unrestricted() {
+        context["edge_kinds"] = serde_json::json!(edge_kind_filter.edge_kinds());
+        if edge_kind_filter.edge_kinds().is_empty() {
+            context["structural_edges"] =
+                serde_json::json!(edge_kind_filter.structural_edges().as_str());
+        }
+    }
     paginate_interactive_query(
         execution.items(),
         traversal_summary(execution.traversal()),
@@ -3780,6 +3855,34 @@ mod tests {
     };
     use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
     use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
+
+    #[test]
+    fn issue_543_hotspots_page_context_keeps_legacy_keys_without_result_filter() {
+        use depgraph_core::DEFAULT_HOTSPOT_WEIGHTS;
+        use depgraph_core::service::{HealthHotspotsRequest, MAX_HEALTH_CHURN_COMMITS};
+
+        let unfiltered = HealthHotspotsRequest::try_new(
+            MAX_HEALTH_CHURN_COMMITS,
+            Vec::new(),
+            DEFAULT_HOTSPOT_WEIGHTS,
+        )
+        .unwrap();
+        assert_eq!(
+            super::hotspots_page_context(&unfiltered, "digest"),
+            serde_json::json!({
+                "collection_digest": "digest",
+                "churn_commit_limit": MAX_HEALTH_CHURN_COMMITS,
+                "churn_path_filter": [],
+                "weights": DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+            })
+        );
+        let filtered = unfiltered
+            .with_result_filter(vec!["src/lib".to_owned()], vec!["file".to_owned()])
+            .unwrap();
+        let context = super::hotspots_page_context(&filtered, "digest");
+        assert_eq!(context["path_prefixes"], serde_json::json!(["src/lib"]));
+        assert_eq!(context["node_kinds"], serde_json::json!(["file"]));
+    }
 
     #[test]
     fn issue_317_every_real_clap_leaf_maps_once_to_the_static_mcp_catalog() {

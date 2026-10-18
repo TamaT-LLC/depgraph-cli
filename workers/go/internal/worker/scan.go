@@ -492,12 +492,20 @@ func scanWithOptions(root string, inventory *repositoryInventory, analysisUnit *
 				selectedModules = append(selectedModules, module)
 			}
 		}
+		ignoredContextPaths := []string{}
 		for _, contextPath := range analysisUnit.ContextPaths {
-			contextSourcePaths[contextPath] = true
 			module := moduleForPath(modules, filepath.Join(absRoot, filepath.FromSlash(contextPath)))
 			if module == nil || !contextModules[module.Dir] {
-				return Result{}, fmt.Errorf("analysis unit context path %q is outside the local module closure", contextPath)
+				// The planner and the Go command can disagree about the local
+				// module closure. Ignoring the path keeps the closure semantics
+				// owned by this worker while the rest of the unit is analyzed.
+				ignoredContextPaths = append(ignoredContextPaths, contextPath)
+				continue
 			}
+			contextSourcePaths[contextPath] = true
+		}
+		if diagnostic, ok := ignoredContextPathsDiagnostic(absRoot, modules, ownedModules, ignoredContextPaths); ok {
+			initialDiagnostics = append(initialDiagnostics, diagnostic)
 		}
 		for _, auxiliaryPath := range analysisUnit.AuxiliaryPaths {
 			if auxiliaryPath == "go.work" {
@@ -898,6 +906,40 @@ func (s *scannerState) retainOwnedFileCompletions() {
 		}
 	}
 	s.files = owned
+}
+
+// maxReportedIgnoredContextPaths bounds the diagnostic message when a planner
+// sends many context paths that this worker does not treat as local.
+const maxReportedIgnoredContextPaths = 5
+
+// ignoredContextPathsDiagnostic reports context paths outside the local module
+// closure as one recoverable diagnostic. It is attached to the owned module
+// manifest so that analysis-unit diagnostic scoping retains it.
+func ignoredContextPathsDiagnostic(absRoot string, modules []Module, ownedModules map[string]bool, ignored []string) (Diagnostic, bool) {
+	if len(ignored) == 0 {
+		return Diagnostic{}, false
+	}
+	manifestPath := ""
+	for _, module := range modules {
+		if ownedModules[module.Dir] && module.ManifestPath != "" {
+			manifestPath = cleanSlash(relativePath(absRoot, module.ManifestPath))
+			break
+		}
+	}
+	reported := ignored
+	suffix := ""
+	if len(reported) > maxReportedIgnoredContextPaths {
+		suffix = fmt.Sprintf(" (and %d more)", len(reported)-maxReportedIgnoredContextPaths)
+		reported = reported[:maxReportedIgnoredContextPaths]
+	}
+	quoted := make([]string, 0, len(reported))
+	for _, path := range reported {
+		quoted = append(quoted, fmt.Sprintf("%q", path))
+	}
+	return Diagnostic{
+		Code: "path_confinement", Severity: "warning", Recoverable: true, Path: manifestPath,
+		Message: fmt.Sprintf("%d analysis unit context path(s) outside the local module closure were not analyzed: %s%s", len(ignored), strings.Join(quoted, ", "), suffix),
+	}, true
 }
 
 func (s *scannerState) retainAnalysisScopeDiagnostics() {

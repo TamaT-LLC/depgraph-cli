@@ -4,21 +4,26 @@ use depgraph_mcp_tools::{
     AcceptedOperationStatus, AgentBuildOutcome, AgentCapability, AgentChangedSince,
     AgentCompletedSnapshot, AgentCondition, AgentContext, AgentCorrelationDifference,
     AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
-    AgentDaemonStatus, AgentDependenciesResponse, AgentDependencyDirection, AgentEdge, AgentError,
-    AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind,
-    AgentExportOutcome, AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact,
-    AgentImpactResponse, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase,
-    AgentPolicyAnnotation, AgentPolicyApiChange, AgentPolicyEvaluationResponse,
-    AgentPolicyViolation, AgentPrecision, AgentQueryRow, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
+    AgentDaemonStatus, AgentDependenciesOutput, AgentDependenciesResponse,
+    AgentDependenciesSummaryResponse, AgentDependencyDetail, AgentDependencyDirection,
+    AgentDependencyEndpoint, AgentDependencyPath, AgentDependencyPathsResponse, AgentEdge,
+    AgentEdgeCommon, AgentEdgeSummary, AgentError, AgentErrorCategory, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
+    AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
+    AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier, AgentLocator,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
+    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryRow,
+    AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRepositorySummary, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
     AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
     AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
     CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
     LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
-    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted,
-    OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS,
+    MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
+    MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
+    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
     PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
     SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
@@ -60,6 +65,27 @@ fn evidence() -> AgentEvidence {
         parse("0.0.330"),
         Some(source_span()),
     )
+}
+
+fn import_evidence() -> AgentImportEvidence {
+    AgentImportEvidence::new(
+        parse("@/lib/foo"),
+        Some(AgentImportBindingKind::Named),
+        Some(parse("fooHelper")),
+        None,
+        false,
+    )
+    .expect("bounded import evidence")
+}
+
+fn evidence_with_import() -> AgentEvidence {
+    AgentEvidence::new(
+        AgentEvidenceKind::Semantic,
+        parse("typescript-native-typechecker"),
+        parse("7.0.2"),
+        Some(source_span()),
+    )
+    .with_import(import_evidence())
 }
 
 fn node() -> AgentNode {
@@ -561,6 +587,28 @@ fn context() -> AgentContext {
     .expect("representative context")
 }
 
+fn repository_summary(repository_id: &str) -> AgentRepositorySummary {
+    AgentRepositorySummary::new(
+        parse(repository_id),
+        AgentCurrentSnapshot::available(completed_snapshot()),
+    )
+}
+
+fn repository_list() -> AgentRepositoryList {
+    AgentRepositoryList::new(vec![repository_summary("repo-1")]).expect("representative list")
+}
+
+fn repository_error() -> AgentError {
+    AgentError::new(
+        AgentErrorCode::InvalidArgument,
+        false,
+        AgentRemediation::CorrectInput,
+        Some(AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        }),
+    )
+}
+
 fn named_snapshot() -> AgentNamedSnapshot {
     AgentNamedSnapshot::new(
         parse("baseline"),
@@ -788,6 +836,14 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
         "AgentEvidence",
         serde_json::to_value(evidence()).expect("serialize evidence"),
     );
+    assert_unknown_field_rejected::<AgentEvidence>(
+        "AgentEvidence with import",
+        serde_json::to_value(evidence_with_import()).expect("serialize evidence"),
+    );
+    assert_unknown_field_rejected::<AgentImportEvidence>(
+        "AgentImportEvidence",
+        serde_json::to_value(import_evidence()).expect("serialize import"),
+    );
     assert_unknown_field_rejected::<AgentNode>(
         "AgentNode",
         serde_json::to_value(node()).expect("serialize node"),
@@ -901,6 +957,18 @@ fn serde_rejects_unknown_fields_for_every_object_and_tagged_enum_branch() {
     assert_unknown_field_rejected::<AgentErrorDetails>(
         "AgentErrorDetails::Operation",
         json!({"kind":"operation","operation_id":OPERATION_ID}),
+    );
+    assert_unknown_field_rejected::<AgentErrorDetails>(
+        "AgentErrorDetails::Repository",
+        json!({"kind":"repository","available_repository_ids":["repo-1"]}),
+    );
+    assert_unknown_field_rejected::<AgentRepositorySummary>(
+        "AgentRepositorySummary",
+        serde_json::to_value(repository_summary("repo-1")).expect("serialize summary"),
+    );
+    assert_unknown_field_rejected::<AgentRepositoryList>(
+        "AgentRepositoryList",
+        serde_json::to_value(repository_list()).expect("serialize repository list"),
     );
     assert_unknown_field_rejected::<AgentError>(
         "AgentError",
@@ -1633,6 +1701,9 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         AgentErrorDetails::Operation {
             operation_id: parse(OPERATION_ID),
         },
+        AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        },
     ];
     for detail in details {
         let round_trip = serde_json::from_value::<AgentErrorDetails>(
@@ -1641,6 +1712,102 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         .expect("deserialize typed details");
         assert_eq!(round_trip, detail);
     }
+}
+
+#[test]
+fn issue_540_repository_ids_are_bounded_unique_and_canonically_ordered() {
+    let ids = |count: usize| {
+        (0..count)
+            .map(|index| parse::<LogicalRepositoryId>(&format!("repo-{index:03}")))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        AgentRepositoryIds::new(Vec::new()),
+        Err(ContractBuildError::RepositorySet)
+    );
+    assert_eq!(
+        AgentRepositoryIds::new(ids(MAX_AGENT_REPOSITORY_ITEMS + 1)),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let maximum = AgentRepositoryIds::new(ids(MAX_AGENT_REPOSITORY_ITEMS)).expect("maximum ids");
+    assert_eq!(maximum.as_slice().len(), MAX_AGENT_REPOSITORY_ITEMS);
+    let canonical = AgentRepositoryIds::new(vec![parse("web"), parse("api"), parse("web")])
+        .expect("constructor canonicalizes");
+    assert_eq!(
+        serde_json::to_value(&canonical).expect("serialize ids"),
+        json!(["api", "web"])
+    );
+
+    for forged in [
+        json!({"kind":"repository","available_repository_ids":[]}),
+        json!({"kind":"repository","available_repository_ids":["web","api"]}),
+        json!({"kind":"repository","available_repository_ids":["web","web"]}),
+        json!({"kind":"repository","available_repository_ids":["/abs/root"]}),
+        json!({"kind":"repository","available_repository_ids":ids(MAX_AGENT_REPOSITORY_ITEMS + 1)}),
+        json!({"kind":"repository"}),
+    ] {
+        assert!(
+            serde_json::from_value::<AgentErrorDetails>(forged.clone()).is_err(),
+            "accepted forged repository details: {forged}"
+        );
+    }
+    let envelope = ErrorEnvelope::new(parse("web"), repository_error());
+    let round_trip = serde_json::from_value::<ErrorEnvelope>(
+        serde_json::to_value(&envelope).expect("serialize envelope"),
+    )
+    .expect("deserialize envelope");
+    assert_eq!(round_trip, envelope);
+    assert_eq!(
+        round_trip.error().details(),
+        Some(&AgentErrorDetails::Repository {
+            available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        })
+    );
+}
+
+#[test]
+fn issue_540_repository_list_is_bounded_unique_and_omits_host_paths() {
+    assert_eq!(
+        AgentRepositoryList::new(Vec::new()),
+        Err(ContractBuildError::RepositorySet)
+    );
+    assert_eq!(
+        AgentRepositoryList::new(vec![repository_summary("a"), repository_summary("a")]),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let too_many = (0..=MAX_AGENT_REPOSITORY_ITEMS)
+        .map(|index| repository_summary(&format!("repo-{index:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        AgentRepositoryList::new(too_many),
+        Err(ContractBuildError::RepositorySet)
+    );
+    let ordered =
+        AgentRepositoryList::new(vec![repository_summary("web"), repository_summary("api")])
+            .expect("constructor orders repositories");
+    let ids = ordered
+        .repositories()
+        .iter()
+        .map(|summary| summary.repository_id().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["api", "web"]);
+
+    let value = serde_json::to_value(repository_list()).expect("serialize list");
+    assert_eq!(value["repositories"][0]["repository_id"], "repo-1");
+    assert_eq!(value["repositories"][0]["snapshot"]["available"], true);
+    for forbidden in ["root", "path", "store", "repository_path"] {
+        assert!(value["repositories"][0].get(forbidden).is_none());
+    }
+    let mut unordered = serde_json::to_value(&ordered).expect("serialize ordered list");
+    unordered["repositories"]
+        .as_array_mut()
+        .expect("repositories array")
+        .reverse();
+    assert!(serde_json::from_value::<AgentRepositoryList>(unordered).is_err());
+    assert!(serde_json::from_value::<AgentRepositoryList>(json!({"repositories": []})).is_err());
+    let mut with_root = serde_json::to_value(repository_list()).expect("serialize list");
+    with_root["repositories"][0]["root"] = json!("/home/user/repository");
+    assert!(serde_json::from_value::<AgentRepositoryList>(with_root).is_err());
 }
 
 #[test]
@@ -1800,9 +1967,12 @@ fn contract_samples() -> Value {
             1,
             Page::new(vec![edge()], 1, true, None).expect("sample dependency page"),
         ).expect("sample dependency response"),
+        "agent_dependencies_summary_response": dependencies_summary_response(),
+        "agent_dependency_paths_response": dependency_paths_response(),
         "agent_build_outcome": build_outcome(),
         "agent_edge": edge(),
         "agent_evidence": evidence(),
+        "agent_evidence_import": evidence_with_import(),
         "agent_impact": impact(),
         "agent_impact_response": impact_response(),
         "agent_cycle": cycle(),
@@ -1817,6 +1987,7 @@ fn contract_samples() -> Value {
         "agent_query_row": query_row(),
         "agent_runtime_validation": runtime_validation(),
         "agent_context": context(),
+        "agent_repository_list": repository_list(),
         "agent_named_snapshot": named_snapshot(),
         "agent_site": site(),
         "agent_snapshot": AgentSnapshot::available(snapshot_id, Some(parse("baseline"))),
@@ -1824,6 +1995,7 @@ fn contract_samples() -> Value {
         "durable_submit_baseline": baseline,
         "durable_submit_task": task,
         "error_envelope": error_envelope,
+        "error_envelope_repository": ErrorEnvelope::new(repository_id.clone(), repository_error()),
         "page": page,
         "page_request": PageRequest::new(
             PageSize::new(25).expect("sample page size"),
@@ -1868,4 +2040,414 @@ fn canonical_contract_samples_match_the_golden_exactly() {
 fn accepted_operation_status_is_the_closed_queued_value() {
     let value = serde_json::to_value(AcceptedOperationStatus::Queued).expect("serialize status");
     assert_eq!(value, json!("queued"));
+}
+
+// Issue #542: dependency list output granularity contracts.
+
+fn heuristic_edge() -> AgentEdge {
+    AgentEdge::new(
+        parse("edge:import-2"),
+        parse("node:src"),
+        parse("node:other"),
+        parse("calls"),
+        AgentPhase::Semantic,
+        AgentResolutionStatus::Resolved,
+        AgentPrecision::Heuristic,
+        parse("profile:default"),
+        None,
+        Some(parse("cfg(test)")),
+        Vec::new(),
+    )
+    .expect("bounded edge")
+}
+
+fn dependencies_summary_response() -> AgentDependenciesSummaryResponse {
+    let edges = [edge(), heuristic_edge()];
+    let common = AgentEdgeCommon::from_edges(&edges);
+    let items = edges
+        .iter()
+        .map(|edge| AgentEdgeSummary::project(edge, &common))
+        .collect::<Vec<_>>();
+    AgentDependenciesSummaryResponse::new(
+        node(),
+        AgentDependencyDirection::Outgoing,
+        false,
+        true,
+        2,
+        common,
+        Page::new(items, 2, true, None).expect("summary page"),
+    )
+    .expect("summary response")
+}
+
+fn dependency_path() -> AgentDependencyPath {
+    AgentDependencyPath::new(
+        AgentDependencyEndpoint::Path(parse("src/lib.rs")),
+        AgentDependencyEndpoint::Id(parse("node:external")),
+        parse("imports"),
+    )
+}
+
+fn dependency_paths_response() -> AgentDependencyPathsResponse {
+    AgentDependencyPathsResponse::new(
+        node(),
+        AgentDependencyDirection::Incoming,
+        true,
+        true,
+        3,
+        Page::new(vec![dependency_path()], 1, true, None).expect("paths page"),
+    )
+    .expect("paths response")
+}
+
+#[test]
+fn issue_542_dependency_detail_dtos_reject_unknown_fields() {
+    let summary = serde_json::to_value(dependencies_summary_response()).expect("summary");
+    assert_unknown_field_rejected::<AgentDependenciesSummaryResponse>(
+        "AgentDependenciesSummaryResponse",
+        summary.clone(),
+    );
+    assert_unknown_field_rejected::<AgentEdgeCommon>("AgentEdgeCommon", summary["common"].clone());
+    assert_unknown_field_rejected::<AgentEdgeSummary>(
+        "AgentEdgeSummary",
+        summary["edges"]["items"][0].clone(),
+    );
+    let paths = serde_json::to_value(dependency_paths_response()).expect("paths");
+    assert_unknown_field_rejected::<AgentDependencyPathsResponse>(
+        "AgentDependencyPathsResponse",
+        paths.clone(),
+    );
+    assert_unknown_field_rejected::<AgentDependencyPath>(
+        "AgentDependencyPath",
+        paths["paths"]["items"][0].clone(),
+    );
+    assert_unknown_field_rejected::<AgentDependenciesOutput>(
+        "AgentDependenciesOutput::Summary",
+        summary,
+    );
+    assert_unknown_field_rejected::<AgentDependenciesOutput>(
+        "AgentDependenciesOutput::Paths",
+        paths,
+    );
+    assert_unknown_field_rejected::<AgentDependenciesOutput>(
+        "AgentDependenciesOutput::Full",
+        serde_json::to_value(
+            AgentDependenciesResponse::new(
+                node(),
+                AgentDependencyDirection::Outgoing,
+                false,
+                true,
+                1,
+                Page::new(vec![edge()], 1, true, None).expect("page"),
+            )
+            .expect("full response"),
+        )
+        .expect("full"),
+    );
+}
+
+#[test]
+fn issue_542_summary_shape_keeps_each_shared_field_in_exactly_one_place() {
+    let value = serde_json::to_value(dependencies_summary_response()).expect("summary");
+    assert_eq!(value["detail"], "summary");
+    assert_eq!(
+        value["common"],
+        json!({"phase":"semantic","resolution_status":"resolved","profile_id":"profile:default","condition":"cfg(test)"})
+    );
+    assert_eq!(
+        value["edges"]["items"][0],
+        json!({"id":"edge:import-1","source_id":"node:src","target_id":"node:dependency","kind":"imports","precision":"exact","site_id":"site:import-1","evidence_count":1})
+    );
+    let round_trip: AgentDependenciesSummaryResponse =
+        serde_json::from_value(value.clone()).expect("summary round trip");
+    assert_eq!(round_trip, dependencies_summary_response());
+
+    let mut repeated = value.clone();
+    repeated["edges"]["items"][0]["phase"] = json!("semantic");
+    assert!(
+        serde_json::from_value::<AgentDependenciesSummaryResponse>(repeated).is_err(),
+        "a field hoisted into common must not repeat per edge"
+    );
+    let mut missing = value.clone();
+    missing["edges"]["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("precision");
+    assert!(
+        serde_json::from_value::<AgentDependenciesSummaryResponse>(missing).is_err(),
+        "a field absent from common must be present per edge"
+    );
+    let mut oversized = value;
+    oversized["edges"]["items"][0]["evidence_count"] = json!(MAX_AGENT_EVIDENCE_ITEMS + 1);
+    assert!(serde_json::from_value::<AgentDependenciesSummaryResponse>(oversized).is_err());
+}
+
+#[test]
+fn issue_542_path_endpoints_carry_exactly_one_of_path_or_id() {
+    let value = serde_json::to_value(dependency_path()).expect("path");
+    assert_eq!(
+        value,
+        json!({"source_path":"src/lib.rs","target_id":"node:external","kind":"imports"})
+    );
+    for invalid in [
+        json!({"source_path":"src/lib.rs","source_id":"node:src","target_id":"node:x","kind":"imports"}),
+        json!({"target_id":"node:x","kind":"imports"}),
+        json!({"source_path":"src/lib.rs","kind":"imports"}),
+        json!({"source_path":"/abs/lib.rs","target_id":"node:x","kind":"imports"}),
+    ] {
+        assert!(
+            serde_json::from_value::<AgentDependencyPath>(invalid.clone()).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn issue_542_dependency_output_deserializes_each_detail_to_one_variant() {
+    let full = AgentDependenciesResponse::new(
+        node(),
+        AgentDependencyDirection::Outgoing,
+        false,
+        true,
+        1,
+        Page::new(vec![edge()], 1, true, None).expect("page"),
+    )
+    .expect("full response");
+    for (output, detail) in [
+        (
+            AgentDependenciesOutput::Full(full.clone()),
+            AgentDependencyDetail::Full,
+        ),
+        (
+            AgentDependenciesOutput::Summary(dependencies_summary_response()),
+            AgentDependencyDetail::Summary,
+        ),
+        (
+            AgentDependenciesOutput::Paths(dependency_paths_response()),
+            AgentDependencyDetail::Paths,
+        ),
+    ] {
+        let value = serde_json::to_value(&output).expect("serialize output");
+        let parsed: AgentDependenciesOutput =
+            serde_json::from_value(value).expect("deserialize output");
+        assert_eq!(parsed.detail(), detail);
+        assert_eq!(parsed, output);
+    }
+    assert_eq!(
+        serde_json::to_value(AgentDependenciesOutput::Full(full.clone())).unwrap(),
+        serde_json::to_value(&full).unwrap(),
+        "full output keeps the legacy bytes without a detail field"
+    );
+    let mut tagged_full = serde_json::to_value(&full).unwrap();
+    tagged_full["detail"] = json!("full");
+    assert!(serde_json::from_value::<AgentDependenciesOutput>(tagged_full).is_err());
+    let mut summary_as_paths = serde_json::to_value(dependencies_summary_response()).unwrap();
+    summary_as_paths["detail"] = json!("paths");
+    assert!(serde_json::from_value::<AgentDependenciesOutput>(summary_as_paths).is_err());
+    assert_eq!(
+        serde_json::to_value(AgentDependencyDetail::default()).unwrap(),
+        json!("full")
+    );
+}
+
+// Issue #544: import evidence carries the specifier and the imported binding.
+
+#[test]
+fn evidence_without_import_keeps_the_legacy_bytes() {
+    let value = serde_json::to_value(evidence()).expect("serialize evidence");
+    assert!(value.get("import").is_none());
+    assert_eq!(
+        value,
+        json!({
+            "kind":"semantic",
+            "extractor":"rust-analyzer",
+            "extractor_version":"0.0.330",
+            "span":{"path":"src/lib.rs","start":{"line":1,"column":2},"end":{"line":3,"column":4}}
+        })
+    );
+}
+
+#[test]
+fn import_evidence_serializes_only_present_fields_and_round_trips() {
+    let value = serde_json::to_value(evidence_with_import()).expect("serialize evidence");
+    assert_eq!(
+        value["import"],
+        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper"})
+    );
+    let parsed: AgentEvidence = serde_json::from_value(value).expect("round trip");
+    assert_eq!(parsed, evidence_with_import());
+    assert_eq!(
+        parsed.import().map(|import| import.specifier().as_str()),
+        Some("@/lib/foo")
+    );
+
+    let full = AgentImportEvidence::new(
+        parse("crate::domain::Named"),
+        Some(AgentImportBindingKind::Named),
+        Some(parse("Named")),
+        Some(parse("NameContract")),
+        true,
+    )
+    .expect("full import evidence");
+    assert_eq!(
+        serde_json::to_value(&full).unwrap(),
+        json!({
+            "specifier":"crate::domain::Named",
+            "binding_kind":"named",
+            "imported_name":"Named",
+            "local_name":"NameContract",
+            "type_only":true
+        })
+    );
+    let specifier_only: AgentImportEvidence =
+        serde_json::from_value(json!({"specifier":"example.com/pkg/util"}))
+            .expect("specifier only");
+    assert_eq!(specifier_only.binding_kind(), None);
+    assert_eq!(
+        serde_json::to_value(&specifier_only).unwrap(),
+        json!({"specifier":"example.com/pkg/util"})
+    );
+}
+
+#[test]
+fn import_binding_kind_is_a_closed_enum() {
+    for kind in [
+        "default",
+        "named",
+        "namespace",
+        "import_equals",
+        "side_effect",
+        "require",
+        "dynamic",
+        "import_type",
+        "named_reexport",
+        "namespace_reexport",
+        "export_star",
+        "reexport",
+        "glob",
+        "glob_reexport",
+        "extern_crate",
+    ] {
+        let parsed: AgentImportBindingKind =
+            serde_json::from_value(json!(kind)).unwrap_or_else(|_| panic!("{kind} is valid"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(kind));
+    }
+    for invalid in ["Named", "wildcard", "", "named_import"] {
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(
+                json!({"specifier":"./a","binding_kind":invalid})
+            )
+            .is_err(),
+            "binding_kind {invalid:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn import_specifier_and_names_are_bounded_and_credential_free() {
+    let at_limit = "a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES);
+    assert!(AgentImportSpecifier::parse(&at_limit).is_ok());
+    assert!(AgentImportSpecifier::parse("a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES + 1)).is_err());
+    assert!(AgentImportSpecifier::parse("").is_err());
+    assert!(AgentImportSpecifier::parse("./a\u{7}b").is_err());
+    assert!(AgentImportSpecifier::parse("./a\nb").is_err());
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"a".repeat(MAX_AGENT_IMPORT_SPECIFIER_BYTES + 1)})
+        )
+        .is_err()
+    );
+
+    for credential in [
+        "https://cdn.example.test/mod.js?token=abc123",
+        concat!("gh", "p_0123456789abcdef0123456789abcdef"),
+        concat!("Bear", "er abcdefghijklmnop"),
+    ] {
+        assert_eq!(
+            AgentImportEvidence::new(parse(credential), None, None, None, false),
+            Err(ContractBuildError::ImportEvidence),
+            "{credential}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":credential})).is_err(),
+            "{credential}"
+        );
+    }
+    assert_eq!(
+        AgentImportEvidence::new(
+            parse("./auth"),
+            Some(AgentImportBindingKind::Named),
+            Some(parse("apiKey")),
+            None,
+            false
+        ),
+        Err(ContractBuildError::ImportEvidence)
+    );
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"./auth","local_name":"clientSecret"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AgentImportEvidence>(
+            json!({"specifier":"./a","imported_name":"x".repeat(257)})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn import_specifier_with_url_userinfo_is_rejected_on_build_and_deserialize() {
+    for specifier in [
+        concat!("https://alice:s3cr3tvalue", "@registry.example.test/mod.js"),
+        concat!("https://u:p", "@host/x.js"),
+        "git+ssh://user@host/x",
+    ] {
+        assert_eq!(
+            AgentImportEvidence::new(parse(specifier), None, None, None, false),
+            Err(ContractBuildError::ImportEvidence),
+            "{specifier}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":specifier})).is_err(),
+            "{specifier}"
+        );
+    }
+    for specifier in [
+        "@scope/pkg",
+        concat!("npm:", "@scope/pkg@1.0.0"),
+        "jsr:@std/path",
+        "node:fs",
+        concat!("https://esm.sh/", "@scope/pkg@1.0.0"),
+        concat!("https://cdn.example.test/mod.js?v", "@1"),
+        concat!("https://cdn.example.test/mod.js#v", "@1"),
+    ] {
+        assert!(
+            AgentImportEvidence::new(parse(specifier), None, None, None, false).is_ok(),
+            "{specifier}"
+        );
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(json!({"specifier":specifier})).is_ok(),
+            "{specifier}"
+        );
+    }
+}
+
+#[test]
+fn import_evidence_rejects_raw_properties_and_detail() {
+    for field in [
+        "properties",
+        "detail",
+        "raw",
+        "occurrence_kind",
+        "module_specifier",
+    ] {
+        let mut value = serde_json::to_value(import_evidence()).expect("serialize import");
+        value[field] = json!("raw");
+        assert!(
+            serde_json::from_value::<AgentImportEvidence>(value).is_err(),
+            "AgentImportEvidence accepted {field}"
+        );
+    }
 }

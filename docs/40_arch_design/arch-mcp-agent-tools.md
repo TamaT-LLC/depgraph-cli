@@ -42,6 +42,11 @@ additive extensionとして採用するかを決定する。
 | Agent host onboarding | verified package preflight, generated host configuration, clean-environment connection probe | Issue #358 implemented through `depgraph agent-config` and `mcp-package-smoke-v3` |
 | Scoped Agent host onboarding | Codex/Claude Code/Cursor/Grok, project/user config, verified shared artifacts, repository-specific Store, lifecycle commands | Issue #387 foundation extended through `depgraph mcp setup/status/update/uninstall` and five-target post-publish E2E |
 | Code-health tools | `health_summary_get`, `health_findings_list`, `health_finding_get`, `health_audit_get`, `health_hotspots_list` | Issue #423 implemented through the shared read-only `DepgraphService` and `depgraph-health-finding-v1` |
+| Repository discovery | `repository_list`, optional `repository_id` | Issue #540 implemented: omitted `repository_id` binds to the server repository; mismatches return `INVALID_ARGUMENT` with the valid IDs, except `operation_get` / `operation_result` / `operation_cancel`, which keep `CAPABILITY_DENIED` without details |
+| Hotspot result filters | `health_hotspots_list` `path_prefixes` / `node_kinds`, CLI `hotspots --path-prefix` / `--node-kind` | Issue #543 implemented: filters apply after scoring, so scores and finding IDs are unchanged |
+| Dependency list output detail | `graph_dependencies_list` / `graph_dependents_list` `detail` (`paths` / `summary` / `full`) | Issue #542 implemented: `full` stays the default and byte-identical; `summary` and `paths` shrink the response without changing the traversal |
+| Import evidence detail | `AgentEvidence.import` (`specifier`, `binding_kind`, `imported_name`, `local_name`, `type_only`) | Issue #544 implemented: only `agent_evidence_list`, `agent_sites_list` and `agent_edges_list` project it, from evidence properties or the import site specifier; dependency list `full`, path, impact and unresolved responses keep the previous shape |
+| Dependency list edge kind selection | `graph_dependencies_list` / `graph_dependents_list` `edge_kinds` / `structural_edges`, CLI `deps` / `dependents` `--edge-kind` / `--structural-edges` | Issue #541 implemented; since v0.7.0 the default is `exclude` (breaking change), and `include` restores the previous every-kind traversal |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -811,6 +816,81 @@ commandはhost設定fileを変更せず、成功した設定だけをstdoutへ�
 | documentationと生成結果を同期 | shared `depgraph-agent-host-config-v1` renderer、README/runbook marker parser、format/profile mutation tests |
 | dogfood blockerのresolution | runbookのP0/P1/P2分類、safe scan remediation、compiler-pack boundary再評価記録 |
 | repository validation | Rust 1.93.1 format、focused CLI/MCP/xtask suites、native package smoke、workspace Clippy `-D warnings`、`cargo xtask test` |
+
+## Issue #540 repository discovery evidence
+
+Agentが最初の呼び出しで`repository_id`を推測して失敗しないよう、次の境界を固定する。
+
+| Area | Evidence |
+| --- | --- |
+| Optional input | 全toolのinput schemaで`repository_id`はrequiredから外れ、descriptionに既定値と取得方法を書く。省略時はserverが束縛する単一repositoryを使う。指定した場合のpattern検証は従来どおり |
+| Correctable error | 束縛repositoryと異なる値は`INVALID_ARGUMENT` / `correct_input`になり、`error.details`はclosed variant `{"kind":"repository","available_repository_ids":[...]}`を返す。IDは1〜64件、昇順、重複なしをconstructor、deserializer、schema(`uniqueItems`)で検証する |
+| Operation tools | `operation_get` / `operation_result` / `operation_cancel`は省略を許可する。明示した別repositoryは従来どおり`CAPABILITY_DENIED`（`error.details`なし）のまま。operation handleは作成したrepositoryに束縛されるため、この3 toolの`repository_id` descriptionだけはこの挙動を書き、`INVALID_ARGUMENT`と`available_repository_ids`には触れない |
+| `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
+
+## Issue #543 hotspot result filter evidence
+
+`health_hotspots_list`の応答を必要な範囲に絞れるよう、次の境界を固定する。
+
+| Area | Evidence |
+| --- | --- |
+| Input | `path_prefixes`（repository相対path、最大1024件、各512 byte以下、`RepositoryRelativePath`で検証し昇順・重複なしに正規化。`churn_path_filter`も同じ上限で、両者のschemaは`maxLength` 512と`x-depgraph-maxUtf8Bytes` 512を持つ）と`node_kinds`（closed enum `file`/`module`/`symbol`/`type`/`route`、hotspot analyzerの対象種別と同じ定数）を任意入力として追加する。不正値は`INVALID_ARGUMENT` |
+| Matching | path prefixはディレクトリ境界で一致させる。`src/lib`は`src/lib`と`src/lib/a.ts`に一致し`src/library.ts`には一致しない。pathを持たないfindingは一致しない。二つの条件はANDで、各リスト内はOR |
+| Score stability | 全候補を採点した後に絞り込むため、正規化score、finding ID、fingerprintは絞り込まない場合と同じ。`churn_path_filter`はGit churnの入力だけを絞り、結果は絞らないことをdescriptionに明記する |
+| Identity | `CollectionIdentity`に`hotspot_path_prefixes` / `hotspot_node_kinds`を`skip_serializing_if`付きで追加する。空の場合のdigestは従来と同じbytesになり、絞り込んだ集合はcomplete集合とdigestを共有しない。cursorの正規化入力（MCP）とページ文脈（CLI）には空でない条件だけを含める。条件を指定しない要求は従来の正規化入力のままでcursorも同じbytesになり、条件が違うcursorは`CURSOR_MISMATCH` |
+| CLI parity | AC-006/AC-015に従い`depgraph hotspots`へ繰り返し指定できる`--path-prefix` / `--node-kind`を追加し、stdio process testでCLIとMCPのdigest、ID、scoreの一致を検証する |
+| Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |
+
+## Issue #542 dependency list output detail evidence
+
+依存一覧の応答がAgentのcontextを圧迫しないよう、`graph_dependencies_list`と`graph_dependents_list`へ出力粒度を追加する。走査、filter、件数上限は変えず、射影だけを変える。
+
+| Area | Evidence |
+| --- | --- |
+| Input | 任意入力`detail`（closed enum `paths` / `summary` / `full`、既定`full`）を追加する。不正値は`INVALID_ARGUMENT`。CLI `deps` / `dependents`の意味は変わらないためCLIへは追加しない |
+| `full` | 従来の`AgentDependenciesResponse`をそのまま返す。`detail`を省略した応答と`detail: "full"`の応答、および変更前の射影はbyte単位で同一で、`detail` fieldを持たない |
+| `summary` | `AgentDependenciesSummaryResponse`（`detail: "summary"`）。各edgeは`AgentEdgeSummary`として`id`、`source_id`、`target_id`、`kind`、`site_id?`、`evidence_count`を持ち、evidence本体を含めない。`phase`、`resolution_status`、`precision`、`profile_id`、`condition`のうち走査結果の全edgeで同じ値のものは`common`（`AgentEdgeCommon`）に1回だけ出し、各edgeからは省く。共通でない値だけedgeごとに残す。各fieldが`common`とedgeのどちらか一方だけにあることをconstructorとdeserializerで検証する |
+| `common`の範囲 | ページ内ではなく走査結果全体で計算する。ページごとに`common`が変わらないため、cursorで続きを取ってもedgeの形が揃い、byte予算の固定部分も一度だけ測ればよい |
+| `paths` | `AgentDependencyPathsResponse`（`detail: "paths"`）。各itemは`AgentDependencyPath`で、source / targetのそれぞれに`*_path`（repository相対path）か、pathを持たないnodeでは`*_id`（node ID）のどちらか一方と、edgeの`kind`だけを持つ。(source, target, kind)が同じitemは走査順の最初の1件に重複除去するため、`total_items`は走査edge数以下になる。conditionを射影しないため、condition総byte数の上限は適用しない |
+| Evidence | 根拠が必要なedgeは、`site_id`を使って`agent_sites_list` / `agent_evidence_list`で個別に取得する。tool descriptionに明記する |
+| Output schema | 出力schemaは`AgentDependenciesOutput`の`oneOf`で、`full`は`detail`を持たない従来形、`summary` / `paths`は必須の`detail` const tagを持つ。全objectが`additionalProperties: false`のため、どの応答も一つの分岐にだけ一致する。Rust側も`detail`の有無と値で一つのvariantへdeserializeする |
+| Paging | 三つの粒度とも`WrappedPageByteProjection`で固定部分（root、counter、`summary`では`common`）を一度測り、候補itemのcanonical bytesを足して1 MiB以内のページを選ぶ。cursor digestは粒度ごとの射影済み集合全体を覆う |
+| Cursor | `full`以外では正規化入力に`detail`を含める。`full`は従来の正規化入力のままでcursorも同じbytesになる。粒度の違うcursorは`CURSOR_MISMATCH` |
+| Extension | 粒度の選択は`DependencyProjectionRequest`に閉じているため、edge kindの絞り込み（Issue #541）は同じ要求型と正規化入力へ追加できる。`graph_impact_get`と`agent_edges_list`への展開は今後の候補とする |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する。既存の`$defs`と`agent_dependencies_response` sampleは変化せず、新しい定義だけが増える |
+
+## Issue #541 dependency list edge kind selection
+
+依存一覧の件数がそのまま依存しているファイル数になるよう、`graph_dependencies_list`と`graph_dependents_list`へ辺種別の選択を追加する。v0.7.0で既定を`exclude`へ切り替え、構造上の辺を既定で除外する（破壊的変更）。従来の挙動は`structural_edges: "include"` / `--structural-edges include`で得られる。
+
+| Area | Evidence |
+| --- | --- |
+| Structural edges | core `edge_kind_selection::STRUCTURAL_EDGE_KINDS`（`contains`、`declares`、`generated_from`、システム設計§7.2のStructure分類）に一つだけ定義する。health unusedなど既存の散在箇所は判定対象が異なる（`generated_from`を含まない等）ため、挙動を変えないよう今回は統合しない |
+| Input | 任意入力`edge_kinds`（Agent token形式の許可リスト、最大64件、`uniqueItems`）と`structural_edges`（closed enum `include` / `exclude`）を追加する。`edge_kinds`が空または省略なら全種別を対象にし、`structural_edges`で構造上の辺を残すか決める。`edge_kinds`を指定した場合は列挙した種別だけを辿る |
+| Contradiction | `structural_edges: "exclude"`を明示し、構造上の種別を含む`edge_kinds`を同時に指定した場合だけを矛盾として`INVALID_ARGUMENT`にする。`edge_kinds`を指定して`structural_edges`を省略した場合は、既定の除外を適用せず許可リストだけで決まる（構造上の種別も指定できる）。`structural_edges: "include"`と許可リストの同時指定も許可リストだけで決まる。入力は`structural_edges`の省略と明示を区別し（core `Option<StructuralEdgeSelection>`）、MCPでは`null`を省略として扱わず`INVALID_ARGUMENT`にする。不正な種別文字列、65件以上、未知の`structural_edges`値も`INVALID_ARGUMENT`。存在しない種別は許可し、結果が空になる |
+| Traversal | core `DependenciesRequest::with_edge_kind_filter`で選択を受け取り、`adjacency_cancellable`が隣接表を作る段階で選ばれない種別を除く。そのため`items`、`nodes`、`total_items`、`traversed_edges`、`max_traversal`の消費は選んだ辺だけで数える。`why` / `impact`などほかの走査は`EdgeKindFilter::unrestricted()`を渡し、挙動を変えない |
+| Default | 既定値はcore `DEFAULT_STRUCTURAL_EDGE_SELECTION`（v0.7.0から`exclude`）の定数一つで決まる。`StructuralEdgeSelection::default()`、`EdgeKindFilter::default()`、MCPの省略時、CLIの省略時、入力schemaの`default`はすべてこの定数を参照する。v0.6.4までの既定（全種別を辿る）からの切り替えは破壊的変更として`docs/releases/unreleased.md`に記載する |
+| Cursor | 全種別を辿る選択（`structural_edges: "include"`かつ`edge_kinds`なし）は従来の正規化入力のままで、cursorも同じbytesになる。それ以外では正規化入力に`edge_kinds`を含め、選択の違うcursorは`CURSOR_MISMATCH`。`edge_kinds`が空のときだけ`structural_edges`も含める。許可リストを指定した場合は許可リストだけで決まるため、`structural_edges`の省略・`include`・`exclude`のどれでも同じcursorになる。既定の`exclude`は明示した`exclude`と同じ正規化入力・cursorになる。既定の要求は切り替え前と正規化入力が変わるため、v0.6.4までのcursorを既定の要求へ渡すと`CURSOR_MISMATCH`になり、`include`を明示した要求では引き続き使える |
+| Detail | 選択は走査に、#542の`detail`は射影にかかるため独立に組み合わせられる。`paths` / `summary`でも件数と`traversed_edges`は選んだ辺だけを数える |
+| CLI parity | `depgraph deps` / `dependents`へ繰り返し指定できる`--edge-kind`と`--structural-edges`（`include` / `exclude`）を追加する。CLIのページcursorの文脈も同じ規則で選択を含める。stdio process testでCLIとMCPのedge ID集合の一致を検証する |
+| Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |
+
+## Issue #544 import evidence detail
+
+Agentがファイルを開かずに「なぜ依存しているか」を説明できるよう、import根拠のevidenceにspecifierと取り込んだbindingを含める。`import`を出すのは`agent_evidence_list`、`agent_sites_list`、`agent_edges_list`の`AgentEvidence`だけで、任意fieldとして現れる。`graph_dependencies_list` / `graph_dependents_list`の`full`は#542で従来と同じ形を約束しているため、`full`と同じ`PathStep`由来のevidence（`graph_path_get`の`steps`、`graph_impact_get`の`dependency_path`）、およびquery結果から射影する`graph_unresolved_list`には`import`を付けず、変更前とbyte単位で同一に保つ。
+
+| Area | Evidence |
+| --- | --- |
+| Output | `AgentEvidence`へ任意field `import`（`AgentImportEvidence`）を追加する。`specifier`（必須、`AgentImportSpecifier`、1〜1024 UTF-8 bytes、制御文字禁止）、`binding_kind?`、`imported_name?`、`local_name?`（`AgentLabel`）、`type_only`（`true`のときだけ出力）を持つ。import根拠を持たないevidenceは`import`を出さず、変更前とbyte単位で同一 |
+| `binding_kind` | closed enum `default` / `named` / `namespace` / `import_equals` / `side_effect` / `require` / `dynamic` / `import_type` / `named_reexport` / `namespace_reexport` / `export_star` / `reexport` / `glob` / `glob_reexport` / `extern_crate`。抽出器が区別を記録していない場合は省略する |
+| Allowlist | core `import_evidence::project_import_evidence`がevidence propertiesのうちTypeScriptの`occurrence_kind` / `module_specifier` / `imported_name` / `type_only`、Rust HIRの`target_specifier` / `glob` / `reexport` / `alias`だけを読む。importでない`occurrence_kind`（`type_reference`、`call_expression`など）は投影しない。その他のproperties、raw detailは従来どおり公開しない |
+| Site fallback | propertiesにimportの記述がないとき、siteが分かる経路（`agent_evidence_list` / `agent_sites_list`のsite evidence、`agent_edges_list`のsiteを持つedge evidence）ではimport系site kind（`import`、`side_effect_import`、`dynamic_import`、`require`、`type_import`、`type_import_equals`、`reexport`、`type_reexport`）の`specifier`を使う。TypeScriptの補助syntax evidence（`occurrence_kind`だけを持つ）もsite specifierで補う |
+| Disclosure bounds | specifierは1024 bytes、名前は256 bytesを上限とし、超過・制御文字・core `contains_credential_shape`に当たる値と、specifierのうち`scheme://`の後のauthority（最初の`/` `?` `#`まで）に`@`を含むURL userinfo（`https://<userinfo>@host/...`、`git+ssh://user@host/...`）は省略する。`://`を持たない`@scope/pkg`、`npm:@scope/pkg@<version>`、`jsr:@std/path`は対象外。specifierが省略された場合は`import`全体を出さず、名前だけが該当した場合はその名前だけを省く。constructorとdeserializerも同じ判定で拒否し、出力時の`redact_public_value`も従来どおり適用される。field名にtoken / secret / passwordを含めない |
+| Language coverage | TypeScript semantic: specifier、binding_kind、imported_name、type_only。TypeScript syntax-only: specifierとsite kindから分かるbinding_kindとtype_only（`side_effect_import`→`side_effect`、`dynamic_import`→`dynamic`、`require`→`require`、`type_import_equals`→`import_equals`かつ`type_only`、`reexport`→`reexport`、`type_reexport`→`reexport`かつ`type_only`。通常の`import`はbinding_kindを省略し、`type_import`はbinding_kindを省略して`type_only`だけを出す）。Rust HIR: use pathをspecifierとし、末尾segmentをimported_name、`as`別名をlocal_name、glob / re-export / extern crateを区別する。Go: import pathだけ（シンボル名の概念がなく、workerはaliasを記録しない）。TypeScriptのlocal別名はworkerが記録しないため出さない |
+| CLI | CLIのJSON出力とstore recordは変えない。`EvidenceProjection`はMCP内部専用の射影で、`PathStep`へもfieldを追加しない |
+| Compatibility | 依存一覧の`full`などは`import`を持たないため、`deny_unknown_fields`でdeserializeする旧clientもそのまま受け取れる。edgeの根拠が必要なら`site_id`で`agent_evidence_list` / `agent_sites_list`を呼ぶ。`graph_dependencies_list` / `graph_dependents_list`のdescriptionにも明記する |
+| Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する（依存一覧から`import`を外した変更ではcatalogのdescriptionだけが変わる）。schemaは`AgentEvidence`に`import`が増え、`AgentImportEvidence` / `AgentImportBindingKind` / `AgentImportSpecifier`が追加されるだけで、他の`$defs`と既存sampleは変化しない。contract goldenには`agent_evidence_import` sampleを追加する |
 
 ## Issue #292 acceptance mapping
 

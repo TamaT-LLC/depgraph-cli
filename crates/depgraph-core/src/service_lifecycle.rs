@@ -1267,7 +1267,7 @@ fn contains_absolute_path(text: &str) -> bool {
     })
 }
 
-fn contains_credential_shape(text: &str) -> bool {
+pub(crate) fn contains_credential_shape(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let trimmed = lower.trim_start();
     let auth_scheme = ["bearer ", "basic "].iter().any(|scheme| {

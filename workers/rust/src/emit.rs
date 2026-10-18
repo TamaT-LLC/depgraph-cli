@@ -9,12 +9,31 @@ use depgraph_protocol::{
     ProfileCompleted, ProfileDeclared, ProtocolEvent, ScanCompleted, ScanStarted,
 };
 
-/// Build a complete typed v1.0 event stream.
+/// Stream a complete typed v1.0 event stream into `sink`, one event at a time,
+/// and return how many events were emitted.
 ///
-/// Debug and test builds validate the producer contract here. Release builds
-/// avoid duplicating the full event graph because the core always validates
-/// the worker stream at its process trust boundary before any store mutation.
-pub fn build_events(scan_id: &str, result: &ScanResult) -> Result<Vec<ProtocolEvent>> {
+/// The scan result is consumed: each node, site, edge, and diagnostic moves
+/// into its event, so the result and the event stream are never both resident.
+/// This does not validate; `ProtocolValidator` retains every event it checks,
+/// so validating callers wrap the sink themselves (see `build_events` and the
+/// debug build of the worker binary). Release builds rely on the core, which
+/// always validates the worker stream at its process trust boundary.
+pub fn emit_events(
+    scan_id: &str,
+    result: ScanResult,
+    mut sink: impl FnMut(ProtocolEvent) -> Result<()>,
+) -> Result<u64> {
+    let ScanResult {
+        root,
+        profile,
+        nodes,
+        sites,
+        edges,
+        diagnostics,
+        files,
+        coverage,
+        performance: _,
+    } = result;
     let mut seq = 0_u64;
     let mut common = || {
         seq += 1;
@@ -27,74 +46,83 @@ pub fn build_events(scan_id: &str, result: &ScanResult) -> Result<Vec<ProtocolEv
         }
     };
 
-    let mut events = vec![
-        ProtocolEvent::ScanStarted(ScanStarted {
-            common: common(),
-            root: result.root.clone(),
-            project_code_executed: false,
-            safe_mode: true,
-        }),
-        ProtocolEvent::ProfileDeclared(ProfileDeclared {
-            common: common(),
-            profile: result.profile.clone(),
-        }),
-    ];
-    events.extend(result.nodes.iter().cloned().map(|node| {
-        ProtocolEvent::NodeUpsert(NodeUpsert {
+    sink(ProtocolEvent::ScanStarted(ScanStarted {
+        common: common(),
+        root,
+        project_code_executed: false,
+        safe_mode: true,
+    }))?;
+    let profile_id = profile.id.clone();
+    sink(ProtocolEvent::ProfileDeclared(ProfileDeclared {
+        common: common(),
+        profile,
+    }))?;
+    for node in nodes {
+        sink(ProtocolEvent::NodeUpsert(NodeUpsert {
             common: common(),
             node,
-        })
-    }));
-    events.extend(result.sites.iter().cloned().map(|site| {
-        ProtocolEvent::DependencySite(DependencySiteEvent {
+        }))?;
+    }
+    for site in sites {
+        sink(ProtocolEvent::DependencySite(DependencySiteEvent {
             common: common(),
             site,
-        })
-    }));
-    events.extend(result.edges.iter().cloned().map(|edge| {
-        ProtocolEvent::EdgeUpsert(EdgeUpsert {
+        }))?;
+    }
+    for edge in edges {
+        sink(ProtocolEvent::EdgeUpsert(EdgeUpsert {
             common: common(),
             edge,
-        })
-    }));
-    events.extend(result.diagnostics.iter().cloned().map(|diagnostic| {
-        ProtocolEvent::Diagnostic(DiagnosticEvent {
+        }))?;
+    }
+    for diagnostic in diagnostics {
+        sink(ProtocolEvent::Diagnostic(DiagnosticEvent {
             common: common(),
             diagnostic,
-        })
-    }));
-    events.extend(result.files.iter().map(|file| {
-        ProtocolEvent::FileCompleted(FileCompleted {
+        }))?;
+    }
+    for file in files {
+        sink(ProtocolEvent::FileCompleted(FileCompleted {
             common: common(),
-            path: file.path.clone(),
+            skipped_sites: file.discovered_sites.saturating_sub(file.emitted_sites),
+            path: file.path,
             discovered_sites: file.discovered_sites,
             emitted_sites: file.emitted_sites,
-            skipped_sites: file.discovered_sites.saturating_sub(file.emitted_sites),
             skipped: file.skipped,
-            reason: file.reason.clone(),
-        })
-    }));
-    events.push(ProtocolEvent::ProfileCompleted(ProfileCompleted {
-        common: common(),
-        profile_id: result.profile.id.clone(),
-        coverage: result.coverage.clone(),
-    }));
-    events.push(ProtocolEvent::ScanCompleted(ScanCompleted {
-        common: common(),
-        coverage: result.coverage.clone(),
-    }));
-
-    #[cfg(debug_assertions)]
-    {
-        let mut validator = ProtocolValidator::new();
-        for event in events.iter().cloned() {
-            validator
-                .push(event)
-                .context("Rust worker generated an invalid protocol event")?;
-        }
-        validator
-            .finish()
-            .context("Rust worker generated an incomplete protocol stream")?;
+            reason: file.reason,
+        }))?;
     }
+    sink(ProtocolEvent::ProfileCompleted(ProfileCompleted {
+        common: common(),
+        profile_id,
+        coverage: coverage.clone(),
+    }))?;
+    sink(ProtocolEvent::ScanCompleted(ScanCompleted {
+        common: common(),
+        coverage,
+    }))?;
+    Ok(seq)
+}
+
+/// Build a complete typed v1.0 event stream in memory.
+///
+/// Debug and test builds validate the producer contract here. The worker
+/// binary streams with `emit_events` instead so it never holds the stream.
+pub fn build_events(scan_id: &str, result: ScanResult) -> Result<Vec<ProtocolEvent>> {
+    let mut events = Vec::new();
+    #[cfg(debug_assertions)]
+    let mut validator = ProtocolValidator::new();
+    emit_events(scan_id, result, |event| {
+        #[cfg(debug_assertions)]
+        validator
+            .push(event.clone())
+            .context("Rust worker generated an invalid protocol event")?;
+        events.push(event);
+        Ok(())
+    })?;
+    #[cfg(debug_assertions)]
+    validator
+        .finish()
+        .context("Rust worker generated an incomplete protocol stream")?;
     Ok(events)
 }

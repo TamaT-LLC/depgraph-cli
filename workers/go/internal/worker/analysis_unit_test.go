@@ -822,3 +822,65 @@ func callGraphLimitDiagnosticForSite(diagnostics []Diagnostic, siteID string) *D
 	}
 	return nil
 }
+
+// Issue #538: a planner that disagrees with the Go command about the local
+// module closure must not abort the whole worker. The out-of-closure context
+// path is ignored with a recoverable diagnostic, and the closure semantics
+// (an unrelated sibling stays external) are unchanged.
+func TestScanAnalysisUnitIgnoresContextPathsOutsideLocalModuleClosure(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app", "go.mod"), "module example.com/app\n\ngo 1.26.1\n\nrequire example.com/lib v1.0.0\n")
+	writeTestFile(t, filepath.Join(root, "app", "main.go"), "package app\n\nimport _ \"example.com/lib/pkg\"\n")
+	writeTestFile(t, filepath.Join(root, "lib", "go.mod"), "module example.com/lib\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "lib", "pkg", "lib.go"), "package pkg\n")
+
+	const outsidePath = "lib/pkg/lib.go"
+	for _, stage := range []AnalysisUnitStage{AnalysisUnitStageSyntax, AnalysisUnitStageSemantic} {
+		t.Run(string(stage), func(t *testing.T) {
+			request := AnalysisUnitRequest{
+				ContractVersion:    AnalysisUnitContractVersion,
+				UnitID:             "analysis-unit:app",
+				Adapter:            AdapterName,
+				UnitRoot:           "app",
+				SourcePaths:        []string{"app/main.go"},
+				Stage:              stage,
+				ContextPaths:       []string{"app/main.go", outsidePath},
+				ChunkID:            "chunk-0",
+				ChunkCount:         1,
+				ContextFingerprint: "outside-closure-context",
+			}
+			result, err := ScanWithAnalysisUnit(root, "", request)
+			if err != nil {
+				t.Fatalf("ScanWithAnalysisUnit() error = %v", err)
+			}
+			var diagnostic *Diagnostic
+			for index := range result.Diagnostics {
+				if result.Diagnostics[index].Code == "path_confinement" && result.Diagnostics[index].Path == "app/go.mod" {
+					diagnostic = &result.Diagnostics[index]
+				}
+			}
+			if diagnostic == nil || !diagnostic.Recoverable || diagnostic.Severity != "warning" ||
+				!strings.Contains(diagnostic.Message, "outside the local module closure") ||
+				!strings.Contains(diagnostic.Message, outsidePath) {
+				t.Fatalf("missing recoverable path_confinement diagnostic for %s: %+v", outsidePath, result.Diagnostics)
+			}
+			if stage == AnalysisUnitStageSyntax {
+				// Source import sites are owned by the syntax stage; the
+				// sibling stays external because no go.work or replace puts it
+				// in the local closure.
+				assertSiteStatus(t, result.Sites, "side_effect_import", "example.com/lib/pkg", "external")
+			}
+			for _, file := range result.Files {
+				if strings.HasPrefix(file.Path, "lib/") {
+					t.Fatalf("out-of-closure context file was analyzed: %+v", file)
+				}
+			}
+			for _, node := range result.Nodes {
+				relativeDir, _ := node.Properties["relative_dir"].(string)
+				if relativeDir == "lib" || strings.HasPrefix(relativeDir, "lib/") {
+					t.Fatalf("out-of-closure module was loaded: %+v", node)
+				}
+			}
+		})
+	}
+}

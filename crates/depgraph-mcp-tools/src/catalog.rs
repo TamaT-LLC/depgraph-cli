@@ -1,21 +1,27 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
-use depgraph_core::service::{MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES};
-use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
+use depgraph_core::service::{
+    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, MAX_HEALTH_FILTER_ITEMS, MAX_HOTSPOT_PATH_BYTES,
+};
+use depgraph_core::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
+    HOTSPOT_SUBJECT_KINDS, MAX_DEPENDENCY_EDGE_KINDS, StructuralEdgeSelection,
+};
 use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
+    AgentDependenciesOutput, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
     AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
     AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
-    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRuntimeValidationResponse,
-    AgentSite, AgentSnapshotDiffResponse, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
-    LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
-    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse, AgentToken,
+    AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
+    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
+    SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -324,7 +330,16 @@ macro_rules! tool_spec {
 const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "get_context",
-        "Get logical repository identity, enabled capabilities, and current snapshot context.",
+        "Get logical repository identity, enabled capabilities, and current snapshot context. repository_id is optional on every tool and defaults to the repository this server is bound to; the returned repository_id, repository_list, and INVALID_ARGUMENT error.details.available_repository_ids all report the valid value.",
+        [],
+        [],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "repository_list",
+        "List the logical repositories this server can address, each with its latest completed snapshot summary. Use the returned repository_id for other tools, or omit repository_id to use the server's default (bound) repository. Host-private root and Store paths are never returned.",
         [],
         [],
         READ,
@@ -430,7 +445,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependencies_list",
-        "Traverse outgoing dependency edges from one selector.",
+        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
         [
             "selector",
             "snapshot",
@@ -440,6 +455,9 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "sessions",
             "environments",
             "max_traversal",
+            "edge_kinds",
+            "structural_edges",
+            "detail",
             "cursor",
             "limit"
         ],
@@ -450,7 +468,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependents_list",
-        "Traverse incoming dependency edges from one selector.",
+        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
         [
             "selector",
             "snapshot",
@@ -460,6 +478,9 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "sessions",
             "environments",
             "max_traversal",
+            "edge_kinds",
+            "structural_edges",
+            "detail",
             "cursor",
             "limit"
         ],
@@ -618,11 +639,13 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_hotspots_list",
-        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights.",
+        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights. path_prefixes and node_kinds narrow the returned findings after scoring, so scores and finding IDs equal the unfiltered ranking; churn_path_filter only narrows the Git churn input.",
         [
             "snapshot",
             "churn_commit_limit",
             "churn_path_filter",
+            "path_prefixes",
+            "node_kinds",
             "weight_fan_in",
             "weight_fan_out",
             "weight_reverse_impact",
@@ -784,14 +807,11 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
         "contract_version".to_owned(),
         json!({"type": "string", "const": MCP_TOOLS_CONTRACT_VERSION}),
     );
-    properties.insert(
-        "repository_id".to_owned(),
-        scalar_schema::<LogicalRepositoryId>(),
-    );
+    properties.insert("repository_id".to_owned(), repository_id_schema(spec.name));
     for field in spec.input_fields {
         properties.insert((*field).to_owned(), field_schema(spec.name, field));
     }
-    let mut required = vec!["contract_version", "repository_id"];
+    let mut required = vec!["contract_version"];
     required.extend_from_slice(required_input_fields(spec.name));
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -839,6 +859,9 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         "get_context" => {
             return exact_success_output_schema::<AgentContext>(spec.name);
         }
+        "repository_list" => {
+            return exact_success_output_schema::<AgentRepositoryList>(spec.name);
+        }
         "agent_node_get" => {
             return exact_success_output_schema::<AgentNode>(spec.name);
         }
@@ -873,7 +896,7 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
             return exact_success_output_schema::<AgentDoctor>(spec.name);
         }
         "graph_dependencies_list" | "graph_dependents_list" => {
-            return exact_success_output_schema::<AgentDependenciesResponse>(spec.name);
+            return exact_success_output_schema::<AgentDependenciesOutput>(spec.name);
         }
         "graph_path_get" => {
             return exact_success_output_schema::<AgentPathResponse>(spec.name);
@@ -1089,6 +1112,17 @@ fn accepted_operation_output_schema() -> Value {
     })
 }
 
+/// Hotspot path lists share the service's byte bound: `maxLength` is a
+/// conservative character cap and the extension carries the exact UTF-8 limit.
+fn hotspot_path_item_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_HOTSPOT_PATH_BYTES,
+        "x-depgraph-maxUtf8Bytes": MAX_HOTSPOT_PATH_BYTES
+    })
+}
+
 fn field_schema(tool_name: &str, field: &str) -> Value {
     match field {
         "query" if tool_name == "graph_query" => json!({
@@ -1109,6 +1143,25 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "direction" => {
             json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
         }
+        "edge_kinds" => json!({
+            "type": "array",
+            "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
+            "uniqueItems": true,
+            "items": scalar_schema::<AgentToken>(),
+            "description": "Follow only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, subject to structural_edges. When structural_edges is omitted, the allowlist alone decides, so structural kinds (contains, declares, generated_from) may be listed. Listing a structural kind with an explicit structural_edges=exclude is contradictory and returns INVALID_ARGUMENT. Applied during traversal, so total_items and traversed_edges count only the selected edges. A cursor is bound to the selection."
+        }),
+        "structural_edges" => json!({
+            "type": "string",
+            "enum": [StructuralEdgeSelection::Include.as_str(), StructuralEdgeSelection::Exclude.as_str()],
+            "default": DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
+            "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. When edge_kinds is given, the allowlist alone decides and omission does not exclude structural kinds. A cursor is bound to the selection."
+        }),
+        "detail" => json!({
+            "type": "string",
+            "enum": ["paths", "summary", "full"],
+            "default": "full",
+            "description": "Output granularity. full (default) is byte-identical to the response without detail. summary returns each edge as id, source_id, target_id, kind, site_id and evidence_count, and states phase, resolution_status, precision, profile_id and condition once in common when every traversed edge shares the value. paths returns unique source/target repository paths (the node ID when a node has no path) with the edge kind. A cursor is bound to its detail."
+        }),
         "cursor" => scalar_schema::<Cursor>(),
         "operation_id" => scalar_schema::<OperationId>(),
         "idempotency_key" => scalar_schema::<IdempotencyKey>(),
@@ -1170,8 +1223,26 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": 1024,
             "items": scalar_schema::<AgentLocator>()
         }),
+        "churn_path_filter" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": hotspot_path_item_schema(),
+            "description": "Repository-relative paths that narrow only the Git churn input (the git_churn layer). It does not remove findings from the result; use path_prefixes for that."
+        }),
+        "path_prefixes" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": hotspot_path_item_schema(),
+            "description": "Return only findings whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Findings without a path never match. Applied after scoring, unlike churn_path_filter which only narrows the Git churn input. Empty or omitted means no restriction."
+        }),
+        "node_kinds" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": {"type": "string", "enum": HOTSPOT_SUBJECT_KINDS},
+            "description": "Return only findings whose subject is one of these hotspot node kinds. Applied after scoring, so scores and finding IDs are unchanged. Empty or omitted means every kind."
+        }),
         "kinds" | "profiles" | "conditions" | "phases" | "sessions" | "environments"
-        | "severities" | "confidences" | "churn_path_filter" => json!({
+        | "severities" | "confidences" => json!({
             "type": "array",
             "maxItems": 1024,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096}
@@ -1189,6 +1260,27 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
     }
+}
+
+const REPOSITORY_ID_DESCRIPTION: &str = "Optional logical repository ID. When omitted, the tool uses the repository this server is bound to (the default). Discover valid values with repository_list or get_context; an unknown value fails with INVALID_ARGUMENT whose error.details.available_repository_ids lists the valid IDs.";
+
+// Operation handles stay bound to the repository that created them, so a foreign
+// repository_id is an authorization failure rather than an input correction hint.
+const OPERATION_REPOSITORY_ID_DESCRIPTION: &str = "Optional. Defaults to the repository bound to this server. Operation handles are bound to the repository that created them; a different repository_id returns CAPABILITY_DENIED without details. Use repository_list or get_context to read the bound id.";
+
+fn repository_id_schema(tool_name: &str) -> Value {
+    let description = match tool_name {
+        "operation_get" | "operation_result" | "operation_cancel" => {
+            OPERATION_REPOSITORY_ID_DESCRIPTION
+        }
+        _ => REPOSITORY_ID_DESCRIPTION,
+    };
+    let mut schema = scalar_schema::<LogicalRepositoryId>();
+    schema
+        .as_object_mut()
+        .expect("logical repository ID schema is an object")
+        .insert("description".to_owned(), json!(description));
+    schema
 }
 
 fn snapshot_selector_schema() -> Value {

@@ -1,0 +1,205 @@
+name: depgraph PR impact
+description: >-
+  Scan the pull request head with depgraph (static analysis only; project code
+  is never executed), compute the reverse impact of every changed file, and
+  render a Markdown report for the job summary and, optionally, a PR comment.
+
+inputs:
+  version:
+    description: depgraph release version to download, without the leading "v".
+    required: false
+    default: "0.6.4"
+  depgraph-path:
+    description: Use this depgraph binary instead of downloading a release. A relative path is resolved from the workspace root.
+    required: false
+    default: ""
+  base-ref:
+    description: Base revision of the pull request (pass github.event.pull_request.base.sha).
+    required: true
+  strict:
+    description: Run `depgraph scan --strict`. Violations are reported, not enforced.
+    required: false
+    default: "false"
+  profiles:
+    description: Newline-separated profile IDs passed to `depgraph impact --profile`.
+    required: false
+    default: ""
+  max-files:
+    description: Maximum number of changed files to query; the rest are reported as skipped.
+    required: false
+    default: "200"
+  max-nodes:
+    description: Optional `depgraph impact --max-nodes` bound (1 to 1000000).
+    required: false
+    default: ""
+  max-edges:
+    description: Optional `depgraph impact --max-edges` bound (1 to 1000000).
+    required: false
+    default: ""
+  post-comment:
+    description: "Create or update the PR comment. Requires `pull-requests: write` on the token."
+    required: false
+    default: "false"
+  pr-number:
+    description: Pull request number the comment is posted to.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  comment-author:
+    description: Login whose marked comment is updated, in addition to github-actions[bot].
+    required: false
+    default: ""
+  github-token:
+    description: Token for the release download and the optional comment.
+    required: false
+    default: ${{ github.token }}
+  working-directory:
+    description: Directory to scan, relative to the workspace.
+    required: false
+    default: "."
+
+outputs:
+  report-path:
+    description: Path of the aggregated report.json.
+    value: ${{ steps.paths.outputs.report-path }}
+  comment-path:
+    description: Path of the rendered comment.md.
+    value: ${{ steps.paths.outputs.comment-path }}
+  scan-exit-code:
+    description: Exit code of `depgraph scan`.
+    value: ${{ steps.scan.outputs.exit-code }}
+  impacted-count:
+    description: Number of distinct impacted graph nodes.
+    value: ${{ steps.collect.outputs.impacted-count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      id: paths
+      shell: bash
+      env:
+        INPUT_STRICT: ${{ inputs.strict }}
+        INPUT_POST_COMMENT: ${{ inputs.post-comment }}
+      run: |
+        set -euo pipefail
+        for pair in "strict=$INPUT_STRICT" "post-comment=$INPUT_POST_COMMENT"; do
+          case "${pair#*=}" in
+            true | false) ;;
+            *) echo "::error::${pair%%=*} must be true or false" >&2; exit 2 ;;
+          esac
+        done
+        # A job may call this Action more than once (for example one scan root
+        # per monorepo package), so each call gets its own directory instead of
+        # sharing a fixed path that a later call would overwrite.
+        out_dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/depgraph-pr-impact.XXXXXX")"
+        {
+          echo "out-dir=${out_dir}"
+          echo "store=${out_dir}/store.db"
+          echo "scan-path=${out_dir}/scan.json"
+          echo "scan-stderr-path=${out_dir}/scan.stderr"
+          echo "report-path=${out_dir}/report.json"
+          echo "comment-path=${out_dir}/comment.md"
+        } >>"$GITHUB_OUTPUT"
+
+    - name: Install depgraph
+      id: install
+      if: inputs.depgraph-path == ''
+      shell: bash
+      env:
+        DEPGRAPH_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: '"${GITHUB_ACTION_PATH}/install.sh"'
+
+    - name: Resolve depgraph binary
+      id: binary
+      shell: bash
+      env:
+        INPUT_DEPGRAPH_PATH: ${{ inputs.depgraph-path }}
+        INSTALLED_PATH: ${{ steps.install.outputs.depgraph-path }}
+      run: |
+        set -euo pipefail
+        binary="${INPUT_DEPGRAPH_PATH:-$INSTALLED_PATH}"
+        if [[ -z "$binary" || ! -x "$binary" ]]; then
+          echo "::error::depgraph binary is not executable" >&2
+          exit 2
+        fi
+        # Later steps run in inputs.working-directory, so pin the binary to an
+        # absolute path resolved from this step's directory (the workspace).
+        binary="$(cd -- "$(dirname -- "$binary")" && pwd -P)/$(basename -- "$binary")"
+        version="$("$binary" --version | awk '{ print $2 }')"
+        echo "path=${binary}" >>"$GITHUB_OUTPUT"
+        echo "version=${version}" >>"$GITHUB_OUTPUT"
+
+    - name: Scan the pull request head
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DEPGRAPH_BIN: ${{ steps.binary.outputs.path }}
+        DEPGRAPH_STORE: ${{ steps.paths.outputs.store }}
+        SCAN_OUTPUT_PATH: ${{ steps.paths.outputs.scan-path }}
+        SCAN_STDERR_PATH: ${{ steps.paths.outputs.scan-stderr-path }}
+        INPUT_STRICT: ${{ inputs.strict }}
+      run: |
+        set -euo pipefail
+        args=(--store "$DEPGRAPH_STORE" scan . --json)
+        if [[ "$INPUT_STRICT" == "true" ]]; then
+          args+=(--strict)
+        fi
+        set +e
+        "$DEPGRAPH_BIN" "${args[@]}" >"$SCAN_OUTPUT_PATH" 2>"$SCAN_STDERR_PATH"
+        code=$?
+        set -e
+        echo "exit-code=${code}" >>"$GITHUB_OUTPUT"
+        echo "depgraph scan exited with ${code}"
+        if [[ "$code" -ne 0 ]]; then
+          tail -n 40 "$SCAN_STDERR_PATH" >&2 || true
+        fi
+
+    - name: Collect impact for changed files
+      id: collect
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DEPGRAPH_BIN: ${{ steps.binary.outputs.path }}
+        DEPGRAPH_VERSION: ${{ steps.binary.outputs.version }}
+        DEPGRAPH_STORE: ${{ steps.paths.outputs.store }}
+        REPORT_PATH: ${{ steps.paths.outputs.report-path }}
+        SCAN_OUTPUT_PATH: ${{ steps.paths.outputs.scan-path }}
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+        BASE_REF: ${{ inputs.base-ref }}
+        PROFILES: ${{ inputs.profiles }}
+        MAX_FILES: ${{ inputs.max-files }}
+        MAX_NODES: ${{ inputs.max-nodes }}
+        MAX_EDGES: ${{ inputs.max-edges }}
+        STRICT: ${{ inputs.strict }}
+      run: node "${GITHUB_ACTION_PATH}/collect.mjs"
+
+    - name: Render the impact report
+      shell: bash
+      env:
+        REPORT_PATH: ${{ steps.paths.outputs.report-path }}
+        COMMENT_PATH: ${{ steps.paths.outputs.comment-path }}
+      run: |
+        set -euo pipefail
+        node "${GITHUB_ACTION_PATH}/render.mjs"
+        cat "$COMMENT_PATH" >>"$GITHUB_STEP_SUMMARY"
+
+    - name: Post or update the PR comment
+      if: inputs.post-comment == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        COMMENT_PATH: ${{ steps.paths.outputs.comment-path }}
+        COMMENT_AUTHOR: ${{ inputs.comment-author }}
+      run: node "${GITHUB_ACTION_PATH}/comment.mjs"
+
+    - name: Fail when the scan produced no usable graph
+      if: steps.collect.outputs.scan-status == 'failed'
+      shell: bash
+      env:
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+      run: |
+        echo "::error::depgraph scan failed with exit ${SCAN_EXIT_CODE}; see the job summary" >&2
+        exit 1

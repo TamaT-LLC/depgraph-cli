@@ -11,6 +11,7 @@ use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::edge_kind_selection::EdgeKindFilter;
 use crate::service_limits::{
     MAX_GRAPH_EVIDENCE_ITEMS, MAX_GRAPH_PHASE_COVERAGE_ITEMS,
     MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_UNRESOLVED_CORRELATION_REASONS,
@@ -963,6 +964,7 @@ pub fn traverse_bounded_filtered(
         transitive,
         reverse,
         filter,
+        &EdgeKindFilter::unrestricted(),
         max_traversal,
         || false,
     )
@@ -975,6 +977,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
     transitive: bool,
     reverse: bool,
     filter: &GraphQueryFilter,
+    edge_kinds: &EdgeKindFilter,
     max_traversal: usize,
     is_cancelled: impl FnMut() -> bool,
 ) -> Result<BoundedTraversalResult> {
@@ -984,6 +987,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable(
         transitive,
         reverse,
         filter,
+        edge_kinds,
         max_traversal,
         MAX_INTERACTIVE_QUERY_TRAVERSAL,
         is_cancelled,
@@ -997,6 +1001,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable_with_adjacency_limit(
     transitive: bool,
     reverse: bool,
     filter: &GraphQueryFilter,
+    edge_kinds: &EdgeKindFilter,
     max_traversal: usize,
     max_adjacency_inspection: usize,
     mut is_cancelled: impl FnMut() -> bool,
@@ -1014,6 +1019,7 @@ pub(crate) fn traverse_bounded_filtered_cancellable_with_adjacency_limit(
         snapshot,
         reverse,
         filter,
+        edge_kinds,
         max_adjacency_inspection,
         &mut is_cancelled,
     )?;
@@ -1134,6 +1140,7 @@ pub fn why_filtered(
         snapshot,
         false,
         filter,
+        &EdgeKindFilter::unrestricted(),
         MAX_INTERACTIVE_QUERY_TRAVERSAL,
         &mut || false,
     )?;
@@ -1774,6 +1781,7 @@ fn adjacency_cancellable<'a>(
     snapshot: &'a GraphSnapshot,
     reverse: bool,
     filter: &GraphQueryFilter,
+    edge_kinds: &EdgeKindFilter,
     max_inspected_edges: usize,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(CanonicalAdjacency<'a>, bool)> {
@@ -1785,7 +1793,9 @@ fn adjacency_cancellable<'a>(
         if inspected_edges >= max_inspected_edges {
             return Ok((ordered, false));
         }
-        if !filter.matches_edge(snapshot, edge) {
+        // Unselected kinds never enter the adjacency, so traversal counters
+        // and materialized results cover only the selected edges.
+        if !edge_kinds.allows(&edge.kind) || !filter.matches_edge(snapshot, edge) {
             continue;
         }
         let (key, next) = if reverse {
@@ -1960,6 +1970,7 @@ mod tests {
             &graph,
             false,
             &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
             usize::MAX,
             &mut || {
                 checks += 1;
@@ -1978,6 +1989,7 @@ mod tests {
             &graph,
             false,
             &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
             usize::MAX,
             &mut || {
                 checks += 1;
@@ -1991,10 +2003,14 @@ mod tests {
     #[test]
     fn adjacency_construction_honors_its_independent_inspection_cap() -> Result<()> {
         let graph = snapshot();
-        let (adjacency, complete) =
-            adjacency_cancellable(&graph, false, &GraphQueryFilter::default(), 1, &mut || {
-                false
-            })?;
+        let (adjacency, complete) = adjacency_cancellable(
+            &graph,
+            false,
+            &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
+            1,
+            &mut || false,
+        )?;
         assert!(!complete);
         assert_eq!(adjacency.values().map(BTreeMap::len).sum::<usize>(), 1);
         Ok(())
@@ -2009,6 +2025,7 @@ mod tests {
             true,
             false,
             &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
             100,
             1,
             || false,

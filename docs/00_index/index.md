@@ -21,6 +21,10 @@
 | PROJ-ARC-001-ADR-010 | PROJ-ARC-001 | [Pre-split analysis planning by dependency scope and work estimate](../40_arch_design/adr-presplit-analysis-planning.md) | Implemented |
 | PROJ-ARC-001-ADR-011 | PROJ-ARC-001 | [v0.6 release, migration, and source contract](../40_arch_design/adr-v0.6-release-contract.md) | Accepted |
 
+## 設計メモ
+
+- [設計メモ: GitHub Action による PR 影響範囲コメント](../40_arch_design/design-github-action-pr-impact.md)（Draft）
+
 ## 運用手順
 
 - [GitHub Actionsを使ったリリース手順](../50_test/release-procedure.md)

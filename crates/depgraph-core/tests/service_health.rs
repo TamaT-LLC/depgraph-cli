@@ -980,3 +980,232 @@ fn issue_423_health_hotspots_degrade_missing_layers_deterministically() -> Resul
     }));
     Ok(())
 }
+
+/// Seed one snapshot with every hotspot subject kind, including a sibling path
+/// (`src/library.rs`) that shares a string prefix but not a directory with
+/// `src/lib`.
+fn seed_issue_543_hotspot_snapshot(
+    store: &mut Store,
+    root: &Path,
+    scan_id: &str,
+    revision: &str,
+) -> Result<String> {
+    store.start_scan_with_revision(scan_id, root, false, Some(revision))?;
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["semantic-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": scan_id,
+            "adapter": "health-fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started)?;
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "fixture:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile)?;
+    let mut seq = 3_u64;
+    for (id, kind, path) in [
+        ("file:src/lib/a.rs", "file", Some("src/lib/a.rs")),
+        ("file:src/library.rs", "file", Some("src/library.rs")),
+        ("symbol:src/lib/a.rs#run", "symbol", Some("src/lib/a.rs")),
+        ("module:src/lib", "module", Some("src/lib")),
+        ("type:src/lib/a.rs#Config", "type", Some("src/lib/a.rs")),
+        ("route:/health", "route", None),
+        ("package:serde", "package", None),
+    ] {
+        let mut node = common("node_upsert", seq);
+        let properties = path.map_or_else(
+            || json!({"language": "rust"}),
+            |path| json!({"path": path, "language": "rust"}),
+        );
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("repo://{id}"),
+            "display_name": id,
+            "properties": properties
+        });
+        store.ingest_event(&node)?;
+        seq += 1;
+    }
+    for (index, (source, target)) in [
+        ("file:src/library.rs", "file:src/lib/a.rs"),
+        ("file:src/lib/a.rs", "symbol:src/lib/a.rs#run"),
+        ("module:src/lib", "file:src/lib/a.rs"),
+        ("route:/health", "symbol:src/lib/a.rs#run"),
+        ("symbol:src/lib/a.rs#run", "type:src/lib/a.rs#Config"),
+        ("file:src/library.rs", "package:serde"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edge = common("edge_upsert", seq);
+        edge["edge"] = json!({
+            "id": format!("edge:issue-543:{index}"),
+            "source": source,
+            "target": target,
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:rust",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge)?;
+        seq += 1;
+    }
+    let mut profile_completed = common("profile_completed", seq);
+    profile_completed["profile_id"] = json!("fixture:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed)?;
+    let mut completed = common("scan_completed", seq + 1);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed)?;
+    store.finish_scan(scan_id, "completed", None, true)?;
+    Ok(store
+        .current_snapshot_id()?
+        .expect("completed hotspot snapshot is promoted"))
+}
+
+fn issue_543_subjects(result: &depgraph_core::service::HealthHotspotsResult) -> Vec<&str> {
+    result
+        .findings()
+        .iter()
+        .map(|finding| finding.subject_id.as_str())
+        .collect()
+}
+
+#[test]
+fn issue_543_hotspot_result_filter_keeps_scores_ids_and_empty_digest_stable() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repo");
+    fs::create_dir_all(root.join("src"))?;
+    let revision = init_git(&root);
+    let store_path = temporary.path().join("graph.sqlite");
+    let mut store = Store::open(&store_path)?;
+    let snapshot_id =
+        seed_issue_543_hotspot_snapshot(&mut store, &root, "issue-543-hotspots", &revision)?;
+    drop(store);
+
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut snapshot =
+        service.start_snapshot_request_at_cancellable(&SnapshotLocator::Current, &cancellation)?;
+    let unfiltered = || HealthHotspotsRequest::try_new(8, Vec::new(), DEFAULT_HOTSPOT_WEIGHTS);
+    let all = service.health_hotspots(&mut snapshot, &unfiltered()?, &cancellation)?;
+    assert_eq!(all.findings().len(), 6, "{:?}", issue_543_subjects(&all));
+
+    // An empty filter is the unfiltered request, and its digest keeps the
+    // pre-#543 identity bytes (no filter keys at all).
+    let empty = service.health_hotspots(
+        &mut snapshot,
+        &unfiltered()?.with_result_filter(Vec::new(), Vec::new())?,
+        &cancellation,
+    )?;
+    assert_eq!(empty.collection_digest(), all.collection_digest());
+    let legacy_identity: depgraph_core::CollectionIdentity = serde_json::from_value(json!({
+        "snapshot_ids": [snapshot_id],
+        "churn_start_oid": revision,
+        "churn_commit_limit": 8,
+        "hotspot_weights": DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+    }))?;
+    let all_ids = all
+        .findings()
+        .iter()
+        .map(|finding| finding.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        all.collection_digest(),
+        depgraph_core::collection_digest(&legacy_identity, &all_ids)
+    );
+
+    // Directory-boundary prefix: `src/lib` matches `src/lib` itself and
+    // `src/lib/a.rs`, never `src/library.rs`; pathless subjects never match.
+    let by_prefix = service.health_hotspots(
+        &mut snapshot,
+        &unfiltered()?.with_result_filter(vec!["src/lib".to_owned()], Vec::new())?,
+        &cancellation,
+    )?;
+    let mut prefixed = issue_543_subjects(&by_prefix);
+    prefixed.sort_unstable();
+    assert_eq!(
+        prefixed,
+        [
+            "file:src/lib/a.rs",
+            "module:src/lib",
+            "symbol:src/lib/a.rs#run",
+            "type:src/lib/a.rs#Config",
+        ]
+    );
+
+    let by_kind = service.health_hotspots(
+        &mut snapshot,
+        &unfiltered()?
+            .with_result_filter(Vec::new(), vec!["symbol".to_owned(), "route".to_owned()])?,
+        &cancellation,
+    )?;
+    let mut kinded = issue_543_subjects(&by_kind);
+    kinded.sort_unstable();
+    assert_eq!(kinded, ["route:/health", "symbol:src/lib/a.rs#run"]);
+
+    let both = service.health_hotspots(
+        &mut snapshot,
+        &unfiltered()?.with_result_filter(
+            vec!["src/lib".to_owned(), "src/library.rs".to_owned()],
+            vec!["file".to_owned()],
+        )?,
+        &cancellation,
+    )?;
+    let mut combined = issue_543_subjects(&both);
+    combined.sort_unstable();
+    assert_eq!(combined, ["file:src/lib/a.rs", "file:src/library.rs"]);
+
+    // Filtering happens after scoring: every kept finding is byte-identical
+    // to the unfiltered one (ID, fingerprint, normalized scores), the rank
+    // order is preserved, and only the collection digest changes.
+    for filtered in [&by_prefix, &by_kind, &both] {
+        let expected = all
+            .findings()
+            .iter()
+            .filter(|finding| {
+                filtered
+                    .findings()
+                    .iter()
+                    .any(|kept| kept.subject_id == finding.subject_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(filtered.findings().iter().collect::<Vec<_>>(), expected);
+        assert_ne!(filtered.collection_digest(), all.collection_digest());
+    }
+    assert_ne!(by_prefix.collection_digest(), by_kind.collection_digest());
+    Ok(())
+}
