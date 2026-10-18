@@ -18,9 +18,10 @@
 Preconditions:
 
 - Baseline launch; doctor (the `vdg` one) passes.
+- Know which Go/Web builds were pinned: `eval "$($V env)"` and note whether `VDG_GO_WORKER` / `VDG_WEB_WORKER` are empty.
 
 - **Summary.** Run `$V run doctor-summary --expect-exit 0 -- doctor`. stdout starts with `doctor report: summary`, `protocol: 1.0`, `latest attempt: completed`.
-- **JSON.** Run `$V run doctor-json --expect-exit 0 -- doctor --json`. `jq '.store_schema_version'` is `19`, the `rust` entry of `.workers` has `available: true` and `integrity: "development-unverified"`, and `go`/`web` have `available: false` (unless `--all-workers`).
+- **JSON.** Run `$V run doctor-json --expect-exit 0 -- doctor --json`. `jq '.store_schema_version'` is `19`, the `rust` entry of `.workers` has `available: true` and `integrity: "development-unverified"`, and each of `go`/`web` has `available: true` when its `VDG_GO_WORKER` / `VDG_WEB_WORKER` is set (build present and pinned) and `available: false` when it is empty.
 - **No Store.** `eval "$($V env)"`, then `(cd "$VDG_FIXTURE" && HOME="$VDG_HOME" DEPGRAPH_RUST_WORKER="$VDG_RUST_WORKER" "$VDG_BIN" --store "$VDG_SCRATCH/none/graph.db" doctor --json)`. Exit `3` with `read-only store is unavailable`; `$VDG_SCRATCH/none` is not created. Record it with `vdg note`.
 - **Unresolved.** Run `$V run unresolved-list --expect-exit 0 -- unresolved --json`. `jq '.total_items'` is `2`; text form (`unresolved`) shows `call sum` and `call iter` at `src/cart.rs:1` with reason `rust-analyzer could not resolve the method call`.
 

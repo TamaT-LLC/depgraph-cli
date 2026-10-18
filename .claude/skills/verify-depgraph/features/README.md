@@ -6,7 +6,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - `$V launch` finished with `vdg: ready run=<id> ...`, so the fixture crate `vdg-fixture` (`src/lib.rs`, `src/cart.rs`, `src/checkout.rs`, git branch `main`, one commit) is scanned into the sandbox Store.
 - `$V doctor` ends with `vdg doctor: run <id> is worth driving`.
-- Only the Rust worker is available unless launch used `--all-workers`.
+- The Rust worker is always available. Go/Web workers are available only when this checkout has their builds (`workers/go/bin/depgraph-go-worker`, `workers/web/dist/worker.mjs`, for example from `--all-workers` or an earlier build); `vdg` pins whichever exist. Check `VDG_GO_WORKER` / `VDG_WEB_WORKER` in `$V env` (empty = not built) or the `go/web worker:` line of `NOTES.md`.
 - Never drive a Store that this run did not create. Never pass the default OS cache path as `--store`.
 
 ## Driving conventions

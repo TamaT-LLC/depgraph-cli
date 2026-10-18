@@ -59,7 +59,7 @@ Read-only. It checks, and exits non-zero with `FAIL` lines if any fails:
 - the real OS cache has no `repositories/<sha256(fixture path)>` entry (proof that nothing leaked into the user's Store);
 - `depgraph --store <store> doctor --json` exits 0, its Rust worker is `available: true` (integrity `development-unverified` is expected for dev builds), and `latest_successful_scan_id` is set.
 
-It also prints `info workers: [...]`; `go`/`web` are `available:false` unless launched with `--all-workers`. Run doctor first, and again whenever anything looks off. Do not drive a run whose doctor fails.
+It also prints `info workers: [...]`; `go`/`web` are `available:true` only when this checkout has their builds (`workers/go/bin/depgraph-go-worker`, `workers/web/dist/worker.mjs`, for example after `--all-workers`), which `vdg` then pins; otherwise `available:false`. Run doctor first, and again whenever anything looks off. Do not drive a run whose doctor fails.
 
 ## Drive
 
@@ -80,7 +80,7 @@ $V fixture-change                                         # branch feat: cart.rs
 $V run rescan --expect-exit 0 -- scan .
 $V run impact-changed -- impact path:src/checkout.rs --changed main   # impacted=true
 $V run unresolved -- unresolved --json                    # .total_items == 2
-$V run strict -- scan . --strict                          # exit 1, "strict policy failed: unresolved=2"
+$V run strict --expect-exit 1 -- scan . --strict         # exit 1, "strict policy failed: unresolved=2"
 ```
 
 Stable handles: selectors (`path:`, `symbol:`, `id:`, `package:`, `route:`, `type:`), `--json` output fields, and the first summary line of text output (`<cmd>: returned N/M items; complete=...`, `result: impacted=...`). Prefer `--json` plus `jq` for assertions; text output contains sha256 node ids that change with content.
@@ -105,7 +105,7 @@ Proof standards:
 - Verify side effects alongside output: the Store moving (`latest_successful_scan_id` changes after a passing rescan, but not after `scan --strict` fails), and the doctor isolation check showing the real cache was not touched.
 - Assert on `--json` fields with `jq`, and record the assertion with `vdg note`.
 - `scan --plan` / `--split-plan` are the "dry run" entry points. They are documented to not launch workers or write a Store; verify that by observing (Store mtime / `doctor` scan id unchanged), not by trusting the name.
-- A path you could not reach (Go/Web adapters without `--all-workers`, MCP without a compiler pack) is reported as unverified, never as passed through another path.
+- A path you could not reach (Go/Web adapters without their worker builds, MCP without a compiler pack) is reported as unverified, never as passed through another path.
 
 Note: `cargo clean` deletes `target/` and with it the evidence. Copy evidence elsewhere (or set `VDG_EVIDENCE_ROOT`) before cleaning.
 

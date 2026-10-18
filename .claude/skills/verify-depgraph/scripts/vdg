@@ -38,17 +38,22 @@ REAL_HOME="${VDG_REAL_HOME:-$HOME}"
 CLI_SOURCES=(crates/depgraph-cli crates/depgraph-core crates/depgraph-store crates/depgraph-protocol
   crates/depgraph-operation crates/depgraph-mcp-tools)
 RUST_WORKER_SOURCES=(workers/rust crates/depgraph-protocol)
+# Both binaries belong to the root Cargo workspace (workers/rust is a member, no own
+# Cargo.lock), so the root manifest, lockfile and workspace-hack feed into each of them.
+WORKSPACE_SOURCES=(Cargo.toml Cargo.lock workspace-hack)
 
 # Git environment for the fixture and for depgraph runs: no user/system config, no hooks,
 # no signing and a fixed identity, so fixture commits stay local and reproducible.
 SANDBOX_GIT_ENV=(
   GIT_CONFIG_GLOBAL=/dev/null
   GIT_CONFIG_NOSYSTEM=1
-  GIT_CONFIG_COUNT=4
+  GIT_CONFIG_COUNT=6
   GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
   GIT_CONFIG_KEY_1=commit.gpgsign GIT_CONFIG_VALUE_1=false
   GIT_CONFIG_KEY_2=tag.gpgsign GIT_CONFIG_VALUE_2=false
   GIT_CONFIG_KEY_3=init.defaultBranch GIT_CONFIG_VALUE_3=main
+  GIT_CONFIG_KEY_4=core.excludesFile GIT_CONFIG_VALUE_4=/dev/null
+  GIT_CONFIG_KEY_5=core.attributesFile GIT_CONFIG_VALUE_5=/dev/null
   GIT_AUTHOR_NAME=vdg GIT_AUTHOR_EMAIL=vdg@example.invalid
   GIT_COMMITTER_NAME=vdg GIT_COMMITTER_EMAIL=vdg@example.invalid
 )
@@ -118,10 +123,13 @@ EOF
 }
 
 # git against the fixture only: GIT_* already scrubbed, config/hooks/signing/identity pinned.
+# HOME/XDG_CONFIG_HOME point at the sandbox home (<scratch>/home next to <scratch>/repo) so the
+# user's ~/.config/git/ignore and attributes cannot drop or rewrite fixture files.
 fixture_git() {
-  local repo="$1"
+  local repo="$1" home
   shift
-  env "${SANDBOX_GIT_ENV[@]}" git -C "$repo" "$@"
+  home="$(dirname "$repo")/home"
+  env HOME="$home" XDG_CONFIG_HOME="$home/.config" "${SANDBOX_GIT_ENV[@]}" git -C "$repo" "$@"
 }
 
 # Run a command with the sandboxed environment. RUSTUP_HOME/CARGO_HOME keep pointing at the
@@ -136,6 +144,7 @@ sandboxed() {
     RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
     CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
     XDG_CACHE_HOME="$VDG_HOME/.cache" \
+    XDG_CONFIG_HOME="$VDG_HOME/.config" \
     "${SANDBOX_GIT_ENV[@]}" \
     "${workers[@]}" \
     "$@"
@@ -225,14 +234,14 @@ real_cache_entry() {
   echo "$cache/repositories/$identity"
 }
 
-# Print up to 3 source files (*.rs, Cargo.toml) under the given crate dirs newer than $1.
+# Print up to 3 source files (*.rs, Cargo.toml, Cargo.lock) under the given paths newer than $1.
 # A missing binary makes every source "newer" so the check fails instead of passing silently.
 newer_sources() {
   local binary="$1" dirs=() dir
   shift
   for dir in "$@"; do dirs+=("$REPO_ROOT/$dir"); done
   if [[ ! -e "$binary" ]]; then echo "(missing $binary)"; return; fi
-  find "${dirs[@]}" -path '*/target' -prune -o \( -name '*.rs' -o -name Cargo.toml \) \
+  find "${dirs[@]}" -path '*/target' -prune -o \( -name '*.rs' -o -name Cargo.toml -o -name Cargo.lock \) \
     -newer "$binary" -print | head -n 3 | tr '\n' ' ' | sed 's/ $//'
 }
 
@@ -248,11 +257,11 @@ cmd_doctor() {
   got="$("$VDG_BIN" --version 2>/dev/null | awk '{print $2}')"
   check "binary version $got == workspace $want" '[[ "$got" == "$want" ]]'
   local stale
-  stale="$(newer_sources "$VDG_BIN" "${CLI_SOURCES[@]}")"
-  check "CLI binary newer than its sources (${CLI_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
+  stale="$(newer_sources "$VDG_BIN" "${CLI_SOURCES[@]}" "${WORKSPACE_SOURCES[@]}")"
+  check "CLI binary newer than its sources (${CLI_SOURCES[*]} ${WORKSPACE_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
   check "rust worker present ($VDG_RUST_WORKER)" '[[ -x "$VDG_RUST_WORKER" ]]'
-  stale="$(newer_sources "$VDG_RUST_WORKER" "${RUST_WORKER_SOURCES[@]}")"
-  check "rust worker binary newer than its sources (${RUST_WORKER_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
+  stale="$(newer_sources "$VDG_RUST_WORKER" "${RUST_WORKER_SOURCES[@]}" "${WORKSPACE_SOURCES[@]}")"
+  check "rust worker binary newer than its sources (${RUST_WORKER_SOURCES[*]} ${WORKSPACE_SOURCES[*]})${stale:+ (stale: $stale)}" '[[ -z "$stale" ]]'
   check "store inside sandbox ($VDG_STORE)" '[[ -f "$VDG_STORE" && "$VDG_STORE" == "$VDG_SCRATCH"/* ]]'
   local entry
   entry="$(real_cache_entry)"
