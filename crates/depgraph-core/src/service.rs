@@ -7,6 +7,11 @@ use std::{
 
 use depgraph_store::Store;
 
+pub use crate::edge_kind_selection::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, EdgeKindFilter, EdgeKindFilterError,
+    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, STRUCTURAL_EDGE_KINDS,
+    StructuralEdgeSelection, is_structural_edge_kind,
+};
 pub use crate::service_agent::{
     CompletedSnapshotView, CompletedSnapshotsPage, CoverageRecord, CurrentSnapshot,
     CurrentSnapshotAvailability, DepgraphContext, EdgeDirection, EdgeProjection,

@@ -58,6 +58,25 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 | グラフ由来のhotspot | `hotspots` | fan-in / fan-out / reverse impact / Git churn / runtimeの整数basis-point順位。各findingの`hotspot_scores`にraw、正規化値、weight、available、totalを構造化して出力します。confidenceの上限は`probable`です |
 | エージェントからの調査 | `agent-config`、`depgraph-mcp` | 検証済みパッケージに結び付いたMCPホスト設定。`health_*` toolも上と同じ判定の限界を持ちます |
 
+### 依存一覧の辺種別を絞り込む
+
+`deps`と`dependents`の結果には、依存の辺に加えて構造上の辺が含まれます。
+構造上の辺は`contains`（パッケージがファイルを含む）、`declares`（ファイルがシンボルを宣言する）、`generated_from`（生成ファイルが元のファイルから作られる）の3種類です。
+依存しているファイルの数を数えたい場合は、`--structural-edges exclude`で構造上の辺を除きます。
+省略時は`include`で、従来どおり構造上の辺も含みます。
+
+```bash
+depgraph dependents path:src/a.ts --structural-edges exclude --json
+depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_uses --json
+```
+
+- `--edge-kind`は辿る辺の種類を指定します。複数回指定でき、指定した種類の辺だけを辿ります。
+- 絞り込みは走査の段階でかけます。そのため、件数と`traversed_items`は選んだ辺だけを数えます。
+- `--structural-edges exclude`と構造上の辺の`--edge-kind`を同時に指定すると、矛盾する指定としてエラーになります。
+- 絞り込み条件を変えた場合、前の`--cursor`は使えません。
+
+MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`edge_kinds`と`structural_edges`を使います。
+
 ## health の confidence の読み方
 
 `health`の結果には、どこまで確信できるかを示すconfidenceが付きます。

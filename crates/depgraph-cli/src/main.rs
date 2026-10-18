@@ -19,7 +19,7 @@ use depgraph_core::service::{
     RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy, RepositoryRelativePath,
     ResolveBuildRequest, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
-    SnapshotNameCreateSelector, SnapshotReadRequest, UnresolvedRequest,
+    SnapshotNameCreateSelector, SnapshotReadRequest, StructuralEdgeSelection, UnresolvedRequest,
 };
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
@@ -247,6 +247,15 @@ enum Commands {
         /// Stop traversal after this many visited dependency edges.
         #[arg(long, value_name = "N", conflicts_with = "all")]
         max_traversal: Option<usize>,
+        /// Follow only edges of this kind (repeatable), such as imports or
+        /// depends_on. Counts cover only the selected edges.
+        #[arg(long, value_name = "KIND")]
+        edge_kind: Vec<String>,
+        /// Follow structural edges (contains, declares, generated_from):
+        /// include or exclude. Omitted keeps them (include). Use exclude to
+        /// count only files that actually depend on each other.
+        #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
+        structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -268,6 +277,15 @@ enum Commands {
         /// Stop traversal after this many visited dependency edges.
         #[arg(long, value_name = "N", conflicts_with = "all")]
         max_traversal: Option<usize>,
+        /// Follow only edges of this kind (repeatable), such as imports or
+        /// depends_on. Counts cover only the selected edges.
+        #[arg(long, value_name = "KIND")]
+        edge_kind: Vec<String>,
+        /// Follow structural edges (contains, declares, generated_from):
+        /// include or exclude. Omitted keeps them (include). Use exclude to
+        /// count only files that actually depend on each other.
+        #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
+        structural_edges: Option<StructuralEdgeSelection>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -1598,6 +1616,8 @@ async fn run(cli: Cli) -> Result<u8> {
             selector,
             transitive,
             max_traversal,
+            edge_kind,
+            structural_edges,
             phase,
             profile,
             session,
@@ -1618,7 +1638,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
-            )?;
+            )?
+            .with_edge_kind_filter(edge_kind, structural_edges.unwrap_or_default())?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -1649,6 +1670,8 @@ async fn run(cli: Cli) -> Result<u8> {
             selector,
             transitive,
             max_traversal,
+            edge_kind,
+            structural_edges,
             phase,
             profile,
             session,
@@ -1669,7 +1692,8 @@ async fn run(cli: Cli) -> Result<u8> {
                 } else {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
-            )?;
+            )?
+            .with_edge_kind_filter(edge_kind, structural_edges.unwrap_or_default())?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -3252,6 +3276,11 @@ fn print_doctor_summary_human(report: &depgraph_core::DoctorSummaryReport) {
     println!("details: {}", report.detail_command);
 }
 
+fn parse_structural_edges(value: &str) -> std::result::Result<StructuralEdgeSelection, String> {
+    StructuralEdgeSelection::parse(value)
+        .ok_or_else(|| format!("expected include or exclude, got {value:?}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interactive_dependencies_page(
     execution: &depgraph_core::service::DependenciesResult,
@@ -3268,13 +3297,21 @@ fn interactive_dependencies_page(
         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
     let max_traversal = request.max_traversal();
     validate_interactive_query_bounds(max_items, max_bytes, Some(max_traversal))?;
-    let context = serde_json::json!({
+    let mut context = serde_json::json!({
         "selector": request.selector(),
         "transitive": request.transitive(),
         "reverse": request.direction().is_incoming(),
         "filter": request.filter(),
         "max_traversal": max_traversal,
     });
+    // Following every edge kind keeps the legacy cursor binding; any other
+    // selection binds the cursor to itself (Issue #541).
+    let edge_kind_filter = request.edge_kind_filter();
+    if !edge_kind_filter.is_unrestricted() {
+        context["edge_kinds"] = serde_json::json!(edge_kind_filter.edge_kinds());
+        context["structural_edges"] =
+            serde_json::json!(edge_kind_filter.structural_edges().as_str());
+    }
     paginate_interactive_query(
         execution.items(),
         traversal_summary(execution.traversal()),

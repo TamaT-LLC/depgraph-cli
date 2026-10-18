@@ -20,6 +20,7 @@ pub mod compiler_precise_graph;
 pub mod config;
 pub mod cross_language;
 pub mod daemon;
+pub mod edge_kind_selection;
 pub mod export;
 pub mod ffi;
 pub mod ffi_link;
@@ -340,6 +341,11 @@ pub use daemon::{
     start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
+pub use edge_kind_selection::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, EdgeKindFilter, EdgeKindFilterError,
+    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, STRUCTURAL_EDGE_KINDS,
+    StructuralEdgeSelection, is_structural_edge_kind,
+};
 pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };

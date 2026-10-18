@@ -27,7 +27,8 @@ use depgraph_core::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
     DepgraphServiceLimits, FindingKind, GraphQueryFilter, HealthFinding, HotspotWeights,
     ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity, SnapshotLocator,
-    VerifiedCompilerPack, read_compiler_pack_requirement, verify_compiler_pack,
+    StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
+    verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
@@ -470,6 +471,11 @@ struct GraphDependenciesArguments {
     environments: Vec<String>,
     #[serde(default)]
     max_traversal: Option<usize>,
+    #[serde(default)]
+    edge_kinds: Vec<String>,
+    /// Omitted means `DEFAULT_STRUCTURAL_EDGE_SELECTION`.
+    #[serde(default)]
+    structural_edges: StructuralEdgeSelection,
     #[serde(default)]
     detail: AgentDependencyDetail,
     #[serde(default)]
@@ -3361,6 +3367,7 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "graph_dependencies_list" | "graph_dependents_list" => {
+            validate_array_argument_lengths(&arguments, &["edge_kinds"])?;
             let arguments = decode_arguments::<GraphDependenciesArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
@@ -3399,7 +3406,8 @@ fn execute_catalog_read_tool(
                 arguments.transitive,
                 filter,
                 max_traversal,
-            )?;
+            )?
+            .with_edge_kind_filter(arguments.edge_kinds, arguments.structural_edges)?;
             let mut normalized = serde_json::json!({
                 "direction": match direction {
                     DependencyDirection::Outgoing => "outgoing",
@@ -3414,6 +3422,14 @@ fn execute_catalog_read_tool(
             // their own projection so a cursor never crosses detail levels.
             if !arguments.detail.is_full() {
                 normalized["detail"] = serde_json::json!(arguments.detail.as_str());
+            }
+            // Following every edge kind keeps the legacy cursor binding; any other
+            // selection binds the cursor to itself (Issue #541).
+            let edge_kind_filter = request.edge_kind_filter();
+            if !edge_kind_filter.is_unrestricted() {
+                normalized["edge_kinds"] = serde_json::json!(edge_kind_filter.edge_kinds());
+                normalized["structural_edges"] =
+                    serde_json::json!(edge_kind_filter.structural_edges().as_str());
             }
             let pagination = PaginationContext::new(
                 cursor_key,

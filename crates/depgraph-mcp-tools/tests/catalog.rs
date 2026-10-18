@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use depgraph_core::{DepgraphCapability, DepgraphCapabilitySet};
+use depgraph_core::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
+    MAX_DEPENDENCY_EDGE_KINDS,
+};
 use depgraph_mcp_tools::{
     ALL_CLI_ACTIONS, AgentCurrentSnapshot, AgentNamedSnapshot, AgentRepositoryList,
     AgentRepositorySummary, CapabilityProfile, CliAction, IdempotencyKey,
@@ -497,6 +500,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
                 "contract_version",
                 "cursor",
                 "detail",
+                "edge_kinds",
                 "environments",
                 "limit",
                 "max_traversal",
@@ -506,6 +510,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
                 "selector",
                 "sessions",
                 "snapshot",
+                "structural_edges",
                 "transitive",
             ]
         );
@@ -1287,5 +1292,80 @@ fn issue_542_dependency_lists_advertise_detail_and_one_output_shape_per_detail()
                 .is_none(),
             "{name} full output keeps the legacy shape"
         );
+    }
+}
+
+#[test]
+fn issue_541_dependency_lists_advertise_edge_kind_selection() {
+    let catalog = ToolCatalog::for_capabilities(&DepgraphCapabilitySet::read_only()).unwrap();
+    for name in ["graph_dependencies_list", "graph_dependents_list"] {
+        let tool = catalog.tool(name).expect("dependency tool");
+        let properties = &tool.input_schema()["properties"];
+        let required = tool.input_schema()["required"].as_array().unwrap();
+        for field in ["edge_kinds", "structural_edges"] {
+            assert!(
+                !required.contains(&json!(field)),
+                "{name} {field} is optional"
+            );
+        }
+
+        let edge_kinds = &properties["edge_kinds"];
+        assert_eq!(edge_kinds["type"], "array", "{name}");
+        assert_eq!(edge_kinds["maxItems"], MAX_DEPENDENCY_EDGE_KINDS, "{name}");
+        assert_eq!(edge_kinds["uniqueItems"], true, "{name}");
+        assert_eq!(edge_kinds["items"]["type"], "string", "{name}");
+        assert_eq!(
+            edge_kinds["items"]["pattern"], "^[a-z][a-z0-9._:-]*$",
+            "{name}"
+        );
+        assert_eq!(edge_kinds["items"]["maxLength"], 64, "{name}");
+        let description = edge_kinds["description"].as_str().unwrap();
+        for expected in [
+            "Empty or omitted",
+            "structural_edges",
+            "INVALID_ARGUMENT",
+            "traversed_edges",
+        ] {
+            assert!(
+                description.contains(expected),
+                "{name} edge_kinds description lacks {expected}: {description}"
+            );
+        }
+
+        let structural = &properties["structural_edges"];
+        assert_eq!(structural["type"], "string", "{name}");
+        assert_eq!(structural["enum"], json!(["include", "exclude"]), "{name}");
+        assert_eq!(
+            structural["default"],
+            DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
+            "{name}"
+        );
+        let description = structural["description"].as_str().unwrap();
+        for expected in [
+            "contains",
+            "declares",
+            "generated_from",
+            "exclude",
+            "cursor",
+        ] {
+            assert!(
+                description.contains(expected),
+                "{name} structural_edges description lacks {expected}: {description}"
+            );
+        }
+
+        for expected in [
+            "contains",
+            "declares",
+            "generated_from",
+            "structural_edges=exclude",
+            "edge_kinds",
+        ] {
+            assert!(
+                tool.description().contains(expected),
+                "{name} description lacks {expected}: {}",
+                tool.description()
+            );
+        }
     }
 }

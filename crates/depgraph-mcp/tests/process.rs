@@ -8565,3 +8565,494 @@ fn issue_544_agent_evidence_carries_import_specifier_and_binding() {
         assert!(!text.contains("PROCESS_544_DETAIL_SECRET"), "{text}");
     }
 }
+
+// Issue #541: dependency lists can drop structural edges and select edge kinds.
+
+fn seed_issue_541_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-541", root, false, Some("revision-541"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-541",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, kind, path) in [
+        ("package:app", "package", None),
+        ("node:a", "module", Some("src/a.rs")),
+        ("node:b", "module", Some("src/b.rs")),
+        ("node:c", "module", Some("src/c.rs")),
+        ("node:gen", "module", Some("src/gen.rs")),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("id:{id}"),
+            "display_name": id,
+            "properties": path.map_or_else(|| json!({}), |path| json!({"path": path}))
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let mut workspace = next("node_upsert");
+    workspace["node"] = json!({
+        "id": "workspace:repository",
+        "kind": "workspace",
+        "locator": "workspace:repository",
+        "display_name": "repository",
+        "properties": {"repository_identity": "workspace:repository"}
+    });
+    store.ingest_event(&workspace).unwrap();
+    for (id, source, target, kind) in [
+        ("edge:contains-a", "package:app", "node:a", "contains"),
+        ("edge:contains-b", "package:app", "node:b", "contains"),
+        ("edge:generated-a", "node:gen", "node:a", "generated_from"),
+        ("edge:import-b", "node:b", "node:a", "imports"),
+        ("edge:import-c", "node:c", "node:a", "imports"),
+    ] {
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": id,
+            "source": source,
+            "target": target,
+            "kind": kind,
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-541", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+#[test]
+fn issue_541_dependency_lists_exclude_structural_edges_and_match_the_cli() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let snapshot_id = seed_issue_541_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let output_schema = |name: &str| {
+        jsonschema::draft202012::new(
+            &tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"],
+        )
+        .unwrap()
+    };
+    let mut next_id = 10;
+    let mut call = |name: &str, arguments: Value| {
+        next_id += 1;
+        let result = interactive_tool_call(&mut mcp, next_id, name, arguments);
+        assert_tool_text_matches_structured(&result);
+        if result["isError"] == false {
+            assert_eq!(result["structuredContent"]["snapshot_id"], snapshot_id);
+            output_schema(name)
+                .validate(&result["structuredContent"])
+                .unwrap_or_else(|error| panic!("{name} advertised schema: {error}"));
+            shared
+                .validate(&result["structuredContent"])
+                .unwrap_or_else(|error| panic!("{name} shared schema: {error}"));
+        }
+        result
+    };
+    let dependents = |selection: Value| {
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "selector": "id:node:a",
+            "max_traversal": 100,
+            "limit": 100
+        });
+        for (key, value) in selection.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        arguments
+    };
+    let edge_ids = |result: &Value| {
+        let mut ids = result["structuredContent"]["result"]["edges"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("edge page: {result}"))
+            .iter()
+            .map(|edge| edge["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let error_code = |result: &Value| {
+        assert_eq!(result["isError"], true, "{result}");
+        result["structuredContent"]["error"]["code"].clone()
+    };
+
+    let legacy = call("graph_dependents_list", dependents(json!({})));
+    assert_eq!(
+        edge_ids(&legacy),
+        [
+            "edge:contains-a",
+            "edge:generated-a",
+            "edge:import-b",
+            "edge:import-c"
+        ]
+    );
+    assert_eq!(
+        legacy["structuredContent"]["result"]["edges"]["total_items"],
+        4
+    );
+    assert_eq!(legacy["structuredContent"]["result"]["traversed_edges"], 4);
+    let explicit_include = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "include"})),
+    );
+    assert_eq!(
+        legacy["content"][0]["text"], explicit_include["content"][0]["text"],
+        "the default keeps the legacy response"
+    );
+
+    let excluded = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude"})),
+    );
+    assert_eq!(edge_ids(&excluded), ["edge:import-b", "edge:import-c"]);
+    assert_eq!(
+        excluded["structuredContent"]["result"]["edges"]["total_items"],
+        2
+    );
+    assert_eq!(
+        excluded["structuredContent"]["result"]["traversed_edges"],
+        2
+    );
+    let allowlisted = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["imports"], "structural_edges": "exclude"})),
+    );
+    assert_eq!(edge_ids(&allowlisted), ["edge:import-b", "edge:import-c"]);
+    let contains_only = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": ["contains"]})),
+    );
+    assert_eq!(edge_ids(&contains_only), ["edge:contains-a"]);
+    let package = call(
+        "graph_dependencies_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "selector": "id:package:app",
+            "max_traversal": 100,
+            "structural_edges": "exclude"
+        }),
+    );
+    assert_eq!(package["isError"], false, "{package}");
+    assert_eq!(
+        package["structuredContent"]["result"]["edges"]["total_items"],
+        0
+    );
+
+    let paths = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude", "detail": "paths"})),
+    );
+    let mut path_items = paths["structuredContent"]["result"]["paths"]["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    path_items.sort_by_key(Value::to_string);
+    assert_eq!(
+        path_items,
+        [
+            json!({"source_path": "src/b.rs", "target_path": "src/a.rs", "kind": "imports"}),
+            json!({"source_path": "src/c.rs", "target_path": "src/a.rs", "kind": "imports"}),
+        ]
+    );
+    assert_eq!(paths["structuredContent"]["result"]["traversed_edges"], 2);
+    let summary = call(
+        "graph_dependents_list",
+        dependents(json!({"structural_edges": "exclude", "detail": "summary"})),
+    );
+    assert_eq!(
+        summary["structuredContent"]["result"]["edges"]["total_items"],
+        2
+    );
+    assert_eq!(
+        summary["structuredContent"]["result"]["common"]["phase"],
+        "semantic"
+    );
+
+    for selection in [
+        json!({"edge_kinds": ["contains"], "structural_edges": "exclude"}),
+        json!({"edge_kinds": ["imports", "generated_from"], "structural_edges": "exclude"}),
+        json!({"edge_kinds": ["Imports"]}),
+        json!({"edge_kinds": [""]}),
+        json!({"edge_kinds": "imports"}),
+        json!({"structural_edges": "none"}),
+        json!({"structural_edges": true}),
+    ] {
+        let rejected = call("graph_dependents_list", dependents(selection.clone()));
+        assert_eq!(error_code(&rejected), "INVALID_ARGUMENT", "{selection}");
+    }
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    let rejected = call(
+        "graph_dependents_list",
+        dependents(json!({"edge_kinds": too_many})),
+    );
+    assert_eq!(error_code(&rejected), "INVALID_ARGUMENT");
+
+    // Cursor binding: the default and an explicit include share the legacy
+    // binding; any other selection is bound to itself.
+    let page = |selection: Value, cursor: Option<&Value>| {
+        let mut arguments = dependents(selection);
+        arguments["limit"] = json!(1);
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.clone();
+        }
+        arguments
+    };
+    let first_default = call("graph_dependents_list", page(json!({}), None));
+    let default_cursor =
+        first_default["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(default_cursor.is_string(), "{first_default}");
+    let first_include = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "include"}), None),
+    );
+    assert_eq!(
+        first_include["structuredContent"]["result"]["edges"]["next_cursor"], default_cursor,
+        "the default cursor bytes are unchanged"
+    );
+    let resumed_include = call(
+        "graph_dependents_list",
+        page(
+            json!({"structural_edges": "include"}),
+            Some(&default_cursor),
+        ),
+    );
+    assert_eq!(resumed_include["isError"], false, "{resumed_include}");
+    for selection in [
+        json!({"structural_edges": "exclude"}),
+        json!({"edge_kinds": ["imports"]}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&default_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let first_excluded = call(
+        "graph_dependents_list",
+        page(json!({"structural_edges": "exclude"}), None),
+    );
+    let excluded_cursor =
+        first_excluded["structuredContent"]["result"]["edges"]["next_cursor"].clone();
+    assert!(excluded_cursor.is_string(), "{first_excluded}");
+    assert_ne!(excluded_cursor, default_cursor);
+    for selection in [
+        json!({}),
+        json!({"edge_kinds": ["imports"], "structural_edges": "exclude"}),
+    ] {
+        let mismatched = call(
+            "graph_dependents_list",
+            page(selection.clone(), Some(&excluded_cursor)),
+        );
+        assert_eq!(error_code(&mismatched), "CURSOR_MISMATCH", "{selection}");
+    }
+    let resumed = call(
+        "graph_dependents_list",
+        page(
+            json!({"structural_edges": "exclude"}),
+            Some(&excluded_cursor),
+        ),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    assert_eq!(edge_ids(&resumed).len(), 1);
+    mcp.finish();
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let cli_edge_ids = |arguments: &[&str]| {
+        let output = cli(arguments);
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut ids = document["data"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        cli_edge_ids(&["dependents", "id:node:a", "--all", "--json"]),
+        edge_ids(&legacy)
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "exclude",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&excluded)
+    );
+    assert_eq!(
+        cli_edge_ids(&[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--all",
+            "--json"
+        ]),
+        edge_ids(&contains_only)
+    );
+    assert!(
+        cli_edge_ids(&[
+            "deps",
+            "id:package:app",
+            "--structural-edges",
+            "exclude",
+            "--all",
+            "--json"
+        ])
+        .is_empty()
+    );
+    for arguments in [
+        &[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "contains",
+            "--structural-edges",
+            "exclude",
+            "--json",
+        ][..],
+        &[
+            "dependents",
+            "id:node:a",
+            "--structural-edges",
+            "none",
+            "--json",
+        ][..],
+        &[
+            "dependents",
+            "id:node:a",
+            "--edge-kind",
+            "Imports",
+            "--json",
+        ][..],
+    ] {
+        assert!(!cli(arguments).status.success(), "{arguments:?}");
+    }
+
+    let cli_page = |arguments: &[&str]| {
+        let output = cli(arguments);
+        (
+            output.status.success(),
+            serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null),
+        )
+    };
+    let (succeeded, first) = cli_page(&["dependents", "id:node:a", "--max-items", "1", "--json"]);
+    assert!(succeeded, "{first}");
+    let cli_cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "include",
+        "--max-items",
+        "1",
+        "--cursor",
+        &cli_cursor,
+        "--json",
+    ]);
+    assert!(succeeded, "explicit include keeps the legacy CLI cursor");
+    let (succeeded, _) = cli_page(&[
+        "dependents",
+        "id:node:a",
+        "--structural-edges",
+        "exclude",
+        "--max-items",
+        "1",
+        "--cursor",
+        &cli_cursor,
+        "--json",
+    ]);
+    assert!(!succeeded, "a CLI cursor is bound to the edge selection");
+    assert_eq!(before, store_invariant(&store_path));
+}
