@@ -825,7 +825,7 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | --- | --- |
 | Optional input | 全toolのinput schemaで`repository_id`はrequiredから外れ、descriptionに既定値と取得方法を書く。省略時はserverが束縛する単一repositoryを使う。指定した場合のpattern検証は従来どおり |
 | Correctable error | 束縛repositoryと異なる値は`INVALID_ARGUMENT` / `correct_input`になり、`error.details`はclosed variant `{"kind":"repository","available_repository_ids":[...]}`を返す。IDは1〜64件、昇順、重複なしをconstructor、deserializer、schema(`uniqueItems`)で検証する |
-| Operation tools | `operation_get` / `operation_result` / `operation_cancel`は省略を許可する。明示した別repositoryは従来どおり`CAPABILITY_DENIED`のまま |
+| Operation tools | `operation_get` / `operation_result` / `operation_cancel`は省略を許可する。明示した別repositoryは従来どおり`CAPABILITY_DENIED`（`error.details`なし）のまま。operation handleは作成したrepositoryに束縛されるため、この3 toolの`repository_id` descriptionだけはこの挙動を書き、`INVALID_ARGUMENT`と`available_repository_ids`には触れない |
 | `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
 

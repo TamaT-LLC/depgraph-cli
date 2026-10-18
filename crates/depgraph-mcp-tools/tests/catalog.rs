@@ -91,6 +91,10 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
     assert_eq!(catalog.tools().len(), 39);
 }
 
+/// Tools handled by the operation-handle path, which keeps foreign repository IDs as
+/// authorization failures instead of input correction hints.
+const OPERATION_HANDLE_TOOLS: [&str; 3] = ["operation_get", "operation_result", "operation_cancel"];
+
 #[test]
 fn issue_540_repository_id_is_optional_and_documented_for_every_tool() {
     let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
@@ -112,14 +116,51 @@ fn issue_540_repository_id_is_optional_and_documented_for_every_tool() {
         let description = repository_id["description"]
             .as_str()
             .unwrap_or_else(|| panic!("{} repository_id has no description", tool.name()));
-        for expected in ["Optional", "repository_list", "available_repository_ids"] {
+        let is_operation_tool = OPERATION_HANDLE_TOOLS.contains(&tool.name());
+        let (expected, forbidden): (&[&str], &[&str]) = if is_operation_tool {
+            (
+                &[
+                    "Optional",
+                    "repository_list",
+                    "CAPABILITY_DENIED",
+                    "without details",
+                ],
+                &["INVALID_ARGUMENT", "available_repository_ids"],
+            )
+        } else {
+            (
+                &[
+                    "Optional",
+                    "repository_list",
+                    "INVALID_ARGUMENT",
+                    "available_repository_ids",
+                ],
+                &["CAPABILITY_DENIED"],
+            )
+        };
+        for expected in expected {
             assert!(
                 description.contains(expected),
                 "{} repository_id description lacks {expected}: {description}",
                 tool.name()
             );
         }
+        for forbidden in forbidden {
+            assert!(
+                !description.contains(forbidden),
+                "{} repository_id description must not mention {forbidden}: {description}",
+                tool.name()
+            );
+        }
     }
+
+    let operation_description = catalog.tool("operation_get").unwrap().input_schema()["properties"]
+        ["repository_id"]["description"]
+        .clone();
+    let read_description = catalog.tool("get_context").unwrap().input_schema()["properties"]
+        ["repository_id"]["description"]
+        .clone();
+    assert_ne!(operation_description, read_description);
 
     let context = catalog.tool("get_context").unwrap();
     let validator =

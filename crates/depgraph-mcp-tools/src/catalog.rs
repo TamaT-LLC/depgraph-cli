@@ -807,7 +807,7 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
         "contract_version".to_owned(),
         json!({"type": "string", "const": MCP_TOOLS_CONTRACT_VERSION}),
     );
-    properties.insert("repository_id".to_owned(), repository_id_schema());
+    properties.insert("repository_id".to_owned(), repository_id_schema(spec.name));
     for field in spec.input_fields {
         properties.insert((*field).to_owned(), field_schema(spec.name, field));
     }
@@ -1264,12 +1264,22 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
 
 const REPOSITORY_ID_DESCRIPTION: &str = "Optional logical repository ID. When omitted, the tool uses the repository this server is bound to (the default). Discover valid values with repository_list or get_context; an unknown value fails with INVALID_ARGUMENT whose error.details.available_repository_ids lists the valid IDs.";
 
-fn repository_id_schema() -> Value {
+// Operation handles stay bound to the repository that created them, so a foreign
+// repository_id is an authorization failure rather than an input correction hint.
+const OPERATION_REPOSITORY_ID_DESCRIPTION: &str = "Optional. Defaults to the repository bound to this server. Operation handles are bound to the repository that created them; a different repository_id returns CAPABILITY_DENIED without details. Use repository_list or get_context to read the bound id.";
+
+fn repository_id_schema(tool_name: &str) -> Value {
+    let description = match tool_name {
+        "operation_get" | "operation_result" | "operation_cancel" => {
+            OPERATION_REPOSITORY_ID_DESCRIPTION
+        }
+        _ => REPOSITORY_ID_DESCRIPTION,
+    };
     let mut schema = scalar_schema::<LogicalRepositoryId>();
     schema
         .as_object_mut()
         .expect("logical repository ID schema is an object")
-        .insert("description".to_owned(), json!(REPOSITORY_ID_DESCRIPTION));
+        .insert("description".to_owned(), json!(description));
     schema
 }
 
