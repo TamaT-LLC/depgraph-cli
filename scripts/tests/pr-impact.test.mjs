@@ -662,6 +662,44 @@ test("renderComment explains a zero-impact result", () => {
   assert.match(body, /影響を受けるノードは見つかりませんでした/);
 });
 
+test("renderComment does not claim zero impact when the change only deletes files", () => {
+  const report = reportFixture({
+    files: [
+      { change: "D", path: "app/users/page.tsx", result: { status: "deleted" } },
+      { change: "D", path: "gone.ts", result: { status: "deleted" } },
+    ],
+  });
+  assert.equal(report.changed_files.filter((file) => file.status === "deleted").length, 2);
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.doesNotMatch(body, /影響を受けるノードは見つかりませんでした/);
+  assert.match(body, /削除されたファイル 2 件の影響（消えたルートなど）は計算していません/);
+});
+
+test("renderComment notes uncomputed deletions next to the impacts of other files", () => {
+  const report = reportFixture({
+    files: [
+      { change: "M", path: "src/a.ts", result: okResult([impact(node("r", "route", "/users"), 1)]) },
+      { change: "D", path: "gone.ts", result: { status: "deleted" } },
+    ],
+  });
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.match(body, /影響ルート（1 件）/);
+  assert.match(body, /削除されたファイル 1 件の影響（消えたルートなど）は計算していません/);
+});
+
+test("renderComment limits a zero-impact claim to the surviving files when some were deleted", () => {
+  const report = reportFixture({
+    files: [
+      { change: "M", path: "src/a.ts", result: okResult([]) },
+      { change: "D", path: "gone.ts", result: { status: "deleted" } },
+    ],
+  });
+  const body = renderComment(report, { repository: REPOSITORY });
+  assert.doesNotMatch(body, /^影響を受けるノードは見つかりませんでした/m);
+  assert.match(body, /削除されたファイルを除く変更では、影響を受けるノードは見つかりませんでした/);
+  assert.match(body, /削除されたファイル 1 件の影響（消えたルートなど）は計算していません/);
+});
+
 test("renderComment lists unmapped, error, deleted, and skipped files in a collapsed section", () => {
   const report = reportFixture({
     files: [

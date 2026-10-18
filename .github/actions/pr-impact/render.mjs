@@ -255,10 +255,20 @@ export function renderComment(report, { repository, maxLength = DEFAULT_MAX_LENG
   if (report.scan.status !== "failed" && notAnalyzed) {
     head.push("scan 結果を照会できなかったため、影響範囲は計算していません。", "");
   } else if (report.scan.status !== "failed") {
-    if (report.impacted.length === 0) {
-      head.push("影響を受けるノードは見つかりませんでした。", "");
+    // Only head is scanned, so deleted files have no nodes to query; a "no
+    // impact" claim must not cover them.
+    const deleted = report.changed_files.filter((file) => file.status === "deleted").length;
+    const onlyDeleted = deleted > 0 && deleted === report.changed_files.length && report.skipped.count === 0;
+    const scope = deleted > 0 ? "削除されたファイルを除く変更では、" : "";
+    if (onlyDeleted) {
+      // Nothing but deletions: there is no surviving change to make a claim about.
+    } else if (report.impacted.length === 0) {
+      head.push(`${scope}影響を受けるノードは見つかりませんでした。`, "");
     } else if (routes.length === 0 && packages.length === 0) {
-      head.push("ルートとパッケージへの影響は見つかりませんでした。", "");
+      head.push(`${scope}ルートとパッケージへの影響は見つかりませんでした。`, "");
+    }
+    if (deleted > 0) {
+      head.push(`削除されたファイル ${deleted} 件の影響（消えたルートなど）は計算していません。head 側だけを scan しており、削除されたファイルのノードがないためです。`, "");
     }
   }
   head.push(...impactTable("影響ルート", "ルート", routes));

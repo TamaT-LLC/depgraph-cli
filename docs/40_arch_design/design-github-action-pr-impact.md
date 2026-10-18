@@ -91,7 +91,7 @@ runner のチェックアウト先が変わっても Store の中身は再利用
 
 流れは次のとおり（実装は `collect.mjs`）。
 
-1. `git diff --name-status -z --find-renames --relative <merge-base> <head>` で変更ファイルを列挙する。base は `base-ref` と head の merge-base に解決する。リネームとコピーは新しいパスで扱い、削除されたファイルは照会せず、コメントでは「削除されたファイル」と明記する。
+1. `git diff --name-status -z --find-renames --relative <merge-base> <head>` で変更ファイルを列挙する。base は `base-ref` と head の merge-base に解決する。リネームとコピーは新しいパスで扱い、削除されたファイルは照会しない。head だけを scan するので、削除されたファイルのノードはグラフにない。report では `changed_files[].status` を `deleted` として残し、件数を数えられるようにする。コメントでは削除されたファイルの影響（消えたルートなど）を計算していないと件数付きで明記し、「影響を受けるノードは見つかりませんでした」は削除されたファイルを除く変更に限って書く。変更が削除だけのときは、この一文を出さない。
 2. `depgraph scan`（`strict` が true なら `--strict`）を head.sha で実行する。Store は `--store` で固定する。
 3. 変更ファイルごとに `depgraph impact path:<file> --json` を呼ぶ。`profiles`、`max-nodes`、`max-edges` はここで渡す。
 4. `depth > 0` の影響ノードを id で重複排除する。同じノードに複数のファイルから届くときは、最も浅い経路を残し、起点のファイルを `reached_from` に集める。kind が `route` と `package_instance` のものを一覧にし、それ以外は件数の内訳だけ出す。
