@@ -4545,7 +4545,9 @@ fn rust_prelude_type(name: &str, edition: &str, policy: RustPreludePolicy) -> bo
 ///
 /// A syntax-only run needs the memory budget raised before HIR can return;
 /// when the toolchain is also incompatible, both causes must be fixed, so
-/// both remediations are reported with the memory budget first.
+/// both remediations are reported with the memory budget first. The
+/// toolchain part reuses the declaration-specific
+/// `rust_hir_toolchain_remediation` recorded in the profile.
 fn hir_required_remediation(properties: &Properties) -> String {
     let syntax_only =
         properties.get("rust_hir_mode").and_then(Value::as_str) == Some("syntax-only");
@@ -4557,10 +4559,13 @@ fn hir_required_remediation(properties: &Properties) -> String {
         .and_then(Value::as_str)
         == Some("compatible");
     if toolchain_compatible {
-        MEMORY_BUDGET_REMEDIATION.to_owned()
-    } else {
-        format!("{MEMORY_BUDGET_REMEDIATION}; also {TOOLCHAIN_REMEDIATION}")
+        return MEMORY_BUDGET_REMEDIATION.to_owned();
     }
+    let toolchain_remediation = properties
+        .get("rust_hir_toolchain_remediation")
+        .and_then(Value::as_str)
+        .unwrap_or(TOOLCHAIN_REMEDIATION);
+    format!("{MEMORY_BUDGET_REMEDIATION}; also {toolchain_remediation}")
 }
 
 fn syntax_fallback_summary<'a>(
@@ -5476,16 +5481,20 @@ pub fn consume(_: Local) {}
         profile_value
     }
 
-    fn assert_memory_then_toolchain_remediation(remediation: &str) {
-        let memory = remediation
-            .find("max_worker_memory_bytes")
-            .expect("memory budget remediation");
-        let toolchain = remediation
-            .find("rustup toolchain install")
-            .expect("toolchain remediation");
+    /// Asserts the memory budget advice comes first, followed by the
+    /// declaration-specific toolchain advice recorded in the profile.
+    fn assert_memory_then_toolchain_remediation(result: &ScanResult) {
+        let remediation = hir_required_remediation(result);
+        let toolchain = result.profile.properties["rust_hir_toolchain_remediation"]
+            .as_str()
+            .expect("profile toolchain remediation");
         assert!(
-            memory < toolchain,
+            remediation.starts_with(MEMORY_BUDGET_REMEDIATION),
             "memory remediation must come first: {remediation}"
+        );
+        assert!(
+            remediation.ends_with(toolchain),
+            "toolchain remediation must follow the memory advice: {remediation}"
         );
     }
 
@@ -5548,7 +5557,7 @@ pub fn consume(_: Local) {}
             assert!(remediation.contains("max_worker_memory_bytes"));
             assert!(!remediation.contains("rustup"));
         } else {
-            assert_memory_then_toolchain_remediation(&remediation);
+            assert_memory_then_toolchain_remediation(&result);
         }
         assert!(result.nodes.iter().any(|node| node.kind == "module"));
         assert!(
@@ -5613,7 +5622,12 @@ pub fn consume(_: Local) {}
         );
         // Fixing only one of the two causes does not restore HIR, so both
         // remediations are reported, memory budget first.
-        assert_memory_then_toolchain_remediation(&hir_required_remediation(&result));
+        assert_memory_then_toolchain_remediation(&result);
+        assert!(
+            properties["rust_hir_toolchain_remediation"]
+                .as_str()
+                .is_some_and(|remediation| remediation.starts_with("pin the repository to Rust"))
+        );
     }
 
     #[test]
