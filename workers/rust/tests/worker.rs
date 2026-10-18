@@ -3277,3 +3277,47 @@ fn write_minimal_crate(root: &Path, package_name: &str, source: &str) {
     .unwrap();
     fs::write(root.join("src/lib.rs"), source).unwrap();
 }
+
+#[test]
+fn worker_binary_accepts_syntax_only_hir_mode_and_marks_the_profile() {
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(fixture())
+        .arg("--scan-id")
+        .arg("syntax-only-mode")
+        .arg("--hir-mode")
+        .arg("syntax-only")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "syntax-only worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let validated = validate_ndjson(Cursor::new(output.stdout)).unwrap();
+    assert!(
+        validated
+            .diagnostics
+            .values()
+            .any(|diagnostic| diagnostic.code == "RUST_HIR_MEMORY_BUDGET_SYNTAX_ONLY")
+    );
+    let profile = validated.profiles.values().next().unwrap();
+    assert_eq!(profile.properties["rust_hir_mode"], "syntax-only");
+    assert_eq!(profile.properties["rust_hir_status"], "not-invoked");
+}
+
+#[test]
+fn worker_binary_rejects_an_unknown_hir_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(fixture())
+        .arg("--scan-id")
+        .arg("unknown-mode")
+        .arg("--hir-mode")
+        .arg("partial")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}

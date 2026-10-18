@@ -19,7 +19,10 @@ mod source;
 mod toolchain;
 
 pub use emit::build_events;
-pub use scanner::{FileCoverage, ScanPhaseMetric, ScanResult, scan, scan_with_inventory_file};
+pub use scanner::{
+    FileCoverage, HirMode, ScanPhaseMetric, ScanResult, scan, scan_with_inventory_file,
+    scan_with_options,
+};
 
 pub const ADAPTER: &str = "rust";
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");

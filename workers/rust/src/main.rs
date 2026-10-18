@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use depgraph_rust_worker::{
-    ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, build_events, scan,
+    ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    RUST_ANALYZER_SALSA_VERSION, build_events, scan_with_options,
 };
 use std::{
     io::{BufWriter, Write},
@@ -19,6 +19,25 @@ struct Args {
     scan_id: String,
     #[arg(long)]
     inventory_file: Option<PathBuf>,
+    /// `syntax-only` skips the rust-analyzer HIR backend; the core requests it
+    /// only to retry a full analysis that exceeded the worker memory budget.
+    #[arg(long, value_enum, default_value_t = HirModeArg::Full)]
+    hir_mode: HirModeArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HirModeArg {
+    Full,
+    SyntaxOnly,
+}
+
+impl From<HirModeArg> for HirMode {
+    fn from(value: HirModeArg) -> Self {
+        match value {
+            HirModeArg::Full => Self::Full,
+            HirModeArg::SyntaxOnly => Self::SyntaxOnly,
+        }
+    }
 }
 
 fn main() {
@@ -41,12 +60,11 @@ fn run() -> Result<()> {
         anyhow::bail!("--scan-id requires a non-empty identifier");
     }
 
-    let result = match args.inventory_file {
-        Some(inventory_file) => {
-            depgraph_rust_worker::scan_with_inventory_file(&args.root, &inventory_file)?
-        }
-        None => scan(&args.root)?,
-    };
+    let result = scan_with_options(
+        &args.root,
+        args.inventory_file.as_deref(),
+        args.hir_mode.into(),
+    )?;
     let protocol_build_started = Instant::now();
     let events = build_events(&args.scan_id, &result)?;
     let protocol_build_ms = elapsed_ms(protocol_build_started);
