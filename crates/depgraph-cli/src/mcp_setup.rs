@@ -1546,9 +1546,8 @@ fn describe_safe_scan_failure(
     }
     push_output_tail(&mut lines, "stderr", stderr);
     lines.push(format!(
-        "reproduce with: depgraph --store {} scan {}",
-        shell_quoted_path(store),
-        shell_quoted_path(root)
+        "reproduce with: {}",
+        safe_scan_reproduction_command(store, root, ShellQuoting::current())
     ));
     lines.join("\n")
 }
@@ -1649,18 +1648,83 @@ fn bounded_tail(text: &str, maximum_bytes: usize) -> String {
     format!("{TRUNCATION_MARKER}{}", &text[start..])
 }
 
-/// Quotes a path for a POSIX shell only when it needs quoting, so the common
-/// case stays copyable as-is.
-fn shell_quoted_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
+/// Shell dialect used to render a copyable reproduction command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellQuoting {
+    Posix,
+    Windows,
+}
+
+impl ShellQuoting {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+}
+
+/// Mirrors the arguments `run_safe_scan` passes (including `--json`) so the
+/// rerun prints the same outcome format the failure summary was built from.
+fn safe_scan_reproduction_command(store: &Path, root: &Path, quoting: ShellQuoting) -> String {
+    format!(
+        "depgraph --store {} scan {} --json",
+        quoted_path_for(&store.to_string_lossy(), quoting),
+        quoted_path_for(&root.to_string_lossy(), quoting)
+    )
+}
+
+/// Quotes a path only when it needs quoting, so the common case stays
+/// copyable as-is.
+fn quoted_path_for(text: &str, quoting: ShellQuoting) -> String {
+    let plain_punctuation: &[u8] = match quoting {
+        ShellQuoting::Posix => b"/._-+:@,=",
+        // `,` `=` `;` are argument separators for cmd.exe builtins and `@`
+        // `,` are PowerShell operators, so only path-safe punctuation stays bare.
+        ShellQuoting::Windows => b"\\/._-:",
+    };
     let is_plain = !text.is_empty()
         && text
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(&byte));
+            .all(|byte| byte.is_ascii_alphanumeric() || plain_punctuation.contains(&byte));
     if is_plain {
-        return text.into_owned();
+        return text.to_owned();
     }
-    format!("'{}'", text.replace('\'', r"'\''"))
+    match quoting {
+        ShellQuoting::Posix => format!("'{}'", text.replace('\'', r"'\''")),
+        ShellQuoting::Windows => windows_double_quoted(text),
+    }
+}
+
+/// cmd.exe does not group arguments with single quotes, so Windows paths are
+/// wrapped in double quotes and parsed by the CRT argument rules. Windows file
+/// names cannot contain `"`, but a lossy or synthetic path might; it is escaped
+/// as `\"` rather than dropped so the command never silently targets another
+/// path. Backslashes are doubled only where they precede a `"` (including the
+/// closing quote), since otherwise `C:\dir\` would escape the closing quote.
+fn windows_double_quoted(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    let mut pending_backslashes = 0;
+    for character in text.chars() {
+        match character {
+            '\\' => pending_backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', pending_backslashes * 2 + 1));
+                quoted.push('"');
+                pending_backslashes = 0;
+            }
+            other => {
+                quoted.extend(std::iter::repeat_n('\\', pending_backslashes));
+                quoted.push(other);
+                pending_backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', pending_backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 fn lifecycle_configuration(host: McpHost, server_name: &str, generated: &str) -> Result<String> {
@@ -3936,27 +4000,91 @@ mod tests {
         let message = describe_failure(Some(3), b"", b"");
 
         assert!(
-            message.contains("depgraph --store /state/graph.db scan /work/repo"),
+            message.contains(
+                "reproduce with: depgraph --store /state/graph.db scan /work/repo --json"
+            ),
             "{message}"
         );
     }
 
     #[test]
-    fn safe_scan_reproduction_command_quotes_paths_with_spaces() {
-        let message = describe_safe_scan_failure(
-            Some(3),
-            b"",
-            b"",
-            Path::new("/Users/me/Library/Application Support/depgraph/graph.db"),
-            Path::new("/work/it's repo"),
+    fn posix_reproduction_command_matches_the_safe_scan_invocation() {
+        let command = safe_scan_reproduction_command(
+            Path::new("/state/graph.db"),
+            Path::new("/work/repo"),
+            ShellQuoting::Posix,
         );
 
-        assert!(
-            message.contains(
-                "depgraph --store '/Users/me/Library/Application Support/depgraph/graph.db' scan '/work/it'\\''s repo'"
-            ),
-            "{message}"
+        assert_eq!(
+            command,
+            "depgraph --store /state/graph.db scan /work/repo --json"
         );
+    }
+
+    #[test]
+    fn posix_reproduction_command_single_quotes_paths_with_spaces() {
+        let command = safe_scan_reproduction_command(
+            Path::new("/Users/me/Library/Application Support/depgraph/graph.db"),
+            Path::new("/work/it's repo"),
+            ShellQuoting::Posix,
+        );
+
+        assert_eq!(
+            command,
+            "depgraph --store '/Users/me/Library/Application Support/depgraph/graph.db' scan '/work/it'\\''s repo' --json"
+        );
+    }
+
+    #[test]
+    fn windows_reproduction_command_double_quotes_paths_with_spaces() {
+        let command = safe_scan_reproduction_command(
+            Path::new(r"C:\Users\me\AppData\Local\depgraph\graph.db"),
+            Path::new(r"C:\work\it's repo"),
+            ShellQuoting::Windows,
+        );
+
+        assert_eq!(
+            command,
+            r#"depgraph --store C:\Users\me\AppData\Local\depgraph\graph.db scan "C:\work\it's repo" --json"#
+        );
+    }
+
+    #[test]
+    fn windows_quoting_never_uses_single_quotes() {
+        assert_eq!(
+            quoted_path_for(r"C:\Program Files\depgraph", ShellQuoting::Windows),
+            r#""C:\Program Files\depgraph""#
+        );
+        assert_eq!(quoted_path_for("", ShellQuoting::Windows), r#""""#);
+    }
+
+    #[test]
+    fn windows_quoting_keeps_trailing_backslashes_from_escaping_the_closing_quote() {
+        assert_eq!(
+            quoted_path_for(r"C:\my dir\", ShellQuoting::Windows),
+            r#""C:\my dir\\""#
+        );
+    }
+
+    #[test]
+    fn windows_quoting_escapes_embedded_double_quotes() {
+        assert_eq!(
+            quoted_path_for(r#"C:\a"b"#, ShellQuoting::Windows),
+            r#""C:\a\"b""#
+        );
+        assert_eq!(
+            quoted_path_for(r#"C:\a\"b"#, ShellQuoting::Windows),
+            r#""C:\a\\\"b""#
+        );
+    }
+
+    #[test]
+    fn posix_quoting_leaves_plain_paths_unquoted() {
+        assert_eq!(
+            quoted_path_for("/work/repo", ShellQuoting::Posix),
+            "/work/repo"
+        );
+        assert_eq!(quoted_path_for("", ShellQuoting::Posix), "''");
     }
 
     #[test]
