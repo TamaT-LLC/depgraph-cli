@@ -130,6 +130,6 @@ bookkeeping to the canonical graph.
 Selectors accept `id:`, `path:`, `package:`, `route:`, `symbol:`, and `type:` prefixes. `symbol:` and `type:` only match their respective node kind. `package:` matches workspace package instances and external dependency packages (by display name, `name@version`, or full `package://` locator), but not semantic `external://` boundaries. A bare or prefixed selector must resolve unambiguously; when candidates are reported, copy the complete stable ID (for example `symbol:sha256:...`) and retry as `id:<stable-id>`.
 
 External dependency packages as `package:` targets (by display name,
-`name@version`, or a full `package://` locator) are available on `main` but are
+`name@version`, or a full `package://` locator) are available in the `v0.6.4` release candidate but are
 not part of the published `v0.6.3` release. In `v0.6.3`, `package:`
 does not select external dependency packages.

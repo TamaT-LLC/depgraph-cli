@@ -86,7 +86,7 @@ Next.js App Routerではsource版（`next:/checkout`）とsemantic版（`next:ap
 その場合は`route:next:app:page:/checkout`のように表示名で指定するか、エラーの候補にある`id:`を使います。
 候補が複数ある場合は、コマンドが返した完全な安定IDを`id:<stable-id>`として指定します。
 
-`main`（未リリース）では、`package:`でnpmなどの外部依存パッケージも指定できます。
+`v0.6.4` のリリース候補では、`package:`でnpmなどの外部依存パッケージも指定できます。
 `package:stripe`、`package:stripe@18.0.0`、`package://npm:stripe@18.0.0#node_modules/stripe`のようなlocator完全指定が使えます。
 公開済みの`v0.6.3`はこの指定に対応していません。
 詳しい規則は[CLI動作リファレンス（英語）](../reference/cli-behavior.md#selectors)を参照してください。

@@ -4264,13 +4264,17 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     if framework_kinds
         != BTreeSet::from([
             "client_boundary",
+            "declared_in",
+            "implemented_by",
             "parent_route",
             "renders",
             "route_entry",
             "server_boundary",
         ])
     {
-        bail!("packaged Next.js graph lost its route/component/boundary vocabulary");
+        bail!(
+            "packaged Next.js graph lost its route/component/boundary/code-link vocabulary: {framework_kinds:?}"
+        );
     }
 
     let product_route = framework_nodes
@@ -4520,15 +4524,19 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     if astro_kinds
         != BTreeSet::from([
             "client_boundary",
+            "declared_in",
             "handled_by",
             "hydrates",
+            "implemented_by",
             "loads",
             "renders",
             "route_entry",
             "server_boundary",
         ])
     {
-        bail!("packaged Astro graph lost its route/render/hydration/resource vocabulary");
+        bail!(
+            "packaged Astro graph lost its route/render/hydration/resource/code-link vocabulary: {astro_kinds:?}"
+        );
     }
     let astro_component = |source_path: &str, environment: &str| {
         astro_nodes.iter().copied().find(|node| {
@@ -4821,6 +4829,8 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
     if tanstack_kinds
         != BTreeSet::from([
             "before_load",
+            "declared_in",
+            "implemented_by",
             "loads",
             "masks_to",
             "navigates_to",
@@ -4829,7 +4839,9 @@ fn verify_packaged_web_import_type_call_graph(executable: &Path, store: &Path) -
             "route_entry",
         ])
     {
-        bail!("packaged TanStack Router graph lost its typed route vocabulary");
+        bail!(
+            "packaged TanStack Router graph lost its typed route/code-link vocabulary: {tanstack_kinds:?}"
+        );
     }
     let tanstack_route = |pattern: &str, route_kind: &str| {
         tanstack_nodes.iter().copied().find(|node| {
