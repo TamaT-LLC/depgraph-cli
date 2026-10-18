@@ -179,14 +179,15 @@ anything. See the
 | Read detailed CLI contracts | [CLI behavior reference](docs/reference/cli-behavior.md) |
 | Enforce architecture rules | [Architecture policy contract](docs/reference/architecture-policy.md) |
 | Import runtime traces | [Runtime trace import contract](docs/reference/runtime-trace.md) |
-| Understand the design | [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md) |
-| Browse all documents | [Documentation index](docs/00_index/index.md) |
+| Understand the design | [the system design](docs/40_arch_design/arch-dependency-graph-cli-system-design.md) (Japanese) |
+| Browse all documents | [Documentation index](docs/00_index/index.md) (Japanese) |
 
 ## Project status and public collaboration
 
 The supported line is currently anchored by the published `v0.6.3` Release.
 Changes on `main` after that tag are development changes. See the
-[`v0.6.3` release notes](docs/releases/v0.6.3.md) for what it contains.
+[`v0.6.3` release notes](docs/releases/v0.6.3.md) (Japanese) for what it
+contains.
 Product support is best effort, without response-time or resolution-time SLAs.
 
 Follow [SUPPORT.md](SUPPORT.md) for usage questions and bug reports. Read
