@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt::Write as _};
 
 use depgraph_core::service::{
-    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, MAX_HEALTH_FILTER_ITEMS,
+    MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES, MAX_HEALTH_FILTER_ITEMS, MAX_HOTSPOT_PATH_BYTES,
 };
 use depgraph_core::{
     DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
@@ -1112,6 +1112,17 @@ fn accepted_operation_output_schema() -> Value {
     })
 }
 
+/// Hotspot path lists share the service's byte bound: `maxLength` is a
+/// conservative character cap and the extension carries the exact UTF-8 limit.
+fn hotspot_path_item_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_HOTSPOT_PATH_BYTES,
+        "x-depgraph-maxUtf8Bytes": MAX_HOTSPOT_PATH_BYTES
+    })
+}
+
 fn field_schema(tool_name: &str, field: &str) -> Value {
     match field {
         "query" if tool_name == "graph_query" => json!({
@@ -1214,14 +1225,14 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }),
         "churn_path_filter" => json!({
             "type": "array",
-            "maxItems": 1024,
-            "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": hotspot_path_item_schema(),
             "description": "Repository-relative paths that narrow only the Git churn input (the git_churn layer). It does not remove findings from the result; use path_prefixes for that."
         }),
         "path_prefixes" => json!({
             "type": "array",
             "maxItems": MAX_HEALTH_FILTER_ITEMS,
-            "items": {"type": "string", "minLength": 1, "maxLength": 512},
+            "items": hotspot_path_item_schema(),
             "description": "Return only findings whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Findings without a path never match. Applied after scoring, unlike churn_path_filter which only narrows the Git churn input. Empty or omitted means no restriction."
         }),
         "node_kinds" => json!({

@@ -2409,14 +2409,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.scan_id(),
                     result.snapshot_id().as_str(),
                     result.findings(),
-                    &serde_json::json!({
-                        "collection_digest": result.collection_digest(),
-                        "churn_commit_limit": request.churn_commit_limit(),
-                        "churn_path_filter": request.churn_path_filter(),
-                        "path_prefixes": request.path_prefixes(),
-                        "node_kinds": request.node_kinds(),
-                        "weights": request.weights().as_map(),
-                    }),
+                    &hotspots_page_context(&request, result.collection_digest()),
                     &output,
                     json,
                     Some(&snapshot),
@@ -2893,6 +2886,29 @@ fn run_health_findings(
     } else {
         Ok(0)
     }
+}
+
+/// Page context for `depgraph hotspots`.
+///
+/// An unrestricted result keeps the pre-#543 context so its cursor bytes are
+/// unchanged; each result filter binds the cursor only when set.
+fn hotspots_page_context(
+    request: &HealthHotspotsRequest,
+    collection_digest: &str,
+) -> serde_json::Value {
+    let mut context = serde_json::json!({
+        "collection_digest": collection_digest,
+        "churn_commit_limit": request.churn_commit_limit(),
+        "churn_path_filter": request.churn_path_filter(),
+        "weights": request.weights().as_map(),
+    });
+    if !request.path_prefixes().is_empty() {
+        context["path_prefixes"] = serde_json::json!(request.path_prefixes());
+    }
+    if !request.node_kinds().is_empty() {
+        context["node_kinds"] = serde_json::json!(request.node_kinds());
+    }
+    context
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3839,6 +3855,34 @@ mod tests {
     };
     use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
     use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
+
+    #[test]
+    fn issue_543_hotspots_page_context_keeps_legacy_keys_without_result_filter() {
+        use depgraph_core::DEFAULT_HOTSPOT_WEIGHTS;
+        use depgraph_core::service::{HealthHotspotsRequest, MAX_HEALTH_CHURN_COMMITS};
+
+        let unfiltered = HealthHotspotsRequest::try_new(
+            MAX_HEALTH_CHURN_COMMITS,
+            Vec::new(),
+            DEFAULT_HOTSPOT_WEIGHTS,
+        )
+        .unwrap();
+        assert_eq!(
+            super::hotspots_page_context(&unfiltered, "digest"),
+            serde_json::json!({
+                "collection_digest": "digest",
+                "churn_commit_limit": MAX_HEALTH_CHURN_COMMITS,
+                "churn_path_filter": [],
+                "weights": DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+            })
+        );
+        let filtered = unfiltered
+            .with_result_filter(vec!["src/lib".to_owned()], vec!["file".to_owned()])
+            .unwrap();
+        let context = super::hotspots_page_context(&filtered, "digest");
+        assert_eq!(context["path_prefixes"], serde_json::json!(["src/lib"]));
+        assert_eq!(context["node_kinds"], serde_json::json!(["file"]));
+    }
 
     #[test]
     fn issue_317_every_real_clap_leaf_maps_once_to_the_static_mcp_catalog() {

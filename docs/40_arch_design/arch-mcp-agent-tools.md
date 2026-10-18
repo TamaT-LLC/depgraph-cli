@@ -835,10 +835,10 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 
 | Area | Evidence |
 | --- | --- |
-| Input | `path_prefixes`（repository相対path、最大1024件、各512 byte以下、`RepositoryRelativePath`で検証し昇順・重複なしに正規化）と`node_kinds`（closed enum `file`/`module`/`symbol`/`type`/`route`、hotspot analyzerの対象種別と同じ定数）を任意入力として追加する。不正値は`INVALID_ARGUMENT` |
+| Input | `path_prefixes`（repository相対path、最大1024件、各512 byte以下、`RepositoryRelativePath`で検証し昇順・重複なしに正規化。`churn_path_filter`も同じ上限で、両者のschemaは`maxLength` 512と`x-depgraph-maxUtf8Bytes` 512を持つ）と`node_kinds`（closed enum `file`/`module`/`symbol`/`type`/`route`、hotspot analyzerの対象種別と同じ定数）を任意入力として追加する。不正値は`INVALID_ARGUMENT` |
 | Matching | path prefixはディレクトリ境界で一致させる。`src/lib`は`src/lib`と`src/lib/a.ts`に一致し`src/library.ts`には一致しない。pathを持たないfindingは一致しない。二つの条件はANDで、各リスト内はOR |
 | Score stability | 全候補を採点した後に絞り込むため、正規化score、finding ID、fingerprintは絞り込まない場合と同じ。`churn_path_filter`はGit churnの入力だけを絞り、結果は絞らないことをdescriptionに明記する |
-| Identity | `CollectionIdentity`に`hotspot_path_prefixes` / `hotspot_node_kinds`を`skip_serializing_if`付きで追加する。空の場合のdigestは従来と同じbytesになり、絞り込んだ集合はcomplete集合とdigestを共有しない。cursorの正規化入力にも条件を含め、条件が違うcursorは`CURSOR_MISMATCH` |
+| Identity | `CollectionIdentity`に`hotspot_path_prefixes` / `hotspot_node_kinds`を`skip_serializing_if`付きで追加する。空の場合のdigestは従来と同じbytesになり、絞り込んだ集合はcomplete集合とdigestを共有しない。cursorの正規化入力（MCP）とページ文脈（CLI）には空でない条件だけを含める。条件を指定しない要求は従来の正規化入力のままでcursorも同じbytesになり、条件が違うcursorは`CURSOR_MISMATCH` |
 | CLI parity | AC-006/AC-015に従い`depgraph hotspots`へ繰り返し指定できる`--path-prefix` / `--node-kind`を追加し、stdio process testでCLIとMCPのdigest、ID、scoreの一致を検証する |
 | Deterministic artifacts | catalog JSONとSHA-256 fixtureを再生成する。shared schemaとcontract goldenは入力schemaを含まないため変化しない |
 

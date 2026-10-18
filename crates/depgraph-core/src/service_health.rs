@@ -50,6 +50,7 @@ use crate::{
         MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
         MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING,
         MAX_HEALTH_SUPPRESSIONS_PER_FINDING, MAX_HEALTH_TOTAL_MANIFEST_BYTES,
+        MAX_HOTSPOT_PATH_BYTES,
     },
 };
 
@@ -471,9 +472,6 @@ pub struct HealthHotspotsRequest {
     path_prefixes: Vec<String>,
     node_kinds: Vec<String>,
 }
-
-/// Longest accepted hotspot path (churn filter or result prefix), in bytes.
-const MAX_HOTSPOT_PATH_BYTES: usize = 512;
 
 /// Validate repository-relative hotspot paths and return them sorted and
 /// deduplicated so equivalent requests share one identity.

@@ -7860,6 +7860,71 @@ fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
         cli_filtered["data"]["collection_digest"],
         cli_all["data"]["collection_digest"]
     );
+    // An unfiltered CLI page keeps the pre-#543 page context, so its cursor
+    // bytes are unchanged; a filtered page binds its cursor to the filter.
+    let cli_first_page = |extra: &[&str]| {
+        let mut arguments = vec!["hotspots", "--json", "--max-items", "1"];
+        arguments.extend_from_slice(extra);
+        let page = cli_json(&arguments);
+        page["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("hotspot page has a continuation cursor: {page}"))
+            .to_owned()
+    };
+    let legacy_context_digest = format!(
+        "interactive-query-context:sha256:{}",
+        depgraph_mcp_tools::canonical_json_sha256(&json!({
+            "contract_version": depgraph_core::INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION,
+            "command": "hotspots",
+            "scan_id": cli_all["scan_id"],
+            "snapshot_id": cli_all["data"]["snapshot_id"],
+            "context": {
+                "collection_digest": cli_all["data"]["collection_digest"],
+                "churn_commit_limit": depgraph_core::service::MAX_HEALTH_CHURN_COMMITS,
+                "churn_path_filter": [],
+                "weights": depgraph_core::DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+            },
+        }))
+        .unwrap()
+    );
+    let legacy_cli_cursor = format!(
+        "depgraph-query-cursor-v1.1.{}",
+        depgraph_mcp_tools::canonical_json_sha256(
+            &json!({"context_digest": legacy_context_digest, "offset": 1})
+        )
+        .unwrap()
+    );
+    let unfiltered_cli_cursor = cli_first_page(&[]);
+    assert_eq!(
+        unfiltered_cli_cursor, legacy_cli_cursor,
+        "an unfiltered hotspots cursor keeps its pre-#543 bytes"
+    );
+    let filtered_cli_cursor = cli_first_page(&["--path-prefix", "src/lib"]);
+    assert_ne!(filtered_cli_cursor, unfiltered_cli_cursor);
+    let (status, _, _) = cli(&[
+        "hotspots",
+        "--json",
+        "--max-items",
+        "1",
+        "--cursor",
+        &filtered_cli_cursor,
+    ]);
+    assert_ne!(status, Some(0), "a filtered cursor is bound to its filter");
+    let (status, _, _) = cli(&[
+        "hotspots",
+        "--json",
+        "--max-items",
+        "1",
+        "--node-kind",
+        "file",
+        "--cursor",
+        &unfiltered_cli_cursor,
+    ]);
+    assert_ne!(
+        status,
+        Some(0),
+        "an unfiltered cursor is bound to no filter"
+    );
     let (status, _, _) = cli(&["hotspots", "--json", "--node-kind", "package"]);
     assert_ne!(status, Some(0), "unknown --node-kind must be rejected");
     let (status, _, _) = cli(&["hotspots", "--json", "--path-prefix", "../outside"]);
@@ -7956,6 +8021,46 @@ fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
     ] {
         let mismatched = call(&mut mcp, id, extra);
         assert_eq!(mismatched["isError"], true, "{mismatched}");
+        assert_eq!(
+            mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
+            "{mismatched}"
+        );
+    }
+
+    // Without a filter the cursor keeps the legacy normalized input: empty
+    // filters equal omitted ones, and any filter rejects that cursor.
+    let unfiltered_page = call(&mut mcp, 20, json!({"limit": 1}));
+    let unfiltered_cursor =
+        unfiltered_page["structuredContent"]["result"]["findings"]["next_cursor"]
+            .as_str()
+            .expect("unfiltered hotspot page has a continuation cursor")
+            .to_owned();
+    let explicit_empty = call(
+        &mut mcp,
+        21,
+        json!({"limit": 1, "path_prefixes": [], "node_kinds": []}),
+    );
+    assert_eq!(
+        explicit_empty["structuredContent"]["result"]["findings"]["next_cursor"],
+        unfiltered_cursor
+    );
+    let resumed = call(
+        &mut mcp,
+        22,
+        json!({"limit": 1, "path_prefixes": [], "cursor": unfiltered_cursor}),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    for (id, extra) in [
+        (
+            23,
+            json!({"limit": 1, "path_prefixes": ["src/lib"], "cursor": unfiltered_cursor}),
+        ),
+        (
+            24,
+            json!({"limit": 1, "node_kinds": ["file"], "cursor": unfiltered_cursor}),
+        ),
+    ] {
+        let mismatched = call(&mut mcp, id, extra);
         assert_eq!(
             mismatched["structuredContent"]["error"]["code"], "CURSOR_MISMATCH",
             "{mismatched}"

@@ -219,6 +219,22 @@ fn issue_543_health_hotspots_list_advertises_result_filters() {
             .contains("after scoring")
     );
 
+    // Both path lists share the service's 512-byte path bound: maxLength is
+    // the conservative character cap and the extension carries the byte cap.
+    let churn_paths = &properties["churn_path_filter"];
+    for paths in [prefixes, churn_paths] {
+        assert_eq!(paths["maxItems"], 1024, "{paths}");
+        assert_eq!(
+            paths["items"],
+            serde_json::json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "x-depgraph-maxUtf8Bytes": 512
+            }),
+            "{paths}"
+        );
+    }
     let churn = properties["churn_path_filter"]["description"]
         .as_str()
         .expect("churn_path_filter documents that it does not filter results");

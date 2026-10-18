@@ -3945,14 +3945,7 @@ fn execute_catalog_read_tool(
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
             let found = service.health_hotspots(&mut snapshot_request, &request, cancellation)?;
-            let normalized = serde_json::json!({
-                "churn_commit_limit": request.churn_commit_limit(),
-                "churn_path_filter": request.churn_path_filter(),
-                "path_prefixes": request.path_prefixes(),
-                "node_kinds": request.node_kinds(),
-                "weights": request.weights().as_map(),
-                "collection_digest": found.collection_digest(),
-            });
+            let normalized = health_hotspots_cursor_input(&request, found.collection_digest());
             let pagination = PaginationContext::new(
                 cursor_key,
                 tool,
@@ -4554,6 +4547,29 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Normalized cursor input for `health_hotspots_list`.
+///
+/// An unrestricted result keeps the pre-#543 normalized input so its cursor
+/// bytes are unchanged; each result filter binds the cursor only when set.
+fn health_hotspots_cursor_input(
+    request: &HealthHotspotsRequest,
+    collection_digest: &str,
+) -> serde_json::Value {
+    let mut normalized = serde_json::json!({
+        "churn_commit_limit": request.churn_commit_limit(),
+        "churn_path_filter": request.churn_path_filter(),
+        "weights": request.weights().as_map(),
+        "collection_digest": collection_digest,
+    });
+    if !request.path_prefixes().is_empty() {
+        normalized["path_prefixes"] = serde_json::json!(request.path_prefixes());
+    }
+    if !request.node_kinds().is_empty() {
+        normalized["node_kinds"] = serde_json::json!(request.node_kinds());
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -4569,6 +4585,42 @@ mod tests {
     use depgraph_operation::OperationJournal;
     use depgraph_store::Store;
     use serde_json::json;
+
+    #[test]
+    fn issue_543_hotspot_cursor_input_keeps_legacy_keys_without_result_filter() {
+        let unfiltered = HealthHotspotsRequest::try_new(
+            MAX_HEALTH_CHURN_COMMITS,
+            vec!["src".to_owned()],
+            DEFAULT_HOTSPOT_WEIGHTS,
+        )
+        .unwrap()
+        .with_result_filter(Vec::new(), Vec::new())
+        .unwrap();
+        assert_eq!(
+            health_hotspots_cursor_input(&unfiltered, "digest"),
+            json!({
+                "churn_commit_limit": MAX_HEALTH_CHURN_COMMITS,
+                "churn_path_filter": ["src"],
+                "weights": DEFAULT_HOTSPOT_WEIGHTS.as_map(),
+                "collection_digest": "digest",
+            })
+        );
+
+        let by_path = unfiltered
+            .clone()
+            .with_result_filter(vec!["src/lib".to_owned()], Vec::new())
+            .unwrap();
+        let input = health_hotspots_cursor_input(&by_path, "digest");
+        assert_eq!(input["path_prefixes"], json!(["src/lib"]));
+        assert!(input.get("node_kinds").is_none(), "{input}");
+
+        let by_kind = unfiltered
+            .with_result_filter(Vec::new(), vec!["file".to_owned()])
+            .unwrap();
+        let input = health_hotspots_cursor_input(&by_kind, "digest");
+        assert_eq!(input["node_kinds"], json!(["file"]));
+        assert!(input.get("path_prefixes").is_none(), "{input}");
+    }
 
     #[test]
     fn completed_tool_result_survives_late_cancellation() {
