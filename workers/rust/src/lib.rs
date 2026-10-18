@@ -18,7 +18,7 @@ mod scanner;
 mod source;
 mod toolchain;
 
-pub use emit::build_events;
+pub use emit::{build_events, emit_events};
 pub use scanner::{
     FileCoverage, HirMode, ScanPhaseMetric, ScanResult, scan, scan_with_inventory_file,
     scan_with_options,

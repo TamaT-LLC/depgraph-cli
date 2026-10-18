@@ -31,7 +31,7 @@ fn semantic_fixture() -> PathBuf {
 #[test]
 fn typed_output_validates_and_contains_all_nine_events() {
     let result = scan(&fixture()).unwrap();
-    let events = build_events("rust-fixture", &result).unwrap();
+    let events = build_events("rust-fixture", result.clone()).unwrap();
     let mut ndjson = Vec::new();
     for event in &events {
         serde_json::to_writer(&mut ndjson, event).unwrap();
@@ -104,7 +104,7 @@ fn typed_output_validates_and_contains_all_nine_events() {
 #[test]
 fn hir_import_type_call_graph_emits_exact_nodes_sites_and_relations() {
     let result = scan(&semantic_fixture()).unwrap();
-    let events = build_events("rust-semantic-fixture", &result).unwrap();
+    let events = build_events("rust-semantic-fixture", result.clone()).unwrap();
     let mut ndjson = Vec::new();
     for event in &events {
         serde_json::to_writer(&mut ndjson, event).unwrap();
@@ -982,7 +982,7 @@ fn hir_import_type_graph_is_repeatable_and_checkout_independent() {
     assert_eq!(first.files, second.files);
 
     let deterministic_events = |result: &depgraph_rust_worker::ScanResult| {
-        build_events("deterministic-rust-scan", result)
+        build_events("deterministic-rust-scan", result.clone())
             .unwrap()
             .into_iter()
             .skip(1)
@@ -3096,7 +3096,7 @@ fn metadata_fallback_is_explicit_and_checkout_stable() {
         assert_eq!(first.coverage, candidate.coverage);
     }
     let deterministic_events = |result: &depgraph_rust_worker::ScanResult| {
-        build_events("deterministic-fallback-scan", result)
+        build_events("deterministic-fallback-scan", result.clone())
             .unwrap()
             .into_iter()
             .skip(1)
