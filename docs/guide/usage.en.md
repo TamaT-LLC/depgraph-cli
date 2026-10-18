@@ -76,8 +76,9 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
 
 - `--edge-kind` selects the edge kinds to follow. It is repeatable, and only
   edges of the listed kinds are followed.
-- The selection applies during traversal, so item counts and
-  `traversed_items` cover only the selected edges.
+- The selection applies during traversal, so item counts and the
+  traversal counter (`traversed_items` in CLI page output,
+  `traversed_edges` in MCP responses) cover only the selected edges.
 - With `--edge-kind`, the listed kinds alone decide which edges are
   followed. When `--structural-edges` is omitted, structural kinds such as
   `--edge-kind contains` may be listed.
