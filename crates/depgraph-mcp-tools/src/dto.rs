@@ -673,12 +673,24 @@ impl AgentNodeSummary {
 impl TryFrom<&depgraph_core::service::NodeProjection> for AgentNodeSummary {
     type Error = ContractBuildError;
 
+    /// Workers store locators such as `file:src/lib.rs` or
+    /// `unknown://web/unresolved-dependency` and free-form display names
+    /// (multi-line TypeScript expressions, long paths) that the Agent scalar
+    /// contract rejects. Like `agent_node_from_fields`, fall back to the
+    /// node id instead of failing the whole page as an integrity error (#563).
     fn try_from(source: &depgraph_core::service::NodeProjection) -> Result<Self, Self::Error> {
+        let id: AgentId = parse_agent_value(source.id())?;
+        let locator = AgentLocator::parse(source.locator())
+            .or_else(|_| AgentLocator::parse(format!("id:{}", id.as_str())))
+            .map_err(|_| ContractBuildError::AgentDtoValue)?;
+        let display_name = AgentLabel::parse(source.display_name())
+            .or_else(|_| AgentLabel::parse(id.as_str()))
+            .map_err(|_| ContractBuildError::AgentDtoValue)?;
         Ok(Self::new(
-            parse_agent_value(source.id())?,
+            id,
             parse_agent_value(source.kind())?,
-            parse_agent_value(source.locator())?,
-            parse_agent_value(source.display_name())?,
+            locator,
+            display_name,
         ))
     }
 }
@@ -5492,5 +5504,103 @@ mod impact_projection_tests {
         let value = serde_json::to_value(&site).expect("serialize site");
         assert!(value["evidence"][0].is_object(), "{value}");
         assert!(value["evidence"][0].get("import").is_none(), "{value}");
+    }
+}
+
+#[cfg(test)]
+mod node_summary_projection_tests {
+    use depgraph_core::service::NodeProjection;
+    use depgraph_store::NodeSummaryRecord;
+
+    use super::AgentNodeSummary;
+
+    fn projection(id: &str, kind: &str, locator: &str, display_name: &str) -> NodeProjection {
+        NodeProjection::from(NodeSummaryRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: locator.to_owned(),
+            display_name: display_name.to_owned(),
+        })
+    }
+
+    fn summary(id: &str, kind: &str, locator: &str, display_name: &str) -> serde_json::Value {
+        let summary = AgentNodeSummary::try_from(&projection(id, kind, locator, display_name))
+            .unwrap_or_else(|error| panic!("{id} must project: {error:?}"));
+        serde_json::to_value(summary).expect("serialize node summary")
+    }
+
+    #[test]
+    fn worker_locators_outside_the_agent_contract_fall_back_to_the_node_id() {
+        // Shapes emitted by the real Rust, Web and Go workers on depgraph-cli itself (#563).
+        for (id, kind, locator) in [
+            (
+                "file:sha256:04f34fdf8705550828c477466db973ecbfb9bf256feda949984947d6695a19be",
+                "file",
+                "file:crates/depgraph-core/src/policy.rs",
+            ),
+            (
+                "unknown:sha256:4944f2486b3db33539a405cd87d5f4b0400374e95642b73d02fdea5e4c346d3f",
+                "unknown_target",
+                "unknown://web/unresolved-dependency",
+            ),
+            (
+                "file:sha256:dc311e2546193919fdb25f373c3b0d2850964e60e8cd01dbaab188b0c2fb7d11",
+                "file",
+                "file://fixtures/web/package.json",
+            ),
+            (
+                "route:sha256:6cb9323a85d846a91b3a0264f2c79e11ea5b512f0b0fea0df1637ee4ac27a911",
+                "route",
+                "route://astro/@fixture/astro-app/docs",
+            ),
+        ] {
+            let value = summary(id, kind, locator, "label");
+            assert_eq!(value["id"], id);
+            assert_eq!(value["kind"], kind);
+            assert_eq!(value["locator"], format!("id:{id}"));
+            assert_eq!(value["display_name"], "label");
+        }
+    }
+
+    #[test]
+    fn display_names_outside_the_agent_contract_fall_back_to_the_node_id() {
+        let id = "external:sha256:1256d0d1759a1c20caf5f254cdb6580e0a7b0a363330d34cba539ca25e68646b";
+        for display_name in [
+            "typescript:stdlib:[\n  \"function\",\n].includes".to_owned(),
+            "a".repeat(257),
+        ] {
+            let value = summary(
+                id,
+                "external_system",
+                "go-symbol:fmt.Println",
+                &display_name,
+            );
+            assert_eq!(value["display_name"], id);
+            assert_eq!(value["locator"], "go-symbol:fmt.Println");
+        }
+    }
+
+    #[test]
+    fn contract_valid_fields_are_projected_unchanged() {
+        let locator = "rust-module:depgraph-core:lib:depgraph_core::profile_selection_rank";
+        let value = summary(
+            "module:sha256:00ba",
+            "module",
+            locator,
+            "profile_selection_rank",
+        );
+        assert_eq!(value["locator"], locator);
+        assert_eq!(value["display_name"], "profile_selection_rank");
+    }
+
+    #[test]
+    fn invalid_ids_and_kinds_still_fail_closed() {
+        for (id, kind) in [("bad id", "file"), ("file:ok", "Bad Kind")] {
+            let projection = projection(id, kind, "file:src/lib.rs", "src/lib.rs");
+            assert!(
+                AgentNodeSummary::try_from(&projection).is_err(),
+                "{id} {kind}"
+            );
+        }
     }
 }
