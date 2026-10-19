@@ -82,6 +82,12 @@ export interface TypeScriptRawDependencySite {
   specifier: string;
   moduleSpecifier: string | null;
   importedName: string | null;
+  /**
+   * Local binding introduced by a direct import binding occurrence
+   * (`default_import`, `named_import`, `namespace_import`, `import_equals`);
+   * null for every other occurrence.
+   */
+  localName: string | null;
   /** Canonical module export path used only for scanner-side proof correlation. */
   exportPath: string[] | null;
   /** Explicit TypeScript `resolution-mode`, if the occurrence declared one. */

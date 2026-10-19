@@ -43,6 +43,70 @@ fn typescript_named_import_projects_specifier_binding_and_imported_name() {
 }
 
 #[test]
+fn typescript_local_binding_name_is_projected() {
+    for (occurrence, imported, local) in [
+        ("named_import", "a", "b"),
+        ("default_import", "default", "d"),
+        ("namespace_import", "*", "ns"),
+        ("import_equals", "=", "eq"),
+    ] {
+        let mut properties = ts_semantic_properties(occurrence);
+        properties["imported_name"] = json!(imported);
+        properties["local_name"] = json!(local);
+        let import = project_import_evidence(&properties, None).expect(occurrence);
+        assert_eq!(import.imported_name(), Some(imported), "{occurrence}");
+        assert_eq!(import.local_name(), Some(local), "{occurrence}");
+    }
+
+    let mut secret = ts_semantic_properties("named_import");
+    secret["local_name"] = json!("apiKey");
+    let import = project_import_evidence(&secret, None).expect("specifier survives");
+    assert_eq!(import.imported_name(), Some("fooHelper"));
+    assert_eq!(import.local_name(), None);
+}
+
+#[test]
+fn go_import_alias_and_dot_import_are_projected_from_site_evidence() {
+    let site = Some(ImportSiteHint::new("import", Some("example.com/pkg/util")));
+    let alias = project_import_evidence(&json!({"local_name": "utilpkg"}), site).expect("alias");
+    assert_eq!(alias.specifier(), "example.com/pkg/util");
+    assert_eq!(alias.binding_kind(), None);
+    assert_eq!(alias.imported_name(), None);
+    assert_eq!(alias.local_name(), Some("utilpkg"));
+
+    let dot = project_import_evidence(&json!({"glob": true}), site).expect("dot import");
+    assert_eq!(dot.binding_kind(), Some(ImportBindingKind::Glob));
+    assert_eq!(dot.local_name(), None);
+
+    let blank = project_import_evidence(
+        &json!({"local_name": "ignored", "glob": true}),
+        Some(ImportSiteHint::new(
+            "side_effect_import",
+            Some("example.com/pkg/util"),
+        )),
+    )
+    .expect("blank import");
+    assert_eq!(blank.binding_kind(), Some(ImportBindingKind::SideEffect));
+    assert_eq!(blank.local_name(), None);
+
+    for rejected in [
+        json!("bad\nname"),
+        json!("x".repeat(MAX_IMPORT_NAME_BYTES + 1)),
+        json!("apiKey"),
+        json!(7),
+    ] {
+        let import = project_import_evidence(&json!({"local_name": rejected}), site)
+            .expect("specifier survives a bad local name");
+        assert_eq!(import.local_name(), None, "{rejected}");
+    }
+    assert_eq!(
+        project_import_evidence(&json!({"glob": "yes"}), site)
+            .and_then(|import| import.binding_kind()),
+        None
+    );
+}
+
+#[test]
 fn typescript_occurrence_kinds_map_to_the_closed_binding_kinds() {
     for (occurrence, expected) in [
         ("default_import", ImportBindingKind::Default),
@@ -422,7 +486,12 @@ fn seed_import_graph(store: &mut Store, root: &Path) -> Result<()> {
             "import",
             "example.com/pkg/util",
             "node:util",
-            vec![evidence("main.go", 3, "source", json!({}))],
+            vec![evidence(
+                "main.go",
+                3,
+                "source",
+                json!({"local_name": "utilpkg"}),
+            )],
         ),
         (
             "site:embed",
@@ -527,6 +596,7 @@ fn agent_evidence_projections_carry_import_evidence_for_sites_and_edges() -> Res
         .expect("Go import site falls back to specifier");
     assert_eq!(import.specifier(), "example.com/pkg/util");
     assert_eq!(import.binding_kind(), None);
+    assert_eq!(import.local_name(), Some("utilpkg"));
 
     let embed = service.list_site_evidence_page(&snapshot, "site:embed", 0, 10, &cancellation)?;
     assert!(embed.items()[0].import().is_none());

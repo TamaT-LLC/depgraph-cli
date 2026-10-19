@@ -1366,6 +1366,42 @@ test("external owner resolution overrides neutral workspace compiler definitions
   }
 });
 
+test("semantic import evidence records the local binding name", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-import-local-name-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "import-local-name", private: true })),
+    writeFile(path.join(root, "lib.ts"), "export const a = 1;\nexport default function d() {}\n"),
+    writeFile(path.join(root, "index.ts"), [
+      'import d, { a as b, a } from "./lib";',
+      'import * as ns from "./lib";',
+      'import "./lib";',
+      'import eq = require("./lib");',
+      "export const used = [d, b, a, ns, eq];",
+      "",
+    ].join("\n")),
+  ]);
+
+  const result = await run("import-local-name", root);
+  const properties = result.events
+    .filter((event) => event.site?.kind === "web_import" && event.site.evidence[0]?.kind === "semantic")
+    .map((event) => event.site.evidence[0].properties)
+    .map(({ occurrence_kind, imported_name, local_name }) => ({ occurrence_kind, imported_name, local_name }));
+  for (const expected of [
+    { occurrence_kind: "default_import", imported_name: "default", local_name: "d" },
+    { occurrence_kind: "named_import", imported_name: "a", local_name: "b" },
+    { occurrence_kind: "named_import", imported_name: "a", local_name: "a" },
+    { occurrence_kind: "namespace_import", imported_name: "*", local_name: "ns" },
+    { occurrence_kind: "import_equals", imported_name: "=", local_name: "eq" },
+    { occurrence_kind: "side_effect_import", imported_name: undefined, local_name: undefined },
+  ]) {
+    assert.ok(
+      properties.some((actual) => JSON.stringify(actual) === JSON.stringify(expected)),
+      `${JSON.stringify(expected)} not in ${JSON.stringify(properties)}`,
+    );
+  }
+});
+
 test("missing explicit workspace, file, link, and portal targets remain unresolved", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-missing-explicit-local-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

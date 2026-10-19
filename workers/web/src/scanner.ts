@@ -726,6 +726,7 @@ class GraphBuilder {
           (raw.importedName.length === 0 && !emptyModuleExportName)
           || raw.importedName.length > 512
         ))
+        || (raw.localName !== null && (raw.localName.length === 0 || raw.localName.length > 512))
       ) throw new Error("TypeScript dependency binding metadata is invalid");
       if (raw.targets.length === 0) throw new Error("TypeScript dependency site has no target");
       if (raw.targetConditions.length !== raw.targets.length) {
@@ -780,6 +781,7 @@ class GraphBuilder {
         ...(raw.resolutionMode === null ? {} : { resolution_mode: raw.resolutionMode }),
         ...(raw.moduleSpecifier === null ? {} : { module_specifier: raw.moduleSpecifier }),
         ...(raw.importedName === null ? {} : { imported_name: raw.importedName }),
+        ...(raw.localName === null ? {} : { local_name: raw.localName }),
       } as const;
       const primary: Evidence = {
         kind: "semantic",

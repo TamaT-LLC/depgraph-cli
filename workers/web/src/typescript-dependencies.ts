@@ -920,10 +920,10 @@ function createSite(
     : null;
   const bindingKind = bindingMetadata?.bindingKind
     ?? (typeof specifier === "string" ? null : specifier.bindingKind);
-  const bindingScope = kind === "web_import"
-    && ["default_import", "named_import", "namespace_import", "import_equals"].includes(occurrenceKind)
-    ? bindingScopeSpan(anchor)
-    : null;
+  const directBinding = kind === "web_import"
+    && ["default_import", "named_import", "namespace_import", "import_equals"].includes(occurrenceKind);
+  const bindingScope = directBinding ? bindingScopeSpan(anchor) : null;
+  const localName = directBinding ? importBindingLocalName(anchor) : null;
   return {
     key: siteKey(source, kind, context.source.relativePath, startOffset, endOffset),
     kind,
@@ -932,6 +932,7 @@ function createSite(
     specifier: protocolSpecifier.slice(0, MAX_SPECIFIER_CHARS),
     moduleSpecifier,
     importedName,
+    localName,
     exportPath,
     resolutionMode: directive.mode,
     resolutionModeProof: directive.mode === null ? null : directive.proof ?? null,
@@ -954,6 +955,25 @@ function createSite(
       targetBasis,
     },
   };
+}
+
+const IMPORT_BINDING_PARENT_KINDS: ReadonlySet<SyntaxKind> = new Set([
+  SyntaxKind.ImportClause,
+  SyntaxKind.ImportSpecifier,
+  SyntaxKind.NamespaceImport,
+  SyntaxKind.ImportEqualsDeclaration,
+]);
+
+/**
+ * The identifier an import declaration binds, when `anchor` is that binding's
+ * name: `d` in `import d from`, `b` in `import { a as b }`, `ns` in
+ * `import * as ns`, `x` in `import x = require()`. Recovery anchors that point
+ * at a module specifier instead yield null.
+ */
+function importBindingLocalName(anchor: Node): string | null {
+  const parent = anchor.parent as (Node & { readonly name?: Node }) | undefined;
+  const bindsAnchor = parent?.name === anchor && IMPORT_BINDING_PARENT_KINDS.has(parent.kind);
+  return bindsAnchor ? (anchor as Identifier).text : null;
 }
 
 async function moduleTargets(

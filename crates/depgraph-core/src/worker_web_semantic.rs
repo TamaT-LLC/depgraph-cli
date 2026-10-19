@@ -2545,6 +2545,7 @@ pub(crate) fn validate_web_definition_graph(
                     && primary.properties.contains_key("algorithm"))
                 || primary.properties.contains_key("type_only")
                 || primary.properties.contains_key("imported_name")
+                || primary.properties.contains_key("local_name")
                 || primary.properties.contains_key("resolution_mode")
             {
                 return Err(format!(
@@ -2591,6 +2592,18 @@ pub(crate) fn validate_web_definition_graph(
                     site.id
                 )
             })?;
+            let local_name = web_optional_evidence_string(
+                &primary.properties,
+                "local_name",
+                TYPESCRIPT_MAX_DISPLAY_NAME_CHARS,
+                false,
+            )
+            .map_err(|()| {
+                format!(
+                    "Web semantic dependency site {} has invalid local_name metadata",
+                    site.id
+                )
+            })?;
             let resolution_mode = match primary.properties.get("resolution_mode") {
                 None => None,
                 Some(value) => match value.as_str() {
@@ -2631,7 +2644,14 @@ pub(crate) fn validate_web_definition_graph(
                     | "empty_reexport"
                     | "export_star"
             );
+            // Only an import declaration's own binding introduces a local name.
+            let direct_binding = site.kind == "web_import"
+                && matches!(
+                    occurrence_kind,
+                    "default_import" | "named_import" | "namespace_import" | "import_equals"
+                );
             let metadata_shape_is_valid = (site.kind == "type_use" || module_specifier.is_some())
+                && (direct_binding || local_name.is_none())
                 && (site.kind != "type_use" || imported_name.is_some())
                 && (!named_binding || imported_name.is_some())
                 && (!namespace_binding || imported_name == Some("*"))

@@ -1739,8 +1739,9 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 		position := source.FileSet.Position(spec.Pos())
 		end := source.FileSet.Position(spec.End())
 		evidence := sourceEvidence(source.RelPath, position.Line, position.Column, end.Line, end.Column, spec.Path.Value)
+		bindingEvidence := importBindingEvidence(spec, evidence)
 		if err != nil || value == "" {
-			s.addUnresolvedSite(source, "import", spec.Path.Value, "invalid import path literal", evidence)
+			s.addUnresolvedSite(source, "import", spec.Path.Value, "invalid import path literal", bindingEvidence)
 			continue
 		}
 		switch value {
@@ -1768,7 +1769,7 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 			continue
 		}
 		if strings.HasPrefix(value, ".") || strings.Contains(value, "\\") {
-			s.addUnresolvedSite(source, importSiteKind(spec), value, "relative or non-canonical imports are not resolved in module mode", evidence)
+			s.addUnresolvedSite(source, importSiteKind(spec), value, "relative or non-canonical imports are not resolved in module mode", bindingEvidence)
 			continue
 		}
 		if targets := resolveLocalGroups(source, value, groups, s.moduleResolution); len(targets) > 0 {
@@ -1784,12 +1785,12 @@ func (s *scannerState) extractFileDependencies(source *sourceFile, groups map[st
 			site := Site{
 				ID: siteID, Source: source.FileNodeID, Kind: importSiteKind(spec), Specifier: value,
 				ResolutionStatus: status, TargetIDs: targetIDs, ProfileID: s.profile.ID,
-				Condition: source.Condition, Precision: "exact", Evidence: evidence,
+				Condition: source.Condition, Precision: "exact", Evidence: bindingEvidence,
 			}
 			s.addSiteWithEdges(site, importEdgeKind(spec))
 		} else {
 			properties := map[string]any{"ecosystem": "go", "import_path": value, "standard_library": looksLikeStandardLibrary(value)}
-			s.addExternalSite(source, importSiteKind(spec), value, importEdgeKind(spec), "external_system", "go-import:"+value, value, evidence, properties)
+			s.addExternalSite(source, importSiteKind(spec), value, importEdgeKind(spec), "external_system", "go-import:"+value, value, bindingEvidence, properties)
 		}
 	}
 
@@ -2794,6 +2795,31 @@ func importSiteKind(spec *ast.ImportSpec) string {
 		return "side_effect_import"
 	}
 	return "import"
+}
+
+// importBindingEvidence records the explicit import name of spec on a copy of
+// its primary evidence. An alias becomes `local_name` (the key TypeScript
+// evidence uses); a dot import binds no local name and records `glob`, as Rust
+// `use path::*` evidence does. Blank imports are already side_effect_import
+// sites, and an omitted name is left implicit rather than guessed.
+func importBindingEvidence(spec *ast.ImportSpec, evidence []Evidence) []Evidence {
+	if spec.Name == nil || spec.Name.Name == "_" || len(evidence) == 0 {
+		return evidence
+	}
+	result := append([]Evidence(nil), evidence...)
+	primary := result[0]
+	properties := make(map[string]any, len(primary.Properties)+1)
+	for key, value := range primary.Properties {
+		properties[key] = value
+	}
+	if spec.Name.Name == "." {
+		properties["glob"] = true
+	} else {
+		properties["local_name"] = spec.Name.Name
+	}
+	primary.Properties = properties
+	result[0] = primary
+	return result
 }
 
 func importEdgeKind(spec *ast.ImportSpec) string {

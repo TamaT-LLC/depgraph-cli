@@ -860,6 +860,13 @@ interface SyntaxResolutionMode {
   error: string | null;
 }
 
+/** Occurrences whose anchor is the identifier the import declaration binds. */
+const DIRECT_IMPORT_BINDING_OCCURRENCES: ReadonlySet<string> = new Set([
+  "default_import",
+  "named_import",
+  "namespace_import",
+  "import_equals",
+]);
 const NO_SYNTAX_RESOLUTION_MODE: SyntaxResolutionMode = Object.freeze({ mode: null, proof: null, error: null });
 const RESOLUTION_MODE_ERRORS: ReadonlySet<string> = new Set([
   "duplicate_resolution_mode",
@@ -2645,6 +2652,14 @@ function validateTypeScriptDependencySites(
         || (site.importedName.length === 0 && !emptyModuleExportName)
         || site.importedName.length > 512
         || hasUnpairedSurrogate(site.importedName)
+      ))
+      || (site.localName !== null && (
+        typeof site.localName !== "string"
+        || site.localName.length === 0
+        || site.localName.length > 512
+        || hasUnpairedSurrogate(site.localName)
+        || site.kind !== "web_import"
+        || !DIRECT_IMPORT_BINDING_OCCURRENCES.has(site.evidence.occurrenceKind)
       ))
     ) throw new DependencyContractError("raw dependency binding metadata is invalid");
     if (
