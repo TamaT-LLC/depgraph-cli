@@ -54,6 +54,15 @@ const CHANGED_PATH_UNMAPPED_DIAGNOSTIC = "changed_path_unmapped";
 const OPTIONAL_SELECTOR_USAGE = /^Usage:.*\bimpact\b.*\[SELECTOR\]/m;
 // What an older CLI prints when the selector is missing anyway.
 const SELECTOR_REQUIRED_PATTERN = /required arguments were not provided[\s\S]*<SELECTOR>/;
+const IMPACT_EXIT_RESOURCE = 3;
+// `DepgraphServiceError::ResourceExhausted`. Changed-set mapping indexes every
+// node, site, edge, and evidence record against one fixed work ceiling, so a
+// large snapshot exhausts it whatever the pull request changed.
+const RESOURCE_EXHAUSTED_PATTERN = /^request exhausted a service resource limit$/;
+// The comment tables list these kinds. A changed-set result reports a route
+// or package the change itself maps to (a changed page, a changed manifest) as
+// a depth-0 changed node, where per-file reports it as impacted at depth 1.
+const KEPT_CHANGED_NODE_KINDS = new Set(["route", "package_instance"]);
 
 /** Parse `git diff --name-status -z` output. Rename and copy records carry two paths. */
 export function parseNameStatusZ(raw) {
@@ -225,7 +234,9 @@ export function classifyChangedSetResult({ exitCode, stdout, stderr }) {
  * when its only mappings have none. Each impacted node (depth > 0) is credited
  * to every changed file in its `changed_paths`, with the depth and path depgraph
  * already reduced to the nearest change. Depth-0 nodes are the changed nodes
- * themselves and are left out, as `per-file` leaves out its root. A file the
+ * themselves and are left out, as `per-file` leaves out its root, except routes
+ * and packages: they stay at depth 0 so the comment tables still list a route
+ * whose page changed or a package whose manifest changed. A file the
  * result does not mention at all is an `error`: the two diffs disagree, and the
  * report must not claim that file has no impact.
  */
@@ -239,8 +250,10 @@ export function changedSetFiles(entries, data) {
   }
   const impactsByPath = new Map();
   for (const item of data.impacts) {
-    if (!(item.depth > 0)) continue;
+    const keepChangedNode = item.depth === 0 && KEPT_CHANGED_NODE_KINDS.has(item.node?.kind);
+    if (!(item.depth > 0) && !keepChangedNode) continue;
     const impact = { node: item.node, depth: item.depth, changed_node_id: item.changed_node_id, dependency_path: item.dependency_path ?? [] };
+    if (keepChangedNode) impact.keep_changed_node = true;
     for (const path of item.changed_paths ?? []) {
       if (!impactsByPath.has(path)) impactsByPath.set(path, []);
       impactsByPath.get(path).push(impact);
@@ -305,7 +318,7 @@ export function aggregateReport({
     entry.status = result.status;
     if (result.status === "ok") {
       const data = result.data;
-      const own = data.impacts.filter((item) => item.depth > 0);
+      const own = data.impacts.filter((item) => item.depth > 0 || item.keep_changed_node === true);
       entry.impacted_count = own.length;
       entry.complete = data.complete !== false;
       if (!entry.complete) incomplete = true;
@@ -477,13 +490,18 @@ async function collectPerFile(entries, { canQuery, fileLimit, options, runDepgra
   return { files, skipped, diagnostics: [] };
 }
 
-// One call covers every changed file, so max-files does not apply. A failed
-// call (exit 2 for a HEAD mismatch, exit 3 for an exceeded bound) leaves every
+// One call covers every changed file, so max-files does not apply. An older
+// CLI that still wants a selector, or a snapshot too large for the changed-set
+// mapping, returns `fallbackReason` so the caller can run per-file instead. Any
+// other failure (exit 2 for a HEAD mismatch, for example) leaves every
 // surviving file as an error rather than as having no impact.
 async function collectChangedSet(entries, { mergeBase, options, runDepgraph }) {
   const processResult = await runDepgraph(buildChangedSetImpactArgs({ ...options, changedRef: mergeBase }));
   if (processResult.exitCode === IMPACT_EXIT_INPUT && SELECTOR_REQUIRED_PATTERN.test(String(processResult.stderr ?? ""))) {
-    return { unsupported: true };
+    return { fallbackReason: "this depgraph requires a selector for impact" };
+  }
+  if (processResult.exitCode === IMPACT_EXIT_RESOURCE && RESOURCE_EXHAUSTED_PATTERN.test(firstLine(processResult.stderr))) {
+    return { fallbackReason: "impact --changed exhausted a depgraph service resource limit" };
   }
   const result = classifyChangedSetResult(processResult);
   if (result.status !== "ok") {
@@ -544,8 +562,8 @@ export async function collectReport({
   let collected;
   if (canQuery && mode.used === IMPACT_MODE_CHANGED_SET) {
     collected = await collectChangedSet(entries, { mergeBase, options, runDepgraph });
-    if (collected.unsupported) {
-      mode = fallBack({ requested: requestedMode, used: IMPACT_MODE_PER_FILE, fallback_reason: "this depgraph requires a selector for impact" });
+    if (collected.fallbackReason) {
+      mode = fallBack({ requested: requestedMode, used: IMPACT_MODE_PER_FILE, fallback_reason: collected.fallbackReason });
       collected = undefined;
     }
   }

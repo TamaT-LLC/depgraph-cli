@@ -30,8 +30,9 @@ inputs:
       per changed file. `changed-set` runs `depgraph impact --changed <merge-base>`
       once for the whole pull request (depgraph 0.7.0 or later). `changed-set`
       falls back to `per-file` with a warning when the depgraph binary has no
-      selector-less `impact --changed`, or when a partial or strict-violating
-      scan is only readable as an `attempt:` snapshot.
+      selector-less `impact --changed`, when a partial or strict-violating scan
+      is only readable as an `attempt:` snapshot, or when the call exhausts a
+      depgraph resource limit (exit 3).
     required: false
     default: per-file
   max-files:

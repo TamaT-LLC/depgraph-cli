@@ -802,6 +802,36 @@ test("changedSetFiles credits each impacted node to every changed path that reac
   assert.deepEqual(byPath["src/unknown.ts"], { status: "error", exitCode: 0, message: "changed-set impact did not report this path" });
 });
 
+test("changedSetFiles keeps a route or package that is itself a changed node at depth 0", () => {
+  const page = node("route-page", "route", "/users/$id");
+  const symbol = node("symbol-render", "symbol", "render");
+  const data = changedSetData({
+    mappings: [mapping("app/users/[id]/page.tsx", ["file-page", "route-page", "symbol-render"]), mapping("package.json", ["pkg-web"])],
+    impacts: [
+      changedImpact(node("file-page", "file", "app/users/[id]/page.tsx"), 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(page, 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(symbol, 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(SCENARIO_PACKAGE, 0, ["package.json"], []),
+    ],
+  });
+  const files = changedSetFiles(
+    [
+      { change: "M", path: "app/users/[id]/page.tsx" },
+      { change: "M", path: "package.json" },
+    ],
+    data,
+  );
+  const report = reportFixture({ files });
+  assert.deepEqual(
+    report.impacted.map((entry) => [entry.kind, entry.display_name, entry.depth, entry.reached_from]),
+    [
+      ["route", "/users/$id", 0, ["app/users/[id]/page.tsx"]],
+      ["package_instance", "apps/web", 0, ["package.json"]],
+    ],
+  );
+  assert.equal(report.impacted[0].keep_changed_node, undefined);
+});
+
 test("changedSetFiles matches a renamed file by its new path", () => {
   const data = changedSetData({
     mappings: [mapping("src/to.ts", ["file-to"], { status: "renamed", old_path: "src/from.ts" })],
@@ -863,23 +893,50 @@ test("collectReport changed-set ignores max-files because it makes a single call
   assert.equal(report.changed_files.filter((file) => file.status === "ok").length, 2);
 });
 
+const HEAD_MISMATCH = "error: current snapshot source revision does not match the repository worktree HEAD\n";
+const RESOURCE_EXHAUSTED = "error: request exhausted a service resource limit\n";
+
 test("collectReport changed-set turns a failed call into errors for every surviving file", async () => {
-  const { runDepgraph } = changedSetDepgraph({
-    answer: () => ({ exitCode: 3, stdout: "", stderr: "error: service resource limit exceeded\n" }),
-  });
-  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph });
+  const { runDepgraph, calls } = changedSetDepgraph({ answer: () => ({ exitCode: 2, stdout: "", stderr: HEAD_MISMATCH }) });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.deepEqual(warnings, []);
+  assert.equal(calls.length, 2);
+  assert.equal(report.impact_mode.used, "changed-set");
   assert.equal(report.incomplete, true);
   assert.deepEqual(
     report.changed_files.map((file) => [file.path, file.status, file.exit_code]),
     [
-      ["src/a.ts", "error", 3],
-      ["src/b.ts", "error", 3],
-      ["docs/c.md", "error", 3],
+      ["src/a.ts", "error", 2],
+      ["src/b.ts", "error", 2],
+      ["docs/c.md", "error", 2],
       ["src/gone.ts", "deleted", undefined],
     ],
   );
-  assert.equal(report.changed_files[0].message, "service resource limit exceeded");
+  assert.equal(report.changed_files[0].message, "current snapshot source revision does not match the repository worktree HEAD");
   assert.deepEqual(report.impacted, []);
+});
+
+test("collectReport changed-set falls back to per-file when the call exhausts a resource limit", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph({ answer: () => ({ exitCode: 3, stdout: "", stderr: RESOURCE_EXHAUSTED }) });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.deepEqual(warnings, ["impact-mode changed-set falls back to per-file: impact --changed exhausted a depgraph service resource limit"]);
+  assert.deepEqual(
+    calls.slice(2).map((args) => args[3]),
+    ["path:src/a.ts", "path:src/b.ts", "path:docs/c.md"],
+  );
+  assert.equal(report.impact_mode.used, "per-file");
+  assert.equal(report.incomplete, false);
+  assert.equal(report.totals.impacted, 3);
+});
+
+test("collectReport changed-set keeps an exit 3 that is not a resource limit as an error", async () => {
+  const { runDepgraph } = changedSetDepgraph({ answer: () => ({ exitCode: 3, stdout: "", stderr: "error: read-only store is unavailable\n" }) });
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph });
+  assert.equal(report.impact_mode.used, "changed-set");
+  assert.equal(report.changed_files[0].status, "error");
+  assert.equal(report.incomplete, true);
 });
 
 test("collectReport changed-set marks the report incomplete when the result is incomplete", async () => {
