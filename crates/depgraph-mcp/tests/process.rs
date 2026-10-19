@@ -3629,6 +3629,174 @@ fn issue_300_handler_maps_oversized_utf8_query_to_a_typed_error() {
     );
 }
 
+/// Seeds nodes shaped like the real Rust, Web and TypeScript workers emit them
+/// (`file:` locators, `unknown://` locators, multi-line display names), which
+/// the `repo://` fixtures above never exercised (#563).
+fn seed_issue_563_store(path: &Path, root: &Path) {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-563", root, false, Some("revision-563"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let common = |event: &str, seq: u64| {
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-563",
+            "adapter": "rust",
+            "adapter_version": "0.1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started", 1);
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared", 2);
+    profile["profile"] = json!({
+        "id": "rust:safe",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (seq, node) in [
+        json!({
+            "id": "file:sha256:0001",
+            "kind": "file",
+            "locator": "file:crates/depgraph-core/src/policy.rs",
+            "display_name": "crates/depgraph-core/src/policy.rs",
+            "properties": {"path": "crates/depgraph-core/src/policy.rs"}
+        }),
+        json!({
+            "id": "unknown:sha256:0002",
+            "kind": "unknown_target",
+            "locator": "unknown://web/unresolved-dependency",
+            "display_name": "Unresolved web dependency in crates/depgraph-core/src/",
+            "properties": {}
+        }),
+        json!({
+            "id": "external:sha256:0003",
+            "kind": "external_system",
+            "locator": "external://typescript/crates%2Fdepgraph-core%2Fsrc%2F",
+            "display_name": "crates/depgraph-core/src/[\n  \"function\",\n].includes",
+            "properties": {}
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut event = common("node_upsert", seq as u64 + 3);
+        event["node"] = node;
+        store.ingest_event(&event).unwrap();
+    }
+    let mut profile_completed = common("profile_completed", 6);
+    profile_completed["profile_id"] = json!("rust:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed", 7);
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-563", "completed", None, true)
+        .unwrap();
+}
+
+#[test]
+fn issue_563_nodes_list_projects_worker_locators_instead_of_failing_integrity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_563_store(&store_path, &root);
+
+    for (match_mode, query, kinds, expected) in [
+        (
+            "prefix",
+            "crates/depgraph-core/src/",
+            json!(["file"]),
+            vec!["file:sha256:0001"],
+        ),
+        (
+            "prefix",
+            "crates/depgraph-core/src/",
+            json!([]),
+            vec!["external:sha256:0003", "file:sha256:0001"],
+        ),
+        (
+            "contains",
+            "depgraph-core/src",
+            json!([]),
+            vec![
+                "external:sha256:0003",
+                "file:sha256:0001",
+                "unknown:sha256:0002",
+            ],
+        ),
+    ] {
+        let result = call_issue_300_tool(
+            &root,
+            &store_path,
+            "agent_nodes_list",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "repository_id": "repository",
+                "query": query,
+                "match_mode": match_mode,
+                "kinds": kinds,
+                "limit": 10
+            }),
+        );
+        assert_eq!(result["isError"], false, "{match_mode} {query}: {result}");
+        let items = result["structuredContent"]["result"]["items"]
+            .as_array()
+            .unwrap();
+        let ids = items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "{match_mode} {query}");
+        for item in items {
+            let id = item["id"].as_str().unwrap();
+            assert_eq!(item["locator"], format!("id:{id}"), "{item}");
+        }
+    }
+
+    let external = call_issue_300_tool(
+        &root,
+        &store_path,
+        "agent_nodes_list",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "repository_id": "repository",
+            "query": "external:sha256:0003",
+            "match_mode": "exact",
+            "limit": 10
+        }),
+    );
+    assert_eq!(external["isError"], false, "{external}");
+    assert_eq!(
+        external["structuredContent"]["result"]["items"][0]["display_name"],
+        "external:sha256:0003"
+    );
+}
+
 #[test]
 fn version_handshake_is_fixed_and_requires_no_repository_configuration() {
     let binary = AssertCommand::cargo_bin("depgraph-mcp").unwrap();
