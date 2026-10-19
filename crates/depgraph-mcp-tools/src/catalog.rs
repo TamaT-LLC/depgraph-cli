@@ -1188,7 +1188,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "type": "string",
             "enum": [AgentEdgeDetail::Summary.as_str(), AgentEdgeDetail::Full.as_str()],
             "default": AgentEdgeDetail::Full.as_str(),
-            "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; fetch the evidence of one edge with agent_sites_list (site_id) or agent_evidence_list. A cursor is bound to its detail."
+            "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; common applies to that page only. To read evidence bodies, repeat the request with detail=full (the edge evidence is not listed by agent_evidence_list, which returns site evidence), or resolve an edge's site_id with agent_sites_list. A cursor is bound to its detail."
         }),
         "detail" => json!({
             "type": "string",

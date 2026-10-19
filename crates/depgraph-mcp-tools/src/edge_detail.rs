@@ -53,6 +53,8 @@ enum AgentEdgesSummaryTag {
 #[serde(deny_unknown_fields)]
 pub struct AgentEdgesSummaryResponse {
     detail: AgentEdgesSummaryTag,
+    /// Fields shared by every edge of this page only; a later page can state a
+    /// different set, so do not apply it to other pages.
     common: AgentEdgeCommon,
     edges: Page<AgentEdgeSummary>,
 }
