@@ -995,7 +995,7 @@ fn map_changed_set_with_limit(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Vec<ChangedNodeMapping>> {
     let mut work = ImpactChangedSetWork::new(maximum, is_cancelled);
-    let index = path_node_index_cancellable(snapshot, &mut work)?;
+    let index = path_node_index_cancellable(snapshot, changed_set, &mut work)?;
     let mut mappings = Vec::with_capacity(changed_set.changes.len());
     for change in &changed_set.changes {
         work.step()?;
@@ -1040,77 +1040,160 @@ fn map_changed_set_with_limit(
     Ok(mappings)
 }
 
+/// Builds the path-to-node index only for the paths named by the changed set.
+///
+/// The snapshot is already in memory, so scanning its records is a filter that
+/// only polls cancellation. The work budget counts the changed paths and each
+/// index entry that actually matches one of them, so a large repository with a
+/// small change stays well inside the preprocessing limit.
 fn path_node_index_cancellable(
     snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
     work: &mut ImpactChangedSetWork<'_>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    // Index keys are always valid normalized paths, and `normalize_git_path`
+    // returns its input unchanged when it accepts it, so a lookup by a raw
+    // change path can only hit a key equal to that raw path.
+    let mut changed_paths = BTreeSet::<&str>::new();
+    for change in &changed_set.changes {
+        for path in [change.old_path.as_deref(), change.new_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            work.step()?;
+            if normalize_git_path(path).is_ok() {
+                changed_paths.insert(path);
+            }
+        }
+    }
+
     let mut index = BTreeMap::<String, BTreeSet<String>>::new();
     for node in &snapshot.nodes {
-        work.step()?;
+        work.check_cancelled()?;
+        #[cfg(test)]
+        PATH_NODE_INDEX_NODE_VISITS.fetch_add(1, Ordering::Relaxed);
         for key in ["path", "source_path", "manifest_path", "relative_path"] {
             if let Some(path) = node.properties.get(key).and_then(serde_json::Value::as_str) {
-                index_node_path(&mut index, path, &node.id, work)?;
+                index_changed_node_path(&mut index, &changed_paths, path, &node.id, work)?;
             }
         }
         if let Some(identity) = node.properties.get("canonical_identity") {
             for key in ["path", "source_path", "relative_path"] {
                 if let Some(path) = identity.get(key).and_then(serde_json::Value::as_str) {
-                    index_node_path(&mut index, path, &node.id, work)?;
+                    index_changed_node_path(&mut index, &changed_paths, path, &node.id, work)?;
                 }
             }
         }
     }
 
-    let mut sites = BTreeMap::new();
-    for site in &snapshot.sites {
-        work.step()?;
-        #[cfg(test)]
-        PATH_NODE_INDEX_SITE_VISITS.fetch_add(1, Ordering::Relaxed);
-        sites.insert(site.id.as_str(), site);
-    }
-    let mut edges = BTreeMap::new();
-    for edge in &snapshot.edges {
-        work.step()?;
-        #[cfg(test)]
-        PATH_NODE_INDEX_EDGE_VISITS.fetch_add(1, Ordering::Relaxed);
-        edges.insert(edge.id.as_str(), edge);
-    }
+    let mut site_paths = BTreeMap::<&str, Vec<&str>>::new();
+    let mut edge_paths = BTreeMap::<&str, Vec<&str>>::new();
     for evidence in &snapshot.evidence {
-        work.step()?;
+        work.check_cancelled()?;
+        #[cfg(test)]
+        PATH_NODE_INDEX_EVIDENCE_VISITS.fetch_add(1, Ordering::Relaxed);
+        let Some(&path) = changed_paths.get(evidence.path.as_str()) else {
+            continue;
+        };
         match evidence.owner_type.as_str() {
-            "node" => index_node_path(&mut index, &evidence.path, &evidence.owner_id, work)?,
+            "node" => {
+                work.step()?;
+                index
+                    .entry(path.to_owned())
+                    .or_default()
+                    .insert(evidence.owner_id.clone());
+            }
             "site" => {
-                if let Some(site) = sites.get(evidence.owner_id.as_str()) {
-                    index_node_path(&mut index, &evidence.path, &site.source, work)?;
-                }
+                work.step()?;
+                site_paths
+                    .entry(evidence.owner_id.as_str())
+                    .or_default()
+                    .push(path);
             }
             "edge" => {
-                if let Some(edge) = edges.get(evidence.owner_id.as_str()) {
-                    index_node_path(&mut index, &evidence.path, &edge.source, work)?;
-                    if matches!(
-                        edge.kind.as_str(),
-                        "declares" | "contains" | "defines" | "routes" | "instantiates"
-                    ) {
-                        index_node_path(&mut index, &evidence.path, &edge.target, work)?;
-                    }
-                }
+                work.step()?;
+                edge_paths
+                    .entry(evidence.owner_id.as_str())
+                    .or_default()
+                    .push(path);
             }
             _ => {}
+        }
+    }
+
+    // A later record with a duplicate ID wins, matching a full ID map.
+    let mut sites = BTreeMap::new();
+    if !site_paths.is_empty() {
+        for site in &snapshot.sites {
+            work.check_cancelled()?;
+            if site_paths.contains_key(site.id.as_str()) {
+                #[cfg(test)]
+                PATH_NODE_INDEX_SITE_VISITS.fetch_add(1, Ordering::Relaxed);
+                sites.insert(site.id.as_str(), site);
+            }
+        }
+    }
+    let mut edges = BTreeMap::new();
+    if !edge_paths.is_empty() {
+        for edge in &snapshot.edges {
+            work.check_cancelled()?;
+            if edge_paths.contains_key(edge.id.as_str()) {
+                #[cfg(test)]
+                PATH_NODE_INDEX_EDGE_VISITS.fetch_add(1, Ordering::Relaxed);
+                edges.insert(edge.id.as_str(), edge);
+            }
+        }
+    }
+    for (site_id, paths) in &site_paths {
+        let Some(site) = sites.get(site_id) else {
+            continue;
+        };
+        for path in paths {
+            insert_changed_node_path(&mut index, path, &site.source, work)?;
+        }
+    }
+    for (edge_id, paths) in &edge_paths {
+        let Some(edge) = edges.get(edge_id) else {
+            continue;
+        };
+        let indexes_target = matches!(
+            edge.kind.as_str(),
+            "declares" | "contains" | "defines" | "routes" | "instantiates"
+        );
+        for path in paths {
+            insert_changed_node_path(&mut index, path, &edge.source, work)?;
+            if indexes_target {
+                insert_changed_node_path(&mut index, path, &edge.target, work)?;
+            }
         }
     }
     Ok(index)
 }
 
-fn index_node_path(
+fn index_changed_node_path(
+    index: &mut BTreeMap<String, BTreeSet<String>>,
+    changed_paths: &BTreeSet<&str>,
+    path: &str,
+    node_id: &str,
+    work: &mut ImpactChangedSetWork<'_>,
+) -> Result<()> {
+    if changed_paths.contains(path) {
+        insert_changed_node_path(index, path, node_id, work)?;
+    }
+    Ok(())
+}
+
+fn insert_changed_node_path(
     index: &mut BTreeMap<String, BTreeSet<String>>,
     path: &str,
     node_id: &str,
     work: &mut ImpactChangedSetWork<'_>,
 ) -> Result<()> {
-    if let Ok(path) = normalize_git_path(path) {
-        work.step()?;
-        index.entry(path).or_default().insert(node_id.to_owned());
-    }
+    work.step()?;
+    index
+        .entry(path.to_owned())
+        .or_default()
+        .insert(node_id.to_owned());
     Ok(())
 }
 
@@ -1146,6 +1229,10 @@ impl<'a> ImpactChangedSetWork<'a> {
         }
     }
 
+    fn check_cancelled(&mut self) -> Result<()> {
+        check_cancelled(self.is_cancelled)
+    }
+
     fn step(&mut self) -> Result<()> {
         check_cancelled(self.is_cancelled)?;
         if self.used >= self.maximum {
@@ -1158,6 +1245,12 @@ impl<'a> ImpactChangedSetWork<'a> {
     }
 }
 
+#[cfg(test)]
+static PATH_NODE_INDEX_NODE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PATH_NODE_INDEX_EVIDENCE_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static PATH_NODE_INDEX_SITE_VISITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -2258,6 +2351,7 @@ mod tests {
 
     use depgraph_store::{
         CoverageRecord, EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, ScanRecord,
+        SiteRecord,
     };
     use serde_json::json;
 
@@ -2268,6 +2362,8 @@ mod tests {
 
     fn reset_changed_set_counters() {
         for counter in [
+            &PATH_NODE_INDEX_NODE_VISITS,
+            &PATH_NODE_INDEX_EVIDENCE_VISITS,
             &PATH_NODE_INDEX_SITE_VISITS,
             &PATH_NODE_INDEX_EDGE_VISITS,
             &CHANGED_NODE_ID_COPY_VISITS,
@@ -2648,8 +2744,76 @@ mod tests {
         }
     }
 
+    fn changed_set_evidence(owner_type: &str, owner_id: &str, path: &str) -> EvidenceRecord {
+        EvidenceRecord {
+            owner_type: owner_type.to_owned(),
+            owner_id: owner_id.to_owned(),
+            ordinal: 0,
+            kind: "semantic".to_owned(),
+            extractor: "fixture".to_owned(),
+            extractor_version: "1".to_owned(),
+            path: path.to_owned(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            detail: None,
+            properties: json!({}),
+        }
+    }
+
+    fn changed_set_site(id: &str, source: &str, target: &str) -> SiteRecord {
+        serde_json::from_value(json!({
+            "id": id,
+            "source": source,
+            "kind": "import",
+            "specifier": "fixture:dependency",
+            "resolution_status": "resolved",
+            "target_ids": [target],
+            "profile_id": "fixture:profile",
+            "condition": {"op":"all","conditions":[]},
+            "precision": "exact"
+        }))
+        .expect("valid changed-set site")
+    }
+
+    /// Adds records whose paths are not in the changed set. They must be
+    /// scanned (and remain cancellable) without consuming work budget.
+    fn add_unrelated_changed_set_records(snapshot: &mut GraphSnapshot, count: usize) {
+        for index in 0..count {
+            let node_id = format!("unrelated:{index:05}");
+            let path = format!("src/unrelated/{index:05}.rs");
+            snapshot.nodes.push(node(&node_id, "file", Some(&path)));
+            let site_id = format!("unrelated-site:{index:05}");
+            snapshot
+                .sites
+                .push(changed_set_site(&site_id, &node_id, &node_id));
+            let edge_id = format!("unrelated-edge:{index:05}");
+            let mut unrelated_edge = edge(&edge_id, &node_id, &node_id, "fixture:profile");
+            unrelated_edge.kind = "contains".to_owned();
+            snapshot.edges.push(unrelated_edge);
+            for (owner_type, owner_id) in [
+                ("node", node_id.as_str()),
+                ("site", site_id.as_str()),
+                ("edge", edge_id.as_str()),
+            ] {
+                snapshot
+                    .evidence
+                    .push(changed_set_evidence(owner_type, owner_id, &path));
+            }
+        }
+    }
+
+    fn changed_set_fixture_ordinal(id: &str) -> usize {
+        id.rsplit(':')
+            .next()
+            .and_then(|ordinal| ordinal.parse().ok())
+            .expect("fixture IDs end with an ordinal")
+    }
+
     fn hostile_changed_set_fixture() -> (GraphSnapshot, GitChangedSet, usize) {
         let node_count = 32_usize;
+        let node_evidence_count = 8_usize;
         let site_count = 8_usize;
         let edge_count = 8_usize;
         let source_count = 8_usize;
@@ -2659,31 +2823,54 @@ mod tests {
             .collect();
         snapshot.sites = (0..site_count)
             .map(|index| {
-                serde_json::from_value(json!({
-                    "id": format!("site:{index:02}"),
-                    "source": format!("shared:{:02}", index % node_count),
-                    "kind": "import",
-                    "specifier": "fixture:dependency",
-                    "resolution_status": "resolved",
-                    "target_ids": [format!("shared:{:02}", (index + 1) % node_count)],
-                    "profile_id": "fixture:profile",
-                    "condition": {"op":"all","conditions":[]},
-                    "precision": "exact"
-                }))
-                .expect("valid changed-set site")
+                changed_set_site(
+                    &format!("site:{index:02}"),
+                    &format!("shared:{:02}", index % node_count),
+                    &format!("shared:{:02}", (index + 1) % node_count),
+                )
             })
             .collect();
         snapshot.edges = (0..edge_count)
             .map(|index| {
-                edge(
+                let mut edge = edge(
                     &format!("edge:{index:02}"),
                     &format!("shared:{:02}", index % node_count),
                     &format!("shared:{:02}", (index + 1) % node_count),
                     "fixture:profile",
-                )
+                );
+                if index % 2 == 0 {
+                    edge.kind = "contains".to_owned();
+                }
+                edge
             })
             .collect();
-        snapshot.evidence.clear();
+        let containment_edge_count = edge_count.div_ceil(2);
+        snapshot.evidence = (0..node_evidence_count)
+            .map(|index| {
+                changed_set_evidence("node", &format!("shared:{index:02}"), "src/shared.rs")
+            })
+            .chain((0..site_count).map(|index| {
+                changed_set_evidence("site", &format!("site:{index:02}"), "src/shared.rs")
+            }))
+            .chain((0..edge_count).map(|index| {
+                changed_set_evidence("edge", &format!("edge:{index:02}"), "src/shared.rs")
+            }))
+            .collect();
+        add_unrelated_changed_set_records(&mut snapshot, 64);
+        // Interleave related and unrelated records so cancellation is polled
+        // between matched records in every scan.
+        snapshot
+            .nodes
+            .sort_by_key(|node| changed_set_fixture_ordinal(&node.id));
+        snapshot
+            .sites
+            .sort_by_key(|site| changed_set_fixture_ordinal(&site.id));
+        snapshot
+            .edges
+            .sort_by_key(|edge| changed_set_fixture_ordinal(&edge.id));
+        snapshot
+            .evidence
+            .sort_by_key(|evidence| changed_set_fixture_ordinal(&evidence.owner_id));
         let changed_set = GitChangedSet {
             requested_ref: "main".to_owned(),
             resolved_ref: "a".repeat(40),
@@ -2700,9 +2887,12 @@ mod tests {
                     .collect(),
             }],
         };
-        let calculated_work = node_count * 2
-            + site_count
-            + edge_count
+        let calculated_work = 2
+            + node_count
+            + node_evidence_count
+            + site_count * 2
+            + edge_count * 2
+            + containment_edge_count
             + 1
             + node_count * 2 * 2
             + node_count
@@ -2766,7 +2956,14 @@ mod tests {
             calculated_work
         );
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].old_node_ids.len(), snapshot.nodes.len());
+        assert_eq!(
+            mappings[0].old_node_ids.len(),
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.id.starts_with("shared:"))
+                .count()
+        );
         assert_eq!(mappings[0].new_node_ids, mappings[0].old_node_ids);
         assert_eq!(
             mappings[0].correlated_node_ids, mappings[0].old_node_ids,
@@ -2789,8 +2986,10 @@ mod tests {
         );
 
         for (counter, stage) in [
-            (&PATH_NODE_INDEX_SITE_VISITS, "site index"),
-            (&PATH_NODE_INDEX_EDGE_VISITS, "edge index"),
+            (&PATH_NODE_INDEX_NODE_VISITS, "node scan"),
+            (&PATH_NODE_INDEX_EVIDENCE_VISITS, "evidence scan"),
+            (&PATH_NODE_INDEX_SITE_VISITS, "site resolution"),
+            (&PATH_NODE_INDEX_EDGE_VISITS, "edge resolution"),
             (&CHANGED_NODE_ID_COPY_VISITS, "path node-ID copy"),
             (
                 &CHANGED_CORRELATED_ID_MATERIALIZATION_VISITS,
@@ -2813,6 +3012,197 @@ mod tests {
             assert!(error.to_string().contains("cancelled"), "stage: {stage}");
             assert_eq!(counter.load(Ordering::Relaxed), 3, "stage: {stage}");
         }
+    }
+
+    /// The pre-filtering full path index, kept as an oracle so the filtered
+    /// index must produce the same mappings.
+    fn full_path_node_index(snapshot: &GraphSnapshot) -> BTreeMap<String, BTreeSet<String>> {
+        let mut index = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut insert = |path: &str, node_id: &str| {
+            if let Ok(path) = normalize_git_path(path) {
+                index.entry(path).or_default().insert(node_id.to_owned());
+            }
+        };
+        for node in &snapshot.nodes {
+            for key in ["path", "source_path", "manifest_path", "relative_path"] {
+                if let Some(path) = node.properties.get(key).and_then(serde_json::Value::as_str) {
+                    insert(path, &node.id);
+                }
+            }
+            if let Some(identity) = node.properties.get("canonical_identity") {
+                for key in ["path", "source_path", "relative_path"] {
+                    if let Some(path) = identity.get(key).and_then(serde_json::Value::as_str) {
+                        insert(path, &node.id);
+                    }
+                }
+            }
+        }
+        let sites = snapshot
+            .sites
+            .iter()
+            .map(|site| (site.id.as_str(), site))
+            .collect::<BTreeMap<_, _>>();
+        let edges = snapshot
+            .edges
+            .iter()
+            .map(|edge| (edge.id.as_str(), edge))
+            .collect::<BTreeMap<_, _>>();
+        for evidence in &snapshot.evidence {
+            match evidence.owner_type.as_str() {
+                "node" => insert(&evidence.path, &evidence.owner_id),
+                "site" => {
+                    if let Some(site) = sites.get(evidence.owner_id.as_str()) {
+                        insert(&evidence.path, &site.source);
+                    }
+                }
+                "edge" => {
+                    if let Some(edge) = edges.get(evidence.owner_id.as_str()) {
+                        insert(&evidence.path, &edge.source);
+                        if matches!(
+                            edge.kind.as_str(),
+                            "declares" | "contains" | "defines" | "routes" | "instantiates"
+                        ) {
+                            insert(&evidence.path, &edge.target);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        index
+    }
+
+    fn assert_matches_full_path_index(snapshot: &GraphSnapshot, changed_set: &GitChangedSet) {
+        let full = full_path_node_index(snapshot);
+        let lookup = |path: Option<&String>| {
+            path.and_then(|path| full.get(path.as_str()))
+                .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let mappings = map_changed_set_with_limit(snapshot, changed_set, usize::MAX, &mut || false)
+            .expect("changed set maps without a limit");
+        assert_eq!(mappings.len(), changed_set.changes.len());
+        for (mapping, change) in mappings.iter().zip(&changed_set.changes) {
+            let old_node_ids = lookup(change.old_path.as_ref());
+            let new_node_ids = lookup(change.new_path.as_ref());
+            let correlated = old_node_ids
+                .iter()
+                .chain(&new_node_ids)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(&mapping.change, change);
+            assert_eq!(mapping.old_node_ids, old_node_ids);
+            assert_eq!(mapping.new_node_ids, new_node_ids);
+            assert_eq!(mapping.correlated_node_ids, correlated);
+        }
+    }
+
+    #[test]
+    fn filtered_changed_set_index_matches_the_full_path_index() {
+        let _guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
+        let (hostile, hostile_set, _) = hostile_changed_set_fixture();
+        let mut evidence_paths = graph();
+        evidence_paths.nodes.push(NodeRecord {
+            id: "identity".to_owned(),
+            kind: "file".to_owned(),
+            locator: "file:identity".to_owned(),
+            display_name: "identity".to_owned(),
+            properties: json!({
+                "manifest_path": "src/route.ts",
+                "canonical_identity": {"relative_path": "src/old.ts"}
+            }),
+        });
+        evidence_paths.edges[2].kind = "routes".to_owned();
+        let mut multi_set = rename_set();
+        multi_set.changes.extend([
+            GitChange {
+                status: "modified".to_owned(),
+                similarity: None,
+                old_path: Some("src/route.ts".to_owned()),
+                new_path: Some("src/route.ts".to_owned()),
+                sources: vec!["worktree".to_owned()],
+            },
+            GitChange {
+                status: "added".to_owned(),
+                similarity: None,
+                old_path: None,
+                new_path: Some("src/missing.ts".to_owned()),
+                sources: vec!["worktree".to_owned()],
+            },
+            GitChange {
+                status: "modified".to_owned(),
+                similarity: None,
+                old_path: Some("src/type.ts".to_owned()),
+                new_path: Some("src/type.ts".to_owned()),
+                sources: vec!["committed".to_owned()],
+            },
+        ]);
+        for (snapshot, changed_set) in [
+            (graph(), rename_set()),
+            (evidence_paths, multi_set),
+            (hostile, hostile_set),
+        ] {
+            assert_matches_full_path_index(&snapshot, &changed_set);
+        }
+    }
+
+    #[test]
+    fn changed_set_work_scales_with_changed_paths_not_snapshot_size() {
+        let _guard = CHANGED_SET_TEST_LOCK.lock().expect("changed-set test lock");
+        let small = graph();
+        let changed_set = rename_set();
+
+        reset_changed_set_counters();
+        let expected = map_changed_set_with_limit(&small, &changed_set, usize::MAX, &mut || false)
+            .expect("the small snapshot maps without a limit");
+        let small_work = CHANGED_SET_WORK_ITEMS.load(Ordering::Relaxed);
+        assert_eq!(
+            expected[0].correlated_node_ids,
+            ["dev", "file", "package", "symbol"]
+        );
+
+        let mut large = small.clone();
+        add_unrelated_changed_set_records(&mut large, 5_000);
+        let snapshot_records =
+            large.nodes.len() + large.sites.len() + large.edges.len() + large.evidence.len();
+        assert!(
+            snapshot_records > small_work * 1_000,
+            "the snapshot must dwarf the work budget: {snapshot_records} records, {small_work} work"
+        );
+
+        reset_changed_set_counters();
+        let mappings = map_changed_set_with_limit(&large, &changed_set, small_work, &mut || false)
+            .expect("unrelated records must not consume the changed-set work budget");
+        assert_eq!(mappings, expected);
+        assert_eq!(CHANGED_SET_WORK_ITEMS.load(Ordering::Relaxed), small_work);
+        assert_eq!(
+            PATH_NODE_INDEX_NODE_VISITS.load(Ordering::Relaxed),
+            large.nodes.len()
+        );
+        assert_eq!(
+            PATH_NODE_INDEX_EVIDENCE_VISITS.load(Ordering::Relaxed),
+            large.evidence.len()
+        );
+        assert_eq!(
+            PATH_NODE_INDEX_EDGE_VISITS.load(Ordering::Relaxed),
+            small
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.owner_type == "edge" && evidence.path == "src/new.ts")
+                .count(),
+            "only edges referenced by matching evidence are resolved"
+        );
+        assert_eq!(PATH_NODE_INDEX_SITE_VISITS.load(Ordering::Relaxed), 0);
+
+        let error = map_changed_set_with_limit(&large, &changed_set, small_work - 1, &mut || false)
+            .expect_err("the matched work is still bounded");
+        assert!(
+            error
+                .downcast_ref::<ImpactChangedSetPreprocessingExhausted>()
+                .is_some()
+        );
     }
 
     #[test]
