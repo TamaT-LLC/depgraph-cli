@@ -5849,6 +5849,18 @@ fn worker_subprocess_path_does_not_resolve_repository_cargo() {
         "printf unsafe > CARGO_EXECUTED\nexit 91",
     );
     let temp = tempfile::tempdir().unwrap();
+    let tool_dir = temp.path().join("tools");
+    fs::create_dir(&tool_dir).unwrap();
+    write_worker(
+        &tool_dir.join("cargo"),
+        "printf trusted > \"$0.executed\"\nprintf 'cargo 1.93.1\\n'",
+    );
+    // Keep the cache's Go identity stable across preflight and postflight;
+    // this test exercises worker PATH isolation, not ambient toolchain setup.
+    write_worker(
+        &tool_dir.join("go"),
+        "printf 'go version go1.26.1 linux/amd64\\n'",
+    );
     let worker = temp.path().join("go-worker.sh");
     write_worker(
         &worker,
@@ -5857,7 +5869,7 @@ fn worker_subprocess_path_does_not_resolve_repository_cargo() {
             complete_worker("file:safe")
         ),
     );
-    let mut paths = vec![std::path::PathBuf::from(".")];
+    let mut paths = vec![std::path::PathBuf::from("."), tool_dir.clone()];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let path = std::env::join_paths(paths).unwrap();
 
@@ -5874,7 +5886,9 @@ fn worker_subprocess_path_does_not_resolve_repository_cargo() {
             "--json",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"completed\""));
+    assert!(tool_dir.join("cargo.executed").exists());
     assert!(!root.path().join("CARGO_EXECUTED").exists());
 }
 
