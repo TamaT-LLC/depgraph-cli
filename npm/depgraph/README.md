@@ -16,6 +16,13 @@ exact-version native package through `optionalDependencies`. Installation does
 not run a lifecycle script and does not download executable code from an
 unrelated host.
 
+Under an older Node.js, npm prints an `EBADENGINE` warning and skips the
+native package, and the launcher then reports the Node.js mismatch. npx keeps
+that incomplete install and reuses it after you switch Node.js, so remove it
+with `npm cache npx rm <key>` (npm 11 or later; the launcher prints the key and
+directory) before running npx again. Reinstall a global install after
+switching.
+
 Each native package retains the complete verified GitHub Release layout,
 including `release-manifest.json`, project licenses, third-party notices, and
 the SPDX SBOM. Before launch, the JavaScript shim checks the package identity,

@@ -7194,6 +7194,100 @@ fn mcp_setup_rejects_a_non_repository_before_network_or_state_changes() {
     assert!(!default_store.exists());
 }
 
+/// A Git-marked repository, a private HOME/Store, and a PATH that holds only a
+/// fake `node` reporting `node_version` (no curl), so `mcp setup` cannot reach
+/// the network whichever check stops it.
+#[cfg(unix)]
+struct McpSetupNodeFixture {
+    root: tempfile::TempDir,
+    home: tempfile::TempDir,
+    bin: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl McpSetupNodeFixture {
+    fn new(with_package_json: bool, node_version: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        if with_package_json {
+            fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        }
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let node = bin.path().join("node");
+        fs::write(&node, format!("#!/bin/sh\necho {node_version}\n")).unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        Self { root, home, bin }
+    }
+
+    fn setup(&self) -> assert_cmd::assert::Assert {
+        let store = self.home.path().join("store.sqlite");
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .env("PATH", self.bin.path())
+            .env("HOME", self.home.path())
+            .args([
+                "--store",
+                store.to_str().unwrap(),
+                "mcp",
+                "setup",
+                "--host",
+                "claude",
+                "--root",
+                self.root.path().to_str().unwrap(),
+            ])
+            .assert()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_setup_rejects_an_old_node_before_downloading_or_scanning() {
+    let fixture = McpSetupNodeFixture::new(true, "v22.23.2");
+    fixture
+        .setup()
+        .failure()
+        .stderr(predicate::str::contains(
+            "MCP setup cannot create a safe snapshot",
+        ))
+        .stderr(predicate::str::contains(
+            "Node.js runtime 22.23.2 does not satisfy Node.js >=24.0.0",
+        ))
+        .stderr(predicate::str::contains("mise use node@24"))
+        .stderr(predicate::str::contains("curl").not())
+        .stderr(predicate::str::contains("creating a safe snapshot").not());
+    assert!(!fixture.root.path().join(".mcp.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_setup_does_not_require_node_without_package_json() {
+    let fixture = McpSetupNodeFixture::new(false, "v22.23.2");
+    fixture
+        .setup()
+        .failure()
+        .stderr(predicate::str::contains("Node.js").not())
+        .stderr(predicate::str::contains("curl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_setup_accepts_a_satisfying_node_and_continues() {
+    let fixture = McpSetupNodeFixture::new(true, "v24.1.0");
+    fixture
+        .setup()
+        .failure()
+        .stderr(predicate::str::contains(
+            "TypeScript/JavaScript analysis will use Node.js v24.1.0",
+        ))
+        .stderr(predicate::str::contains("does not satisfy").not())
+        .stderr(predicate::str::contains("curl"));
+}
+
 fn seed_issue_423_health_store(
     store_path: &Path,
     root: &Path,

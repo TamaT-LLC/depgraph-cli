@@ -7995,3 +7995,68 @@ async fn protocol_validation_does_not_starve_another_workers_pipe_reader() -> Re
     validation??;
     Ok(())
 }
+
+#[test]
+fn web_runtime_preflight_skips_repositories_without_package_json() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    std::fs::write(temp.path().join("Cargo.toml"), "[workspace]")?;
+    std::fs::create_dir(temp.path().join("node_modules"))?;
+    std::fs::write(temp.path().join("node_modules/package.json"), "{}")?;
+    assert_eq!(preflight_web_runtime(temp.path())?, None);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fake_node(script: &str) -> Result<(tempfile::TempDir, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir()?;
+    let node = directory.path().join("node");
+    std::fs::write(&node, script)?;
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755))?;
+    Ok((directory, node))
+}
+
+#[cfg(unix)]
+#[test]
+fn web_runtime_preflight_rejects_an_old_node_with_the_switch_hint() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("package.json"), "{}")?;
+    let (_directory, node) = fake_node("#!/bin/sh\necho v22.23.2\n")?;
+    let message = format!(
+        "{:#}",
+        preflight_node_runtime(&node, root.path()).expect_err("Node.js 22 must be rejected")
+    );
+    assert!(
+        message.contains("Node.js runtime 22.23.2 does not satisfy Node.js >=24.0.0"),
+        "{message}"
+    );
+    assert!(message.contains(&node.display().to_string()), "{message}");
+    assert!(message.contains("mise use node@24"), "{message}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn web_runtime_preflight_accepts_a_satisfying_node() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("package.json"), "{}")?;
+    let (_directory, node) = fake_node("#!/bin/sh\necho v24.1.0\n")?;
+    let runtime = preflight_node_runtime(&node, root.path())?;
+    assert_eq!(runtime.version, "v24.1.0");
+    assert_eq!(runtime.node, node);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn web_runtime_preflight_reports_a_failing_node() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (_directory, node) = fake_node("#!/bin/sh\nexit 7\n")?;
+    let message = format!(
+        "{:#}",
+        preflight_node_runtime(&node, root.path()).expect_err("a failing probe must be rejected")
+    );
+    assert!(message.contains("--version` failed"), "{message}");
+    Ok(())
+}

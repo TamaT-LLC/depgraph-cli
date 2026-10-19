@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use depgraph_core::{
     DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, StoreLockGuard,
     acquire_store_writer_lock, compiler_pack_host_target, default_store_path,
+    worker::preflight_web_runtime,
 };
 use depgraph_mcp_tools::{
     AgentHostCapabilityProfile, AgentHostFormat, agent_host_launch_arguments,
@@ -214,6 +215,9 @@ pub(crate) fn setup(
         &binding.config,
         &layout.cache_base,
     )?;
+    if refresh_snapshot || current_snapshot_if_valid(&binding.config)?.is_none() {
+        preflight_safe_scan_runtime(binding.config.canonical_root())?;
+    }
     let curl = CurlClient::discover(binding.config.canonical_root())?;
     let release = fetch_release_metadata(&curl, &layout)?;
     layout.prepare_directories()?;
@@ -1474,6 +1478,23 @@ impl AgentInputPaths {
             acknowledge_project_exec_human_confirmation: false,
         })
     }
+}
+
+/// Fails before the release download and the safe scan when the scan could
+/// not start its Web worker, instead of reporting it after minutes of Rust and
+/// Go analysis. Repositories without package.json never start the Web worker
+/// and pass without a Node.js runtime.
+fn preflight_safe_scan_runtime(root: &Path) -> Result<()> {
+    if let Some(runtime) =
+        preflight_web_runtime(root).context("MCP setup cannot create a safe snapshot")?
+    {
+        eprintln!(
+            "mcp setup: TypeScript/JavaScript analysis will use Node.js {} ({})",
+            runtime.version,
+            runtime.node.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_safe_scan(core: &Path, release_root: &Path, config: &DepgraphServiceConfig) -> Result<()> {
