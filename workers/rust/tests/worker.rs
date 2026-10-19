@@ -3329,6 +3329,92 @@ fn sysroot_items_with_the_same_module_path_and_name_keep_distinct_identities() {
     );
 }
 
+/// Resolver identities of the bundled sysroot `read` method of
+/// `impl Read for File` after scanning a crate whose `lib.rs` is `source`.
+/// `None` when the host has no verified toolchain for the HIR backend.
+fn sysroot_impl_read_resolver(source: &str) -> Option<String> {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sysroot-impl-owner");
+    write_minimal_crate(&root, "sysroot-impl-owner", source);
+    let sysroot = temp.path().join("rust-sysroot");
+    write_attested_sysroot(&sysroot, |crate_name| {
+        if crate_name == "std" {
+            concat!(
+                "pub mod fs {\n",
+                "    pub struct File;\n",
+                "    pub fn open() -> File { File }\n",
+                "    pub trait Read {\n",
+                "        fn read(&mut self) -> u8;\n",
+                "    }\n",
+                "    impl Read for File {\n",
+                "        fn read(&mut self) -> u8 { 1 }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned()
+        } else {
+            format!("pub struct {crate_name};\n")
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--scan-id")
+        .arg("sysroot-impl-owner")
+        .env_remove("DEPGRAPH_PROFILE_CONFIG")
+        .env("DEPGRAPH_RUST_RELEASE_GATE", "release-gate-verified")
+        .env("DEPGRAPH_RUST_SYSROOT_ROOT", &sysroot)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout)).unwrap();
+    let profile = validated.profiles.values().next().unwrap();
+    if profile.properties["rust_hir_toolchain_status"] != "compatible" {
+        return None;
+    }
+    let resolvers: Vec<_> = validated
+        .nodes
+        .values()
+        .filter(|node| {
+            node.properties.get("bundled_sysroot") == Some(&serde_json::Value::Bool(true))
+                && node.display_name.as_deref() == Some("read")
+        })
+        .map(|node| {
+            node.properties["resolver_identity"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(resolvers.len(), 1, "{resolvers:?}");
+    resolvers.into_iter().next()
+}
+
+#[test]
+fn sysroot_impl_item_identity_does_not_depend_on_earlier_type_references() {
+    // The impl owner of a sysroot method must not change with whether the
+    // scanned crate named the self type before calling the method.
+    let named = sysroot_impl_read_resolver(concat!(
+        "use std::fs::{File, Read};\n",
+        "pub fn run() -> u8 {\n",
+        "    let mut file: File = std::fs::open();\n",
+        "    file.read()\n",
+        "}\n",
+    ));
+    let unnamed = sysroot_impl_read_resolver(concat!(
+        "use std::fs::Read;\n",
+        "pub fn run() -> u8 {\n",
+        "    let mut file = std::fs::open();\n",
+        "    file.read()\n",
+        "}\n",
+    ));
+    assert_eq!(named, unnamed);
+}
+
 fn worker_profile(profile_config: &str) -> depgraph_protocol::Profile {
     let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
         .arg("--root")

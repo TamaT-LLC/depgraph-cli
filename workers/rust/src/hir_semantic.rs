@@ -3047,7 +3047,14 @@ impl Extractor<'_> {
             }
             AssocItemContainer::Impl(impl_) => {
                 let location = self.definition_location(Definition::SelfType(impl_))?;
-                let self_type = self.canonical_type(impl_.self_ty(self.db));
+                // `canonical_type` names a sysroot ADT by its resolver only
+                // after an earlier reference materialized it, so the owner
+                // uses the bare ADT name to stay independent of scan order.
+                // The impl location already makes the owner unique.
+                let self_type = impl_.self_ty(self.db).as_adt().map_or_else(
+                    || "_".to_owned(),
+                    |adt| adt.name(self.db).as_str().to_owned(),
+                );
                 let trait_suffix = impl_
                     .trait_(self.db)
                     .map(|trait_| format!(" as {}", trait_.name(self.db).as_str()))
