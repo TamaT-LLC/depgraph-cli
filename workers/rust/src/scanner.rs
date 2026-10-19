@@ -2338,8 +2338,8 @@ impl State {
                     Occurrence::Use {
                         target_specifier,
                         site_specifier,
-                        alias: _,
-                        glob: _,
+                        alias,
+                        glob,
                         reexport,
                         module_scope: _,
                         inline_ancestors,
@@ -2359,6 +2359,19 @@ impl State {
                         } else {
                             ("rust_use", "imports")
                         };
+                        // The same import facts the HIR adapter records, so the
+                        // agent tools can name the imported binding (Issue #566).
+                        let mut evidence = source_evidence(&source.rel_path, span, site_kind);
+                        evidence
+                            .properties
+                            .insert("target_specifier".into(), json!(target_specifier));
+                        evidence.properties.insert("glob".into(), json!(glob));
+                        evidence
+                            .properties
+                            .insert("reexport".into(), json!(reexport));
+                        if let Some(alias) = alias {
+                            evidence.properties.insert("alias".into(), json!(alias));
+                        }
                         self.add_site(
                             &source_node,
                             site_kind,
@@ -2366,7 +2379,7 @@ impl State {
                             edge_kind,
                             condition,
                             resolution,
-                            source_evidence(&source.rel_path, span, site_kind),
+                            evidence,
                         )?;
                         self.increment_file_site(&source.rel_path);
                     }
@@ -2449,6 +2462,13 @@ impl State {
                             .as_deref()
                             .map(|alias| format!("{specifier} as {alias}"))
                             .unwrap_or_else(|| specifier.clone());
+                        let mut evidence = source_evidence(&source.rel_path, span, "extern crate");
+                        evidence
+                            .properties
+                            .insert("target_specifier".into(), json!(specifier));
+                        if let Some(alias) = alias {
+                            evidence.properties.insert("alias".into(), json!(alias));
+                        }
                         self.add_site(
                             &source_node,
                             "extern_crate",
@@ -2456,7 +2476,7 @@ impl State {
                             "imports",
                             condition,
                             resolution,
-                            source_evidence(&source.rel_path, span, "extern crate"),
+                            evidence,
                         )?;
                         self.increment_file_site(&source.rel_path);
                     }
