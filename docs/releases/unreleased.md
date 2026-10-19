@@ -27,7 +27,7 @@ MCP の `graph_dependencies_list` / `graph_dependents_list` と CLI の `depgrap
 
 ## 修正
 
-- セレクターなしの `depgraph impact --changed <GIT_REF>` が、リポジトリ全体を scan した大きな Store では変更の大きさに関係なく前処理の上限に達し、resource limit（exit 3）で失敗していた問題を直す。変更パスの対応付けは変更パスの数と実際に一致した node / evidence の数だけを作業量として数え、無関係なレコードは上限に数えない。
+- セレクターなしの `depgraph impact --changed <GIT_REF>` で、変更パスの対応付けが、リポジトリ全体を scan した大きな Store では変更の大きさに関係なく前処理の上限に達し、resource limit（exit 3）で失敗していた問題を直す。変更パスの対応付けは変更パスの数と実際に一致した node / evidence の数だけを作業量として数え、無関係なレコードは上限に数えない。隣接表の構築など後続の前処理は、従来どおり同じ上限の対象になる。
 
 ## 互換性の注意
 
