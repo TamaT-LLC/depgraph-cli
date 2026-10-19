@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,11 +8,16 @@ import test from "node:test";
 import {
   aggregateReport,
   ambiguousCandidateId,
+  buildChangedSetImpactArgs,
   buildImpactArgs,
+  changedSetFiles,
+  classifyChangedSetResult,
   classifyImpactResult,
   collectReport,
+  parseImpactMode,
   parseNameStatusZ,
   parseProfiles,
+  supportsChangedSetImpact,
 } from "../../.github/actions/pr-impact/collect.mjs";
 import {
   COMMENT_MARKER,
@@ -621,6 +626,407 @@ test("collectReport explains a missing merge-base and keeps the git stderr", asy
   });
 });
 
+
+// --- changed-set impact mode -----------------------------------------------
+
+const MERGE_BASE = "c".repeat(40);
+const NEW_HELP = "Show reverse dependency impact\n\nUsage: depgraph impact [OPTIONS] [SELECTOR]\n\nArguments:\n  [SELECTOR]  Graph node\n";
+const OLD_HELP = "Show reverse dependency impact\n\nUsage: depgraph impact [OPTIONS] <SELECTOR>\n\nArguments:\n  <SELECTOR>  \n";
+const OLD_SELECTOR_ERROR =
+  "error: the following required arguments were not provided:\n  <SELECTOR>\n\nUsage: depgraph impact --changed <GIT_REF> <SELECTOR>\n";
+
+function mapping(path, nodeIds, extra = {}) {
+  return { change: { status: "modified", new_path: path, sources: ["committed"], ...extra }, old_node_ids: [], new_node_ids: nodeIds, correlated_node_ids: nodeIds };
+}
+
+function changedImpact(target, depth, changedPaths, path = [step("imports", "src/a.ts", 3)]) {
+  return { node: target, depth, changed_node_id: "file-a", changed_paths: changedPaths, dependency_path: path };
+}
+
+function changedSetData(overrides = {}) {
+  return {
+    mode: "changed_set",
+    complete: true,
+    filters: {},
+    changed_set: { requested_ref: MERGE_BASE, merge_base: MERGE_BASE, head: HEAD_SHA, repository_prefix: "", changes: [] },
+    mappings: [],
+    changed_nodes: [],
+    unmapped: [],
+    impacts: [],
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+function changedSetEnvelope(data) {
+  return { exitCode: 0, stdout: JSON.stringify({ schema_version: "1.0", command: "impact", scan_id: "s", data }), stderr: "" };
+}
+
+// The graph a.ts <- b.ts <- route, with c.ts unmapped and gone.ts deleted,
+// answered both ways so the two modes can be compared.
+const SCENARIO_DIFF = ["M", "src/a.ts", "M", "src/b.ts", "M", "docs/c.md", "D", "src/gone.ts", ""].join("\0");
+const SCENARIO_ROUTE = node("route-orders", "route", "GET /orders");
+const SCENARIO_PACKAGE = node("pkg-web", "package_instance", "apps/web");
+const ROUTE_FROM_B = [step("routes", "src/route.ts", 2), step("imports", "src/b.ts", 1)];
+
+function scenarioPerFile(args) {
+  const selector = args[3];
+  const root = (path) => node(`file-${path}`, "file", path);
+  if (selector === "path:src/a.ts") {
+    const data = {
+      root: root("src/a.ts"),
+      complete: true,
+      diagnostics: [],
+      impacts: [
+        impact(root("src/a.ts"), 0, []),
+        impact(node("file-src/b.ts", "file", "src/b.ts"), 1),
+        impact(SCENARIO_ROUTE, 2, [...ROUTE_FROM_B, step("imports", "src/a.ts", 3)]),
+        impact(SCENARIO_PACKAGE, 1, [step("contains", "apps/web/package.json", 1)]),
+      ],
+    };
+    return { exitCode: 0, stdout: JSON.stringify({ data }), stderr: "" };
+  }
+  if (selector === "path:src/b.ts") {
+    const data = { root: root("src/b.ts"), complete: true, diagnostics: [], impacts: [impact(root("src/b.ts"), 0, []), impact(SCENARIO_ROUTE, 1, ROUTE_FROM_B)] };
+    return { exitCode: 0, stdout: JSON.stringify({ data }), stderr: "" };
+  }
+  return { exitCode: 2, stdout: "", stderr: `error: selector "${selector}" did not match any node\n` };
+}
+
+function scenarioChangedSet() {
+  return changedSetData({
+    mappings: [mapping("src/a.ts", ["file-src/a.ts"]), mapping("src/b.ts", ["file-src/b.ts"]), mapping("docs/c.md", []), mapping("src/gone.ts", [], { status: "deleted", new_path: undefined, old_path: "src/gone.ts" })],
+    unmapped: [
+      { status: "modified", new_path: "docs/c.md", reason: "not_in_snapshot" },
+      { status: "deleted", old_path: "src/gone.ts", reason: "deleted" },
+    ],
+    impacts: [
+      changedImpact(node("file-src/a.ts", "file", "src/a.ts"), 0, ["src/a.ts"], []),
+      changedImpact(node("file-src/b.ts", "file", "src/b.ts"), 0, ["src/a.ts", "src/b.ts"], []),
+      changedImpact(SCENARIO_ROUTE, 1, ["src/a.ts", "src/b.ts"], ROUTE_FROM_B),
+      changedImpact(SCENARIO_PACKAGE, 1, ["src/a.ts"], [step("contains", "apps/web/package.json", 1)]),
+    ],
+    diagnostics: [
+      { code: "changed_path_unmapped", message: "changed path docs/c.md was not present in the selected snapshot" },
+      { code: "profile_skipped", message: "profile web was skipped" },
+    ],
+  });
+}
+
+function changedSetDepgraph({ help = NEW_HELP, answer } = {}) {
+  const calls = [];
+  const runDepgraph = async (args) => {
+    calls.push(args);
+    if (args[0] === "impact" && args[1] === "--help") return { exitCode: 0, stdout: help, stderr: "" };
+    if (args.some((arg) => arg.startsWith("--changed="))) return answer ? answer(args) : changedSetEnvelope(scenarioChangedSet());
+    return scenarioPerFile(args);
+  };
+  return { runDepgraph, calls };
+}
+
+function scenarioCollect(overrides = {}) {
+  const { runGit } = fakeGit(SCENARIO_DIFF);
+  return { baseRef: "main", store: "/s", profiles: [], scanExitCode: 0, strict: false, depgraphVersion: "0.7.0", runGit, ...overrides };
+}
+
+test("parseImpactMode defaults to per-file and rejects unknown modes", () => {
+  assert.equal(parseImpactMode(undefined), "per-file");
+  assert.equal(parseImpactMode(""), "per-file");
+  assert.equal(parseImpactMode(" changed-set "), "changed-set");
+  assert.throws(() => parseImpactMode("changed_set"), /impact-mode must be one of per-file, changed-set/);
+});
+
+test("buildChangedSetImpactArgs attaches the merge-base and options so no value becomes a flag", () => {
+  assert.deepEqual(buildChangedSetImpactArgs({ store: "/s", changedRef: MERGE_BASE, profiles: ["web", "--evil"], maxNodes: 10, maxEdges: 20 }), [
+    "--store",
+    "/s",
+    "impact",
+    `--changed=${MERGE_BASE}`,
+    "--json",
+    "--profile=web",
+    "--profile=--evil",
+    "--max-nodes=10",
+    "--max-edges=20",
+  ]);
+  assert.throws(() => buildChangedSetImpactArgs({ store: "/s", changedRef: "main" }), /not an object id/);
+  assert.throws(() => buildChangedSetImpactArgs({ store: "/s", changedRef: "--output=x" }), /not an object id/);
+});
+
+test("supportsChangedSetImpact reads the optional selector from the usage line, not the version", () => {
+  assert.equal(supportsChangedSetImpact({ exitCode: 0, stdout: NEW_HELP }), true);
+  assert.equal(supportsChangedSetImpact({ exitCode: 0, stdout: OLD_HELP }), false);
+  assert.equal(supportsChangedSetImpact({ exitCode: 2, stdout: NEW_HELP }), false);
+  assert.equal(supportsChangedSetImpact({ exitCode: 0, stdout: "" }), false);
+});
+
+test("classifyChangedSetResult accepts only a changed_set envelope and keeps failures as errors", () => {
+  assert.equal(classifyChangedSetResult(changedSetEnvelope(changedSetData())).status, "ok");
+  assert.deepEqual(classifyChangedSetResult({ exitCode: 0, stdout: JSON.stringify({ data: okResult([]).data }), stderr: "" }), {
+    status: "error",
+    exitCode: 0,
+    message: "impact JSON envelope is not a changed_set result",
+  });
+  assert.equal(classifyChangedSetResult({ exitCode: 0, stdout: "not json", stderr: "" }).message, "impact output is not valid JSON");
+  assert.deepEqual(classifyChangedSetResult({ exitCode: 3, stdout: "", stderr: "error: service resource limit exceeded\n" }), {
+    status: "error",
+    exitCode: 3,
+    message: "service resource limit exceeded",
+  });
+});
+
+test("changedSetFiles credits each impacted node to every changed path that reaches it", () => {
+  const entries = [
+    { change: "M", path: "src/a.ts" },
+    { change: "M", path: "src/b.ts" },
+    { change: "M", path: "docs/c.md" },
+    { change: "D", path: "src/gone.ts" },
+    { change: "A", path: "src/unknown.ts" },
+  ];
+  const files = changedSetFiles(entries, scenarioChangedSet());
+  const byPath = Object.fromEntries(files.map((file) => [file.path, file.result]));
+  assert.equal(byPath["src/a.ts"].status, "ok");
+  assert.deepEqual(
+    byPath["src/a.ts"].data.impacts.map((item) => [item.node.id, item.depth]),
+    [
+      ["route-orders", 1],
+      ["pkg-web", 1],
+    ],
+  );
+  // b.ts is itself a changed node (depth 0), so it is not an impact of a.ts here.
+  assert.deepEqual(
+    byPath["src/b.ts"].data.impacts.map((item) => item.node.id),
+    ["route-orders"],
+  );
+  assert.deepEqual(byPath["docs/c.md"], { status: "unmapped", exitCode: 0, message: "no graph node for this path" });
+  assert.deepEqual(byPath["src/gone.ts"], { status: "deleted" });
+  assert.deepEqual(byPath["src/unknown.ts"], { status: "error", exitCode: 0, message: "changed-set impact did not report this path" });
+});
+
+test("changedSetFiles keeps a route or package that is itself a changed node at depth 0", () => {
+  const page = node("route-page", "route", "/users/$id");
+  const symbol = node("symbol-render", "symbol", "render");
+  const data = changedSetData({
+    mappings: [mapping("app/users/[id]/page.tsx", ["file-page", "route-page", "symbol-render"]), mapping("package.json", ["pkg-web"])],
+    impacts: [
+      changedImpact(node("file-page", "file", "app/users/[id]/page.tsx"), 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(page, 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(symbol, 0, ["app/users/[id]/page.tsx"], []),
+      changedImpact(SCENARIO_PACKAGE, 0, ["package.json"], []),
+    ],
+  });
+  const files = changedSetFiles(
+    [
+      { change: "M", path: "app/users/[id]/page.tsx" },
+      { change: "M", path: "package.json" },
+    ],
+    data,
+  );
+  const report = reportFixture({ files });
+  assert.deepEqual(
+    report.impacted.map((entry) => [entry.kind, entry.display_name, entry.depth, entry.reached_from]),
+    [
+      ["route", "/users/$id", 0, ["app/users/[id]/page.tsx"]],
+      ["package_instance", "apps/web", 0, ["package.json"]],
+    ],
+  );
+  assert.equal(report.impacted[0].keep_changed_node, undefined);
+});
+
+test("changedSetFiles matches a renamed file by its new path", () => {
+  const data = changedSetData({
+    mappings: [mapping("src/to.ts", ["file-to"], { status: "renamed", old_path: "src/from.ts" })],
+    impacts: [changedImpact(SCENARIO_ROUTE, 2, ["src/to.ts"])],
+  });
+  const [file] = changedSetFiles([{ change: "R", path: "src/to.ts", oldPath: "src/from.ts", similarity: 90 }], data);
+  assert.equal(file.result.status, "ok");
+  assert.equal(file.oldPath, "src/from.ts");
+  assert.deepEqual(file.result.data.impacts.map((item) => item.node.id), ["route-orders"]);
+});
+
+test("collectReport changed-set makes one impact call and reports what per-file reports", async () => {
+  const perFile = changedSetDepgraph();
+  const perFileReport = await collectReport({ ...scenarioCollect(), runDepgraph: perFile.runDepgraph });
+  const changedSet = changedSetDepgraph();
+  const warnings = [];
+  const changedSetReport = await collectReport({
+    ...scenarioCollect(),
+    impactMode: "changed-set",
+    runDepgraph: changedSet.runDepgraph,
+    onWarning: (text) => warnings.push(text),
+  });
+
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(
+    changedSet.calls.map((args) => args.slice(0, 4)),
+    [
+      ["impact", "--help"],
+      ["--store", "/s", "impact", `--changed=${MERGE_BASE}`],
+    ],
+  );
+  assert.deepEqual(changedSetReport.impact_mode, { requested: "changed-set", used: "changed-set" });
+  assert.deepEqual(perFileReport.impact_mode, { requested: "per-file", used: "per-file" });
+  assert.deepEqual(
+    changedSetReport.changed_files.map((file) => [file.path, file.status, file.impacted_count]),
+    [
+      ["src/a.ts", "ok", 2],
+      ["src/b.ts", "ok", 1],
+      ["docs/c.md", "unmapped", undefined],
+      ["src/gone.ts", "deleted", undefined],
+    ],
+  );
+  assert.deepEqual(changedSetReport.totals, { changed: 4, routes: 1, packages: 1, others: 0, impacted: 2 });
+  assert.equal(changedSetReport.incomplete, false);
+  assert.deepEqual(changedSetReport.diagnostics, [{ code: "profile_skipped", message: "profile web was skipped" }]);
+
+  // per-file also lists b.ts, a changed file, as impacted by a.ts; the
+  // changed-set result treats it as a changed node. Everything else agrees.
+  const withoutChangedFiles = perFileReport.impacted.filter((entry) => entry.id !== "file-src/b.ts");
+  assert.deepEqual(changedSetReport.impacted, withoutChangedFiles);
+  assert.deepEqual(changedSetReport.skipped, perFileReport.skipped);
+});
+
+test("collectReport changed-set ignores max-files because it makes a single call", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph();
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", maxFiles: 1, runDepgraph });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(report.skipped, { count: 0, paths: [] });
+  assert.equal(report.changed_files.filter((file) => file.status === "ok").length, 2);
+});
+
+const HEAD_MISMATCH = "error: current snapshot source revision does not match the repository worktree HEAD\n";
+const RESOURCE_EXHAUSTED = "error: request exhausted a service resource limit\n";
+
+test("collectReport changed-set turns a failed call into errors for every surviving file", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph({ answer: () => ({ exitCode: 2, stdout: "", stderr: HEAD_MISMATCH }) });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.deepEqual(warnings, []);
+  assert.equal(calls.length, 2);
+  assert.equal(report.impact_mode.used, "changed-set");
+  assert.equal(report.incomplete, true);
+  assert.deepEqual(
+    report.changed_files.map((file) => [file.path, file.status, file.exit_code]),
+    [
+      ["src/a.ts", "error", 2],
+      ["src/b.ts", "error", 2],
+      ["docs/c.md", "error", 2],
+      ["src/gone.ts", "deleted", undefined],
+    ],
+  );
+  assert.equal(report.changed_files[0].message, "current snapshot source revision does not match the repository worktree HEAD");
+  assert.deepEqual(report.impacted, []);
+});
+
+test("collectReport changed-set falls back to per-file when the call exhausts a resource limit", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph({ answer: () => ({ exitCode: 3, stdout: "", stderr: RESOURCE_EXHAUSTED }) });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.deepEqual(warnings, ["impact-mode changed-set falls back to per-file: impact --changed exhausted a depgraph service resource limit"]);
+  assert.deepEqual(
+    calls.slice(2).map((args) => args[3]),
+    ["path:src/a.ts", "path:src/b.ts", "path:docs/c.md"],
+  );
+  assert.equal(report.impact_mode.used, "per-file");
+  assert.equal(report.incomplete, false);
+  assert.equal(report.totals.impacted, 3);
+});
+
+test("collectReport changed-set keeps an exit 3 that is not a resource limit as an error", async () => {
+  const { runDepgraph } = changedSetDepgraph({ answer: () => ({ exitCode: 3, stdout: "", stderr: "error: read-only store is unavailable\n" }) });
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph });
+  assert.equal(report.impact_mode.used, "changed-set");
+  assert.equal(report.changed_files[0].status, "error");
+  assert.equal(report.incomplete, true);
+});
+
+test("collectReport changed-set marks the report incomplete when the result is incomplete", async () => {
+  const { runDepgraph } = changedSetDepgraph({ answer: () => changedSetEnvelope({ ...scenarioChangedSet(), complete: false }) });
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph });
+  assert.equal(report.incomplete, true);
+  assert.equal(report.changed_files[0].complete, false);
+});
+
+test("collectReport changed-set falls back to per-file with a warning on a depgraph without it", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph({ help: OLD_HELP });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.deepEqual(warnings, ["impact-mode changed-set falls back to per-file: this depgraph does not support impact --changed without a selector"]);
+  assert.equal(calls.some((args) => args.some((arg) => arg.startsWith("--changed="))), false);
+  assert.deepEqual(
+    calls.slice(1).map((args) => args[3]),
+    ["path:src/a.ts", "path:src/b.ts", "path:docs/c.md"],
+  );
+  assert.equal(report.impact_mode.used, "per-file");
+  assert.match(report.impact_mode.fallback_reason, /does not support/);
+  assert.equal(report.totals.impacted, 3);
+});
+
+test("collectReport changed-set falls back when the call itself says a selector is required", async () => {
+  const { runDepgraph } = changedSetDepgraph({ answer: () => ({ exitCode: 2, stdout: "", stderr: OLD_SELECTOR_ERROR }) });
+  const warnings = [];
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", runDepgraph, onWarning: (text) => warnings.push(text) });
+  assert.equal(warnings.length, 1);
+  assert.equal(report.impact_mode.used, "per-file");
+  assert.equal(report.changed_files[0].status, "ok");
+});
+
+test("collectReport changed-set reads a partial scan attempt per file because impact --changed needs the current snapshot", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph();
+  const warnings = [];
+  const report = await collectReport({
+    ...scenarioCollect(),
+    impactMode: "changed-set",
+    scanExitCode: 3,
+    scanOutput: { scan_id: "4aea1ad6-316f-4863-94f5-14ee01e3763a", status: "partial", error: "rust worker exceeded its memory budget" },
+    runDepgraph,
+    onWarning: (text) => warnings.push(text),
+  });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /attempt/);
+  assert.equal(calls.some((args) => args[0] === "impact" && args[1] === "--help"), false);
+  assert.equal(calls[0][2], "--scan-id=attempt:4aea1ad6-316f-4863-94f5-14ee01e3763a");
+  assert.equal(report.impact_mode.used, "per-file");
+  assert.equal(report.scan.status, "partial");
+});
+
+test("collectReport changed-set does not query impact when the scan failed", async () => {
+  const { runDepgraph, calls } = changedSetDepgraph();
+  const report = await collectReport({ ...scenarioCollect(), impactMode: "changed-set", scanExitCode: 3, scanMessage: "worker failed", runDepgraph });
+  assert.deepEqual(calls, []);
+  assert.equal(report.changed_files[0].status, "not_analyzed");
+});
+
+test("collectReport rejects an unknown impact mode before running git", async () => {
+  const { runGit, calls } = fakeGit("");
+  await assert.rejects(collectReport({ ...scenarioCollect(), runGit, impactMode: "fast", runDepgraph: async () => assert.fail() }), /impact-mode/);
+  assert.deepEqual(calls, []);
+});
+
+test("the Validate inputs step rejects an unknown impact-mode", () => {
+  const script = compositeStepScript(readFileSync(ACTION_YML, "utf8"), "paths");
+  const runnerTemp = mkdtempSync(join(tmpdir(), "pr-impact-runner-"));
+  try {
+    const run = (mode) =>
+      spawnSync("bash", ["-c", script], {
+        encoding: "utf8",
+        env: {
+          PATH: process.env.PATH,
+          RUNNER_TEMP: runnerTemp,
+          GITHUB_OUTPUT: join(runnerTemp, "out"),
+          INPUT_STRICT: "false",
+          INPUT_POST_COMMENT: "false",
+          INPUT_IMPACT_MODE: mode,
+        },
+      });
+    assert.equal(run("changed-set").status, 0);
+    const rejected = run("changed_set");
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /impact-mode must be per-file or changed-set/);
+  } finally {
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
 // --- rendering -----------------------------------------------------------
 
 test("escapeMarkdown neutralizes table, HTML, code, link, and mention syntax", () => {
@@ -937,7 +1343,14 @@ test("each Action call in a job gets its own output directory", () => {
       const outputFile = join(runnerTemp, `github-output-${index}`);
       writeFileSync(outputFile, "");
       execFileSync("bash", ["-c", script], {
-        env: { PATH: process.env.PATH, RUNNER_TEMP: runnerTemp, GITHUB_OUTPUT: outputFile, INPUT_STRICT: "false", INPUT_POST_COMMENT: "false" },
+        env: {
+          PATH: process.env.PATH,
+          RUNNER_TEMP: runnerTemp,
+          GITHUB_OUTPUT: outputFile,
+          INPUT_STRICT: "false",
+          INPUT_POST_COMMENT: "false",
+          INPUT_IMPACT_MODE: "per-file",
+        },
       });
       return readOutputs(readFileSync(outputFile, "utf8"));
     };
