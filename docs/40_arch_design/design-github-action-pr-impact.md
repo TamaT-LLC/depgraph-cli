@@ -9,7 +9,7 @@
 
 PR に「この変更で影響を受けるルートとパッケージ」を根拠つきで自動コメントする Action を、現行の CLI だけで試作できる。
 試作の既定（`impact-mode: per-file`）は、変更ファイルごとに `depgraph impact path:<file> --json` を呼んで Action 側で集約する。
-#550 で CLI に「セレクター省略の `impact --changed`」が入ったので、`impact-mode: changed-set` を選ぶと 1 回の呼び出しで同じ形の report を作る。
+PR #550 で CLI に「セレクター省略の `impact --changed`」が入ったので、`impact-mode: changed-set` を選ぶと 1 回の呼び出しで同じ形の report を作る。
 この CLI 機能は v0.7.0 で公開予定のため、既定はまだ `per-file` にしてある。v0.7.0 の公開後に既定を `changed-set` に切り替える（「`changed-set` への既定の切り替え手順」節）。
 
 fork PR では `pull_request_target` を使わない。
