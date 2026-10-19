@@ -7251,6 +7251,7 @@ fn mcp_setup_rejects_an_old_node_before_downloading_or_scanning() {
     fixture
         .setup()
         .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "MCP setup cannot create a safe snapshot",
         ))
