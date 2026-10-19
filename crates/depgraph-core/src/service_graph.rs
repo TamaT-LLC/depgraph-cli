@@ -1506,10 +1506,13 @@ fn explain_path_bounded(
         ));
     }
 
+    // Building the adjacency reads every snapshot edge once, so it is bounded
+    // by the snapshot-wide preprocessing budget. `max_traversal` bounds only
+    // the edges the search visits, as it does for dependency traversals.
     let adjacency = canonical_outgoing_adjacency(
         snapshot,
         request.filter(),
-        request.max_traversal(),
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
         cancellation,
     )?;
     let mut queue = VecDeque::from([from.id.clone()]);
@@ -2567,5 +2570,46 @@ mod tests {
                 "stage: {stage}"
             );
         }
+    }
+
+    #[test]
+    fn issue_562_path_max_traversal_bounds_visited_edges_not_snapshot_size() {
+        // 2,000 snapshot edges, far more than the request's traversal limit;
+        // the requested path is one hop.
+        let snapshot = cycle_snapshot(1_000, 2);
+        let one_hop = ExplainPathRequest::try_new(
+            "id:file:00:00",
+            "id:file:00:01",
+            GraphQueryFilter::default(),
+            500,
+        )
+        .expect("one-hop request");
+        let (path, traversed) =
+            explain_path_bounded(&snapshot, &one_hop, &CancellationToken::new())
+                .expect("a one-hop path fits a 500-edge traversal limit");
+        assert!(path.path_found);
+        assert_eq!(
+            path.steps
+                .iter()
+                .map(|step| step.edge.id.as_str())
+                .collect::<Vec<_>>(),
+            ["edge:00:00"]
+        );
+        assert_eq!(traversed, 1);
+
+        // A path that needs more visited edges than the limit still fails
+        // closed instead of reporting that no path exists.
+        let long_cycle = cycle_snapshot(1, 600);
+        let too_long = ExplainPathRequest::try_new(
+            "id:file:00:00",
+            "id:file:00:599",
+            GraphQueryFilter::default(),
+            500,
+        )
+        .expect("long path request");
+        assert!(matches!(
+            explain_path_bounded(&long_cycle, &too_long, &CancellationToken::new()),
+            Err(DepgraphServiceError::ResourceExhausted)
+        ));
     }
 }
