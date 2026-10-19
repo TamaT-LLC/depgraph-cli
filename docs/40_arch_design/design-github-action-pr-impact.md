@@ -135,15 +135,19 @@ Action はこの結果を per-file と同じ「ファイルごとの結果」に
 - 変更ファイルの一覧は、per-file と同じく Action 自身の `git diff --relative` で作る。CLI の `changed_set` はワークツリーの未コミット変更と untracked も含み、`--find-copies` も使うので、一覧を CLI に合わせるとファイル数が per-file とずれる。CLI だけが見た変更は、その変更にしか届かないノードごと report に入らない。
 - パスの基準は両者で同じである。CLI は scan のルート（Action では `working-directory`）で `git rev-parse --show-prefix` を取り、リポジトリルート基準の diff からその prefix を外す（`read_git_changed_set_cancellable`）。`--relative` の結果と同じく、scan ルート基準のパスになる。`path_prefix` の扱いも per-file と変わらない。
 - 状態は `data.mappings` で決める。新しいパス（リネームとコピーは新しい側）の mapping に対応ノードがあれば `ok`、mapping はあるが対応ノードが無ければ `unmapped`、mapping が無ければ `error`（2 つの diff が食い違っており、影響なしと断定できない）にする。削除は per-file と同じく照会せず `deleted` にする。
-- 影響ノードは depth > 0 のものだけを数え、`changed_paths` にある変更ファイルそれぞれに帰属させる。`reached_from` は `changed_paths`、depth と経路は CLI が計算済みの値をそのまま使う。
+- 影響ノードは depth > 0 のものを数え、`changed_paths` にある変更ファイルそれぞれに帰属させる。`reached_from` は `changed_paths`、depth と経路は CLI が計算済みの値をそのまま使う。
+- depth 0 の変更ノードのうち、kind が `route` と `package_instance` のものだけは depth 0 のまま影響ノードに残す。ページのファイルを変えたときのルートや、`package.json` を変えたときのパッケージは、CLI では変更ノード自身（depth 0）になる。除くとコメントのルート表とパッケージ表から消えてしまう。根拠の経路は空になり、コメントには「経路の根拠は記録されていません」と出る。
 - `data.diagnostics` のうち `changed_path_unmapped` は `unmapped` の状態と重複するので除き、残りはパスなしで `diagnostics` に入れる。
-- 呼び出しが失敗したとき（HEAD と `source_revision` の不一致などの exit 2、上限超過の exit 3 など）は、削除以外の全ファイルを終了コードとメッセージつきの `error` にし、report を不完全扱いにする。`complete=false` の結果も不完全扱いにする（現在の CLI は `complete=false` のとき exit 3 を返す）。
+- 呼び出しが失敗したとき（HEAD と `source_revision` の不一致の exit 2 など）は、削除以外の全ファイルを終了コードとメッセージつきの `error` にし、report を不完全扱いにする。`complete=false` の結果も不完全扱いにする（現在の CLI は `complete=false` のとき exit 3 を返す）。
+- ただし exit 3 で stderr が `request exhausted a service resource limit` のとき（上限超過）は per-file に戻す（次の小節）。per-file でもファイルごとに上限を超えれば、そのファイルが `error` になり report は不完全扱いになる。
 - 1 回の呼び出しなので `max-files` は使わない。超過分を `skipped` にしても計算時間は減らず、計算済みの結果を捨てるだけになるからである。探索の大きさは `max-nodes` / `max-edges` で抑える。
 
 per-file との違いは 2 つある。
 
-- per-file では、別の変更ファイルから届く変更ファイル（a.ts が変わり、a.ts に依存する b.ts も変わった場合の b.ts）が影響ノードに入る。changed-set ではそれは変更ノード自身（depth 0）なので入らない。変更ファイルはコメントの変更ファイル数とファイル一覧に出るので、情報は失われない。
-- changed-set は、ファイルノードだけでなく、パス、`manifest_path`、evidence でそのファイルに結びつくノードも始点にする（`path_node_index_cancellable`）。per-file の `path:` で対応ノードが無い `Cargo.toml` のようなファイルも、パッケージに結びつけば `ok` になる。逆に、変更ファイルの evidence を持つノード（そのファイルを含むパッケージなど）は depth 0 の始点になり、影響ノードには入らない。
+- per-file では、別の変更ファイルから届く変更ファイル（a.ts が変わり、a.ts に依存する b.ts も変わった場合の b.ts）が影響ノードに入る。changed-set ではそれは変更ノード自身（depth 0）なので入らない。変更ファイルはコメントの変更ファイル数とファイル一覧に出るので、情報は失われない。ファイルごとの `impacted_count` もその分だけ小さくなる。
+- changed-set は、ファイルノードだけでなく、パス、`manifest_path`、evidence でそのファイルに結びつくノードも始点にする（`path_node_index_cancellable`）。per-file の `path:` で対応ノードが無い `Cargo.toml` のようなファイルも、パッケージに結びつけば `ok` になる。逆に、変更ファイルに結びつくノードは depth 0 の始点になる。route と package_instance は上記のとおり depth 0 で残すが、それ以外の kind（workspace やシンボルなど）は影響ノードに入らない。
+
+計測（scratchpad の measurement.md。`workers/web` を scan ルートにした 31 ファイルの変更）では、両方式に共通する 35 ノードの depth と `reached_from` はすべて一致した。per-file だけにあった 26 ノードは、変更ファイル自身の 24 ノードと、`package.json` の変更で depth 0 になったパッケージと workspace だった。
 
 #### changed-set を使えないときの振る舞い
 
@@ -153,6 +157,7 @@ per-file との違いは 2 つある。
 
 - 取得した depgraph が、セレクター省略の `impact --changed` に対応していない（v0.6.4 など）。判定はバージョン番号ではなく機能で行う。`depgraph impact --help` の Usage 行で、セレクターが `[SELECTOR]`（省略可）か `<SELECTOR>`（必須）かを見る（`supportsChangedSetImpact`）。main からビルドしたバイナリは、次のリリースまで前のバージョン番号を名乗るためである。念のため、呼び出しが clap の「必須引数が無い」エラー（exit 2）を返したときも同じく戻す。
 - scan が部分結果（exit 3）や strict 違反（exit 1）で、`--scan-id=attempt:<scan_id>` でしか読めない。`impact --changed` は current snapshot でしか動かない（`service_graph.rs` の `impact_changed_set` が `is_current()` 以外を `InvalidInput` にする）。per-file は `--changed` を使わないので attempt を読める。
+- 呼び出しが exit 3 の上限超過（`request exhausted a service resource limit`）で終わった。変更パスとノードの対応付け（`path_node_index_cancellable`）は snapshot の全 node、site、edge、evidence を 1 件ずつ数え、固定の上限 `MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`（1,000,000）を超えると失敗する。`--max-nodes` / `--max-edges` では緩められない。このリポジトリ全体の snapshot は合計約 105 万件（node 7.1 万、site 21.7 万、edge 24.4 万、evidence 52.2 万）で、変更が 1 ファイルでも必ず exit 3 になる。CLI 側の課題として「CLI 側に足りない機能」の 1 番に書いた。
 
 ## Action の入出力
 
@@ -377,7 +382,7 @@ CLI との結合は、Action の `version` 入力で CLI のバージョンを�
 
 優先度の高い順に並べる。1 番は対応済みで、2 番と 3 番が入れば試作の補正の大半が要らなくなる。
 
-1. 変更集合全体を起点にする `impact --changed`（セレクター省略）。#550 で main に入り、v0.7.0 で公開予定。Action は `impact-mode: changed-set` で使う（「試作の方式」節）。残る課題は、`--scan-id=attempt:` と組み合わせられないこと（部分結果や strict 違反の scan では per-file に戻る）と、変更ファイル自身が別の変更から届くことを depth 0 以外で表せないことである。
+1. 変更集合全体を起点にする `impact --changed`（セレクター省略）。#550 で main に入り、v0.7.0 で公開予定。Action は `impact-mode: changed-set` で使う（「試作の方式」節）。残る課題は 3 つある。変更パスの対応付けが snapshot の全レコード数を固定の上限 1,000,000 と比べるため、このリポジトリ規模（約 105 万件）では変更の大きさによらず exit 3 になること（`impact --changed` 全般の問題で、Action は per-file に戻る）。`--scan-id=attempt:` と組み合わせられないこと（部分結果や strict 違反の scan では per-file に戻る）。変更ファイル自身が別の変更から届くことを depth 0 以外で表せないこと。
 2. 完全一致のファイルセレクター（`file:` など）、またはサフィックス一致のフォールバックを無効にするオプション。
 3. strict 違反や部分結果の scan に対する impact。`attempt:` を自動で参照するか、採用する scan id を明示できるようにする。今は既定の照会が exit 2 になり、全ファイルが unmapped に見える。
 4. 上限超過や部分結果でも `complete=false` で結果を返し、ドキュメントとの食い違いを解消する。部分結果時、Go のファイル単位 impact が import 先へ伝わらない問題も含む。
