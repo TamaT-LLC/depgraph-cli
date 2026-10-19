@@ -8,8 +8,9 @@
 ## 結論
 
 PR に「この変更で影響を受けるルートとパッケージ」を根拠つきで自動コメントする Action を、現行の CLI だけで試作できる。
-ただし変更ファイル全体の影響範囲を 1 コマンドで出す手段が CLI に無いので、試作では変更ファイルごとに `depgraph impact path:<file> --json` を呼んで Action 側で集約する。
-この方式は暫定であり、CLI に「セレクター省略の `impact --changed`」が入った時点で 1 コマンドに置き換える。
+試作の既定（`impact-mode: per-file`）は、変更ファイルごとに `depgraph impact path:<file> --json` を呼んで Action 側で集約する。
+#550 で CLI に「セレクター省略の `impact --changed`」が入ったので、`impact-mode: changed-set` を選ぶと 1 回の呼び出しで同じ形の report を作る。
+この CLI 機能は v0.7.0 で公開予定のため、既定はまだ `per-file` にしてある。v0.7.0 の公開後に既定を `changed-set` に切り替える（「`changed-set` への既定の切り替え手順」節）。
 
 fork PR では `pull_request_target` を使わない。
 `pull_request` の read-only ジョブで解析してコメント本文を artifact にし、コメント投稿は `workflow_run` で起動する別 workflow が担う。
@@ -89,6 +90,12 @@ runner のチェックアウト先が変わっても Store の中身は再利用
 
 ## 試作の方式（暫定）
 
+Action は 2 つの方式を持ち、入力 `impact-mode` で選ぶ。
+どちらも `depgraph-pr-impact-report-v0` の同じ形の `report.json` を書き、`render.mjs` は方式を区別しない。
+`report.json` の `impact_mode` に、要求した方式（`requested`）、実際に使った方式（`used`）、戻した理由（`fallback_reason`）を記録する。
+
+### per-file（既定）
+
 流れは次のとおり（実装は `collect.mjs`）。
 
 1. `git diff --name-status -z --find-renames --relative <merge-base> <head>` で変更ファイルを列挙する。base は `base-ref` と head の merge-base に解決する。リネームとコピーは新しいパスで扱い、削除されたファイルは照会しない。head だけを scan するので、削除されたファイルのノードはグラフにない。report では `changed_files[].status` を `deleted` として残し、件数を数えられるようにする。コメントでは削除されたファイルの影響（消えたルートなど）を計算していないと件数付きで明記し、「影響を受けるノードは見つかりませんでした」は削除されたファイルを除く変更に限って書く。変更が削除だけのときは、この一文を出さない。
@@ -119,6 +126,34 @@ warm impact は 1 回数十 ms と測定されている（`docs/releases/v0.4.0-
 グラフに対応づけられなかったファイル（ドキュメントや設定ファイルなど）は、コメント末尾の折りたたみに理由つきで出す。
 黙って捨てると、影響なしと誤読されるからである。
 
+### changed-set（depgraph 0.7.0 以降）
+
+`depgraph impact --changed=<merge-base> --json` を 1 回だけ呼ぶ（`collectChangedSet`）。
+CLI は変更ファイルに対応する全ノードを depth 0 の始点にして逆方向 BFS を 1 回行い、各ノードに最小の depth、最短の `dependency_path`、届く変更パスの全部（`changed_paths`）を付けて返す（`crates/depgraph-core/src/impact.rs` の `impact_changed_set_cancellable`）。
+Action はこの結果を per-file と同じ「ファイルごとの結果」に分け直してから、per-file と同じ `aggregateReport` に通す（`changedSetFiles`）。
+
+- 変更ファイルの一覧は、per-file と同じく Action 自身の `git diff --relative` で作る。CLI の `changed_set` はワークツリーの未コミット変更と untracked も含み、`--find-copies` も使うので、一覧を CLI に合わせるとファイル数が per-file とずれる。CLI だけが見た変更は、その変更にしか届かないノードごと report に入らない。
+- パスの基準は両者で同じである。CLI は scan のルート（Action では `working-directory`）で `git rev-parse --show-prefix` を取り、リポジトリルート基準の diff からその prefix を外す（`read_git_changed_set_cancellable`）。`--relative` の結果と同じく、scan ルート基準のパスになる。`path_prefix` の扱いも per-file と変わらない。
+- 状態は `data.mappings` で決める。新しいパス（リネームとコピーは新しい側）の mapping に対応ノードがあれば `ok`、mapping はあるが対応ノードが無ければ `unmapped`、mapping が無ければ `error`（2 つの diff が食い違っており、影響なしと断定できない）にする。削除は per-file と同じく照会せず `deleted` にする。
+- 影響ノードは depth > 0 のものだけを数え、`changed_paths` にある変更ファイルそれぞれに帰属させる。`reached_from` は `changed_paths`、depth と経路は CLI が計算済みの値をそのまま使う。
+- `data.diagnostics` のうち `changed_path_unmapped` は `unmapped` の状態と重複するので除き、残りはパスなしで `diagnostics` に入れる。
+- 呼び出しが失敗したとき（HEAD と `source_revision` の不一致などの exit 2、上限超過の exit 3 など）は、削除以外の全ファイルを終了コードとメッセージつきの `error` にし、report を不完全扱いにする。`complete=false` の結果も不完全扱いにする（現在の CLI は `complete=false` のとき exit 3 を返す）。
+- 1 回の呼び出しなので `max-files` は使わない。超過分を `skipped` にしても計算時間は減らず、計算済みの結果を捨てるだけになるからである。探索の大きさは `max-nodes` / `max-edges` で抑える。
+
+per-file との違いは 2 つある。
+
+- per-file では、別の変更ファイルから届く変更ファイル（a.ts が変わり、a.ts に依存する b.ts も変わった場合の b.ts）が影響ノードに入る。changed-set ではそれは変更ノード自身（depth 0）なので入らない。変更ファイルはコメントの変更ファイル数とファイル一覧に出るので、情報は失われない。
+- changed-set は、ファイルノードだけでなく、パス、`manifest_path`、evidence でそのファイルに結びつくノードも始点にする（`path_node_index_cancellable`）。per-file の `path:` で対応ノードが無い `Cargo.toml` のようなファイルも、パッケージに結びつけば `ok` になる。逆に、変更ファイルの evidence を持つノード（そのファイルを含むパッケージなど）は depth 0 の始点になり、影響ノードには入らない。
+
+#### changed-set を使えないときの振る舞い
+
+`impact-mode: changed-set` でも、次の場合は `::warning::` を出して per-file に戻す。
+エラーで止めずに戻すのは、戻しても report の形と正しさは変わらず、遅くなるだけだからである。
+`changed-set` を既定にした後も、古い `version` や `depgraph-path` を指定した利用者の workflow を壊さずに済む。
+
+- 取得した depgraph が、セレクター省略の `impact --changed` に対応していない（v0.6.4 など）。判定はバージョン番号ではなく機能で行う。`depgraph impact --help` の Usage 行で、セレクターが `[SELECTOR]`（省略可）か `<SELECTOR>`（必須）かを見る（`supportsChangedSetImpact`）。main からビルドしたバイナリは、次のリリースまで前のバージョン番号を名乗るためである。念のため、呼び出しが clap の「必須引数が無い」エラー（exit 2）を返したときも同じく戻す。
+- scan が部分結果（exit 3）や strict 違反（exit 1）で、`--scan-id=attempt:<scan_id>` でしか読めない。`impact --changed` は current snapshot でしか動かない（`service_graph.rs` の `impact_changed_set` が `is_current()` 以外を `InvalidInput` にする）。per-file は `--changed` を使わないので attempt を読める。
+
 ## Action の入出力
 
 ### 入力
@@ -129,7 +164,8 @@ warm impact は 1 回数十 ms と測定されている（`docs/releases/v0.4.0-
 | `strict` | true で `scan --strict`。exit 1 はコメントで報告するだけで、ジョブは落とさない |
 | `profiles` | 改行区切りで `impact` の `--profile` に渡す。scan 側のプロファイル指定は CLI の不足機能（後述） |
 | `version` / `depgraph-path` | 使う CLI のバージョン（既定 `0.6.4`）、または用意済みバイナリのパス。後者を指定すると取得しない |
-| `max-files` / `max-nodes` / `max-edges` | 呼び出し回数（既定 200）と、`impact` の探索上限。探索上限は CLI と同じ 1〜1,000,000 で、範囲外は collect の開始前に失敗させる |
+| `impact-mode` | `per-file`（既定）か `changed-set`。`changed-set` は depgraph 0.7.0 以降で 1 回の呼び出しにし、使えないときは警告して `per-file` に戻す。それ以外の値は Validate inputs で exit 2 |
+| `max-files` / `max-nodes` / `max-edges` | per-file の呼び出し回数（既定 200。changed-set では使わない）と、`impact` の探索上限。探索上限は CLI と同じ 1〜1,000,000 で、範囲外は collect の開始前に失敗させる |
 | `post-comment` / `github-token` | 同一リポジトリの PR で、同じジョブからコメントするとき（既定は false）。トークンに `pull-requests: write` が要る。`github-token` はリリース取得にも使う |
 | `pr-number` | コメント先の PR 番号。既定は `github.event.pull_request.number` |
 | `comment-author` | 更新対象にするコメントの投稿者。`github-actions[bot]` に加えて指定できる |
@@ -339,9 +375,9 @@ CLI との結合は、Action の `version` 入力で CLI のバージョンを�
 
 ## CLI 側に足りない機能
 
-優先度の高い順に並べる。上の 3 つが入れば、試作の補正の大半と 1 ファイルずつの照会が要らなくなる。
+優先度の高い順に並べる。1 番は対応済みで、2 番と 3 番が入れば試作の補正の大半が要らなくなる。
 
-1. 変更集合全体を起点にする `impact --changed`（セレクター省略）。複数始点の逆方向 BFS にし、複数セレクターを 1 回で受けられる形でもよい。`main.rs:303-304`、`ImpactRequest`、`impact_cancellable`（`impact.rs:1202-1403`）、`map_changed_set`（`impact.rs:917-1048`）を再利用できる。現状は 1 件ごとに Store を開き直し、1 ファイルあたり約 1.5 秒かかる。
+1. 変更集合全体を起点にする `impact --changed`（セレクター省略）。#550 で main に入り、v0.7.0 で公開予定。Action は `impact-mode: changed-set` で使う（「試作の方式」節）。残る課題は、`--scan-id=attempt:` と組み合わせられないこと（部分結果や strict 違反の scan では per-file に戻る）と、変更ファイル自身が別の変更から届くことを depth 0 以外で表せないことである。
 2. 完全一致のファイルセレクター（`file:` など）、またはサフィックス一致のフォールバックを無効にするオプション。
 3. strict 違反や部分結果の scan に対する impact。`attempt:` を自動で参照するか、採用する scan id を明示できるようにする。今は既定の照会が exit 2 になり、全ファイルが unmapped に見える。
 4. 上限超過や部分結果でも `complete=false` で結果を返し、ドキュメントとの食い違いを解消する。部分結果時、Go のファイル単位 impact が import 先へ伝わらない問題も含む。
@@ -363,6 +399,16 @@ CLI との結合は、Action の `version` 入力で CLI のバージョンを�
 - 小さな Next.js fixture では scan が 3 秒で exit 0 になり、ルート `next:app:page:/users/$id` を深さ 4 で検出した。
 - このリポジトリ自身では scan が 138 秒で exit 3 になった。Rust worker がメモリ上限 2GiB を超え、Go worker が testdata の fixture で `outside the local module closure` を出したためである。
 - collect は 1 ファイル約 1.5 秒で、34 ファイルに約 53 秒かかった。34 件中 28 件が unmapped だった。
+
+## `changed-set` への既定の切り替え手順
+
+v0.7.0（セレクター省略の `impact --changed` を含む最初のリリース）が公開されたら、次の順で既定を切り替える。1 つの PR にまとめてよい。
+
+1. `action.yml` の `version` の既定値を `0.7.0` にする。リリースに `.sha256` サイドカーがあることと、`install.sh` で取得と検証ができることを確かめる。
+2. `action.yml` の `impact-mode` の既定値を `changed-set` にし、説明文の「(depgraph 0.7.0 or later)」と既定の記述を直す。`per-file` は、古い `version` を指定する利用者と attempt の scan のために残す。
+3. `scripts/tests/pr-impact.test.mjs` を更新する。`impactMode` を省略した collectReport が changed-set で動くこと、`per-file` を明示したときに従来どおり動くことを確かめるテストに直す。`node --test scripts/tests/pr-impact.test.mjs` と `cargo xtask test` を通す。
+4. この設計メモの「結論」「試作の方式」「Action の入出力」の既定値の記述と、フッター例の CLI バージョンを更新する。
+5. このリポジトリの dry-run（`.github/workflows/depgraph-pr-impact.yml`）は Action を base から取るので、切り替えの PR がマージされた後の PR から changed-set で動く。マージ後の最初の PR で Step Summary の件数と、artifact の `report.json` の `impact_mode.used` が `changed-set` であることを確かめる。
 
 ## 未決事項と次の一手
 
