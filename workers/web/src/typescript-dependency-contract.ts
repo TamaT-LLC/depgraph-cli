@@ -35,6 +35,8 @@ export const MAX_CONDITION_DEPTH = 64;
 export const MAX_CONDITION_NODES = 65_536;
 export const MAX_CONDITION_VALUES = 4_096;
 export const MAX_EXPORT_PATH_DEPTH = 64;
+/** UTF-16 code units of an imported or local binding name. */
+export const MAX_BINDING_NAME_CHARS = 512;
 
 export const TYPESCRIPT_CLOSED_LOCAL_CALL_FLOW_ALGORITHM = "typescript-closed-local-call-flow-v1";
 export const TYPESCRIPT_CLOSED_LOCAL_FRESH_INSTANCE_FLOW_ALGORITHM = "typescript-closed-local-fresh-instance-flow-v1";

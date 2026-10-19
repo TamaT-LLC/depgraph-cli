@@ -47,6 +47,7 @@ import {
   MAX_EXPORTS_PER_MODULE,
   MAX_MODULE_EXPORT_BINDINGS,
   MAX_SITES,
+  MAX_BINDING_NAME_CHARS,
   MAX_SPECIFIER_CHARS,
   nodeEnd,
   nodeSpan,
@@ -2664,7 +2665,7 @@ function validateTypeScriptDependencySites(
       || (site.localName !== null && (
         typeof site.localName !== "string"
         || site.localName.length === 0
-        || site.localName.length > 512
+        || site.localName.length > MAX_BINDING_NAME_CHARS
         || hasUnpairedSurrogate(site.localName)
         || site.kind !== "web_import"
         || !DIRECT_IMPORT_BINDING_OCCURRENCES.has(site.evidence.occurrenceKind)

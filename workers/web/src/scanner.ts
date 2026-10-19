@@ -1,5 +1,5 @@
 import { externalDeclarationRequests, loadExternalDeclarations } from "./external-declarations";
-import { isTypeUseTargetKind } from "./typescript-dependency-contract";
+import { isTypeUseTargetKind, MAX_BINDING_NAME_CHARS } from "./typescript-dependency-contract";
 import path from "node:path";
 import ts from "typescript";
 import { normalizeRelative, readJson, readUtf8, WEB_SOURCE_EXTENSIONS, type FileInventoryIssue } from "./fs";
@@ -726,7 +726,7 @@ class GraphBuilder {
           (raw.importedName.length === 0 && !emptyModuleExportName)
           || raw.importedName.length > 512
         ))
-        || (raw.localName !== null && (raw.localName.length === 0 || raw.localName.length > 512))
+        || (raw.localName !== null && (raw.localName.length === 0 || raw.localName.length > MAX_BINDING_NAME_CHARS))
       ) throw new Error("TypeScript dependency binding metadata is invalid");
       if (raw.targets.length === 0) throw new Error("TypeScript dependency site has no target");
       if (raw.targetConditions.length !== raw.targets.length) {

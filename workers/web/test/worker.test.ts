@@ -1402,6 +1402,30 @@ test("semantic import evidence records the local binding name", async (context) 
   }
 });
 
+test("an oversized import alias keeps the semantic import without a local name", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-long-local-name-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const alias = "x".repeat(513);
+  await Promise.all([
+    writeFile(path.join(root, "package.json"), JSON.stringify({ name: "long-local-name", private: true })),
+    writeFile(path.join(root, "lib.ts"), "export const a = 1;\n"),
+    writeFile(path.join(root, "index.ts"), `import { a as ${alias} } from "./lib";\nexport const used = ${alias};\n`),
+  ]);
+
+  const result = await run("long-local-name", root);
+  assert.equal(result.events.at(-1)?.event, "scan_completed");
+  assert.ok(!result.events.some((event) => (
+    event.diagnostic?.code === "web.typescript_semantic_dependency_contract_violation"
+  )), JSON.stringify(result.events.filter((event) => event.diagnostic)));
+  const named = result.events.find((event) => (
+    event.site?.kind === "web_import"
+    && event.site.evidence[0]?.kind === "semantic"
+    && event.site.evidence[0].properties.occurrence_kind === "named_import"
+  ))?.site;
+  assert.equal(named?.evidence[0].properties.imported_name, "a");
+  assert.ok(!("local_name" in named.evidence[0].properties));
+});
+
 test("missing explicit workspace, file, link, and portal targets remain unresolved", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-web-missing-explicit-local-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

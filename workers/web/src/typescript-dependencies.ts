@@ -63,6 +63,7 @@ import {
   isModuleLoaderCall,
   MAX_AST_DEPTH,
   MAX_AST_NODES,
+  MAX_BINDING_NAME_CHARS,
   MAX_CONDITION_DEPTH,
   MAX_CONDITION_NODES,
   MAX_CONDITION_VALUES,
@@ -923,7 +924,7 @@ function createSite(
   const directBinding = kind === "web_import"
     && ["default_import", "named_import", "namespace_import", "import_equals"].includes(occurrenceKind);
   const bindingScope = directBinding ? bindingScopeSpan(anchor) : null;
-  const localName = directBinding ? importBindingLocalName(anchor) : null;
+  const localName = directBinding ? boundedBindingName(importBindingLocalName(anchor)) : null;
   return {
     key: siteKey(source, kind, context.source.relativePath, startOffset, endOffset),
     kind,
@@ -974,6 +975,14 @@ function importBindingLocalName(anchor: Node): string | null {
   const parent = anchor.parent as (Node & { readonly name?: Node }) | undefined;
   const bindsAnchor = parent?.name === anchor && IMPORT_BINDING_PARENT_KINDS.has(parent.kind);
   return bindsAnchor ? (anchor as Identifier).text : null;
+}
+
+/**
+ * A local name is optional evidence, so one the raw contract cannot carry is
+ * dropped instead of failing the semantic dependency graph.
+ */
+function boundedBindingName(name: string | null): string | null {
+  return name !== null && name.length <= MAX_BINDING_NAME_CHARS && !hasUnpairedSurrogate(name) ? name : null;
 }
 
 async function moduleTargets(
