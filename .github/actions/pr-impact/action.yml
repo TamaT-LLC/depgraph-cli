@@ -24,8 +24,21 @@ inputs:
     description: Newline-separated profile IDs passed to `depgraph impact --profile`.
     required: false
     default: ""
+  impact-mode:
+    description: >-
+      How impact is computed. `per-file` runs `depgraph impact path:<file>` once
+      per changed file. `changed-set` runs `depgraph impact --changed <merge-base>`
+      once for the whole pull request (depgraph 0.7.0 or later). `changed-set`
+      falls back to `per-file` with a warning when the depgraph binary has no
+      selector-less `impact --changed`, or when a partial or strict-violating
+      scan is only readable as an `attempt:` snapshot.
+    required: false
+    default: per-file
   max-files:
-    description: Maximum number of changed files to query; the rest are reported as skipped.
+    description: >-
+      Maximum number of changed files to query in `per-file` mode; the rest are
+      reported as skipped. `changed-set` mode makes one call regardless of the
+      file count and ignores this bound.
     required: false
     default: "200"
   max-nodes:
@@ -80,6 +93,7 @@ runs:
       env:
         INPUT_STRICT: ${{ inputs.strict }}
         INPUT_POST_COMMENT: ${{ inputs.post-comment }}
+        INPUT_IMPACT_MODE: ${{ inputs.impact-mode }}
       run: |
         set -euo pipefail
         for pair in "strict=$INPUT_STRICT" "post-comment=$INPUT_POST_COMMENT"; do
@@ -88,6 +102,10 @@ runs:
             *) echo "::error::${pair%%=*} must be true or false" >&2; exit 2 ;;
           esac
         done
+        case "$INPUT_IMPACT_MODE" in
+          per-file | changed-set) ;;
+          *) echo "::error::impact-mode must be per-file or changed-set" >&2; exit 2 ;;
+        esac
         # A job may call this Action more than once (for example one scan root
         # per monorepo package), so each call gets its own directory instead of
         # sharing a fixed path that a later call would overwrite.
@@ -169,6 +187,7 @@ runs:
         SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
         BASE_REF: ${{ inputs.base-ref }}
         PROFILES: ${{ inputs.profiles }}
+        IMPACT_MODE: ${{ inputs.impact-mode }}
         MAX_FILES: ${{ inputs.max-files }}
         MAX_NODES: ${{ inputs.max-nodes }}
         MAX_EDGES: ${{ inputs.max-edges }}

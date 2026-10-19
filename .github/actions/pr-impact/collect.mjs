@@ -2,6 +2,11 @@
 // aggregated report. Pure helpers are exported for tests; the CLI entry point
 // at the bottom wires them to git, depgraph, and the environment.
 //
+// Two impact modes produce the same report shape. `per-file` runs
+// `depgraph impact path:<file>` once per changed file. `changed-set` runs
+// `depgraph impact --changed <merge-base>` once (depgraph 0.7.0 and later) and
+// splits its result back into per-file entries.
+//
 // No shell is involved: git and depgraph run through execFile with argument
 // arrays, and every value that reaches an argv slot is either validated or
 // attached to its flag (`--profile=<value>`) so it cannot become an option.
@@ -31,6 +36,24 @@ const MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 const BASE_REF_PATTERN = /^[0-9A-Za-z._/~^@{}-]+$/;
 const ATTEMPT_ID_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._:-]*$/;
 const KIND_ORDER = { route: 0, package_instance: 1 };
+const OBJECT_ID_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+export const IMPACT_MODE_PER_FILE = "per-file";
+export const IMPACT_MODE_CHANGED_SET = "changed-set";
+const IMPACT_MODES = [IMPACT_MODE_PER_FILE, IMPACT_MODE_CHANGED_SET];
+// `data.mode` of a selector-less `impact --changed` result (depgraph-core
+// `CHANGED_SET_IMPACT_MODE`).
+const CHANGED_SET_DATA_MODE = "changed_set";
+// The changed-set result lists unmapped paths in `unmapped[]` and repeats each
+// one as this diagnostic; the per-file status already says it.
+const CHANGED_PATH_UNMAPPED_DIAGNOSTIC = "changed_path_unmapped";
+// clap's usage line marks an optional positional as `[SELECTOR]` and a
+// required one as `<SELECTOR>`; only a CLI with the optional form accepts
+// `impact --changed <ref>` without a selector. The version number is not used:
+// a build from main reports the last released version.
+const OPTIONAL_SELECTOR_USAGE = /^Usage:.*\bimpact\b.*\[SELECTOR\]/m;
+// What an older CLI prints when the selector is missing anyway.
+const SELECTOR_REQUIRED_PATTERN = /required arguments were not provided[\s\S]*<SELECTOR>/;
 
 /** Parse `git diff --name-status -z` output. Rename and copy records carry two paths. */
 export function parseNameStatusZ(raw) {
@@ -72,6 +95,29 @@ export function buildImpactArgs({ store, path, selector, profiles = [], maxNodes
   if (maxNodes !== undefined) args.push(`--max-nodes=${maxNodes}`);
   if (maxEdges !== undefined) args.push(`--max-edges=${maxEdges}`);
   return args;
+}
+
+/** Arguments of the single changed-set call; the ref is a validated object id. */
+export function buildChangedSetImpactArgs({ store, changedRef, profiles = [], maxNodes, maxEdges }) {
+  if (typeof changedRef !== "string" || !OBJECT_ID_PATTERN.test(changedRef)) {
+    throw new Error(`changed-set ref is not an object id: ${JSON.stringify(changedRef)}`);
+  }
+  const args = ["--store", store, "impact", `--changed=${changedRef}`, "--json"];
+  for (const profile of profiles) args.push(`--profile=${profile}`);
+  if (maxNodes !== undefined) args.push(`--max-nodes=${maxNodes}`);
+  if (maxEdges !== undefined) args.push(`--max-edges=${maxEdges}`);
+  return args;
+}
+
+export function parseImpactMode(raw) {
+  const mode = String(raw ?? "").trim() || IMPACT_MODE_PER_FILE;
+  if (!IMPACT_MODES.includes(mode)) throw new Error(`impact-mode must be one of ${IMPACT_MODES.join(", ")}`);
+  return mode;
+}
+
+/** Whether `depgraph impact --help` shows that the selector may be omitted. */
+export function supportsChangedSetImpact({ exitCode, stdout }) {
+  return exitCode === 0 && OPTIONAL_SELECTOR_USAGE.test(String(stdout ?? ""));
 }
 
 function firstLine(text) {
@@ -146,6 +192,78 @@ export function ambiguousCandidateId(stderr, path) {
   return undefined;
 }
 
+/** Turn the single changed-set `depgraph impact` process result into ok / error. */
+export function classifyChangedSetResult({ exitCode, stdout, stderr }) {
+  if (exitCode !== 0) {
+    return { status: "error", exitCode, message: messageHead(stderr) || messageHead(stdout) || `exit ${exitCode}` };
+  }
+  let envelope;
+  try {
+    envelope = JSON.parse(stdout);
+  } catch {
+    return { status: "error", exitCode, message: "impact output is not valid JSON" };
+  }
+  const data = envelope?.data;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    data.mode !== CHANGED_SET_DATA_MODE ||
+    !Array.isArray(data.impacts) ||
+    !Array.isArray(data.mappings) ||
+    !Array.isArray(data.unmapped)
+  ) {
+    return { status: "error", exitCode, message: "impact JSON envelope is not a changed_set result" };
+  }
+  return { status: "ok", data };
+}
+
+/**
+ * Split one changed-set result into the per-file results `aggregateReport`
+ * folds, so both modes produce the same report.
+ *
+ * A file is `ok` when depgraph mapped it to at least one node, and `unmapped`
+ * when its only mappings have none. Each impacted node (depth > 0) is credited
+ * to every changed file in its `changed_paths`, with the depth and path depgraph
+ * already reduced to the nearest change. Depth-0 nodes are the changed nodes
+ * themselves and are left out, as `per-file` leaves out its root. A file the
+ * result does not mention at all is an `error`: the two diffs disagree, and the
+ * report must not claim that file has no impact.
+ */
+export function changedSetFiles(entries, data) {
+  const mapped = new Map();
+  for (const mapping of data.mappings) {
+    const path = mapping?.change?.new_path ?? mapping?.change?.old_path;
+    if (typeof path !== "string") continue;
+    const nodes = Array.isArray(mapping.correlated_node_ids) ? mapping.correlated_node_ids.length : 0;
+    mapped.set(path, (mapped.get(path) ?? 0) + nodes);
+  }
+  const impactsByPath = new Map();
+  for (const item of data.impacts) {
+    if (!(item.depth > 0)) continue;
+    const impact = { node: item.node, depth: item.depth, changed_node_id: item.changed_node_id, dependency_path: item.dependency_path ?? [] };
+    for (const path of item.changed_paths ?? []) {
+      if (!impactsByPath.has(path)) impactsByPath.set(path, []);
+      impactsByPath.get(path).push(impact);
+    }
+  }
+  return entries.map((entry) => {
+    if (entry.change === "D") return { ...entry, result: { status: "deleted" } };
+    const nodes = mapped.get(entry.path);
+    if (nodes === undefined) {
+      return { ...entry, result: { status: "error", exitCode: 0, message: "changed-set impact did not report this path" } };
+    }
+    if (nodes === 0) return { ...entry, result: { status: "unmapped", exitCode: 0, message: "no graph node for this path" } };
+    const impacts = impactsByPath.get(entry.path) ?? [];
+    return { ...entry, result: { status: "ok", data: { complete: data.complete !== false, impacts, diagnostics: [] } } };
+  });
+}
+
+function changedSetDiagnostics(data) {
+  return (Array.isArray(data.diagnostics) ? data.diagnostics : [])
+    .filter((diagnostic) => diagnostic?.code !== CHANGED_PATH_UNMAPPED_DIAGNOSTIC)
+    .map((diagnostic) => ({ code: diagnostic.code, message: diagnostic.message }));
+}
+
 function isCloser(candidate, current) {
   if (candidate.depth !== current.depth) return candidate.depth < current.depth;
   return candidate.dependency_path.length < current.dependency_path.length;
@@ -172,10 +290,12 @@ export function aggregateReport({
   scan,
   files,
   skipped = [],
+  diagnostics: reportDiagnostics = [],
+  impactMode,
 }) {
   const impacted = new Map();
   const changedFiles = [];
-  const diagnostics = [];
+  const diagnostics = [...reportDiagnostics];
   let incomplete = scan.partial === true;
 
   for (const file of files) {
@@ -237,7 +357,7 @@ export function aggregateReport({
   if (scan.message) scanReport.message = scan.message;
   if (scanReport.status === "failed") incomplete = true;
 
-  return {
+  const report = {
     schema_version: REPORT_SCHEMA_VERSION,
     depgraph_version: depgraphVersion,
     base_sha: baseSha,
@@ -258,6 +378,8 @@ export function aggregateReport({
     diagnostics,
     impacted: impactedList,
   };
+  if (impactMode) report.impact_mode = impactMode;
+  return report;
 }
 
 function scanStatus(scan) {
@@ -308,44 +430,28 @@ async function resolveHistory(runGit, args, what) {
   }
 }
 
-/** Run the whole collection against injectable git and depgraph runners. */
-export async function collectReport({
-  baseRef,
-  headRef = "HEAD",
-  store,
-  profiles = [],
-  maxFiles,
-  maxNodes,
-  maxEdges,
-  scanExitCode,
-  scanOutput,
-  scanMessage,
-  strict = false,
-  depgraphVersion,
-  runGit,
-  runDepgraph,
-}) {
-  if (typeof baseRef !== "string" || !BASE_REF_PATTERN.test(baseRef) || baseRef.startsWith("-")) {
-    throw new Error(`base ref is not a plain revision: ${JSON.stringify(baseRef)}`);
+/**
+ * The impact mode this run can use. `changed-set` falls back to `per-file`
+ * with a reason when depgraph cannot answer it: the scan is only readable as an
+ * `attempt:` (a changed-set query needs the current completed snapshot), or the
+ * CLI predates the selector-less `impact --changed`.
+ */
+async function resolveImpactMode(requested, { attemptId, runDepgraph }) {
+  if (requested !== IMPACT_MODE_CHANGED_SET) return { requested, used: requested };
+  if (attemptId !== undefined) {
+    return {
+      requested,
+      used: IMPACT_MODE_PER_FILE,
+      fallback_reason: "the scan is only readable as attempt:<scan_id>, which impact --changed does not accept",
+    };
   }
-  const fileLimit = positiveInteger("max-files", maxFiles) ?? 200;
-  const nodeLimit = positiveInteger("max-nodes", maxNodes, MAX_TRAVERSAL_LIMIT);
-  const edgeLimit = positiveInteger("max-edges", maxEdges, MAX_TRAVERSAL_LIMIT);
+  if (!supportsChangedSetImpact(await runDepgraph(["impact", "--help"]))) {
+    return { requested, used: IMPACT_MODE_PER_FILE, fallback_reason: "this depgraph does not support impact --changed without a selector" };
+  }
+  return { requested, used: requested };
+}
 
-  const baseSha = await resolveHistory(runGit, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], `cannot resolve base ref ${baseRef}`);
-  const headSha = (await runGit(["rev-parse", "--verify", "--quiet", headRef])).trim();
-  const mergeBase = await resolveHistory(runGit, ["merge-base", baseSha, headSha], `cannot find a merge-base between base ref ${baseRef} and ${headRef}`);
-  const pathPrefix = (await runGit(["rev-parse", "--show-prefix"])).trim();
-  const diff = await runGit(["diff", "--name-status", "-z", "--find-renames", "--relative", mergeBase, headSha, "--"]);
-  const entries = parseNameStatusZ(diff);
-
-  const attemptId = scanAttemptId(scanExitCode, scanOutput);
-  const message = scanMessage ?? (scanOutput && typeof scanOutput.error === "string" ? messageHead(shortenAbsolutePaths(scanOutput.error)) : undefined);
-  const scan = { exitCode: scanExitCode, partial: attemptId !== undefined && scanExitCode === SCAN_EXIT_WORKER_FAILURE, message };
-  // A non-zero scan leaves only an attempt behind; without its id an impact
-  // query cannot read what this scan produced, so it must not be issued.
-  const canQuery = scanExitCode === SCAN_EXIT_OK || attemptId !== undefined;
-
+async function collectPerFile(entries, { canQuery, fileLimit, options, runDepgraph }) {
   const files = [];
   const skipped = [];
   let queried = 0;
@@ -363,12 +469,87 @@ export async function collectReport({
       continue;
     }
     queried += 1;
-    const options = { store, profiles, maxNodes: nodeLimit, maxEdges: edgeLimit, attemptId };
     let processResult = await runDepgraph(buildImpactArgs({ ...options, path: entry.path }));
     const candidate = processResult.exitCode === IMPACT_EXIT_INPUT ? ambiguousCandidateId(processResult.stderr, entry.path) : undefined;
     if (candidate) processResult = await runDepgraph(buildImpactArgs({ ...options, selector: `id:${candidate}` }));
     files.push({ ...entry, result: classifyImpactResult(processResult, { path: entry.path }) });
   }
+  return { files, skipped, diagnostics: [] };
+}
+
+// One call covers every changed file, so max-files does not apply. A failed
+// call (exit 2 for a HEAD mismatch, exit 3 for an exceeded bound) leaves every
+// surviving file as an error rather than as having no impact.
+async function collectChangedSet(entries, { mergeBase, options, runDepgraph }) {
+  const processResult = await runDepgraph(buildChangedSetImpactArgs({ ...options, changedRef: mergeBase }));
+  if (processResult.exitCode === IMPACT_EXIT_INPUT && SELECTOR_REQUIRED_PATTERN.test(String(processResult.stderr ?? ""))) {
+    return { unsupported: true };
+  }
+  const result = classifyChangedSetResult(processResult);
+  if (result.status !== "ok") {
+    const files = entries.map((entry) => ({ ...entry, result: entry.change === "D" ? { status: "deleted" } : result }));
+    return { files, skipped: [], diagnostics: [] };
+  }
+  return { files: changedSetFiles(entries, result.data), skipped: [], diagnostics: changedSetDiagnostics(result.data) };
+}
+
+/** Run the whole collection against injectable git and depgraph runners. */
+export async function collectReport({
+  baseRef,
+  headRef = "HEAD",
+  store,
+  profiles = [],
+  impactMode,
+  maxFiles,
+  maxNodes,
+  maxEdges,
+  scanExitCode,
+  scanOutput,
+  scanMessage,
+  strict = false,
+  depgraphVersion,
+  runGit,
+  runDepgraph,
+  onWarning = () => {},
+}) {
+  if (typeof baseRef !== "string" || !BASE_REF_PATTERN.test(baseRef) || baseRef.startsWith("-")) {
+    throw new Error(`base ref is not a plain revision: ${JSON.stringify(baseRef)}`);
+  }
+  const requestedMode = parseImpactMode(impactMode);
+  const fileLimit = positiveInteger("max-files", maxFiles) ?? 200;
+  const nodeLimit = positiveInteger("max-nodes", maxNodes, MAX_TRAVERSAL_LIMIT);
+  const edgeLimit = positiveInteger("max-edges", maxEdges, MAX_TRAVERSAL_LIMIT);
+
+  const baseSha = await resolveHistory(runGit, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], `cannot resolve base ref ${baseRef}`);
+  const headSha = (await runGit(["rev-parse", "--verify", "--quiet", headRef])).trim();
+  const mergeBase = await resolveHistory(runGit, ["merge-base", baseSha, headSha], `cannot find a merge-base between base ref ${baseRef} and ${headRef}`);
+  const pathPrefix = (await runGit(["rev-parse", "--show-prefix"])).trim();
+  const diff = await runGit(["diff", "--name-status", "-z", "--find-renames", "--relative", mergeBase, headSha, "--"]);
+  const entries = parseNameStatusZ(diff);
+
+  const attemptId = scanAttemptId(scanExitCode, scanOutput);
+  const message = scanMessage ?? (scanOutput && typeof scanOutput.error === "string" ? messageHead(shortenAbsolutePaths(scanOutput.error)) : undefined);
+  const scan = { exitCode: scanExitCode, partial: attemptId !== undefined && scanExitCode === SCAN_EXIT_WORKER_FAILURE, message };
+  // A non-zero scan leaves only an attempt behind; without its id an impact
+  // query cannot read what this scan produced, so it must not be issued.
+  const canQuery = scanExitCode === SCAN_EXIT_OK || attemptId !== undefined;
+  const options = { store, profiles, maxNodes: nodeLimit, maxEdges: edgeLimit, attemptId };
+
+  const fallBack = (mode) => {
+    onWarning(`impact-mode ${mode.requested} falls back to ${mode.used}: ${mode.fallback_reason}`);
+    return mode;
+  };
+  let mode = canQuery ? await resolveImpactMode(requestedMode, { attemptId, runDepgraph }) : { requested: requestedMode, used: requestedMode };
+  if (mode.fallback_reason) fallBack(mode);
+  let collected;
+  if (canQuery && mode.used === IMPACT_MODE_CHANGED_SET) {
+    collected = await collectChangedSet(entries, { mergeBase, options, runDepgraph });
+    if (collected.unsupported) {
+      mode = fallBack({ requested: requestedMode, used: IMPACT_MODE_PER_FILE, fallback_reason: "this depgraph requires a selector for impact" });
+      collected = undefined;
+    }
+  }
+  collected ??= await collectPerFile(entries, { canQuery, fileLimit, options, runDepgraph });
 
   return aggregateReport({
     baseSha,
@@ -378,8 +559,10 @@ export async function collectReport({
     depgraphVersion,
     strict,
     scan,
-    files,
-    skipped,
+    files: collected.files,
+    skipped: collected.skipped,
+    diagnostics: collected.diagnostics,
+    impactMode: mode,
   });
 }
 
@@ -428,6 +611,7 @@ async function main() {
     baseRef: env.BASE_REF,
     store: env.DEPGRAPH_STORE,
     profiles: parseProfiles(env.PROFILES),
+    impactMode: env.IMPACT_MODE,
     maxFiles: env.MAX_FILES,
     maxNodes: env.MAX_NODES,
     maxEdges: env.MAX_EDGES,
@@ -437,13 +621,14 @@ async function main() {
     depgraphVersion: env.DEPGRAPH_VERSION ?? "unknown",
     runGit,
     runDepgraph,
+    onWarning: (text) => console.log(`::warning::${text}`),
   });
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   if (env.GITHUB_OUTPUT) {
     appendFileSync(env.GITHUB_OUTPUT, `impacted-count=${report.totals.impacted}\nscan-status=${report.scan.status}\n`);
   }
   console.log(
-    `depgraph pr-impact: ${report.totals.changed} changed file(s), ${report.totals.impacted} impacted node(s), scan ${report.scan.status}`,
+    `depgraph pr-impact: ${report.totals.changed} changed file(s), ${report.totals.impacted} impacted node(s), scan ${report.scan.status}, impact-mode ${report.impact_mode.used}`,
   );
 }
 
