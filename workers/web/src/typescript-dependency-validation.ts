@@ -1111,7 +1111,9 @@ function jsDocBindingSyntaxCorrelates(
   const tokens = jsDocImportTagTokens(site, sourceText);
   if (tokens === null) return false;
   const evidenceIndex = tokens.findIndex((token) => (
-    token.startOffset === site.evidence.startOffset && token.endOffset === site.evidence.endOffset
+    token.startOffset === site.evidence.startOffset
+    && token.endOffset === site.evidence.endOffset
+    && localNameMatchesBinding(site, token)
   ));
   if (evidenceIndex < 0) return false;
   const fromIndex = tokens.findIndex((token, indexValue) => (
@@ -1151,6 +1153,11 @@ function jsDocBindingSyntaxCorrelates(
     && syntaxResolutionModeMatches(site, staticResolutionMode(tokens, moduleIndex, true));
 }
 
+/** A direct binding's evidence span is the bound identifier, so a local name must be its text. */
+function localNameMatchesBinding(site: TypeScriptRawDependencySite, binding: DependencyValidationToken): boolean {
+  return site.localName === null || site.localName === binding.value;
+}
+
 function directBindingSyntaxCorrelates(
   site: TypeScriptRawDependencySite,
   sourceText: string,
@@ -1160,6 +1167,7 @@ function directBindingSyntaxCorrelates(
     token.startOffset === site.evidence.startOffset && token.endOffset === site.evidence.endOffset
   ));
   if (evidenceIndex < 0) return jsDocBindingSyntaxCorrelates(site, sourceText);
+  if (!localNameMatchesBinding(site, tokens[evidenceIndex]!)) return false;
   for (let importIndex = evidenceIndex - 1; importIndex >= 0; importIndex -= 1) {
     if (tokens[importIndex]?.kind !== SyntaxKind.ImportKeyword) continue;
     const clauseTypeOnly = typeOnlyImportClause(tokens, importIndex);

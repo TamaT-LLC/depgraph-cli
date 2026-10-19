@@ -1031,6 +1031,11 @@ test("validateTypeScriptRawDependencyDelta accepts the extracted delta and rejec
     site.moduleSpecifier = "./other";
   }, /raw dependency direct binding syntax does not correlate/u);
   reject((delta) => {
+    const site = delta.sites.find((candidate) => candidate.kind === "web_import");
+    assert.ok(site?.localName);
+    site.localName = "other";
+  }, /raw dependency direct binding syntax does not correlate/u);
+  reject((delta) => {
     const site = delta.sites.find((candidate) => candidate.kind === "web_reexport");
     assert.ok(site);
     site.importedName = "missing";
