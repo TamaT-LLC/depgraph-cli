@@ -148,8 +148,10 @@ impl ImportEvidence {
 ///
 /// TypeScript semantic evidence is recognised by `occurrence_kind`, Rust HIR
 /// evidence by `target_specifier`. Otherwise an import-like `site` lends its
-/// specifier (Go and TypeScript syntax-only sites). Values that exceed the
-/// bounds, contain control characters, or look like credentials are omitted.
+/// specifier (Go and TypeScript syntax-only sites), and the evidence may name
+/// the binding: a Go alias as `local_name`, a Go dot import as `glob`. Values
+/// that exceed the bounds, contain control characters, or look like
+/// credentials are omitted.
 #[must_use]
 pub fn project_import_evidence(
     properties: &Value,
@@ -161,7 +163,7 @@ pub fn project_import_evidence(
     if let Some(target) = properties.get("target_specifier") {
         return project_rust(properties, target);
     }
-    project_site_only(site?)
+    project_site_only(properties, site?)
 }
 
 fn project_typescript(
@@ -178,7 +180,7 @@ fn project_typescript(
         specifier,
         Some(binding_kind),
         properties.get("imported_name").and_then(Value::as_str),
-        None,
+        properties.get("local_name").and_then(Value::as_str),
         properties.get("type_only").and_then(Value::as_bool) == Some(true),
     )
 }
@@ -212,7 +214,7 @@ fn project_rust(properties: &Value, target: &Value) -> Option<ImportEvidence> {
     )
 }
 
-fn project_site_only(site: ImportSiteHint<'_>) -> Option<ImportEvidence> {
+fn project_site_only(properties: &Value, site: ImportSiteHint<'_>) -> Option<ImportEvidence> {
     // Only syntax-level import site kinds whose specifier is the literal module
     // string qualify. Semantic site kinds always carry evidence properties, and
     // e.g. `rust_use` specifiers embed the alias rather than the target path.
@@ -227,7 +229,22 @@ fn project_site_only(site: ImportSiteHint<'_>) -> Option<ImportEvidence> {
         "type_reexport" => (Some(ImportBindingKind::Reexport), true),
         _ => return None,
     };
-    ImportEvidence::build(site.specifier, binding_kind, None, None, type_only)
+    // A Go dot import (`import . "pkg"`) binds every exported name and no local
+    // name, like a Rust glob `use`. Side-effect imports bind nothing.
+    if site.kind == "import" && properties.get("glob").and_then(Value::as_bool) == Some(true) {
+        return ImportEvidence::build(
+            site.specifier,
+            Some(ImportBindingKind::Glob),
+            None,
+            None,
+            false,
+        );
+    }
+    let local_name = match binding_kind {
+        Some(ImportBindingKind::SideEffect) => None,
+        _ => properties.get("local_name").and_then(Value::as_str),
+    };
+    ImportEvidence::build(site.specifier, binding_kind, None, local_name, type_only)
 }
 
 /// Whether `value` may be disclosed as an import specifier: non-empty, at most

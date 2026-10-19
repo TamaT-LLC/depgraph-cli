@@ -757,6 +757,7 @@ test("extractTypeScriptRawDependencyDelta pins the raw delta and stays determini
       specifier: "Holder",
       moduleSpecifier: null,
       importedName: "Holder",
+      localName: null,
       exportPath: null,
       resolutionMode: null,
       resolutionModeProof: null,
@@ -785,6 +786,7 @@ test("extractTypeScriptRawDependencyDelta pins the raw delta and stays determini
       specifier: "Value",
       moduleSpecifier: "./defs",
       importedName: "Value",
+      localName: null,
       exportPath: ["Value"],
       resolutionMode: null,
       resolutionModeProof: null,
@@ -821,6 +823,7 @@ test("extractTypeScriptRawDependencyDelta pins the raw delta and stays determini
       specifier: "./defs",
       moduleSpecifier: "./defs",
       importedName: "Value",
+      localName: "Value",
       exportPath: ["Value"],
       resolutionMode: null,
       resolutionModeProof: null,
@@ -849,6 +852,7 @@ test("extractTypeScriptRawDependencyDelta pins the raw delta and stays determini
       specifier: "./defs",
       moduleSpecifier: "./defs",
       importedName: "named",
+      localName: "named",
       exportPath: ["named"],
       resolutionMode: null,
       resolutionModeProof: null,
@@ -877,6 +881,7 @@ test("extractTypeScriptRawDependencyDelta pins the raw delta and stays determini
       specifier: "./defs",
       moduleSpecifier: "./defs",
       importedName: "named",
+      localName: null,
       exportPath: ["named"],
       resolutionMode: null,
       resolutionModeProof: null,
@@ -1024,6 +1029,11 @@ test("validateTypeScriptRawDependencyDelta accepts the extracted delta and rejec
     const site = delta.sites.find((candidate) => candidate.kind === "web_import");
     assert.ok(site);
     site.moduleSpecifier = "./other";
+  }, /raw dependency direct binding syntax does not correlate/u);
+  reject((delta) => {
+    const site = delta.sites.find((candidate) => candidate.kind === "web_import");
+    assert.ok(site?.localName);
+    site.localName = "other";
   }, /raw dependency direct binding syntax does not correlate/u);
   reject((delta) => {
     const site = delta.sites.find((candidate) => candidate.kind === "web_reexport");

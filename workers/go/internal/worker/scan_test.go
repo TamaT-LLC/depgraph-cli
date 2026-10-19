@@ -307,6 +307,51 @@ func TestSiblingModulesRequireGoWorkOrLocalReplaceForResolution(t *testing.T) {
 	}
 }
 
+func TestImportEvidenceRecordsExplicitImportNames(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/app\n\ngo 1.26.1\n")
+	writeTestFile(t, filepath.Join(root, "util", "util.go"), "package util\n")
+	writeTestFile(t, filepath.Join(root, "main.go"), `package app
+
+import (
+	utilpkg "example.com/app/util"
+	. "example.net/dot/pkg"
+	_ "example.net/blank/pkg"
+	"strings"
+	legacy "./legacy"
+)
+`)
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	tests := []struct {
+		kind, specifier string
+		want            map[string]any
+	}{
+		{kind: "import", specifier: "example.com/app/util", want: map[string]any{"local_name": "utilpkg"}},
+		{kind: "import", specifier: "example.net/dot/pkg", want: map[string]any{"glob": true}},
+		{kind: "side_effect_import", specifier: "example.net/blank/pkg", want: map[string]any{}},
+		{kind: "import", specifier: "strings", want: map[string]any{}},
+		{kind: "import", specifier: "./legacy", want: map[string]any{"local_name": "legacy"}},
+	}
+	for _, test := range tests {
+		site := findSite(result.Sites, test.kind, test.specifier)
+		if site == nil || len(site.Evidence) != 1 {
+			t.Fatalf("%s %s site is missing: %+v", test.kind, test.specifier, site)
+		}
+		if !reflect.DeepEqual(site.Evidence[0].Properties, test.want) {
+			t.Fatalf("%s site evidence properties = %#v, want %#v", test.specifier, site.Evidence[0].Properties, test.want)
+		}
+		for _, edge := range result.Edges {
+			if edge.SiteID == site.ID && !reflect.DeepEqual(edge.Evidence[0].Properties, test.want) {
+				t.Fatalf("%s edge evidence properties = %#v, want %#v", test.specifier, edge.Evidence[0].Properties, test.want)
+			}
+		}
+	}
+}
+
 func TestRemoteReplacementUsesResolvedPackageLocator(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "go.mod"), `module example.com/app

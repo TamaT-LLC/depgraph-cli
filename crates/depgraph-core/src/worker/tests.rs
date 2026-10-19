@@ -4892,6 +4892,26 @@ fn web_import_type_gate_rejects_mismatched_capability_and_strict_site_contract()
         "binding metadata does not match occurrence_kind",
     ));
 
+    let mut local_name_on_reexport = baseline.clone();
+    mutate_semantic_primary_properties(&mut local_name_on_reexport, "web_reexport", |properties| {
+        properties["local_name"] = serde_json::json!("Target");
+    });
+    cases.push((
+        "local name on re-export",
+        local_name_on_reexport,
+        "binding metadata does not match occurrence_kind",
+    ));
+
+    let mut empty_local_name = baseline.clone();
+    mutate_semantic_primary_properties(&mut empty_local_name, "web_import", |properties| {
+        properties["local_name"] = serde_json::json!("");
+    });
+    cases.push((
+        "empty local name",
+        empty_local_name,
+        "invalid local_name metadata",
+    ));
+
     let mut mismatched_protocol_specifier = baseline.clone();
     mutate_semantic_primary_properties(
         &mut mismatched_protocol_specifier,

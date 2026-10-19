@@ -8519,10 +8519,11 @@ fn seed_issue_544_store(path: &Path, root: &Path) -> String {
             "type_only": false,
             "module_specifier": "@/lib/foo",
             "imported_name": "fooHelper",
+            "local_name": "helper",
             "secret": "PROCESS_544_PROPERTY_SECRET"
         }),
     );
-    let go = issue_544_evidence("main.go", 3, "source", json!({}));
+    let go = issue_544_evidence("main.go", 3, "source", json!({"local_name": "utilpkg"}));
     for (offset, (site_id, edge_id, source, target, kind, specifier, evidence)) in [
         (
             "site:ts",
@@ -8623,7 +8624,7 @@ fn issue_544_import_evidence_is_listed_by_agent_tools_but_not_dependency_lists()
     let item = &typescript["structuredContent"]["result"]["items"][0];
     assert_eq!(
         item["import"],
-        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper"})
+        json!({"specifier":"@/lib/foo","binding_kind":"named","imported_name":"fooHelper","local_name":"helper"})
     );
     assert!(item.get("properties").is_none());
     assert!(item.get("detail").is_none());
@@ -8637,7 +8638,7 @@ fn issue_544_import_evidence_is_listed_by_agent_tools_but_not_dependency_lists()
     assert_eq!(go["isError"], false, "{go}");
     assert_eq!(
         go["structuredContent"]["result"]["items"][0]["import"],
-        json!({"specifier":"example.com/pkg/util"})
+        json!({"specifier":"example.com/pkg/util","local_name":"utilpkg"})
     );
 
     let sites = interactive_tool_call(

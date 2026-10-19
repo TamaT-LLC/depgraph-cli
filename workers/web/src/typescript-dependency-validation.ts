@@ -47,6 +47,7 @@ import {
   MAX_EXPORTS_PER_MODULE,
   MAX_MODULE_EXPORT_BINDINGS,
   MAX_SITES,
+  MAX_BINDING_NAME_CHARS,
   MAX_SPECIFIER_CHARS,
   nodeEnd,
   nodeSpan,
@@ -860,6 +861,13 @@ interface SyntaxResolutionMode {
   error: string | null;
 }
 
+/** Occurrences whose anchor is the identifier the import declaration binds. */
+const DIRECT_IMPORT_BINDING_OCCURRENCES: ReadonlySet<string> = new Set([
+  "default_import",
+  "named_import",
+  "namespace_import",
+  "import_equals",
+]);
 const NO_SYNTAX_RESOLUTION_MODE: SyntaxResolutionMode = Object.freeze({ mode: null, proof: null, error: null });
 const RESOLUTION_MODE_ERRORS: ReadonlySet<string> = new Set([
   "duplicate_resolution_mode",
@@ -1104,7 +1112,9 @@ function jsDocBindingSyntaxCorrelates(
   const tokens = jsDocImportTagTokens(site, sourceText);
   if (tokens === null) return false;
   const evidenceIndex = tokens.findIndex((token) => (
-    token.startOffset === site.evidence.startOffset && token.endOffset === site.evidence.endOffset
+    token.startOffset === site.evidence.startOffset
+    && token.endOffset === site.evidence.endOffset
+    && localNameMatchesBinding(site, token)
   ));
   if (evidenceIndex < 0) return false;
   const fromIndex = tokens.findIndex((token, indexValue) => (
@@ -1144,6 +1154,11 @@ function jsDocBindingSyntaxCorrelates(
     && syntaxResolutionModeMatches(site, staticResolutionMode(tokens, moduleIndex, true));
 }
 
+/** A direct binding's evidence span is the bound identifier, so a local name must be its text. */
+function localNameMatchesBinding(site: TypeScriptRawDependencySite, binding: DependencyValidationToken): boolean {
+  return site.localName === null || site.localName === binding.value;
+}
+
 function directBindingSyntaxCorrelates(
   site: TypeScriptRawDependencySite,
   sourceText: string,
@@ -1153,6 +1168,7 @@ function directBindingSyntaxCorrelates(
     token.startOffset === site.evidence.startOffset && token.endOffset === site.evidence.endOffset
   ));
   if (evidenceIndex < 0) return jsDocBindingSyntaxCorrelates(site, sourceText);
+  if (!localNameMatchesBinding(site, tokens[evidenceIndex]!)) return false;
   for (let importIndex = evidenceIndex - 1; importIndex >= 0; importIndex -= 1) {
     if (tokens[importIndex]?.kind !== SyntaxKind.ImportKeyword) continue;
     const clauseTypeOnly = typeOnlyImportClause(tokens, importIndex);
@@ -2645,6 +2661,14 @@ function validateTypeScriptDependencySites(
         || (site.importedName.length === 0 && !emptyModuleExportName)
         || site.importedName.length > 512
         || hasUnpairedSurrogate(site.importedName)
+      ))
+      || (site.localName !== null && (
+        typeof site.localName !== "string"
+        || site.localName.length === 0
+        || site.localName.length > MAX_BINDING_NAME_CHARS
+        || hasUnpairedSurrogate(site.localName)
+        || site.kind !== "web_import"
+        || !DIRECT_IMPORT_BINDING_OCCURRENCES.has(site.evidence.occurrenceKind)
       ))
     ) throw new DependencyContractError("raw dependency binding metadata is invalid");
     if (
