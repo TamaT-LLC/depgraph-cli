@@ -1179,7 +1179,11 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "operation_id" => scalar_schema::<OperationId>(),
         "idempotency_key" => scalar_schema::<IdempotencyKey>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
-        "selector" if tool_name == "graph_export" => scalar_schema::<AgentLocator>(),
+        // Export resolves its selector outside the graph traversal tools, so
+        // it does not promise their not-found and ambiguity details.
+        "selector" if matches!(tool_name, "graph_export" | "export_file") => {
+            scalar_schema::<AgentLocator>()
+        }
         "selector" => node_selector_schema(),
         "from" | "to" if matches!(tool_name, "snapshot_diff_get" | "policy_evaluate") => {
             snapshot_selector_schema()
@@ -1222,6 +1226,16 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})
+        }
+        // Cycle and unresolved listing count per-phase work and report a
+        // plain RESOURCE_EXHAUSTED without resource_limit details.
+        "max_traversal" if matches!(tool_name, "graph_cycles_list" | "graph_unresolved_list") => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Work bound of each preprocessing, traversal and finalization phase. A request that hits it returns RESOURCE_EXHAUSTED without error.details."
+            })
         }
         "max_traversal" => json!({
             "type": "integer",
