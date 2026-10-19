@@ -37,9 +37,9 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.6.4";
+const STABLE_RELEASE_VERSION: &str = "0.7.0";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
-const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.6";
+const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.7";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
 const AGENT_DOGFOOD_REPORT_PATH: &str =
     "fixtures/agent-dogfood-v1/evidence/v0.5.0-rc.7/report.json";
@@ -691,12 +691,15 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.6.3'",
         "V0_6_3_RELEASE_SOURCE_SHA: 21434e0e7a603d866f5fb677b087b9d193dae931",
         "historical_source_sha=\"$V0_6_3_RELEASE_SOURCE_SHA\"",
-        "STABLE_MAINTENANCE_REF: heads/release/0.6",
+        "github.event.workflow_run.head_branch == 'v0.6.4'",
+        "V0_6_4_RELEASE_SOURCE_SHA: 35c3edea133b7f5a0cd269edd945776d9db9e7f2",
+        "historical_source_sha=\"$V0_6_4_RELEASE_SOURCE_SHA\"",
+        "STABLE_MAINTENANCE_REF: heads/release/0.7",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
         "signed tag preserved for retry",
         "http_status\" == \"404\"",
-        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.6 baseline",
+        "$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.7 baseline",
     ] {
         if !source_guard.contains(required) {
             bail!(
