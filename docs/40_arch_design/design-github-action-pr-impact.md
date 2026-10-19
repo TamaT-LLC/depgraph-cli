@@ -147,7 +147,7 @@ per-file との違いは 2 つある。
 - per-file では、別の変更ファイルから届く変更ファイル（a.ts が変わり、a.ts に依存する b.ts も変わった場合の b.ts）が影響ノードに入る。changed-set ではそれは変更ノード自身（depth 0）なので入らない。変更ファイルはコメントの変更ファイル数とファイル一覧に出るので、情報は失われない。ファイルごとの `impacted_count` もその分だけ小さくなる。
 - changed-set は、ファイルノードだけでなく、パス、`manifest_path`、evidence でそのファイルに結びつくノードも始点にする（`path_node_index_cancellable`）。per-file の `path:` で対応ノードが無い `Cargo.toml` のようなファイルも、パッケージに結びつけば `ok` になる。逆に、変更ファイルに結びつくノードは depth 0 の始点になる。route と package_instance は上記のとおり depth 0 で残すが、それ以外の kind（workspace やシンボルなど）は影響ノードに入らない。
 
-計測（scratchpad の measurement.md。`workers/web` を scan ルートにした 31 ファイルの変更）では、両方式に共通する 35 ノードの depth と `reached_from` はすべて一致した。per-file だけにあった 26 ノードは、変更ファイル自身の 24 ノードと、`package.json` の変更で depth 0 になったパッケージと workspace だった。
+計測（3993c47 で `workers/web` を scan ルートにし、`3993c47~28..3993c47` の 31 ファイルの変更を両方式で集計）では、両方式に共通する 35 ノードの depth と `reached_from` はすべて一致した。per-file だけにあった 26 ノードは、変更ファイル自身の 24 ノードと、`package.json` の変更で depth 0 になったパッケージと workspace だった。
 
 #### changed-set を使えないときの振る舞い
 
@@ -404,6 +404,8 @@ CLI との結合は、Action の `version` 入力で CLI のバージョンを�
 - 小さな Next.js fixture では scan が 3 秒で exit 0 になり、ルート `next:app:page:/users/$id` を深さ 4 で検出した。
 - このリポジトリ自身では scan が 138 秒で exit 3 になった。Rust worker がメモリ上限 2GiB を超え、Go worker が testdata の fixture で `outside the local module closure` を出したためである。
 - collect は 1 ファイル約 1.5 秒で、34 ファイルに約 53 秒かかった。34 件中 28 件が unmapped だった。
+- 2026-10-19、main（3993c47）のビルドで再計測した（macOS、Apple Silicon）。リポジトリ全体の scan は exit 0 で約 173 秒。`b73a7c6..3993c47` の 33 ファイルで、per-file の collect は約 124 秒（1 ファイル約 3.8 秒）だった。changed-set は対応付けの上限超過で exit 3 になり、per-file に戻った。
+- `workers/web` を scan ルートにした 31 ファイルの変更では、collect は per-file 0.81 秒、changed-set 0.21 秒だった。
 
 ## `changed-set` への既定の切り替え手順
 
