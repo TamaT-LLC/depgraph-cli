@@ -1,0 +1,46 @@
+{
+  "version": "0.7.0",
+  "purpose": "Native output pins collected on an unmerged observation branch after semantic and cross-checkout determinism checks, before comparison with stale v0.6.4 hashes. This failed run is not release approval evidence. The observation-only CI matrix change is not part of the release source.",
+  "targets": [
+    {
+      "target": "aarch64-apple-darwin",
+      "query_plan_digest": "bounded-query-plan:sha256:e659dc0e778e1be962f492e3e1599b6f15ae795a39f4cf409ea45fde655d14a2",
+      "query_result_digest": "bounded-query-result:sha256:d50ef4108661c1b16b97fa0f0a48d503ba51103ff6fbe07cabe892fe4fe6d582",
+      "query_output_sha256": "ee97b06732abcc5309b5c13d0d1dc85b04a18d9bbf6b9c85c718c59f3dc5c9c4",
+      "profile_plan_digest": "profile-selection-plan:sha256:46c7395a8148b8f982d031ffe45831f149ef1499793e7c01feb34d3cac2a7bb8",
+      "profile_plan_output_sha256": "0b3c185484e068a80ccae3fd0405133612c9e37b5286e2c27fbfb226def2df03",
+      "source_commit": "1b0ac366a2986ce993c756413d17d28360abada4",
+      "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/39217541797/job/117944838973"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "query_plan_digest": "bounded-query-plan:sha256:b4b115436b29b920a014a15751ad1acdd690ffb355546b03023cc618bef3f7c0",
+      "query_result_digest": "bounded-query-result:sha256:a46978be9f2257fb711ab5488cb1d7531ebad96f6c9ac41ecc6c82b11cf9ebe7",
+      "query_output_sha256": "0bc6234eb457764083b9949b97f5c79a9bb59e59f33e68b55f6cc52e15aae2a0",
+      "profile_plan_digest": "profile-selection-plan:sha256:38aa97add0f9557442a5f4f3f6584f3df175c080c7b0dbd9364b0edf2a706626",
+      "profile_plan_output_sha256": "e5c917dd92c0f2412d340ee1648d6815f21f0440b03a2f867dfe3ef10872b7cf",
+      "source_commit": "1b0ac366a2986ce993c756413d17d28360abada4",
+      "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/39217541797/job/117944838999"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "query_plan_digest": "bounded-query-plan:sha256:cacad7d823f9e125187ed9b57c1c987bab63a8ce382e2c6aac8f16651b905b8b",
+      "query_result_digest": "bounded-query-result:sha256:3766a083a4efd5ebbf787bd360e1a2bfea40e3b34a0190f70b9b91c3fd91e6f1",
+      "query_output_sha256": "7cc0049f12664f0afa1d519909702b7b3b16cb37409f16849b43795ef9426964",
+      "profile_plan_digest": "profile-selection-plan:sha256:36e716f13d1bb95d71ffc6cf18da361e064c869c2dd56cb5e5069731f58c202c",
+      "profile_plan_output_sha256": "f2ab757f2eae7a448965782ecb5734b03d8a92ead2c023b16673088cd30684e2",
+      "source_commit": "1b0ac366a2986ce993c756413d17d28360abada4",
+      "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/39217541797/job/117944839648"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "query_plan_digest": "bounded-query-plan:sha256:ec1bf001701feb2a4a3c3f70aef1672c9bb912888eefa2801f57ec6283847ef2",
+      "query_result_digest": "bounded-query-result:sha256:b993ed35d0627d3b0396fd090542f1c6c5f11d64e9115e934b85645eb73cc998",
+      "query_output_sha256": "7fae48f3d609b55630e8c1a29059931c4f797812afedacb0d88977c8c480a665",
+      "profile_plan_digest": "profile-selection-plan:sha256:2a7a90eedb4a1971eb6841fae884407a638d2564a1bbaf75b7ac09e62b4e33ae",
+      "profile_plan_output_sha256": "a3d27041798a00cb8aaf0ff12e3e51a4c8758b5c577d4b92b99835cec97ff818",
+      "source_commit": "1b0ac366a2986ce993c756413d17d28360abada4",
+      "job_url": "https://github.com/TamaT-LLC/depgraph-cli/actions/runs/39217541797/job/117944838770"
+    }
+  ]
+}
