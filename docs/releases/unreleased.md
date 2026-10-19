@@ -25,6 +25,10 @@ MCP の `graph_dependencies_list` / `graph_dependents_list` と CLI の `depgrap
 - `health_hotspots_list` に `path_prefixes` と `node_kinds` の絞り込みを、CLI の `hotspots` に `--path-prefix` と `--node-kind` を追加する。score と finding ID は絞り込み前と変わらない（[#543](https://github.com/TamaT-LLC/depgraph-cli/issues/543)）。
 - MCP の `agent_evidence_list` / `agent_sites_list` / `agent_edges_list` が返す import 根拠に、任意フィールド `import` として import の specifier と取り込んだシンボル（`imported_name` / `local_name` など）を含める。依存一覧の `detail: "full"` は従来と同じ形のままで `import` を含まない（[#544](https://github.com/TamaT-LLC/depgraph-cli/issues/544)）。
 
+## 修正
+
+- セレクターなしの `depgraph impact --changed <GIT_REF>` で、変更パスの対応付けが、リポジトリ全体を scan した大きな Store では変更の大きさに関係なく前処理の上限に達し、resource limit（exit 3）で失敗していた問題を直す。変更パスの対応付けは変更パスの数と実際に一致した node / evidence の数だけを作業量として数え、無関係なレコードは上限に数えない。隣接表の構築など後続の前処理は、従来どおり同じ上限の対象になる。
+
 ## 互換性の注意
 
 v0.6.1 の `depgraph-mcp` を現在の Claude Code に登録すると、tools を取得できず `request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities` で失敗する。
