@@ -829,6 +829,19 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
 
+## Issue #565 error detail evidence
+
+Agentがエラー応答から原因を特定し、同じ呼び出しを条件を変えて繰り返さずに済むよう、`error.details`を拡張する。`depgraph-mcp-tools-v1`のまま、既存variantの既存fieldは変えず、任意fieldと新variantだけを追加する。
+
+| Area | Evidence |
+| --- | --- |
+| Resource limit | `resource_limit`へ任意field `observed`（止まった時点の処理量）と`argument`（上限を動かせるtool引数）を`skip_serializing_if`付きで追加する。両方がない値は変更前とbyte単位で同一。`AgentResourceLimit`へ`snapshot_edges`と`preprocessing_work_items`を追加する。core は`DepgraphServiceError::ResourceLimitExceeded { limit, maximum, observed }`を返し、依存一覧の`max_traversal`到達（`traversal_items`）、`graph_path_get`のadjacency構築で`max_traversal`を超えるsnapshot edge数（`snapshot_edges`、`observed`はsnapshotのedge数）、依存一覧の固定adjacency上限、selector解決と走査後処理の作業量上限を区別する。引数があり、上限値と`observed`が引数の最大値（1,000,000）以下なら`remediation`は`increase_limit`、それ以外は`narrow_query`。その他の`ResourceExhausted`は従来どおり`details`なし |
+| Argument | 新variant `{"kind":"argument","argument"?:<name>,"reason":...}`。`reason`はclosed enum `missing` / `unknown_argument` / `invalid_value` / `out_of_range` / `too_many_items` / `ambiguous_selector` / `no_matching_node`。typed decodeの失敗はserdeが名指しするmissing fieldと、取り除くとdecodeが通る（またはそのfieldがmissingになる）宣言済みfieldだけを名前として返す。スキーマにない引数は名前を返さない。`max_traversal`、`limit`、filter配列、health enum配列の検証も引数名を返す。引数名は`AgentToken`で検証し、外れた値は名前を省く |
+| Not found | coreのselector解決は`SelectorResolutionFailure`（no match / ambiguous）を型付きで返し、`dependencies` / `impact`は`selector`、`explain_path`は`from` / `to`を付ける。CLIの表示文言は変えない。MCPは一致なしを`NOT_FOUND` / `correct_input` / `no_matching_node`、複数一致を`INVALID_ARGUMENT` / `ambiguous_selector`へ写す。selectorの値は返さない |
+| Query diagnostic | 新variant `query_diagnostic`は`QueryDiagnostic`の`code` / `class` / `clause` / `token_class` / `line` / `column` / `byte_offset`だけを投影する。どれも文法の静的ラベルか位置で、query本文は返さない。`argument`は`query_file_*`コードなら`query_file`、それ以外は`query`。`graph_query`のdescriptionに文法、node field、file locator、例を載せる |
+| Confidentiality | `redact_public_value`の対象になるfield名（`query`、`*token`など）を使わない。selector、path、query、未知の引数名を応答へ反射しないことをprocess testで確認する |
+| Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。contract goldenは変化しない。schemaのclosed object数は205（`argument`と`query_diagnostic`のbranch） |
+
 ## Issue #543 hotspot result filter evidence
 
 `health_hotspots_list`の応答を必要な範囲に絞れるよう、次の境界を固定する。

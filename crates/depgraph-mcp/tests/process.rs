@@ -1867,6 +1867,238 @@ fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_ex
 }
 
 #[test]
+fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let error_of = |result: &Value| -> Value {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_tool_text_matches_structured(result);
+        shared.validate(&result["structuredContent"]).unwrap();
+        result["structuredContent"]["error"].clone()
+    };
+    let graph_arguments = |extra: Value| {
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "transitive": true,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        arguments
+    };
+
+    // (1) A traversal that hits max_traversal names the bound, the visits it
+    // made, and the argument that widens it.
+    let exhausted = error_of(&interactive_tool_call(
+        &mut mcp,
+        2,
+        "graph_dependencies_list",
+        graph_arguments(json!({"selector": "id:node:a", "max_traversal": 1})),
+    ));
+    assert_eq!(
+        exhausted,
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "traversal_items",
+                "maximum": 1,
+                "observed": 1,
+                "argument": "max_traversal"
+            }
+        })
+    );
+    // graph_path_get also bounds the snapshot edges it inspects by
+    // max_traversal and reports how many edges the snapshot holds.
+    let path_exhausted = error_of(&interactive_tool_call(
+        &mut mcp,
+        3,
+        "graph_path_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "from": "id:node:a",
+            "to": "id:node:d",
+            "max_traversal": 1
+        }),
+    ));
+    assert_eq!(path_exhausted["code"], "RESOURCE_EXHAUSTED");
+    assert_eq!(path_exhausted["remediation"], "increase_limit");
+    assert_eq!(path_exhausted["details"]["limit"], "snapshot_edges");
+    assert_eq!(path_exhausted["details"]["maximum"], 1);
+    assert_eq!(path_exhausted["details"]["argument"], "max_traversal");
+    assert!(path_exhausted["details"]["observed"].as_u64().unwrap() > 1);
+
+    // (2) INVALID_ARGUMENT names the schema-defined argument and the reason.
+    for (id, arguments, argument, reason) in [
+        (
+            4,
+            graph_arguments(json!({"selector": "id:node:a", "max_traversal": 0})),
+            Some("max_traversal"),
+            "out_of_range",
+        ),
+        (
+            5,
+            graph_arguments(json!({"selector": "id:node:a", "limit": 0})),
+            Some("limit"),
+            "out_of_range",
+        ),
+        (
+            6,
+            graph_arguments(json!({"selector": "id:node:a", "transitive": "yes"})),
+            Some("transitive"),
+            "invalid_value",
+        ),
+        (
+            7,
+            graph_arguments(json!({"selector": "id:node:a", "detail": "everything"})),
+            Some("detail"),
+            "invalid_value",
+        ),
+        (
+            8,
+            json!({"contract_version": "depgraph-mcp-tools-v1"}),
+            Some("selector"),
+            "missing",
+        ),
+        (
+            9,
+            graph_arguments(json!({"selector": "id:node:a", "PRIVATE_DETAIL_ARGUMENT": 1})),
+            None,
+            "unknown_argument",
+        ),
+    ] {
+        let error = error_of(&interactive_tool_call(
+            &mut mcp,
+            id,
+            "graph_dependents_list",
+            arguments,
+        ));
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+        assert_eq!(error["remediation"], "correct_input");
+        let mut expected = json!({"kind": "argument", "reason": reason});
+        if let Some(argument) = argument {
+            expected["argument"] = json!(argument);
+        }
+        assert_eq!(error["details"], expected, "request {id}");
+        assert!(!error.to_string().contains("PRIVATE_DETAIL"));
+    }
+
+    // (3) A selector that matches no node is NOT_FOUND, not INVALID_ARGUMENT,
+    // and the supplied path is never echoed.
+    let missing = error_of(&interactive_tool_call(
+        &mut mcp,
+        10,
+        "graph_dependents_list",
+        graph_arguments(json!({
+            "selector": "path:crates/PRIVATE_DETAIL/model.rs",
+            "detail": "paths",
+            "limit": 1
+        })),
+    ));
+    assert_eq!(
+        missing,
+        json!({
+            "code": "NOT_FOUND",
+            "category": "not_found",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {"kind": "argument", "argument": "selector", "reason": "no_matching_node"}
+        })
+    );
+    let missing_to = error_of(&interactive_tool_call(
+        &mut mcp,
+        11,
+        "graph_path_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": "baseline",
+            "from": "id:node:a",
+            "to": "id:node:PRIVATE_DETAIL"
+        }),
+    ));
+    assert_eq!(missing_to["code"], "NOT_FOUND");
+    assert_eq!(
+        missing_to["details"],
+        json!({"kind": "argument", "argument": "to", "reason": "no_matching_node"})
+    );
+
+    // (4) A rejected graph query locates the failure without echoing it.
+    for (id, query, code, clause, token_class, byte_offset) in [
+        (
+            12,
+            "help",
+            "query_keyword_expected",
+            "match",
+            "identifier",
+            0,
+        ),
+        (
+            13,
+            "dependents crates/depgraph-core/src/lib.rs",
+            "query_lex_invalid_character",
+            "lexer",
+            "invalid_character",
+            17,
+        ),
+        (
+            14,
+            r#"{"PRIVATE_DETAIL": true}"#,
+            "query_lex_invalid_character",
+            "lexer",
+            "invalid_character",
+            0,
+        ),
+        (
+            15,
+            r#"MATCH p = (source:"file")-["imports"*1..1]->(target:"file") RETURN source.id"#,
+            "query_keyword_expected",
+            "limit",
+            "end_of_input",
+            76,
+        ),
+    ] {
+        let error = error_of(&interactive_tool_call(
+            &mut mcp,
+            id,
+            "graph_query",
+            json!({"contract_version": "depgraph-mcp-tools-v1", "query": query}),
+        ));
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+        let details = &error["details"];
+        assert_eq!(details["kind"], "query_diagnostic", "{error}");
+        assert_eq!(details["argument"], "query");
+        assert_eq!(details["code"], code, "{query}");
+        assert_eq!(details["clause"], clause, "{query}");
+        assert_eq!(details["token_class"], token_class, "{query}");
+        assert_eq!(details["byte_offset"], byte_offset, "{query}");
+        assert_eq!(details["line"], 1);
+        assert_eq!(details["column"], byte_offset + 1);
+        let encoded = error.to_string();
+        assert!(!encoded.contains("PRIVATE_DETAIL"));
+        assert!(!encoded.contains("dependents"));
+    }
+
+    mcp.finish();
+    assert_eq!(store_invariant(&store_path), before);
+}
+
+#[test]
 fn issue_302_real_results_validate_against_advertised_and_shared_schemas() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");

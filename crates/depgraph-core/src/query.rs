@@ -32,7 +32,67 @@ type CanonicalAdjacency<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'a str), &'a
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph selector preprocessing exceeded its service bound")]
-struct SelectorPreprocessingExhausted;
+struct SelectorPreprocessingExhausted {
+    maximum: usize,
+}
+
+/// Why a selector could not be resolved to exactly one node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectorFailureKind {
+    /// No node matched the selector.
+    NoMatch,
+    /// More than one node matched the selector.
+    Ambiguous,
+}
+
+/// Selector failure classified from a graph query error chain (Issue #565).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectorFailure {
+    pub kind: SelectorFailureKind,
+    /// Request field that carried the selector, once the service entry point
+    /// tagged it (`selector`, `from`, or `to`).
+    pub argument: Option<&'static str>,
+}
+
+/// Typed selector resolution failure. Its message is the diagnostic the CLI
+/// has always printed, so classifying it does not change human output.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct SelectorResolutionFailure {
+    kind: SelectorFailureKind,
+    argument: Option<&'static str>,
+    message: String,
+}
+
+/// Classifies a graph query error as a selector resolution failure.
+#[must_use]
+pub fn selector_failure(error: &anyhow::Error) -> Option<SelectorFailure> {
+    error
+        .downcast_ref::<SelectorResolutionFailure>()
+        .map(|failure| SelectorFailure {
+            kind: failure.kind,
+            argument: failure.argument,
+        })
+}
+
+/// Records which request field carried the selector that failed to resolve.
+pub(crate) fn tag_selector_argument(
+    mut error: anyhow::Error,
+    argument: &'static str,
+) -> anyhow::Error {
+    if let Some(failure) = error.downcast_mut::<SelectorResolutionFailure>() {
+        failure.argument.get_or_insert(argument);
+    }
+    error
+}
+
+/// Work-item bound that selector resolution or traversal postprocessing
+/// exhausted, if that is why the query failed.
+pub(crate) fn preprocessing_work_limit(error: &anyhow::Error) -> Option<usize> {
+    error
+        .downcast_ref::<SelectorPreprocessingExhausted>()
+        .map(|exhausted| exhausted.maximum)
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph selector preprocessing was cancelled")]
@@ -835,7 +895,12 @@ fn choose_unique_bounded_cancellable(
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<NodeRecord> {
     match candidates.count {
-        0 => bail!("selector {selector:?} did not match any node"),
+        0 => Err(SelectorResolutionFailure {
+            kind: SelectorFailureKind::NoMatch,
+            argument: None,
+            message: format!("selector {selector:?} did not match any node"),
+        }
+        .into()),
         1 => {
             work.step(is_cancelled)?;
             candidates
@@ -851,9 +916,14 @@ fn choose_unique_bounded_cancellable(
                 choices.push(format!("{} ({}, id:{})", node.locator, node.kind, node.id));
             }
             let choices = choices.join(", ");
-            bail!(
-                "selector {selector:?} is ambiguous; select a candidate with id:<stable-id>. candidates: {choices}"
-            )
+            Err(SelectorResolutionFailure {
+                kind: SelectorFailureKind::Ambiguous,
+                argument: None,
+                message: format!(
+                    "selector {selector:?} is ambiguous; select a candidate with id:<stable-id>. candidates: {choices}"
+                ),
+            }
+            .into())
         }
     }
 }
@@ -873,7 +943,9 @@ impl<'a> SelectorCandidates<'a> {
         self.count = self
             .count
             .checked_add(1)
-            .ok_or(SelectorPreprocessingExhausted)?;
+            .ok_or(SelectorPreprocessingExhausted {
+                maximum: usize::MAX,
+            })?;
         let key = (node.id.as_str(), ordinal);
         if self.first.len() < 10 {
             self.first.insert(key, node);
@@ -904,7 +976,10 @@ impl SelectorWork {
             return Err(SelectorPreprocessingCancelled.into());
         }
         if self.used >= self.maximum {
-            return Err(SelectorPreprocessingExhausted.into());
+            return Err(SelectorPreprocessingExhausted {
+                maximum: self.maximum,
+            }
+            .into());
         }
         self.used += 1;
         #[cfg(test)]

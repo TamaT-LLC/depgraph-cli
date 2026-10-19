@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs, io,
+    fmt, fs, io,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -796,6 +796,15 @@ pub enum DepgraphServiceError {
     SnapshotWorktreeMismatch,
     #[error("request exhausted a service resource limit")]
     ResourceExhausted,
+    /// `ResourceExhausted` with the bound that was hit, so a caller can tell
+    /// which limit to widen or which argument to narrow (Issue #565).
+    #[error("request exhausted a service resource limit: {limit}={maximum}{}", observed_suffix(*.observed))]
+    ResourceLimitExceeded {
+        limit: DepgraphResourceLimit,
+        maximum: u64,
+        /// Work counted when the request stopped, when known.
+        observed: Option<u64>,
+    },
     #[error("inline graph export exceeds the configured service output limit")]
     InlineExportTooLarge { maximum: usize },
     #[error("request was cancelled")]
@@ -839,9 +848,10 @@ impl DepgraphServiceError {
             Self::NotFound => DepgraphServiceErrorCategory::NotFound,
             Self::Conflict | Self::StoreWriterConflict => DepgraphServiceErrorCategory::Conflict,
             Self::SnapshotWorktreeMismatch => DepgraphServiceErrorCategory::Input,
-            Self::QueryRejected | Self::ResourceExhausted | Self::InlineExportTooLarge { .. } => {
-                DepgraphServiceErrorCategory::Resource
-            }
+            Self::QueryRejected
+            | Self::ResourceExhausted
+            | Self::ResourceLimitExceeded { .. }
+            | Self::InlineExportTooLarge { .. } => DepgraphServiceErrorCategory::Resource,
             Self::Cancelled => DepgraphServiceErrorCategory::Cancelled,
             Self::ReadStoreUnavailable { .. }
             | Self::MutatingStoreUnavailable { .. }
@@ -869,9 +879,78 @@ impl DepgraphServiceError {
         Self::GraphQuery { source }
     }
 
+    #[must_use]
+    pub const fn resource_limit(
+        limit: DepgraphResourceLimit,
+        maximum: u64,
+        observed: Option<u64>,
+    ) -> Self {
+        Self::ResourceLimitExceeded {
+            limit,
+            maximum,
+            observed,
+        }
+    }
+
+    /// The selector resolution failure behind a graph query error, if any.
+    #[must_use]
+    pub fn selector_failure(&self) -> Option<crate::SelectorFailure> {
+        match self {
+            Self::GraphQuery { source } => crate::query::selector_failure(source),
+            _ => None,
+        }
+    }
+
     pub fn project_execution(source: anyhow::Error) -> Self {
         Self::ProjectExecution { source }
     }
+}
+
+/// Service bounds that `DepgraphServiceError::ResourceLimitExceeded` names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepgraphResourceLimit {
+    /// Edge visits of one graph traversal, set by the request's
+    /// `max_traversal` (CLI `--max-traversal`).
+    MaxTraversal,
+    /// Snapshot edges path search inspects while building its adjacency,
+    /// also bounded by the request's `max_traversal`.
+    PathEdgeInspection,
+    /// Snapshot edges dependency traversal inspects while building its
+    /// adjacency, bounded by the fixed interactive traversal ceiling.
+    AdjacencyEdgeInspection,
+    /// Work items of selector resolution and traversal postprocessing.
+    PreprocessingWorkItems,
+}
+
+impl DepgraphResourceLimit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTraversal => "max_traversal",
+            Self::PathEdgeInspection => "path_edge_inspection",
+            Self::AdjacencyEdgeInspection => "adjacency_edge_inspection",
+            Self::PreprocessingWorkItems => "preprocessing_work_items",
+        }
+    }
+
+    /// Request argument that widens this bound, if one does.
+    #[must_use]
+    pub const fn argument(self) -> Option<&'static str> {
+        match self {
+            Self::MaxTraversal | Self::PathEdgeInspection => Some("max_traversal"),
+            Self::AdjacencyEdgeInspection | Self::PreprocessingWorkItems => None,
+        }
+    }
+}
+
+impl fmt::Display for DepgraphResourceLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+fn observed_suffix(observed: Option<u64>) -> String {
+    observed.map_or_else(String::new, |observed| format!(" (observed {observed})"))
 }
 
 impl From<DepgraphServiceConfigurationError> for DepgraphServiceError {

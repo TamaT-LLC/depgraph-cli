@@ -20,12 +20,13 @@ use crate::{
         QueryPageDiagnostic, TraversalPageItem, TraversalResult, UnresolvedResult, WhyResult,
         is_cancelled as is_query_cancelled, is_integrity as is_query_integrity,
         is_resource_exhausted as is_query_resource_exhausted,
-        materialize_path_steps_bounded_cancellable, resolve_selector_bounded_cancellable,
-        traversal_page_items, traverse_bounded_filtered_cancellable,
+        materialize_path_steps_bounded_cancellable, preprocessing_work_limit,
+        resolve_selector_bounded_cancellable, tag_selector_argument, traversal_page_items,
+        traverse_bounded_filtered_cancellable,
     },
     service::{
-        DepgraphService, DepgraphServiceError, DepgraphServiceResult, RepositoryPathSelector,
-        ResolvedSnapshotId, SnapshotReadRequest,
+        DepgraphResourceLimit, DepgraphService, DepgraphServiceError, DepgraphServiceResult,
+        RepositoryPathSelector, ResolvedSnapshotId, SnapshotReadRequest,
     },
     service_limits::{
         MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS,
@@ -545,11 +546,13 @@ impl DepgraphService {
             request.max_traversal(),
             || cancellation.is_cancelled(),
         )
-        .map_err(|source| graph_query_service_error(source, cancellation))?;
+        .map_err(|source| {
+            graph_query_service_error(tag_selector_argument(source, "selector"), cancellation)
+        })?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        ensure_dependency_traversal_complete(&execution)?;
+        ensure_dependency_traversal_complete(&execution, request.max_traversal())?;
         let items =
             traversal_page_items(&execution.result).map_err(|_| DepgraphServiceError::Integrity)?;
         Ok(DependenciesResult {
@@ -606,7 +609,9 @@ impl DepgraphService {
             request.filters().clone(),
             || cancellation.is_cancelled(),
         )
-        .map_err(|source| impact_service_error(source, cancellation))?;
+        .map_err(|source| {
+            impact_service_error(tag_selector_argument(source, "selector"), cancellation)
+        })?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
@@ -754,6 +759,12 @@ fn graph_query_service_error(
 ) -> DepgraphServiceError {
     if cancellation.is_cancelled() || is_query_cancelled(&source) {
         DepgraphServiceError::Cancelled
+    } else if let Some(maximum) = preprocessing_work_limit(&source) {
+        DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::PreprocessingWorkItems,
+            saturating_u64(maximum),
+            None,
+        )
     } else if is_query_resource_exhausted(&source) {
         DepgraphServiceError::ResourceExhausted
     } else if is_query_integrity(&source) {
@@ -763,13 +774,34 @@ fn graph_query_service_error(
     }
 }
 
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// A traversal that stopped early names the bound it hit: its own
+/// `max_traversal` edge visits, or otherwise the fixed adjacency inspection
+/// ceiling that no request argument widens.
 fn ensure_dependency_traversal_complete(
     execution: &BoundedTraversalResult,
+    max_traversal: usize,
 ) -> DepgraphServiceResult<()> {
-    if !execution.complete {
-        return Err(DepgraphServiceError::ResourceExhausted);
+    if execution.complete {
+        return Ok(());
     }
-    Ok(())
+    let max_traversal = saturating_u64(max_traversal);
+    Err(if execution.traversed_edges >= max_traversal {
+        DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::MaxTraversal,
+            max_traversal,
+            Some(execution.traversed_edges),
+        )
+    } else {
+        DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::AdjacencyEdgeInspection,
+            saturating_u64(crate::MAX_INTERACTIVE_QUERY_TRAVERSAL),
+            None,
+        )
+    })
 }
 
 fn validate_string_filter(values: &[String]) -> DepgraphServiceResult<()> {
@@ -1486,14 +1518,18 @@ fn explain_path_bounded(
         MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
         &mut || cancellation.is_cancelled(),
     )
-    .map_err(|source| graph_query_service_error(source, cancellation))?;
+    .map_err(|source| {
+        graph_query_service_error(tag_selector_argument(source, "from"), cancellation)
+    })?;
     let to = resolve_selector_bounded_cancellable(
         snapshot,
         request.to(),
         MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
         &mut || cancellation.is_cancelled(),
     )
-    .map_err(|source| graph_query_service_error(source, cancellation))?;
+    .map_err(|source| {
+        graph_query_service_error(tag_selector_argument(source, "to"), cancellation)
+    })?;
     if from.id == to.id {
         return Ok((
             WhyResult {
@@ -1533,7 +1569,11 @@ fn explain_path_bounded(
                 return Err(DepgraphServiceError::Cancelled);
             }
             if traversed_edges >= request.max_traversal() {
-                return Err(DepgraphServiceError::ResourceExhausted);
+                return Err(DepgraphServiceError::resource_limit(
+                    DepgraphResourceLimit::MaxTraversal,
+                    saturating_u64(request.max_traversal()),
+                    Some(saturating_u64(traversed_edges)),
+                ));
             }
             traversed_edges += 1;
             if seen.insert(edge.target.clone()) {
@@ -1589,7 +1629,11 @@ fn canonical_outgoing_adjacency<'a>(
             return Err(DepgraphServiceError::Cancelled);
         }
         if inspected_edges >= max_inspected_edges {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::PathEdgeInspection,
+                saturating_u64(max_inspected_edges),
+                Some(saturating_u64(snapshot.edges.len())),
+            ));
         }
         if filter.matches_edge(snapshot, edge) {
             ordered
@@ -1909,9 +1953,98 @@ mod tests {
         .expect("bounded query reports its incomplete execution");
         assert!(!execution.complete);
         assert!(matches!(
-            ensure_dependency_traversal_complete(&execution),
-            Err(DepgraphServiceError::ResourceExhausted)
+            ensure_dependency_traversal_complete(&execution, 100),
+            Err(DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::AdjacencyEdgeInspection,
+                maximum,
+                observed: None,
+            }) if maximum == crate::MAX_INTERACTIVE_QUERY_TRAVERSAL as u64
         ));
+    }
+
+    #[test]
+    fn issue_565_traversal_limit_names_max_traversal_and_observed_visits() {
+        let snapshot = cycle_snapshot(1, 3);
+        let execution = crate::query::traverse_bounded_filtered_cancellable(
+            &snapshot,
+            "id:file:00:00",
+            true,
+            false,
+            &GraphQueryFilter::default(),
+            &EdgeKindFilter::unrestricted(),
+            1,
+            || false,
+        )
+        .expect("bounded query reports its incomplete execution");
+        assert!(!execution.complete);
+        let error = ensure_dependency_traversal_complete(&execution, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::MaxTraversal,
+                maximum: 1,
+                observed: Some(1),
+            }
+        ));
+        assert_eq!(
+            error.category(),
+            crate::service::DepgraphServiceErrorCategory::Resource
+        );
+        // The CLI message keeps its prefix and appends the bound.
+        assert_eq!(
+            error.to_string(),
+            "request exhausted a service resource limit: max_traversal=1 (observed 1)"
+        );
+        assert_eq!(
+            DepgraphResourceLimit::MaxTraversal.argument(),
+            Some("max_traversal")
+        );
+        assert_eq!(
+            DepgraphResourceLimit::AdjacencyEdgeInspection.argument(),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_565_selector_failures_are_typed_tagged_and_keep_their_message() {
+        let snapshot = cycle_snapshot(1, 3);
+        let cancellation = CancellationToken::new();
+        let missing = crate::query::resolve_selector(&snapshot, "path:src/missing.rs").unwrap_err();
+        let message = format!("{missing:#}");
+        let error =
+            graph_query_service_error(tag_selector_argument(missing, "selector"), &cancellation);
+        assert!(matches!(error, DepgraphServiceError::GraphQuery { .. }));
+        assert_eq!(
+            error.selector_failure(),
+            Some(crate::SelectorFailure {
+                kind: crate::SelectorFailureKind::NoMatch,
+                argument: Some("selector"),
+            })
+        );
+        let DepgraphServiceError::GraphQuery { source } = &error else {
+            unreachable!();
+        };
+        assert_eq!(format!("{source:#}"), message);
+        assert_eq!(
+            message,
+            "selector \"path:src/missing.rs\" did not match any node"
+        );
+
+        // A bare selector that partially matches several nodes is ambiguous.
+        let ambiguous = crate::query::resolve_selector(&snapshot, "file:00").unwrap_err();
+        let error =
+            graph_query_service_error(tag_selector_argument(ambiguous, "from"), &cancellation);
+        assert_eq!(
+            error.selector_failure(),
+            Some(crate::SelectorFailure {
+                kind: crate::SelectorFailureKind::Ambiguous,
+                argument: Some("from"),
+            })
+        );
+
+        // Ordinary graph query errors are not selector failures.
+        let ordinary = graph_query_service_error(anyhow::anyhow!("other"), &cancellation);
+        assert_eq!(ordinary.selector_failure(), None);
     }
 
     fn unresolved_snapshot(site_count: usize) -> GraphSnapshot {

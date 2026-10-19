@@ -224,6 +224,89 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
     }
 }
 
+fn mapped_error(source: &DepgraphServiceError) -> Value {
+    let mapped =
+        CanonicalResponseMapper::service_error(repository_id(), source).expect("map service error");
+    mapped.result().structured_content.as_ref().unwrap()["error"].clone()
+}
+
+#[test]
+fn issue_565_resource_limits_name_the_bound_the_work_and_the_argument() {
+    use depgraph_core::DepgraphResourceLimit;
+
+    let raisable = mapped_error(&DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::MaxTraversal,
+        50_000,
+        Some(50_000),
+    ));
+    assert_eq!(
+        raisable,
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "traversal_items",
+                "maximum": 50_000,
+                "observed": 50_000,
+                "argument": "max_traversal"
+            }
+        })
+    );
+    // At the argument's ceiling only narrowing helps.
+    let ceiling = mapped_error(&DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::MaxTraversal,
+        1_000_000,
+        Some(1_000_000),
+    ));
+    assert_eq!(ceiling["remediation"], "narrow_query");
+    assert_eq!(ceiling["details"]["argument"], "max_traversal");
+    // A snapshot larger than the ceiling cannot be reached by raising it.
+    let oversized = mapped_error(&DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::PathEdgeInspection,
+        50_000,
+        Some(2_000_000),
+    ));
+    assert_eq!(oversized["remediation"], "narrow_query");
+    assert_eq!(oversized["details"]["limit"], "snapshot_edges");
+    assert_eq!(oversized["details"]["observed"], 2_000_000);
+    for limit in [
+        DepgraphResourceLimit::AdjacencyEdgeInspection,
+        DepgraphResourceLimit::PreprocessingWorkItems,
+    ] {
+        let fixed = mapped_error(&DepgraphServiceError::resource_limit(
+            limit, 1_000_000, None,
+        ));
+        assert_eq!(fixed["remediation"], "narrow_query");
+        assert!(fixed["details"].get("argument").is_none(), "{fixed}");
+        assert!(fixed["details"].get("observed").is_none(), "{fixed}");
+    }
+    // The unclassified variant keeps its v1 shape without details.
+    assert!(
+        mapped_error(&DepgraphServiceError::ResourceExhausted)
+            .get("details")
+            .is_none()
+    );
+}
+
+#[test]
+fn issue_565_unclassified_graph_query_errors_stay_detail_free_and_unreflected() {
+    let error = mapped_error(&DepgraphServiceError::graph_query(
+        io::Error::other("selector \"path:/Users/private/secret.rs\" is weird").into(),
+    ));
+    assert_eq!(
+        error,
+        json!({
+            "code": "INVALID_ARGUMENT",
+            "category": "input",
+            "retryable": false,
+            "remediation": "correct_input"
+        })
+    );
+}
+
 #[test]
 fn mapper_redacts_sensitive_strings_from_closed_success_dtos() {
     for sensitive in [

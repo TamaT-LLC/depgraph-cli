@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
-    AgentRepositoryIds, ContractValueError, Cursor, LogicalRepositoryId, OperationId, SnapshotId,
-    SnapshotName,
+    AgentRepositoryIds, AgentToken, ContractValueError, Cursor, LogicalRepositoryId, OperationId,
+    SnapshotId, SnapshotName,
 };
 
 pub const MCP_TOOLS_CONTRACT_VERSION: &str = "depgraph-mcp-tools-v1";
@@ -489,8 +489,54 @@ pub enum AgentResourceLimit {
     InputBytes,
     OutputBytes,
     PageItems,
+    /// Edge visits of one traversal; widened by `max_traversal`.
     TraversalItems,
     DeadlineMilliseconds,
+    /// Snapshot edges inspected to build traversal adjacency.
+    SnapshotEdges,
+    /// Work items of selector resolution and traversal postprocessing.
+    PreprocessingWorkItems,
+}
+
+/// Closed reason a tool argument was rejected (Issue #565).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentArgumentReason {
+    /// A required argument is absent.
+    Missing,
+    /// An argument is not part of the tool's input schema. Its name is not
+    /// echoed; compare the call with the tool's input schema.
+    UnknownArgument,
+    /// The value has the wrong type, format, or enumeration member.
+    InvalidValue,
+    /// A numeric value is outside its documented range.
+    OutOfRange,
+    /// An array has more items than the tool accepts.
+    TooManyItems,
+    /// The selector matched several nodes; retry with `id:<stable-id>`.
+    AmbiguousSelector,
+    /// The selector matched no node in the selected snapshot.
+    NoMatchingNode,
+}
+
+/// Failure class of a rejected bounded graph query.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQueryFailureClass {
+    Input,
+    Security,
+    Syntax,
+    Limit,
+    Binding,
+    Type,
+}
+
+/// `graph_query` argument a query diagnostic refers to.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQueryArgument {
+    Query,
+    QueryFile,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -502,6 +548,12 @@ pub enum AgentErrorDetails {
     ResourceLimit {
         limit: AgentResourceLimit,
         maximum: u64,
+        /// Work counted when the request stopped, when known (Issue #565).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed: Option<u64>,
+        /// Tool argument that widens or narrows this bound, when one does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        argument: Option<AgentToken>,
     },
     Operation {
         operation_id: OperationId,
@@ -511,6 +563,51 @@ pub enum AgentErrorDetails {
     Repository {
         available_repository_ids: AgentRepositoryIds,
     },
+    /// Which tool argument was rejected and why (Issue #565). `argument` is
+    /// omitted when the server cannot name a schema-defined argument.
+    Argument {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        argument: Option<AgentToken>,
+        reason: AgentArgumentReason,
+    },
+    /// Where a bounded graph query failed to parse or type-check. The query
+    /// text is never echoed; `line`, `column`, and `byte_offset` locate the
+    /// offending token, `clause` names the grammar clause being parsed, and
+    /// `token_class` names the token found there.
+    QueryDiagnostic {
+        argument: AgentQueryArgument,
+        code: AgentToken,
+        class: AgentQueryFailureClass,
+        clause: AgentToken,
+        token_class: AgentToken,
+        line: u64,
+        column: u64,
+        byte_offset: u64,
+    },
+}
+
+impl AgentErrorDetails {
+    /// A resource bound without observed work or a narrowing argument.
+    #[must_use]
+    pub const fn resource_limit(limit: AgentResourceLimit, maximum: u64) -> Self {
+        Self::ResourceLimit {
+            limit,
+            maximum,
+            observed: None,
+            argument: None,
+        }
+    }
+
+    /// Names a schema-defined tool argument. Argument names are compile-time
+    /// constants, so a name outside the token contract is a programming error
+    /// and degrades to an unnamed argument rather than failing the response.
+    #[must_use]
+    pub fn argument(argument: Option<&str>, reason: AgentArgumentReason) -> Self {
+        Self::Argument {
+            argument: argument.and_then(|name| AgentToken::parse(name).ok()),
+            reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]

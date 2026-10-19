@@ -20,11 +20,11 @@ pub use catalog::{
 };
 
 pub use contract::{
-    AgentCapability, AgentError, AgentErrorCategory, AgentErrorCode, AgentErrorDetails,
-    AgentRemediation, AgentResourceLimit, CommonRequest, ContractBuildError, ContractVersion,
-    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_ITEMS, ErrorEnvelope, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MCP_TOOLS_CONTRACT_VERSION, Page, PageByteLimit, PageRequest, PageSize, SnapshotSelector,
-    SuccessEnvelope,
+    AgentArgumentReason, AgentCapability, AgentError, AgentErrorCategory, AgentErrorCode,
+    AgentErrorDetails, AgentQueryArgument, AgentQueryFailureClass, AgentRemediation,
+    AgentResourceLimit, CommonRequest, ContractBuildError, ContractVersion, DEFAULT_PAGE_BYTES,
+    DEFAULT_PAGE_ITEMS, ErrorEnvelope, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION,
+    Page, PageByteLimit, PageRequest, PageSize, SnapshotSelector, SuccessEnvelope,
 };
 pub use dependency_detail::{
     AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
