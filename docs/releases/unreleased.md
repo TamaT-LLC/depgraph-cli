@@ -17,6 +17,11 @@ MCP ツールのエラー応答 `error.details` に、原因を特定できる�
 `depgraph-mcp-tools` crate の型で応答を `deny_unknown_fields` 付きで Deserialize している利用者は、追加された要素を受け取るために crate を更新する。
 存在しないパスを渡したときに `INVALID_ARGUMENT` を前提としていた利用者は、`NOT_FOUND` も扱う。
 
+## 追加機能
+
+- MCP の `agent_edges_list` に、辺種別の許可リスト `edge_kinds` と出力粒度 `detail`（`summary` / `full`、既定 `full`）を追加する。`summary` は evidence 本体を省き、ページ内で共通の `phase` / `profile_id` などを `common` に 1 回だけ出し、各辺に `site_id` と `evidence_count` を残す。`agent_sites_list` に `site_id` を追加し、1 件の site を ID で取得できるようにする。どちらも省略時の応答と cursor は従来と同じ（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
+- `health_hotspots_list` の説明と利用ガイドに、fan-in / fan-out / reverse impact の数え方と、fan-in だけで順位を付ける weight の指定を書く（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
+
 ## 修正
 
 - 大きなリポジトリで、MCP の `health_hotspots_list` と CLI の `depgraph hotspots` が `path_prefixes` / `node_kinds` / `limit` で絞り込んでも resource limit（`RESOURCE_EXHAUSTED`、exit 3）で失敗していた問題を直す。reverse impact を subject ごとに探索せず、最大 64 subject をまとめて 1 回の探索で数えるようにして、スコア計算の作業量を減らした。score、順位、finding ID、fingerprint は従来の計算と同じで、絞り込みは従来どおりスコア計算の後に適用する（[#562](https://github.com/TamaT-LLC/depgraph-cli/issues/562)）。
@@ -27,3 +32,5 @@ MCP ツールのエラー応答 `error.details` に、原因を特定できる�
 - Rust worker の大規模ワークスペースでの HIR 結果の統合を速くし、ピークメモリを下げる。site ごとに全 edge を走査していた検証と診断集約を索引引きにし、HIR の統合時に rust-analyzer のデータベースとグラフの複製を同時に保持しないようにする（[#564](https://github.com/TamaT-LLC/depgraph-cli/issues/564)）。
 - npm launcher が platform 別の optional package を見つけられないとき、実行中の Node.js が `engines`（`>=24.0.0`）を満たすかを先に確かめる。満たさない場合は、Node.js の不足が原因で npm が platform package を入れなかったことと切り替え方を表示する。npx から起動された場合は、Node.js を切り替えても npx が不完全なインストール先を再利用し続けるため、`npm cache npx rm <key>` で消すキーとディレクトリも表示する（[#567](https://github.com/TamaT-LLC/depgraph-cli/issues/567)）。
 - `depgraph mcp setup` / `update` は、safe scan が走る場合、リリース資産の取得と scan の前に TypeScript/JavaScript 解析用の Node.js を検査し、`>=24.0.0` を満たさなければ検出した Node.js のパスとバージョン、切り替え方を示して即座に失敗する。`package.json` を含まないリポジトリでは Node.js を要求しない（[#567](https://github.com/TamaT-LLC/depgraph-cli/issues/567)）。
+- Rust の file node が MCP の `repository_path` と依存一覧 `detail: "paths"` でパスではなく node ID で返っていた問題を直す。locator `file:<path>` のパスを検証してから使う（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
+- Rust の syntax-only 解析（`rust-static`）の `use` / `pub use` / `extern crate` の evidence に、HIR 解析と同じ import 先・glob・re-export・別名を記録する。MCP の `import` に specifier と取り込んだ名前が出るようになり、CLI の JSON 出力の evidence `properties` にも同じキーが加わる（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。

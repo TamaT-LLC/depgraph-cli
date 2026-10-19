@@ -25,35 +25,35 @@ use depgraph_core::service::{
 use depgraph_core::{
     CancellationToken, Confidence, CycleLevel, DEFAULT_HOTSPOT_WEIGHTS, DepgraphCapability,
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, FindingKind, GraphQueryFilter, HealthFinding, HotspotWeights,
-    ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity, SnapshotLocator,
+    DepgraphServiceLimits, EdgeKindFilter, FindingKind, GraphQueryFilter, HealthFinding,
+    HotspotWeights, ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity, SnapshotLocator,
     StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
     verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
     AgentArgumentReason, AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportFormat,
-    AgentGraphExportMediaType, AgentGraphExportResponse, AgentHealthAudit, AgentHealthExecution,
-    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
-    AgentHealthSummary, AgentId, AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary,
-    AgentOperation, AgentOperationStatus, AgentPathResponse, AgentPolicyAnnotation,
-    AgentPolicyAnnotationLevel, AgentPolicyApiChange, AgentPolicyApiChangeKind,
-    AgentPolicyEvaluationResponse, AgentPolicySeverity, AgentPolicySummary, AgentPolicyViolation,
-    AgentProfilePlan, AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome,
-    AgentRepositoryList, AgentRepositorySummary, AgentResourceLimit, AgentRuntimeTraceEvent,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffChange,
-    AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType, AgentSnapshotDiffResponse,
-    AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper, ContractBuildError,
-    ContractVersion, Cursor, CursorKey, DependencyProjectionRequest, DurableSubmitResult,
-    ErrorEnvelope, IdempotencyKey, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES,
-    MappedToolResult, OperationAccepted, OperationId, Page, PageByteLimit, PageRequest, PageSize,
-    PaginationContext, PortableTerminalOutputContract, RepositoryRelativePath,
-    ResponseMappingError, SnapshotId, SnapshotName, SuccessEnvelope, TASK_POLL_INTERVAL_MS,
-    ToolCatalog, project_bounded_query_rows_cancellable, project_cycles_page_cancellable,
-    project_dependencies_output_cancellable, project_impact_response_cancellable,
-    project_unresolved_page_cancellable,
+    AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentEdgeDetail,
+    AgentEdgesOutput, AgentEdgesSummaryResponse, AgentError, AgentErrorCode, AgentErrorDetails,
+    AgentEvidence, AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse,
+    AgentHealthAudit, AgentHealthExecution, AgentHealthFinding, AgentHealthFindingDetail,
+    AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary, AgentId, AgentLocator,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
+    AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
+    AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
+    AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
+    AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary,
+    AgentResourceLimit, AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshotDiffChange, AgentSnapshotDiffChangeType, AgentSnapshotDiffRecordType,
+    AgentSnapshotDiffResponse, AgentToken, BoundedQueryProjectionFailure, CanonicalResponseMapper,
+    ContractBuildError, ContractVersion, Cursor, CursorKey, DependencyProjectionRequest,
+    DurableSubmitResult, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
+    MAX_AGENT_CONDITION_BYTES, MAX_PAGE_BYTES, MappedToolResult, OperationAccepted, OperationId,
+    Page, PageByteLimit, PageRequest, PageSize, PaginationContext, PortableTerminalOutputContract,
+    RepositoryRelativePath, ResponseMappingError, SnapshotId, SnapshotName, SuccessEnvelope,
+    TASK_POLL_INTERVAL_MS, ToolCatalog, project_bounded_query_rows_cancellable,
+    project_cycles_page_cancellable, project_dependencies_output_cancellable,
+    project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
 use depgraph_operation::{
     DEADLINE_EXCEEDED_ERROR_JSON, EXECUTION_STATE_UNKNOWN_ERROR_JSON, JournalError,
@@ -340,6 +340,8 @@ struct AgentSitesListArguments {
     #[serde(default)]
     node_id: Option<String>,
     #[serde(default)]
+    site_id: Option<String>,
+    #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
     limit: Option<u16>,
@@ -373,6 +375,10 @@ struct AgentEdgesListArguments {
     snapshot: Option<String>,
     #[serde(default = "default_agent_edges_direction")]
     direction: AgentEdgesDirection,
+    #[serde(default)]
+    edge_kinds: Vec<String>,
+    #[serde(default)]
+    detail: AgentEdgeDetail,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -3155,8 +3161,11 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            if let Some(node_id) = arguments.node_id.as_deref() {
-                AgentId::parse(node_id).map_err(|_| {
+            for id in [arguments.node_id.as_deref(), arguments.site_id.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                AgentId::parse(id).map_err(|_| {
                     ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput)
                 })?;
             }
@@ -3165,7 +3174,12 @@ fn execute_catalog_read_tool(
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
-            let normalized = serde_json::json!({"node_id": arguments.node_id});
+            let mut normalized = serde_json::json!({"node_id": arguments.node_id});
+            // Without site_id the cursor binding stays byte-identical to the one
+            // before Issue #566.
+            if let Some(site_id) = arguments.site_id.as_deref() {
+                normalized["site_id"] = serde_json::json!(site_id);
+            }
             let pagination = PaginationContext::new(
                 cursor_key,
                 "agent_sites_list",
@@ -3180,6 +3194,7 @@ fn execute_catalog_read_tool(
             let found = service.list_sites_page(
                 &resolved_snapshot_id,
                 arguments.node_id.as_deref(),
+                arguments.site_id.as_deref(),
                 offset,
                 usize::from(request.max_items().get()),
                 cancellation,
@@ -3201,6 +3216,7 @@ fn execute_catalog_read_tool(
             .map_err(Into::into)
         }
         "agent_edges_list" => {
+            validate_array_argument_lengths(&arguments, &["edge_kinds"])?;
             let arguments = decode_arguments::<AgentEdgesListArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
@@ -3209,13 +3225,28 @@ fn execute_catalog_read_tool(
             )?;
             AgentId::parse(&arguments.node_id)
                 .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            // agent_edges_list has always listed every kind, so an empty allowlist
+            // stays unrestricted (structural edges included).
+            let edge_kinds = EdgeKindFilter::try_new(
+                arguments.edge_kinds,
+                Some(StructuralEdgeSelection::Include),
+            )
+            .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
             let snapshot =
                 SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
-            let normalized =
+            let mut normalized =
                 serde_json::json!({"node_id": arguments.node_id, "direction": arguments.direction});
+            // The default selection and detail keep the cursor binding
+            // byte-identical to the one before Issue #566.
+            if !edge_kinds.is_unrestricted() {
+                normalized["edge_kinds"] = serde_json::json!(edge_kinds.edge_kinds());
+            }
+            if !arguments.detail.is_full() {
+                normalized["detail"] = serde_json::json!(arguments.detail.as_str());
+            }
             let pagination = PaginationContext::new(
                 cursor_key,
                 "agent_edges_list",
@@ -3231,6 +3262,7 @@ fn execute_catalog_read_tool(
                 &resolved_snapshot_id,
                 &arguments.node_id,
                 arguments.direction.into(),
+                &edge_kinds,
                 offset,
                 usize::from(request.max_items().get()),
                 cancellation,
@@ -3242,13 +3274,25 @@ fn execute_catalog_read_tool(
                 .map(AgentEdge::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(contract_mapping_error)?;
-            let page = pagination
-                .paginate_window(&items, offset, found.total_items(), &request)
-                .map_err(ToolExecutionFailure::Agent)?;
+            let result = if arguments.detail.is_full() {
+                AgentEdgesOutput::Full(
+                    pagination
+                        .paginate_window(&items, offset, found.total_items(), &request)
+                        .map_err(ToolExecutionFailure::Agent)?,
+                )
+            } else {
+                let (common, summaries) = AgentEdgesSummaryResponse::project_items(&items);
+                let page = pagination
+                    .paginate_window(&summaries, offset, found.total_items(), &request)
+                    .map_err(ToolExecutionFailure::Agent)?;
+                AgentEdgesOutput::Summary(
+                    AgentEdgesSummaryResponse::new(common, page).map_err(contract_mapping_error)?,
+                )
+            };
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),
-                page,
+                result,
             ))
             .map_err(Into::into)
         }

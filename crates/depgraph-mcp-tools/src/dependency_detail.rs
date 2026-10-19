@@ -240,7 +240,7 @@ impl AgentEdgeSummary {
     }
 
     /// Every shared field lives in exactly one place: `common` or this edge.
-    fn is_consistent_with(&self, common: &AgentEdgeCommon) -> bool {
+    pub(crate) fn is_consistent_with(&self, common: &AgentEdgeCommon) -> bool {
         common.phase.is_some() != self.phase.is_some()
             && common.resolution_status.is_some() != self.resolution_status.is_some()
             && common.precision.is_some() != self.precision.is_some()

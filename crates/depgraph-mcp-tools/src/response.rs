@@ -40,7 +40,7 @@ use crate::{
 use crate::{
     AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
     AgentDependencyPath, AgentDependencyPathsResponse, AgentEdgeCommon, AgentEdgeSummary,
-    DependencyProjectionRequest,
+    AgentEdgesOutput, AgentEdgesSummaryResponse, DependencyProjectionRequest,
 };
 
 const CURSOR_VERSION: &str = "v1";
@@ -83,6 +83,8 @@ public_result!(
     AgentImpactResponse,
     AgentDependenciesResponse,
     AgentEdge,
+    AgentEdgesOutput,
+    AgentEdgesSummaryResponse,
     AgentEvidence,
     AgentDaemonStatus,
     AgentDoctor,

@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use anyhow::Result;
-use depgraph_core::CancellationToken;
 use depgraph_core::import_evidence::{
     ImportBindingKind, ImportSiteHint, MAX_IMPORT_NAME_BYTES, MAX_IMPORT_SPECIFIER_BYTES,
     is_public_import_specifier, project_import_evidence,
@@ -12,6 +11,7 @@ use depgraph_core::service::{
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceLimits,
     EdgeDirection, SnapshotLocator,
 };
+use depgraph_core::{CancellationToken, EdgeKindFilter};
 use depgraph_store::Store;
 use serde_json::{Value, json};
 
@@ -601,7 +601,8 @@ fn agent_evidence_projections_carry_import_evidence_for_sites_and_edges() -> Res
     let embed = service.list_site_evidence_page(&snapshot, "site:embed", 0, 10, &cancellation)?;
     assert!(embed.items()[0].import().is_none());
 
-    let sites = service.list_sites_page(&snapshot, Some("node:main"), 0, 10, &cancellation)?;
+    let sites =
+        service.list_sites_page(&snapshot, Some("node:main"), None, 0, 10, &cancellation)?;
     let go_site = sites
         .items()
         .iter()
@@ -618,6 +619,7 @@ fn agent_evidence_projections_carry_import_evidence_for_sites_and_edges() -> Res
         &snapshot,
         "node:main",
         EdgeDirection::Outgoing,
+        &EdgeKindFilter::unrestricted(),
         0,
         10,
         &cancellation,
@@ -640,5 +642,46 @@ fn agent_evidence_projections_carry_import_evidence_for_sites_and_edges() -> Res
         .find(|edge| edge.id() == "edge:embed")
         .expect("embed edge");
     assert!(embed_edge.evidence()[0].import().is_none());
+
+    // Issue #566: one site is fetched by ID, and the edge-kind allowlist is
+    // applied before paging so totals count only the selected kinds.
+    let single = service.list_sites_page(&snapshot, None, Some("site:go"), 0, 10, &cancellation)?;
+    assert_eq!(single.total_items(), 1);
+    assert_eq!(single.items()[0].id(), "site:go");
+    let narrowed = service.list_sites_page(
+        &snapshot,
+        Some("node:app"),
+        Some("site:go"),
+        0,
+        10,
+        &cancellation,
+    )?;
+    assert_eq!(narrowed.total_items(), 0, "node_id and site_id both apply");
+    let unknown =
+        service.list_sites_page(&snapshot, None, Some("site:missing"), 0, 10, &cancellation)?;
+    assert_eq!(unknown.total_items(), 0);
+    assert!(unknown.items().is_empty());
+
+    let imports_only = service.list_edges_page(
+        &snapshot,
+        "node:main",
+        EdgeDirection::Outgoing,
+        &EdgeKindFilter::try_new(vec!["imports".to_owned()], None).expect("valid allowlist"),
+        0,
+        10,
+        &cancellation,
+    )?;
+    assert_eq!(imports_only.total_items(), edges.total_items());
+    let calls_only = service.list_edges_page(
+        &snapshot,
+        "node:main",
+        EdgeDirection::Outgoing,
+        &EdgeKindFilter::try_new(vec!["calls".to_owned()], None).expect("valid allowlist"),
+        0,
+        10,
+        &cancellation,
+    )?;
+    assert_eq!(calls_only.total_items(), 0);
+    assert!(calls_only.items().is_empty());
     Ok(())
 }

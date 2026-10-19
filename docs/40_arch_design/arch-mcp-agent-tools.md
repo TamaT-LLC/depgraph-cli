@@ -47,6 +47,7 @@ additive extensionとして採用するかを決定する。
 | Dependency list output detail | `graph_dependencies_list` / `graph_dependents_list` `detail` (`paths` / `summary` / `full`) | Issue #542 implemented: `full` stays the default and byte-identical; `summary` and `paths` shrink the response without changing the traversal |
 | Import evidence detail | `AgentEvidence.import` (`specifier`, `binding_kind`, `imported_name`, `local_name`, `type_only`) | Issue #544 implemented: only `agent_evidence_list`, `agent_sites_list` and `agent_edges_list` project it, from evidence properties or the import site specifier; dependency list `full`, path, impact and unresolved responses keep the previous shape |
 | Dependency list edge kind selection | `graph_dependencies_list` / `graph_dependents_list` `edge_kinds` / `structural_edges`, CLI `deps` / `dependents` `--edge-kind` / `--structural-edges` | Issue #541 implemented; since v0.7.0 the default is `exclude` (breaking change), and `include` restores the previous every-kind traversal |
+| Agent edge output size and lookup | `agent_edges_list` `edge_kinds` / `detail` (`summary` / `full`), `agent_sites_list` `site_id`, Rust file node paths, Rust syntax import evidence | Issue #566 implemented: defaults keep the previous bytes and cursors; see [Issue #566](#issue-566-agent-edge-output-size-and-lookup) |
 | Open questions | `0` | Resolved |
 
 ### Code-health host guidance
@@ -904,6 +905,22 @@ Agentがファイルを開かずに「なぜ依存しているか」を説明で
 | CLI | CLIのJSON出力とstore recordは変えない。`EvidenceProjection`はMCP内部専用の射影で、`PathStep`へもfieldを追加しない |
 | Compatibility | 依存一覧の`full`などは`import`を持たないため、`deny_unknown_fields`でdeserializeする旧clientもそのまま受け取れる。edgeの根拠が必要なら`site_id`で`agent_evidence_list` / `agent_sites_list`を呼ぶ。`graph_dependencies_list` / `graph_dependents_list`のdescriptionにも明記する |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成する（依存一覧から`import`を外した変更ではcatalogのdescriptionだけが変わる）。schemaは`AgentEvidence`に`import`が増え、`AgentImportEvidence` / `AgentImportBindingKind` / `AgentImportSpecifier`が追加されるだけで、他の`$defs`と既存sampleは変化しない。contract goldenには`agent_evidence_import` sampleを追加する |
+
+## Issue #566 agent edge output size and lookup
+
+大規模リポジトリでは、hub fileの`agent_edges_list`の1ページがAgent hostの結果サイズ上限を超え、Rustのfile nodeが`detail: "paths"`でnode IDになり、import名に辿り着くまでの呼び出しが増えていた。既定の応答とcursorは変えずに、出力を絞る入力と名前解決の経路を追加する。
+
+| Area | Evidence |
+| --- | --- |
+| `agent_edges_list` `edge_kinds` | 任意入力。Agent token形式で最大64件、重複は除いて昇順に正規化する（core `EdgeKindFilter`）。空または省略は従来どおり構造辺を含む全種別。core `list_edges_page`がpagingの前に絞るため、`total_items`は選んだ辺だけを数える。不正値は`INVALID_ARGUMENT` |
+| `agent_edges_list` `detail` | 任意入力（closed enum `summary` / `full`、既定`full`）。`full`は従来の`Page<AgentEdge>`で、省略した応答とbyte単位で同一。`summary`は`AgentEdgesSummaryResponse`（`detail: "summary"`、`common`、`edges`）で、各itemは#542の`AgentEdgeSummary`（`id`、`source_id`、`target_id`、`kind`、`site_id?`、`evidence_count`）でevidence本体を持たない。`phase` / `resolution_status` / `precision` / `profile_id` / `condition`はページ内の全edgeで同じ値なら`common`に1回だけ出し、そうでなければedgeごとに残す。依存一覧と違い、edge一覧はStoreでページを切り全件を持たないため、`common`はページ単位で計算する（byte予算でページが短くなっても、残るedgeでも共通なので整合する）。実リポジトリ（`crates/depgraph-core/src`のsyntax-only scan、`src/lib.rs`の出辺1,760本）で`limit: 100`の応答は`full`の81,345文字から47,553文字になった。出力schemaは`AgentEdgesOutput`の`oneOf`で、空ページでも`detail` tagにより一つの分岐にだけ一致する |
+| Cursor | `edge_kinds`が全種別で`detail`が`full`のときは従来の正規化入力のままでcursorも同じbytes。それ以外は正規化入力に`edge_kinds` / `detail`を含め、違う選択のcursorは`CURSOR_MISMATCH` |
+| `agent_sites_list` `site_id` | 任意入力。指定したsiteだけを返す（未知のIDは空ページ）。`node_id`と同時に指定するとAND。`site_id`を省略した呼び出しのcursorは従来と同じbytes。edgeの`site_id`から、specifier、resolution、import根拠を1回で取得できる |
+| Rust file node path | Rust workerのfile nodeは`path` propertyを持たず、locator `file:<path>`だけにpathを持つ。`AgentNode`の射影は、`path` / `source_path`がない`file` nodeでlocatorの`file:`の後を`RepositoryRelativePath`として検証できた場合だけ`repository_path`に使う。`file://`、絶対path、`..`は使わない。`agent_node_get`などの`repository_path`と、依存一覧`detail: "paths"`の`source_path` / `target_path`に現れる（任意fieldの追加） |
+| Rust syntax import evidence | syntax-only（`rust-static`）の`rust_use` / `rust_reexport` evidenceに、HIRと同じ`target_specifier` / `glob` / `reexport` / `alias?`を、`extern_crate`に`target_specifier` / `alias?`を記録する。coreの既存のRust射影がそのまま`import`のspecifier、binding_kind、imported_name、local_nameを作る。site / edge IDはpropertiesに依存しないため変わらない |
+| Fan-in definition | `health_hotspots_list`のdescriptionと利用ガイドに、fan-in / fan-outはsnapshotの全edge record（構造辺、全phase / profileを含み、同じsourceからの複数edgeも別々に数える）、reverse impactは重複なしの推移的依存元であることと、fan-inだけで順位を付けるweightの指定を書く。採点は変えない |
+| Not in scope | `module_declaration`（`mod foo;`）のimport根拠はclosed enum `binding_kind`の追加が要るため扱わない。`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約も別Issueで扱う |
+| Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。schemaには`AgentEdgesOutput`、`AgentEdgesSummaryResponse`、`AgentEdgeDetail`とその成功envelopeが増える |
 
 ## Issue #292 acceptance mapping
 

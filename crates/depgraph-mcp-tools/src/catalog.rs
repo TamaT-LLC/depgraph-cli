@@ -13,15 +13,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesOutput, AgentDoctor, AgentEdge, AgentEvidence, AgentGraphExportResponse,
-    AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
-    AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
-    AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPolicyEvaluationResponse,
-    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRepositoryList,
-    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse, AgentToken,
-    AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
-    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
-    SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentDependenciesOutput, AgentDoctor, AgentEdgeDetail, AgentEdgesOutput, AgentEvidence,
+    AgentGraphExportResponse, AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage,
+    AgentHealthHotspots, AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
+    AgentPathResponse, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRuntimeValidationResponse, AgentSite,
+    AgentSnapshotDiffResponse, AgentToken, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
+    LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
+    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -373,8 +373,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "agent_sites_list",
-        "List bounded dependency sites using the frozen agent site contract.",
-        ["snapshot", "node_id", "cursor", "limit"],
+        "List bounded dependency sites using the frozen agent site contract. node_id keeps the sites whose source is that node. site_id keeps only that one site (an empty page when the ID is unknown), so the site_id of an edge from agent_edges_list or a dependency list resolves to its specifier, resolution and evidence, including the import specifier and binding when recorded, in one call. Both filters may be combined.",
+        ["snapshot", "node_id", "site_id", "cursor", "limit"],
         [],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -382,8 +382,16 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "agent_edges_list",
-        "List bounded dependency edges using the frozen agent edge contract.",
-        ["snapshot", "node_id", "direction", "cursor", "limit"],
+        "List bounded dependency edges incident to one node using the frozen agent edge contract. Complete edges carry their evidence, including the import specifier and binding when recorded, and are often 0.5 to 1 KB each, so one page of a hub file can exceed an Agent host's result limit. Use detail=summary to drop evidence bodies and state fields shared by the page once (each edge keeps site_id and evidence_count), edge_kinds to keep only some kinds such as imports, and a smaller limit with the returned next_cursor to page. Every edge kind, structural edges (contains, declares, generated_from) included, is listed unless edge_kinds is given. For a file-level view with unique source/target repository paths, call graph_dependencies_list or graph_dependents_list with selector id:<node_id> and detail=paths.",
+        [
+            "snapshot",
+            "node_id",
+            "direction",
+            "edge_kinds",
+            "detail",
+            "cursor",
+            "limit"
+        ],
         [],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -639,7 +647,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "health_hotspots_list",
-        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights. path_prefixes and node_kinds narrow the returned findings after scoring, so scores and finding IDs equal the unfiltered ranking; churn_path_filter only narrows the Git churn input.",
+        "Rank graph hotspots with integer basis-point scores. Each finding exposes a closed hotspot_scores breakdown for fan-in, fan-out, reverse impact, Git churn, and runtime (raw, normalized basis points, weight basis points, and availability) plus total. The fan-in raw value counts every edge record in the snapshot whose target is the subject: all edge kinds, structural contains, declares and generated_from included, every phase and profile, and each record separately, so several edges from one source (different sites, kinds or profiles) each count. Fan-out counts the edges whose source is the subject the same way, and reverse impact counts the distinct transitive dependents over every edge. These raw values can therefore differ from graph_dependents_list, which excludes structural edges by default and with detail=paths lists unique (source, target, kind). To rank by fan-in alone, set weight_fan_in to 10000 and the other weights to 0. Hotspots are capped at probable confidence; missing Git churn or runtime observation contributes 0 without renormalizing weights. path_prefixes and node_kinds narrow the returned findings after scoring, so scores and finding IDs equal the unfiltered ranking; churn_path_filter only narrows the Git churn input.",
         [
             "snapshot",
             "churn_commit_limit",
@@ -869,7 +877,7 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
             return exact_success_output_schema::<Page<AgentSite>>(spec.name);
         }
         "agent_edges_list" => {
-            return exact_success_output_schema::<Page<AgentEdge>>(spec.name);
+            return exact_success_output_schema::<AgentEdgesOutput>(spec.name);
         }
         "agent_evidence_list" => {
             return exact_success_output_schema::<Page<AgentEvidence>>(spec.name);
@@ -1156,6 +1164,13 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "direction" => {
             json!({"type": "string", "enum": ["both", "incoming", "outgoing"]})
         }
+        "edge_kinds" if tool_name == "agent_edges_list" => json!({
+            "type": "array",
+            "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
+            "uniqueItems": true,
+            "items": scalar_schema::<AgentToken>(),
+            "description": "List only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, structural kinds (contains, declares, generated_from) included. Applied before paging, so total_items counts only the selected edges. A cursor is bound to the selection."
+        }),
         "edge_kinds" => json!({
             "type": "array",
             "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
@@ -1168,6 +1183,12 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "enum": [StructuralEdgeSelection::Include.as_str(), StructuralEdgeSelection::Exclude.as_str()],
             "default": DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
             "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. When edge_kinds is given, the allowlist alone decides and omission does not exclude structural kinds. A cursor is bound to the selection."
+        }),
+        "detail" if tool_name == "agent_edges_list" => json!({
+            "type": "string",
+            "enum": [AgentEdgeDetail::Summary.as_str(), AgentEdgeDetail::Full.as_str()],
+            "default": AgentEdgeDetail::Full.as_str(),
+            "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; fetch the evidence of one edge with agent_sites_list (site_id) or agent_evidence_list. A cursor is bound to its detail."
         }),
         "detail" => json!({
             "type": "string",
