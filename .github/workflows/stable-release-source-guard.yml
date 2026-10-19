@@ -21,7 +21,8 @@ jobs:
        github.event.workflow_run.head_branch == 'v0.6.1' ||
        github.event.workflow_run.head_branch == 'v0.6.2' ||
        github.event.workflow_run.head_branch == 'v0.6.3' ||
-       github.event.workflow_run.head_branch == 'v0.6.4')
+       github.event.workflow_run.head_branch == 'v0.6.4' ||
+       github.event.workflow_run.head_branch == 'v0.7.0')
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -55,8 +56,10 @@ jobs:
           V0_6_2_RELEASE_SOURCE_SHA: 3e5cdda6d1a2ea8904981f52bdc554c9e574307a
           V0_6_3_RELEASE_TAG: v0.6.3
           V0_6_3_RELEASE_SOURCE_SHA: 21434e0e7a603d866f5fb677b087b9d193dae931
-          STABLE_RELEASE_TAG: v0.6.4
-          STABLE_MAINTENANCE_REF: heads/release/0.6
+          V0_6_4_RELEASE_TAG: v0.6.4
+          V0_6_4_RELEASE_SOURCE_SHA: 35c3edea133b7f5a0cd269edd945776d9db9e7f2
+          STABLE_RELEASE_TAG: v0.7.0
+          STABLE_MAINTENANCE_REF: heads/release/0.7
           STABLE_MAIN_REF: heads/main
           STABLE_BASELINE_STATUS: maintenance-ref-pinned
         run: |
@@ -97,7 +100,7 @@ jobs:
             if [[ "$maintenance_sha" != "missing" &&
                   "$RELEASE_SOURCE_SHA" == "$maintenance_sha" &&
                   "$RELEASE_SOURCE_SHA" == "$main_sha" ]]; then
-              echo "$RELEASE_TAG source is the exact main and release/0.6 baseline ($STABLE_BASELINE_STATUS)"
+              echo "$RELEASE_TAG source is the exact main and release/0.7 baseline ($STABLE_BASELINE_STATUS)"
               exit 0
             fi
 
@@ -105,7 +108,7 @@ jobs:
               "repos/$REPOSITORY/actions/runs/$RELEASE_RUN_ID/cancel" || true
             gh api --method DELETE \
               "repos/$REPOSITORY/git/refs/tags/$STABLE_RELEASE_TAG"
-            echo "::error::$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.6 baseline ($STABLE_BASELINE_STATUS; main=$main_sha maintenance=$maintenance_sha)"
+            echo "::error::$STABLE_RELEASE_TAG source $RELEASE_SOURCE_SHA is not the exact main/release/0.7 baseline ($STABLE_BASELINE_STATUS; main=$main_sha maintenance=$maintenance_sha)"
             exit 1
           fi
 
@@ -130,6 +133,8 @@ jobs:
             historical_source_sha="$V0_6_2_RELEASE_SOURCE_SHA"
           elif [[ "$RELEASE_TAG" == "$V0_6_3_RELEASE_TAG" ]]; then
             historical_source_sha="$V0_6_3_RELEASE_SOURCE_SHA"
+          elif [[ "$RELEASE_TAG" == "$V0_6_4_RELEASE_TAG" ]]; then
+            historical_source_sha="$V0_6_4_RELEASE_SOURCE_SHA"
           fi
           if [[ -n "$historical_source_sha" &&
                 "$RELEASE_SOURCE_SHA" == "$historical_source_sha" ]]; then
