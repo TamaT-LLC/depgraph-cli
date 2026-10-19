@@ -3151,27 +3151,7 @@ fn release_gate_environment_requires_the_exact_verified_value() {
     let root = temp.path().join("release-gate");
     write_minimal_crate(&root, "release-gate", "pub struct Thing;\n");
     let sysroot = temp.path().join("rust-sysroot");
-    fs::create_dir(&sysroot).unwrap();
-    fs::write(
-        sysroot.join("SOURCE.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "contract_version": RUST_SYSROOT_CONTRACT_VERSION,
-            "toolchain_version": RUST_TOOLCHAIN_BASELINE,
-            "toolchain_commit": RUSTC_BASELINE_COMMIT,
-            "component_version": RUST_SYSROOT_COMPONENT_VERSION,
-            "source_layout": RUST_SYSROOT_SOURCE_LAYOUT,
-            "acquisition": "rustup-component:rust-src",
-            "normalized_root": "library",
-            "license_expression": RUST_SYSROOT_LICENSE_EXPRESSION,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    for crate_name in ["core", "alloc", "std"] {
-        let source = sysroot.join("library").join(crate_name).join("src");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("lib.rs"), format!("pub struct {crate_name};\n")).unwrap();
-    }
+    write_attested_sysroot(&sysroot, |crate_name| format!("pub struct {crate_name};\n"));
 
     for (value, expected_gate, expected_sysroot, semantic_complete) in [
         (
@@ -3230,6 +3210,123 @@ fn release_gate_environment_requires_the_exact_verified_value() {
             semantic_complete
         );
     }
+}
+
+/// Writes a minimal bundled sysroot that the worker accepts as attested when
+/// it also receives the verified release gate.
+fn write_attested_sysroot(sysroot: &Path, source: impl Fn(&str) -> String) {
+    fs::create_dir(sysroot).unwrap();
+    fs::write(
+        sysroot.join("SOURCE.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "contract_version": RUST_SYSROOT_CONTRACT_VERSION,
+            "toolchain_version": RUST_TOOLCHAIN_BASELINE,
+            "toolchain_commit": RUSTC_BASELINE_COMMIT,
+            "component_version": RUST_SYSROOT_COMPONENT_VERSION,
+            "source_layout": RUST_SYSROOT_SOURCE_LAYOUT,
+            "acquisition": "rustup-component:rust-src",
+            "normalized_root": "library",
+            "license_expression": RUST_SYSROOT_LICENSE_EXPRESSION,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for crate_name in ["core", "alloc", "std"] {
+        let directory = sysroot.join("library").join(crate_name).join("src");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("lib.rs"), source(crate_name)).unwrap();
+    }
+}
+
+#[test]
+fn sysroot_items_with_the_same_module_path_and_name_keep_distinct_identities() {
+    // #564: `std::fs::read` and the `read` method of `impl Read for File` in
+    // the same module used to share one sysroot identity, so the conflicting
+    // node discarded the whole HIR graph of the scan.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sysroot-identity");
+    write_minimal_crate(
+        &root,
+        "sysroot-identity",
+        concat!(
+            "use std::fs::{self, File, Read};\n",
+            "pub fn run() -> u8 {\n",
+            "    let mut file = File;\n",
+            "    fs::read(\"input\") + file.read() + Read::read(&mut file)\n",
+            "}\n",
+        ),
+    );
+    let sysroot = temp.path().join("rust-sysroot");
+    write_attested_sysroot(&sysroot, |crate_name| {
+        if crate_name == "std" {
+            concat!(
+                "pub mod fs {\n",
+                "    pub fn read(path: &str) -> u8 { 0 }\n",
+                "    pub struct File;\n",
+                "    pub trait Read {\n",
+                "        fn read(&mut self) -> u8;\n",
+                "    }\n",
+                "    impl Read for File {\n",
+                "        fn read(&mut self) -> u8 { 1 }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned()
+        } else {
+            format!("pub struct {crate_name};\n")
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--scan-id")
+        .arg("sysroot-identity")
+        .env_remove("DEPGRAPH_PROFILE_CONFIG")
+        .env("DEPGRAPH_RUST_RELEASE_GATE", "release-gate-verified")
+        .env("DEPGRAPH_RUST_SYSROOT_ROOT", &sysroot)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout)).unwrap();
+    let profile = validated.profiles.values().next().unwrap();
+    if profile.properties["rust_hir_toolchain_status"] != "compatible" {
+        // Hosts without the verified toolchain never reach the HIR backend.
+        return;
+    }
+    assert_eq!(profile.properties["rust_hir_sysroot_status"], "attested");
+    assert_ne!(
+        profile.properties["rust_hir_status"],
+        "failed",
+        "HIR graph was discarded: {:?}",
+        profile.properties.get("rust_hir_failure_stage")
+    );
+    let read_resolvers: BTreeSet<_> = validated
+        .nodes
+        .values()
+        .filter(|node| {
+            node.properties.get("bundled_sysroot") == Some(&serde_json::Value::Bool(true))
+                && node.display_name.as_deref() == Some("read")
+        })
+        .map(|node| {
+            node.properties["resolver_identity"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        read_resolvers.contains("rust-sysroot#std::crate::fs::read"),
+        "{read_resolvers:?}"
+    );
+    assert!(
+        read_resolvers.len() >= 2,
+        "the free function and the method need distinct identities: {read_resolvers:?}"
+    );
 }
 
 fn worker_profile(profile_config: &str) -> depgraph_protocol::Profile {
