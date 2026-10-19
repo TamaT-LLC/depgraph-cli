@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use depgraph_store::{GraphSnapshot, NodeRecord};
 use serde_json::json;
@@ -209,33 +209,17 @@ pub fn score_hotspots_cancellable(
             subjects.push(node);
         }
     }
-    let mut subject_ids = BTreeSet::new();
-    for node in &subjects {
-        work.step(&mut is_cancelled)?;
-        subject_ids.insert(node.id.as_str());
-    }
-    let mut fan_in_by_id = BTreeMap::<&str, u64>::new();
-    let mut fan_out_by_id = BTreeMap::<&str, u64>::new();
-    for edge in &snapshot.edges {
-        work.step(&mut is_cancelled)?;
-        if subject_ids.contains(edge.target.as_str()) {
-            let count = fan_in_by_id.entry(edge.target.as_str()).or_insert(0);
-            *count = count.saturating_add(1);
-        }
-        if subject_ids.contains(edge.source.as_str()) {
-            let count = fan_out_by_id.entry(edge.source.as_str()).or_insert(0);
-            *count = count.saturating_add(1);
-        }
-    }
-    let reverse = reverse_impact_sizes(snapshot, &subjects, &mut work, &mut is_cancelled)?;
+    let graph = HotspotGraph::build(snapshot, &subjects, &mut work, &mut is_cancelled)?;
+    let reverse = graph.reverse_impact_sizes(&subjects, &mut work, &mut is_cancelled)?;
     let mut fan_in = Vec::with_capacity(subjects.len());
     let mut fan_out = Vec::with_capacity(subjects.len());
     let mut churn_values = Vec::with_capacity(subjects.len());
     let mut runtime_values = Vec::with_capacity(subjects.len());
-    for node in &subjects {
+    for (position, node) in subjects.iter().enumerate() {
         work.step(&mut is_cancelled)?;
-        fan_in.push(fan_in_by_id.get(node.id.as_str()).copied().unwrap_or(0));
-        fan_out.push(fan_out_by_id.get(node.id.as_str()).copied().unwrap_or(0));
+        let subject = graph.subject_vertices[position];
+        fan_in.push(graph.fan_in[subject]);
+        fan_out.push(graph.fan_out[subject]);
         churn_values.push(if availability.churn {
             churn_value(node, churn)
         } else {
@@ -410,37 +394,166 @@ fn node_path(node: &NodeRecord) -> Option<String> {
         .map(|path| path.as_str().to_owned())
 }
 
-fn reverse_impact_sizes(
-    snapshot: &GraphSnapshot,
-    subjects: &[&NodeRecord],
-    work: &mut HotspotWork,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Result<Vec<u64>, HotspotAnalysisError> {
-    let mut incoming = BTreeMap::<&str, Vec<&str>>::new();
-    for edge in &snapshot.edges {
-        work.step(is_cancelled)?;
-        incoming
-            .entry(edge.target.as_str())
-            .or_default()
-            .push(edge.source.as_str());
-    }
-    let mut sizes = Vec::with_capacity(subjects.len());
-    for subject in subjects {
-        work.step(is_cancelled)?;
-        let mut seen = BTreeSet::from([subject.id.as_str()]);
-        let mut queue = VecDeque::from([subject.id.as_str()]);
-        while let Some(current) = queue.pop_front() {
+/// Subjects whose reverse reachability is computed together, one bit each.
+const REVERSE_IMPACT_LANES: usize = u64::BITS as usize;
+
+/// Interned view of the snapshot edges used by the fan and reverse-impact
+/// layers.
+///
+/// Vertices are every subject plus every edge endpoint, so an endpoint
+/// without a node record still counts toward reverse impact. Subjects are
+/// interned first; `fan_in` / `fan_out` count every edge (duplicates
+/// included), while the reverse adjacency keeps each distinct
+/// `target -> source` pair once because reachability does not depend on
+/// edge multiplicity.
+struct HotspotGraph {
+    subject_vertices: Vec<usize>,
+    fan_in: Vec<u64>,
+    fan_out: Vec<u64>,
+    dependents_start: Vec<usize>,
+    dependents: Vec<usize>,
+}
+
+impl HotspotGraph {
+    fn build(
+        snapshot: &GraphSnapshot,
+        subjects: &[&NodeRecord],
+        work: &mut HotspotWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self, HotspotAnalysisError> {
+        let mut vertices = HashMap::<&str, usize>::with_capacity(subjects.len());
+        let mut subject_vertices = Vec::with_capacity(subjects.len());
+        for node in subjects {
             work.step(is_cancelled)?;
-            for dependent in incoming.get(current).into_iter().flatten() {
+            let next = vertices.len();
+            subject_vertices.push(*vertices.entry(node.id.as_str()).or_insert(next));
+        }
+        let distinct_subjects = vertices.len();
+        let mut fan_in = vec![0_u64; distinct_subjects];
+        let mut fan_out = vec![0_u64; distinct_subjects];
+        let mut pairs = Vec::with_capacity(snapshot.edges.len());
+        for edge in &snapshot.edges {
+            work.step(is_cancelled)?;
+            let next = vertices.len();
+            let target = *vertices.entry(edge.target.as_str()).or_insert(next);
+            let next = vertices.len();
+            let source = *vertices.entry(edge.source.as_str()).or_insert(next);
+            if let Some(count) = fan_in.get_mut(target) {
+                *count = count.saturating_add(1);
+            }
+            if let Some(count) = fan_out.get_mut(source) {
+                *count = count.saturating_add(1);
+            }
+            pairs.push((target, source));
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        let mut dependents_start = vec![0_usize; vertices.len() + 1];
+        for &(target, _) in &pairs {
+            dependents_start[target + 1] += 1;
+        }
+        for vertex in 0..vertices.len() {
+            dependents_start[vertex + 1] += dependents_start[vertex];
+        }
+        let dependents = pairs.into_iter().map(|(_, source)| source).collect();
+        Ok(Self {
+            subject_vertices,
+            fan_in,
+            fan_out,
+            dependents_start,
+            dependents,
+        })
+    }
+
+    fn vertex_count(&self) -> usize {
+        self.dependents_start.len() - 1
+    }
+
+    fn dependents_of(&self, vertex: usize) -> &[usize] {
+        &self.dependents[self.dependents_start[vertex]..self.dependents_start[vertex + 1]]
+    }
+
+    /// Count, for every subject, the distinct vertices that transitively
+    /// depend on it (the subject itself excluded).
+    ///
+    /// Instead of one breadth-first search per subject, up to 64 subjects
+    /// share one pass: each vertex carries a bit mask of the batch subjects
+    /// it can reach through incoming edges, and a work list propagates a mask
+    /// to the dependents until no mask grows. A vertex shared by many
+    /// subjects of a batch is expanded once for all of them, so the work is
+    /// proportional to the union of the batch's reverse closures rather than
+    /// their sum. The counts equal the per-subject search exactly; batch
+    /// order changes only the amount of work, and batches follow the subject
+    /// locators so subjects of one file, which share most dependents, are
+    /// usually batched together.
+    fn reverse_impact_sizes(
+        &self,
+        subjects: &[&NodeRecord],
+        work: &mut HotspotWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Vec<u64>, HotspotAnalysisError> {
+        let mut order = (0..subjects.len()).collect::<Vec<_>>();
+        order.sort_by(|left, right| {
+            subjects[*left]
+                .locator
+                .cmp(&subjects[*right].locator)
+                .then_with(|| subjects[*left].id.cmp(&subjects[*right].id))
+        });
+        let mut sizes = vec![0_u64; subjects.len()];
+        let mut masks = vec![0_u64; self.vertex_count()];
+        let mut queued = vec![false; self.vertex_count()];
+        let mut touched = Vec::new();
+        let mut queue = VecDeque::new();
+        let mut reached = [0_u64; REVERSE_IMPACT_LANES];
+        for batch in order.chunks(REVERSE_IMPACT_LANES) {
+            for (lane, &position) in batch.iter().enumerate() {
                 work.step(is_cancelled)?;
-                if seen.insert(dependent) {
-                    queue.push_back(dependent);
+                let vertex = self.subject_vertices[position];
+                if masks[vertex] == 0 {
+                    touched.push(vertex);
+                }
+                masks[vertex] |= 1_u64 << lane;
+                if !queued[vertex] {
+                    queued[vertex] = true;
+                    queue.push_back(vertex);
                 }
             }
+            while let Some(current) = queue.pop_front() {
+                work.step(is_cancelled)?;
+                queued[current] = false;
+                let mask = masks[current];
+                for &dependent in self.dependents_of(current) {
+                    work.step(is_cancelled)?;
+                    let grown = masks[dependent] | mask;
+                    if grown == masks[dependent] {
+                        continue;
+                    }
+                    if masks[dependent] == 0 {
+                        touched.push(dependent);
+                    }
+                    masks[dependent] = grown;
+                    if !queued[dependent] {
+                        queued[dependent] = true;
+                        queue.push_back(dependent);
+                    }
+                }
+            }
+            reached.fill(0);
+            for vertex in touched.drain(..) {
+                work.step(is_cancelled)?;
+                let mut lanes = masks[vertex];
+                masks[vertex] = 0;
+                while lanes != 0 {
+                    reached[lanes.trailing_zeros() as usize] += 1;
+                    lanes &= lanes - 1;
+                }
+            }
+            for (lane, &position) in batch.iter().enumerate() {
+                sizes[position] = reached[lane].saturating_sub(1);
+            }
         }
-        sizes.push(u64::try_from(seen.len().saturating_sub(1)).unwrap_or(u64::MAX));
+        Ok(sizes)
     }
-    Ok(sizes)
 }
 
 struct HotspotWork {
@@ -822,6 +935,285 @@ mod tests {
                 || true,
             ),
             Err(HotspotAnalysisError::Cancelled)
+        );
+    }
+
+    fn issue_562_node(id: &str, kind: &str, locator: &str, path: Option<&str>) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: locator.to_owned(),
+            display_name: id.to_owned(),
+            properties: path.map_or_else(|| json!({}), |path| json!({ "path": path })),
+        }
+    }
+
+    fn issue_562_edge(ordinal: usize, source: &str, target: &str, kind: &str) -> EdgeRecord {
+        let mut record = edge(source, target);
+        record.id = format!("edge:{ordinal:08}");
+        record.kind = kind.to_owned();
+        record
+    }
+
+    /// The per-subject breadth-first search that scored reverse impact before
+    /// #562, kept as the reference. Returns the sizes and the work it counted.
+    fn issue_562_reference_reverse_impact(
+        snapshot: &GraphSnapshot,
+        subjects: &[&NodeRecord],
+    ) -> (Vec<u64>, usize) {
+        let mut work = snapshot.edges.len();
+        let mut incoming = BTreeMap::<&str, Vec<&str>>::new();
+        for edge in &snapshot.edges {
+            incoming
+                .entry(edge.target.as_str())
+                .or_default()
+                .push(edge.source.as_str());
+        }
+        let mut sizes = Vec::with_capacity(subjects.len());
+        for subject in subjects {
+            work += 1;
+            let mut seen = std::collections::BTreeSet::from([subject.id.as_str()]);
+            let mut queue = VecDeque::from([subject.id.as_str()]);
+            while let Some(current) = queue.pop_front() {
+                work += 1;
+                for dependent in incoming.get(current).into_iter().flatten() {
+                    work += 1;
+                    if seen.insert(dependent) {
+                        queue.push_back(dependent);
+                    }
+                }
+            }
+            sizes.push(u64::try_from(seen.len() - 1).expect("size fits"));
+        }
+        (sizes, work)
+    }
+
+    fn issue_562_subjects(snapshot: &GraphSnapshot) -> Vec<&NodeRecord> {
+        snapshot
+            .nodes
+            .iter()
+            .filter(|node| is_hotspot_subject_kind(&node.kind))
+            .collect()
+    }
+
+    fn issue_562_lane_reverse_impact(snapshot: &GraphSnapshot) -> Vec<u64> {
+        let subjects = issue_562_subjects(snapshot);
+        let mut work = HotspotWork::new(usize::MAX);
+        let graph = HotspotGraph::build(snapshot, &subjects, &mut work, &mut || false)
+            .expect("unbounded graph build");
+        graph
+            .reverse_impact_sizes(&subjects, &mut work, &mut || false)
+            .expect("unbounded reverse impact")
+    }
+
+    /// A deterministic graph with cycles, self-loops, duplicate edges,
+    /// non-subject vertices, and endpoints that have no node record.
+    fn issue_562_irregular_snapshot(seed: u64, subjects: usize, edges: usize) -> GraphSnapshot {
+        let mut state = seed;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).expect("31-bit value") % bound
+        };
+        let externals = subjects / 4 + 1;
+        let mut nodes = Vec::new();
+        for index in 0..subjects {
+            let kind = HOTSPOT_SUBJECT_KINDS[index % HOTSPOT_SUBJECT_KINDS.len()];
+            let path = format!("src/f{:03}.rs", index % 17);
+            nodes.push(issue_562_node(
+                &format!("n:{index:05}"),
+                kind,
+                &format!("repo://{path}#{index}"),
+                Some(&path),
+            ));
+        }
+        for index in 0..externals {
+            nodes.push(issue_562_node(
+                &format!("x:{index:05}"),
+                "unknown_target",
+                &format!("external://{index}"),
+                None,
+            ));
+        }
+        let vertex = |choice: usize| match choice % 10 {
+            0 => format!("x:{:05}", choice % externals),
+            1 => format!("dangling:{}", choice % 7),
+            _ => format!("n:{:05}", choice % subjects),
+        };
+        let mut records = Vec::new();
+        for ordinal in 0..edges {
+            let source = vertex(next(subjects * 10));
+            let target = if next(20) == 0 {
+                source.clone()
+            } else {
+                vertex(next(subjects * 10))
+            };
+            records.push(issue_562_edge(ordinal, &source, &target, "imports"));
+            if next(5) == 0 {
+                records.push(issue_562_edge(edges + ordinal, &source, &target, "calls"));
+            }
+        }
+        snapshot(nodes, records)
+    }
+
+    #[test]
+    fn issue_562_batched_reverse_impact_equals_per_subject_search() {
+        for (seed, subjects, edges) in [
+            (1, 1, 0),
+            (2, 63, 40),
+            (3, 64, 200),
+            (4, 65, 300),
+            (5, 200, 150),
+            (6, 200, 900),
+            (7, 333, 2_500),
+        ] {
+            let graph = issue_562_irregular_snapshot(seed, subjects, edges);
+            let reference_subjects = issue_562_subjects(&graph);
+            let (expected, _) = issue_562_reference_reverse_impact(&graph, &reference_subjects);
+            assert_eq!(
+                issue_562_lane_reverse_impact(&graph),
+                expected,
+                "seed {seed}: batched reverse impact diverged from the per-subject search"
+            );
+        }
+    }
+
+    /// Shape of the depgraph-cli snapshot in #562 at a smaller scale: files
+    /// import earlier files (with a few cycles), declare symbols that call
+    /// each other, and reference external targets. Imports repeat one
+    /// source/target pair, as `type_uses` and `expands` do in real scans.
+    fn issue_562_large_snapshot() -> GraphSnapshot {
+        const FILES: usize = 120;
+        const SYMBOLS_PER_FILE: usize = 75;
+        const EXTERNALS: usize = 500;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut push = |source: String, target: String, kind: &str| {
+            let ordinal = edges.len();
+            edges.push(issue_562_edge(ordinal, &source, &target, kind));
+        };
+        for file in 0..FILES {
+            let path = format!("crates/core/src/f{file:03}.rs");
+            nodes.push(issue_562_node(
+                &format!("file:{file:03}"),
+                "file",
+                &format!("file:{path}"),
+                Some(&path),
+            ));
+            for symbol in 0..SYMBOLS_PER_FILE {
+                nodes.push(issue_562_node(
+                    &format!("symbol:{file:03}:{symbol:02}"),
+                    "symbol",
+                    &format!("symbol:{path}#s{symbol:02}"),
+                    Some(&path),
+                ));
+            }
+        }
+        for external in 0..EXTERNALS {
+            nodes.push(issue_562_node(
+                &format!("unknown:{external:03}"),
+                "unknown_target",
+                &format!("unknown:{external:03}"),
+                None,
+            ));
+        }
+        for file in 0..FILES {
+            for back in 1..=3 {
+                if let Some(imported) = file.checked_sub(back) {
+                    for _ in 0..3 {
+                        push(
+                            format!("file:{file:03}"),
+                            format!("file:{imported:03}"),
+                            "imports",
+                        );
+                    }
+                }
+            }
+            if file % 10 == 9 {
+                push(
+                    format!("file:{:03}", file - 9),
+                    format!("file:{file:03}"),
+                    "imports",
+                );
+            }
+            for symbol in 0..SYMBOLS_PER_FILE {
+                push(
+                    format!("file:{file:03}"),
+                    format!("symbol:{file:03}:{symbol:02}"),
+                    "declares",
+                );
+                if symbol > 0 {
+                    push(
+                        format!("symbol:{file:03}:{symbol:02}"),
+                        format!("symbol:{file:03}:{:02}", symbol - 1),
+                        "calls",
+                    );
+                }
+                push(
+                    format!("symbol:{file:03}:{symbol:02}"),
+                    format!(
+                        "unknown:{:03}",
+                        (file * SYMBOLS_PER_FILE + symbol) % EXTERNALS
+                    ),
+                    "type_uses",
+                );
+            }
+        }
+        snapshot(nodes, edges)
+    }
+
+    fn issue_562_findings_digest(findings: &[HealthFinding]) -> String {
+        use sha2::{Digest as _, Sha256};
+        let canonical = serde_json::to_string(findings).expect("findings serialize");
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    }
+
+    #[test]
+    fn issue_562_large_snapshot_hotspots_fit_the_service_budget_with_unchanged_scores() {
+        let graph = issue_562_large_snapshot();
+        let subjects = issue_562_subjects(&graph);
+        let maximum_work = crate::service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS;
+        let (expected_reverse, reference_work) =
+            issue_562_reference_reverse_impact(&graph, &subjects);
+        assert!(
+            reference_work > maximum_work,
+            "fixture must exhaust the service budget under the per-subject search \
+             (needed {reference_work} work items)"
+        );
+
+        let findings = score_hotspots_cancellable(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+            crate::service_limits::MAX_HEALTH_FINDINGS,
+            maximum_work,
+            || false,
+        )
+        .expect("hotspot scoring fits the default service budget");
+        assert_eq!(findings.len(), subjects.len());
+        let reverse_by_subject = subjects
+            .iter()
+            .zip(&expected_reverse)
+            .map(|(node, size)| (node.id.as_str(), *size))
+            .collect::<BTreeMap<_, _>>();
+        for finding in &findings {
+            let scores = finding.hotspot_scores.as_ref().expect("hotspot scores");
+            assert_eq!(
+                scores.reverse_impact.raw,
+                reverse_by_subject[finding.subject_id.as_str()],
+                "reverse impact of {} changed",
+                finding.subject_id
+            );
+        }
+        // Digest of the complete ranking (order, IDs, fingerprints, raw and
+        // normalized layers) that the per-subject search produced before #562.
+        assert_eq!(
+            issue_562_findings_digest(&findings),
+            "c05d18749daff4f75b6493c4b53008855271d6aebbbf98c691b1c2ff3f3c267f",
+            "hotspot ranking differs from the pre-#562 analyzer"
         );
     }
 }
