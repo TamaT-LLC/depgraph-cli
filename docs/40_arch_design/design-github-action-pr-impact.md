@@ -32,13 +32,15 @@ fork PR では `pull_request_target` を使わない。
 
 ## 現行 CLI でできること、できないこと
 
-### impact はセレクター必須
+### v0.6.4 まで impact はセレクター必須
 
-`impact <SELECTOR>` はセレクターが必須である（`crates/depgraph-cli/src/main.rs:302-334`、`crates/depgraph-core/src/service_graph.rs:49-82`）。
+v0.6.4 までのリリース版では、`impact <SELECTOR>` はセレクターが必須である（`crates/depgraph-cli/src/main.rs:302-334`、`crates/depgraph-core/src/service_graph.rs:49-82`）。
 
 `--changed <ref>` を付けても、意味論は「セレクターを焦点にする」ものになる。
 セレクターから順方向に変更ノードへ届けば `root_impacted=true` となり、`impacts` はセレクター自身の逆方向到達集合である（`crates/depgraph-core/src/impact.rs:1230-1351`、`docs/reference/cli-behavior.md:122`）。
-変更ファイル全体を起点にした影響範囲は、1 コマンドでは出せない。
+このため v0.6.4 までは、変更ファイル全体を起点にした影響範囲を 1 コマンドでは出せない。
+PR #550（未リリース、v0.7.0 予定）でセレクター省略の `impact --changed` が入った。
+使い方は [changed-set（depgraph 0.7.0 以降）](#changed-setdepgraph-070-以降) の節を参照する。
 
 ### --changed まわりの制約
 
