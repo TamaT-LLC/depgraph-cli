@@ -1867,6 +1867,103 @@ fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_ex
 }
 
 #[test]
+fn issue_570_contract_version_defaults_to_v1_and_an_explicit_unknown_version_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    assert!(!tools.is_empty());
+    for tool in &tools {
+        let input = &tool["inputSchema"];
+        assert!(
+            !input["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("contract_version")),
+            "{} still requires contract_version",
+            tool["name"]
+        );
+        assert_eq!(
+            input["properties"]["contract_version"]["default"], "depgraph-mcp-tools-v1",
+            "{}",
+            tool["name"]
+        );
+    }
+
+    let context = interactive_tool_call(&mut mcp, 3, "get_context", json!({}));
+    assert_eq!(context["isError"], false, "{context}");
+    assert_eq!(
+        context["structuredContent"]["contract_version"],
+        "depgraph-mcp-tools-v1"
+    );
+    shared.validate(&context["structuredContent"]).unwrap();
+    let explicit_context = interactive_tool_call(
+        &mut mcp,
+        4,
+        "get_context",
+        json!({"contract_version": "depgraph-mcp-tools-v1"}),
+    );
+    assert_eq!(
+        context["structuredContent"],
+        explicit_context["structuredContent"]
+    );
+
+    // A tool with its own required arguments, paged with the version omitted and
+    // continued with it explicit: both select the same contract and cursor binding.
+    let nodes_arguments = json!({"query": "fixture", "match_mode": "contains", "limit": 1});
+    let omitted = interactive_tool_call(&mut mcp, 5, "agent_nodes_list", nodes_arguments.clone());
+    assert_eq!(omitted["isError"], false, "{omitted}");
+    let mut explicit_arguments = nodes_arguments.clone();
+    explicit_arguments["contract_version"] = json!("depgraph-mcp-tools-v1");
+    let explicit =
+        interactive_tool_call(&mut mcp, 6, "agent_nodes_list", explicit_arguments.clone());
+    assert_eq!(
+        omitted["structuredContent"]["result"]["items"],
+        explicit["structuredContent"]["result"]["items"]
+    );
+    if let Some(cursor) = omitted["structuredContent"]["result"]["next_cursor"].as_str() {
+        explicit_arguments["cursor"] = json!(cursor);
+        let next = interactive_tool_call(&mut mcp, 7, "agent_nodes_list", explicit_arguments);
+        assert_eq!(next["isError"], false, "{next}");
+    }
+
+    for (id, name, mut arguments) in [
+        (8, "get_context", json!({})),
+        (
+            9,
+            "agent_nodes_list",
+            json!({"query": "fixture", "match_mode": "contains"}),
+        ),
+    ] {
+        arguments["contract_version"] = json!("depgraph-mcp-tools-v2");
+        let rejected = interactive_tool_call(&mut mcp, id, name, arguments);
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        let error = &rejected["structuredContent"]["error"];
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{rejected}");
+        assert_eq!(
+            error["details"],
+            json!({"kind": "argument", "argument": "contract_version", "reason": "invalid_value"}),
+            "{rejected}"
+        );
+        shared.validate(&rejected["structuredContent"]).unwrap();
+    }
+    mcp.finish();
+}
+
+#[test]
 fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");

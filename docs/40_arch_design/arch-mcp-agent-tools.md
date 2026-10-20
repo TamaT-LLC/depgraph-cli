@@ -830,6 +830,17 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
 
+## Issue #570 optional contract version
+
+`contract_version`も`repository_id`と同じく全toolのinput schemaでrequiredから外す。受け付ける値は`depgraph-mcp-tools-v1`だけなので、省略時はserverが実装する現行の版として扱う。
+
+| Area | Evidence |
+| --- | --- |
+| Optional input | 引数構造体の`contract_version`に`#[serde(default)]`を付け、`ContractVersion::default()`（`V1`）を使う。input schemaは`const`を保ったまま`default`とdescriptionを足す |
+| Explicit version | 明示した未知の版は従来どおりdecodeで失敗し、`INVALID_ARGUMENT`と`{"kind":"argument","argument":"contract_version","reason":"invalid_value"}`を返す |
+| Cursor | 正規化入力にcontract versionを含めないため、省略した呼び出しのcursorを明示した呼び出しで続けられる |
+| Shared schema | `CommonRequest`などのcontract DTOと応答の`contract_version`は変えない。shared schemaとcontract goldenは変わらず、tool catalog goldenだけを再生成する |
+
 ## Issue #565 error detail evidence
 
 Agentがエラー応答から原因を特定し、同じ呼び出しを条件を変えて繰り返さずに済むよう、`error.details`を拡張する。`depgraph-mcp-tools-v1`のまま、既存variantの既存fieldは変えず、任意fieldと新variantだけを追加する。

@@ -107,10 +107,23 @@ fn issue_540_repository_id_is_optional_and_documented_for_every_tool() {
             tool.name()
         );
         assert!(
-            required.contains(&Value::String("contract_version".to_owned())),
-            "{} must keep contract_version required",
+            !required.contains(&Value::String("contract_version".to_owned())),
+            "{} still requires contract_version",
             tool.name()
         );
+        let contract_version = &input["properties"]["contract_version"];
+        assert_eq!(contract_version["const"], "depgraph-mcp-tools-v1");
+        assert_eq!(contract_version["default"], "depgraph-mcp-tools-v1");
+        let description = contract_version["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} contract_version has no description", tool.name()));
+        for expected in ["Optional", "depgraph-mcp-tools-v1", "INVALID_ARGUMENT"] {
+            assert!(
+                description.contains(expected),
+                "{} contract_version description lacks {expected}: {description}",
+                tool.name()
+            );
+        }
         let repository_id = &input["properties"]["repository_id"];
         assert_eq!(repository_id["pattern"], "^[A-Za-z0-9][A-Za-z0-9._:+-]*$");
         let description = repository_id["description"]
@@ -166,6 +179,9 @@ fn issue_540_repository_id_is_optional_and_documented_for_every_tool() {
     let validator =
         jsonschema::draft202012::new(&Value::Object(context.input_schema().clone())).unwrap();
     assert!(validator.is_valid(&serde_json::json!({"contract_version": "depgraph-mcp-tools-v1"})));
+    assert!(validator.is_valid(&serde_json::json!({})));
+    assert!(validator.is_valid(&serde_json::json!({"repository_id": "repository"})));
+    assert!(!validator.is_valid(&serde_json::json!({"contract_version": "depgraph-mcp-tools-v2"})));
     assert!(validator.is_valid(&serde_json::json!({
         "contract_version": "depgraph-mcp-tools-v1",
         "repository_id": "repository"
@@ -186,10 +202,7 @@ fn issue_540_repository_list_is_an_immediate_read_only_tool_with_a_closed_output
     assert_eq!(list.authorization(), ToolAuthorization::FixedCapabilities);
     assert_eq!(list.operation_behavior(), OperationBehavior::Immediate);
     assert!(list.cli_actions().is_empty());
-    assert_eq!(
-        list.input_schema()["required"],
-        serde_json::json!(["contract_version"])
-    );
+    assert_eq!(list.input_schema()["required"], serde_json::json!([]));
     let mut fields = list.input_schema()["properties"]
         .as_object()
         .unwrap()
@@ -337,7 +350,6 @@ fn resolve_build_requires_acknowledgement_exact_mode_and_project_exec_authority(
     assert_eq!(
         build.input_schema()["required"],
         serde_json::json!([
-            "contract_version",
             "idempotency_key",
             "acknowledgement",
             "rust_compiler_precise"
@@ -387,11 +399,11 @@ fn daemon_control_inputs_require_a_bounded_idempotency_key_and_remain_closed() {
 
     assert_eq!(
         start.input_schema()["required"],
-        serde_json::json!(["contract_version", "idempotency_key"])
+        serde_json::json!(["idempotency_key"])
     );
     assert_eq!(
         stop.input_schema()["required"],
-        serde_json::json!(["contract_version", "idempotency_key"])
+        serde_json::json!(["idempotency_key"])
     );
     assert_eq!(
         start.input_schema()["properties"]
@@ -1003,7 +1015,7 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
 
     let path = catalog.tool("graph_path_get").unwrap();
     let required = path.input_schema()["required"].as_array().unwrap();
-    for field in ["contract_version", "from", "to"] {
+    for field in ["from", "to"] {
         assert!(required.contains(&Value::String(field.to_owned())));
     }
     assert!(!required.contains(&Value::String("repository_id".to_owned())));
@@ -1068,10 +1080,7 @@ fn tool_specific_required_fields_and_scalar_contracts_are_preserved() {
     );
 
     let context = catalog.tool("get_context").unwrap();
-    assert_eq!(
-        context.input_schema()["required"],
-        serde_json::json!(["contract_version"])
-    );
+    assert_eq!(context.input_schema()["required"], serde_json::json!([]));
 }
 
 #[test]
@@ -1096,7 +1105,7 @@ fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered()
     let scan = catalog.tool("scan_submit").unwrap();
     assert_eq!(
         scan.input_schema()["required"],
-        serde_json::json!(["contract_version", "idempotency_key"])
+        serde_json::json!(["idempotency_key"])
     );
     assert_eq!(
         scan.input_schema()["properties"]["idempotency_key"]["maxLength"],
@@ -1142,7 +1151,7 @@ fn store_write_tools_have_closed_inputs_outputs_and_remain_capability_filtered()
     let runtime = catalog.tool("runtime_trace_import_submit").unwrap();
     assert_eq!(
         runtime.input_schema()["required"],
-        serde_json::json!(["contract_version", "idempotency_key"])
+        serde_json::json!(["idempotency_key"])
     );
     let runtime_input = Value::Object(runtime.input_schema().clone());
     let runtime_validator = jsonschema::draft202012::new(&runtime_input).unwrap();

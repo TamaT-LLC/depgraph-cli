@@ -813,14 +813,18 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
     let mut properties = Map::new();
     properties.insert(
         "contract_version".to_owned(),
-        json!({"type": "string", "const": MCP_TOOLS_CONTRACT_VERSION}),
+        json!({
+            "type": "string",
+            "const": MCP_TOOLS_CONTRACT_VERSION,
+            "default": MCP_TOOLS_CONTRACT_VERSION,
+            "description": CONTRACT_VERSION_DESCRIPTION
+        }),
     );
     properties.insert("repository_id".to_owned(), repository_id_schema(spec.name));
     for field in spec.input_fields {
         properties.insert((*field).to_owned(), field_schema(spec.name, field));
     }
-    let mut required = vec!["contract_version"];
-    required.extend_from_slice(required_input_fields(spec.name));
+    let required = required_input_fields(spec.name).to_vec();
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": format!("{}_input", spec.name),
@@ -1315,6 +1319,11 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         _ => json!({"type": "string", "minLength": 1, "maxLength": 1048576}),
     }
 }
+
+// Issue #570: the contract version is optional like repository_id. Omitting it
+// selects the version this server implements; an explicit unknown value is still
+// rejected so a client never silently runs against a different contract.
+const CONTRACT_VERSION_DESCRIPTION: &str = "Optional tool contract version. When omitted, the tool uses the contract this server implements (depgraph-mcp-tools-v1, the default). An explicit value other than depgraph-mcp-tools-v1 fails with INVALID_ARGUMENT.";
 
 const REPOSITORY_ID_DESCRIPTION: &str = "Optional logical repository ID. When omitted, the tool uses the repository this server is bound to (the default). Discover valid values with repository_list or get_context; an unknown value fails with INVALID_ARGUMENT whose error.details.available_repository_ids lists the valid IDs.";
 
