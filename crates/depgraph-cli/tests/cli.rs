@@ -8278,3 +8278,241 @@ fn next_semantic_route_reaches_and_is_impacted_by_implementation_symbols() {
     );
     assert!(file_impacted_kinds.contains(&"route"), "{file_impact:#}");
 }
+
+/// A Rust snapshot whose profile fell back to syntax-only, as the Rust worker
+/// records it after the HIR memory budget (Issue #579).
+fn seed_issue_579_snapshot(store_path: &Path, root: &Path, degraded: bool, fanout: usize) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision("issue-579", root, false, Some("revision-579"))
+        .unwrap();
+    let coverage = |reasons: serde_json::Value| {
+        json!({
+            "profiles": 1,
+            "files_discovered": 0,
+            "files_analyzed": 0,
+            "files_skipped": 0,
+            "dependency_sites": 1 + fanout,
+            "resolved": 1 + fanout,
+            "candidates": 0,
+            "external": 0,
+            "unresolved": 0,
+            "unsupported_syntax": 0,
+            "project_code_executed": false,
+            "completeness": [],
+            "reasons": reasons
+        })
+    };
+    let reasons = if degraded {
+        json!(["rust-hir-memory-budget", "unresolved-sites"])
+    } else {
+        json!([])
+    };
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-579",
+            "adapter": "rust",
+            "adapter_version": "0.7.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "profile:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": if degraded {
+            json!({"rust_hir_mode": "syntax-only", "rust_hir_enable_gate": "memory-budget-syntax-only"})
+        } else {
+            json!({"rust_hir_mode": "full"})
+        }
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, path) in [("file:lib", "src/lib.rs"), ("file:model", "src/model.rs")] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": format!("file:{path}"),
+            "display_name": path,
+            "properties": {"language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let evidence = json!([{
+        "kind": "source", "extractor": "rust-static", "extractor_version": "0.7.0",
+        "path": "src/lib.rs", "start_line": 1, "start_column": 1,
+        "end_line": 1, "end_column": 12, "properties": {}
+    }]);
+    let mut site = next("dependency_site");
+    site["site"] = json!({
+        "id": "site:use", "source": "file:lib", "kind": "rust_use",
+        "specifier": "crate::model::Thing", "resolution_status": "resolved",
+        "target_ids": ["file:model"], "profile_id": "profile:rust",
+        "condition": {"op": "true"}, "precision": "exact", "evidence": evidence
+    });
+    store.ingest_event(&site).unwrap();
+    let mut edge = next("edge_upsert");
+    edge["edge"] = json!({
+        "id": "edge:use", "source": "file:lib", "target": "file:model",
+        "kind": "imports", "site_id": "site:use", "phase": "source",
+        "environment": "host", "profile_id": "profile:rust",
+        "condition": {"op": "true"}, "resolution_status": "resolved",
+        "precision": "exact", "generated": false, "evidence": evidence
+    });
+    store.ingest_event(&edge).unwrap();
+    // Extra files that import the model, so a dependents page can fill its budget.
+    for index in 0..fanout {
+        let id = format!("file:dependent{index:03}");
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": "file", "locator": format!("file:src/dependent{index:03}.rs"),
+            "display_name": format!("src/dependent{index:03}.rs"), "properties": {"language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+        let site_id = format!("site:dependent{index:03}");
+        let mut site = next("dependency_site");
+        site["site"] = json!({
+            "id": site_id, "source": id, "kind": "rust_use",
+            "specifier": "crate::model::Thing", "resolution_status": "resolved",
+            "target_ids": ["file:model"], "profile_id": "profile:rust",
+            "condition": {"op": "true"}, "precision": "exact", "evidence": evidence
+        });
+        store.ingest_event(&site).unwrap();
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": format!("edge:dependent{index:03}"), "source": id, "target": "file:model",
+            "kind": "imports", "site_id": site_id, "phase": "source",
+            "environment": "host", "profile_id": "profile:rust",
+            "condition": {"op": "true"}, "resolution_status": "resolved",
+            "precision": "exact", "generated": false, "evidence": evidence
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("profile:rust");
+    profile_completed["coverage"] = coverage(reasons.clone());
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage(reasons);
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-579", "completed", None, true)
+        .unwrap();
+}
+
+#[test]
+fn issue_579_dependents_report_a_syntax_only_rust_profile() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let degraded_store = temporary.path().join("degraded.sqlite");
+    let full_store = temporary.path().join("full.sqlite");
+    seed_issue_579_snapshot(&degraded_store, &root, true, 0);
+    seed_issue_579_snapshot(&full_store, &root, false, 0);
+    let run = |store: &Path, arguments: &[&str]| {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .arg("--store")
+            .arg(store)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let expected = json!([{
+        "profile_id": "profile:rust",
+        "language": "rust",
+        "analysis_mode": "syntax-only",
+        "reasons": ["rust-hir-memory-budget"]
+    }]);
+    for (command, selector) in [("dependents", "id:file:model"), ("deps", "id:file:lib")] {
+        for extra in [&[][..], &["--all"][..]] {
+            let mut arguments = vec![command, selector, "--json"];
+            arguments.extend_from_slice(extra);
+            let degraded: serde_json::Value =
+                serde_json::from_str(&run(&degraded_store, &arguments)).unwrap();
+            assert_eq!(
+                degraded["analysis_degradations"], expected,
+                "{arguments:?}: {degraded}"
+            );
+            let full: serde_json::Value =
+                serde_json::from_str(&run(&full_store, &arguments)).unwrap();
+            assert!(
+                full.get("analysis_degradations").is_none(),
+                "{arguments:?}: {full}"
+            );
+        }
+        let text = run(&degraded_store, &[command, selector]);
+        assert!(
+            text.contains(
+                "degraded analysis: rust profile profile:rust ran in syntax-only mode (rust-hir-memory-budget)"
+            ),
+            "{text}"
+        );
+        assert!(!run(&full_store, &[command, selector]).contains("degraded analysis"));
+    }
+}
+
+#[test]
+fn issue_579_degraded_profiles_count_toward_the_page_byte_budget() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("degraded.sqlite");
+    seed_issue_579_snapshot(&store, &root, true, 120);
+    // Without reserving the degraded profiles, page selection can fill the
+    // budget and adding them afterwards overflows it. Sweeping budgets across
+    // more than one page item makes some selection end within the metadata
+    // size of the budget.
+    for budget in (8_192_usize..9_728).step_by(32) {
+        let output = Command::cargo_bin("depgraph")
+            .unwrap()
+            .arg("--store")
+            .arg(&store)
+            .args([
+                "dependents",
+                "id:file:model",
+                "--json",
+                "--max-items",
+                "1000",
+                "--max-bytes",
+            ])
+            .arg(budget.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "budget {budget}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.trim_end().len() <= budget,
+            "budget {budget}: {}",
+            stdout.len()
+        );
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            value["analysis_degradations"][0]["analysis_mode"],
+            "syntax-only"
+        );
+        let returned = value["returned_items"].as_u64().unwrap();
+        assert!(returned > 0 && returned < 121, "{value}");
+    }
+}

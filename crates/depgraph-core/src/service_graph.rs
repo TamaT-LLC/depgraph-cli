@@ -399,6 +399,7 @@ pub struct DependenciesResult {
     complete: bool,
     traversed_edges: u64,
     diagnostics: Vec<QueryPageDiagnostic>,
+    analysis_degradations: Vec<AnalysisDegradation>,
 }
 
 impl DependenciesResult {
@@ -435,6 +436,88 @@ impl DependenciesResult {
     pub fn diagnostics(&self) -> &[QueryPageDiagnostic] {
         &self.diagnostics
     }
+
+    /// Profiles of the snapshot whose analysis fell back to a less precise
+    /// mode (Issue #579). Empty when every profile ran at full precision.
+    #[must_use]
+    pub fn analysis_degradations(&self) -> &[AnalysisDegradation] {
+        &self.analysis_degradations
+    }
+}
+
+/// Analysis mode a profile fell back to.
+pub const RUST_SYNTAX_ONLY_ANALYSIS_MODE: &str = "syntax-only";
+
+/// Reason recorded when the core reran a Rust unit in syntax-only mode after
+/// the worker exceeded its memory limit. Matches the scan diagnostic code.
+pub const RUST_SYNTAX_ONLY_FALLBACK_REASON: &str = "rust-hir-syntax-only-fallback";
+
+/// Maximum degraded profiles reported for one snapshot.
+pub const MAX_ANALYSIS_DEGRADATIONS: usize = 256;
+
+/// Maximum reasons reported for one degraded profile.
+pub const MAX_ANALYSIS_DEGRADATION_REASONS: usize = 16;
+
+/// One snapshot profile whose analysis was less precise than requested, for
+/// example a Rust profile that ran in syntax-only mode because rust-analyzer
+/// HIR exceeded the worker memory budget (Issue #579).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct AnalysisDegradation {
+    pub profile_id: String,
+    pub language: String,
+    pub analysis_mode: String,
+    pub reasons: Vec<String>,
+}
+
+/// The degraded profiles of `snapshot`, sorted by profile ID.
+///
+/// A Rust profile is degraded when its `rust_hir_mode` property is
+/// `syntax-only`. Its reasons are the profile coverage reasons that name the
+/// HIR fallback (`rust-hir-*`, such as `rust-hir-memory-budget` from the
+/// worker) and, when the core reran the unit after a worker memory failure,
+/// [`RUST_SYNTAX_ONLY_FALLBACK_REASON`].
+#[must_use]
+pub fn snapshot_analysis_degradations(snapshot: &GraphSnapshot) -> Vec<AnalysisDegradation> {
+    let mut degradations = snapshot
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .properties
+                .get("rust_hir_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some(RUST_SYNTAX_ONLY_ANALYSIS_MODE)
+        })
+        .map(|profile| {
+            let mut reasons = profile
+                .coverage
+                .iter()
+                .flat_map(|coverage| coverage.reasons.iter())
+                .filter(|reason| reason.starts_with("rust-hir-"))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if profile
+                .properties
+                .get("rust_hir_mode_reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                reasons.insert(RUST_SYNTAX_ONLY_FALLBACK_REASON.to_owned());
+            }
+            AnalysisDegradation {
+                profile_id: profile.id.clone(),
+                language: profile.language.clone(),
+                analysis_mode: RUST_SYNTAX_ONLY_ANALYSIS_MODE.to_owned(),
+                reasons: reasons
+                    .into_iter()
+                    .take(MAX_ANALYSIS_DEGRADATION_REASONS)
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    degradations.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+    degradations.truncate(MAX_ANALYSIS_DEGRADATIONS);
+    degradations
 }
 
 #[derive(Clone, Debug)]
@@ -563,6 +646,7 @@ impl DepgraphService {
             complete: execution.complete,
             traversed_edges: execution.traversed_edges,
             diagnostics: execution.diagnostics,
+            analysis_degradations: snapshot_analysis_degradations(&snapshot),
         })
     }
 

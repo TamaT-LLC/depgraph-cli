@@ -960,8 +960,8 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // and the AgentDependenciesOutput success envelope. Issue #544 adds AgentImportEvidence.
     // Issue #565 adds the AgentErrorDetails::Argument and ::QueryDiagnostic branches.
     // Issue #566 adds the agent_edges_list summary response and the AgentEdgesOutput
-    // success envelope.
-    assert_eq!(objects, 207, "review newly added object schemas explicitly");
+    // success envelope. Issue #579 adds AgentAnalysisDegradation.
+    assert_eq!(objects, 208, "review newly added object schemas explicitly");
 }
 
 #[test]

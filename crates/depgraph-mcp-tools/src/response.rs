@@ -20,12 +20,12 @@ use zeroize::Zeroize;
 
 use crate::dto::{AgentImpactProjection, ImpactProjectionFailure};
 use crate::{
-    AgentArgumentReason, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle,
-    AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
-    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
-    AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
+    AgentAnalysisDegradation, AgentArgumentReason, AgentCapability, AgentCompletedSnapshot,
+    AgentContext, AgentCycle, AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge,
+    AgentError, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportResponse,
+    AgentHealthAudit, AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage,
+    AgentHealthHotspots, AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryArgument, AgentQueryFailureClass,
     AgentQueryRow, AgentRemediation, AgentRepositoryInitOutcome, AgentRepositoryList,
     AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
@@ -1342,11 +1342,13 @@ pub fn project_dependencies_output_cancellable(
         return Err(cancelled_error());
     }
     let root = AgentNode::try_from(source).map_err(impact_contract_error)?;
-    project_dependency_items_cancellable(
+    let degradations = AgentAnalysisDegradation::project_core(source.analysis_degradations());
+    project_dependency_items_with_degradations_cancellable(
         root,
         source.items(),
         source.traversed_edges(),
         projection,
+        &degradations,
         pagination,
         request,
         cancellation,
@@ -1364,6 +1366,32 @@ pub fn project_dependency_items_cancellable(
     items: &[depgraph_core::query::TraversalPageItem],
     traversed_edges: u64,
     projection: DependencyProjectionRequest,
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<AgentDependenciesOutput, AgentError> {
+    project_dependency_items_with_degradations_cancellable(
+        root,
+        items,
+        traversed_edges,
+        projection,
+        &[],
+        pagination,
+        request,
+        cancellation,
+    )
+}
+
+/// [`project_dependency_items_cancellable`] that also reports the snapshot's
+/// degraded profiles. They are part of the fixed response bytes, so every page
+/// stays within the byte budget (Issue #579).
+#[allow(clippy::too_many_arguments)]
+pub fn project_dependency_items_with_degradations_cancellable(
+    root: AgentNode,
+    items: &[depgraph_core::query::TraversalPageItem],
+    traversed_edges: u64,
+    projection: DependencyProjectionRequest,
+    degradations: &[AgentAnalysisDegradation],
     pagination: &PaginationContext,
     request: &PageRequest,
     cancellation: &CancellationToken,
@@ -1392,6 +1420,7 @@ pub fn project_dependency_items_cancellable(
                         traversed_edges,
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Full)
@@ -1417,6 +1446,7 @@ pub fn project_dependency_items_cancellable(
                         common.clone(),
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Summary)
@@ -1433,6 +1463,7 @@ pub fn project_dependency_items_cancellable(
                         traversed_edges,
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Paths)

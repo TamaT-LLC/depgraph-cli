@@ -28,9 +28,10 @@ pub use contract::{
     Page, PageByteLimit, PageRequest, PageSize, SnapshotSelector, SuccessEnvelope,
 };
 pub use dependency_detail::{
-    AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
-    AgentDependencyEndpoint, AgentDependencyPath, AgentDependencyPathsResponse, AgentEdgeCommon,
-    AgentEdgeSummary, DependencyProjectionRequest,
+    AgentAnalysisDegradation, AgentDependenciesOutput, AgentDependenciesSummaryResponse,
+    AgentDependencyDetail, AgentDependencyEndpoint, AgentDependencyPath,
+    AgentDependencyPathsResponse, AgentEdgeCommon, AgentEdgeSummary, DependencyProjectionRequest,
+    MAX_AGENT_ANALYSIS_DEGRADATION_REASONS, MAX_AGENT_ANALYSIS_DEGRADATIONS,
 };
 pub use dto::{
     AGENT_SCAN_OUTCOME_CONTRACT_VERSION, AgentAnalysisCoverage, AgentAnalysisProgress,

@@ -969,6 +969,18 @@ schemarsはRustの整数型から`format: "uint32"`などJSON Schema 2020-12に�
 | Applied to | tool catalogの全input / output schema、shared schema `depgraph-mcp-tools-v1`、`depgraph-agent-scan-outcome-v2`。手書きのschema（health DTOなど）も同じ変換を通る |
 | Tests | catalogとshared schemaの全`format`がJSON Schema 2020-12の定義済み値であること、変換の境界（既存boundの保持、property名`format`を誤変換しないこと）、scan outcome v2 schemaのchecked-in fileと生成結果の一致 |
 
+## Issue #579 analysis degradation metadata
+
+RustのHIRがメモリ予算を超えてsyntax-onlyに落ちても、依存一覧の応答からは分からなかった。worker / coreがscan時に残す情報を、依存一覧の任意metadataに載せる。
+
+| Area | Evidence |
+| --- | --- |
+| Source | core `snapshot_analysis_degradations`がsnapshotのprofileを見る。`rust_hir_mode=syntax-only`のprofileを劣化とし、reasonsはprofile coverageの`rust-hir-*`（workerの`rust-hir-memory-budget`）と、coreが再実行時に書く`rust_hir_mode_reason`に対応する`rust-hir-syntax-only-fallback`（scan診断と同じcode）。profile ID順、最大256 profile、1 profileあたり最大16 reason |
+| Scope | 結果のedgeに関わるprofileだけではなく、snapshot全体で判定する。syntax-onlyで失われたedgeは結果に現れないため、結果のedgeから判定すると劣化を見落とす |
+| MCP | `AgentDependenciesResponse` / `AgentDependenciesSummaryResponse` / `AgentDependencyPathsResponse`に任意field `analysis_degradations`（`AgentAnalysisDegradation`の配列）を足す。空なら出力しないので、劣化のないsnapshotの応答とcursorは従来とbyte単位で同じ。fieldはbyte予算の固定部分に含めてpagingする。契約外のprofile ID / language / modeのentryと、契約外のreasonは省く |
+| CLI | `deps` / `dependents`の`--json`（paged / `--all`）はtop-levelに`analysis_degradations`を足し、テキスト出力は先頭に`degraded analysis:`の行を出す |
+| Not in scope | `graph_path_get`、impact、health系、snapshot系の応答には載せない。snapshot系はすでにcoverage reasonsを返す |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |

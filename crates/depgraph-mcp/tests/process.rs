@@ -10942,3 +10942,189 @@ fn issue_581_argument_details_do_not_need_contract_version() {
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
+
+/// A Rust snapshot whose profile fell back to syntax-only after the HIR
+/// memory budget, or ran at full precision (Issue #579).
+fn seed_issue_579_store(path: &Path, root: &Path, degraded: bool) {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-579", root, false, Some("revision-579"))
+        .unwrap();
+    let reasons = if degraded {
+        json!(["rust-hir-memory-budget", "unresolved-sites"])
+    } else {
+        json!([])
+    };
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 1,
+        "resolved": 1,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": [],
+        "reasons": reasons
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-579",
+            "adapter": "rust",
+            "adapter_version": "0.7.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "profile:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": if degraded {
+            json!({"rust_hir_mode": "syntax-only", "rust_hir_mode_reason": "memory-limit"})
+        } else {
+            json!({"rust_hir_mode": "full"})
+        }
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, locator) in [
+        ("file:lib", "file:src/lib.rs"),
+        ("file:model", "file:src/model.rs"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": locator,
+            "display_name": id,
+            "properties": {"language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let evidence = issue_544_evidence("src/lib.rs", 1, "source", json!({}));
+    let mut site = next("dependency_site");
+    site["site"] = json!({
+        "id": "site:use",
+        "source": "file:lib",
+        "kind": "rust_use",
+        "specifier": "crate::model::Thing",
+        "resolution_status": "resolved",
+        "target_ids": ["file:model"],
+        "profile_id": "profile:rust",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "evidence": [evidence.clone()]
+    });
+    store.ingest_event(&site).unwrap();
+    let mut edge = next("edge_upsert");
+    edge["edge"] = json!({
+        "id": "edge:use",
+        "site_id": "site:use",
+        "source": "file:lib",
+        "target": "file:model",
+        "kind": "imports",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "profile:rust",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false,
+        "evidence": [evidence]
+    });
+    store.ingest_event(&edge).unwrap();
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("profile:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-579", "completed", None, true)
+        .unwrap();
+}
+
+#[test]
+fn issue_579_dependency_lists_report_degraded_profiles_only_when_present() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let expected = json!([{
+        "profile_id": "profile:rust",
+        "language": "rust",
+        "analysis_mode": "syntax-only",
+        "reasons": ["rust-hir-memory-budget", "rust-hir-syntax-only-fallback"]
+    }]);
+    for degraded in [true, false] {
+        let store_path = temporary.path().join(format!("store-{degraded}.sqlite"));
+        seed_issue_579_store(&store_path, &root, degraded);
+        let mut mcp = InteractiveMcp::start(&root, &store_path);
+        initialize_interactive_mcp(&mut mcp, 1);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let mut id = 2;
+        for (tool, selector) in [
+            ("graph_dependencies_list", "id:file:lib"),
+            ("graph_dependents_list", "id:file:model"),
+        ] {
+            let advertised = tools.iter().find(|entry| entry["name"] == tool).unwrap();
+            assert!(
+                advertised["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("analysis_degradations"),
+                "{tool}"
+            );
+            let output = jsonschema::draft202012::new(&advertised["outputSchema"]).unwrap();
+            for detail in ["full", "summary", "paths"] {
+                id += 1;
+                let result = interactive_tool_call(
+                    &mut mcp,
+                    id,
+                    tool,
+                    json!({
+                        "contract_version": "depgraph-mcp-tools-v1",
+                        "selector": selector,
+                        "detail": detail
+                    }),
+                );
+                assert_eq!(result["isError"], false, "{tool} {detail}: {result}");
+                output.validate(&result["structuredContent"]).unwrap();
+                if detail == "full" {
+                    shared.validate(&result["structuredContent"]).unwrap();
+                }
+                let body = &result["structuredContent"]["result"];
+                if degraded {
+                    assert_eq!(body["analysis_degradations"], expected, "{tool} {detail}");
+                } else {
+                    assert!(
+                        body.get("analysis_degradations").is_none(),
+                        "{tool} {detail}: {body}"
+                    );
+                }
+            }
+        }
+        mcp.finish();
+    }
+}

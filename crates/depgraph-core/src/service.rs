@@ -38,10 +38,11 @@ pub use crate::service_bounded::{
 };
 pub use crate::service_build::{ResolveBuildRequest, ResolveBuildServiceOutcome};
 pub use crate::service_graph::{
-    ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest, CyclesResult,
-    DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
-    ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
-    UnresolvedServiceResult,
+    AnalysisDegradation, ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest,
+    CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
+    ExplainPathResult, ImpactRequest, ImpactServiceResult, MAX_ANALYSIS_DEGRADATION_REASONS,
+    MAX_ANALYSIS_DEGRADATIONS, RUST_SYNTAX_ONLY_ANALYSIS_MODE, RUST_SYNTAX_ONLY_FALLBACK_REASON,
+    UnresolvedRequest, UnresolvedServiceResult, snapshot_analysis_degradations,
 };
 pub use crate::service_health::{
     HealthAuditReadScope, HealthAuditRequest, HealthAuditResult, HealthCoverageOverview,
