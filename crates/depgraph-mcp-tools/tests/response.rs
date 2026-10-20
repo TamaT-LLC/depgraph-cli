@@ -263,23 +263,22 @@ fn issue_565_resource_limits_name_the_bound_the_work_and_the_argument() {
     ));
     assert_eq!(ceiling["remediation"], "narrow_query");
     assert_eq!(ceiling["details"]["argument"], "max_traversal");
-    // A snapshot larger than the ceiling cannot be reached by raising it.
-    let oversized = mapped_error(&DepgraphServiceError::resource_limit(
-        DepgraphResourceLimit::PathEdgeInspection,
-        50_000,
-        Some(2_000_000),
-    ));
-    assert_eq!(oversized["remediation"], "narrow_query");
-    assert_eq!(oversized["details"]["limit"], "snapshot_edges");
-    assert_eq!(oversized["details"]["observed"], 2_000_000);
-    for limit in [
-        DepgraphResourceLimit::AdjacencyEdgeInspection,
-        DepgraphResourceLimit::PreprocessingWorkItems,
+    // Fixed bounds that no argument widens only ask for narrowing.
+    for (limit, name) in [
+        (
+            DepgraphResourceLimit::AdjacencyEdgeInspection,
+            "snapshot_edges",
+        ),
+        (
+            DepgraphResourceLimit::PreprocessingWorkItems,
+            "preprocessing_work_items",
+        ),
     ] {
         let fixed = mapped_error(&DepgraphServiceError::resource_limit(
             limit, 1_000_000, None,
         ));
         assert_eq!(fixed["remediation"], "narrow_query");
+        assert_eq!(fixed["details"]["limit"], name);
         assert!(fixed["details"].get("argument").is_none(), "{fixed}");
         assert!(fixed["details"].get("observed").is_none(), "{fixed}");
     }

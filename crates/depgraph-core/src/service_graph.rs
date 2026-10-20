@@ -1630,9 +1630,9 @@ fn canonical_outgoing_adjacency<'a>(
         }
         if inspected_edges >= max_inspected_edges {
             return Err(DepgraphServiceError::resource_limit(
-                DepgraphResourceLimit::PathEdgeInspection,
+                DepgraphResourceLimit::PreprocessingWorkItems,
                 saturating_u64(max_inspected_edges),
-                Some(saturating_u64(snapshot.edges.len())),
+                None,
             ));
         }
         if filter.matches_edge(snapshot, edge) {
@@ -2740,9 +2740,14 @@ mod tests {
             500,
         )
         .expect("long path request");
+        // The error names the visited-edge bound, not the snapshot size.
         assert!(matches!(
             explain_path_bounded(&long_cycle, &too_long, &CancellationToken::new()),
-            Err(DepgraphServiceError::ResourceExhausted)
+            Err(DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::MaxTraversal,
+                maximum: 500,
+                observed: Some(500),
+            })
         ));
     }
 }

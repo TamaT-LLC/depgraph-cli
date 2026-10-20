@@ -912,13 +912,11 @@ pub enum DepgraphResourceLimit {
     /// Edge visits of one graph traversal, set by the request's
     /// `max_traversal` (CLI `--max-traversal`).
     MaxTraversal,
-    /// Snapshot edges path search inspects while building its adjacency,
-    /// also bounded by the request's `max_traversal`.
-    PathEdgeInspection,
     /// Snapshot edges dependency traversal inspects while building its
     /// adjacency, bounded by the fixed interactive traversal ceiling.
     AdjacencyEdgeInspection,
-    /// Work items of selector resolution and traversal postprocessing.
+    /// Snapshot-wide preprocessing work items: selector resolution, path
+    /// search adjacency, and traversal postprocessing.
     PreprocessingWorkItems,
 }
 
@@ -927,7 +925,6 @@ impl DepgraphResourceLimit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MaxTraversal => "max_traversal",
-            Self::PathEdgeInspection => "path_edge_inspection",
             Self::AdjacencyEdgeInspection => "adjacency_edge_inspection",
             Self::PreprocessingWorkItems => "preprocessing_work_items",
         }
@@ -937,7 +934,7 @@ impl DepgraphResourceLimit {
     #[must_use]
     pub const fn argument(self) -> Option<&'static str> {
         match self {
-            Self::MaxTraversal | Self::PathEdgeInspection => Some("max_traversal"),
+            Self::MaxTraversal => Some("max_traversal"),
             Self::AdjacencyEdgeInspection | Self::PreprocessingWorkItems => None,
         }
     }

@@ -533,15 +533,12 @@ fn map_resource_limit(
 ) -> AgentError {
     let agent_limit = match limit {
         DepgraphResourceLimit::MaxTraversal => AgentResourceLimit::TraversalItems,
-        DepgraphResourceLimit::PathEdgeInspection
-        | DepgraphResourceLimit::AdjacencyEdgeInspection => AgentResourceLimit::SnapshotEdges,
+        DepgraphResourceLimit::AdjacencyEdgeInspection => AgentResourceLimit::SnapshotEdges,
         DepgraphResourceLimit::PreprocessingWorkItems => AgentResourceLimit::PreprocessingWorkItems,
     };
     let argument = limit.argument();
     let ceiling = MAX_INTERACTIVE_QUERY_TRAVERSAL as u64;
-    let raisable = argument.is_some()
-        && maximum < ceiling
-        && observed.is_none_or(|observed| observed <= ceiling);
+    let raisable = argument.is_some() && maximum < ceiling;
     AgentError::new(
         AgentErrorCode::ResourceExhausted,
         false,

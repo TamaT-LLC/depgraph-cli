@@ -611,15 +611,15 @@ fn explain_path_is_canonical_and_never_reports_false_after_exhaustion() -> Resul
             &cancellation,
         )
         .unwrap_err();
-    // max_traversal also bounds the snapshot edges path search inspects, and
-    // the error reports how many edges the snapshot holds (Issue #565).
+    // max_traversal bounds the edges the search visits, and the error names
+    // that bound and the visits made when it stopped (Issue #565).
     assert!(matches!(
         exhausted,
         DepgraphServiceError::ResourceLimitExceeded {
-            limit: DepgraphResourceLimit::PathEdgeInspection,
+            limit: DepgraphResourceLimit::MaxTraversal,
             maximum: 1,
-            observed: Some(observed),
-        } if observed > 1
+            observed: Some(1),
+        }
     ));
 
     let unreachable = service.explain_path(

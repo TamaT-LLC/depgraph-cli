@@ -492,9 +492,10 @@ pub enum AgentResourceLimit {
     /// Edge visits of one traversal; widened by `max_traversal`.
     TraversalItems,
     DeadlineMilliseconds,
-    /// Snapshot edges inspected to build traversal adjacency.
+    /// Snapshot edges a dependency traversal inspects to build its adjacency.
     SnapshotEdges,
-    /// Work items of selector resolution and traversal postprocessing.
+    /// Snapshot-wide preprocessing work items: selector resolution, path
+    /// search adjacency, and traversal postprocessing.
     PreprocessingWorkItems,
 }
 

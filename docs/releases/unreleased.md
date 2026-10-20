@@ -8,7 +8,7 @@ v0.7.0 向けの変更と移行手順は [v0.7.0 リリースノート](v0.7.0.m
 MCP ツールのエラー応答 `error.details` に、原因を特定できる情報を追加する（[#565](https://github.com/TamaT-LLC/depgraph-cli/issues/565)）。
 `contract_version` は `depgraph-mcp-tools-v1` のままで、既存のフィールドと `details` の既存の形は変えない。
 
-- `RESOURCE_EXHAUSTED` の `details`（`kind: "resource_limit"`）に、当たった上限の `limit` と `maximum` に加えて、止まった時点の処理量 `observed` と、上限を動かせる引数 `argument`（例: `max_traversal`）を任意フィールドとして含める。`limit` に `snapshot_edges` と `preprocessing_work_items` を追加する。引数を上げれば通る場合、`remediation` は `narrow_query` ではなく `increase_limit` になる。
+- `RESOURCE_EXHAUSTED` の `details`（`kind: "resource_limit"`）に、当たった上限の `limit` と `maximum` に加えて、止まった時点の処理量 `observed` と、上限を動かせる引数 `argument`（例: `max_traversal`）を任意フィールドとして含める。`limit` に、依存一覧が隣接表の構築で調べる snapshot の edge 数 `snapshot_edges` と、selector の解決や `graph_path_get` の隣接表の構築などに共通する前処理の作業量 `preprocessing_work_items` を追加する。`graph_path_get` が探索中に `max_traversal` に達した場合は、依存一覧と同じ `traversal_items` を返す。引数を上げれば通る場合、`remediation` は `narrow_query` ではなく `increase_limit` になる。
 - `INVALID_ARGUMENT` の `details` に `kind: "argument"` を追加し、問題の引数名 `argument` と理由 `reason`（`missing` / `unknown_argument` / `invalid_value` / `out_of_range` / `too_many_items` / `ambiguous_selector`）を返す。スキーマにない引数は名前を返さない。
 - セレクターに一致するノードがない場合は、`INVALID_ARGUMENT` ではなく `NOT_FOUND`（`reason: "no_matching_node"`）を返す。
 - `graph_query` の不正な query には `kind: "query_diagnostic"` を返し、失敗したコード、構文の節、見つかったトークンの種類、行・列・バイト位置を示す。query の本文は返さない。ツール説明に構文と例を載せる。

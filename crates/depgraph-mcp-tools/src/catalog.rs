@@ -1241,7 +1241,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "type": "integer",
             "minimum": 1,
             "maximum": 1000000,
-            "description": "Edge visit bound of the traversal, default 50000. graph_path_get also bounds the snapshot edges it inspects by this value. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit, its maximum, the observed work when known, and argument=max_traversal when this argument moves the bound; remediation increase_limit means a larger max_traversal can succeed."
+            "description": "Edge visit bound of the traversal, default 50000. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit, its maximum, the observed work when known, and argument=max_traversal when this argument moves the bound; remediation increase_limit means a larger max_traversal can succeed."
         }),
         "profiles_document" => json!({
             "type": "string",

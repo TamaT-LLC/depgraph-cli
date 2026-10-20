@@ -1923,8 +1923,8 @@ fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
             }
         })
     );
-    // graph_path_get also bounds the snapshot edges it inspects by
-    // max_traversal and reports how many edges the snapshot holds.
+    // graph_path_get counts only the edges its search visits against
+    // max_traversal and reports the same bound.
     let path_exhausted = error_of(&interactive_tool_call(
         &mut mcp,
         3,
@@ -1937,12 +1937,7 @@ fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
             "max_traversal": 1
         }),
     ));
-    assert_eq!(path_exhausted["code"], "RESOURCE_EXHAUSTED");
-    assert_eq!(path_exhausted["remediation"], "increase_limit");
-    assert_eq!(path_exhausted["details"]["limit"], "snapshot_edges");
-    assert_eq!(path_exhausted["details"]["maximum"], 1);
-    assert_eq!(path_exhausted["details"]["argument"], "max_traversal");
-    assert!(path_exhausted["details"]["observed"].as_u64().unwrap() > 1);
+    assert_eq!(path_exhausted, exhausted);
 
     // (2) INVALID_ARGUMENT names the schema-defined argument and the reason.
     for (id, arguments, argument, reason) in [
