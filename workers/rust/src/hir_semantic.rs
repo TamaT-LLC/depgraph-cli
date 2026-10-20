@@ -1015,9 +1015,14 @@ impl Extractor<'_> {
                 .unwrap_or_default();
             let syntax_index = FileSyntaxIndex::new(self.db, file_id, &parsed);
             self.index_external_aliases(&crate_key, module, &syntax_index, occurrences);
-            dependency_sources.push((crate_key, file_id, path, module, syntax_index, occurrences));
+            drop(syntax_index);
+            drop(parsed);
+            self.sema = Semantics::new(self.db);
+            dependency_sources.push((crate_key, file_id, path, module, occurrences));
         }
-        for (crate_key, file_id, path, module, syntax_index, occurrences) in dependency_sources {
+        for (crate_key, file_id, path, module, occurrences) in dependency_sources {
+            let parsed = self.sema.parse_guess_edition(file_id);
+            let syntax_index = FileSyntaxIndex::new(self.db, file_id, &parsed);
             self.extract_dependency_occurrences(
                 &crate_key,
                 file_id,
@@ -1026,6 +1031,9 @@ impl Extractor<'_> {
                 &syntax_index,
                 occurrences,
             )?;
+            drop(syntax_index);
+            drop(parsed);
+            self.sema = Semantics::new(self.db);
         }
         Ok(())
     }
@@ -2885,12 +2893,24 @@ impl Extractor<'_> {
                 "bundled sysroot definition has no stable canonical name".into(),
             ));
         };
+        let Some(owner_segments) = self.sysroot_owner_segments(definition) else {
+            return Ok(ClassifiedTarget::Unsupported(
+                "bundled sysroot associated item has no exact attested owner".into(),
+            ));
+        };
         let mut resolver = format!("rust-sysroot#{sysroot_name}::crate");
         for segment in module_path {
             resolver.push_str("::");
             resolver.push_str(&segment);
         }
-        if !resolver.ends_with(&format!("::{display_name}")) {
+        // Associated items, enum variants, and fields are qualified by their
+        // owner so that, for example, `std::fs::read` and the `read` method of
+        // `impl Read for File` in the same module keep distinct identities.
+        for segment in &owner_segments {
+            resolver.push_str("::");
+            resolver.push_str(segment);
+        }
+        if !owner_segments.is_empty() || !resolver.ends_with(&format!("::{display_name}")) {
             resolver.push_str("::");
             resolver.push_str(&display_name);
         }
@@ -2978,6 +2998,73 @@ impl Extractor<'_> {
             node_id,
             external: false,
         })
+    }
+
+    /// Owner path segments between a bundled sysroot definition's module path
+    /// and its own name: the trait or impl of an associated item, the enum of
+    /// a variant, and the struct, union, or enum variant of a field.  `None`
+    /// means an impl owner has no exact attested source to identify it.
+    fn sysroot_owner_segments(&self, definition: Definition) -> Option<Vec<String>> {
+        let assoc_item = match definition {
+            Definition::Function(function) => function.as_assoc_item(self.db),
+            Definition::Const(constant) => constant.as_assoc_item(self.db),
+            Definition::TypeAlias(alias) => alias.as_assoc_item(self.db),
+            Definition::EnumVariant(variant) => {
+                return Some(vec![
+                    variant
+                        .parent_enum(self.db)
+                        .name(self.db)
+                        .as_str()
+                        .to_owned(),
+                ]);
+            }
+            Definition::Field(field) => {
+                return Some(match field.parent_def(self.db) {
+                    ra_ap_hir::Variant::Struct(struct_) => {
+                        vec![struct_.name(self.db).as_str().to_owned()]
+                    }
+                    ra_ap_hir::Variant::Union(union) => {
+                        vec![union.name(self.db).as_str().to_owned()]
+                    }
+                    ra_ap_hir::Variant::EnumVariant(variant) => vec![
+                        variant
+                            .parent_enum(self.db)
+                            .name(self.db)
+                            .as_str()
+                            .to_owned(),
+                        variant.name(self.db).as_str().to_owned(),
+                    ],
+                });
+            }
+            _ => None,
+        };
+        let Some(assoc_item) = assoc_item else {
+            return Some(Vec::new());
+        };
+        match assoc_item.container(self.db) {
+            AssocItemContainer::Trait(trait_) => {
+                Some(vec![trait_.name(self.db).as_str().to_owned()])
+            }
+            AssocItemContainer::Impl(impl_) => {
+                let location = self.definition_location(Definition::SelfType(impl_))?;
+                // `canonical_type` names a sysroot ADT by its resolver only
+                // after an earlier reference materialized it, so the owner
+                // uses the bare ADT name to stay independent of scan order.
+                // The impl location already makes the owner unique.
+                let self_type = impl_.self_ty(self.db).as_adt().map_or_else(
+                    || "_".to_owned(),
+                    |adt| adt.name(self.db).as_str().to_owned(),
+                );
+                let trait_suffix = impl_
+                    .trait_(self.db)
+                    .map(|trait_| format!(" as {}", trait_.name(self.db).as_str()))
+                    .unwrap_or_default();
+                Some(vec![format!(
+                    "impl<{self_type}{trait_suffix}>@{}:{}:{}",
+                    location.path, location.start_line, location.start_column
+                )])
+            }
+        }
     }
 
     fn sysroot_root_location(&self, sysroot_name: &str) -> Option<SourceLocation> {

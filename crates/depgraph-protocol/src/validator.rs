@@ -1215,6 +1215,16 @@ fn validate_semantic_maps(
         }
     }
 
+    // Index edges by their dependency site once. Scanning every edge for
+    // every site made this validation quadratic, which took tens of minutes
+    // on a workspace with a few hundred thousand HIR edges (#564).
+    let mut edges_by_site = BTreeMap::<&str, Vec<&GraphEdge>>::new();
+    for edge in edges.values() {
+        if let Some(site_id) = edge.site_id.as_deref() {
+            edges_by_site.entry(site_id).or_default().push(edge);
+        }
+    }
+
     let mut code_link_sources = BTreeSet::new();
     for site in sites.values() {
         let strict_dependency_site = strict_dependency_sites.contains(site.id.as_str());
@@ -1419,10 +1429,7 @@ fn validate_semantic_maps(
             || go_semantic_site
             || framework_semantic_site
             || (web_semantic_site && site.kind == "call");
-        for edge in edges
-            .values()
-            .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
-        {
+        for edge in edges_by_site.get(site.id.as_str()).into_iter().flatten() {
             if edge.kind != expected_edge_kind {
                 return invariant(format!(
                     "semantic dependency site {} requires {expected_edge_kind} edges, found {}",

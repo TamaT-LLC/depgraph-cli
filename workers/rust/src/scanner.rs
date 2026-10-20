@@ -225,6 +225,13 @@ struct State {
     package_nodes: BTreeMap<usize, String>,
     file_nodes: BTreeMap<String, String>,
     module_nodes: BTreeMap<ModuleKey, BTreeSet<String>>,
+    /// File nodes holding the items of each statically known module: the
+    /// crate root file, the file an out-of-line `mod` declaration resolves
+    /// to, or the file that contains an inline `mod` block.
+    module_body_files: BTreeMap<ModuleKey, BTreeSet<String>>,
+    /// Source-phase edges of each syntax dependency site, so that a site's
+    /// edges are found without scanning every edge of the graph.
+    syntax_site_edges: BTreeMap<String, BTreeSet<String>>,
     syntax_type_nodes: BTreeMap<SyntaxTypeKey, Vec<SyntaxTypeCandidate>>,
     rust_prelude_policies: BTreeMap<usize, RustPreludePolicy>,
     source_module_contexts: BTreeMap<(usize, String), BTreeSet<ModuleContext>>,
@@ -566,7 +573,7 @@ fn scan_with_inventory_and_semantic_extractor(
     });
     if let Some(model) = hir_model {
         let hir_semantic_started = Instant::now();
-        state.extract_hir_semantics(&packages, &sources, &model, semantic_extractor);
+        state.extract_hir_semantics(&packages, &sources, model, semantic_extractor);
         let semantic_items = state
             .profile
             .properties
@@ -607,6 +614,38 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+/// Sizes of a semantic delta, recorded before the delta is merged.
+struct SemanticDeltaCounts {
+    node_count: u64,
+    relation_count: u64,
+    site_count: u64,
+    call_site_count: u64,
+}
+
+impl SemanticDeltaCounts {
+    fn of(delta: &SemanticDelta) -> Self {
+        Self {
+            node_count: delta.nodes.len() as u64,
+            relation_count: delta.edges.len() as u64,
+            site_count: delta.sites.len() as u64,
+            call_site_count: delta
+                .sites
+                .iter()
+                .filter(|site| site.kind == "call")
+                .count() as u64,
+        }
+    }
+}
+
+/// Keys a semantic merge inserted, so that a failed merge can be undone.
+#[derive(Default)]
+struct SemanticMergeUndo {
+    nodes: Vec<String>,
+    edges: Vec<String>,
+    sites: Vec<String>,
+    site_files: Vec<String>,
+}
+
 impl State {
     fn new(
         root: PathBuf,
@@ -627,6 +666,8 @@ impl State {
             package_nodes: BTreeMap::new(),
             file_nodes: BTreeMap::new(),
             module_nodes: BTreeMap::new(),
+            module_body_files: BTreeMap::new(),
+            syntax_site_edges: BTreeMap::new(),
             syntax_type_nodes: BTreeMap::new(),
             rust_prelude_policies: BTreeMap::new(),
             source_module_contexts: BTreeMap::new(),
@@ -1277,33 +1318,40 @@ impl State {
         &mut self,
         packages: &[Package],
         sources: &[SourceUnit],
-        model: &SafeProjectModel,
+        model: SafeProjectModel,
         semantic_extractor: SemanticExtractor,
     ) {
-        let result = (|| -> Result<(SemanticDelta, BTreeMap<String, SemanticCrateContext>)> {
-            let contexts = self.semantic_crate_contexts(packages, model)?;
+        let extracted = (|| -> Result<(SemanticDelta, BTreeMap<String, SemanticCrateContext>)> {
+            let contexts = self.semantic_crate_contexts(packages, &model)?;
             let occurrences_by_path = sources
                 .iter()
                 .filter(|source| source.parsed)
                 .map(|source| (source.rel_path.as_str(), source.occurrences.as_slice()))
                 .collect();
             let delta =
-                semantic_extractor(model, &contexts, &occurrences_by_path, &self.profile.id)?;
-            self.merge_semantic_delta(&delta)?;
+                semantic_extractor(&model, &contexts, &occurrences_by_path, &self.profile.id)?;
             Ok((delta, contexts))
         })();
+        // The rust-analyzer database holds every query result of the
+        // extraction. Release it before the delta is merged so that the
+        // database and the merged graph are never resident together (#564).
+        drop(model);
+        let result = extracted.and_then(|(mut delta, contexts)| {
+            let counts = SemanticDeltaCounts::of(&delta);
+            let issues = std::mem::take(&mut delta.issues);
+            self.merge_semantic_delta(delta)?;
+            Ok((counts, issues, contexts))
+        });
 
         match result {
-            Ok((delta, contexts)) => {
-                let node_count = delta.nodes.len() as u64;
-                let relation_count = delta.edges.len() as u64;
-                let site_count = delta.sites.len() as u64;
-                let call_site_count = delta
-                    .sites
-                    .iter()
-                    .filter(|site| site.kind == "call")
-                    .count() as u64;
-                let issue_count = delta.issues.len() as u64;
+            Ok((counts, issues, contexts)) => {
+                let SemanticDeltaCounts {
+                    node_count,
+                    relation_count,
+                    site_count,
+                    call_site_count,
+                } = counts;
+                let issue_count = issues.len() as u64;
                 self.profile.properties.insert(
                     "analysis".into(),
                     Value::String("syntax+hir-imports-types-calls".into()),
@@ -1373,7 +1421,7 @@ impl State {
                     None,
                     "rust-hir-semantic-graph-ready",
                 );
-                for issue in delta.issues {
+                for issue in issues {
                     self.reasons.insert("rust-hir-semantic-incomplete".into());
                     self.add_diagnostic(
                         DiagnosticSeverity::Warning,
@@ -1469,23 +1517,90 @@ impl State {
         Ok(contexts)
     }
 
-    fn merge_semantic_delta(&mut self, delta: &SemanticDelta) -> Result<()> {
-        let mut nodes = self.nodes.clone();
-        let mut edges = self.edges.clone();
-        let mut sites = self.sites.clone();
-        let mut files = self.files.clone();
-        for node in &delta.nodes {
-            if let Some(existing) = nodes.get(&node.id) {
-                if existing != node {
-                    bail!("semantic delta conflicts with node {}", node.id);
-                }
-            } else {
-                nodes.insert(node.id.clone(), node.clone());
+    /// Unions a validated HIR semantic delta into the syntax graph.
+    ///
+    /// The merge is atomic: on any conflict or validation failure every node,
+    /// edge, site, and file counter it added is removed again, so the syntax
+    /// graph is left exactly as it was. It moves the delta in and records only
+    /// the keys it inserted instead of cloning the whole graph, because on a
+    /// large workspace a second copy of the graph alone takes gigabytes (#564).
+    fn merge_semantic_delta(&mut self, delta: SemanticDelta) -> Result<()> {
+        let SemanticDelta {
+            nodes,
+            edges,
+            sites,
+            refined_use_keys,
+            refined_type_use_keys,
+            refined_call_keys,
+            issues: _,
+        } = delta;
+        let mut semantic_import_sites = 0_usize;
+        let mut semantic_type_use_sites = 0_usize;
+        let mut semantic_call_sites = 0_usize;
+        for site in &sites {
+            match site.kind.as_str() {
+                "rust_use" | "rust_reexport" | "extern_crate" => semantic_import_sites += 1,
+                "type_use" => semantic_type_use_sites += 1,
+                "call" => semantic_call_sites += 1,
+                _ => {}
             }
         }
-        for site in &delta.sites {
-            if let Some(existing) = sites.get(&site.id) {
-                if existing != site {
+        if semantic_import_sites != refined_use_keys.len() {
+            bail!(
+                "semantic import refinement ledger has {semantic_import_sites} sites but {} occurrence keys",
+                refined_use_keys.len()
+            );
+        }
+        if semantic_type_use_sites != refined_type_use_keys.len() {
+            bail!(
+                "semantic type-use refinement ledger has {semantic_type_use_sites} sites but {} occurrence keys",
+                refined_type_use_keys.len()
+            );
+        }
+        if semantic_call_sites != refined_call_keys.len() {
+            bail!(
+                "semantic call refinement ledger has {semantic_call_sites} sites but {} occurrence keys",
+                refined_call_keys.len()
+            );
+        }
+
+        let mut inserted = SemanticMergeUndo::default();
+        let merged = self
+            .insert_semantic_delta(nodes, edges, sites, &mut inserted)
+            .and_then(|()| {
+                validate_semantic_graph_maps(&self.nodes, &self.edges, &self.sites)
+                    .context("validate Rust HIR semantic delta")
+            });
+        if let Err(error) = merged {
+            self.undo_semantic_merge(inserted);
+            return Err(error);
+        }
+        self.semantic_type_use_occurrences
+            .extend(refined_type_use_keys);
+        self.semantic_call_occurrences.extend(refined_call_keys);
+        Ok(())
+    }
+
+    fn insert_semantic_delta(
+        &mut self,
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
+        sites: Vec<DependencySite>,
+        inserted: &mut SemanticMergeUndo,
+    ) -> Result<()> {
+        for node in nodes {
+            if let Some(existing) = self.nodes.get(&node.id) {
+                if existing != &node {
+                    bail!("semantic delta conflicts with node {}", node.id);
+                }
+                continue;
+            }
+            inserted.nodes.push(node.id.clone());
+            self.nodes.insert(node.id.clone(), node);
+        }
+        for site in sites {
+            if let Some(existing) = self.sites.get(&site.id) {
+                if existing != &site {
                     bail!("semantic delta conflicts with site {}", site.id);
                 }
                 continue;
@@ -1498,71 +1613,44 @@ impl State {
                 .path
                 .as_deref()
                 .with_context(|| format!("semantic site {} has no evidence path", site.id))?;
-            let file = files.get_mut(path).with_context(|| {
+            let file = self.files.get_mut(path).with_context(|| {
                 format!("semantic site {} references unknown file {path}", site.id)
             })?;
             file.discovered_sites += 1;
             file.emitted_sites += 1;
-            sites.insert(site.id.clone(), site.clone());
+            inserted.site_files.push(path.to_owned());
+            inserted.sites.push(site.id.clone());
+            self.sites.insert(site.id.clone(), site);
         }
-        for edge in &delta.edges {
-            if let Some(existing) = edges.get(&edge.id) {
-                if existing != edge {
+        for edge in edges {
+            if let Some(existing) = self.edges.get(&edge.id) {
+                if existing != &edge {
                     bail!("semantic delta conflicts with edge {}", edge.id);
                 }
-            } else {
-                edges.insert(edge.id.clone(), edge.clone());
+                continue;
+            }
+            inserted.edges.push(edge.id.clone());
+            self.edges.insert(edge.id.clone(), edge);
+        }
+        Ok(())
+    }
+
+    fn undo_semantic_merge(&mut self, inserted: SemanticMergeUndo) {
+        for id in inserted.nodes {
+            self.nodes.remove(&id);
+        }
+        for id in inserted.edges {
+            self.edges.remove(&id);
+        }
+        for id in inserted.sites {
+            self.sites.remove(&id);
+        }
+        for path in inserted.site_files {
+            if let Some(file) = self.files.get_mut(&path) {
+                file.discovered_sites -= 1;
+                file.emitted_sites -= 1;
             }
         }
-        let semantic_import_sites = delta
-            .sites
-            .iter()
-            .filter(|site| {
-                matches!(
-                    site.kind.as_str(),
-                    "rust_use" | "rust_reexport" | "extern_crate"
-                )
-            })
-            .count();
-        if semantic_import_sites != delta.refined_use_keys.len() {
-            bail!(
-                "semantic import refinement ledger has {semantic_import_sites} sites but {} occurrence keys",
-                delta.refined_use_keys.len()
-            );
-        }
-        let semantic_type_use_sites = delta
-            .sites
-            .iter()
-            .filter(|site| site.kind == "type_use")
-            .count();
-        if semantic_type_use_sites != delta.refined_type_use_keys.len() {
-            bail!(
-                "semantic type-use refinement ledger has {semantic_type_use_sites} sites but {} occurrence keys",
-                delta.refined_type_use_keys.len()
-            );
-        }
-        let semantic_call_sites = delta
-            .sites
-            .iter()
-            .filter(|site| site.kind == "call")
-            .count();
-        if semantic_call_sites != delta.refined_call_keys.len() {
-            bail!(
-                "semantic call refinement ledger has {semantic_call_sites} sites but {} occurrence keys",
-                delta.refined_call_keys.len()
-            );
-        }
-        validate_semantic_graph_maps(&nodes, &edges, &sites)
-            .context("validate Rust HIR semantic delta")?;
-        self.nodes = nodes;
-        self.edges = edges;
-        self.sites = sites;
-        self.files = files;
-        self.semantic_type_use_occurrences
-            .extend(delta.refined_type_use_keys.iter().cloned());
-        self.semantic_call_occurrences
-            .extend(delta.refined_call_keys.iter().cloned());
-        Ok(())
     }
 
     fn record_hir_project_unavailable(&mut self, path: Option<&str>, reason: &str) {
@@ -2016,6 +2104,21 @@ impl State {
 
     fn index_modules(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         self.prepare_module_contexts(packages, sources);
+        for ((package_index, rel_path), contexts) in &self.source_module_contexts {
+            let Some(file_node) = self.file_nodes.get(rel_path) else {
+                continue;
+            };
+            for context in contexts {
+                self.module_body_files
+                    .entry(ModuleKey {
+                        package_index: *package_index,
+                        scope: context.scope.clone(),
+                        path: context.path.clone(),
+                    })
+                    .or_default()
+                    .insert(file_node.clone());
+            }
+        }
         for source in sources {
             let (Some(package_index), true) = (source.package_index, source.parsed) else {
                 continue;
@@ -2075,12 +2178,19 @@ impl State {
                             "canonical_module_path": canonical_name
                         })),
                     })?;
+                    let module_key = ModuleKey {
+                        package_index,
+                        scope: context.scope,
+                        path: module_path,
+                    };
+                    if inline {
+                        self.module_body_files
+                            .entry(module_key.clone())
+                            .or_default()
+                            .insert(source_node.clone());
+                    }
                     self.module_nodes
-                        .entry(ModuleKey {
-                            package_index,
-                            scope: context.scope,
-                            path: module_path,
-                        })
+                        .entry(module_key)
                         .or_default()
                         .insert(module_id.clone());
                     self.add_structural_edge(
@@ -2992,6 +3102,13 @@ impl State {
                 .cloned()
                 .unwrap_or_default();
             let mut targets = BTreeSet::new();
+            // A path that names the crate root explicitly (`crate::Item`,
+            // `super::Item` from a top-level module) resolves to the root
+            // file. Paths rooted in the extern prelude never fall back to the
+            // crate root, because their first segment may name an item that
+            // is not a module at all.
+            let explicit_root = matches!(first, "crate" | "self" | "super");
+            let own_file = self.file_nodes.get(path).cloned();
             for context in contexts {
                 let mut module_path;
                 let mut cursor;
@@ -3024,14 +3141,35 @@ impl State {
                     }
                 }
                 module_path.extend(parts[cursor..].iter().cloned());
-                for prefix_len in (0..=module_path.len()).rev() {
+                let shortest_prefix = usize::from(!explicit_root);
+                for prefix_len in (shortest_prefix..=module_path.len()).rev() {
                     let key = ModuleKey {
                         package_index,
                         scope: context.scope.clone(),
                         path: module_path[..prefix_len].to_vec(),
                     };
+                    // Prefer the file that holds the module's items, so that
+                    // `use crate::a::Item` is a file-level dependency on the
+                    // file of module `a` rather than on the file that merely
+                    // declares `mod a;`. A path into the importing file itself
+                    // keeps the module-level target instead of a file
+                    // self-loop.
+                    let body_files = self.module_body_files.get(&key);
+                    let other_files: Vec<_> = body_files
+                        .into_iter()
+                        .flatten()
+                        .filter(|file| Some(*file) != own_file.as_ref())
+                        .cloned()
+                        .collect();
+                    if !other_files.is_empty() {
+                        targets.extend(other_files);
+                        break;
+                    }
                     if let Some(nodes) = self.module_nodes.get(&key) {
                         targets.extend(nodes.iter().cloned());
+                        break;
+                    }
+                    if body_files.is_some() {
                         break;
                     }
                 }
@@ -3273,6 +3411,10 @@ impl State {
                 Some(&self.profile.id),
                 &format!("site:{site_id}:{edge_kind}:{target}"),
             );
+            self.syntax_site_edges
+                .entry(site_id.clone())
+                .or_default()
+                .insert(edge_id.clone());
             self.insert_edge(GraphEdge {
                 id: edge_id,
                 source: source.into(),
@@ -3499,11 +3641,10 @@ impl State {
                 );
             }
         }
-        for edge in self
-            .edges
-            .values_mut()
-            .filter(|edge| edge.site_id.as_deref() == Some(site_id))
-        {
+        for edge_id in self.syntax_site_edges.get(site_id).into_iter().flatten() {
+            let Some(edge) = self.edges.get_mut(edge_id) else {
+                continue;
+            };
             for edge_evidence in &mut edge.evidence {
                 edge_evidence.properties.insert(
                     "fallback_diagnostic_group".into(),
@@ -5016,6 +5157,119 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("src/lib.rs"), source).unwrap();
+    }
+
+    #[test]
+    fn syntax_only_crate_paths_resolve_to_the_file_of_the_named_module() {
+        // #564: without HIR, `use crate::a::Item` must be a file-level
+        // dependency on the file that holds module `a`, not on the crate root
+        // file that only declares `mod a;`.
+        let temp = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            temp.path(),
+            r#"pub mod model;
+pub mod nested;
+pub mod inline {
+    pub struct Inner;
+}
+
+pub struct Root;
+pub enum Kind {
+    A,
+}
+
+use crate::model::Thing;
+use Kind::A;
+"#,
+        );
+        fs::write(
+            temp.path().join("src/model.rs"),
+            "pub struct Thing;\nuse crate::Root;\nuse super::nested::deep::Leaf;\n",
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        fs::write(temp.path().join("src/nested/mod.rs"), "pub mod deep;\n").unwrap();
+        fs::write(
+            temp.path().join("src/nested/deep.rs"),
+            "pub struct Leaf;\nuse crate::inline::Inner;\nuse self::Missing;\n",
+        )
+        .unwrap();
+
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        assert_eq!(result.profile.properties["rust_hir_mode"], "syntax-only");
+
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let use_site = |source: &str, specifier: &str| {
+            let source_id = file_id(source);
+            result
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == "rust_use"
+                        && site.source == source_id
+                        && site.specifier == specifier
+                })
+                .unwrap_or_else(|| panic!("missing use site {specifier} in {source}"))
+        };
+        for (source, specifier, target) in [
+            ("src/lib.rs", "crate::model::Thing", "src/model.rs"),
+            ("src/model.rs", "crate::Root", "src/lib.rs"),
+            (
+                "src/model.rs",
+                "super::nested::deep::Leaf",
+                "src/nested/deep.rs",
+            ),
+            ("src/nested/deep.rs", "crate::inline::Inner", "src/lib.rs"),
+        ] {
+            let site = use_site(source, specifier);
+            assert_eq!(
+                site.resolution_status,
+                ResolutionStatus::Resolved,
+                "{source}: {specifier}"
+            );
+            assert_eq!(
+                site.target_ids,
+                vec![file_id(target)],
+                "{source}: {specifier}"
+            );
+            assert!(
+                result.edges.iter().any(|edge| {
+                    edge.site_id.as_deref() == Some(site.id.as_str())
+                        && edge.kind == "imports"
+                        && edge.target == file_id(target)
+                }),
+                "{source}: {specifier}"
+            );
+        }
+        // A path that is not rooted at `crate`, `self`, or `super` never falls
+        // back to the crate root file: `Kind` is an enum, not a module.
+        assert_eq!(
+            use_site("src/lib.rs", "Kind::A").resolution_status,
+            ResolutionStatus::Unresolved
+        );
+        // A path into the importing file itself keeps its module-level target
+        // instead of becoming a file self-loop.
+        let self_path = use_site("src/nested/deep.rs", "self::Missing");
+        assert_eq!(self_path.target_ids.len(), 1);
+        assert!(result.nodes.iter().any(|node| {
+            node.id == self_path.target_ids[0]
+                && node.kind == "module"
+                && node.display_name.as_deref() == Some("nested::deep")
+        }));
     }
 
     #[test]
