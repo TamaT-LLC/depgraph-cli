@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.7.0";
+const STABLE_RELEASE_VERSION: &str = "0.7.1";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.7";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -191,7 +191,7 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.0";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.1";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
@@ -694,6 +694,9 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.6.4'",
         "V0_6_4_RELEASE_SOURCE_SHA: 35c3edea133b7f5a0cd269edd945776d9db9e7f2",
         "historical_source_sha=\"$V0_6_4_RELEASE_SOURCE_SHA\"",
+        "github.event.workflow_run.head_branch == 'v0.7.0'",
+        "V0_7_0_RELEASE_SOURCE_SHA: defa669857aaa026d8aca445ce742484e1ffcc00",
+        "historical_source_sha=\"$V0_7_0_RELEASE_SOURCE_SHA\"",
         "STABLE_MAINTENANCE_REF: heads/release/0.7",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",

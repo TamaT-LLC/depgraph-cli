@@ -118,7 +118,7 @@ git fetch origin main
 test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 test -f "docs/releases/${release_tag}.md"
 
-if [[ "$release_tag" == "v0.7.0" ]]; then
+if [[ "$release_tag" == "v0.7.1" ]]; then
   maintenance="$(git ls-remote origin refs/heads/release/0.7 | awk '{print $1}')"
   if [[ -n "$maintenance" ]]; then
     git fetch origin refs/heads/release/0.7
@@ -338,3 +338,9 @@ workflowで残りの検証を完走できる。recoveryは元runをsuccessに見
 通常のPRでは高速CIとGreptileだけを完了条件にする。
 OS固有処理、toolchain、依存関係、package、release workflow、性能契約を変更するPRでは、マージ前にも`workflow_dispatch`で対象branchのフルCIを実行する。
 リリース時は`main`のフルCIを一度通し、そのexact commitへタグを作成する。
+
+## v0.7.1 patch release
+
+v0.7.1 は main の `6f1ee30` を基点に、製品と adapter の版、native smoke の実測値、リリースノートを更新する。
+公開済み v0.7.0 の署名 tag と source `defa669857aaa026d8aca445ce742484e1ffcc00` は履歴として固定する。
+`release/0.7` を exact Full CI が成功した main の candidate へ fast-forward してから、同じ source に署名 tag `v0.7.1` を作る。
