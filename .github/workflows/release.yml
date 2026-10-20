@@ -322,7 +322,7 @@ jobs:
           main_head_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
           test "$GITHUB_SHA" = "$main_head_sha"
           maintenance_head_sha="$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.7.0" ]]; then
+          if [[ "$GITHUB_REF_NAME" == "v0.7.1" ]]; then
             maintenance_head_sha="$(git ls-remote origin refs/heads/release/0.7 | awk '{print $1}')"
             test "$GITHUB_SHA" = "$maintenance_head_sha"
           fi
@@ -399,7 +399,7 @@ jobs:
           test "$(jq -r '.object.type' <<<"$tag_payload")" = "commit"
           test "$(jq -r '.object.sha' <<<"$tag_payload")" = "$GITHUB_SHA"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" == "v0.7.0" ]]; then
+          if [[ "$GITHUB_REF_NAME" == "v0.7.1" ]]; then
             test "$(git ls-remote origin refs/heads/release/0.7 | awk '{print $1}')" = "$GITHUB_SHA"
           fi
           test "$(jq -r '.verification.signature != null' <<<"$tag_payload")" = "true"
