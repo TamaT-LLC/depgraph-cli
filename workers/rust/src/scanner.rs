@@ -964,6 +964,7 @@ impl State {
                 display_name: Some(rel_path.clone()),
                 properties: properties(json!({
                     "language": "rust",
+                    "path": rel_path,
                     "generated": generated,
                     "package": package_index.map(|index| packages[index].name.clone()),
                     "package_locator": package_locator,
@@ -1746,6 +1747,7 @@ impl State {
                         properties: properties(json!({
                             "language": "rust",
                             "crate_root": true,
+                            "source_path": target.src_path,
                             "target_kind": target.kind,
                             "crate_scope": scope,
                             "canonical_module_path": "",
@@ -3345,9 +3347,10 @@ impl State {
                     id: id.clone(),
                     kind: kind.into(),
                     locator: format!("file:{rel}"),
-                    display_name: Some(rel),
+                    display_name: Some(rel.clone()),
                     properties: properties(json!({
                         "language": if macro_name == "include" { "rust" } else { "data" },
+                        "path": rel,
                         "included_by_macro": macro_name
                     })),
                 })?;
