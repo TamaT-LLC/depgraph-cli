@@ -646,6 +646,64 @@ mod doctor_schema {
         protocol: Option<LifecycleText>,
         integrity: LifecycleText,
         root_launch_allowed: bool,
+        // The fields below were added for #569. They are optional in the
+        // schema so a report from an earlier server still validates.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolution: Option<WorkerResolution>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact: Option<RepositoryRelativePath>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_requirement: Option<LifecycleText>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unavailable_reason: Option<WorkerUnavailableReason>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_launch_blocked_reason: Option<WorkerRootLaunchBlockedReason>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_impact: Option<WorkerScanImpact>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<LifecycleText>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remediation: Option<LifecycleText>,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "kebab-case")]
+    enum WorkerResolution {
+        ReleaseManifest,
+        EnvironmentOverride,
+        DevelopmentBuild,
+        Unresolved,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "kebab-case")]
+    enum WorkerUnavailableReason {
+        ReleaseVerificationFailed,
+        OverrideUnreadable,
+        NotFound,
+        ProbeSuppressed,
+        RuntimeUnavailable,
+        RuntimeRequirementUnmet,
+        IntegrityMismatch,
+        HandshakeFailed,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "kebab-case")]
+    enum WorkerRootLaunchBlockedReason {
+        WorkerUnavailable,
+        ArtifactInsideRoot,
+        RuntimeUnavailable,
+        ArtifactMissing,
+        LaunchPolicyViolation,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(rename_all = "kebab-case")]
+    enum WorkerScanImpact {
+        WorkerUsed,
+        AdapterUnitsFail,
+        ScanSecurityFailed,
     }
 
     #[derive(JsonSchema)]

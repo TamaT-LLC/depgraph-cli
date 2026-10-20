@@ -140,7 +140,7 @@ impl AdapterKind {
         }
     }
 
-    fn env_override(self) -> &'static str {
+    pub(crate) fn env_override(self) -> &'static str {
         match self {
             Self::Rust => "DEPGRAPH_RUST_WORKER",
             Self::Go => "DEPGRAPH_GO_WORKER",
@@ -449,6 +449,14 @@ struct BundledManifest {
     license_expression: String,
     project_licenses: Vec<BundledArtifact>,
     core: BundledArtifact,
+    /// Release companions that run the core service in their own process
+    /// (the MCP server answers `doctor_get`, and the operation runner executes
+    /// MCP-submitted scans). Either may be the running executable that
+    /// locates workers; see `verify_running_release_executable`.
+    #[serde(default)]
+    mcp_server: Option<BundledArtifact>,
+    #[serde(default)]
+    operation_runner: Option<BundledArtifact>,
     schema: BundledArtifact,
     query_fixture: BundledArtifact,
     cross_language_fixture: BundledArtifact,
@@ -625,14 +633,7 @@ fn locate_verified_bundled_worker_for_executable(
     }
     let core = verify_bundled_artifact(&release_root, &manifest.core, "core executable")?;
     if let Some(expected) = expected_executable {
-        let expected = expected
-            .canonicalize()
-            .context("security policy violation: failed to canonicalize the running core")?;
-        if core != expected {
-            bail!(
-                "security policy violation: release manifest core path does not match the running executable"
-            );
-        }
+        verify_running_release_executable(&release_root, &manifest, &core, expected)?;
     }
     verify_bundled_artifact(&release_root, &manifest.schema, "protocol schema")?;
     if manifest.query_fixture.path != BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH
@@ -1199,6 +1200,65 @@ pub(crate) fn verify_web_release_handshake(
         bail!("security policy violation: Web worker semantic handshake mismatch");
     }
     Ok(())
+}
+
+/// Release-relative paths of the companion executables that may locate
+/// workers from the same verified release as the core.
+const RELEASE_MCP_SERVER_BASENAME: &str = "depgraph-mcp";
+const RELEASE_OPERATION_RUNNER_BASENAME: &str = "depgraph-operation-runner";
+
+/// Accepts the running executable when it is the verified core or one of the
+/// release companions the manifest attests by path and checksum.
+///
+/// `depgraph doctor` and `depgraph scan` run in the core, but the MCP server
+/// answers `doctor_get` in its own process and MCP-submitted scans run in the
+/// operation runner. Requiring the core path alone made both report every
+/// worker as unavailable although the core's own scan used the same workers
+/// (#569). A companion is accepted only at its fixed release path and only
+/// after its checksum matches the manifest, so a binary copied next to a
+/// release still fails closed.
+fn verify_running_release_executable(
+    release_root: &Path,
+    manifest: &BundledManifest,
+    core: &Path,
+    running: &Path,
+) -> Result<()> {
+    let running = running
+        .canonicalize()
+        .context("security policy violation: failed to canonicalize the running executable")?;
+    if running == core {
+        return Ok(());
+    }
+    let companions = [
+        (
+            manifest.mcp_server.as_ref(),
+            format!("bin/{}", executable_name(RELEASE_MCP_SERVER_BASENAME)),
+            "MCP server executable",
+        ),
+        (
+            manifest.operation_runner.as_ref(),
+            format!(
+                "libexec/{}",
+                executable_name(RELEASE_OPERATION_RUNNER_BASENAME)
+            ),
+            "operation runner executable",
+        ),
+    ];
+    for (artifact, expected_path, description) in companions {
+        let Some(artifact) = artifact else {
+            continue;
+        };
+        if artifact.path != expected_path
+            || release_root.join(&artifact.path).canonicalize().ok() != Some(running.clone())
+        {
+            continue;
+        }
+        verify_bundled_artifact(release_root, artifact, description)?;
+        return Ok(());
+    }
+    bail!(
+        "security policy violation: the running executable is neither the release manifest core nor an attested release companion"
+    )
 }
 
 fn verify_bundled_artifact(

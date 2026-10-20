@@ -2771,6 +2771,9 @@ fn print_agent_doctor_human(report: &serde_json::Value, details: bool) {
     if let Some(protocol) = report["protocol_version"].as_str() {
         println!("protocol: {protocol}");
     }
+    for line in agent_doctor_worker_lines(report) {
+        println!("{line}");
+    }
     if let Some(latest) = report["latest_attempt"].as_object() {
         let status = latest["status"].as_str().unwrap_or("unknown");
         println!("latest attempt: {status}");
@@ -2780,6 +2783,57 @@ fn print_agent_doctor_human(report: &serde_json::Value, details: bool) {
     if details {
         println!("details: redacted agent-safe projection");
     }
+}
+
+/// One summary line per worker plus its scan impact and explanation, so the
+/// human report says how each worker was located and, when it cannot run,
+/// which check failed and what a scan gets instead (#569).
+fn agent_doctor_worker_lines(report: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for worker in report["workers"].as_array().into_iter().flatten() {
+        let text = |field: &str| worker[field].as_str().unwrap_or("unknown");
+        let adapter = text("adapter");
+        let state = if worker["available"].as_bool() == Some(true) {
+            "available".to_owned()
+        } else {
+            format!(
+                "unavailable ({})",
+                worker["unavailable_reason"].as_str().unwrap_or("unknown")
+            )
+        };
+        let launch = if worker["root_launch_allowed"].as_bool() == Some(true) {
+            "allowed".to_owned()
+        } else {
+            format!(
+                "blocked ({})",
+                worker["root_launch_blocked_reason"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            )
+        };
+        let mut located = text("resolution").to_owned();
+        if let Some(artifact) = worker["artifact"].as_str() {
+            located.push_str(&format!(" {artifact}"));
+        }
+        lines.push(format!(
+            "worker {adapter}: {state}; located via {located}; integrity {}; root launch {launch}",
+            text("integrity")
+        ));
+        if let Some(requirement) = worker["runtime_requirement"].as_str() {
+            lines.push(format!("worker {adapter} runtime: {requirement}"));
+        }
+        lines.push(format!(
+            "worker {adapter} scan impact: {}; {}",
+            text("scan_impact"),
+            text("diagnostic")
+        ));
+        if worker["available"].as_bool() != Some(true)
+            || worker["root_launch_allowed"].as_bool() != Some(true)
+        {
+            lines.push(format!("worker {adapter} action: {}", text("remediation")));
+        }
+    }
+    lines
 }
 
 fn graph_snapshot_request(
@@ -3944,6 +3998,49 @@ mod tests {
     };
     use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
     use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
+
+    #[test]
+    fn issue_569_human_doctor_names_worker_route_reason_and_scan_impact() {
+        let report = serde_json::json!({
+            "workers": [
+                {
+                    "adapter": "rust",
+                    "available": true,
+                    "integrity": "verified",
+                    "root_launch_allowed": true,
+                    "resolution": "release-manifest",
+                    "artifact": "libexec/depgraph-rust-worker",
+                    "scan_impact": "worker-used",
+                    "diagnostic": "ready",
+                    "remediation": "no action is needed"
+                },
+                {
+                    "adapter": "web",
+                    "available": false,
+                    "integrity": "verified",
+                    "root_launch_allowed": true,
+                    "resolution": "release-manifest",
+                    "runtime_requirement": "Node.js >=24.0.0",
+                    "unavailable_reason": "runtime-requirement-unmet",
+                    "scan_impact": "adapter-units-fail",
+                    "diagnostic": "node is too old",
+                    "remediation": "put Node.js 24 first on PATH"
+                }
+            ]
+        });
+        let lines = super::agent_doctor_worker_lines(&report);
+        assert_eq!(
+            lines,
+            vec![
+                "worker rust: available; located via release-manifest libexec/depgraph-rust-worker; integrity verified; root launch allowed",
+                "worker rust scan impact: worker-used; ready",
+                "worker web: unavailable (runtime-requirement-unmet); located via release-manifest; integrity verified; root launch allowed",
+                "worker web runtime: Node.js >=24.0.0",
+                "worker web scan impact: adapter-units-fail; node is too old",
+                "worker web action: put Node.js 24 first on PATH",
+            ]
+        );
+    }
 
     #[test]
     fn issue_543_hotspots_page_context_keeps_legacy_keys_without_result_filter() {
