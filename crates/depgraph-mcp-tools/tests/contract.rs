@@ -7,26 +7,26 @@ use depgraph_mcp_tools::{
     AgentCycle, AgentCycleLevel, AgentDaemonStatus, AgentDependenciesOutput,
     AgentDependenciesResponse, AgentDependenciesSummaryResponse, AgentDependencyDetail,
     AgentDependencyDirection, AgentDependencyEndpoint, AgentDependencyPath,
-    AgentDependencyPathsResponse, AgentEdge, AgentEdgeCommon, AgentEdgeSummary, AgentError,
-    AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind,
-    AgentExportOutcome, AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact,
-    AgentImpactResponse, AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
-    AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
-    AgentPolicyApiChange, AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision,
-    AgentQueryArgument, AgentQueryFailureClass, AgentQueryRow, AgentRemediation,
-    AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary,
-    AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse,
-    AgentScanOutcome, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition,
-    AgentSourceSpan, AgentUnresolved, CommonRequest, ContractBuildError, Cursor,
-    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS,
-    MAX_AGENT_CONDITION_BYTES, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES,
-    MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES,
-    MAX_AGENT_QUERY_VALUES, MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
-    MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools, Page,
-    PageByteLimit, PageRequest, PageSize, PortableTerminalOutputContract, RepositoryRelativePath,
-    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
-    TasksNegotiation, canonical_json_bytes,
+    AgentDependencyPathsResponse, AgentEdge, AgentEdgeCommon, AgentEdgeDetail, AgentEdgeSummary,
+    AgentEdgesOutput, AgentEdgesSummaryResponse, AgentError, AgentErrorCategory, AgentErrorCode,
+    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
+    AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
+    AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier, AgentLocator,
+    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
+    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
+    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryArgument,
+    AgentQueryFailureClass, AgentQueryRow, AgentRemediation, AgentRepositoryIds,
+    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary, AgentResolutionStatus,
+    AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse, AgentScanOutcome,
+    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan,
+    AgentUnresolved, CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
+    LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
+    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS,
+    MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
+    MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
+    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
+    PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
+    SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -2324,6 +2324,97 @@ fn issue_542_dependency_output_deserializes_each_detail_to_one_variant() {
     assert!(serde_json::from_value::<AgentDependenciesOutput>(summary_as_paths).is_err());
     assert_eq!(
         serde_json::to_value(AgentDependencyDetail::default()).unwrap(),
+        json!("full")
+    );
+}
+
+// Issue #566: agent_edges_list output granularity contracts.
+
+fn edges_summary_response() -> AgentEdgesSummaryResponse {
+    let (common, items) = AgentEdgesSummaryResponse::project_items(&[edge(), heuristic_edge()]);
+    AgentEdgesSummaryResponse::new(
+        common,
+        Page::new(items, 2, true, None).expect("summary page"),
+    )
+    .expect("summary response")
+}
+
+#[test]
+fn issue_566_edges_summary_hoists_page_shared_fields_and_drops_evidence() {
+    let value = serde_json::to_value(edges_summary_response()).expect("summary");
+    assert_eq!(value["detail"], "summary");
+    assert_eq!(
+        value["common"],
+        json!({"phase":"semantic","resolution_status":"resolved","profile_id":"profile:default","condition":"cfg(test)"})
+    );
+    assert_eq!(
+        value["edges"]["items"][0],
+        json!({"id":"edge:import-1","source_id":"node:src","target_id":"node:dependency","kind":"imports","precision":"exact","site_id":"site:import-1","evidence_count":1})
+    );
+    assert!(value["edges"]["items"][0].get("evidence").is_none());
+    let round_trip: AgentEdgesSummaryResponse =
+        serde_json::from_value(value.clone()).expect("summary round trip");
+    assert_eq!(round_trip, edges_summary_response());
+
+    assert_unknown_field_rejected::<AgentEdgesSummaryResponse>(
+        "AgentEdgesSummaryResponse",
+        value.clone(),
+    );
+    let mut repeated = value.clone();
+    repeated["edges"]["items"][0]["phase"] = json!("semantic");
+    assert!(
+        serde_json::from_value::<AgentEdgesSummaryResponse>(repeated).is_err(),
+        "a field hoisted into common must not repeat per edge"
+    );
+    let mut missing = value;
+    missing["edges"]["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("precision");
+    assert!(
+        serde_json::from_value::<AgentEdgesSummaryResponse>(missing).is_err(),
+        "a field absent from common must be present per edge"
+    );
+}
+
+#[test]
+fn issue_566_edges_output_deserializes_each_detail_to_one_variant() {
+    let full = Page::new(vec![edge()], 1, true, None).expect("page");
+    for (output, detail) in [
+        (AgentEdgesOutput::Full(full.clone()), AgentEdgeDetail::Full),
+        (
+            AgentEdgesOutput::Summary(edges_summary_response()),
+            AgentEdgeDetail::Summary,
+        ),
+        (
+            AgentEdgesOutput::Summary(
+                AgentEdgesSummaryResponse::new(
+                    AgentEdgeCommon::default(),
+                    Page::new(Vec::new(), 0, true, None).expect("empty page"),
+                )
+                .expect("empty summary"),
+            ),
+            AgentEdgeDetail::Summary,
+        ),
+    ] {
+        let value = serde_json::to_value(&output).expect("serialize output");
+        let parsed: AgentEdgesOutput = serde_json::from_value(value).expect("deserialize output");
+        assert_eq!(parsed.detail(), detail);
+        assert_eq!(parsed, output);
+    }
+    assert_eq!(
+        serde_json::to_value(AgentEdgesOutput::Full(full.clone())).unwrap(),
+        serde_json::to_value(&full).unwrap(),
+        "full output keeps the legacy page bytes without a detail field"
+    );
+    let mut tagged_full = serde_json::to_value(&full).unwrap();
+    tagged_full["detail"] = json!("full");
+    assert!(serde_json::from_value::<AgentEdgesOutput>(tagged_full).is_err());
+    let mut summary_as_paths = serde_json::to_value(edges_summary_response()).unwrap();
+    summary_as_paths["detail"] = json!("paths");
+    assert!(serde_json::from_value::<AgentEdgesOutput>(summary_as_paths).is_err());
+    assert_eq!(
+        serde_json::to_value(AgentEdgeDetail::default()).unwrap(),
         json!("full")
     );
 }

@@ -7,6 +7,7 @@ use depgraph_store::{
 use serde::Serialize;
 
 use crate::CancellationToken;
+use crate::edge_kind_selection::EdgeKindFilter;
 use crate::import_evidence::{ImportEvidence, ImportSiteHint, project_import_evidence};
 use crate::service::{
     DepgraphCapability, DepgraphService, DepgraphServiceError, DepgraphServiceResult,
@@ -834,10 +835,13 @@ impl DepgraphService {
         CompletedSnapshotView::from_store(details.map_err(DepgraphServiceError::store_operation)?)
     }
 
+    /// Lists dependency sites, optionally narrowed to one source node and/or
+    /// one site ID. An unknown `site_id` yields an empty page.
     pub fn list_sites_page(
         &self,
         snapshot_id: &ResolvedSnapshotId,
         node_id: Option<&str>,
+        site_id: Option<&str>,
         offset: usize,
         limit: usize,
         cancellation: &CancellationToken,
@@ -848,6 +852,7 @@ impl DepgraphService {
             .sites
             .into_iter()
             .filter(|site| node_id.is_none_or(|id| site.source == id))
+            .filter(|site| site_id.is_none_or(|id| site.id == id))
             .map(|site| {
                 let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
                 let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id, Some(hint));
@@ -869,11 +874,15 @@ impl DepgraphService {
         graph_page_from_items(snapshot_id, items, offset, limit, GraphSitesPageResult::new)
     }
 
+    /// Lists the edges incident to one node. `edge_kinds` is applied before
+    /// paging, so `total_items` counts only the selected edge kinds.
+    #[allow(clippy::too_many_arguments)]
     pub fn list_edges_page(
         &self,
         snapshot_id: &ResolvedSnapshotId,
         node_id: &str,
         direction: EdgeDirection,
+        edge_kinds: &EdgeKindFilter,
         offset: usize,
         limit: usize,
         cancellation: &CancellationToken,
@@ -893,6 +902,7 @@ impl DepgraphService {
                 EdgeDirection::Outgoing => edge.source == node_id,
                 EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
             })
+            .filter(|edge| edge_kinds.allows(&edge.kind))
             .map(|edge| {
                 let hint = edge
                     .site_id

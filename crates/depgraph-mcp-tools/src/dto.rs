@@ -3668,6 +3668,12 @@ pub(crate) fn agent_node_from_fields(
     display_name: &str,
     properties: &serde_json::Value,
 ) -> Result<AgentNode, ContractBuildError> {
+    // Rust file nodes record their path only in the `file:<path>` locator, so a
+    // file node without a path property falls back to it (Issue #566).
+    let locator_path = (kind == "file")
+        .then(|| locator.strip_prefix("file:"))
+        .flatten()
+        .filter(|path| !path.starts_with("//"));
     let id = AgentId::parse(id).map_err(|_| ContractBuildError::AgentDtoValue)?;
     let locator = AgentLocator::parse(locator)
         .or_else(|_| AgentLocator::parse(format!("id:{}", id.as_str())))
@@ -3675,6 +3681,7 @@ pub(crate) fn agent_node_from_fields(
     let repository_path = ["path", "source_path"]
         .into_iter()
         .filter_map(|key| properties.get(key).and_then(serde_json::Value::as_str))
+        .chain(locator_path)
         .find_map(|path| RepositoryRelativePath::parse(path).ok());
     Ok(AgentNode::new(
         id,
@@ -5602,5 +5609,52 @@ mod node_summary_projection_tests {
                 "{id} {kind}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod node_path_tests {
+    use super::agent_node_from_fields;
+    use serde_json::json;
+
+    fn repository_path(
+        kind: &str,
+        locator: &str,
+        properties: &serde_json::Value,
+    ) -> Option<String> {
+        agent_node_from_fields("node:a", kind, locator, "a", properties)
+            .expect("projected node")
+            .repository_path()
+            .map(|path| path.as_str().to_owned())
+    }
+
+    #[test]
+    fn issue_566_rust_file_nodes_take_their_path_from_the_file_locator() {
+        assert_eq!(
+            repository_path("file", "file:src/lib.rs", &json!({"language": "rust"})),
+            Some("src/lib.rs".to_owned())
+        );
+        // An explicit path property still wins over the locator.
+        assert_eq!(
+            repository_path("file", "file:src/lib.rs", &json!({"path": "src/main.rs"})),
+            Some("src/main.rs".to_owned())
+        );
+        // Only file nodes, and only repository-relative `file:` locators, qualify.
+        assert_eq!(
+            repository_path("module", "file:src/lib.rs", &json!({})),
+            None
+        );
+        assert_eq!(
+            repository_path("file", "file:///etc/passwd", &json!({})),
+            None
+        );
+        assert_eq!(
+            repository_path("file", "file:../outside.rs", &json!({})),
+            None
+        );
+        assert_eq!(
+            repository_path("file", "repo://src/lib.rs", &json!({})),
+            None
+        );
     }
 }

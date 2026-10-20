@@ -124,6 +124,17 @@ depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --js
 The MCP `health_hotspots_list` tool accepts the same filters as `path_prefixes`
 and `node_kinds`.
 
+The fan-in raw value is the number of edges in the snapshot whose target is the
+node. It counts every edge kind, structural edges (`contains`, `declares`,
+`generated_from`) included, every phase and profile, and counts several edges
+from the same source (different sites, kinds, or profiles) separately. Fan-out
+counts the source side the same way, and reverse impact counts the distinct
+transitive dependents over every edge. The raw values can therefore differ from
+`graph_dependents_list`, which excludes structural edges by default and, with
+`detail: "paths"`, deduplicates by (source, target, kind). To rank by fan-in
+alone, set `weight_fan_in` (CLI `--weight-fan-in`) to 10000 and the other
+weights to 0.
+
 Read the typed hotspot score layers (`fan_in`, `fan_out`, `reverse_impact`,
 `git_churn`, `runtime`, and `total`) instead of parsing `reason`. Finding
 `suppressions` remain a wire-compatible output-only/deferred field in v1: there

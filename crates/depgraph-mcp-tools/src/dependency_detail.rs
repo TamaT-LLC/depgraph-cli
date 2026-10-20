@@ -96,11 +96,13 @@ enum AgentDependencyPathsTag {
     Paths,
 }
 
-/// Edge fields whose value is identical for every edge of the whole traversal.
+/// Edge fields whose value is identical for every edge in the scope of the response
+/// that carries them.
 ///
 /// A present field is omitted from every `AgentEdgeSummary`; an absent field is kept per
-/// edge. The set is computed over the complete traversal, not one page, so it is stable
-/// across pages and cursor continuation.
+/// edge. The dependency list summary computes the set over the complete traversal, so it
+/// is stable across pages and cursor continuation; the `agent_edges_list` summary
+/// computes it per page, so it can differ between pages.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEdgeCommon {
@@ -240,7 +242,7 @@ impl AgentEdgeSummary {
     }
 
     /// Every shared field lives in exactly one place: `common` or this edge.
-    fn is_consistent_with(&self, common: &AgentEdgeCommon) -> bool {
+    pub(crate) fn is_consistent_with(&self, common: &AgentEdgeCommon) -> bool {
         common.phase.is_some() != self.phase.is_some()
             && common.resolution_status.is_some() != self.resolution_status.is_some()
             && common.precision.is_some() != self.precision.is_some()
@@ -307,6 +309,7 @@ pub struct AgentDependenciesSummaryResponse {
     transitive: bool,
     traversal_complete: bool,
     traversed_edges: u64,
+    /// Fields shared by every edge of the complete traversal; stable across pages.
     common: AgentEdgeCommon,
     edges: Page<AgentEdgeSummary>,
 }

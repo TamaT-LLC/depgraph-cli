@@ -108,6 +108,13 @@ depgraph hotspots --path-prefix src/lib --node-kind file --node-kind symbol --js
 - `--churn-path`はGit churnの入力だけを絞り、結果のfindingは減らしません。
 
 MCPの`health_hotspots_list`では、同じ意味の`path_prefixes`と`node_kinds`を使います。
+
+fan-inのrawは、snapshot内でそのnodeをtargetとするedgeの件数です。
+構造辺（`contains`、`declares`、`generated_from`）を含むすべての辺種別、phase、profileを数え、同じsourceからの複数のedge（siteや辺種別、profileの違い）もそれぞれ1件と数えます。
+fan-outはsourceの側を同じ規則で数え、reverse impactはすべての辺を逆にたどった推移的な依存元を重複なしで数えます。
+そのため、構造辺を既定で除外し、`detail: "paths"`では(source, target, kind)の組で重複を除く`graph_dependents_list`の件数とは一致しないことがあります。
+fan-inだけで順位を付けるには、`weight_fan_in`（CLIでは`--weight-fan-in`）を10000、他のweightを0にします。
+
 findingの`suppressions`は、v1ではwire互換性のために残している出力専用のfieldです。
 CLI、MCP、policyからの入力経路はなく、組み込みanalyzerは常に空配列を返します。
 auditは、Store schema 18以降が保存するpolicy digest、analyzer version、finding contract versionを比較します。

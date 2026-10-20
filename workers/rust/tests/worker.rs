@@ -3504,3 +3504,63 @@ fn worker_binary_rejects_an_unknown_hir_mode() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn syntax_only_import_evidence_records_the_target_binding_and_alias() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("imports");
+    write_minimal_crate(
+        &root,
+        "imports",
+        "pub mod model;\npub use model::Thing;\nuse model::Other as Renamed;\nuse model::*;\nextern crate alloc as heap;\n",
+    );
+    fs::write(
+        root.join("src/model.rs"),
+        "pub struct Thing;\npub struct Other;\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--scan-id")
+        .arg("syntax-only-imports")
+        .arg("--hir-mode")
+        .arg("syntax-only")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "syntax-only worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validated = validate_ndjson(Cursor::new(output.stdout)).unwrap();
+    let properties = |kind: &str, specifier: &str| {
+        let site = validated
+            .sites
+            .values()
+            .find(|site| site.kind == kind && site.specifier == specifier)
+            .unwrap_or_else(|| panic!("missing {kind} site {specifier}"));
+        let evidence = &site.evidence[0];
+        assert_eq!(evidence.extractor, "rust-static");
+        serde_json::to_value(&evidence.properties).unwrap()
+    };
+    // Issue #566: the syntax adapter records the same import facts as the HIR
+    // adapter, so the agent tools can name the imported binding.
+    assert_eq!(
+        properties("rust_reexport", "model::Thing"),
+        serde_json::json!({"target_specifier": "model::Thing", "glob": false, "reexport": true})
+    );
+    assert_eq!(
+        properties("rust_use", "model::Other as Renamed"),
+        serde_json::json!({"target_specifier": "model::Other", "glob": false, "reexport": false, "alias": "Renamed"})
+    );
+    // Like the HIR adapter, a glob keeps the written `*` in its target.
+    assert_eq!(
+        properties("rust_use", "model::*"),
+        serde_json::json!({"target_specifier": "model::*", "glob": true, "reexport": false})
+    );
+    assert_eq!(
+        properties("extern_crate", "alloc as heap"),
+        serde_json::json!({"target_specifier": "alloc", "alias": "heap"})
+    );
+}

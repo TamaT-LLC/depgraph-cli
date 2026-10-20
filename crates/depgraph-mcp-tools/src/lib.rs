@@ -4,6 +4,7 @@ mod catalog;
 mod contract;
 mod dependency_detail;
 mod dto;
+mod edge_detail;
 mod health_dto;
 mod host_config;
 mod import_evidence;
@@ -58,6 +59,7 @@ pub use dto::{
     MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows,
     project_bounded_query_rows_cancellable,
 };
+pub use edge_detail::{AgentEdgeDetail, AgentEdgesOutput, AgentEdgesSummaryResponse};
 pub use health_dto::{
     AgentFindingKind, AgentFindingKindScope, AgentHealthAudit, AgentHealthBlocker,
     AgentHealthBlockerKind, AgentHealthCheckpointReport, AgentHealthConfidence,

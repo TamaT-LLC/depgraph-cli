@@ -9817,3 +9817,324 @@ fn issue_541_dependency_list_cursors_bind_the_edge_selection() {
     session.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
+
+// Issue #566: agent_edges_list output size, file paths for Rust file nodes, and
+// single-site lookup.
+
+fn seed_issue_566_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-566", root, false, Some("revision-566"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 2,
+        "resolved": 2,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-566",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    // Like the Rust worker, file nodes carry their path only in the locator.
+    for (id, kind, locator) in [
+        ("node:lib", "file", "file:src/lib.rs"),
+        ("node:model", "file", "file:src/model.rs"),
+        ("module:model", "module", "rust-module:fixture:lib::model"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": locator,
+            "display_name": id,
+            "properties": {"language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let use_evidence = issue_544_evidence(
+        "src/lib.rs",
+        2,
+        "source",
+        json!({
+            "target_specifier": "model::Thing",
+            "glob": false,
+            "reexport": false,
+            "alias": "Renamed"
+        }),
+    );
+    let mod_evidence = issue_544_evidence("src/lib.rs", 1, "source", json!({}));
+    for (site_id, edge_id, kind, specifier, evidence) in [
+        (
+            "site:use",
+            "edge:use",
+            "rust_use",
+            "model::Thing as Renamed",
+            use_evidence,
+        ),
+        (
+            "site:mod",
+            "edge:mod",
+            "module_declaration",
+            "src/model.rs",
+            mod_evidence,
+        ),
+    ] {
+        let mut site = next("dependency_site");
+        site["site"] = json!({
+            "id": site_id,
+            "source": "node:lib",
+            "kind": kind,
+            "specifier": specifier,
+            "resolution_status": "resolved",
+            "target_ids": ["node:model"],
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": [evidence.clone()]
+        });
+        store.ingest_event(&site).unwrap();
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": edge_id,
+            "site_id": site_id,
+            "source": "node:lib",
+            "target": "node:model",
+            "kind": "imports",
+            "phase": "source",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [evidence]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut declares = next("edge_upsert");
+    declares["edge"] = json!({
+        "id": "edge:declares",
+        "source": "node:lib",
+        "target": "module:model",
+        "kind": "declares",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "fixture:safe",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false
+    });
+    store.ingest_event(&declares).unwrap();
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-566", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+#[test]
+fn issue_566_edges_shrink_rust_files_have_paths_and_sites_resolve_by_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_566_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    let mut call = |name: &str, extra: Value| {
+        id += 1;
+        let mut arguments = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        interactive_tool_call(&mut mcp, id, name, arguments)
+    };
+    let edges = |extra: Value| {
+        let mut arguments = json!({"node_id": "node:lib", "direction": "outgoing"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+
+    // The default stays the legacy page of complete edges, structural edges included.
+    let full = call("agent_edges_list", edges(json!({})));
+    assert_eq!(full["isError"], false, "{full}");
+    assert_tool_text_matches_structured(&full);
+    let page = &full["structuredContent"]["result"];
+    assert!(page.get("detail").is_none(), "{full}");
+    assert_eq!(page["total_items"], 3, "{full}");
+    let use_edge = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["id"] == "edge:use")
+        .expect("use edge");
+    assert_eq!(
+        use_edge["evidence"][0]["import"],
+        json!({"specifier":"model::Thing","binding_kind":"named","imported_name":"Thing","local_name":"Renamed"}),
+        "Rust syntax evidence names the imported binding"
+    );
+
+    // edge_kinds is applied before paging.
+    let imports = call(
+        "agent_edges_list",
+        edges(json!({"edge_kinds": ["imports"]})),
+    );
+    assert_eq!(imports["isError"], false, "{imports}");
+    assert_eq!(imports["structuredContent"]["result"]["total_items"], 2);
+
+    // summary drops evidence bodies and binds its cursor to the detail.
+    let summary = call(
+        "agent_edges_list",
+        edges(json!({"detail": "summary", "limit": 1})),
+    );
+    assert_eq!(summary["isError"], false, "{summary}");
+    assert_tool_text_matches_structured(&summary);
+    let result = &summary["structuredContent"]["result"];
+    assert_eq!(result["detail"], "summary", "{summary}");
+    assert_eq!(result["edges"]["total_items"], 3, "{summary}");
+    let item = &result["edges"]["items"][0];
+    assert!(item.get("evidence").is_none(), "{summary}");
+    assert!(item["evidence_count"].is_number(), "{summary}");
+    // Fields shared by the whole page are stated once in common.
+    assert_eq!(
+        result["common"],
+        json!({"phase":"source","resolution_status":"resolved","precision":"exact","profile_id":"fixture:safe","condition":"true"}),
+        "{summary}"
+    );
+    assert!(item.get("phase").is_none(), "{summary}");
+    let cursor = result["edges"]["next_cursor"].clone();
+    assert!(cursor.is_string(), "{summary}");
+    let resumed = call(
+        "agent_edges_list",
+        edges(json!({"detail": "summary", "limit": 1, "cursor": cursor.clone()})),
+    );
+    assert_eq!(resumed["isError"], false, "{resumed}");
+    assert_ne!(
+        resumed["structuredContent"]["result"]["edges"]["items"][0]["id"],
+        item["id"]
+    );
+    for selection in [
+        json!({}),
+        json!({"detail": "full"}),
+        json!({"detail": "summary", "edge_kinds": ["imports"]}),
+    ] {
+        let mut arguments = edges(selection.clone());
+        arguments["limit"] = json!(1);
+        arguments["cursor"] = cursor.clone();
+        let mismatched = call("agent_edges_list", arguments);
+        assert_eq!(
+            issue_541_error_code(&mismatched),
+            "CURSOR_MISMATCH",
+            "{selection}"
+        );
+    }
+    // Invalid new inputs name the argument like every other INVALID_ARGUMENT
+    // (Issue #565), without echoing the rejected value.
+    for (arguments, argument) in [
+        (json!({"edge_kinds": ["Not A Kind"]}), "edge_kinds"),
+        (json!({"edge_kinds": "imports"}), "edge_kinds"),
+        (json!({"detail": "paths"}), "detail"),
+    ] {
+        let invalid = call("agent_edges_list", edges(arguments.clone()));
+        assert_eq!(
+            issue_541_error_code(&invalid),
+            "INVALID_ARGUMENT",
+            "{arguments}"
+        );
+        assert_eq!(
+            invalid["structuredContent"]["error"]["details"],
+            json!({"kind": "argument", "argument": argument, "reason": "invalid_value"}),
+            "{arguments}"
+        );
+        assert!(!invalid.to_string().contains("Not A Kind"), "{invalid}");
+    }
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    let invalid = call("agent_edges_list", edges(json!({"edge_kinds": too_many})));
+    assert_eq!(
+        invalid["structuredContent"]["error"]["details"],
+        json!({"kind": "argument", "argument": "edge_kinds", "reason": "too_many_items"}),
+        "{invalid}"
+    );
+
+    // One site by ID, including its import facts.
+    let site = call("agent_sites_list", json!({"site_id": "site:use"}));
+    assert_eq!(site["isError"], false, "{site}");
+    let sites = &site["structuredContent"]["result"];
+    assert_eq!(sites["total_items"], 1, "{site}");
+    assert_eq!(sites["items"][0]["id"], "site:use");
+    assert_eq!(
+        sites["items"][0]["evidence"][0]["import"]["local_name"],
+        "Renamed"
+    );
+    let missing = call("agent_sites_list", json!({"site_id": "site:missing"}));
+    assert_eq!(missing["isError"], false, "{missing}");
+    assert_eq!(missing["structuredContent"]["result"]["total_items"], 0);
+
+    // Rust file nodes are reported by path, not by node ID.
+    let paths = call(
+        "graph_dependents_list",
+        json!({"selector": "id:node:model", "detail": "paths"}),
+    );
+    assert_eq!(paths["isError"], false, "{paths}");
+    assert_eq!(
+        paths["structuredContent"]["result"]["paths"]["items"],
+        json!([{"source_path":"src/lib.rs","target_path":"src/model.rs","kind":"imports"}]),
+        "{paths}"
+    );
+    let node = call("agent_node_get", json!({"node_id": "node:lib"}));
+    assert_eq!(node["isError"], false, "{node}");
+    assert_eq!(
+        node["structuredContent"]["result"]["repository_path"],
+        "src/lib.rs"
+    );
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
