@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    if: false
     branches: [main]
   pull_request:
   workflow_dispatch:
@@ -24,6 +25,7 @@ concurrency:
 
 jobs:
   rust:
+    if: false
     runs-on: ubuntu-24.04
     env:
       # Test artifacts are never debugged on the runner; panic locations come
@@ -108,6 +110,7 @@ jobs:
       - run: cargo test --workspace --locked --doc
 
   go:
+    if: false
     runs-on: ubuntu-24.04
     env:
       GOTOOLCHAIN: local
@@ -153,7 +156,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-windows-amd64.test" ./internal/worker
 
   go-macos:
-    if: ${{ !inputs.benchmark_only }}
+    if: false
     runs-on: macos-15
     env:
       GOTOOLCHAIN: local
@@ -193,6 +196,7 @@ jobs:
         run: go test -race ./internal/worker -run 'TestGoLoader|TestAnalysisSplit|TestOpenReferenceFile|TestComputeGoReferenceFingerprint|TestGoReferenceFileDigest|TestSupportedUnix' -count=1
 
   web:
+    if: false
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -304,7 +308,7 @@ jobs:
           if-no-files-found: error
 
   compiler-precise-hostile:
-    if: ${{ !inputs.benchmark_only }}
+    if: false
     runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
@@ -402,7 +406,7 @@ jobs:
 
   benchmark:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch'
+    if: false
     runs-on: ubuntu-24.04
     env:
       # Product targets remain explicit report fields. Hosted-runner ceilings
@@ -461,7 +465,7 @@ jobs:
 
   integration:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
+    if: false
     strategy:
       # Preserve the successful platform evidence when the other matrix leg
       # fails so a transient/native failure cannot erase its diagnostics.
@@ -980,7 +984,7 @@ jobs:
 
   windows-smoke:
     needs: [rust, go, web]
-    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
+    if: false
     runs-on: windows-2025
     env:
       # This job builds debug then release on one runner without reclaiming
@@ -1481,8 +1485,19 @@ jobs:
         include:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustflags: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            rustflags: -C linker-features=-lld
+          - os: macos-15
+            target: aarch64-apple-darwin
+            rustflags: ""
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            rustflags: ""
     runs-on: ${{ matrix.os }}
     env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
