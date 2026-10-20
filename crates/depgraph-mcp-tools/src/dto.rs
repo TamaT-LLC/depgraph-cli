@@ -3897,6 +3897,18 @@ fn parse_agent_condition(value: &str) -> Result<AgentCondition, ContractBuildErr
     AgentCondition::parse(value).map_err(|_| ContractBuildError::AgentDtoValue)
 }
 
+/// Strict projection of an identifying Store value (ids, kinds, profile and
+/// site ids, extractors, coverage tokens) into its Agent scalar contract.
+///
+/// These values are fail closed: a value outside the contract makes the whole
+/// response an integrity error rather than being rewritten, because a client
+/// uses them to address the graph and a substituted id would point at another
+/// entity. The workers emit them in contract form; Issue #580 checked every
+/// distinct id, kind, profile id, site id, extractor, extractor version and
+/// coverage reason of a depgraph-cli self-scan (Rust, Go, and Web workers)
+/// against these contracts and found none outside them. Free-form display
+/// values (locators, display names, specifiers, reasons) never use this
+/// helper: they fall back to `id:<id>` or are omitted (#563).
 pub(crate) fn parse_agent_value<T>(value: &str) -> Result<T, ContractBuildError>
 where
     T: std::str::FromStr,

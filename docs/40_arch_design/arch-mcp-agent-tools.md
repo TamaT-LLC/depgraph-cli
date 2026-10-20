@@ -922,6 +922,18 @@ Agentがファイルを開かずに「なぜ依存しているか」を説明で
 | Not in scope | `module_declaration`（`mod foo;`）のimport根拠はclosed enum `binding_kind`の追加が要るため扱わない。`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約も別Issueで扱う |
 | Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。schemaには`AgentEdgesOutput`、`AgentEdgesSummaryResponse`、`AgentEdgeDetail`とその成功envelopeが増える |
 
+## Issue #580 worker-shaped DTO values
+
+Issue #563でAgentNodeSummaryのlocatorとdisplay nameが契約外になった。ほかの厳しいDTO変換も、workerの実データで`INTEGRITY_FAILURE`にならないかを確かめた。
+
+| Area | Evidence |
+| --- | --- |
+| Policy | id、kind、profile id、site id、extractor、extractor version、coverageのcompleteness / reasonsは、graphを指す値なのでfail closedのままにする（`parse_agent_value`の説明に理由を書いた）。locator、display name、specifier、site reasonなどの表示用の値は`id:<id>`へのフォールバックか省略で扱う（#563と同じ） |
+| Store enumeration | depgraph-cli自身（Rust / Go / TS、ノード71,909、edge 245,056、site 218,548、evidence extractor 21種、profile 89）のStoreで、上の値の重複を除いた全件を各scalar契約で検査し、契約外は0件だった。契約外はlocator（`unknown://`、`external://`、`file://`、`file:`）とdisplay name（改行入り、256 byte超が510件）だけで、どちらもフォールバック済み |
+| Tool walk | 同じStoreに実バイナリの`depgraph-mcp`を接続し、読み取りtool 27種を約600回呼んだ。`agent_nodes_list`は全ノードをcursorで最後までたどり、`agent_node_get` / `agent_edges_list`（full / summary、両方向）/ `agent_sites_list` / `agent_evidence_list` / 依存一覧3 detail / impact / pathは種類ごとに層化した標本を使った。`INTEGRITY_FAILURE`と`INTERNAL`は0件だった。`graph_export`、`snapshot_diff_get`、`policy_evaluate`、`health_hotspots_list`、cycles、unresolved、範囲指定なしの`agent_sites_list`はこの規模では上限（`RESOURCE_EXHAUSTED`）で止まり、DTO変換まで届かない |
+| Regression | process test `issue_580_*`は、self-scanと同じ形の値（`file:` / `file://` / `external://` / `unknown://` / `go-symbol:` locator、256 byte超の複数行display name、`profile:sha256:` profile、21種のうち代表のextractor、実際のcoverage reasons）を入れたStoreで、上限に届かない全読み取りtoolを呼び、advertised output schemaで検証する |
+| Known limit | health findingのevidence `path`は`AgentLabel`（256 byte）で、超えるとintegrity errorになる。self-scanの最長は94 byte。closed DTOのfield型を変える必要があるため、このIssueでは変えない |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |
