@@ -997,6 +997,109 @@ fn verify_node_version(requirement: &str, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Node.js runtime a scan of a repository would hand to the Web worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebRuntimePreflight {
+    pub node: PathBuf,
+    pub version: String,
+}
+
+/// Checks the Web worker's Node.js requirement before any analysis starts, so
+/// a long-running workflow can fail immediately instead of after the Rust and
+/// Go workers. Returns `Ok(None)` when the repository has no `package.json`:
+/// the scan then never starts the Web worker and needs no Node.js at all.
+///
+/// The runtime is resolved and probed the way the worker launch does it (the
+/// sanitized PATH, a cleared environment, and a neutral working directory),
+/// so version-manager shims select the same Node.js the scan would get.
+pub fn preflight_web_runtime(root: &Path) -> Result<Option<WebRuntimePreflight>> {
+    if !detect_adapters(root, false)?.contains(&AdapterKind::Web) {
+        return Ok(None);
+    }
+    let node = resolve_safe_executable("node", root).map_err(|_| {
+        anyhow::anyhow!(
+            "TypeScript/JavaScript analysis of this repository (it contains package.json) needs {WEB_RUNTIME_REQUIREMENT}, but no node executable was found on PATH outside the repository; install Node.js {major} or newer, put it on PATH, and rerun",
+            major = web_runtime_minimum_major()
+        )
+    })?;
+    preflight_node_runtime(&node, root).map(Some)
+}
+
+fn preflight_node_runtime(node: &Path, root: &Path) -> Result<WebRuntimePreflight> {
+    let version = probe_node_version_blocking(node, root).with_context(|| {
+        format!(
+            "TypeScript/JavaScript analysis needs {WEB_RUNTIME_REQUIREMENT}, but `{} --version` failed",
+            node.display()
+        )
+    })?;
+    if let Err(error) = verify_node_version(WEB_RUNTIME_REQUIREMENT, &version) {
+        bail!(
+            "{error:#} (found {}, which reports {version}); TypeScript/JavaScript analysis of this repository needs it because the repository contains package.json; put Node.js {major} or newer first on PATH (for example `mise use node@{major}`, `nvm use {major}`, or `fnm use {major}`) and rerun",
+            node.display(),
+            major = web_runtime_minimum_major()
+        );
+    }
+    Ok(WebRuntimePreflight {
+        node: node.to_path_buf(),
+        version,
+    })
+}
+
+fn web_runtime_minimum_major() -> u64 {
+    WEB_RUNTIME_REQUIREMENT
+        .strip_prefix("Node.js >=")
+        .and_then(parse_version_triplet)
+        .map_or(0, |(major, _, _)| major)
+}
+
+/// Synchronous counterpart of the async runtime probe, for callers that are
+/// not inside a Tokio task context and must not start a runtime of their own.
+fn probe_node_version_blocking(node: &Path, root: &Path) -> Result<String> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    let neutral_cwd = neutral_working_directory(root)?;
+    let mut command = Command::new(node);
+    command
+        .arg("--version")
+        .current_dir(&neutral_cwd.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear();
+    copy_safe_environment(&mut command, root)?;
+    let mut child = command
+        .as_std_mut()
+        .spawn()
+        .with_context(|| format!("failed to start {}", node.display()))?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for node --version")?
+        {
+            break status;
+        }
+        if started.elapsed() > PROBE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("node --version timed out after 5 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read as _;
+        pipe.by_ref()
+            .take(64 * 1024)
+            .read_to_end(&mut stdout)
+            .context("failed to read node --version output")?;
+    }
+    if !status.success() {
+        bail!("node --version exited with {status}");
+    }
+    let version = String::from_utf8(stdout).context("node --version returned non-UTF-8 output")?;
+    Ok(version.trim().to_owned())
+}
+
 fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;

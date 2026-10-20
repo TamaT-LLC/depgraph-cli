@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
@@ -129,19 +130,86 @@ export async function verifyPackageCommand({
   return canonicalCandidate;
 }
 
+/**
+ * Whether `version` satisfies an engines range of the form `>=X.Y.Z`, the only
+ * form this package declares. Returns null for any other range, so a caller
+ * never claims a mismatch it could not establish.
+ */
+export function satisfiesMinimumVersion(range, version) {
+  const minimum = /^>=\s*v?(\d+)\.(\d+)\.(\d+)$/u.exec(String(range ?? "").trim());
+  const actual = /^v?(\d+)\.(\d+)\.(\d+)/u.exec(String(version ?? "").trim());
+  if (!minimum || !actual) return null;
+  for (let index = 1; index <= 3; index += 1) {
+    const difference = Number(actual[index]) - Number(minimum[index]);
+    if (difference !== 0) return difference > 0;
+  }
+  return true;
+}
+
+/**
+ * The npx install directory holding this launcher, if npx started it. npx
+ * installs into `<npm cache>/_npx/<key>/node_modules`, and later runs reuse
+ * that directory whenever the requested package itself is present there,
+ * without re-checking its optional dependencies.
+ */
+export function npxInstallFor(launcherPath) {
+  const match = /^(.*[\\/]_npx[\\/]([0-9a-f]{16}))[\\/]node_modules[\\/]/u.exec(launcherPath ?? "");
+  return match ? { directory: match[1], key: match[2] } : null;
+}
+
+export function missingPlatformPackageMessage({
+  packageName,
+  rootPackage,
+  nodeVersion = process.version,
+  launcherPath = fileURLToPath(import.meta.url),
+}) {
+  const range = rootPackage?.engines?.node;
+  const spec = `${rootPackage?.name ?? "@tamat-llc/depgraph"}@${rootPackage?.version ?? "latest"}`;
+  const node = nodeVersion.startsWith("v") ? nodeVersion : `v${nodeVersion}`;
+  const npx = npxInstallFor(launcherPath);
+  const reinstall = npx
+    ? [
+      "  npx reuses its install directory even after Node.js is switched, so remove it before rerunning npx:",
+      `    npm cache npx rm ${npx.key}    (npm 11 or later)`,
+      `    or delete ${npx.directory}`,
+    ]
+    : [
+      `  global install: npm install -g --include=optional ${spec}`,
+      "  project install: npm install --include=optional",
+    ];
+
+  if (satisfiesMinimumVersion(range, nodeVersion) === false) {
+    const major = /^>=\s*v?(\d+)/u.exec(range.trim())[1];
+    return [
+      `Node.js ${node} does not satisfy ${spec}'s requirement node ${range}.`,
+      `npm reports this as an EBADENGINE warning and then skips the optional platform package ${packageName}, which has the same requirement, so the native depgraph executable was not installed.`,
+      `fix: switch to Node.js ${major} or newer (for example \`mise use node@${major}\`, \`nvm use ${major}\`, or \`fnm use ${major}\`), then reinstall:`,
+      ...reinstall,
+    ].join("\n");
+  }
+  return [
+    `required optional package ${packageName} is missing, although Node.js ${node} satisfies node ${range ?? "(no engines requirement)"}.`,
+    "likely causes:",
+    "  - the install ran under an older Node.js, where npm skips the platform package after its EBADENGINE warning, and that install is being reused",
+    "  - optional dependencies were omitted (--omit=optional, --no-optional, or omit=optional in the npm config)",
+    "fix: reinstall with optional dependencies:",
+    ...reinstall,
+  ].join("\n");
+}
+
 async function installedCommand(command) {
   const descriptor = selectPlatform();
+  const rootPackage = await readRegularJson(new URL("../package.json", import.meta.url), "CLI package metadata");
   let platformPackageJson;
   try {
     platformPackageJson = require.resolve(`${descriptor.packageName}/package.json`);
   } catch (error) {
     throw new Error(
-      `required optional package ${descriptor.packageName} is missing; reinstall @tamat-llc/depgraph without omitting optional dependencies`,
+      missingPlatformPackageMessage({ packageName: descriptor.packageName, rootPackage }),
       { cause: error },
     );
   }
 
-  const rootPackage = await readRegularJson(new URL("../package.json", import.meta.url), "CLI package metadata");
   return verifyPackageCommand({
     packageRoot: path.dirname(await realpath(platformPackageJson)),
     descriptor,
