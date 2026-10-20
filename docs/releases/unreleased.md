@@ -25,7 +25,7 @@ Rust worker が出す file node（`include!` 由来を含む）と `include_str!
 - `depgraph hotspots` と MCP の `health_hotspots_list` で、Rust の file と crate root の module の finding に `location` が付く。`--path-prefix` / `path_prefixes` で Rust のファイルを絞り込めるようになる（従来は 0 件だった）。
 - Git churn が Rust のファイルと crate root の module に対応付けられ、hotspot の `git_churn` layer に反映される（従来は 0）。
 - `unused-file` の finding に `location` が付く。
-- MCP の `agent_nodes_list` / `agent_node_get` の `repository_path` は、`path` property から取る。
+- MCP の `agent_node_get` の `repository_path` と、依存一覧 `detail: "paths"` のパスは、`path` property から取る。
 
 互換性:
 

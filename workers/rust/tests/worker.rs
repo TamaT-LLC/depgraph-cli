@@ -3572,10 +3572,14 @@ fn issue_577_file_asset_and_crate_root_nodes_record_their_repository_path() {
     write_minimal_crate(
         &root,
         "paths",
-        "pub mod model;\npub const DATA: &str = include_str!(\"data.txt\");\n",
+        "pub mod model;\npub const DATA: &str = include_str!(\"data.txt\");\ninclude!(\"../generated/items.in\");\n",
     );
     fs::write(root.join("src/model.rs"), "pub struct Thing;\n").unwrap();
     fs::write(root.join("src/data.txt"), "payload").unwrap();
+    // Not a `.rs` file, so the `include!` target is not an inventoried source
+    // file and the include site creates its own file node.
+    fs::create_dir_all(root.join("generated")).unwrap();
+    fs::write(root.join("generated/items.in"), "pub struct Generated;\n").unwrap();
 
     let result = scan(&root).unwrap();
 
@@ -3584,7 +3588,12 @@ fn issue_577_file_asset_and_crate_root_nodes_record_their_repository_path() {
         .iter()
         .filter(|node| node.locator.starts_with("file:"))
         .collect();
-    for expected in ["src/lib.rs", "src/model.rs", "src/data.txt"] {
+    for expected in [
+        "src/lib.rs",
+        "src/model.rs",
+        "src/data.txt",
+        "generated/items.in",
+    ] {
         assert!(
             located
                 .iter()
@@ -3609,6 +3618,12 @@ fn issue_577_file_asset_and_crate_root_nodes_record_their_repository_path() {
         .unwrap();
     assert_eq!(asset.kind, "asset");
     assert_eq!(asset.properties["included_by_macro"], "include_str");
+    let included = located
+        .iter()
+        .find(|node| node.locator == "file:generated/items.in")
+        .unwrap();
+    assert_eq!(included.kind, "file");
+    assert_eq!(included.properties["included_by_macro"], "include");
 
     let crate_root = result
         .nodes
