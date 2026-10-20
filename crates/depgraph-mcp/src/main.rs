@@ -1972,8 +1972,13 @@ fn execute_resolve_build_submit(
     // False acknowledgement and non-exact modes fail before journal, store
     // mutation, runner resolution, probes, or project child creation.
     if !arguments.acknowledgement || !arguments.rust_compiler_precise {
-        return Err(ToolExecutionFailure::Service(
-            DepgraphServiceError::InvalidInput,
+        return Err(invalid_argument(
+            Some(if arguments.acknowledgement {
+                "rust_compiler_precise"
+            } else {
+                "acknowledgement"
+            }),
+            AgentArgumentReason::InvalidValue,
         ));
     }
     if cancellation.is_cancelled() {
@@ -2022,8 +2027,10 @@ fn execute_export_file_submit(
         depgraph_core::service::RepositoryRelativePath::parse(arguments.output_path.as_str())?;
     let selector = arguments.selector.map(|value| value.as_str().to_owned());
     let format: GraphExportFormat = arguments.format.into();
-    let requested_snapshot =
-        SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let requested_snapshot = parse_snapshot_argument(
+        arguments.snapshot.as_deref().unwrap_or("current"),
+        "snapshot",
+    )?;
     let existing_input = existing_export_file_submission_input(config, &arguments.idempotency_key)?;
     let replay_snapshot;
     let snapshot_to_resolve = match (&requested_snapshot, existing_input.as_ref()) {
@@ -2194,8 +2201,10 @@ fn execute_runtime_import_submit(
         ));
     }
 
-    let requested_locator =
-        SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let requested_locator = parse_snapshot_argument(
+        arguments.snapshot.as_deref().unwrap_or("current"),
+        "snapshot",
+    )?;
     let trace_file = arguments.trace_file.map(TryInto::try_into).transpose()?;
     let source = depgraph_core::service::RuntimeTraceSourceRequest {
         trace: arguments.trace,
@@ -2675,7 +2684,10 @@ fn execute_snapshot_name_create(
         arguments.repository_id.as_ref(),
         repository_id,
     )?;
-    let selector = SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+    let selector = parse_snapshot_argument(
+        arguments.snapshot.as_deref().unwrap_or("current"),
+        "snapshot",
+    )?;
     let named = service.snapshot_name_create(
         &SnapshotNameCreateRequest::new(arguments.name.as_str(), selector),
         cancellation,
@@ -3045,8 +3057,9 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             if arguments.kinds.len() > 1_024 {
-                return Err(ToolExecutionFailure::Service(
-                    DepgraphServiceError::InvalidInput,
+                return Err(invalid_argument(
+                    Some("kinds"),
+                    AgentArgumentReason::TooManyItems,
                 ));
             }
             let kinds = arguments
@@ -3054,9 +3067,11 @@ fn execute_catalog_read_tool(
                 .iter()
                 .map(AgentToken::parse)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
-            let snapshot =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+                .map_err(|_| invalid_argument(Some("kinds"), AgentArgumentReason::InvalidValue))?;
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
@@ -3112,10 +3127,13 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            let node_id = AgentId::parse(&arguments.node_id)
-                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
-            let snapshot =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let node_id = AgentId::parse(&arguments.node_id).map_err(|_| {
+                invalid_argument(Some("node_id"), AgentArgumentReason::InvalidValue)
+            })?;
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
@@ -3161,16 +3179,19 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            for id in [arguments.node_id.as_deref(), arguments.site_id.as_deref()]
-                .into_iter()
-                .flatten()
-            {
+            for (argument, id) in [
+                ("node_id", arguments.node_id.as_deref()),
+                ("site_id", arguments.site_id.as_deref()),
+            ] {
+                let Some(id) = id else { continue };
                 AgentId::parse(id).map_err(|_| {
-                    ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput)
+                    invalid_argument(Some(argument), AgentArgumentReason::InvalidValue)
                 })?;
             }
-            let snapshot =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
@@ -3223,25 +3244,20 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            AgentId::parse(&arguments.node_id)
-                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            AgentId::parse(&arguments.node_id).map_err(|_| {
+                invalid_argument(Some("node_id"), AgentArgumentReason::InvalidValue)
+            })?;
             // agent_edges_list has always listed every kind, so an empty allowlist
             // stays unrestricted (structural edges included).
             let edge_kinds = EdgeKindFilter::try_new(
                 arguments.edge_kinds,
                 Some(StructuralEdgeSelection::Include),
             )
-            .map_err(|error| {
-                invalid_argument(
-                    Some("edge_kinds"),
-                    match error {
-                        EdgeKindFilterError::TooManyKinds => AgentArgumentReason::TooManyItems,
-                        _ => AgentArgumentReason::InvalidValue,
-                    },
-                )
-            })?;
-            let snapshot =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            .map_err(edge_kinds_argument_error)?;
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
@@ -3311,10 +3327,13 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            AgentId::parse(&arguments.site_id)
-                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
-            let snapshot =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            AgentId::parse(&arguments.site_id).map_err(|_| {
+                invalid_argument(Some("site_id"), AgentArgumentReason::InvalidValue)
+            })?;
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
@@ -3406,7 +3425,7 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            let snapshot = SnapshotLocator::parse(arguments.snapshot)?;
+            let snapshot = parse_snapshot_argument(&arguments.snapshot, "snapshot")?;
             let shown = service.show_completed_snapshot_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(shown.id())?;
             let result = AgentCompletedSnapshot::try_from(&shown)
@@ -3503,8 +3522,10 @@ fn execute_catalog_read_tool(
                 ToolExecutionFailure::Service(DepgraphServiceError::graph_query(source))
             })?;
             let max_traversal = graph_max_traversal(arguments.max_traversal)?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3513,6 +3534,10 @@ fn execute_catalog_read_tool(
             } else {
                 DependencyDirection::Outgoing
             };
+            // Validate the selection here so a rejected kind names `edge_kinds`
+            // with the same reason as agent_edges_list (Issue #581).
+            EdgeKindFilter::try_new(arguments.edge_kinds.clone(), arguments.structural_edges)
+                .map_err(edge_kinds_argument_error)?;
             let request = DependenciesRequest::try_new(
                 arguments.selector.as_str(),
                 direction,
@@ -3611,8 +3636,10 @@ fn execute_catalog_read_tool(
                 filter,
                 graph_max_traversal(arguments.max_traversal)?,
             )?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3645,8 +3672,9 @@ fn execute_catalog_read_tool(
                 &arguments.environments,
             )?;
             if arguments.conditions.len() > 1_024 {
-                return Err(ToolExecutionFailure::Service(
-                    DepgraphServiceError::InvalidInput,
+                return Err(invalid_argument(
+                    Some("conditions"),
+                    AgentArgumentReason::TooManyItems,
                 ));
             }
             let filters = ImpactFilters::new(
@@ -3671,8 +3699,10 @@ fn execute_catalog_read_tool(
                 arguments.changed_since,
                 filters,
             )?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3720,8 +3750,10 @@ fn execute_catalog_read_tool(
             };
             let request =
                 CyclesRequest::try_new(level, graph_max_traversal(arguments.max_traversal)?)?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3756,16 +3788,19 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             if arguments.kinds.len() > 1_024 {
-                return Err(ToolExecutionFailure::Service(
-                    DepgraphServiceError::InvalidInput,
+                return Err(invalid_argument(
+                    Some("kinds"),
+                    AgentArgumentReason::TooManyItems,
                 ));
             }
             let request = UnresolvedRequest::try_new(
                 arguments.kinds,
                 graph_max_traversal(arguments.max_traversal)?,
             )?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3804,8 +3839,8 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             let request = SnapshotDiffRequest::new(
-                SnapshotLocator::parse(&arguments.from)?,
-                SnapshotLocator::parse(&arguments.to)?,
+                parse_snapshot_argument(&arguments.from, "from")?,
+                parse_snapshot_argument(&arguments.to, "to")?,
                 SnapshotDiffFilters::try_new(arguments.kinds, Vec::new(), Vec::new(), Vec::new())?,
             );
             let result = project_snapshot_diff(service.snapshot_diff(&request, cancellation)?)
@@ -3826,8 +3861,8 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             let request = PolicyEvaluateRequest::new(
-                SnapshotLocator::parse(&arguments.from)?,
-                SnapshotLocator::parse(&arguments.to)?,
+                parse_snapshot_argument(&arguments.from, "from")?,
+                parse_snapshot_argument(&arguments.to, "to")?,
             );
             let result = project_policy_result(service.policy_evaluate(&request, cancellation)?)
                 .map_err(contract_mapping_error)?;
@@ -3854,8 +3889,10 @@ fn execute_catalog_read_tool(
             };
             let request = HealthSummaryRequest::try_new(kinds)?
                 .with_allow_partial(arguments.allow_partial_ranges);
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3894,8 +3931,10 @@ fn execute_catalog_read_tool(
                 MAX_HEALTH_FINDINGS,
             )?
             .with_allow_partial(arguments.allow_partial_ranges);
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3943,8 +3982,10 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             let request = HealthFindingGetRequest::try_new(arguments.finding_id)?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -3967,8 +4008,10 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             let request = HealthAuditRequest::try_new(arguments.changed, arguments.base_snapshot)?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let scope =
@@ -4040,8 +4083,10 @@ fn execute_catalog_read_tool(
                 weights,
             )?
             .with_result_filter(arguments.path_prefixes, arguments.node_kinds)?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let mut snapshot_request =
                 service.start_snapshot_request_at_cancellable(&locator, cancellation)?;
             let snapshot_id = parse_snapshot_id(snapshot_request.snapshot_id().as_str())?;
@@ -4078,7 +4123,10 @@ fn execute_catalog_read_tool(
                 repository_id,
             )?;
             let request = GraphExportRequest::try_new(
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?,
+                parse_snapshot_argument(
+                    arguments.snapshot.as_deref().unwrap_or("current"),
+                    "snapshot",
+                )?,
                 arguments.format.into(),
                 arguments
                     .selector
@@ -4108,8 +4156,10 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let request = BoundedQueryRequest {
                 query: arguments.query,
                 query_file: arguments.query_file.map(TryInto::try_into).transpose()?,
@@ -4156,8 +4206,10 @@ fn execute_catalog_read_tool(
                 arguments.repository_id.as_ref(),
                 repository_id,
             )?;
-            let locator =
-                SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
+            let locator = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
             let request = RuntimeValidateRequest {
                 trace: arguments.trace,
                 trace_file: arguments.trace_file.map(TryInto::try_into).transpose()?,
@@ -4245,6 +4297,28 @@ fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailu
 /// `INVALID_ARGUMENT` naming the schema-defined argument and why it was
 /// rejected (Issue #565). Callers pass compile-time argument names only, so
 /// no caller-supplied text reaches the response.
+/// A `snapshot` / `from` / `to` value that is not a snapshot name, stable
+/// ID, or `current` names the argument (Issue #581). The value itself is not
+/// echoed.
+fn parse_snapshot_argument(
+    value: &str,
+    argument: &'static str,
+) -> Result<SnapshotLocator, ToolExecutionFailure> {
+    SnapshotLocator::parse(value)
+        .map_err(|_| invalid_argument(Some(argument), AgentArgumentReason::InvalidValue))
+}
+
+/// The same `edge_kinds` reasons for agent_edges_list and the dependency lists.
+fn edge_kinds_argument_error(error: EdgeKindFilterError) -> ToolExecutionFailure {
+    invalid_argument(
+        Some("edge_kinds"),
+        match error {
+            EdgeKindFilterError::TooManyKinds => AgentArgumentReason::TooManyItems,
+            _ => AgentArgumentReason::InvalidValue,
+        },
+    )
+}
+
 fn invalid_argument(argument: Option<&str>, reason: AgentArgumentReason) -> ToolExecutionFailure {
     ToolExecutionFailure::Agent(AgentError::new(
         AgentErrorCode::InvalidArgument,

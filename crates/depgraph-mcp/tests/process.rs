@@ -10138,3 +10138,195 @@ fn issue_566_edges_shrink_rust_files_have_paths_and_sites_resolve_by_id() {
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
+
+#[test]
+fn issue_581_argument_and_limit_errors_name_the_argument_and_the_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut id = 1;
+    let mut error_of = |name: &str, arguments: Value| -> Value {
+        id += 1;
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = interactive_tool_call(&mut mcp, id, name, full);
+        assert_eq!(result["isError"], true, "{name} {arguments}: {result}");
+        assert_tool_text_matches_structured(&result);
+        shared.validate(&result["structuredContent"]).unwrap();
+        result["structuredContent"]["error"].clone()
+    };
+    let argument = |name: &str, reason: &str| {
+        json!({
+            "code": "INVALID_ARGUMENT",
+            "category": "input",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {"kind": "argument", "argument": name, "reason": reason}
+        })
+    };
+
+    // (1) A snapshot value that is not a name, a stable ID, or `current`.
+    for (tool, arguments, name) in [
+        (
+            "agent_nodes_list",
+            json!({"query": "a", "match_mode": "contains", "snapshot": "latest"}),
+            "snapshot",
+        ),
+        (
+            "graph_dependencies_list",
+            json!({"selector": "id:node:a", "snapshot": "snapshot:sha256:zz"}),
+            "snapshot",
+        ),
+        ("snapshot_get", json!({"snapshot": "latest"}), "snapshot"),
+        (
+            "snapshot_diff_get",
+            json!({"from": "latest", "to": "current"}),
+            "from",
+        ),
+        (
+            "policy_evaluate",
+            json!({"from": "current", "to": "latest"}),
+            "to",
+        ),
+    ] {
+        assert_eq!(
+            error_of(tool, arguments),
+            argument(name, "invalid_value"),
+            "{tool}"
+        );
+    }
+
+    // (2) edge_kinds of the dependency lists reports what agent_edges_list does.
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    for tool in [
+        "graph_dependencies_list",
+        "graph_dependents_list",
+        "agent_edges_list",
+    ] {
+        let target = if tool == "agent_edges_list" {
+            json!({"node_id": "node:a"})
+        } else {
+            json!({"selector": "id:node:a"})
+        };
+        for (edge_kinds, reason) in [
+            (json!(["Not A Kind"]), "invalid_value"),
+            (json!(too_many), "too_many_items"),
+        ] {
+            let mut arguments = target.clone();
+            arguments["edge_kinds"] = edge_kinds;
+            assert_eq!(
+                error_of(tool, arguments),
+                argument("edge_kinds", reason),
+                "{tool}"
+            );
+        }
+    }
+    let mut contradictory = json!({"selector": "id:node:a", "structural_edges": "exclude"});
+    contradictory["edge_kinds"] = json!(["contains"]);
+    assert_eq!(
+        error_of("graph_dependencies_list", contradictory),
+        argument("edge_kinds", "invalid_value")
+    );
+
+    // (3) IDs that are not Agent IDs name the argument.
+    for (tool, arguments, name) in [
+        (
+            "agent_sites_list",
+            json!({"site_id": "not an id"}),
+            "site_id",
+        ),
+        (
+            "agent_sites_list",
+            json!({"node_id": "not an id"}),
+            "node_id",
+        ),
+        (
+            "agent_sites_list",
+            json!({"node_id": "node:a", "site_id": "not an id"}),
+            "site_id",
+        ),
+        ("agent_node_get", json!({"node_id": "not an id"}), "node_id"),
+        (
+            "agent_edges_list",
+            json!({"node_id": "not an id"}),
+            "node_id",
+        ),
+        (
+            "agent_evidence_list",
+            json!({"site_id": "not an id"}),
+            "site_id",
+        ),
+    ] {
+        assert_eq!(
+            error_of(tool, arguments),
+            argument(name, "invalid_value"),
+            "{tool}"
+        );
+    }
+
+    // (4) Impact and export bounds are named with the argument that widens them.
+    let impact = error_of(
+        "graph_impact_get",
+        json!({"selector": "id:node:d", "max_nodes": 1}),
+    );
+    assert_eq!(
+        impact,
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "impact_nodes",
+                "maximum": 1,
+                "argument": "max_nodes"
+            }
+        })
+    );
+    let export = error_of("graph_export", json!({"format": "json", "max_nodes": 1}));
+    assert_eq!(export["code"], "RESOURCE_EXHAUSTED", "{export}");
+    assert_eq!(export["remediation"], "increase_limit", "{export}");
+    assert_eq!(export["details"]["limit"], "export_nodes", "{export}");
+    assert_eq!(export["details"]["maximum"], 1, "{export}");
+    assert_eq!(export["details"]["argument"], "max_nodes", "{export}");
+    assert!(
+        export["details"]["observed"].as_u64().unwrap() > 1,
+        "{export}"
+    );
+
+    // (5) graph_export resolves its selector like dependencies and impact.
+    let missing = error_of(
+        "graph_export",
+        json!({"format": "json", "selector": "src/missing.rs"}),
+    );
+    assert_eq!(
+        missing,
+        json!({
+            "code": "NOT_FOUND",
+            "category": "not_found",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {"kind": "argument", "argument": "selector", "reason": "no_matching_node"}
+        })
+    );
+    let encoded = missing.to_string();
+    assert!(!encoded.contains("missing.rs"), "{encoded}");
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}

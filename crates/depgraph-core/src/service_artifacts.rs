@@ -11,6 +11,8 @@ use depgraph_store::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::DepgraphResourceLimit;
+
 use crate::{
     CancellationToken, Config, GraphQueryFilter,
     export::{export_filtered_with_partial_metadata, filter_snapshot, partial_export_metadata},
@@ -629,16 +631,14 @@ impl DepgraphService {
         let raw = diff_graph_snapshots(&from_id, &to_id, from, to)
             .map_err(|source| cancelled_or_store(source, cancellation))?;
         let filtered = request.filters().apply(raw);
-        if graph_snapshot_diff_item_count(&filtered) > MAX_SHARED_ARTIFACT_ITEMS {
-            return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
-                cancellation,
-            ));
+        let items = graph_snapshot_diff_item_count(&filtered);
+        if items > MAX_SHARED_ARTIFACT_ITEMS {
+            return Err(cancelled_or(artifact_items_error(items), cancellation));
         }
         let mut result = project_snapshot_diff(filtered, request.filters().clone(), cancellation)?;
         if result.item_count() > MAX_SHARED_ARTIFACT_ITEMS {
             return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
+                artifact_items_error(result.item_count()),
                 cancellation,
             ));
         }
@@ -676,13 +676,12 @@ impl DepgraphService {
         )
         .map_err(|source| cancelled_or_policy(source, cancellation))?;
         check_cancelled(cancellation)?;
-        if evaluated
+        let items = evaluated
             .api_changes
             .len()
-            .saturating_add(evaluated.violations.len())
-            > MAX_SHARED_ARTIFACT_ITEMS
-        {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            .saturating_add(evaluated.violations.len());
+        if items > MAX_SHARED_ARTIFACT_ITEMS {
+            return Err(artifact_items_error(items));
         }
         let annotations = policy_annotations(&evaluated)
             .map_err(|source| cancelled_or_policy(source, cancellation))?;
@@ -733,16 +732,12 @@ impl DepgraphService {
             }
             projected_annotations.push(ServicePolicyAnnotation::from(annotation));
         }
-        if api_changes
+        let items = api_changes
             .len()
             .saturating_add(violations.len())
-            .saturating_add(projected_annotations.len())
-            > MAX_SHARED_ARTIFACT_ITEMS
-        {
-            return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
-                cancellation,
-            ));
+            .saturating_add(projected_annotations.len());
+        if items > MAX_SHARED_ARTIFACT_ITEMS {
+            return Err(cancelled_or(artifact_items_error(items), cancellation));
         }
         let mut result = ServicePolicyResult {
             schema_version: POLICY_EVALUATION_SERVICE_SCHEMA_VERSION.to_owned(),
@@ -799,12 +794,8 @@ impl DepgraphService {
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
         let filtered = filter_snapshot(&snapshot, request.filter());
         let mut selected = select_export_graph(filtered, request, cancellation)?;
-        if selected.nodes.len() > request.max_nodes() || selected.edges.len() > request.max_edges()
-        {
-            return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
-                cancellation,
-            ));
+        if let Some(error) = export_bound_error(&selected, request) {
+            return Err(cancelled_or(error, cancellation));
         }
         canonicalize_export_graph(&mut selected);
         let maximum = self.config().limits().max_output_bytes();
@@ -853,12 +844,8 @@ impl DepgraphService {
             crate::service_graph::load_pinned_snapshot(&mut snapshot_request, cancellation)?;
         let filtered = filter_snapshot(&snapshot, request.filter());
         let selected = select_export_graph(filtered, request, cancellation)?;
-        if selected.nodes.len() > request.max_nodes() || selected.edges.len() > request.max_edges()
-        {
-            return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
-                cancellation,
-            ));
+        if let Some(error) = export_bound_error(&selected, request) {
+            return Err(cancelled_or(error, cancellation));
         }
         let format = match request.format() {
             GraphExportFormat::Json => crate::ExportFormat::Json,
@@ -880,7 +867,11 @@ impl DepgraphService {
         // weakening the bounded inline contract.
         let maximum = MAX_RAW_COMPATIBLE_GRAPH_EXPORT_BYTES;
         if content.len() > maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::OutputBytes,
+                saturating_u64(maximum),
+                Some(saturating_u64(content.len())),
+            ));
         }
         Ok(GraphExportResult {
             schema_version: GRAPH_EXPORT_SERVICE_SCHEMA_VERSION.to_owned(),
@@ -955,7 +946,11 @@ impl DepgraphService {
                 },
             })?;
         if bytes.len() > maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::InputBytes,
+                saturating_u64(maximum),
+                None,
+            ));
         }
         check_cancelled(cancellation)?;
         let raw = std::str::from_utf8(&bytes).map_err(|_| DepgraphServiceError::PolicyInput)?;
@@ -1089,10 +1084,7 @@ fn project_records<T, U>(
     let mut map = |record| {
         work = work.saturating_add(1);
         if work > MAX_SHARED_ARTIFACT_WORK_ITEMS || cancellation.is_cancelled() {
-            return Err(cancelled_or(
-                DepgraphServiceError::ResourceExhausted,
-                cancellation,
-            ));
+            return Err(cancelled_or(artifact_work_error(None), cancellation));
         }
         Ok(project(record))
     };
@@ -1322,9 +1314,9 @@ pub(crate) fn preflight_graph_work(
     let count = graph_record_count(from)
         .checked_add(graph_record_count(to))
         .and_then(|count| count.checked_mul(factor))
-        .ok_or(DepgraphServiceError::ResourceExhausted)?;
+        .ok_or_else(|| artifact_work_error(None))?;
     if count > MAX_SHARED_ARTIFACT_WORK_ITEMS {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        return Err(artifact_work_error(Some(count)));
     }
     Ok(())
 }
@@ -1430,14 +1422,28 @@ fn select_export_graph(
         MAX_SHARED_ARTIFACT_WORK_ITEMS,
         &mut || cancellation.is_cancelled(),
     )
-    .map_err(|_| cancelled_or(DepgraphServiceError::InvalidInput, cancellation))?;
+    .map_err(|source| {
+        // Like dependencies and impact, a selector that matches no node is
+        // NOT_FOUND / no_matching_node and an ambiguous one names `selector`
+        // (Issue #581).
+        let error = if crate::query::selector_failure(&source).is_some() {
+            DepgraphServiceError::graph_query(crate::query::tag_selector_argument(
+                source, "selector",
+            ))
+        } else if crate::query::preprocessing_work_limit(&source).is_some() {
+            artifact_work_error(None)
+        } else {
+            DepgraphServiceError::InvalidInput
+        };
+        cancelled_or(error, cancellation)
+    })?;
     let mut adjacency = BTreeMap::<String, Vec<String>>::new();
     for (index, edge) in snapshot.edges.iter().enumerate() {
         if index.is_multiple_of(128) {
             check_cancelled(cancellation)?;
         }
         if index.saturating_mul(2) > MAX_SHARED_ARTIFACT_WORK_ITEMS {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(artifact_work_error(None));
         }
         adjacency
             .entry(edge.source.clone())
@@ -1459,14 +1465,18 @@ fn select_export_graph(
         for next in adjacency.get(&node).into_iter().flatten() {
             work = work.saturating_add(1);
             if work > MAX_SHARED_ARTIFACT_WORK_ITEMS {
-                return Err(DepgraphServiceError::ResourceExhausted);
+                return Err(artifact_work_error(None));
             }
             if work.is_multiple_of(128) {
                 check_cancelled(cancellation)?;
             }
             if retained.insert(next.clone()) {
                 if retained.len() > request.max_nodes() {
-                    return Err(DepgraphServiceError::ResourceExhausted);
+                    return Err(DepgraphServiceError::resource_limit(
+                        DepgraphResourceLimit::ExportNodes,
+                        saturating_u64(request.max_nodes()),
+                        None,
+                    ));
                 }
                 queue.push_back(next.clone());
             }
@@ -1882,6 +1892,51 @@ fn cancelled_or(
     }
 }
 
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// A snapshot diff or policy result with more items than one artifact carries.
+fn artifact_items_error(items: usize) -> DepgraphServiceError {
+    DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::ArtifactItems,
+        saturating_u64(MAX_SHARED_ARTIFACT_ITEMS),
+        Some(saturating_u64(items)),
+    )
+}
+
+/// Diff, policy, or export selection work beyond the shared artifact budget.
+fn artifact_work_error(observed: Option<usize>) -> DepgraphServiceError {
+    DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::ArtifactWorkItems,
+        saturating_u64(MAX_SHARED_ARTIFACT_WORK_ITEMS),
+        observed.map(saturating_u64),
+    )
+}
+
+/// The export bound a selected graph exceeds, naming `max_nodes` /
+/// `max_edges` (Issue #581).
+fn export_bound_error(
+    selected: &GraphSnapshot,
+    request: &GraphExportRequest,
+) -> Option<DepgraphServiceError> {
+    if selected.nodes.len() > request.max_nodes() {
+        Some(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::ExportNodes,
+            saturating_u64(request.max_nodes()),
+            Some(saturating_u64(selected.nodes.len())),
+        ))
+    } else if selected.edges.len() > request.max_edges() {
+        Some(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::ExportEdges,
+            saturating_u64(request.max_edges()),
+            Some(saturating_u64(selected.edges.len())),
+        ))
+    } else {
+        None
+    }
+}
+
 fn cancelled_or_store(
     source: anyhow::Error,
     cancellation: &CancellationToken,
@@ -1894,7 +1949,14 @@ fn cancelled_or_policy(
     cancellation: &CancellationToken,
 ) -> DepgraphServiceError {
     if is_policy_evaluation_resource_exhausted(&source) {
-        cancelled_or(DepgraphServiceError::ResourceExhausted, cancellation)
+        cancelled_or(
+            DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::PreprocessingWorkItems,
+                saturating_u64(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS),
+                None,
+            ),
+            cancellation,
+        )
     } else if is_policy_evaluation_cancelled(&source) {
         cancelled_or(DepgraphServiceError::Cancelled, cancellation)
     } else {

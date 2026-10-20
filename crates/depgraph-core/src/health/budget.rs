@@ -4,6 +4,10 @@ pub enum HealthAnalysisError {
     Cancelled,
     #[error("health analysis exhausted its bounded work budget")]
     ResourceExhausted,
+    /// The analysis produced more findings than the response may carry
+    /// (Issue #581 names this bound apart from the work budget).
+    #[error("health analysis exceeded its finding limit")]
+    FindingLimit,
     #[error("health analysis detected an invalid graph result")]
     Integrity,
 }

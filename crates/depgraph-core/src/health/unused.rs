@@ -1377,7 +1377,7 @@ pub(crate) fn analyze_subjects<'a>(
         };
         if let Some(finding) = analyze_subject(global, local, node, kind, budget, is_cancelled)? {
             if findings.len() >= maximum_findings {
-                return Err(HealthAnalysisError::ResourceExhausted);
+                return Err(HealthAnalysisError::FindingLimit);
             }
             findings.push(finding);
         }

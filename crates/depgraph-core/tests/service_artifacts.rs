@@ -603,10 +603,19 @@ fn inline_exports_are_safe_deterministic_bounded_and_content_addressed() -> Resu
         )?,
         &CancellationToken::new(),
     );
-    assert!(matches!(
-        nodes_exceeded,
-        Err(DepgraphServiceError::ResourceExhausted)
-    ));
+    // The export bound is named with the argument that widens it (Issue #581).
+    match nodes_exceeded {
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit,
+            maximum: 1,
+            observed: Some(observed),
+        }) => {
+            assert_eq!(limit, depgraph_core::DepgraphResourceLimit::ExportNodes);
+            assert_eq!(limit.argument(), Some("max_nodes"));
+            assert!(observed > 1);
+        }
+        other => panic!("unexpected export result {other:?}"),
+    }
 
     let small_service = service_with_output_limit(&root, &store_path, 512)?;
     let overflow = small_service.graph_export(

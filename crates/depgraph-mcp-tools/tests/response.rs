@@ -291,6 +291,94 @@ fn issue_565_resource_limits_name_the_bound_the_work_and_the_argument() {
 }
 
 #[test]
+fn issue_581_impact_health_and_artifact_limits_are_named() {
+    use depgraph_core::DepgraphResourceLimit;
+
+    // Bounds an argument widens ask for increase_limit below its ceiling.
+    for (limit, name, argument, maximum, ceiling) in [
+        (
+            DepgraphResourceLimit::ImpactNodes,
+            "impact_nodes",
+            "max_nodes",
+            10_000,
+            1_000_000,
+        ),
+        (
+            DepgraphResourceLimit::ImpactEdges,
+            "impact_edges",
+            "max_edges",
+            50_000,
+            1_000_000,
+        ),
+        (
+            DepgraphResourceLimit::ExportNodes,
+            "export_nodes",
+            "max_nodes",
+            10,
+            50_000,
+        ),
+        (
+            DepgraphResourceLimit::ExportEdges,
+            "export_edges",
+            "max_edges",
+            10,
+            100_000,
+        ),
+    ] {
+        let raisable = mapped_error(&DepgraphServiceError::resource_limit(
+            limit,
+            maximum,
+            Some(maximum + 1),
+        ));
+        assert_eq!(
+            raisable,
+            json!({
+                "code": "RESOURCE_EXHAUSTED",
+                "category": "resource",
+                "retryable": false,
+                "remediation": "increase_limit",
+                "details": {
+                    "kind": "resource_limit",
+                    "limit": name,
+                    "maximum": maximum,
+                    "observed": maximum + 1,
+                    "argument": argument
+                }
+            })
+        );
+        let at_ceiling = mapped_error(&DepgraphServiceError::resource_limit(limit, ceiling, None));
+        assert_eq!(at_ceiling["remediation"], "narrow_query", "{name}");
+        assert_eq!(at_ceiling["details"]["argument"], argument, "{name}");
+    }
+    // Fixed service bounds only ask for narrowing.
+    for (limit, name) in [
+        (DepgraphResourceLimit::ImpactPathSteps, "impact_path_steps"),
+        (DepgraphResourceLimit::ChangedPaths, "changed_paths"),
+        (DepgraphResourceLimit::HealthFindings, "health_findings"),
+        (
+            DepgraphResourceLimit::HealthFindingItems,
+            "health_finding_items",
+        ),
+        (DepgraphResourceLimit::HealthManifests, "health_manifests"),
+        (DepgraphResourceLimit::InputBytes, "input_bytes"),
+        (DepgraphResourceLimit::ArtifactItems, "artifact_items"),
+        (
+            DepgraphResourceLimit::ArtifactWorkItems,
+            "artifact_work_items",
+        ),
+        (DepgraphResourceLimit::OutputBytes, "output_bytes"),
+    ] {
+        let fixed = mapped_error(&DepgraphServiceError::resource_limit(limit, 10_000, None));
+        assert_eq!(fixed["code"], "RESOURCE_EXHAUSTED", "{name}");
+        assert_eq!(fixed["remediation"], "narrow_query", "{name}");
+        assert_eq!(
+            fixed["details"],
+            json!({"kind": "resource_limit", "limit": name, "maximum": 10_000})
+        );
+    }
+}
+
+#[test]
 fn issue_565_unclassified_graph_query_errors_stay_detail_free_and_unreflected() {
     let error = mapped_error(&DepgraphServiceError::graph_query(
         io::Error::other("selector \"path:/Users/private/secret.rs\" is weird").into(),

@@ -9,8 +9,7 @@ use chacha20poly1305::{
 };
 use depgraph_core::{
     CancellationToken, DepgraphCapability, DepgraphResourceLimit, DepgraphServiceError,
-    MAX_INTERACTIVE_QUERY_TRAVERSAL, QueryDiagnostic, QueryFailureClass, RepositoryFileError,
-    SelectorFailureKind,
+    QueryDiagnostic, QueryFailureClass, RepositoryFileError, SelectorFailureKind,
     service::{CyclesResult, DependenciesResult, ImpactServiceResult, UnresolvedServiceResult},
 };
 use rmcp::model::CallToolResult;
@@ -537,10 +536,25 @@ fn map_resource_limit(
         DepgraphResourceLimit::MaxTraversal => AgentResourceLimit::TraversalItems,
         DepgraphResourceLimit::AdjacencyEdgeInspection => AgentResourceLimit::SnapshotEdges,
         DepgraphResourceLimit::PreprocessingWorkItems => AgentResourceLimit::PreprocessingWorkItems,
+        DepgraphResourceLimit::ImpactNodes => AgentResourceLimit::ImpactNodes,
+        DepgraphResourceLimit::ImpactEdges => AgentResourceLimit::ImpactEdges,
+        DepgraphResourceLimit::ImpactPathSteps => AgentResourceLimit::ImpactPathSteps,
+        DepgraphResourceLimit::ChangedPaths => AgentResourceLimit::ChangedPaths,
+        DepgraphResourceLimit::HealthFindings => AgentResourceLimit::HealthFindings,
+        DepgraphResourceLimit::HealthFindingItems => AgentResourceLimit::HealthFindingItems,
+        DepgraphResourceLimit::HealthManifests => AgentResourceLimit::HealthManifests,
+        DepgraphResourceLimit::InputBytes => AgentResourceLimit::InputBytes,
+        DepgraphResourceLimit::ArtifactItems => AgentResourceLimit::ArtifactItems,
+        DepgraphResourceLimit::ArtifactWorkItems => AgentResourceLimit::ArtifactWorkItems,
+        DepgraphResourceLimit::ExportNodes => AgentResourceLimit::ExportNodes,
+        DepgraphResourceLimit::ExportEdges => AgentResourceLimit::ExportEdges,
+        DepgraphResourceLimit::OutputBytes => AgentResourceLimit::OutputBytes,
     };
     let argument = limit.argument();
-    let ceiling = MAX_INTERACTIVE_QUERY_TRAVERSAL as u64;
-    let raisable = argument.is_some() && maximum < ceiling;
+    let raisable = argument.is_some()
+        && limit
+            .argument_ceiling()
+            .is_some_and(|ceiling| maximum < ceiling);
     AgentError::new(
         AgentErrorCode::ResourceExhausted,
         false,

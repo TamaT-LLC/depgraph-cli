@@ -616,7 +616,10 @@ impl DepgraphService {
             return Err(DepgraphServiceError::Cancelled);
         }
         if !result.complete {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(impact_incomplete_error(
+                &result.diagnostics,
+                request.filters(),
+            ));
         }
         Ok(ImpactServiceResult {
             snapshot_id,
@@ -653,7 +656,10 @@ impl DepgraphService {
             return Err(DepgraphServiceError::Cancelled);
         }
         if !result.complete {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(impact_incomplete_error(
+                &result.diagnostics,
+                request.filters(),
+            ));
         }
         Ok(ChangedSetImpactServiceResult {
             snapshot_id,
@@ -718,12 +724,38 @@ impl DepgraphService {
     }
 }
 
+/// An impact traversal that stopped at its `max_nodes` / `max_edges` result
+/// bound names that bound and the argument that widens it (Issue #581).
+fn impact_incomplete_error(
+    diagnostics: &[crate::impact::ImpactDiagnostic],
+    filters: &crate::impact::ImpactFilters,
+) -> DepgraphServiceError {
+    let hit = |code: &str| diagnostics.iter().any(|diagnostic| diagnostic.code == code);
+    if hit("impact_node_limit_reached") {
+        DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::ImpactNodes,
+            saturating_u64(filters.max_nodes),
+            None,
+        )
+    } else if hit("impact_edge_limit_reached") {
+        DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::ImpactEdges,
+            saturating_u64(filters.max_edges),
+            None,
+        )
+    } else {
+        DepgraphServiceError::ResourceExhausted
+    }
+}
+
 fn impact_service_error(
     source: anyhow::Error,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceError {
     if cancellation.is_cancelled() {
         DepgraphServiceError::Cancelled
+    } else if let Some((limit, maximum)) = crate::impact::resource_limit(&source) {
+        DepgraphServiceError::resource_limit(limit, maximum, None)
     } else if crate::impact::is_resource_exhausted(&source) {
         DepgraphServiceError::ResourceExhausted
     } else if crate::impact::is_integrity(&source) {
@@ -739,6 +771,8 @@ fn impact_changed_set_service_error(
 ) -> DepgraphServiceError {
     if cancellation.is_cancelled() {
         DepgraphServiceError::Cancelled
+    } else if let Some((limit, maximum)) = crate::impact::resource_limit(&source) {
+        DepgraphServiceError::resource_limit(limit, maximum, None)
     } else if crate::impact::is_resource_exhausted(&source) {
         DepgraphServiceError::ResourceExhausted
     } else {
@@ -833,7 +867,11 @@ fn preflight_impact_snapshot(
             return Err(DepgraphServiceError::Cancelled);
         }
         if length > MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::PreprocessingWorkItems,
+                saturating_u64(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS),
+                Some(saturating_u64(length)),
+            ));
         }
     }
     let mut evidence_per_owner = BTreeMap::<(&str, &str), usize>::new();
@@ -1846,7 +1884,15 @@ mod tests {
             crate::impact::changed_set_preprocessing_exhausted_for_test(),
             &cancellation,
         );
-        assert!(matches!(resource, DepgraphServiceError::ResourceExhausted));
+        // The changed-set bound is named (Issue #581).
+        assert!(matches!(
+            resource,
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::ChangedPaths,
+                maximum: 100_000,
+                observed: None,
+            }
+        ));
 
         let ordinary = impact_changed_set_service_error(
             anyhow::anyhow!("invalid Git ref"),

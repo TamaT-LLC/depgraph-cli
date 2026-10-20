@@ -68,7 +68,11 @@ impl<'a> FindingCollector<'a> {
         cancellation: &CancellationToken,
     ) -> DepgraphServiceResult<()> {
         if findings.len() > MAX_HEALTH_FINDINGS {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(DepgraphServiceError::resource_limit(
+                crate::DepgraphResourceLimit::HealthFindings,
+                u64::try_from(MAX_HEALTH_FINDINGS).unwrap_or(u64::MAX),
+                Some(u64::try_from(findings.len()).unwrap_or(u64::MAX)),
+            ));
         }
         let mut ids = Vec::with_capacity(findings.len());
         for finding in findings {
@@ -177,18 +181,31 @@ fn retain_first(page: &mut BTreeMap<String, HealthFinding>, finding: HealthFindi
 fn validate_fields(finding: &HealthFinding) -> DepgraphServiceResult<()> {
     HealthFindingGetRequest::try_new(finding.id.clone())
         .map_err(|_| DepgraphServiceError::Integrity)?;
-    if finding.evidence.len() > MAX_HEALTH_EVIDENCE_PER_FINDING
-        || finding.remediations.len() > MAX_HEALTH_REMEDIATIONS_PER_FINDING
-        || finding.suppressions.len() > MAX_HEALTH_SUPPRESSIONS_PER_FINDING
-        || finding
-            .blockers
-            .iter()
-            .map(|blocker| blocker.kind)
-            .collect::<BTreeSet<_>>()
-            .len()
-            > MAX_HEALTH_BLOCKERS_PER_FINDING
-    {
-        return Err(DepgraphServiceError::ResourceExhausted);
+    let blocker_kinds = finding
+        .blockers
+        .iter()
+        .map(|blocker| blocker.kind)
+        .collect::<BTreeSet<_>>()
+        .len();
+    for (count, maximum) in [
+        (finding.evidence.len(), MAX_HEALTH_EVIDENCE_PER_FINDING),
+        (
+            finding.remediations.len(),
+            MAX_HEALTH_REMEDIATIONS_PER_FINDING,
+        ),
+        (
+            finding.suppressions.len(),
+            MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
+        ),
+        (blocker_kinds, MAX_HEALTH_BLOCKERS_PER_FINDING),
+    ] {
+        if count > maximum {
+            return Err(DepgraphServiceError::resource_limit(
+                crate::DepgraphResourceLimit::HealthFindingItems,
+                u64::try_from(maximum).unwrap_or(u64::MAX),
+                Some(u64::try_from(count).unwrap_or(u64::MAX)),
+            ));
+        }
     }
     // Preserve original blockers on candidate pages. Once partial status is
     // known, mark_partial followed by bound_findings keeps the legacy

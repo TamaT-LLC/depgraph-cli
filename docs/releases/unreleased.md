@@ -17,6 +17,14 @@ MCP ツールのエラー応答 `error.details` に、原因を特定できる�
 `depgraph-mcp-tools` crate の型で応答を `deny_unknown_fields` 付きで Deserialize している利用者は、追加された要素を受け取るために crate を更新する。
 存在しないパスを渡したときに `INVALID_ARGUMENT` を前提としていた利用者は、`NOT_FOUND` も扱う。
 
+続けて、details のないエラーが残っていたツールも同じ形に揃える（[#581](https://github.com/TamaT-LLC/depgraph-cli/issues/581)）。
+
+- `snapshot` / `from` / `to` に snapshot 名・stable ID・`current` 以外の値（`latest` など）を渡したときの `INVALID_ARGUMENT` に、`{"kind":"argument","argument":"snapshot"|"from"|"to","reason":"invalid_value"}` を付ける。値そのものは返さない。
+- `graph_dependencies_list` / `graph_dependents_list` の `edge_kinds` が不正なときは、`agent_edges_list` と同じく `argument: "edge_kinds"` と `invalid_value` / `too_many_items` を返す。
+- `agent_sites_list` の `site_id` / `node_id`、`agent_node_get` / `agent_edges_list` の `node_id`、`agent_evidence_list` の `site_id`、`agent_nodes_list` / `graph_unresolved_list` の `kinds`、`graph_impact_get` の `conditions`、`resolve_build_submit` の `acknowledgement` / `rust_compiler_precise` の不正値にも、引数名と理由を付ける。
+- impact、health、hotspot、snapshot diff、policy、export の上限超過の `RESOURCE_EXHAUSTED` に `kind: "resource_limit"` の details を付ける。`limit` に `impact_nodes` / `impact_edges`（`max_nodes` / `max_edges` で広げられる）、`impact_path_steps`、`changed_paths`、`health_findings`、`health_finding_items`、`health_manifests`、`artifact_items`、`artifact_work_items`、`export_nodes` / `export_edges`（`max_nodes` / `max_edges`）を追加する。health と hotspot の作業量の上限は、既存の `preprocessing_work_items` として返す。
+- `graph_export` のセレクターに一致するノードがない場合は、依存一覧と同じく `NOT_FOUND`（`argument: "selector"`、`reason: "no_matching_node"`）を返す。これまでは details のない `INVALID_ARGUMENT` だった。CLI の `export` も、上限やセレクターの失敗を同じ文言で示す。終了コードは変えない。
+
 ## 追加機能
 
 - MCP の `agent_edges_list` に、辺種別の許可リスト `edge_kinds` と出力粒度 `detail`（`summary` / `full`、既定 `full`）を追加する。`summary` は evidence 本体を省き、ページ内で共通の `phase` / `profile_id` などを `common` に 1 回だけ出し、各辺に `site_id` と `evidence_count` を残す。`agent_sites_list` に `site_id` を追加し、1 件の site を ID で取得できるようにする。どちらも省略時の応答と cursor は従来と同じ（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。

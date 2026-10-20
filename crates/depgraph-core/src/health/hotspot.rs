@@ -162,6 +162,9 @@ pub enum HotspotAnalysisError {
     Cancelled,
     #[error("hotspot analysis exhausted its bounded work budget")]
     ResourceExhausted,
+    /// More hotspot subjects than the response may carry as findings.
+    #[error("hotspot analysis exceeded its subject limit")]
+    SubjectLimit,
 }
 
 #[must_use = "hotspot analysis results must be handled"]
@@ -204,7 +207,7 @@ pub fn score_hotspots_cancellable(
         work.step(&mut is_cancelled)?;
         if is_hotspot_subject_kind(&node.kind) {
             if subjects.len() >= maximum_subjects {
-                return Err(HotspotAnalysisError::ResourceExhausted);
+                return Err(HotspotAnalysisError::SubjectLimit);
             }
             subjects.push(node);
         }
@@ -908,7 +911,7 @@ mod tests {
                 usize::MAX,
                 || false,
             ),
-            Err(HotspotAnalysisError::ResourceExhausted)
+            Err(HotspotAnalysisError::SubjectLimit)
         );
         assert_eq!(
             score_hotspots_cancellable(

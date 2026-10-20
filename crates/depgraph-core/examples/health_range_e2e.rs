@@ -135,6 +135,7 @@ fn analysis_outcome(error: &HealthAnalysisError) -> &'static str {
     match error {
         HealthAnalysisError::Cancelled => "cancelled",
         HealthAnalysisError::ResourceExhausted => "resource_exhausted",
+        HealthAnalysisError::FindingLimit => "finding_limit",
         HealthAnalysisError::Integrity => "integrity",
     }
 }

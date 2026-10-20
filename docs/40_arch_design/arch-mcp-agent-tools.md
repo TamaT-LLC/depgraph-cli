@@ -922,6 +922,20 @@ Agentがファイルを開かずに「なぜ依存しているか」を説明で
 | Not in scope | `module_declaration`（`mod foo;`）のimport根拠はclosed enum `binding_kind`の追加が要るため扱わない。`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約も別Issueで扱う |
 | Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。schemaには`AgentEdgesOutput`、`AgentEdgesSummaryResponse`、`AgentEdgeDetail`とその成功envelopeが増える |
 
+## Issue #581 remaining argument and limit details
+
+Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EXHAUSTED`を、同じclosed形式に揃える。既存variantの既存fieldは変えず、`AgentResourceLimit`の値を足すだけにする。
+
+| Area | Evidence |
+| --- | --- |
+| Snapshot arguments | MCP層の`parse_snapshot_argument`が`SnapshotLocator::parse`の失敗を`{"kind":"argument","argument":"snapshot"\|"from"\|"to","reason":"invalid_value"}`にする。値はechoしない |
+| Edge kinds | 依存一覧はcoreへ渡す前に`EdgeKindFilter::try_new`で検証し、`agent_edges_list`と同じ`edge_kinds_argument_error`（`too_many_items` / `invalid_value`、構造辺の矛盾も`invalid_value`）を返す |
+| IDs and lists | `site_id` / `node_id` / `kinds` / `conditions` / `acknowledgement` / `rust_compiler_precise`の検証失敗に引数名を付ける |
+| Resource limits | core `DepgraphResourceLimit`に`ImpactNodes` / `ImpactEdges` / `ImpactPathSteps` / `ChangedPaths` / `HealthFindings` / `HealthFindingItems` / `HealthManifests` / `InputBytes` / `ArtifactItems` / `ArtifactWorkItems` / `ExportNodes` / `ExportEdges` / `OutputBytes`を足す。impactの内部markerは上限の種類と値を持ち、`impact::resource_limit`がservice境界で取り出す。health分析は作業量（`ResourceExhausted`、全phaseとrangeが`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`）とfinding数（新variant `FindingLimit` / hotspotの`SubjectLimit`）を区別する。rangeの再分割は両方をoverrunとして従来どおり扱う |
+| Remediation | `increase_limit`は引数で広げられ、上限値がその引数の最大値（`max_traversal`とimpactの`max_nodes` / `max_edges`は1,000,000、exportは50,000 / 100,000）未満のときだけ。`DepgraphResourceLimit::argument_ceiling`で判定する |
+| Export selector | `graph_export`のselector解決失敗を依存一覧と同じ`SelectorResolutionFailure`のtag付きgraph query errorにし、`NOT_FOUND` / `no_matching_node`を返す |
+| Not in scope | `graph_cycles_list` / `graph_unresolved_list`のphase作業量、bounded query、lifecycle、repository操作の`ResourceExhausted`はdetailsなしのまま |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |

@@ -1240,10 +1240,36 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             json!({"type": "integer", "minimum": 1})
         }
         "max_nodes" if matches!(tool_name, "graph_export" | "export_file") => {
-            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_NODES})
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_GRAPH_EXPORT_NODES,
+                "description": "Largest node count of the exported graph. A larger selection returns RESOURCE_EXHAUSTED with error.details limit export_nodes, the selected count as observed, and argument max_nodes."
+            })
         }
         "max_edges" if matches!(tool_name, "graph_export" | "export_file") => {
-            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_EDGES})
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_GRAPH_EXPORT_EDGES,
+                "description": "Largest edge count of the exported graph. A larger selection returns RESOURCE_EXHAUSTED with error.details limit export_edges, the selected count as observed, and argument max_edges."
+            })
+        }
+        "max_nodes" if tool_name == "graph_impact_get" => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Unique nodes the impact traversal may keep (default 10000). A traversal that reaches it returns RESOURCE_EXHAUSTED with error.details limit impact_nodes and argument max_nodes."
+            })
+        }
+        "max_edges" if tool_name == "graph_impact_get" => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Unique edges the impact traversal may keep (default 50000). A traversal that reaches it returns RESOURCE_EXHAUSTED with error.details limit impact_edges and argument max_edges."
+            })
         }
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})

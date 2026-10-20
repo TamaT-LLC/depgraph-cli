@@ -319,7 +319,7 @@ fn push_finding(
     finding: HealthFinding,
 ) -> Result<(), HealthAnalysisError> {
     if !finding_ids.contains(&finding.id) && finding_ids.len() >= maximum_findings {
-        return Err(HealthAnalysisError::ResourceExhausted);
+        return Err(HealthAnalysisError::FindingLimit);
     }
     finding_ids.insert(finding.id.clone());
     findings.push(finding);

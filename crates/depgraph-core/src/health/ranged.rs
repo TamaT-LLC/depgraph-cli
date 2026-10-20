@@ -222,9 +222,9 @@ impl<F: FnMut() -> bool> HealthWorkBudget for RangeBudget<'_, F> {
             .step(self.is_cancelled)
             .map_err(|error| match error {
                 HealthAnalysisError::Cancelled => HealthWorkError::Cancelled,
-                HealthAnalysisError::ResourceExhausted | HealthAnalysisError::Integrity => {
-                    HealthWorkError::ResourceExhausted
-                }
+                HealthAnalysisError::ResourceExhausted
+                | HealthAnalysisError::FindingLimit
+                | HealthAnalysisError::Integrity => HealthWorkError::ResourceExhausted,
             })
     }
 }
@@ -353,7 +353,10 @@ fn run_range(
             work_used: inner.used() as u64,
         }),
         Err(HealthAnalysisError::Cancelled) => RangeStep::Cancelled,
-        Err(HealthAnalysisError::ResourceExhausted) => RangeStep::Overrun,
+        // A range that overran its work or finding share is re-split.
+        Err(HealthAnalysisError::ResourceExhausted | HealthAnalysisError::FindingLimit) => {
+            RangeStep::Overrun
+        }
         Err(HealthAnalysisError::Integrity) => RangeStep::Integrity,
     })
 }
@@ -378,7 +381,7 @@ pub fn analyze_unused_ranged(
     let error = if findings.windows(2).any(|pair| pair[0].id == pair[1].id) {
         Some(HealthAnalysisError::Integrity)
     } else if findings.len() > maximum_findings {
-        Some(HealthAnalysisError::ResourceExhausted)
+        Some(HealthAnalysisError::FindingLimit)
     } else {
         None
     };
