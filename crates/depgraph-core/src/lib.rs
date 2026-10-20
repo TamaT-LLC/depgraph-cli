@@ -539,6 +539,22 @@ pub struct WorkerHealth {
     pub error: Option<String>,
     pub root_launch_allowed: bool,
     pub root_launch_error: Option<String>,
+    /// How the worker was located: the same route a scan in this process
+    /// takes (`release-manifest`, `environment-override`, `development-build`),
+    /// or `unresolved` when no worker could be located.
+    pub resolution: &'static str,
+    /// Release-relative artifact path that was verified, for a worker located
+    /// through the release manifest.
+    pub artifact: Option<String>,
+    /// External runtime the worker needs (the Web worker's Node.js range).
+    pub runtime_requirement: Option<String>,
+    /// Stable code for the check that made `available` false.
+    pub unavailable_reason: Option<&'static str>,
+    /// Stable code for the check that made `root_launch_allowed` false.
+    pub root_launch_blocked_reason: Option<&'static str>,
+    /// What a scan of a repository that needs this adapter gets from this
+    /// worker: `worker-used`, `adapter-units-fail`, or `scan-security-failed`.
+    pub scan_impact: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1220,6 +1236,79 @@ fn worker_root_launch_policy(spec: &worker::WorkerSpec, root: &Path) -> (bool, O
     }
 }
 
+/// The route `locate_worker` took for `spec`. Only the release-manifest
+/// branch records an expected version, and the environment override is the
+/// only route consulted before the development build candidates.
+fn worker_resolution(spec: &worker::WorkerSpec) -> &'static str {
+    if spec.expected_version.is_some() {
+        "release-manifest"
+    } else if std::env::var_os(spec.adapter.env_override()).is_some() {
+        "environment-override"
+    } else {
+        "development-build"
+    }
+}
+
+/// The verified artifact relative to the release root (`libexec/<worker>`).
+/// Development and override paths are absolute and stay out of the report.
+fn worker_release_artifact(spec: &worker::WorkerSpec) -> Option<String> {
+    spec.expected_version.as_ref()?;
+    let file = spec.artifact_path.file_name()?.to_str()?;
+    let directory = spec.artifact_path.parent()?.file_name()?.to_str()?;
+    Some(format!("{directory}/{file}"))
+}
+
+fn worker_location_failure_reason(error: &str) -> &'static str {
+    if is_security_error(error) {
+        "release-verification-failed"
+    } else if error.contains("does not name a readable worker") {
+        "override-unreadable"
+    } else {
+        "not-found"
+    }
+}
+
+fn worker_probe_failure_reason(error: &str) -> &'static str {
+    if error.contains("node is unavailable on the sanitized PATH") {
+        "runtime-unavailable"
+    } else if error.contains("Node.js runtime") {
+        "runtime-requirement-unmet"
+    } else if is_security_error(error) {
+        "release-verification-failed"
+    } else {
+        "handshake-failed"
+    }
+}
+
+fn worker_root_launch_blocked_reason(error: &str) -> &'static str {
+    if error.contains("is inside the scan root") {
+        "artifact-inside-root"
+    } else if error.contains("node is unavailable on the sanitized PATH") {
+        "runtime-unavailable"
+    } else if error.contains("worker artifact") && error.contains("is unavailable") {
+        "artifact-missing"
+    } else {
+        "launch-policy-violation"
+    }
+}
+
+fn worker_scan_impact(
+    available: bool,
+    root_launch_allowed: bool,
+    unavailable_reason: Option<&str>,
+) -> &'static str {
+    if available && root_launch_allowed {
+        "worker-used"
+    } else if matches!(
+        unavailable_reason,
+        Some("release-verification-failed" | "probe-suppressed")
+    ) {
+        "scan-security-failed"
+    } else {
+        "adapter-units-fail"
+    }
+}
+
 fn evaluated_worker_health(
     adapter: AdapterKind,
     spec: worker::WorkerSpec,
@@ -1232,19 +1321,33 @@ fn evaluated_worker_health(
         .and_then(parse_worker_handshake)
         .map(|(_, _, protocol)| protocol.to_owned());
     let integrity = worker_integrity(adapter, &spec.artifact_path, reported_version);
+    let unavailable_reason = match &version {
+        Err(error) => Some(worker_probe_failure_reason(&format!("{error:#}"))),
+        Ok(_) if integrity.starts_with("error: ") => Some("integrity-mismatch"),
+        Ok(_) => None,
+    };
     let error = version
         .as_ref()
         .err()
         .map(ToString::to_string)
         .or_else(|| integrity.strip_prefix("error: ").map(ToOwned::to_owned));
+    let available = error.is_none();
     WorkerHealth {
         adapter: adapter.name().to_owned(),
-        available: error.is_none(),
+        available,
+        resolution: worker_resolution(&spec),
+        artifact: worker_release_artifact(&spec),
+        runtime_requirement: spec.runtime_requirement.clone(),
         command: Some(spec.display),
         version: version.ok(),
         protocol,
         integrity,
         error,
+        root_launch_blocked_reason: root_launch_error
+            .as_deref()
+            .map(worker_root_launch_blocked_reason),
+        scan_impact: worker_scan_impact(available, root_launch_allowed, unavailable_reason),
+        unavailable_reason,
         root_launch_allowed,
         root_launch_error,
     }
@@ -1256,9 +1359,13 @@ fn suppressed_worker_health(
     root: &Path,
 ) -> WorkerHealth {
     let (root_launch_allowed, root_launch_error) = worker_root_launch_policy(&spec, root);
+    let unavailable_reason = Some("probe-suppressed");
     WorkerHealth {
         adapter: adapter.name().to_owned(),
         available: false,
+        resolution: worker_resolution(&spec),
+        artifact: worker_release_artifact(&spec),
+        runtime_requirement: spec.runtime_requirement.clone(),
         command: Some(spec.display),
         version: None,
         protocol: None,
@@ -1267,8 +1374,38 @@ fn suppressed_worker_health(
             "worker probe suppressed because another adapter failed release security verification"
                 .to_owned(),
         ),
+        unavailable_reason,
+        root_launch_blocked_reason: root_launch_error
+            .as_deref()
+            .map(worker_root_launch_blocked_reason),
+        // A scan stops every worker once one adapter fails release security
+        // verification, so this worker would not run either.
+        scan_impact: worker_scan_impact(false, root_launch_allowed, unavailable_reason),
         root_launch_allowed,
         root_launch_error,
+    }
+}
+
+fn unresolved_worker_health(adapter: AdapterKind, error: String) -> WorkerHealth {
+    let unavailable_reason = Some(worker_location_failure_reason(&error));
+    WorkerHealth {
+        adapter: adapter.name().to_owned(),
+        available: false,
+        resolution: "unresolved",
+        artifact: None,
+        runtime_requirement: None,
+        command: None,
+        version: None,
+        protocol: None,
+        integrity: "unavailable".to_owned(),
+        root_launch_error: Some(format!(
+            "root launch policy was not evaluated because the worker is unavailable: {error}"
+        )),
+        error: Some(error),
+        unavailable_reason,
+        root_launch_blocked_reason: Some("worker-unavailable"),
+        scan_impact: worker_scan_impact(false, false, unavailable_reason),
+        root_launch_allowed: false,
     }
 }
 
@@ -1287,19 +1424,7 @@ async fn doctor_workers(root: &Path, cancellation: &CancellationToken) -> Vec<Wo
                 let version = worker_artifact_version(&spec, cancellation).await;
                 evaluated_worker_health(adapter, spec, root, version)
             }
-            DoctorWorkerLocation::Unavailable(error) => WorkerHealth {
-                adapter: adapter.name().to_owned(),
-                available: false,
-                command: None,
-                version: None,
-                protocol: None,
-                integrity: "unavailable".to_owned(),
-                error: Some(error.clone()),
-                root_launch_allowed: false,
-                root_launch_error: Some(format!(
-                    "root launch policy was not evaluated because the worker is unavailable: {error}"
-                )),
-            },
+            DoctorWorkerLocation::Unavailable(error) => unresolved_worker_health(adapter, error),
         });
     }
     workers
@@ -1947,7 +2072,16 @@ fn release_health() -> Result<Option<ReleaseHealth>> {
         compatibility: manifest.compatibility,
         compatibility_integrity,
         license_expression: manifest.license_expression,
-        core_integrity: artifact_integrity(root, &manifest.core, Some(&executable)),
+        // The MCP server and the operation runner read the same manifest from
+        // their own process; the core identity check only applies to the core.
+        core_integrity: artifact_integrity(
+            root,
+            &manifest.core,
+            Path::new(&manifest.core.path)
+                .file_name()
+                .is_some_and(|name| Some(name) == executable.file_name())
+                .then_some(executable.as_path()),
+        ),
         schema_integrity: artifact_integrity(root, &manifest.schema, None),
         runtime_integrity,
         runtime_requirements: manifest.runtime_requirements,
@@ -2467,6 +2601,104 @@ mod tests {
             (AdapterKind::Go, DoctorWorkerLocation::Unavailable(error))
                 if error == "Go worker is unavailable"
         ));
+    }
+
+    /// #569: an unavailable worker names the check that failed and what a
+    /// scan gets instead, so `available: false` is no longer ambiguous.
+    #[test]
+    fn doctor_worker_health_names_the_failed_check_and_scan_impact() {
+        let unresolved = super::unresolved_worker_health(
+            AdapterKind::Rust,
+            "security policy violation: bundled release verification failed".to_owned(),
+        );
+        assert!(!unresolved.available);
+        assert_eq!(unresolved.resolution, "unresolved");
+        assert_eq!(
+            unresolved.unavailable_reason,
+            Some("release-verification-failed")
+        );
+        assert_eq!(
+            unresolved.root_launch_blocked_reason,
+            Some("worker-unavailable")
+        );
+        assert_eq!(unresolved.scan_impact, "scan-security-failed");
+
+        let missing = super::unresolved_worker_health(
+            AdapterKind::Go,
+            "go worker is unavailable; set DEPGRAPH_GO_WORKER or build the bundled worker"
+                .to_owned(),
+        );
+        assert_eq!(missing.unavailable_reason, Some("not-found"));
+        assert_eq!(missing.scan_impact, "adapter-units-fail");
+
+        let unrelated_root = tempfile::tempdir().expect("unrelated root");
+        let mut web = test_worker_spec(AdapterKind::Web);
+        web.runtime_requirement = Some("Node.js >=24.0.0".to_owned());
+        let old_node = evaluated_worker_health(
+            AdapterKind::Web,
+            web,
+            unrelated_root.path(),
+            Err(anyhow::anyhow!(
+                "Node.js runtime 22.23.2 does not satisfy Node.js >=24.0.0"
+            )),
+        );
+        assert!(!old_node.available);
+        assert_eq!(old_node.resolution, "development-build");
+        assert_eq!(
+            old_node.unavailable_reason,
+            Some("runtime-requirement-unmet")
+        );
+        assert_eq!(
+            old_node.runtime_requirement.as_deref(),
+            Some("Node.js >=24.0.0")
+        );
+        assert_eq!(old_node.scan_impact, "adapter-units-fail");
+        assert!(old_node.artifact.is_none());
+
+        let source_root = tempfile::tempdir().expect("source root");
+        let artifact = source_root.path().join("depgraph-go-worker");
+        std::fs::write(&artifact, b"fixture").expect("worker artifact");
+        let mut go = test_worker_spec(AdapterKind::Go);
+        go.artifact_path = artifact;
+        let version = format!(
+            "depgraph-go-worker {} (protocol 1.0)",
+            env!("CARGO_PKG_VERSION")
+        );
+        let used = evaluated_worker_health(
+            AdapterKind::Go,
+            go.clone(),
+            unrelated_root.path(),
+            Ok(version.clone()),
+        );
+        assert!(used.available && used.root_launch_allowed);
+        assert_eq!(used.unavailable_reason, None);
+        assert_eq!(used.root_launch_blocked_reason, None);
+        assert_eq!(used.scan_impact, "worker-used");
+
+        let blocked = evaluated_worker_health(AdapterKind::Go, go, source_root.path(), Ok(version));
+        assert!(blocked.available && !blocked.root_launch_allowed);
+        assert_eq!(
+            blocked.root_launch_blocked_reason,
+            Some("artifact-inside-root")
+        );
+        assert_eq!(blocked.scan_impact, "adapter-units-fail");
+
+        let mut released = test_worker_spec(AdapterKind::Rust);
+        released.artifact_path = PathBuf::from("/opt/depgraph/libexec/depgraph-rust-worker");
+        released.expected_version = Some(env!("CARGO_PKG_VERSION").to_owned());
+        assert_eq!(super::worker_resolution(&released), "release-manifest");
+        assert_eq!(
+            super::worker_release_artifact(&released).as_deref(),
+            Some("libexec/depgraph-rust-worker")
+        );
+
+        let suppressed = suppressed_worker_health(
+            AdapterKind::Go,
+            test_worker_spec(AdapterKind::Go),
+            Path::new("/tmp"),
+        );
+        assert_eq!(suppressed.unavailable_reason, Some("probe-suppressed"));
+        assert_eq!(suppressed.scan_impact, "scan-security-failed");
     }
 }
 

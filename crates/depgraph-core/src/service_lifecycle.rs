@@ -109,6 +109,18 @@ struct DoctorWorker {
     protocol: Option<String>,
     integrity: String,
     root_launch_allowed: bool,
+    resolution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_requirement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_launch_blocked_reason: Option<String>,
+    scan_impact: String,
+    diagnostic: String,
+    remediation: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -842,6 +854,93 @@ impl From<WorkerHealth> for DoctorWorker {
                 safe_text(worker.integrity)
             },
             root_launch_allowed: worker.root_launch_allowed,
+            resolution: worker.resolution.to_owned(),
+            artifact: worker.artifact.map(safe_text),
+            runtime_requirement: worker.runtime_requirement.map(safe_text),
+            unavailable_reason: worker.unavailable_reason.map(ToOwned::to_owned),
+            root_launch_blocked_reason: worker.root_launch_blocked_reason.map(ToOwned::to_owned),
+            scan_impact: worker.scan_impact.to_owned(),
+            diagnostic: doctor_worker_diagnostic(
+                worker.unavailable_reason,
+                worker.root_launch_blocked_reason,
+            )
+            .to_owned(),
+            remediation: doctor_worker_remediation(
+                worker.unavailable_reason,
+                worker.root_launch_blocked_reason,
+            )
+            .to_owned(),
+        }
+    }
+}
+
+/// Fixed, path-free explanation of the check that decided a worker's state.
+/// The availability failure wins because root launch is not meaningful for a
+/// worker that cannot run at all.
+fn doctor_worker_diagnostic(
+    unavailable_reason: Option<&str>,
+    root_launch_blocked_reason: Option<&str>,
+) -> &'static str {
+    match (unavailable_reason, root_launch_blocked_reason) {
+        (None, None) => {
+            "the worker was located, its version handshake succeeded, and it may launch for the diagnostic root"
+        }
+        (Some("release-verification-failed"), _) => {
+            "the release manifest, a bundled artifact, or the running executable failed release verification"
+        }
+        (Some("override-unreadable"), _) => {
+            "the DEPGRAPH_<ADAPTER>_WORKER override does not name a readable worker"
+        }
+        (Some("not-found"), _) => "no development worker build or override was found",
+        (Some("probe-suppressed"), _) => {
+            "the version probe was skipped because another adapter failed release verification"
+        }
+        (Some("runtime-unavailable"), _) => {
+            "no node executable was found on the sanitized PATH outside the repository"
+        }
+        (Some("runtime-requirement-unmet"), _) => {
+            "the node executable first on the sanitized PATH does not satisfy the Web worker runtime requirement"
+        }
+        (Some("integrity-mismatch"), _) => {
+            "the worker artifact does not match its expected identity"
+        }
+        (Some(_), _) => "the worker version handshake failed",
+        (None, Some("artifact-inside-root")) => {
+            "the development worker artifact is inside the diagnostic root, so it may not launch for it"
+        }
+        (None, Some("runtime-unavailable")) => {
+            "no node executable outside the diagnostic root was found on the sanitized PATH"
+        }
+        (None, Some("artifact-missing")) => {
+            "the worker artifact disappeared before root launch was checked"
+        }
+        (None, Some(_)) => "the worker launch policy rejected the diagnostic root",
+    }
+}
+
+fn doctor_worker_remediation(
+    unavailable_reason: Option<&str>,
+    root_launch_blocked_reason: Option<&str>,
+) -> &'static str {
+    match (unavailable_reason, root_launch_blocked_reason) {
+        (None, None) => "no action is needed",
+        (Some("release-verification-failed" | "probe-suppressed" | "integrity-mismatch"), _) => {
+            "reinstall the depgraph release (for MCP, rerun `depgraph mcp setup`) instead of editing its files"
+        }
+        (Some("override-unreadable"), _) => "point the override at a readable worker or unset it",
+        (Some("not-found"), _) => "build the workers or set the DEPGRAPH_<ADAPTER>_WORKER override",
+        (Some("runtime-unavailable" | "runtime-requirement-unmet"), _)
+        | (None, Some("runtime-unavailable")) => {
+            "put Node.js 24 or newer first on the PATH of the process that runs depgraph (for MCP, the Agent host's environment) and rerun"
+        }
+        (Some(_), _) => {
+            "rebuild or reinstall the worker so its version handshake matches this core"
+        }
+        (None, Some("artifact-inside-root")) => {
+            "run depgraph from a build outside the scanned repository"
+        }
+        (None, Some(_)) => {
+            "rerun doctor; reinstall depgraph if the worker artifact keeps disappearing"
         }
     }
 }
@@ -1902,6 +2001,68 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    fn worker_health_fixture() -> WorkerHealth {
+        WorkerHealth {
+            adapter: "web".to_owned(),
+            available: false,
+            command: Some("node /opt/depgraph/libexec/depgraph-web-worker.mjs".to_owned()),
+            version: None,
+            protocol: None,
+            integrity: "verified".to_owned(),
+            error: Some(
+                "Node.js runtime 22.23.2 does not satisfy Node.js >=24.0.0 (/opt/node)".to_owned(),
+            ),
+            root_launch_allowed: true,
+            root_launch_error: None,
+            resolution: "release-manifest",
+            artifact: Some("libexec/depgraph-web-worker.mjs".to_owned()),
+            runtime_requirement: Some("Node.js >=24.0.0".to_owned()),
+            unavailable_reason: Some("runtime-requirement-unmet"),
+            root_launch_blocked_reason: None,
+            scan_impact: "adapter-units-fail",
+        }
+    }
+
+    /// #569: the agent-safe worker projection explains the decision with
+    /// stable codes and fixed text, and still omits raw errors and paths.
+    #[test]
+    fn doctor_worker_projection_explains_unavailability_without_raw_errors() {
+        let projected = serde_json::to_value(DoctorWorker::from(worker_health_fixture()))
+            .expect("worker projection serializes");
+        assert_eq!(projected["available"], false);
+        assert_eq!(projected["resolution"], "release-manifest");
+        assert_eq!(projected["artifact"], "libexec/depgraph-web-worker.mjs");
+        assert_eq!(projected["runtime_requirement"], "Node.js >=24.0.0");
+        assert_eq!(projected["unavailable_reason"], "runtime-requirement-unmet");
+        assert!(projected.get("root_launch_blocked_reason").is_none());
+        assert_eq!(projected["scan_impact"], "adapter-units-fail");
+        assert!(
+            projected["diagnostic"]
+                .as_str()
+                .is_some_and(|text| text.contains("runtime requirement"))
+        );
+        assert!(
+            projected["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("Node.js 24"))
+        );
+        for hidden in ["command", "error", "root_launch_error"] {
+            assert!(projected.get(hidden).is_none(), "{hidden} leaked");
+        }
+        assert!(!projected.to_string().contains("/opt/"));
+
+        let mut usable = worker_health_fixture();
+        usable.available = true;
+        usable.error = None;
+        usable.unavailable_reason = None;
+        usable.scan_impact = "worker-used";
+        let projected =
+            serde_json::to_value(DoctorWorker::from(usable)).expect("worker projection serializes");
+        assert!(projected.get("unavailable_reason").is_none());
+        assert_eq!(projected["scan_impact"], "worker-used");
+        assert_eq!(projected["remediation"], "no action is needed");
+    }
 
     #[test]
     fn doctor_text_projection_rejects_paths_credentials_controls_and_wide_values() {
