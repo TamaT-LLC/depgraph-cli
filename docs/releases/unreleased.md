@@ -44,6 +44,7 @@ Rust worker が出す file node（`include!` 由来を含む）と `include_str!
 
 ## 追加機能
 
+- MCP ツールの `contract_version` を省略可能にする。`repository_id` と同じく全ツールの入力 Schema の `required` から外し、省略時はサーバーが実装する `depgraph-mcp-tools-v1` として扱う。明示した未知の版は従来どおり `INVALID_ARGUMENT`（`argument: "contract_version"`、`reason: "invalid_value"`）で拒否する（[#570](https://github.com/TamaT-LLC/depgraph-cli/issues/570)）。
 - MCP の `agent_edges_list` に、辺種別の許可リスト `edge_kinds` と出力粒度 `detail`（`summary` / `full`、既定 `full`）を追加する。`summary` は evidence 本体を省き、ページ内で共通の `phase` / `profile_id` などを `common` に 1 回だけ出し、各辺に `site_id` と `evidence_count` を残す。`agent_sites_list` に `site_id` を追加し、1 件の site を ID で取得できるようにする。どちらも省略時の応答と cursor は従来と同じ（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
 - `health_hotspots_list` の説明と利用ガイドに、fan-in / fan-out / reverse impact の数え方と、fan-in だけで順位を付ける weight の指定を書く（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
 

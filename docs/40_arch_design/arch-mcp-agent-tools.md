@@ -830,6 +830,17 @@ Agentが最初の呼び出しで`repository_id`を推測して失敗しないよ
 | `repository_list` | READ、即時、CLI action なし。`get_context`と同じread-only profileに入り、closed `AgentRepositoryList`（logical `repository_id`と`AgentCurrentSnapshot`）だけを返す。NFR-005によりroot、Store、absolute pathは投影しない |
 | Deterministic artifacts | shared schema、catalog JSON、contract golden、各SHA-256 fixtureを再生成し、stdio process testで省略・誤指定・一覧の三経路をadvertised/shared schemaの双方で検証する |
 
+## Issue #570 optional contract version
+
+`contract_version`も`repository_id`と同じく全toolのinput schemaでrequiredから外す。受け付ける値は`depgraph-mcp-tools-v1`だけなので、省略時はserverが実装する現行の版として扱う。
+
+| Area | Evidence |
+| --- | --- |
+| Optional input | 引数構造体の`contract_version`に`#[serde(default)]`を付け、`ContractVersion::default()`（`V1`）を使う。input schemaは`const`を保ったまま`default`とdescriptionを足す |
+| Explicit version | 明示した未知の版は従来どおりdecodeで失敗し、`INVALID_ARGUMENT`と`{"kind":"argument","argument":"contract_version","reason":"invalid_value"}`を返す |
+| Cursor | 正規化入力にcontract versionを含めないため、省略した呼び出しのcursorを明示した呼び出しで続けられる |
+| Shared schema | `CommonRequest`などのcontract DTOと応答の`contract_version`は変えない。shared schemaとcontract goldenは変わらず、tool catalog goldenだけを再生成する |
+
 ## Issue #565 error detail evidence
 
 Agentがエラー応答から原因を特定し、同じ呼び出しを条件を変えて繰り返さずに済むよう、`error.details`を拡張する。`depgraph-mcp-tools-v1`のまま、既存variantの既存fieldは変えず、任意fieldと新variantだけを追加する。
@@ -921,6 +932,18 @@ Agentがファイルを開かずに「なぜ依存しているか」を説明で
 | Fan-in definition | `health_hotspots_list`のdescriptionと利用ガイドに、fan-in / fan-outはsnapshotの全edge record（構造辺、全phase / profileを含み、同じsourceからの複数edgeも別々に数える）、reverse impactは重複なしの推移的依存元であることと、fan-inだけで順位を付けるweightの指定を書く。採点は変えない |
 | Not in scope | `module_declaration`（`mod foo;`）のimport根拠はclosed enum `binding_kind`の追加が要るため扱わない。`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約も別Issueで扱う |
 | Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。schemaには`AgentEdgesOutput`、`AgentEdgesSummaryResponse`、`AgentEdgeDetail`とその成功envelopeが増える |
+
+## Issue #580 worker-shaped DTO values
+
+Issue #563でAgentNodeSummaryのlocatorとdisplay nameが契約外になった。ほかの厳しいDTO変換も、workerの実データで`INTEGRITY_FAILURE`にならないかを確かめた。
+
+| Area | Evidence |
+| --- | --- |
+| Policy | id、kind、profile id、site id、extractor、extractor version、coverageのcompleteness / reasonsは、graphを指す値なのでfail closedのままにする（`parse_agent_value`の説明に理由を書いた）。locator、display name、specifier、site reasonなどの表示用の値は`id:<id>`へのフォールバックか省略で扱う（#563と同じ） |
+| Store enumeration | depgraph-cli自身（Rust / Go / TS、ノード71,909、edge 245,056、site 218,548、evidence extractor 21種、profile 89）のStoreで、上の値の重複を除いた全件を各scalar契約で検査し、契約外は0件だった。契約外はlocator（`unknown://`、`external://`、`file://`、`file:`）とdisplay name（改行入り、256 byte超が510件）だけで、どちらもフォールバック済み |
+| Tool walk | 同じStoreに実バイナリの`depgraph-mcp`を接続し、読み取りtool 27種を約600回呼んだ。`agent_nodes_list`は全ノードをcursorで最後までたどり、`agent_node_get` / `agent_edges_list`（full / summary、両方向）/ `agent_sites_list` / `agent_evidence_list` / 依存一覧3 detail / impact / pathは種類ごとに層化した標本を使った。`INTEGRITY_FAILURE`と`INTERNAL`は0件だった。`graph_export`、`snapshot_diff_get`、`policy_evaluate`、`health_hotspots_list`、cycles、unresolved、範囲指定なしの`agent_sites_list`はこの規模では上限（`RESOURCE_EXHAUSTED`）で止まり、DTO変換まで届かない |
+| Regression | process test `issue_580_*`は、self-scanと同じ形の値（`file:` / `file://` / `external://` / `unknown://` / `go-symbol:` locator、256 byte超の複数行display name、`profile:sha256:` profile、21種のうち代表のextractor、実際のcoverage reasons）を入れたStoreで、上限に届かない全読み取りtoolを呼び、advertised output schemaで検証する |
+| Known limit | health findingのevidence `path`は`AgentLabel`（256 byte）で、超えるとintegrity errorになる。self-scanの最長は94 byte。closed DTOのfield型を変える必要があるため、このIssueでは変えない |
 
 ## Issue #581 remaining argument and limit details
 

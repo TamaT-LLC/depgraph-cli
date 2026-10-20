@@ -1867,6 +1867,103 @@ fn issue_302_graph_handlers_page_canonically_explain_paths_and_fail_closed_on_ex
 }
 
 #[test]
+fn issue_570_contract_version_defaults_to_v1_and_an_explicit_unknown_version_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_300_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    assert!(!tools.is_empty());
+    for tool in &tools {
+        let input = &tool["inputSchema"];
+        assert!(
+            !input["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("contract_version")),
+            "{} still requires contract_version",
+            tool["name"]
+        );
+        assert_eq!(
+            input["properties"]["contract_version"]["default"], "depgraph-mcp-tools-v1",
+            "{}",
+            tool["name"]
+        );
+    }
+
+    let context = interactive_tool_call(&mut mcp, 3, "get_context", json!({}));
+    assert_eq!(context["isError"], false, "{context}");
+    assert_eq!(
+        context["structuredContent"]["contract_version"],
+        "depgraph-mcp-tools-v1"
+    );
+    shared.validate(&context["structuredContent"]).unwrap();
+    let explicit_context = interactive_tool_call(
+        &mut mcp,
+        4,
+        "get_context",
+        json!({"contract_version": "depgraph-mcp-tools-v1"}),
+    );
+    assert_eq!(
+        context["structuredContent"],
+        explicit_context["structuredContent"]
+    );
+
+    // A tool with its own required arguments, paged with the version omitted and
+    // continued with it explicit: both select the same contract and cursor binding.
+    let nodes_arguments = json!({"query": "fixture", "match_mode": "contains", "limit": 1});
+    let omitted = interactive_tool_call(&mut mcp, 5, "agent_nodes_list", nodes_arguments.clone());
+    assert_eq!(omitted["isError"], false, "{omitted}");
+    let mut explicit_arguments = nodes_arguments.clone();
+    explicit_arguments["contract_version"] = json!("depgraph-mcp-tools-v1");
+    let explicit =
+        interactive_tool_call(&mut mcp, 6, "agent_nodes_list", explicit_arguments.clone());
+    assert_eq!(
+        omitted["structuredContent"]["result"]["items"],
+        explicit["structuredContent"]["result"]["items"]
+    );
+    if let Some(cursor) = omitted["structuredContent"]["result"]["next_cursor"].as_str() {
+        explicit_arguments["cursor"] = json!(cursor);
+        let next = interactive_tool_call(&mut mcp, 7, "agent_nodes_list", explicit_arguments);
+        assert_eq!(next["isError"], false, "{next}");
+    }
+
+    for (id, name, mut arguments) in [
+        (8, "get_context", json!({})),
+        (
+            9,
+            "agent_nodes_list",
+            json!({"query": "fixture", "match_mode": "contains"}),
+        ),
+    ] {
+        arguments["contract_version"] = json!("depgraph-mcp-tools-v2");
+        let rejected = interactive_tool_call(&mut mcp, id, name, arguments);
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        let error = &rejected["structuredContent"]["error"];
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{rejected}");
+        assert_eq!(
+            error["details"],
+            json!({"kind": "argument", "argument": "contract_version", "reason": "invalid_value"}),
+            "{rejected}"
+        );
+        shared.validate(&rejected["structuredContent"]).unwrap();
+    }
+    mcp.finish();
+}
+
+#[test]
 fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -10139,6 +10236,469 @@ fn issue_566_edges_shrink_rust_files_have_paths_and_sites_resolve_by_id() {
     assert_eq!(before, store_invariant(&store_path));
 }
 
+const ISSUE_580_PROFILE: &str =
+    "profile:sha256:5da8a6b68fad26d95c77d745a7847ce7f4b0c81e1d1c2b3a4f5e6d7c8b9a0f1e";
+/// A TypeScript expression the Web worker turned into an external node: the
+/// locator holds `//` and percent-encoded newlines, and the display name is a
+/// multi-line value longer than an `AgentLabel` (Issue #580, from the
+/// depgraph-cli self-scan).
+const ISSUE_580_EXPRESSION: &str = "typescript:stdlib:[\n        `import { shared } from \"../shared\";`,\n        `import type { Shared } from \"../shared\";`,\n        `export { shared as generatedShared${index} } from \"../shared\";`,\n        `export type { Shared as GeneratedShared${index} } from \"../shared\";`,\n        `export const generated${index}: Shared = shared();`,\n      ].join";
+
+fn issue_580_evidence(extractor: &str, version: &str, path: &str, kind: &str) -> Value {
+    json!({
+        "kind": kind,
+        "extractor": extractor,
+        "extractor_version": version,
+        "path": path,
+        "start_line": 3,
+        "start_column": 1,
+        "end_line": 3,
+        "end_column": 25,
+        "properties": {}
+    })
+}
+
+/// Seeds the value shapes the Rust, Go, and Web workers store, copied from a
+/// scan of depgraph-cli itself, instead of the synthetic `repo://` locators
+/// the other process tests use (Issue #580).
+fn seed_issue_580_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-580", root, false, Some("revision-580"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 4,
+        "resolved": 2,
+        "candidates": 0,
+        "external": 1,
+        "unresolved": 1,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": [],
+        "reasons": [
+            "analysis-unit-unknown-dependency",
+            "go-packages-parser-fallback",
+            "rust-hir-memory-budget",
+            "typescript_definition_graph_incomplete",
+            "unresolved_dependency_sites"
+        ]
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-580",
+            "adapter": "rust",
+            "adapter_version": "0.7.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": ISSUE_580_PROFILE,
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": {"rust_hir_mode": "syntax-only"}
+    });
+    store.ingest_event(&profile).unwrap();
+    let encoded_expression = ISSUE_580_EXPRESSION
+        .replace('%', "%25")
+        .replace('\n', "%0A")
+        .replace(' ', "%20")
+        .replace(':', "%3A")
+        .replace('[', "%5B")
+        .replace(']', "%5D");
+    assert!(ISSUE_580_EXPRESSION.len() > 256);
+    for (id, kind, locator, display_name, properties) in [
+        // Rust file nodes: the path lives only in the `file:` locator.
+        (
+            "file:sha256:0580a",
+            "file",
+            "file:crates/core/src/lib.rs".to_owned(),
+            "crates/core/src/lib.rs".to_owned(),
+            json!({"language": "rust"}),
+        ),
+        (
+            "file:sha256:0580b",
+            "file",
+            "file:crates/core/src/model.rs".to_owned(),
+            "crates/core/src/model.rs".to_owned(),
+            json!({"language": "rust"}),
+        ),
+        // Web file nodes use `file://`.
+        (
+            "file:sha256:0580c",
+            "file",
+            "file://workers/web/src/index.ts".to_owned(),
+            "workers/web/src/index.ts".to_owned(),
+            json!({"path": "workers/web/src/index.ts"}),
+        ),
+        (
+            "external:sha256:0580d",
+            "external_system",
+            format!("external://typescript/{encoded_expression}"),
+            ISSUE_580_EXPRESSION.to_owned(),
+            json!({}),
+        ),
+        (
+            "unknown_target:sha256:0580e",
+            "unknown_target",
+            "unknown://web/unresolved-dependency".to_owned(),
+            "Unresolved web dependency".to_owned(),
+            json!({}),
+        ),
+        (
+            "external_system:sha256:0580f",
+            "external_system",
+            "go-symbol:archive/zip.(*Writer).Close".to_owned(),
+            "Close".to_owned(),
+            json!({}),
+        ),
+        (
+            "module:sha256:0580g",
+            "module",
+            "rust-module:depgraph-core:lib::model".to_owned(),
+            "crate::model".to_owned(),
+            json!({}),
+        ),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": locator,
+            "display_name": display_name,
+            "properties": properties
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    for (site_id, edge, kind, specifier, status, targets, reason, evidence) in [
+        (
+            "site:sha256:0580s1",
+            Some((
+                "edge:sha256:0580e1",
+                "file:sha256:0580a",
+                "file:sha256:0580b",
+                "imports",
+            )),
+            "rust_use",
+            "crate::model::Thing".to_owned(),
+            "resolved",
+            vec!["file:sha256:0580b"],
+            None,
+            issue_580_evidence("rust-static", "0.7.0", "crates/core/src/lib.rs", "source"),
+        ),
+        (
+            "site:sha256:0580s2",
+            Some((
+                "edge:sha256:0580e2",
+                "file:sha256:0580b",
+                "file:sha256:0580a",
+                "imports",
+            )),
+            "rust_use",
+            "crate::Root".to_owned(),
+            "resolved",
+            vec!["file:sha256:0580a"],
+            None,
+            issue_580_evidence("rust-static", "0.7.0", "crates/core/src/model.rs", "source"),
+        ),
+        (
+            "site:sha256:0580s3",
+            Some((
+                "edge:sha256:0580e3",
+                "file:sha256:0580c",
+                "external:sha256:0580d",
+                "calls",
+            )),
+            "call",
+            ISSUE_580_EXPRESSION.replacen("typescript:stdlib:", "", 1),
+            "external",
+            vec!["external:sha256:0580d"],
+            None,
+            issue_580_evidence(
+                "typescript-native-syntax",
+                "7.0.2",
+                "workers/web/src/index.ts",
+                "source",
+            ),
+        ),
+        (
+            "site:sha256:0580s4",
+            Some((
+                "edge:sha256:0580e5",
+                "file:sha256:0580c",
+                "unknown_target:sha256:0580e",
+                "imports",
+            )),
+            "import",
+            "file://workers/web/src/missing.ts".to_owned(),
+            "unresolved",
+            vec!["unknown_target:sha256:0580e"],
+            Some("unresolved_dependency_sites"),
+            issue_580_evidence(
+                "go-static-worker",
+                "0.7.0",
+                "workers/web/src/index.ts",
+                "source",
+            ),
+        ),
+    ] {
+        let source = edge.map_or("file:sha256:0580c", |(_, source, _, _)| source);
+        let mut site = next("dependency_site");
+        site["site"] = json!({
+            "id": site_id,
+            "source": source,
+            "kind": kind,
+            "specifier": specifier,
+            "resolution_status": status,
+            "target_ids": targets,
+            "profile_id": ISSUE_580_PROFILE,
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": [evidence.clone()]
+        });
+        if let Some(reason) = reason {
+            site["site"]["reason"] = json!(reason);
+        }
+        store.ingest_event(&site).unwrap();
+        if let Some((edge_id, source, target, edge_kind)) = edge {
+            let mut event = next("edge_upsert");
+            event["edge"] = json!({
+                "id": edge_id,
+                "site_id": site_id,
+                "source": source,
+                "target": target,
+                "kind": edge_kind,
+                "phase": "source",
+                "environment": "host",
+                "profile_id": ISSUE_580_PROFILE,
+                "resolution_status": status,
+                "precision": "exact",
+                "condition": {"op": "all", "conditions": []},
+                "generated": false,
+                "evidence": [evidence]
+            });
+            store.ingest_event(&event).unwrap();
+        }
+    }
+    let mut declares = next("edge_upsert");
+    declares["edge"] = json!({
+        "id": "edge:sha256:0580e4",
+        "source": "file:sha256:0580a",
+        "target": "module:sha256:0580g",
+        "kind": "declares",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": ISSUE_580_PROFILE,
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false
+    });
+    store.ingest_event(&declares).unwrap();
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!(ISSUE_580_PROFILE);
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-580", "completed", None, true)
+        .unwrap();
+    let snapshot_id = store.current_snapshot_id().unwrap().unwrap();
+    store
+        .create_snapshot_name("self-scan", &snapshot_id)
+        .unwrap();
+    snapshot_id
+}
+
+#[test]
+fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_580_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let output_schemas = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            (
+                tool["name"].as_str().unwrap().to_owned(),
+                jsonschema::draft202012::new(&tool["outputSchema"]).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut id = 2;
+    let mut call = |name: &str, arguments: Value| {
+        id += 1;
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        // The walk makes more reads than the runtime read burst; wait for the
+        // token bucket instead of treating the rate limit as a failure.
+        let mut attempts = 0_u32;
+        let result = loop {
+            let result = interactive_tool_call(&mut mcp, id, name, full.clone());
+            let error = &result["structuredContent"]["error"];
+            if error["code"] == "RESOURCE_EXHAUSTED" && error["remediation"] == "retry" {
+                attempts += 1;
+                assert!(attempts < 40, "{name} stayed rate limited: {result}");
+                id += 1;
+                std::thread::sleep(Duration::from_millis(260));
+                continue;
+            }
+            break result;
+        };
+        assert_eq!(result["isError"], false, "{name} {arguments}: {result}");
+        output_schemas[name]
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{name} output: {error}"));
+        result["structuredContent"]["result"].clone()
+    };
+
+    let nodes = [
+        "file:sha256:0580a",
+        "file:sha256:0580b",
+        "file:sha256:0580c",
+        "external:sha256:0580d",
+        "unknown_target:sha256:0580e",
+        "external_system:sha256:0580f",
+        "module:sha256:0580g",
+    ];
+    for tool in ["get_context", "repository_list"] {
+        call(tool, json!({}));
+    }
+    let snapshot = call("snapshot_get", json!({"snapshot": "current"}));
+    assert_eq!(
+        snapshot["coverage"]["reasons"][2], "rust-hir-memory-budget",
+        "{snapshot}"
+    );
+    assert_eq!(snapshot["profile_ids"], json!([ISSUE_580_PROFILE]));
+    let named = call("snapshot_list", json!({}));
+    assert_eq!(named["items"][0]["name"], "self-scan", "{named}");
+
+    let listed = call(
+        "agent_nodes_list",
+        json!({"query": "sha256:0580", "match_mode": "contains", "limit": 100}),
+    );
+    assert_eq!(
+        listed["items"].as_array().unwrap().len(),
+        nodes.len(),
+        "{listed}"
+    );
+    for node_id in nodes {
+        let node = call("agent_node_get", json!({"node_id": node_id}));
+        assert_eq!(node["id"], node_id);
+        for direction in ["outgoing", "incoming"] {
+            for detail in ["full", "summary"] {
+                call(
+                    "agent_edges_list",
+                    json!({"node_id": node_id, "direction": direction, "detail": detail}),
+                );
+            }
+        }
+        let selector = format!("id:{node_id}");
+        for tool in ["graph_dependencies_list", "graph_dependents_list"] {
+            for detail in ["full", "summary", "paths"] {
+                call(tool, json!({"selector": selector, "detail": detail}));
+            }
+            call(tool, json!({"selector": selector, "transitive": true}));
+        }
+        call("graph_impact_get", json!({"selector": selector}));
+    }
+    // Locators outside the AgentLocator contract fall back to `id:`; the
+    // over-long multi-line display name is omitted from AgentNode.
+    let external = call(
+        "agent_node_get",
+        json!({"node_id": "external:sha256:0580d"}),
+    );
+    assert_eq!(external["locator"], "id:external:sha256:0580d");
+    assert!(external.get("display_name").is_none(), "{external}");
+    let rust_file = call("agent_node_get", json!({"node_id": "file:sha256:0580a"}));
+    assert_eq!(rust_file["locator"], "id:file:sha256:0580a");
+    assert_eq!(rust_file["repository_path"], "crates/core/src/lib.rs");
+
+    let sites = call("agent_sites_list", json!({}));
+    let sites = sites["items"].as_array().unwrap().clone();
+    assert_eq!(sites.len(), 4);
+    for site in &sites {
+        let site_id = site["id"].as_str().unwrap();
+        call("agent_sites_list", json!({"site_id": site_id}));
+        let evidence = call("agent_evidence_list", json!({"site_id": site_id}));
+        assert_eq!(evidence["items"].as_array().unwrap().len(), 1, "{evidence}");
+    }
+    let expression_site = sites
+        .iter()
+        .find(|site| site["id"] == "site:sha256:0580s3")
+        .unwrap();
+    assert_eq!(expression_site["specifier"], "id:site:sha256:0580s3");
+    call("agent_sites_list", json!({"node_id": "file:sha256:0580c"}));
+
+    call(
+        "graph_path_get",
+        json!({"from": "id:file:sha256:0580c", "to": "id:external:sha256:0580d"}),
+    );
+    call(
+        "graph_path_get",
+        json!({"from": "id:file:sha256:0580a", "to": "id:file:sha256:0580b"}),
+    );
+    let cycles = call("graph_cycles_list", json!({"level": "file"}));
+    assert_eq!(cycles["items"].as_array().unwrap().len(), 1, "{cycles}");
+    let unresolved = call("graph_unresolved_list", json!({}));
+    assert_eq!(
+        unresolved["items"].as_array().unwrap().len(),
+        1,
+        "{unresolved}"
+    );
+    for format in ["json", "dot", "mermaid", "graphml"] {
+        call("graph_export", json!({"format": format}));
+    }
+    call(
+        "graph_query",
+        json!({"query": "MATCH p = (source:\"file\")-[\"imports\"*1..1]->(target:\"file\")\nRETURN source.id, target.id LIMIT 10"}),
+    );
+    call(
+        "snapshot_diff_get",
+        json!({"from": "current", "to": "self-scan"}),
+    );
+    call(
+        "policy_evaluate",
+        json!({"from": "current", "to": "self-scan"}),
+    );
+    call("health_summary_get", json!({}));
+    let findings = call("health_findings_list", json!({}));
+    for finding in findings["findings"]["items"].as_array().unwrap() {
+        call("health_finding_get", json!({"finding_id": finding["id"]}));
+    }
+    call("health_hotspots_list", json!({}));
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
 #[test]
 fn issue_581_argument_and_limit_errors_name_the_argument_and_the_bound() {
     let temporary = tempfile::tempdir().unwrap();
@@ -10333,6 +10893,52 @@ fn issue_581_argument_and_limit_errors_name_the_argument_and_the_bound() {
     let encoded = missing.to_string();
     assert!(!encoded.contains("missing.rs"), "{encoded}");
 
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_581_argument_details_do_not_need_contract_version() {
+    // contract_version is optional (Issue #570): an argument error carries
+    // the same details whether or not the caller sends it.
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    for (tool, arguments, name) in [
+        ("snapshot_get", json!({"snapshot": "latest"}), "snapshot"),
+        ("graph_unresolved_list", json!({"kinds": [""]}), "kinds"),
+        ("agent_node_get", json!({"node_id": "not an id"}), "node_id"),
+        (
+            "graph_dependencies_list",
+            json!({"selector": "id:node:a", "edge_kinds": ["not a kind"]}),
+            "edge_kinds",
+        ),
+    ] {
+        id += 1;
+        let omitted = interactive_tool_call(&mut mcp, id, tool, arguments.clone());
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        id += 1;
+        let explicit = interactive_tool_call(&mut mcp, id, tool, full);
+        assert_eq!(omitted["isError"], true, "{tool} {arguments}: {omitted}");
+        assert_eq!(
+            omitted["structuredContent"], explicit["structuredContent"],
+            "{tool} {arguments}"
+        );
+        assert_eq!(
+            omitted["structuredContent"]["error"]["details"],
+            json!({"kind": "argument", "argument": name, "reason": "invalid_value"}),
+            "{tool} {arguments}: {omitted}"
+        );
+    }
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
