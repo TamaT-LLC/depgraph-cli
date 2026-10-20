@@ -2,6 +2,11 @@ name: npm Release
 
 on:
   workflow_dispatch:
+    inputs:
+      recover_v071:
+        description: Publish the immutable v0.7.1 closure after its verified owner-authorized recovery
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -11,16 +16,28 @@ concurrency:
 
 jobs:
   prepare:
+    if: ${{ !inputs.recover_v071 || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
     outputs:
-      release_tag: ${{ steps.release.outputs.release_tag }}
-      release_version: ${{ steps.release.outputs.release_version }}
+      release_tag: ${{ steps.release.outputs.release_tag || steps.recovery.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version || steps.recovery.outputs.release_version }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: inputs.recover_v071 && github.ref == 'refs/heads/main'
+        with:
+          persist-credentials: false
+      - name: Verify the explicit immutable v0.7.1 recovery
+        if: inputs.recover_v071 && github.ref == 'refs/heads/main'
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify-v071-recovery.py verify
       - name: Bind the successful Release run to an immutable stable release
         id: release
+        if: ${{ !inputs.recover_v071 }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,7 +120,7 @@ jobs:
           echo "release_version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ steps.recovery.outputs.release_source_sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -116,8 +133,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.release_version }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag || steps.recovery.outputs.release_tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.release_version || steps.recovery.outputs.release_version }}
         run: |
           set -euo pipefail
           mkdir release-assets
@@ -147,7 +164,7 @@ jobs:
       - name: Install the tarballs without lifecycle scripts and run the packaged Linux CLI
         shell: bash
         env:
-          RELEASE_VERSION: ${{ steps.release.outputs.release_version }}
+          RELEASE_VERSION: ${{ steps.release.outputs.release_version || steps.recovery.outputs.release_version }}
         run: |
           set -euo pipefail
           inventory=npm-dist/npm-package-set.json
@@ -182,7 +199,7 @@ jobs:
           retention-days: 7
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (inputs.recover_v071 && github.ref == 'refs/heads/main')
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 210
