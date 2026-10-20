@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.7.0";
+const STABLE_RELEASE_VERSION: &str = "0.7.1";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.7";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -191,39 +191,39 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.0";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.1";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:ec1bf001701feb2a4a3c3f70aef1672c9bb912888eefa2801f57ec6283847ef2",
-        query_result_digest: "bounded-query-result:sha256:b993ed35d0627d3b0396fd090542f1c6c5f11d64e9115e934b85645eb73cc998",
-        query_output_sha256: "7fae48f3d609b55630e8c1a29059931c4f797812afedacb0d88977c8c480a665",
-        profile_plan_digest: "profile-selection-plan:sha256:2a7a90eedb4a1971eb6841fae884407a638d2564a1bbaf75b7ac09e62b4e33ae",
-        profile_plan_output_sha256: "a3d27041798a00cb8aaf0ff12e3e51a4c8758b5c577d4b92b99835cec97ff818",
+        query_plan_digest: "bounded-query-plan:sha256:655615e98358c15499075240856fcc150fc9b0298eb46dee93b60d136de87685",
+        query_result_digest: "bounded-query-result:sha256:83026bd6a05da6e4860259c82384c7d2a62a73655d010a44aa2e2da60f436012",
+        query_output_sha256: "1d16962ef1835f7dc85c12081b1ffc9c27cf6beb2fc6a949f109f770b15523cf",
+        profile_plan_digest: "profile-selection-plan:sha256:462c46653643a3d18ef55f8a3d7d313cac85ed0d5e6d599a7d22f7684b25e9d2",
+        profile_plan_output_sha256: "b580913993099777903f77ea1e570577368ed0fc1e3155dd2cc0cc818f44578f",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:b4b115436b29b920a014a15751ad1acdd690ffb355546b03023cc618bef3f7c0",
-        query_result_digest: "bounded-query-result:sha256:a46978be9f2257fb711ab5488cb1d7531ebad96f6c9ac41ecc6c82b11cf9ebe7",
-        query_output_sha256: "0bc6234eb457764083b9949b97f5c79a9bb59e59f33e68b55f6cc52e15aae2a0",
-        profile_plan_digest: "profile-selection-plan:sha256:38aa97add0f9557442a5f4f3f6584f3df175c080c7b0dbd9364b0edf2a706626",
-        profile_plan_output_sha256: "e5c917dd92c0f2412d340ee1648d6815f21f0440b03a2f867dfe3ef10872b7cf",
+        query_plan_digest: "bounded-query-plan:sha256:e5070d058780fc2e414cf318bbc9fe910c0ab7e2b26be5932040d30747ac33bf",
+        query_result_digest: "bounded-query-result:sha256:d7de22fcca4cbd1d73615522fea03f42bbcf2e630dd370ca512862d484048e49",
+        query_output_sha256: "3bcbca05c803dbc3f34dde94cb275e20d8704d9bdb7ee7100467ec827743f273",
+        profile_plan_digest: "profile-selection-plan:sha256:f21764f9c1eae3cd421bc1d3ad5fe72a9b7d86f50bea01c73969c8ffdb7c310c",
+        profile_plan_output_sha256: "c1bca983d3225b351484d6b210b75c53c23f97ae9a78461bdab645b8ac3e1ff5",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:e659dc0e778e1be962f492e3e1599b6f15ae795a39f4cf409ea45fde655d14a2",
-        query_result_digest: "bounded-query-result:sha256:d50ef4108661c1b16b97fa0f0a48d503ba51103ff6fbe07cabe892fe4fe6d582",
-        query_output_sha256: "ee97b06732abcc5309b5c13d0d1dc85b04a18d9bbf6b9c85c718c59f3dc5c9c4",
-        profile_plan_digest: "profile-selection-plan:sha256:46c7395a8148b8f982d031ffe45831f149ef1499793e7c01feb34d3cac2a7bb8",
-        profile_plan_output_sha256: "0b3c185484e068a80ccae3fd0405133612c9e37b5286e2c27fbfb226def2df03",
+        query_plan_digest: "bounded-query-plan:sha256:dc47fdd0b317d581b8e4c65228bb8f34cd7153bde3b3d873da4dcab503bbbb4a",
+        query_result_digest: "bounded-query-result:sha256:f2c7efbfe9960eec4c417343f89c765f7a0d61f3565862a82466e33238a9a177",
+        query_output_sha256: "8acf3aa686184e4457bc4301f0b5a1fb60353974c8691cc8fd1639d5dc206aec",
+        profile_plan_digest: "profile-selection-plan:sha256:570ed675575f7de5f4a4ac9b5f0e9caf33b3944bdbd43bf4084e22ea83bdad60",
+        profile_plan_output_sha256: "cd026f9f39f96f1ddbe41bcc4cd0d6777368a99a21d05439027599554a44c314",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:cacad7d823f9e125187ed9b57c1c987bab63a8ce382e2c6aac8f16651b905b8b",
-        query_result_digest: "bounded-query-result:sha256:3766a083a4efd5ebbf787bd360e1a2bfea40e3b34a0190f70b9b91c3fd91e6f1",
-        query_output_sha256: "7cc0049f12664f0afa1d519909702b7b3b16cb37409f16849b43795ef9426964",
-        profile_plan_digest: "profile-selection-plan:sha256:36e716f13d1bb95d71ffc6cf18da361e064c869c2dd56cb5e5069731f58c202c",
-        profile_plan_output_sha256: "f2ab757f2eae7a448965782ecb5734b03d8a92ead2c023b16673088cd30684e2",
+        query_plan_digest: "bounded-query-plan:sha256:e1f22ba4efe805c74d35631bdbca9abb34c57fd0e30267ef92e7435754cbe229",
+        query_result_digest: "bounded-query-result:sha256:394a4bf15e2aa122e44708f1d156d34817fe298d52e394caabfba5ec00eaefec",
+        query_output_sha256: "19f233834bd8f336877208f4b48595c2fafeab95ed3182092d89d8d0bab4258d",
+        profile_plan_digest: "profile-selection-plan:sha256:804df798547c03b5bf745ba6678851aaf301a8fdeea65c5f76b516a9fe25381d",
+        profile_plan_output_sha256: "3d002439c09410b4b7699e5930ed0e2096c227a4f4474e7585f2dff2978f0c7d",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -694,6 +694,9 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.6.4'",
         "V0_6_4_RELEASE_SOURCE_SHA: 35c3edea133b7f5a0cd269edd945776d9db9e7f2",
         "historical_source_sha=\"$V0_6_4_RELEASE_SOURCE_SHA\"",
+        "github.event.workflow_run.head_branch == 'v0.7.0'",
+        "V0_7_0_RELEASE_SOURCE_SHA: defa669857aaa026d8aca445ce742484e1ffcc00",
+        "historical_source_sha=\"$V0_7_0_RELEASE_SOURCE_SHA\"",
         "STABLE_MAINTENANCE_REF: heads/release/0.7",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
@@ -7582,7 +7585,7 @@ jobs:
     #[test]
     fn native_smoke_pins_match_recorded_native_observations() {
         let evidence: Value = serde_json::from_str(include_str!(
-            "../fixtures/native-smoke-v0.7.0-observations.json"
+            "../fixtures/native-smoke-v0.7.1-observations.json"
         ))
         .unwrap();
         assert_eq!(evidence["version"], VERSION);
@@ -7597,24 +7600,24 @@ jobs:
             let observed = observations[0];
             let (run, job, source_commit) = match *target {
                 "aarch64-apple-darwin" => (
-                    39217541797_u64,
-                    117944838973_u64,
-                    "1b0ac366a2986ce993c756413d17d28360abada4",
+                    39395768146_u64,
+                    118538001160_u64,
+                    "912198b87294dc0e5934a2c2abf88e77422fca09",
                 ),
                 "aarch64-unknown-linux-gnu" => (
-                    39217541797_u64,
-                    117944838999_u64,
-                    "1b0ac366a2986ce993c756413d17d28360abada4",
+                    39395278063_u64,
+                    118536377284_u64,
+                    "e7be6557a1abd96545cbd64b58e148f8bf7cf181",
                 ),
                 "x86_64-pc-windows-msvc" => (
-                    39217541797_u64,
-                    117944839648_u64,
-                    "1b0ac366a2986ce993c756413d17d28360abada4",
+                    39395768146_u64,
+                    118538001269_u64,
+                    "912198b87294dc0e5934a2c2abf88e77422fca09",
                 ),
                 "x86_64-unknown-linux-gnu" => (
-                    39217541797_u64,
-                    117944838770_u64,
-                    "1b0ac366a2986ce993c756413d17d28360abada4",
+                    39395768146_u64,
+                    118538001296_u64,
+                    "912198b87294dc0e5934a2c2abf88e77422fca09",
                 ),
                 _ => panic!("missing recorded native job for {target}"),
             };
