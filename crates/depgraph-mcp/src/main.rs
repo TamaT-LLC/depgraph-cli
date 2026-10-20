@@ -25,9 +25,9 @@ use depgraph_core::service::{
 use depgraph_core::{
     CancellationToken, Confidence, CycleLevel, DEFAULT_HOTSPOT_WEIGHTS, DepgraphCapability,
     DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, EdgeKindFilter, FindingKind, GraphQueryFilter, HealthFinding,
-    HotspotWeights, ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity, SnapshotLocator,
-    StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
+    DepgraphServiceLimits, EdgeKindFilter, EdgeKindFilterError, FindingKind, GraphQueryFilter,
+    HealthFinding, HotspotWeights, ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity,
+    SnapshotLocator, StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
     verify_compiler_pack,
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
@@ -3231,7 +3231,15 @@ fn execute_catalog_read_tool(
                 arguments.edge_kinds,
                 Some(StructuralEdgeSelection::Include),
             )
-            .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?;
+            .map_err(|error| {
+                invalid_argument(
+                    Some("edge_kinds"),
+                    match error {
+                        EdgeKindFilterError::TooManyKinds => AgentArgumentReason::TooManyItems,
+                        _ => AgentArgumentReason::InvalidValue,
+                    },
+                )
+            })?;
             let snapshot =
                 SnapshotLocator::parse(arguments.snapshot.as_deref().unwrap_or("current"))?;
             let resolved_snapshot_id =

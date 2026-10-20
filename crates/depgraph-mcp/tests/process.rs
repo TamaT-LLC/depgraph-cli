@@ -10073,13 +10073,35 @@ fn issue_566_edges_shrink_rust_files_have_paths_and_sites_resolve_by_id() {
             "{selection}"
         );
     }
-    let invalid = call(
-        "agent_edges_list",
-        edges(json!({"edge_kinds": ["Not A Kind"]})),
+    // Invalid new inputs name the argument like every other INVALID_ARGUMENT
+    // (Issue #565), without echoing the rejected value.
+    for (arguments, argument) in [
+        (json!({"edge_kinds": ["Not A Kind"]}), "edge_kinds"),
+        (json!({"edge_kinds": "imports"}), "edge_kinds"),
+        (json!({"detail": "paths"}), "detail"),
+    ] {
+        let invalid = call("agent_edges_list", edges(arguments.clone()));
+        assert_eq!(
+            issue_541_error_code(&invalid),
+            "INVALID_ARGUMENT",
+            "{arguments}"
+        );
+        assert_eq!(
+            invalid["structuredContent"]["error"]["details"],
+            json!({"kind": "argument", "argument": argument, "reason": "invalid_value"}),
+            "{arguments}"
+        );
+        assert!(!invalid.to_string().contains("Not A Kind"), "{invalid}");
+    }
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    let invalid = call("agent_edges_list", edges(json!({"edge_kinds": too_many})));
+    assert_eq!(
+        invalid["structuredContent"]["error"]["details"],
+        json!({"kind": "argument", "argument": "edge_kinds", "reason": "too_many_items"}),
+        "{invalid}"
     );
-    assert_eq!(issue_541_error_code(&invalid), "INVALID_ARGUMENT");
-    let invalid = call("agent_edges_list", edges(json!({"detail": "paths"})));
-    assert_eq!(issue_541_error_code(&invalid), "INVALID_ARGUMENT");
 
     // One site by ID, including its import facts.
     let site = call("agent_sites_list", json!({"site_id": "site:use"}));
