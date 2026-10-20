@@ -35,28 +35,71 @@ pub const IMPACT_QUERY_CACHE_SCHEMA_VERSION: &str = "depgraph-impact-query-cache
 
 #[derive(Debug, thiserror::Error)]
 #[error("impact dependency-path materialization exceeded its service bound")]
-struct ImpactPathMaterializationExhausted;
+struct ImpactPathMaterializationExhausted {
+    limit: crate::DepgraphResourceLimit,
+    maximum: usize,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("impact runtime-context preprocessing exceeded its service bound")]
-struct ImpactRuntimeContextIndexExhausted;
+struct ImpactRuntimeContextIndexExhausted {
+    limit: crate::DepgraphResourceLimit,
+    maximum: usize,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("impact changed-set preprocessing exceeded its service bound")]
-struct ImpactChangedSetPreprocessingExhausted;
+struct ImpactChangedSetPreprocessingExhausted {
+    limit: crate::DepgraphResourceLimit,
+    maximum: usize,
+}
 
 #[cfg(test)]
 pub(crate) fn changed_set_preprocessing_exhausted_for_test() -> anyhow::Error {
-    ImpactChangedSetPreprocessingExhausted.into()
+    ImpactChangedSetPreprocessingExhausted {
+        limit: crate::DepgraphResourceLimit::ChangedPaths,
+        maximum: MAX_CHANGED_PATHS,
+    }
+    .into()
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("impact adjacency preprocessing exceeded its service bound")]
-struct ImpactAdjacencyPreprocessingExhausted;
+struct ImpactAdjacencyPreprocessingExhausted {
+    limit: crate::DepgraphResourceLimit,
+    maximum: usize,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("impact changed-path attribution exceeded its service bound")]
-struct ImpactChangedPathAttributionExhausted;
+struct ImpactChangedPathAttributionExhausted {
+    limit: crate::DepgraphResourceLimit,
+    maximum: usize,
+}
+
+/// The service bound an impact failure hit, for `resource_limit` details
+/// (Issue #581). `None` for failures that are not impact bounds.
+pub(crate) fn resource_limit(error: &anyhow::Error) -> Option<(crate::DepgraphResourceLimit, u64)> {
+    let bound = |limit: crate::DepgraphResourceLimit, maximum: usize| {
+        Some((limit, u64::try_from(maximum).unwrap_or(u64::MAX)))
+    };
+    if let Some(error) = error.downcast_ref::<ImpactPathMaterializationExhausted>() {
+        return bound(error.limit, error.maximum);
+    }
+    if let Some(error) = error.downcast_ref::<ImpactRuntimeContextIndexExhausted>() {
+        return bound(error.limit, error.maximum);
+    }
+    if let Some(error) = error.downcast_ref::<ImpactChangedSetPreprocessingExhausted>() {
+        return bound(error.limit, error.maximum);
+    }
+    if let Some(error) = error.downcast_ref::<ImpactAdjacencyPreprocessingExhausted>() {
+        return bound(error.limit, error.maximum);
+    }
+    if let Some(error) = error.downcast_ref::<ImpactChangedPathAttributionExhausted>() {
+        return bound(error.limit, error.maximum);
+    }
+    None
+}
 
 pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
     error
@@ -543,7 +586,11 @@ pub(crate) fn read_git_churn_cancellable(
         )?;
         parse_nul_paths(&paths, &prefix, &mut is_cancelled, |path| {
             if path_occurrences >= MAX_CHANGED_PATHS {
-                return Err(ImpactChangedSetPreprocessingExhausted.into());
+                return Err(ImpactChangedSetPreprocessingExhausted {
+                    limit: crate::DepgraphResourceLimit::ChangedPaths,
+                    maximum: MAX_CHANGED_PATHS,
+                }
+                .into());
             }
             path_occurrences += 1;
             if normalized_filters.is_empty()
@@ -693,7 +740,11 @@ fn run_bounded_child_cancellable(
         if overflow.load(Ordering::Acquire) {
             kill_reap_and_join(&mut child, stdout_reader, stderr_reader);
             check_cancelled(is_cancelled)?;
-            return Err(ImpactChangedSetPreprocessingExhausted.into());
+            return Err(ImpactChangedSetPreprocessingExhausted {
+                limit: crate::DepgraphResourceLimit::InputBytes,
+                maximum: maximum_output_bytes,
+            }
+            .into());
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -713,7 +764,11 @@ fn run_bounded_child_cancellable(
         .map_err(|_| anyhow::anyhow!("Git stderr reader failed"))?;
     check_cancelled(is_cancelled)?;
     if overflow.load(Ordering::Acquire) {
-        return Err(ImpactChangedSetPreprocessingExhausted.into());
+        return Err(ImpactChangedSetPreprocessingExhausted {
+            limit: crate::DepgraphResourceLimit::InputBytes,
+            maximum: maximum_output_bytes,
+        }
+        .into());
     }
     let stdout = stdout?;
     stderr?;
@@ -960,7 +1015,11 @@ fn insert_change_bounded(
         }
         std::collections::btree_map::Entry::Vacant(entry) => {
             if at_capacity {
-                return Err(ImpactChangedSetPreprocessingExhausted.into());
+                return Err(ImpactChangedSetPreprocessingExhausted {
+                    limit: crate::DepgraphResourceLimit::ChangedPaths,
+                    maximum: maximum_changes,
+                }
+                .into());
             }
             entry.insert(change.sources.into_iter().collect());
         }
@@ -1236,7 +1295,11 @@ impl<'a> ImpactChangedSetWork<'a> {
     fn step(&mut self) -> Result<()> {
         check_cancelled(self.is_cancelled)?;
         if self.used >= self.maximum {
-            return Err(ImpactChangedSetPreprocessingExhausted.into());
+            return Err(ImpactChangedSetPreprocessingExhausted {
+                limit: crate::DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum: self.maximum,
+            }
+            .into());
         }
         self.used += 1;
         #[cfg(test)]
@@ -1692,7 +1755,11 @@ fn changed_node_ids_cancellable(
         for node_id in &mapping.correlated_node_ids {
             check_cancelled(is_cancelled)?;
             if changed_id_work >= MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
-                return Err(ImpactChangedSetPreprocessingExhausted.into());
+                return Err(ImpactChangedSetPreprocessingExhausted {
+                    limit: crate::DepgraphResourceLimit::PreprocessingWorkItems,
+                    maximum: MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+                }
+                .into());
             }
             changed_id_work += 1;
             changed_ids.insert(node_id.clone());
@@ -1844,7 +1911,11 @@ impl ChangedPathAttributionWork {
     fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
         check_cancelled(is_cancelled)?;
         if self.used >= self.maximum {
-            return Err(ImpactChangedPathAttributionExhausted.into());
+            return Err(ImpactChangedPathAttributionExhausted {
+                limit: crate::DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum: self.maximum,
+            }
+            .into());
         }
         self.used += 1;
         Ok(())
@@ -1922,7 +1993,11 @@ impl ImpactAdjacencyWork {
     fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
         check_cancelled(is_cancelled)?;
         if self.used >= self.maximum {
-            return Err(ImpactAdjacencyPreprocessingExhausted.into());
+            return Err(ImpactAdjacencyPreprocessingExhausted {
+                limit: crate::DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum: self.maximum,
+            }
+            .into());
         }
         self.used += 1;
         #[cfg(test)]
@@ -2114,7 +2189,11 @@ impl RuntimeContextWorkBudget {
     fn step(&mut self, is_cancelled: &mut impl FnMut() -> bool) -> Result<()> {
         check_cancelled(is_cancelled)?;
         if self.used >= self.maximum {
-            return Err(ImpactRuntimeContextIndexExhausted.into());
+            return Err(ImpactRuntimeContextIndexExhausted {
+                limit: crate::DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum: self.maximum,
+            }
+            .into());
         }
         self.used += 1;
         #[cfg(test)]
@@ -2239,7 +2318,11 @@ fn shortest_path_to_changed(
     while current != root_id {
         check_cancelled(is_cancelled)?;
         if reversed.len() >= MAX_DEPENDENCY_PATH_STEPS {
-            return Err(ImpactPathMaterializationExhausted.into());
+            return Err(ImpactPathMaterializationExhausted {
+                limit: crate::DepgraphResourceLimit::ImpactPathSteps,
+                maximum: MAX_DEPENDENCY_PATH_STEPS,
+            }
+            .into());
         }
         let Some(edge_id) = predecessor.get(&current) else {
             return Ok(None);
@@ -2326,17 +2409,27 @@ fn preflight_path_materialization(
         if !nodes.contains_key(node_id) {
             continue;
         }
-        let path_steps = depth
-            .checked_add(suffix_length)
-            .ok_or(ImpactPathMaterializationExhausted)?;
+        let per_path = ImpactPathMaterializationExhausted {
+            limit: crate::DepgraphResourceLimit::ImpactPathSteps,
+            maximum: MAX_DEPENDENCY_PATH_STEPS,
+        };
+        let path_steps = depth.checked_add(suffix_length).ok_or(per_path)?;
         if path_steps > MAX_DEPENDENCY_PATH_STEPS {
-            return Err(ImpactPathMaterializationExhausted.into());
+            return Err(ImpactPathMaterializationExhausted {
+                limit: crate::DepgraphResourceLimit::ImpactPathSteps,
+                maximum: MAX_DEPENDENCY_PATH_STEPS,
+            }
+            .into());
         }
+        let cumulative = || ImpactPathMaterializationExhausted {
+            limit: crate::DepgraphResourceLimit::ImpactPathSteps,
+            maximum: MAX_IMPACT_MATERIALIZED_PATH_STEPS,
+        };
         cumulative_steps = cumulative_steps
             .checked_add(path_steps)
-            .ok_or(ImpactPathMaterializationExhausted)?;
+            .ok_or_else(cumulative)?;
         if cumulative_steps > MAX_IMPACT_MATERIALIZED_PATH_STEPS {
-            return Err(ImpactPathMaterializationExhausted.into());
+            return Err(cumulative().into());
         }
     }
     check_cancelled(is_cancelled)?;
@@ -2600,7 +2693,11 @@ mod tests {
         assert!(is_resource_exhausted(&error));
         assert_eq!(
             error.to_string(),
-            ImpactChangedSetPreprocessingExhausted.to_string()
+            "impact changed-set preprocessing exceeded its service bound"
+        );
+        assert_eq!(
+            resource_limit(&error),
+            Some((crate::DepgraphResourceLimit::InputBytes, 64))
         );
         for forbidden in ["Bearer", "review-secret", "/Users/private"] {
             assert!(!error.to_string().contains(forbidden));

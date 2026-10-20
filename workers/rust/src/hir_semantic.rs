@@ -17,8 +17,8 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use depgraph_protocol::{
-    Condition, DependencySite, Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision,
-    Properties, ResolutionStatus, stable_id_from_value,
+    Condition, DependencySite, Evidence, EvidenceKind, EvidencePropertyDefaults, GraphEdge,
+    GraphNode, Phase, Precision, Properties, ResolutionStatus, stable_id_from_value,
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, CallableKind, Crate, GenericDef, GenericParam,
@@ -3558,7 +3558,7 @@ impl Extractor<'_> {
             condition: condition.clone(),
             precision: resolution.precision,
             reason: resolution.reason.clone(),
-            evidence: evidence.clone(),
+            evidence,
         };
         if let Some(existing) = self.sites.get(&site_id)
             && existing != &site
@@ -3589,7 +3589,8 @@ impl Extractor<'_> {
                 resolution_status: resolution.status,
                 precision: resolution.precision,
                 generated: location.generated,
-                evidence: evidence.clone(),
+                // Shares the site's evidence until the edge is emitted (#578).
+                evidence: Vec::new(),
             };
             if let Some(existing) = self.edges.get(&edge_id)
                 && existing != &edge
@@ -4150,12 +4151,11 @@ impl Extractor<'_> {
             end_line: Some(location.end_line),
             end_column: Some(location.end_column),
             detail: Some(detail.into()),
+            // The properties every HIR evidence item shares are added back by
+            // `hir_evidence_property_defaults` when the evidence leaves the
+            // worker, instead of being held on each item (#578).
             properties: properties(json!({
-                "backend": "rust-analyzer-library",
-                "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
-                "rust_analyzer_revision": RUST_ANALYZER_REVISION,
                 "crate_identity": crate_key,
-                "active_cfg_source": "profile.rust_hir_active_cfg_by_crate",
                 "hir_kind": hir_kind,
             })),
         }
@@ -4422,6 +4422,22 @@ fn condition_conjuncts(condition: &Condition) -> Vec<String> {
 fn source_range<Ast>(source: InFile<(TextRange, Option<Ast>)>) -> (InFile<TextRange>, bool) {
     let missing_source_ast = source.value.1.is_none();
     (source.map(|(range, _)| range), missing_source_ast)
+}
+
+/// The properties that every Rust HIR evidence item carries with the same
+/// value. `evidence` leaves them out of each item; the scan result applies
+/// them to every evidence item of this extractor and version on output.
+pub(crate) fn hir_evidence_property_defaults() -> EvidencePropertyDefaults {
+    EvidencePropertyDefaults {
+        extractor: EXTRACTOR.into(),
+        extractor_version: RUST_ANALYZER_CRATE_VERSION.into(),
+        properties: properties(json!({
+            "active_cfg_source": "profile.rust_hir_active_cfg_by_crate",
+            "backend": "rust-analyzer-library",
+            "rust_analyzer_revision": RUST_ANALYZER_REVISION,
+            "rust_analyzer_version": RUST_ANALYZER_CRATE_VERSION,
+        })),
+    }
 }
 
 fn properties(value: Value) -> Properties {

@@ -244,10 +244,12 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
             GO_FIXTURE,
             3,
             [
+                // Go file nodes record their repository-relative `path`
+                // (Issue #591), so the unused file carries a location.
                 ExpectedFinding {
                     kind: FindingKind::UnusedFile,
-                    path: None,
-                    locator: Some("file:pkg/unused/unused.go"),
+                    path: Some("pkg/unused/unused.go"),
+                    locator: None,
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedExport,

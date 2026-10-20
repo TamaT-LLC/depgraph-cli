@@ -9,8 +9,7 @@ use chacha20poly1305::{
 };
 use depgraph_core::{
     CancellationToken, DepgraphCapability, DepgraphResourceLimit, DepgraphServiceError,
-    MAX_INTERACTIVE_QUERY_TRAVERSAL, QueryDiagnostic, QueryFailureClass, RepositoryFileError,
-    SelectorFailureKind,
+    QueryDiagnostic, QueryFailureClass, RepositoryFileError, SelectorFailureKind,
     service::{CyclesResult, DependenciesResult, ImpactServiceResult, UnresolvedServiceResult},
 };
 use rmcp::model::CallToolResult;
@@ -21,12 +20,12 @@ use zeroize::Zeroize;
 
 use crate::dto::{AgentImpactProjection, ImpactProjectionFailure};
 use crate::{
-    AgentArgumentReason, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle,
-    AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError,
-    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
-    AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
-    AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
+    AgentAnalysisDegradation, AgentArgumentReason, AgentCapability, AgentCompletedSnapshot,
+    AgentContext, AgentCycle, AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge,
+    AgentError, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportResponse,
+    AgentHealthAudit, AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage,
+    AgentHealthHotspots, AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
     AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryArgument, AgentQueryFailureClass,
     AgentQueryRow, AgentRemediation, AgentRepositoryInitOutcome, AgentRepositoryList,
     AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
@@ -92,6 +91,7 @@ public_result!(
     AgentNode,
     AgentNodeSummary,
     AgentPathResponse,
+    crate::AgentPathOutput,
     AgentPathStep,
     AgentProfilePlan,
     AgentRuntimeOutcome,
@@ -537,10 +537,25 @@ fn map_resource_limit(
         DepgraphResourceLimit::MaxTraversal => AgentResourceLimit::TraversalItems,
         DepgraphResourceLimit::AdjacencyEdgeInspection => AgentResourceLimit::SnapshotEdges,
         DepgraphResourceLimit::PreprocessingWorkItems => AgentResourceLimit::PreprocessingWorkItems,
+        DepgraphResourceLimit::ImpactNodes => AgentResourceLimit::ImpactNodes,
+        DepgraphResourceLimit::ImpactEdges => AgentResourceLimit::ImpactEdges,
+        DepgraphResourceLimit::ImpactPathSteps => AgentResourceLimit::ImpactPathSteps,
+        DepgraphResourceLimit::ChangedPaths => AgentResourceLimit::ChangedPaths,
+        DepgraphResourceLimit::HealthFindings => AgentResourceLimit::HealthFindings,
+        DepgraphResourceLimit::HealthFindingItems => AgentResourceLimit::HealthFindingItems,
+        DepgraphResourceLimit::HealthManifests => AgentResourceLimit::HealthManifests,
+        DepgraphResourceLimit::InputBytes => AgentResourceLimit::InputBytes,
+        DepgraphResourceLimit::ArtifactItems => AgentResourceLimit::ArtifactItems,
+        DepgraphResourceLimit::ArtifactWorkItems => AgentResourceLimit::ArtifactWorkItems,
+        DepgraphResourceLimit::ExportNodes => AgentResourceLimit::ExportNodes,
+        DepgraphResourceLimit::ExportEdges => AgentResourceLimit::ExportEdges,
+        DepgraphResourceLimit::OutputBytes => AgentResourceLimit::OutputBytes,
     };
     let argument = limit.argument();
-    let ceiling = MAX_INTERACTIVE_QUERY_TRAVERSAL as u64;
-    let raisable = argument.is_some() && maximum < ceiling;
+    let raisable = argument.is_some()
+        && limit
+            .argument_ceiling()
+            .is_some_and(|ceiling| maximum < ceiling);
     AgentError::new(
         AgentErrorCode::ResourceExhausted,
         false,
@@ -1328,11 +1343,13 @@ pub fn project_dependencies_output_cancellable(
         return Err(cancelled_error());
     }
     let root = AgentNode::try_from(source).map_err(impact_contract_error)?;
-    project_dependency_items_cancellable(
+    let degradations = AgentAnalysisDegradation::project_core(source.analysis_degradations());
+    project_dependency_items_with_degradations_cancellable(
         root,
         source.items(),
         source.traversed_edges(),
         projection,
+        &degradations,
         pagination,
         request,
         cancellation,
@@ -1350,6 +1367,32 @@ pub fn project_dependency_items_cancellable(
     items: &[depgraph_core::query::TraversalPageItem],
     traversed_edges: u64,
     projection: DependencyProjectionRequest,
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<AgentDependenciesOutput, AgentError> {
+    project_dependency_items_with_degradations_cancellable(
+        root,
+        items,
+        traversed_edges,
+        projection,
+        &[],
+        pagination,
+        request,
+        cancellation,
+    )
+}
+
+/// [`project_dependency_items_cancellable`] that also reports the snapshot's
+/// degraded profiles. They are part of the fixed response bytes, so every page
+/// stays within the byte budget (Issue #579).
+#[allow(clippy::too_many_arguments)]
+pub fn project_dependency_items_with_degradations_cancellable(
+    root: AgentNode,
+    items: &[depgraph_core::query::TraversalPageItem],
+    traversed_edges: u64,
+    projection: DependencyProjectionRequest,
+    degradations: &[AgentAnalysisDegradation],
     pagination: &PaginationContext,
     request: &PageRequest,
     cancellation: &CancellationToken,
@@ -1378,6 +1421,7 @@ pub fn project_dependency_items_cancellable(
                         traversed_edges,
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Full)
@@ -1403,6 +1447,7 @@ pub fn project_dependency_items_cancellable(
                         common.clone(),
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Summary)
@@ -1419,6 +1464,7 @@ pub fn project_dependency_items_cancellable(
                         traversed_edges,
                         page,
                     )
+                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Paths)

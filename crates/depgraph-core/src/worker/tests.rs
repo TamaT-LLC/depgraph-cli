@@ -8135,3 +8135,206 @@ fn web_runtime_preflight_reports_a_failing_node() -> Result<()> {
     assert!(message.contains("--version` failed"), "{message}");
     Ok(())
 }
+
+/// The protocol golden stream rewritten for `adapter` and `root`, with each
+/// site-linked edge carrying its site's evidence; `compact` writes it in the
+/// `compact-evidence-v1` encoding instead (#578).
+fn issue_578_stream(adapter: &str, root: &Path, compact: bool) -> Result<Vec<u8>> {
+    let mut site_evidence = std::collections::BTreeMap::new();
+    let mut output = Vec::new();
+    let mut events =
+        include_str!("../../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson")
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<serde_json::Result<Vec<_>>>()?;
+    // The compact encoding needs each site before its edges, as the Rust
+    // worker writes them.
+    events.sort_by_key(|event| usize::from(event["event"] == "edge_upsert"));
+    let last_site = events
+        .iter()
+        .rposition(|event| event["event"] == "dependency_site")
+        .unwrap_or_default();
+    let edges: Vec<_> = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .map(|first| events.drain(first..).collect())
+        .unwrap_or_default();
+    events.splice(last_site + 1..last_site + 1, edges);
+    for (seq, mut event) in events.into_iter().enumerate() {
+        event["seq"] = Value::from(seq + 1);
+        event["adapter"] = Value::String(adapter.to_owned());
+        match event["event"].as_str() {
+            Some("scan_started") => {
+                event["root"] = Value::String(root.to_string_lossy().into_owned());
+            }
+            Some("profile_declared") if compact => {
+                event["profile"]["properties"]["evidence_encoding"] =
+                    Value::String("compact-evidence-v1".to_owned());
+            }
+            Some("dependency_site") => {
+                site_evidence.insert(
+                    event["site"]["id"].as_str().unwrap_or_default().to_owned(),
+                    event["site"]["evidence"].clone(),
+                );
+            }
+            Some("edge_upsert") => {
+                if let Some(evidence) = event["edge"]["site_id"]
+                    .as_str()
+                    .and_then(|site_id| site_evidence.get(site_id))
+                {
+                    event["edge"]["evidence"] = if compact {
+                        Value::Array(Vec::new())
+                    } else {
+                        evidence.clone()
+                    };
+                }
+            }
+            _ => {}
+        }
+        serde_json::to_writer(&mut output, &event)?;
+        output.push(b'\n');
+    }
+    Ok(output)
+}
+
+#[test]
+fn issue_578_rust_compact_evidence_is_decoded_before_validation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let parse = |adapter: &str, compact: bool| -> Result<ParsedProtocol> {
+        Ok(parse_events_preserving_prefix(
+            &issue_578_stream(adapter, &root, compact)?,
+            "scan-golden",
+            adapter,
+            &root,
+            MAX_EVENT_LINE_BYTES,
+            None,
+            None,
+        ))
+    };
+    let full = parse("rust", false)?;
+    assert_eq!(full.error, None);
+    let compact = parse("rust", true)?;
+    assert_eq!(compact.error, None);
+    // The decoded events, and so the stored rows, equal the full stream's.
+    assert_eq!(compact.events, full.events);
+    assert!(
+        compact
+            .events
+            .iter()
+            .filter(|event| event["event"] == "edge_upsert")
+            .all(|event| !event["edge"]["evidence"].as_array().unwrap().is_empty())
+    );
+
+    // The core asks only the Rust worker for the encoding, so another
+    // adapter's compact stream fails closed.
+    let other = parse("go", true)?;
+    assert_eq!(
+        other.failure_kind,
+        Some(WorkerFailureKind::MalformedProtocol)
+    );
+    assert!(
+        other
+            .error
+            .unwrap()
+            .contains("must include at least one evidence item")
+    );
+    assert!(requests_compact_evidence("rust"));
+    assert!(!requests_compact_evidence("go"));
+    assert!(!requests_compact_evidence("web"));
+
+    // Restoring the encoding cannot grow the stream past the core's bound.
+    let bounded = parse_events_with_expansion_limit(
+        &issue_578_stream("rust", &root, true)?,
+        "scan-golden",
+        "rust",
+        &root,
+        MAX_EVENT_LINE_BYTES,
+        None,
+        None,
+        1,
+    );
+    assert_eq!(bounded.failure_kind, Some(WorkerFailureKind::OutputLimit));
+    assert!(
+        bounded
+            .error
+            .unwrap()
+            .contains("would add more than 1 bytes")
+    );
+    Ok(())
+}
+
+#[test]
+fn issue_578_checkpoint_replay_bounds_compact_evidence_by_the_configured_budget() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    // A compact checkpoint whose restored evidence outgrows its own bytes:
+    // the profile declares one large evidence property default once, and the
+    // decoder inserts it into the site's evidence and the edge's copy.
+    let padding = "x".repeat(64 * 1024);
+    let mut events = issue_578_stream("rust", &root, true)?
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    for event in &mut events {
+        if event["event"] == "profile_declared" {
+            event["profile"]["properties"]["evidence_property_defaults"] = serde_json::json!([{
+                "extractor": "typescript-static",
+                "extractor_version": "0.1.0",
+                "properties": { "padding": padding },
+            }]);
+        }
+    }
+    let mut stream_bytes = 0;
+    for event in &events {
+        stream_bytes += serde_json::to_vec(event)?.len() + 1;
+    }
+    let spec = WorkerSpec {
+        adapter: AdapterKind::Rust,
+        program: OsString::from("depgraph-rust-worker"),
+        leading_args: Vec::new(),
+        display: "depgraph-rust-worker".to_owned(),
+        artifact_path: PathBuf::from("depgraph-rust-worker"),
+        runtime_requirement: None,
+        expected_version: None,
+        release_attested: false,
+        attested_rust_sysroot: None,
+    };
+    let replay = |max_protocol_bytes: usize| {
+        replay_analysis_checkpoint(
+            events.clone(),
+            &spec,
+            &root,
+            "scan-golden",
+            &ScanConfig {
+                max_protocol_line_bytes: MAX_EVENT_LINE_BYTES,
+                max_protocol_bytes,
+                ..ScanConfig::default()
+            },
+        )
+    };
+
+    // A budget that admits the checkpoint's bytes but not their restoration
+    // fails, although the default budget would have admitted both.
+    assert!(stream_bytes < ScanConfig::default().max_protocol_bytes);
+    let Err(error) = replay(stream_bytes) else {
+        panic!("restoration past the configured budget must fail");
+    };
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(&format!("would add more than {stream_bytes} bytes")),
+        "{error}"
+    );
+
+    // A budget that admits the restoration replays the decoded events.
+    let output = replay(4 * stream_bytes)?;
+    assert!(
+        output
+            .events
+            .iter()
+            .filter(|event| event["event"] == "edge_upsert")
+            .all(|event| event["edge"]["evidence"][0]["properties"]["padding"] == padding)
+    );
+    Ok(())
+}

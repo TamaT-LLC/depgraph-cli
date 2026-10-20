@@ -2620,3 +2620,94 @@ fn import_evidence_rejects_raw_properties_and_detail() {
         );
     }
 }
+
+#[test]
+fn issue_579_analysis_degradations_are_optional_bounded_and_round_trip() {
+    use depgraph_mcp_tools::{
+        AgentAnalysisDegradation, AgentId, AgentLabel, AgentToken,
+        MAX_AGENT_ANALYSIS_DEGRADATION_REASONS,
+    };
+
+    let page = || Page::new(vec![edge()], 1, true, None).expect("complete edge page");
+    let plain = AgentDependenciesResponse::new(
+        node(),
+        AgentDependencyDirection::Outgoing,
+        false,
+        true,
+        1,
+        page(),
+    )
+    .unwrap();
+    // Without degradation the bytes are those of the response before #579.
+    let plain_value = serde_json::to_value(&plain).unwrap();
+    assert!(plain_value.get("analysis_degradations").is_none());
+
+    let degradation = AgentAnalysisDegradation::new(
+        AgentId::parse("profile:rust").unwrap(),
+        AgentToken::parse("rust").unwrap(),
+        AgentToken::parse("syntax-only").unwrap(),
+        vec![AgentLabel::parse("rust-hir-memory-budget").unwrap()],
+    )
+    .unwrap();
+    let degraded = plain
+        .clone()
+        .with_analysis_degradations(vec![degradation.clone()]);
+    let value = serde_json::to_value(&degraded).unwrap();
+    assert_eq!(
+        value["analysis_degradations"],
+        json!([{
+            "profile_id": "profile:rust",
+            "language": "rust",
+            "analysis_mode": "syntax-only",
+            "reasons": ["rust-hir-memory-budget"]
+        }])
+    );
+    let mut without = value.clone();
+    without
+        .as_object_mut()
+        .unwrap()
+        .remove("analysis_degradations");
+    assert_eq!(without, plain_value);
+    assert_eq!(
+        serde_json::from_value::<AgentDependenciesResponse>(value.clone()).unwrap(),
+        degraded
+    );
+    let output = serde_json::from_value::<AgentDependenciesOutput>(value).unwrap();
+    assert_eq!(output.detail(), AgentDependencyDetail::Full);
+
+    // Bounds and closed fields are enforced on input.
+    let too_many_reasons =
+        vec![AgentLabel::parse("reason").unwrap(); MAX_AGENT_ANALYSIS_DEGRADATION_REASONS + 1];
+    assert!(
+        AgentAnalysisDegradation::new(
+            AgentId::parse("profile:rust").unwrap(),
+            AgentToken::parse("rust").unwrap(),
+            AgentToken::parse("syntax-only").unwrap(),
+            too_many_reasons,
+        )
+        .is_err()
+    );
+    let mut unknown = serde_json::to_value(&degraded).unwrap();
+    unknown["analysis_degradations"][0]["extra"] = json!(true);
+    assert!(serde_json::from_value::<AgentDependenciesResponse>(unknown).is_err());
+
+    // Core values outside the Agent contract are skipped, not failed.
+    let projected = AgentAnalysisDegradation::project_core(&[
+        depgraph_core::service::AnalysisDegradation {
+            profile_id: "profile:rust".to_owned(),
+            language: "rust".to_owned(),
+            analysis_mode: "syntax-only".to_owned(),
+            reasons: vec![
+                "rust-hir-memory-budget".to_owned(),
+                "bad\nreason".to_owned(),
+            ],
+        },
+        depgraph_core::service::AnalysisDegradation {
+            profile_id: "not an id".to_owned(),
+            language: "rust".to_owned(),
+            analysis_mode: "syntax-only".to_owned(),
+            reasons: Vec::new(),
+        },
+    ]);
+    assert_eq!(projected, vec![degradation]);
+}

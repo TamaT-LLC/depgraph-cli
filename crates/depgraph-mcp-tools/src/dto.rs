@@ -2523,6 +2523,12 @@ pub struct AgentDependenciesResponse {
     traversal_complete: bool,
     traversed_edges: u64,
     edges: Page<AgentEdge>,
+    /// Snapshot profiles analyzed in a less precise mode, such as Rust
+    /// syntax-only after the HIR memory budget (Issue #579). Omitted when every
+    /// profile ran at full precision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 256))]
+    analysis_degradations: Vec<crate::AgentAnalysisDegradation>,
 }
 
 impl AgentDependenciesResponse {
@@ -2544,7 +2550,23 @@ impl AgentDependenciesResponse {
             traversal_complete,
             traversed_edges,
             edges,
+            analysis_degradations: Vec::new(),
         })
+    }
+
+    /// Attaches the snapshot's degraded profiles (Issue #579).
+    #[must_use]
+    pub fn with_analysis_degradations(
+        mut self,
+        analysis_degradations: Vec<crate::AgentAnalysisDegradation>,
+    ) -> Self {
+        self.analysis_degradations = analysis_degradations;
+        self
+    }
+
+    #[must_use]
+    pub fn analysis_degradations(&self) -> &[crate::AgentAnalysisDegradation] {
+        &self.analysis_degradations
     }
 
     /// Projects bounded core traversal items without exposing core properties or paths.
@@ -2570,6 +2592,11 @@ impl AgentDependenciesResponse {
             source.traversed_edges(),
             edges,
         )
+        .map(|response| {
+            response.with_analysis_degradations(crate::AgentAnalysisDegradation::project_core(
+                source.analysis_degradations(),
+            ))
+        })
     }
 
     #[must_use]
@@ -2587,6 +2614,11 @@ struct AgentDependenciesResponseWire {
     traversal_complete: bool,
     traversed_edges: u64,
     edges: Page<AgentEdge>,
+    #[serde(
+        default,
+        deserialize_with = "crate::dependency_detail::deserialize_analysis_degradations"
+    )]
+    analysis_degradations: Vec<crate::AgentAnalysisDegradation>,
 }
 
 impl<'de> Deserialize<'de> for AgentDependenciesResponse {
@@ -2603,6 +2635,7 @@ impl<'de> Deserialize<'de> for AgentDependenciesResponse {
             wire.traversed_edges,
             wire.edges,
         )
+        .map(|response| response.with_analysis_degradations(wire.analysis_degradations))
         .map_err(D::Error::custom)
     }
 }
@@ -2661,6 +2694,31 @@ impl AgentPathResponse {
             traversed_edges,
             steps,
         })
+    }
+
+    #[must_use]
+    pub const fn from(&self) -> &AgentNode {
+        &self.from
+    }
+
+    #[must_use]
+    pub const fn to(&self) -> &AgentNode {
+        &self.to
+    }
+
+    #[must_use]
+    pub const fn path_found(&self) -> bool {
+        self.path_found
+    }
+
+    #[must_use]
+    pub const fn traversed_edges(&self) -> u64 {
+        self.traversed_edges
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> &[AgentPathStep] {
+        &self.steps
     }
 }
 

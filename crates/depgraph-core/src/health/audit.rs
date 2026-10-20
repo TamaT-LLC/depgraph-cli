@@ -508,7 +508,7 @@ fn push_finding(
     finding: HealthFinding,
 ) -> Result<(), HealthAnalysisError> {
     if findings.len() >= maximum_findings {
-        return Err(HealthAnalysisError::ResourceExhausted);
+        return Err(HealthAnalysisError::FindingLimit);
     }
     findings.push(finding);
     Ok(())
@@ -650,7 +650,7 @@ mod tests {
                 usize::MAX,
                 || false,
             ),
-            Err(HealthAnalysisError::ResourceExhausted)
+            Err(HealthAnalysisError::FindingLimit)
         );
     }
 

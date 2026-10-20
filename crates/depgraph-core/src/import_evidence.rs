@@ -29,6 +29,9 @@ pub enum ImportBindingKind {
     Glob,
     GlobReexport,
     ExternCrate,
+    /// A Rust `mod name;` declaration: it binds the module `name` in the
+    /// declaring file (Issue #566).
+    ModuleDeclaration,
 }
 
 impl ImportBindingKind {
@@ -50,6 +53,7 @@ impl ImportBindingKind {
             Self::Glob => "glob",
             Self::GlobReexport => "glob_reexport",
             Self::ExternCrate => "extern_crate",
+            Self::ModuleDeclaration => "module_declaration",
         }
     }
 
@@ -227,6 +231,25 @@ fn project_site_only(properties: &Value, site: ImportSiteHint<'_>) -> Option<Imp
         "type_import_equals" => (Some(ImportBindingKind::ImportEquals), true),
         "reexport" => (Some(ImportBindingKind::Reexport), false),
         "type_reexport" => (Some(ImportBindingKind::Reexport), true),
+        // `mod name;`: the specifier is the module name, which the declaration
+        // binds locally (Issue #566).
+        "module_declaration" => {
+            // Only a plain module name is a binding; a path-like specifier
+            // (`#[path]` or a fixture) is kept as the specifier alone.
+            let local_name = site.specifier.filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_')
+            });
+            return ImportEvidence::build(
+                site.specifier,
+                Some(ImportBindingKind::ModuleDeclaration),
+                None,
+                local_name,
+                false,
+            );
+        }
         _ => return None,
     };
     // A Go dot import (`import . "pkg"`) binds every exported name and no local

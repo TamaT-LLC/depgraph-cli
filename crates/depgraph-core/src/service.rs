@@ -38,10 +38,11 @@ pub use crate::service_bounded::{
 };
 pub use crate::service_build::{ResolveBuildRequest, ResolveBuildServiceOutcome};
 pub use crate::service_graph::{
-    ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest, CyclesResult,
-    DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
-    ExplainPathResult, ImpactRequest, ImpactServiceResult, UnresolvedRequest,
-    UnresolvedServiceResult,
+    AnalysisDegradation, ChangedSetImpactRequest, ChangedSetImpactServiceResult, CyclesRequest,
+    CyclesResult, DependenciesRequest, DependenciesResult, DependencyDirection, ExplainPathRequest,
+    ExplainPathResult, ImpactRequest, ImpactServiceResult, MAX_ANALYSIS_DEGRADATION_REASONS,
+    MAX_ANALYSIS_DEGRADATIONS, RUST_SYNTAX_ONLY_ANALYSIS_MODE, RUST_SYNTAX_ONLY_FALLBACK_REASON,
+    UnresolvedRequest, UnresolvedServiceResult, snapshot_analysis_degradations,
 };
 pub use crate::service_health::{
     HealthAuditReadScope, HealthAuditRequest, HealthAuditResult, HealthCoverageOverview,
@@ -916,8 +917,36 @@ pub enum DepgraphResourceLimit {
     /// adjacency, bounded by the fixed interactive traversal ceiling.
     AdjacencyEdgeInspection,
     /// Snapshot-wide preprocessing work items: selector resolution, path
-    /// search adjacency, and traversal postprocessing.
+    /// search adjacency, traversal postprocessing, and the per-phase health
+    /// analysis budget.
     PreprocessingWorkItems,
+    /// Unique nodes an impact traversal keeps, set by its `max_nodes`.
+    ImpactNodes,
+    /// Unique edges an impact traversal keeps, set by its `max_edges`.
+    ImpactEdges,
+    /// Dependency-path steps materialized for one impact response.
+    ImpactPathSteps,
+    /// Changed paths read from Git for a changed-set impact or audit.
+    ChangedPaths,
+    /// Findings in one health response or one analyzed range.
+    HealthFindings,
+    /// Evidence, remediation, suppression, or blocker entries of one finding.
+    HealthFindingItems,
+    /// Dependency manifests read by one health analysis.
+    HealthManifests,
+    /// Bytes of repository input files read by one request (manifests,
+    /// policy configuration).
+    InputBytes,
+    /// Items in one snapshot diff or policy evaluation result.
+    ArtifactItems,
+    /// Work items of one snapshot diff, policy evaluation, or export selection.
+    ArtifactWorkItems,
+    /// Nodes of one graph export, set by its `max_nodes`.
+    ExportNodes,
+    /// Edges of one graph export, set by its `max_edges`.
+    ExportEdges,
+    /// Serialized bytes of one graph export.
+    OutputBytes,
 }
 
 impl DepgraphResourceLimit {
@@ -927,6 +956,19 @@ impl DepgraphResourceLimit {
             Self::MaxTraversal => "max_traversal",
             Self::AdjacencyEdgeInspection => "adjacency_edge_inspection",
             Self::PreprocessingWorkItems => "preprocessing_work_items",
+            Self::ImpactNodes => "impact_nodes",
+            Self::ImpactEdges => "impact_edges",
+            Self::ImpactPathSteps => "impact_path_steps",
+            Self::ChangedPaths => "changed_paths",
+            Self::HealthFindings => "health_findings",
+            Self::HealthFindingItems => "health_finding_items",
+            Self::HealthManifests => "health_manifests",
+            Self::InputBytes => "input_bytes",
+            Self::ArtifactItems => "artifact_items",
+            Self::ArtifactWorkItems => "artifact_work_items",
+            Self::ExportNodes => "export_nodes",
+            Self::ExportEdges => "export_edges",
+            Self::OutputBytes => "output_bytes",
         }
     }
 
@@ -935,7 +977,32 @@ impl DepgraphResourceLimit {
     pub const fn argument(self) -> Option<&'static str> {
         match self {
             Self::MaxTraversal => Some("max_traversal"),
-            Self::AdjacencyEdgeInspection | Self::PreprocessingWorkItems => None,
+            Self::ImpactNodes | Self::ExportNodes => Some("max_nodes"),
+            Self::ImpactEdges | Self::ExportEdges => Some("max_edges"),
+            Self::AdjacencyEdgeInspection
+            | Self::PreprocessingWorkItems
+            | Self::ImpactPathSteps
+            | Self::ChangedPaths
+            | Self::HealthFindings
+            | Self::HealthFindingItems
+            | Self::HealthManifests
+            | Self::InputBytes
+            | Self::ArtifactItems
+            | Self::ArtifactWorkItems
+            | Self::OutputBytes => None,
+        }
+    }
+
+    /// Largest value the widening argument accepts, when there is one.
+    #[must_use]
+    pub const fn argument_ceiling(self) -> Option<u64> {
+        match self {
+            Self::MaxTraversal | Self::ImpactNodes | Self::ImpactEdges => {
+                Some(crate::query::MAX_INTERACTIVE_QUERY_TRAVERSAL as u64)
+            }
+            Self::ExportNodes => Some(crate::service_artifacts::MAX_GRAPH_EXPORT_NODES as u64),
+            Self::ExportEdges => Some(crate::service_artifacts::MAX_GRAPH_EXPORT_EDGES as u64),
+            _ => None,
         }
     }
 }

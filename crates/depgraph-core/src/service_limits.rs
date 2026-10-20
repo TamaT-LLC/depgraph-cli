@@ -67,6 +67,26 @@ pub const MAX_HEALTH_SUPPRESSIONS_PER_FINDING: usize = 8;
 /// Maximum values accepted by one health request filter.
 pub const MAX_HEALTH_FILTER_ITEMS: usize = 1_024;
 
+/// Maximum hotspot subjects scored together in one request, which also bounds
+/// the findings one hotspot response returns.
+///
+/// Hotspot layers are rank-normalized over every subject, so subjects cannot be
+/// split into pages or ranges the way other health findings are, and a Rust HIR
+/// snapshot records parameters, locals, and closures as subjects. This is
+/// therefore separate from [`MAX_HEALTH_FINDINGS`]: the HIR snapshot of
+/// depgraph-cli itself had 69,900 subjects (Issue #590).
+pub const MAX_HOTSPOT_SUBJECTS: usize = 250_000;
+
+/// Maximum hotspot analysis work: subject discovery, the interned edge view,
+/// batched reverse impact, and finding construction.
+///
+/// The work grows with nodes plus edges and with the reverse closures of the
+/// subjects, so a fixed graph-service budget does not scale with HIR
+/// snapshots. The HIR snapshot of depgraph-cli itself (212,915 nodes, 245,923
+/// edges) used 3,561,396 items, 2,892,858 of them for reverse impact, and
+/// about 1.3 seconds (Issue #590).
+pub const MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS: usize = 16_000_000;
+
 /// Longest accepted hotspot path (churn filter or result prefix), in bytes.
 pub const MAX_HOTSPOT_PATH_BYTES: usize = 512;
 

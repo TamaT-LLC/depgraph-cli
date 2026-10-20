@@ -27,6 +27,9 @@ pub enum AgentImportBindingKind {
     Glob,
     GlobReexport,
     ExternCrate,
+    // A Rust `mod name;` declaration; `local_name` is the declared module
+    // (Issue #566). A plain comment keeps the schema a flat string enum.
+    ModuleDeclaration,
 }
 
 impl From<ImportBindingKind> for AgentImportBindingKind {
@@ -47,6 +50,7 @@ impl From<ImportBindingKind> for AgentImportBindingKind {
             ImportBindingKind::Glob => Self::Glob,
             ImportBindingKind::GlobReexport => Self::GlobReexport,
             ImportBindingKind::ExternCrate => Self::ExternCrate,
+            ImportBindingKind::ModuleDeclaration => Self::ModuleDeclaration,
         }
     }
 }

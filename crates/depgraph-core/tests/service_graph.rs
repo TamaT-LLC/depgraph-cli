@@ -766,7 +766,11 @@ fn impact_dependency_paths_accept_1000_steps_and_reject_1001_without_partial_suc
     let mut snapshot = graph_service.start_snapshot_request("current")?;
     assert!(matches!(
         graph_service.impact(&mut snapshot, &request, &CancellationToken::new()),
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::ImpactPathSteps,
+            maximum: 1_000,
+            observed: None,
+        })
     ));
     Ok(())
 }
@@ -828,7 +832,11 @@ fn impact_wide_deep_graph_exhausts_cumulative_path_materialization_without_parti
     let mut snapshot = graph_service.start_snapshot_request("current")?;
     assert!(matches!(
         graph_service.impact(&mut snapshot, &request, &CancellationToken::new()),
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::ImpactPathSteps,
+            maximum: 50_000,
+            observed: None,
+        })
     ));
     Ok(())
 }
@@ -1213,7 +1221,11 @@ fn changed_set_impact_request_and_limits_fail_closed() -> Result<()> {
     let mut snapshot = graph_service.start_snapshot_request("current")?;
     assert!(matches!(
         graph_service.impact_changed_set(&mut snapshot, &request, &CancellationToken::new()),
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::ImpactNodes,
+            maximum: 3,
+            observed: None,
+        })
     ));
     Ok(())
 }
@@ -1305,7 +1317,11 @@ fn issue_303_service_methods_are_canonical_bounded_and_cancellable() -> Result<(
             )?,
             &cancellation,
         ),
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::ImpactNodes,
+            maximum: 1,
+            observed: None,
+        })
     ));
     assert!(matches!(
         service.cycles(

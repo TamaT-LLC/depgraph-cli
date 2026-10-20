@@ -7,8 +7,8 @@ use depgraph_core::{
 use depgraph_mcp_tools::{
     ALL_CLI_ACTIONS, AgentCurrentSnapshot, AgentNamedSnapshot, AgentRepositoryList,
     AgentRepositorySummary, CapabilityProfile, CliAction, IdempotencyKey,
-    MAX_IDEMPOTENCY_KEY_CHARS, OperationAccepted, OperationBehavior, OperationId, SuccessEnvelope,
-    ToolAuthorization, ToolCatalog,
+    MAX_IDEMPOTENCY_KEY_CHARS, OperationAccepted, OperationBehavior, OperationId,
+    STANDARD_JSON_SCHEMA_FORMATS, SuccessEnvelope, ToolAuthorization, ToolCatalog,
 };
 
 use serde_json::{Value, json};
@@ -602,6 +602,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
         fields,
         [
             "contract_version",
+            "detail",
             "environments",
             "from",
             "max_traversal",
@@ -616,7 +617,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
     assert_eq!(path.operation_behavior(), OperationBehavior::Immediate);
     assert_eq!(
         success_output_schema(path.output_schema())["properties"]["result"]["$ref"],
-        "#/$defs/AgentPathResponse"
+        "#/$defs/AgentPathOutput"
     );
 }
 
@@ -1442,5 +1443,83 @@ fn issue_541_dependency_lists_advertise_edge_kind_selection() {
             !tool.description().contains("included by default"),
             "{name} description still claims the old default"
         );
+    }
+}
+
+/// Collects every `format` keyword with its JSON pointer (Issue #568).
+fn collect_formats(value: &Value, pointer: &str, found: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(format) = object.get("format").and_then(Value::as_str) {
+                found.push((pointer.to_owned(), format.to_owned()));
+            }
+            for (key, child) in object {
+                collect_formats(child, &format!("{pointer}/{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_formats(item, &format!("{pointer}/{index}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn issue_568_tool_schemas_use_only_standard_formats_and_bound_integers() {
+    let catalog = ToolCatalog::for_capabilities(&full_capabilities()).unwrap();
+    let mut integers = 0_usize;
+    for tool in catalog.tools() {
+        for (side, schema) in [
+            ("input", tool.input_schema()),
+            ("output", tool.output_schema()),
+        ] {
+            let schema = Value::Object(schema.clone());
+            let mut found = Vec::new();
+            collect_formats(&schema, "#", &mut found);
+            for (pointer, format) in &found {
+                assert!(
+                    STANDARD_JSON_SCHEMA_FORMATS.contains(&format.as_str()),
+                    "{} {side} schema uses non-standard format {format:?} at {pointer}",
+                    tool.name()
+                );
+            }
+            integers += count_bounded_integers(&schema);
+        }
+    }
+    assert!(integers > 0, "the catalog has integer fields with bounds");
+
+    // Ranges that the removed formats implied are kept as bounds.
+    let nodes = catalog.tool("agent_nodes_list").unwrap();
+    let output = Value::Object(nodes.output_schema().clone());
+    let total_items = find_property(&output, "total_items").expect("page output has total_items");
+    assert_eq!(total_items["minimum"], 0, "{total_items}");
+    assert_eq!(total_items["maximum"], u64::MAX, "{total_items}");
+}
+
+fn count_bounded_integers(value: &Value) -> usize {
+    match value {
+        Value::Object(object) => {
+            let own = usize::from(
+                object.get("type") == Some(&json!("integer"))
+                    && object.contains_key("minimum")
+                    && object.contains_key("maximum"),
+            );
+            own + object.values().map(count_bounded_integers).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_bounded_integers).sum(),
+        _ => 0,
+    }
+}
+
+fn find_property<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => object
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+            .or_else(|| object.values().find_map(|child| find_property(child, name))),
+        Value::Array(items) => items.iter().find_map(|item| find_property(item, name)),
+        _ => None,
     }
 }

@@ -30,8 +30,8 @@ use depgraph_core::{
     PolicyAnnotation, QueryDiagnostic, QueryFailureClass, RepositoryProfilePlanPreview,
     ScanCacheMode, TraversalPageItem, TypedProjection, UnresolvedResult, default_store_path,
     paginate_interactive_query, profile_selection_human_summary, read_compiler_pack_requirement,
-    render_condition, render_github_annotations, traversal_summary, unresolved_summary,
-    validate_interactive_query_bounds,
+    render_condition, render_github_annotations, service::AnalysisDegradation, traversal_summary,
+    unresolved_summary, validate_interactive_query_bounds,
 };
 use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
 use depgraph_protocol::canonical_json;
@@ -1650,20 +1650,27 @@ async fn run(cli: Cli) -> Result<u8> {
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_graph_structured("deps", &snapshot, result.traversal(), json)?;
+                print_dependency_structured(
+                    "deps",
+                    &snapshot,
+                    result.traversal(),
+                    json,
+                    result.analysis_degradations(),
+                )?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
                 }
             } else {
                 let page =
                     interactive_dependencies_page(&result, "deps", &request, &output, &snapshot)?;
-                print_graph_page(
+                print_dependency_page(
                     &page,
                     json,
                     &snapshot,
                     output
                         .max_bytes
                         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
+                    result.analysis_degradations(),
                 )?;
                 if !json {
                     for item in &page.items {
@@ -1704,7 +1711,13 @@ async fn run(cli: Cli) -> Result<u8> {
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
-                print_graph_structured("dependents", &snapshot, result.traversal(), json)?;
+                print_dependency_structured(
+                    "dependents",
+                    &snapshot,
+                    result.traversal(),
+                    json,
+                    result.analysis_degradations(),
+                )?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
                 }
@@ -1716,13 +1729,14 @@ async fn run(cli: Cli) -> Result<u8> {
                     &output,
                     &snapshot,
                 )?;
-                print_graph_page(
+                print_dependency_page(
                     &page,
                     json,
                     &snapshot,
                     output
                         .max_bytes
                         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
+                    result.analysis_degradations(),
                 )?;
                 if !json {
                     for item in &page.items {
@@ -3418,7 +3432,11 @@ fn interactive_dependencies_page(
             context: &context,
             cursor: output.cursor.as_deref(),
             max_items,
-            max_bytes: partial_page_budget(snapshot, max_bytes)?,
+            max_bytes: dependency_page_budget(
+                snapshot,
+                execution.analysis_degradations(),
+                max_bytes,
+            )?,
             traversal_complete: execution.complete(),
             traversed_items: execution.traversed_edges(),
             root: Some(&execution.traversal().root),
@@ -3445,29 +3463,93 @@ fn partial_page_budget(snapshot: &SnapshotReadRequest, max_bytes: usize) -> Resu
         .context("partial analysis metadata exceeds the output budget")
 }
 
+/// Page budget of a dependency list: the partial metadata and the degraded
+/// profiles are added after page selection, so both are reserved first
+/// (Issue #579).
+fn dependency_page_budget(
+    snapshot: &SnapshotReadRequest,
+    degradations: &[AnalysisDegradation],
+    max_bytes: usize,
+) -> Result<usize> {
+    let budget = partial_page_budget(snapshot, max_bytes)?;
+    if degradations.is_empty() {
+        return Ok(budget);
+    }
+    // The value and its key, with the same slack partial metadata reserves for
+    // the separators and a longer serialized_output_bytes.
+    let reserved = canonical_json(&serde_json::to_value(degradations)?).len()
+        + "analysis_degradations".len()
+        + 32;
+    budget
+        .checked_sub(reserved)
+        .context("analysis degradation metadata exceeds the output budget")
+}
+
 fn print_graph_page<T: Serialize>(
     page: &InteractiveQueryPage<T>,
     json_output: bool,
     snapshot: &SnapshotReadRequest,
     max_bytes: usize,
 ) -> Result<()> {
-    let Some(partial) = partial_query_metadata(snapshot) else {
-        return print_interactive_page(page, json_output);
-    };
-    if !json_output {
+    print_dependency_page(page, json_output, snapshot, max_bytes, &[])
+}
+
+/// Prints a line per profile analyzed in a less precise mode (Issue #579).
+fn print_analysis_degradation_notice(degradations: &[AnalysisDegradation]) {
+    for degradation in degradations {
         println!(
-            "partial analysis: {} (only analyzed dependencies are available)",
-            snapshot.scan_id()
+            "degraded analysis: {} profile {} ran in {} mode ({}); dependencies can be incomplete",
+            degradation.language,
+            degradation.profile_id,
+            degradation.analysis_mode,
+            if degradation.reasons.is_empty() {
+                "no reason recorded".to_owned()
+            } else {
+                degradation.reasons.join(", ")
+            }
         );
+    }
+}
+
+/// `print_graph_page` that also reports the snapshot's degraded profiles as
+/// `analysis_degradations` (Issue #579). Without degradations or partial
+/// metadata the output is unchanged.
+fn print_dependency_page<T: Serialize>(
+    page: &InteractiveQueryPage<T>,
+    json_output: bool,
+    snapshot: &SnapshotReadRequest,
+    max_bytes: usize,
+    degradations: &[AnalysisDegradation],
+) -> Result<()> {
+    let partial = partial_query_metadata(snapshot);
+    if partial.is_none() && degradations.is_empty() {
+        return print_interactive_page(page, json_output);
+    }
+    if !json_output {
+        if partial.is_some() {
+            println!(
+                "partial analysis: {} (only analyzed dependencies are available)",
+                snapshot.scan_id()
+            );
+        }
+        print_analysis_degradation_notice(degradations);
         return print_interactive_page(page, false);
     }
     let mut value = serde_json::to_value(page)?;
-    value["partial"] = partial;
+    if let Some(partial) = partial {
+        value["partial"] = partial;
+    }
+    if !degradations.is_empty() {
+        value["analysis_degradations"] = serde_json::to_value(degradations)?;
+    }
     // Include the metadata and the length field itself in the byte contract.
     loop {
         let encoded = canonical_json(&value);
         if encoded.len() > max_bytes {
-            anyhow::bail!("partial analysis metadata exceeds the output budget");
+            if degradations.is_empty() {
+                anyhow::bail!("partial analysis metadata exceeds the output budget");
+            }
+            anyhow::bail!("analysis metadata exceeds the output budget");
         }
         if value["serialized_output_bytes"].as_u64() == Some(encoded.len() as u64) {
             println!("{encoded}");
@@ -3475,6 +3557,36 @@ fn print_graph_page<T: Serialize>(
         }
         value["serialized_output_bytes"] = serde_json::json!(encoded.len());
     }
+}
+
+/// `print_graph_structured` that also reports the snapshot's degraded
+/// profiles (Issue #579). Without degradations the output is unchanged.
+fn print_dependency_structured<T: Serialize>(
+    command: &'static str,
+    snapshot: &SnapshotReadRequest,
+    data: &T,
+    json_output: bool,
+    degradations: &[AnalysisDegradation],
+) -> Result<()> {
+    if degradations.is_empty() {
+        return print_graph_structured(command, snapshot, data, json_output);
+    }
+    if !json_output {
+        print_analysis_degradation_notice(degradations);
+        return print_graph_structured(command, snapshot, data, false);
+    }
+    let mut value = serde_json::json!({
+        "schema_version": "1.0",
+        "command": command,
+        "scan_id": snapshot.scan_id(),
+        "data": data,
+        "analysis_degradations": degradations,
+    });
+    if let Some(partial) = partial_query_metadata(snapshot) {
+        value["partial"] = partial;
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 fn print_graph_structured<T: Serialize>(

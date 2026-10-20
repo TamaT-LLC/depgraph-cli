@@ -6,6 +6,7 @@ use crate::{
     stable_id_from_value,
 };
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::{Component, Path, PathBuf};
@@ -78,6 +79,8 @@ pub enum ProtocolError {
     PayloadAfterProfileCompletion { found: &'static str },
     #[error("protocol path {path:?} escapes scan root {root:?}")]
     UnsafePath { path: String, root: String },
+    #[error("decoding the compact evidence encoding would add more than {limit} bytes")]
+    ExpansionLimit { limit: usize },
     #[error("protocol invariant failed: {0}")]
     Invariant(String),
 }
@@ -173,6 +176,25 @@ impl ProtocolValidator {
     #[must_use]
     pub fn validated_events(&self) -> &[ProtocolEvent] {
         &self.events
+    }
+
+    /// Returns an accepted dependency site by ID.
+    #[must_use]
+    pub fn dependency_site(&self, id: &str) -> Option<&DependencySite> {
+        self.sites.get(id)
+    }
+
+    /// Expands one `compact-evidence-v1` event with `decoder`, then validates
+    /// and records it like [`Self::push`]. Use this only for a worker that was
+    /// asked for the compact encoding; [`Self::push`] rejects its edges that
+    /// omit evidence.
+    pub fn push_compact(
+        &mut self,
+        decoder: &mut crate::CompactEvidenceDecoder,
+        mut event: ProtocolEvent,
+    ) -> Result<(), ProtocolError> {
+        decoder.decode(&mut event, |site_id| self.sites.get(site_id))?;
+        self.push(event)
     }
 
     /// Validates and records one event. Conditions are canonicalized before
@@ -399,7 +421,12 @@ impl ProtocolValidator {
                         self.project_code_executed, completed.coverage.project_code_executed
                     )));
                 }
-                validate_site_edge_maps(&self.nodes, &self.edges, &self.sites)?;
+                validate_site_edge_maps(
+                    &self.nodes,
+                    &self.edges,
+                    &self.sites,
+                    EdgeEvidence::Required,
+                )?;
                 validate_cross_language_maps(
                     &self.profiles,
                     &self.nodes,
@@ -732,12 +759,18 @@ pub fn validate_build_contract(protocol: &ValidatedProtocol) -> Result<(), Proto
 /// Validates the opt-in Milestone 2 semantic graph contract on an already
 /// validated protocol stream.
 pub fn validate_semantic_contract(protocol: &ValidatedProtocol) -> Result<(), ProtocolError> {
-    validate_site_edge_maps(&protocol.nodes, &protocol.edges, &protocol.sites)?;
+    validate_site_edge_maps(
+        &protocol.nodes,
+        &protocol.edges,
+        &protocol.sites,
+        EdgeEvidence::Required,
+    )?;
     validate_semantic_maps(
         &protocol.profiles,
         &protocol.nodes,
         &protocol.edges,
         &protocol.sites,
+        EdgeEvidence::Required,
     )?;
     validate_cross_language_maps(
         &protocol.profiles,
@@ -797,7 +830,7 @@ pub fn validate_site_edge_invariants(
         .cloned()
         .map(|site| (site.id.clone(), site))
         .collect();
-    validate_site_edge_maps(&nodes, &edges, &sites)
+    validate_site_edge_maps(&nodes, &edges, &sites, EdgeEvidence::Required)
 }
 
 /// Validates an in-memory graph against both the base endpoint/site contract
@@ -838,19 +871,75 @@ pub fn validate_semantic_graph_maps(
     edges: &BTreeMap<String, GraphEdge>,
     sites: &BTreeMap<String, DependencySite>,
 ) -> Result<(), ProtocolError> {
-    validate_site_edge_maps(nodes, edges, sites)?;
+    validate_graph_maps(nodes, edges, sites, EdgeEvidence::Required)
+}
+
+/// Validates an in-memory producer graph whose site-linked edges may leave
+/// `evidence` empty to share the evidence of their dependency site.
+///
+/// This is an in-memory representation only: a producer that uses it must
+/// copy the site evidence back into each such edge before it emits the edge,
+/// and the wire protocol still requires every edge to carry its own evidence
+/// (`validate_semantic_graph_maps`). On a large Rust workspace the edge copies
+/// of site evidence took about a quarter of the worker heap (#578).
+pub fn validate_semantic_graph_maps_with_shared_site_evidence(
+    nodes: &BTreeMap<String, GraphNode>,
+    edges: &BTreeMap<String, GraphEdge>,
+    sites: &BTreeMap<String, DependencySite>,
+) -> Result<(), ProtocolError> {
+    validate_graph_maps(nodes, edges, sites, EdgeEvidence::SharedWithSite)
+}
+
+fn validate_graph_maps(
+    nodes: &BTreeMap<String, GraphNode>,
+    edges: &BTreeMap<String, GraphEdge>,
+    sites: &BTreeMap<String, DependencySite>,
+    edge_evidence: EdgeEvidence,
+) -> Result<(), ProtocolError> {
+    validate_site_edge_maps(nodes, edges, sites, edge_evidence)?;
     let profiles = BTreeMap::new();
-    validate_semantic_maps(&profiles, nodes, edges, sites)
+    validate_semantic_maps(&profiles, nodes, edges, sites, edge_evidence)
+}
+
+/// Whether a site-linked edge with empty `evidence` shares its site's
+/// evidence (in-memory producer graphs only) or is invalid (the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeEvidence {
+    Required,
+    SharedWithSite,
+}
+
+/// The edge as a consumer receives it: a shared-evidence edge gets a
+/// transient copy of its linked site's evidence. Every other edge, and every
+/// edge under `EdgeEvidence::Required`, is returned unchanged.
+fn edge_with_evidence<'a>(
+    edge: &'a GraphEdge,
+    site: Option<&DependencySite>,
+    edge_evidence: EdgeEvidence,
+) -> Cow<'a, GraphEdge> {
+    match site {
+        Some(site) if edge_evidence == EdgeEvidence::SharedWithSite && edge.evidence.is_empty() => {
+            let mut shared = edge.clone();
+            shared.evidence.clone_from(&site.evidence);
+            Cow::Owned(shared)
+        }
+        _ => Cow::Borrowed(edge),
+    }
 }
 
 fn validate_site_edge_maps(
     nodes: &BTreeMap<String, GraphNode>,
     edges: &BTreeMap<String, GraphEdge>,
     sites: &BTreeMap<String, DependencySite>,
+    edge_evidence: EdgeEvidence,
 ) -> Result<(), ProtocolError> {
     let mut edges_by_site = BTreeMap::<&str, Vec<&GraphEdge>>::new();
     for edge in edges.values() {
-        validate_edge(edge)?;
+        let linked_site = edge
+            .site_id
+            .as_deref()
+            .and_then(|site_id| sites.get(site_id));
+        validate_edge(&edge_with_evidence(edge, linked_site, edge_evidence))?;
         if !nodes.contains_key(&edge.source) {
             return invariant(format!(
                 "edge {} references missing source node {}",
@@ -967,6 +1056,7 @@ fn validate_site_edge_maps(
             ));
         }
         for edge in site_edges {
+            let edge = &*edge_with_evidence(edge, Some(site), edge_evidence);
             if edge.source != site.source {
                 return invariant(format!(
                     "edge {} source does not match dependency site {}",
@@ -1139,6 +1229,7 @@ fn validate_semantic_maps(
     nodes: &BTreeMap<String, GraphNode>,
     edges: &BTreeMap<String, GraphEdge>,
     sites: &BTreeMap<String, DependencySite>,
+    edge_evidence: EdgeEvidence,
 ) -> Result<(), ProtocolError> {
     let strict_dependency_sites: BTreeSet<_> = sites
         .values()
@@ -1175,6 +1266,7 @@ fn validate_semantic_maps(
             .site_id
             .as_deref()
             .and_then(|site_id| sites.get(site_id));
+        let edge = &*edge_with_evidence(edge, linked_site, edge_evidence);
         let linked_to_strict_site =
             linked_site.is_some_and(|site| strict_dependency_sites.contains(site.id.as_str()));
         if let Some(expected_kind) = linked_site.and_then(source_fallback_edge_kind_for_site) {
@@ -1430,6 +1522,7 @@ fn validate_semantic_maps(
             || framework_semantic_site
             || (web_semantic_site && site.kind == "call");
         for edge in edges_by_site.get(site.id.as_str()).into_iter().flatten() {
+            let edge = &*edge_with_evidence(edge, Some(site), edge_evidence);
             if edge.kind != expected_edge_kind {
                 return invariant(format!(
                     "semantic dependency site {} requires {expected_edge_kind} edges, found {}",

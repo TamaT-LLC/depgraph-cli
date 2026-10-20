@@ -5,6 +5,7 @@
 //! top level. Unknown optional fields are intentionally accepted for forward
 //! compatibility; unknown event names and malformed required fields are not.
 
+mod compact_evidence;
 mod condition;
 mod cross_language;
 mod delta;
@@ -13,6 +14,11 @@ mod model;
 mod stable_id;
 mod validator;
 
+pub use compact_evidence::{
+    COMPACT_EVIDENCE_ENCODING_V1, COMPACT_EVIDENCE_REQUEST_ENV, CompactEvidenceDecoder,
+    EVIDENCE_ENCODING_PROPERTY, EVIDENCE_PROPERTY_DEFAULTS_PROPERTY, EvidencePropertyDefaults,
+    apply_evidence_property_defaults,
+};
 pub use condition::Condition;
 pub use cross_language::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -50,7 +56,8 @@ pub use validator::{
     build_edge_stable_id, build_site_stable_id, semantic_identity_profile_id,
     validate_build_contract, validate_build_ndjson, validate_ndjson, validate_safe_ndjson,
     validate_safe_semantic_ndjson, validate_semantic_contract, validate_semantic_graph,
-    validate_semantic_graph_maps, validate_semantic_ndjson, validate_site_edge_invariants,
+    validate_semantic_graph_maps, validate_semantic_graph_maps_with_shared_site_evidence,
+    validate_semantic_ndjson, validate_site_edge_invariants,
 };
 
 /// The only protocol version accepted by this crate.

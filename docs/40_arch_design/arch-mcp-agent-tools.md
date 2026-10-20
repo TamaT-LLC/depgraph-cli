@@ -930,7 +930,10 @@ Agentがファイルを開かずに「なぜ依存しているか」を説明で
 | Rust file node path | Rust workerのfile nodeは`path` propertyを持たず、locator `file:<path>`だけにpathを持つ。`AgentNode`の射影は、`path` / `source_path`がない`file` nodeでlocatorの`file:`の後を`RepositoryRelativePath`として検証できた場合だけ`repository_path`に使う。`file://`、絶対path、`..`は使わない。`agent_node_get`などの`repository_path`と、依存一覧`detail: "paths"`の`source_path` / `target_path`に現れる（任意fieldの追加） |
 | Rust syntax import evidence | syntax-only（`rust-static`）の`rust_use` / `rust_reexport` evidenceに、HIRと同じ`target_specifier` / `glob` / `reexport` / `alias?`を、`extern_crate`に`target_specifier` / `alias?`を記録する。coreの既存のRust射影がそのまま`import`のspecifier、binding_kind、imported_name、local_nameを作る。site / edge IDはpropertiesに依存しないため変わらない |
 | Fan-in definition | `health_hotspots_list`のdescriptionと利用ガイドに、fan-in / fan-outはsnapshotの全edge record（構造辺、全phase / profileを含み、同じsourceからの複数edgeも別々に数える）、reverse impactは重複なしの推移的依存元であることと、fan-inだけで順位を付けるweightの指定を書く。採点は変えない |
-| Not in scope | `module_declaration`（`mod foo;`）のimport根拠はclosed enum `binding_kind`の追加が要るため扱わない。`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約も別Issueで扱う |
+| Not in scope (first PR) | `module_declaration`（`mod foo;`）のimport根拠、`graph_path_get`の軽量出力、`get_context`の`profile_ids`省略、ファイル単位のimports辺からsemantic辺のimport名への集約は、最初のPR（#572）では扱わなかった |
+| `mod foo;` evidence | `binding_kind`に`module_declaration`を足す（closed enumへの値の追加）。site kind `module_declaration`の証拠は、siteのspecifier（module名）を`specifier`にし、識別子だけからなるときは同じ値を`local_name`にする。`#[path]`などのパス形のspecifierは`local_name`を付けない。worker側の変更はない |
+| `graph_path_get` `detail` | 任意入力`detail`（`full` / `summary` / `paths`、既定`full`）。`full`は従来の`AgentPathResponse`とbyte単位で同じ。`summary`は`AgentPathSummaryResponse`（`common`と`AgentEdgeSummary`のsteps）、`paths`は`AgentPathPathsResponse`（`AgentDependencyPath`のsteps、重複は除かない）。出力schemaは`AgentPathOutput`の`oneOf`。軽い形はfull projectionから作るので、経路のtopology検査を共有する。depgraph-cli自身のsyntax-only scanで`crates/depgraph-mcp/src/main.rs`から`crates/depgraph-core/src/lib.rs`への経路は、full 4,710 byte、summary 2,157 byte、paths 1,453 byteだった |
+| Deferred | ファイル単位のimports辺からimport名への集約、fan-in専用のranking、`get_context`の`profile_ids`省略は、出力契約の設計判断が要るため見送る（PRに選択肢を書いた） |
 | Deterministic artifacts | shared schema、catalog JSON、各SHA-256 fixtureを再生成する。schemaには`AgentEdgesOutput`、`AgentEdgesSummaryResponse`、`AgentEdgeDetail`とその成功envelopeが増える |
 
 ## Issue #580 worker-shaped DTO values
@@ -944,6 +947,43 @@ Issue #563でAgentNodeSummaryのlocatorとdisplay nameが契約外になった�
 | Tool walk | 同じStoreに実バイナリの`depgraph-mcp`を接続し、読み取りtool 27種を約600回呼んだ。`agent_nodes_list`は全ノードをcursorで最後までたどり、`agent_node_get` / `agent_edges_list`（full / summary、両方向）/ `agent_sites_list` / `agent_evidence_list` / 依存一覧3 detail / impact / pathは種類ごとに層化した標本を使った。`INTEGRITY_FAILURE`と`INTERNAL`は0件だった。`graph_export`、`snapshot_diff_get`、`policy_evaluate`、`health_hotspots_list`、cycles、unresolved、範囲指定なしの`agent_sites_list`はこの規模では上限（`RESOURCE_EXHAUSTED`）で止まり、DTO変換まで届かない |
 | Regression | process test `issue_580_*`は、self-scanと同じ形の値（`file:` / `file://` / `external://` / `unknown://` / `go-symbol:` locator、256 byte超の複数行display name、`profile:sha256:` profile、21種のうち代表のextractor、実際のcoverage reasons）を入れたStoreで、上限に届かない全読み取りtoolを呼び、advertised output schemaで検証する |
 | Known limit | health findingのevidence `path`は`AgentLabel`（256 byte）で、超えるとintegrity errorになる。self-scanの最長は94 byte。closed DTOのfield型を変える必要があるため、このIssueでは変えない |
+
+## Issue #581 remaining argument and limit details
+
+Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EXHAUSTED`を、同じclosed形式に揃える。既存variantの既存fieldは変えず、`AgentResourceLimit`の値を足すだけにする。
+
+| Area | Evidence |
+| --- | --- |
+| Snapshot arguments | MCP層の`parse_snapshot_argument`が`SnapshotLocator::parse`の失敗を`{"kind":"argument","argument":"snapshot"\|"from"\|"to","reason":"invalid_value"}`にする。値はechoしない |
+| Edge kinds | 依存一覧はcoreへ渡す前に`EdgeKindFilter::try_new`で検証し、`agent_edges_list`と同じ`edge_kinds_argument_error`（`too_many_items` / `invalid_value`、構造辺の矛盾も`invalid_value`）を返す |
+| IDs and lists | `site_id` / `node_id` / `kinds` / `conditions` / `acknowledgement` / `rust_compiler_precise`の検証失敗に引数名を付ける |
+| Resource limits | core `DepgraphResourceLimit`に`ImpactNodes` / `ImpactEdges` / `ImpactPathSteps` / `ChangedPaths` / `HealthFindings` / `HealthFindingItems` / `HealthManifests` / `InputBytes` / `ArtifactItems` / `ArtifactWorkItems` / `ExportNodes` / `ExportEdges` / `OutputBytes`を足す。impactの内部markerは上限の種類と値を持ち、`impact::resource_limit`がservice境界で取り出す。health分析は作業量（`ResourceExhausted`、全phaseとrangeが`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`）とfinding数（新variant `FindingLimit` / hotspotの`SubjectLimit`）を区別する。rangeの再分割は両方をoverrunとして従来どおり扱う |
+| Hotspot limits | Issue #590でhotspotの上限はhealth共通の値から専用の値に変わった。`health_hotspots_list`の作業量は`MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS`（16,000,000）、subject数と返却件数は`MAX_HOTSPOT_SUBJECTS`（250,000）で、detailsの`limit`は`preprocessing_work_items` / `health_findings`のまま、`maximum`はこの専用の値を返す |
+| Remediation | `increase_limit`は引数で広げられ、上限値がその引数の最大値（`max_traversal`とimpactの`max_nodes` / `max_edges`は1,000,000、exportは50,000 / 100,000）未満のときだけ。`DepgraphResourceLimit::argument_ceiling`で判定する |
+| Export selector | `graph_export`のselector解決失敗を依存一覧と同じ`SelectorResolutionFailure`のtag付きgraph query errorにし、`NOT_FOUND` / `no_matching_node`を返す |
+| Not in scope | `graph_cycles_list` / `graph_unresolved_list`のphase作業量、bounded query、lifecycle、repository操作の`ResourceExhausted`はdetailsなしのまま |
+
+## Issue #568 standard schema formats
+
+schemarsはRustの整数型から`format: "uint32"`などJSON Schema 2020-12にない値を出す。Ajvを使うMCP client（Claude Codeなど）は、tool一覧の取得時にこれを`unknown format "…" ignored`として1件ずつ警告していた（39 toolで1,134件）。
+
+| Area | Evidence |
+| --- | --- |
+| Normalization | `standardize_integer_formats`が`uint8` / `uint16` / `uint32` / `uint64` / `uint`と`int8`〜`int64` / `int`の`format`を外し、型の範囲を`minimum` / `maximum`で表す。既にある`minimum` / `maximum`（`NonZero`の1、basis pointの10,000など）は型の範囲より狭いので残す。受け付ける値の集合は変わらない |
+| Applied to | tool catalogの全input / output schema、shared schema `depgraph-mcp-tools-v1`、`depgraph-agent-scan-outcome-v2`。手書きのschema（health DTOなど）も同じ変換を通る |
+| Tests | catalogとshared schemaの全`format`がJSON Schema 2020-12の定義済み値であること、変換の境界（既存boundの保持、property名`format`を誤変換しないこと）、scan outcome v2 schemaのchecked-in fileと生成結果の一致 |
+
+## Issue #579 analysis degradation metadata
+
+RustのHIRがメモリ予算を超えてsyntax-onlyに落ちても、依存一覧の応答からは分からなかった。worker / coreがscan時に残す情報を、依存一覧の任意metadataに載せる。
+
+| Area | Evidence |
+| --- | --- |
+| Source | core `snapshot_analysis_degradations`がsnapshotのprofileを見る。`rust_hir_mode=syntax-only`のprofileを劣化とし、reasonsはprofile coverageの`rust-hir-*`（workerの`rust-hir-memory-budget`）と、coreが再実行時に書く`rust_hir_mode_reason`に対応する`rust-hir-syntax-only-fallback`（scan診断と同じcode）。profile ID順、最大256 profile、1 profileあたり最大16 reason |
+| Scope | 結果のedgeに関わるprofileだけではなく、snapshot全体で判定する。syntax-onlyで失われたedgeは結果に現れないため、結果のedgeから判定すると劣化を見落とす |
+| MCP | `AgentDependenciesResponse` / `AgentDependenciesSummaryResponse` / `AgentDependencyPathsResponse`に任意field `analysis_degradations`（`AgentAnalysisDegradation`の配列）を足す。空なら出力しないので、劣化のないsnapshotの応答とcursorは従来とbyte単位で同じ。fieldはbyte予算の固定部分に含めてpagingする。契約外のprofile ID / language / modeのentryと、契約外のreasonは省く |
+| CLI | `deps` / `dependents`の`--json`（paged / `--all`）はtop-levelに`analysis_degradations`を足し、テキスト出力は先頭に`degraded analysis:`の行を出す |
+| Not in scope | `graph_path_get`、impact、health系、snapshot系の応答には載せない。snapshot系はすでにcoverage reasonsを返す |
 
 ## Issue #292 acceptance mapping
 

@@ -495,8 +495,31 @@ pub enum AgentResourceLimit {
     /// Snapshot edges a dependency traversal inspects to build its adjacency.
     SnapshotEdges,
     /// Snapshot-wide preprocessing work items: selector resolution, path
-    /// search adjacency, and traversal postprocessing.
+    /// search adjacency, traversal postprocessing, and each health analysis
+    /// phase or range.
     PreprocessingWorkItems,
+    /// Unique nodes an impact traversal keeps; widened by `max_nodes`.
+    ImpactNodes,
+    /// Unique edges an impact traversal keeps; widened by `max_edges`.
+    ImpactEdges,
+    /// Dependency-path steps materialized for one impact response.
+    ImpactPathSteps,
+    /// Changed paths read from Git for a changed-set impact or audit.
+    ChangedPaths,
+    /// Findings in one health response or one analyzed range.
+    HealthFindings,
+    /// Evidence, remediation, suppression, or blocker entries of one finding.
+    HealthFindingItems,
+    /// Dependency manifests read by one health analysis.
+    HealthManifests,
+    /// Items in one snapshot diff or policy evaluation result.
+    ArtifactItems,
+    /// Work items of one snapshot diff, policy evaluation, or export selection.
+    ArtifactWorkItems,
+    /// Nodes of one graph export; widened by `max_nodes`.
+    ExportNodes,
+    /// Edges of one graph export; widened by `max_edges`.
+    ExportEdges,
 }
 
 /// Closed reason a tool argument was rejected (Issue #565).

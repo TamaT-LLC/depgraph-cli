@@ -14,13 +14,14 @@ use crate::{
     AgentEdgesSummaryResponse, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
     AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
-    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary, AgentRuntimeOutcome,
-    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2,
-    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest,
-    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
-    PortableTerminalOutput, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentNodeSummary, AgentOperation, AgentPathOutput, AgentPathPathsResponse, AgentPathResponse,
+    AgentPathStep, AgentPathSummaryResponse, AgentPolicyEvaluationResponse, AgentProfilePlan,
+    AgentQueryRow, AgentQueryValue, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRepositorySummary, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
+    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
+    SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -148,6 +149,10 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentEdgesOutput>(),
             generator.subschema_for::<AgentEdgesSummaryResponse>(),
             generator.subschema_for::<AgentEdgeDetail>(),
+            generator.subschema_for::<SuccessEnvelope<AgentPathOutput>>(),
+            generator.subschema_for::<AgentPathOutput>(),
+            generator.subschema_for::<AgentPathSummaryResponse>(),
+            generator.subschema_for::<AgentPathPathsResponse>(),
         ];
         json_schema!({
             "$id": MCP_TOOLS_SCHEMA_ID,
@@ -160,10 +165,93 @@ impl JsonSchema for McpToolsV1Schema {
 
 #[must_use]
 pub fn mcp_tools_v1_schema() -> Schema {
-    SchemaSettings::draft2020_12()
+    let mut schema = SchemaSettings::draft2020_12()
         .for_deserialize()
         .into_generator()
-        .into_root_schema_for::<McpToolsV1Schema>()
+        .into_root_schema_for::<McpToolsV1Schema>();
+    standardize_schema(&mut schema);
+    schema
+}
+
+/// `format` values that JSON Schema 2020-12 defines. Validators such as Ajv
+/// warn about every other value (Issue #568).
+pub const STANDARD_JSON_SCHEMA_FORMATS: &[&str] = &[
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+/// Inclusive range of the Rust integer formats schemars emits.
+fn integer_format_range(format: &str) -> Option<(serde_json::Number, serde_json::Number)> {
+    let unsigned = |maximum: u64| Some((0_u64.into(), maximum.into()));
+    let signed = |minimum: i64, maximum: i64| Some((minimum.into(), maximum.into()));
+    match format {
+        "uint8" => unsigned(u8::MAX.into()),
+        "uint16" => unsigned(u16::MAX.into()),
+        "uint32" => unsigned(u32::MAX.into()),
+        "uint64" | "uint" => unsigned(u64::MAX),
+        "int8" => signed(i8::MIN.into(), i8::MAX.into()),
+        "int16" => signed(i16::MIN.into(), i16::MAX.into()),
+        "int32" => signed(i32::MIN.into(), i32::MAX.into()),
+        "int64" | "int" => signed(i64::MIN, i64::MAX),
+        _ => None,
+    }
+}
+
+/// Replaces the non-standard integer `format` values schemars derives from
+/// Rust integer types (`uint32`, `uint64`, ...) with the equivalent
+/// `minimum` / `maximum` bounds. A bound that is already present is kept,
+/// because a hand-written or `NonZero` bound is at least as tight as the type
+/// range, so the set of accepted values does not change (Issue #568).
+pub fn standardize_integer_formats(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let range = object
+                .get("format")
+                .and_then(serde_json::Value::as_str)
+                .and_then(integer_format_range);
+            if let Some((minimum, maximum)) = range {
+                object.remove("format");
+                object
+                    .entry("minimum")
+                    .or_insert(serde_json::Value::Number(minimum));
+                object
+                    .entry("maximum")
+                    .or_insert(serde_json::Value::Number(maximum));
+            }
+            for child in object.values_mut() {
+                standardize_integer_formats(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                standardize_integer_formats(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn standardize_schema(schema: &mut Schema) {
+    let mut value = serde_json::to_value(&*schema).expect("a schemars Schema is JSON");
+    standardize_integer_formats(&mut value);
+    *schema = Schema::try_from(value).expect("a standardized schema stays a schema");
 }
 
 /// Standalone schema for the additive scan outcome projection.  It is kept
@@ -175,6 +263,7 @@ pub fn agent_scan_outcome_v2_schema() -> Schema {
         .for_deserialize()
         .into_generator()
         .into_root_schema_for::<AgentScanOutcomeV2>();
+    standardize_schema(&mut schema);
     if let Some(object) = schema.as_object_mut() {
         object.insert(
             "$id".to_owned(),

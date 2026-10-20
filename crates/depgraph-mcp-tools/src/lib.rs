@@ -10,6 +10,7 @@ mod host_config;
 mod import_evidence;
 mod lifecycle;
 mod operation;
+mod path_detail;
 mod repository;
 mod response;
 mod scalar;
@@ -28,9 +29,10 @@ pub use contract::{
     Page, PageByteLimit, PageRequest, PageSize, SnapshotSelector, SuccessEnvelope,
 };
 pub use dependency_detail::{
-    AgentDependenciesOutput, AgentDependenciesSummaryResponse, AgentDependencyDetail,
-    AgentDependencyEndpoint, AgentDependencyPath, AgentDependencyPathsResponse, AgentEdgeCommon,
-    AgentEdgeSummary, DependencyProjectionRequest,
+    AgentAnalysisDegradation, AgentDependenciesOutput, AgentDependenciesSummaryResponse,
+    AgentDependencyDetail, AgentDependencyEndpoint, AgentDependencyPath,
+    AgentDependencyPathsResponse, AgentEdgeCommon, AgentEdgeSummary, DependencyProjectionRequest,
+    MAX_AGENT_ANALYSIS_DEGRADATION_REASONS, MAX_AGENT_ANALYSIS_DEGRADATIONS,
 };
 pub use dto::{
     AGENT_SCAN_OUTCOME_CONTRACT_VERSION, AgentAnalysisCoverage, AgentAnalysisProgress,
@@ -90,6 +92,7 @@ pub use operation::{
     TaskAccepted, TaskResultType, TasksNegotiation, UNBOUNDED_SCAN_DEADLINE_MS,
     UNBOUNDED_SCAN_RETAIN_UNTIL_MS,
 };
+pub use path_detail::{AgentPathOutput, AgentPathPathsResponse, AgentPathSummaryResponse};
 pub use repository::{
     AgentRepositoryIds, AgentRepositoryList, AgentRepositorySummary, MAX_AGENT_REPOSITORY_ITEMS,
 };
@@ -115,6 +118,7 @@ pub use scalar::{
 };
 pub use schema::{
     AGENT_SCAN_OUTCOME_V2_SCHEMA_ID, CanonicalJsonError, MCP_TOOLS_SCHEMA_ID,
-    agent_scan_outcome_v2_schema, canonical_json_bytes, canonical_json_sha256,
-    canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    STANDARD_JSON_SCHEMA_FORMATS, agent_scan_outcome_v2_schema, canonical_json_bytes,
+    canonical_json_sha256, canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    standardize_integer_formats,
 };

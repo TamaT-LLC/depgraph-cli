@@ -10698,3 +10698,543 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
 }
+
+#[test]
+fn issue_581_argument_and_limit_errors_name_the_argument_and_the_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut id = 1;
+    let mut error_of = |name: &str, arguments: Value| -> Value {
+        id += 1;
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = interactive_tool_call(&mut mcp, id, name, full);
+        assert_eq!(result["isError"], true, "{name} {arguments}: {result}");
+        assert_tool_text_matches_structured(&result);
+        shared.validate(&result["structuredContent"]).unwrap();
+        result["structuredContent"]["error"].clone()
+    };
+    let argument = |name: &str, reason: &str| {
+        json!({
+            "code": "INVALID_ARGUMENT",
+            "category": "input",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {"kind": "argument", "argument": name, "reason": reason}
+        })
+    };
+
+    // (1) A snapshot value that is not a name, a stable ID, or `current`.
+    for (tool, arguments, name) in [
+        (
+            "agent_nodes_list",
+            json!({"query": "a", "match_mode": "contains", "snapshot": "latest"}),
+            "snapshot",
+        ),
+        (
+            "graph_dependencies_list",
+            json!({"selector": "id:node:a", "snapshot": "snapshot:sha256:zz"}),
+            "snapshot",
+        ),
+        ("snapshot_get", json!({"snapshot": "latest"}), "snapshot"),
+        (
+            "snapshot_diff_get",
+            json!({"from": "latest", "to": "current"}),
+            "from",
+        ),
+        (
+            "policy_evaluate",
+            json!({"from": "current", "to": "latest"}),
+            "to",
+        ),
+    ] {
+        assert_eq!(
+            error_of(tool, arguments),
+            argument(name, "invalid_value"),
+            "{tool}"
+        );
+    }
+
+    // (2) edge_kinds of the dependency lists reports what agent_edges_list does.
+    let too_many = (0..65)
+        .map(|index| format!("kind{index}"))
+        .collect::<Vec<_>>();
+    for tool in [
+        "graph_dependencies_list",
+        "graph_dependents_list",
+        "agent_edges_list",
+    ] {
+        let target = if tool == "agent_edges_list" {
+            json!({"node_id": "node:a"})
+        } else {
+            json!({"selector": "id:node:a"})
+        };
+        for (edge_kinds, reason) in [
+            (json!(["Not A Kind"]), "invalid_value"),
+            (json!(too_many), "too_many_items"),
+        ] {
+            let mut arguments = target.clone();
+            arguments["edge_kinds"] = edge_kinds;
+            assert_eq!(
+                error_of(tool, arguments),
+                argument("edge_kinds", reason),
+                "{tool}"
+            );
+        }
+    }
+    let mut contradictory = json!({"selector": "id:node:a", "structural_edges": "exclude"});
+    contradictory["edge_kinds"] = json!(["contains"]);
+    assert_eq!(
+        error_of("graph_dependencies_list", contradictory),
+        argument("edge_kinds", "invalid_value")
+    );
+
+    // (3) IDs that are not Agent IDs name the argument.
+    for (tool, arguments, name) in [
+        (
+            "agent_sites_list",
+            json!({"site_id": "not an id"}),
+            "site_id",
+        ),
+        (
+            "agent_sites_list",
+            json!({"node_id": "not an id"}),
+            "node_id",
+        ),
+        (
+            "agent_sites_list",
+            json!({"node_id": "node:a", "site_id": "not an id"}),
+            "site_id",
+        ),
+        ("agent_node_get", json!({"node_id": "not an id"}), "node_id"),
+        ("graph_unresolved_list", json!({"kinds": [""]}), "kinds"),
+        (
+            "graph_unresolved_list",
+            json!({"kinds": ["bad\nkind"]}),
+            "kinds",
+        ),
+        (
+            "agent_edges_list",
+            json!({"node_id": "not an id"}),
+            "node_id",
+        ),
+        (
+            "agent_evidence_list",
+            json!({"site_id": "not an id"}),
+            "site_id",
+        ),
+    ] {
+        assert_eq!(
+            error_of(tool, arguments),
+            argument(name, "invalid_value"),
+            "{tool}"
+        );
+    }
+
+    // (4) Impact and export bounds are named with the argument that widens them.
+    let impact = error_of(
+        "graph_impact_get",
+        json!({"selector": "id:node:d", "max_nodes": 1}),
+    );
+    assert_eq!(
+        impact,
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "impact_nodes",
+                "maximum": 1,
+                "argument": "max_nodes"
+            }
+        })
+    );
+    let export = error_of("graph_export", json!({"format": "json", "max_nodes": 1}));
+    assert_eq!(export["code"], "RESOURCE_EXHAUSTED", "{export}");
+    assert_eq!(export["remediation"], "increase_limit", "{export}");
+    assert_eq!(export["details"]["limit"], "export_nodes", "{export}");
+    assert_eq!(export["details"]["maximum"], 1, "{export}");
+    assert_eq!(export["details"]["argument"], "max_nodes", "{export}");
+    assert!(
+        export["details"]["observed"].as_u64().unwrap() > 1,
+        "{export}"
+    );
+
+    // (5) graph_export resolves its selector like dependencies and impact.
+    let missing = error_of(
+        "graph_export",
+        json!({"format": "json", "selector": "src/missing.rs"}),
+    );
+    assert_eq!(
+        missing,
+        json!({
+            "code": "NOT_FOUND",
+            "category": "not_found",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {"kind": "argument", "argument": "selector", "reason": "no_matching_node"}
+        })
+    );
+    let encoded = missing.to_string();
+    assert!(!encoded.contains("missing.rs"), "{encoded}");
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_581_argument_details_do_not_need_contract_version() {
+    // contract_version is optional (Issue #570): an argument error carries
+    // the same details whether or not the caller sends it.
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    for (tool, arguments, name) in [
+        ("snapshot_get", json!({"snapshot": "latest"}), "snapshot"),
+        ("graph_unresolved_list", json!({"kinds": [""]}), "kinds"),
+        ("agent_node_get", json!({"node_id": "not an id"}), "node_id"),
+        (
+            "graph_dependencies_list",
+            json!({"selector": "id:node:a", "edge_kinds": ["not a kind"]}),
+            "edge_kinds",
+        ),
+    ] {
+        id += 1;
+        let omitted = interactive_tool_call(&mut mcp, id, tool, arguments.clone());
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        id += 1;
+        let explicit = interactive_tool_call(&mut mcp, id, tool, full);
+        assert_eq!(omitted["isError"], true, "{tool} {arguments}: {omitted}");
+        assert_eq!(
+            omitted["structuredContent"], explicit["structuredContent"],
+            "{tool} {arguments}"
+        );
+        assert_eq!(
+            omitted["structuredContent"]["error"]["details"],
+            json!({"kind": "argument", "argument": name, "reason": "invalid_value"}),
+            "{tool} {arguments}: {omitted}"
+        );
+    }
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+/// A Rust snapshot whose profile fell back to syntax-only after the HIR
+/// memory budget, or ran at full precision (Issue #579).
+fn seed_issue_579_store(path: &Path, root: &Path, degraded: bool) {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-579", root, false, Some("revision-579"))
+        .unwrap();
+    let reasons = if degraded {
+        json!(["rust-hir-memory-budget", "unresolved-sites"])
+    } else {
+        json!([])
+    };
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 1,
+        "resolved": 1,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": [],
+        "reasons": reasons
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-579",
+            "adapter": "rust",
+            "adapter_version": "0.7.0",
+            "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "profile:rust",
+        "language": "rust",
+        "features": [],
+        "environment": {},
+        "properties": if degraded {
+            json!({"rust_hir_mode": "syntax-only", "rust_hir_mode_reason": "memory-limit"})
+        } else {
+            json!({"rust_hir_mode": "full"})
+        }
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, locator) in [
+        ("file:lib", "file:src/lib.rs"),
+        ("file:model", "file:src/model.rs"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": "file",
+            "locator": locator,
+            "display_name": id,
+            "properties": {"language": "rust"}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let evidence = issue_544_evidence("src/lib.rs", 1, "source", json!({}));
+    let mut site = next("dependency_site");
+    site["site"] = json!({
+        "id": "site:use",
+        "source": "file:lib",
+        "kind": "rust_use",
+        "specifier": "crate::model::Thing",
+        "resolution_status": "resolved",
+        "target_ids": ["file:model"],
+        "profile_id": "profile:rust",
+        "condition": {"op": "all", "conditions": []},
+        "precision": "exact",
+        "evidence": [evidence.clone()]
+    });
+    store.ingest_event(&site).unwrap();
+    let mut edge = next("edge_upsert");
+    edge["edge"] = json!({
+        "id": "edge:use",
+        "site_id": "site:use",
+        "source": "file:lib",
+        "target": "file:model",
+        "kind": "imports",
+        "phase": "source",
+        "environment": "host",
+        "profile_id": "profile:rust",
+        "resolution_status": "resolved",
+        "precision": "exact",
+        "condition": {"op": "all", "conditions": []},
+        "generated": false,
+        "evidence": [evidence]
+    });
+    store.ingest_event(&edge).unwrap();
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("profile:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-579", "completed", None, true)
+        .unwrap();
+}
+
+#[test]
+fn issue_579_dependency_lists_report_degraded_profiles_only_when_present() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let expected = json!([{
+        "profile_id": "profile:rust",
+        "language": "rust",
+        "analysis_mode": "syntax-only",
+        "reasons": ["rust-hir-memory-budget", "rust-hir-syntax-only-fallback"]
+    }]);
+    for degraded in [true, false] {
+        let store_path = temporary.path().join(format!("store-{degraded}.sqlite"));
+        seed_issue_579_store(&store_path, &root, degraded);
+        let mut mcp = InteractiveMcp::start(&root, &store_path);
+        initialize_interactive_mcp(&mut mcp, 1);
+        let listed = mcp.request(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let mut id = 2;
+        for (tool, selector) in [
+            ("graph_dependencies_list", "id:file:lib"),
+            ("graph_dependents_list", "id:file:model"),
+        ] {
+            let advertised = tools.iter().find(|entry| entry["name"] == tool).unwrap();
+            assert!(
+                advertised["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("analysis_degradations"),
+                "{tool}"
+            );
+            let output = jsonschema::draft202012::new(&advertised["outputSchema"]).unwrap();
+            for detail in ["full", "summary", "paths"] {
+                id += 1;
+                let result = interactive_tool_call(
+                    &mut mcp,
+                    id,
+                    tool,
+                    json!({
+                        "contract_version": "depgraph-mcp-tools-v1",
+                        "selector": selector,
+                        "detail": detail
+                    }),
+                );
+                assert_eq!(result["isError"], false, "{tool} {detail}: {result}");
+                output.validate(&result["structuredContent"]).unwrap();
+                if detail == "full" {
+                    shared.validate(&result["structuredContent"]).unwrap();
+                }
+                let body = &result["structuredContent"]["result"];
+                if degraded {
+                    assert_eq!(body["analysis_degradations"], expected, "{tool} {detail}");
+                } else {
+                    assert!(
+                        body.get("analysis_degradations").is_none(),
+                        "{tool} {detail}: {body}"
+                    );
+                }
+            }
+        }
+        mcp.finish();
+    }
+}
+
+#[test]
+fn issue_566_path_detail_shrinks_the_path_and_mod_declarations_name_the_module() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let path_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "graph_path_get")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        path_tool["inputSchema"]["properties"]["detail"]["enum"],
+        json!(["paths", "summary", "full"])
+    );
+    let output = jsonschema::draft202012::new(&path_tool["outputSchema"]).unwrap();
+    let mut id = 2;
+    let mut path = |detail: Option<&str>| {
+        id += 1;
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "from": "id:node:a",
+            "to": "id:node:d"
+        });
+        if let Some(detail) = detail {
+            arguments["detail"] = json!(detail);
+        }
+        let result = interactive_tool_call(&mut mcp, id, "graph_path_get", arguments);
+        assert_eq!(result["isError"], false, "{detail:?}: {result}");
+        output.validate(&result["structuredContent"]).unwrap();
+        shared.validate(&result["structuredContent"]).unwrap();
+        assert_tool_text_matches_structured(&result);
+        result["structuredContent"].clone()
+    };
+
+    // full is the default and keeps the legacy bytes.
+    let legacy = path(None);
+    assert_eq!(path(Some("full")), legacy);
+    let full = &legacy["result"];
+    assert!(full.get("detail").is_none());
+    let steps = full["steps"].as_array().unwrap();
+    assert!(!steps.is_empty());
+
+    let summary = path(Some("summary"));
+    let summary = &summary["result"];
+    assert_eq!(summary["detail"], "summary");
+    assert_eq!(summary["from"], full["from"]);
+    assert_eq!(summary["to"], full["to"]);
+    assert_eq!(summary["path_found"], true);
+    assert_eq!(summary["common"]["phase"], "semantic", "{summary}");
+    let summary_steps = summary["steps"].as_array().unwrap();
+    assert_eq!(summary_steps.len(), steps.len());
+    for (light, heavy) in summary_steps.iter().zip(steps) {
+        assert_eq!(light["id"], heavy["edge"]["id"]);
+        assert_eq!(light["kind"], heavy["edge"]["kind"]);
+        assert_eq!(light["evidence_count"], 1);
+        assert!(light.get("evidence").is_none(), "{light}");
+    }
+
+    let paths = path(Some("paths"));
+    let paths = &paths["result"];
+    assert_eq!(paths["detail"], "paths");
+    let path_steps = paths["steps"].as_array().unwrap();
+    assert_eq!(path_steps.len(), steps.len());
+    assert_eq!(path_steps[0]["source_path"], "src/a.rs", "{paths}");
+    assert_eq!(
+        path_steps.last().unwrap()["target_path"],
+        "src/d.rs",
+        "{paths}"
+    );
+    assert!(
+        serde_json::to_string(paths).unwrap().len() < serde_json::to_string(full).unwrap().len()
+    );
+    mcp.finish();
+
+    // `mod model;` evidence names the declared module.
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_566_store(&store_path, &root);
+    let site = call_issue_300_tool(
+        &root,
+        &store_path,
+        "agent_sites_list",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "site_id": "site:mod"}),
+    );
+    assert_eq!(site["isError"], false, "{site}");
+    assert_eq!(
+        site["structuredContent"]["result"]["items"][0]["evidence"][0]["import"],
+        json!({
+            "specifier": "src/model.rs",
+            "binding_kind": "module_declaration"
+        })
+    );
+}

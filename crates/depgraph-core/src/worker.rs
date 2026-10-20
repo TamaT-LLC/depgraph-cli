@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
+    COMPACT_EVIDENCE_ENCODING_V1, COMPACT_EVIDENCE_REQUEST_ENV, CompactEvidenceDecoder,
     CompletenessLevel, EvidenceKind, MAX_EVENT_LINE_BYTES, Phase, Precision, ProtocolError,
     ProtocolEvent, ProtocolValidator, ResolutionStatus, ValidatedDelta, WorkerDeltaRequest,
     validate_delta_ndjson, validate_semantic_contract,
@@ -147,6 +148,16 @@ impl AdapterKind {
             Self::Web => "DEPGRAPH_WEB_WORKER",
         }
     }
+}
+
+/// Whether the core asks this adapter's worker for the `compact-evidence-v1`
+/// encoding of a full scan stream, and so decodes that encoding (#578).
+///
+/// The request travels in the environment: a worker that does not know the
+/// encoding ignores it and writes the full encoding, which the decoder passes
+/// through unchanged. Only the Rust worker implements the encoding.
+fn requests_compact_evidence(adapter: &str) -> bool {
+    adapter == AdapterKind::Rust.name()
 }
 
 pub(crate) fn worker_capabilities(handshake: &str) -> Vec<String> {
@@ -1924,6 +1935,9 @@ where
             config.worker_timeout_seconds.to_string(),
         );
     }
+    if delta_request.is_none() && requests_compact_evidence(spec.adapter.name()) {
+        command.env(COMPACT_EVIDENCE_REQUEST_ENV, COMPACT_EVIDENCE_ENCODING_V1);
+    }
     if spec.adapter == AdapterKind::Rust
         && std::env::var("DEPGRAPH_SCAN_PROFILE").as_deref() == Ok("1")
     {
@@ -2076,6 +2090,7 @@ where
     let validation_scan_id = scan_id.to_owned();
     let delta_request = delta_request.cloned();
     let max_line_bytes = config.max_protocol_line_bytes;
+    let max_protocol_bytes = config.max_protocol_bytes;
     let expected_version = spec.expected_version.clone();
     let release_attested = spec.release_attested;
     let adapter = spec.adapter;
@@ -2096,7 +2111,10 @@ where
                     parsed.security_violation,
                 )
             } else {
-                let parsed = parse_events_preserving_prefix(
+                // Restoring the compact evidence encoding may at most double
+                // the bytes read, so a worker cannot amplify its bounded
+                // output into unbounded core memory (#578).
+                let parsed = parse_events_with_expansion_limit(
                     &stdout_bytes,
                     &validation_scan_id,
                     adapter.name(),
@@ -2104,6 +2122,7 @@ where
                     max_line_bytes,
                     expected_version.as_deref(),
                     Some(release_attested),
+                    max_protocol_bytes,
                 );
                 (
                     parsed.events,
@@ -2758,7 +2777,9 @@ pub(crate) fn replay_analysis_checkpoint(
             bail!("analysis checkpoint exceeds the worker output budget");
         }
     }
-    let parsed = parse_events_preserving_prefix(
+    // The live worker path bounds compact evidence restoration by the
+    // configured protocol budget; a replay must use the same bound (#578).
+    let parsed = parse_events_with_expansion_limit(
         &bytes,
         scan_id,
         spec.adapter.name(),
@@ -2766,6 +2787,7 @@ pub(crate) fn replay_analysis_checkpoint(
         config.max_protocol_line_bytes,
         spec.expected_version.as_deref(),
         Some(spec.release_attested),
+        config.max_protocol_bytes,
     );
     if let Some(error) = parsed.error {
         bail!("analysis checkpoint validation failed: {error}");
@@ -2899,7 +2921,34 @@ fn parse_events_preserving_prefix(
     expected_adapter_version: Option<&str>,
     release_attested: Option<bool>,
 ) -> ParsedProtocol {
+    parse_events_with_expansion_limit(
+        stdout,
+        expected_scan_id,
+        expected_adapter,
+        root,
+        configured_line_limit,
+        expected_adapter_version,
+        release_attested,
+        ScanConfig::default().max_protocol_bytes,
+    )
+}
+
+/// Parses like [`parse_events_preserving_prefix`]; restoring the compact
+/// evidence encoding may add at most `expansion_limit` bytes to the stream.
+#[allow(clippy::too_many_arguments)]
+fn parse_events_with_expansion_limit(
+    stdout: &[u8],
+    expected_scan_id: &str,
+    expected_adapter: &str,
+    root: &Path,
+    configured_line_limit: usize,
+    expected_adapter_version: Option<&str>,
+    release_attested: Option<bool>,
+    expansion_limit: usize,
+) -> ParsedProtocol {
     let mut validator = ProtocolValidator::for_safe_scan();
+    let mut compact_evidence = requests_compact_evidence(expected_adapter)
+        .then(|| CompactEvidenceDecoder::with_expansion_limit(expansion_limit));
     let line_limit = configured_line_limit.min(MAX_EVENT_LINE_BYTES);
     let mut parse_error = None;
     let mut failure_kind = None;
@@ -2933,7 +2982,7 @@ fn parse_events_preserving_prefix(
             failure_kind = Some(WorkerFailureKind::OutputLimit);
             break;
         }
-        let event: ProtocolEvent = match serde_json::from_slice(line) {
+        let mut event: ProtocolEvent = match serde_json::from_slice(line) {
             Ok(event) => event,
             Err(error) => {
                 parse_error = Some(format!(
@@ -2944,6 +2993,23 @@ fn parse_events_preserving_prefix(
                 break;
             }
         };
+        // Expand the compact evidence encoding the core asked the Rust worker
+        // for before any check reads the event, so every later check and the
+        // store see the ordinary protocol 1.0 event (#578).
+        if let Some(decoder) = compact_evidence.as_mut()
+            && let Err(error) =
+                decoder.decode(&mut event, |site_id| validator.dependency_site(site_id))
+        {
+            failure_kind = Some(match error {
+                ProtocolError::ExpansionLimit { .. } => WorkerFailureKind::OutputLimit,
+                _ => WorkerFailureKind::MalformedProtocol,
+            });
+            parse_error = Some(format!(
+                "protocol validation failed at line {}: {error}",
+                line_index + 1
+            ));
+            break;
+        }
         let current_web_semantic_node_id = if enforce_web_definition_graph
             && let ProtocolEvent::NodeUpsert(upsert) = &event
             && matches!(upsert.node.kind.as_str(), "symbol" | "type")

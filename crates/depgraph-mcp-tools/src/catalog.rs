@@ -16,12 +16,12 @@ use crate::{
     AgentDependenciesOutput, AgentDoctor, AgentEdgeDetail, AgentEdgesOutput, AgentEvidence,
     AgentGraphExportResponse, AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage,
     AgentHealthHotspots, AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
-    AgentPathResponse, AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow,
-    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRuntimeValidationResponse, AgentSite,
-    AgentSnapshotDiffResponse, AgentToken, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey,
-    LogicalRepositoryId, MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput,
-    RepositoryRelativePath, SnapshotId, SnapshotName, SuccessEnvelope,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathOutput,
+    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome,
+    AgentRepositoryList, AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse,
+    AgentToken, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
+    MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
+    SnapshotId, SnapshotName, SuccessEnvelope,
 };
 
 #[allow(dead_code)]
@@ -237,8 +237,8 @@ impl ToolCatalog {
                 Ok(ToolDefinition {
                     name: spec.name,
                     description: spec.description,
-                    input_schema: input_schema(spec),
-                    output_schema: output_schema(spec),
+                    input_schema: standardized(input_schema(spec)),
+                    output_schema: standardized(output_schema(spec)),
                     cli_actions: spec.cli_actions,
                     required_capabilities: spec.required_capabilities,
                     authorization: spec.authorization,
@@ -453,7 +453,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependencies_list",
-        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
+        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision.",
         [
             "selector",
             "snapshot",
@@ -476,7 +476,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependents_list",
-        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges.",
+        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision.",
         [
             "selector",
             "snapshot",
@@ -499,7 +499,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_path_get",
-        "Explain a bounded dependency path between two selectors.",
+        "Explain a bounded dependency path between two selectors. Use detail to shrink the response: paths returns each step as its source and target repository paths (the node ID when a node has no path) with the edge kind, summary returns each step edge without evidence and states shared edge fields once in common, full (default) returns every step with both nodes and the edge evidence in the previous shape.",
         [
             "from",
             "to",
@@ -508,7 +508,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "profiles",
             "sessions",
             "environments",
-            "max_traversal"
+            "max_traversal",
+            "detail"
         ],
         [CliAction::Why],
         READ,
@@ -911,7 +912,7 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
             return exact_success_output_schema::<AgentDependenciesOutput>(spec.name);
         }
         "graph_path_get" => {
-            return exact_success_output_schema::<AgentPathResponse>(spec.name);
+            return exact_success_output_schema::<AgentPathOutput>(spec.name);
         }
         "graph_impact_get" => {
             return exact_success_output_schema::<AgentImpactResponse>(spec.name);
@@ -1194,6 +1195,12 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "default": AgentEdgeDetail::Full.as_str(),
             "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; common applies to that page only. To read evidence bodies, repeat the request with detail=full (the edge evidence is not listed by agent_evidence_list, which returns site evidence), or resolve an edge's site_id with agent_sites_list. A cursor is bound to its detail."
         }),
+        "detail" if tool_name == "graph_path_get" => json!({
+            "type": "string",
+            "enum": ["paths", "summary", "full"],
+            "default": "full",
+            "description": "Output granularity. full (default) is byte-identical to the response without detail: from, to, and steps with both nodes and the edge evidence. summary returns detail, common and steps as id, source_id, target_id, kind, site_id and evidence_count; phase, resolution_status, precision, profile_id and condition are stated once in common when every step shares the value. paths returns detail and steps as source and target repository paths (the node ID when a node has no path) with the edge kind."
+        }),
         "detail" => json!({
             "type": "string",
             "enum": ["paths", "summary", "full"],
@@ -1244,10 +1251,36 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             json!({"type": "integer", "minimum": 1})
         }
         "max_nodes" if matches!(tool_name, "graph_export" | "export_file") => {
-            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_NODES})
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_GRAPH_EXPORT_NODES,
+                "description": "Largest node count of the exported graph. A larger selection returns RESOURCE_EXHAUSTED with error.details limit export_nodes, the selected count as observed, and argument max_nodes."
+            })
         }
         "max_edges" if matches!(tool_name, "graph_export" | "export_file") => {
-            json!({"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_EXPORT_EDGES})
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_GRAPH_EXPORT_EDGES,
+                "description": "Largest edge count of the exported graph. A larger selection returns RESOURCE_EXHAUSTED with error.details limit export_edges, the selected count as observed, and argument max_edges."
+            })
+        }
+        "max_nodes" if tool_name == "graph_impact_get" => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Unique nodes the impact traversal may keep (default 10000). A traversal that reaches it returns RESOURCE_EXHAUSTED with error.details limit impact_nodes and argument max_nodes."
+            })
+        }
+        "max_edges" if tool_name == "graph_impact_get" => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Unique edges the impact traversal may keep (default 50000). A traversal that reaches it returns RESOURCE_EXHAUSTED with error.details limit impact_edges and argument max_edges."
+            })
         }
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})
@@ -1385,6 +1418,13 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "health_audit_get" => &["changed"],
         _ => &[],
     }
+}
+
+/// Advertised tool schemas use only standard `format` values (Issue #568).
+fn standardized(schema: Map<String, Value>) -> Map<String, Value> {
+    let mut value = Value::Object(schema);
+    crate::standardize_integer_formats(&mut value);
+    json_object(value)
 }
 
 fn json_object(value: Value) -> Map<String, Value> {

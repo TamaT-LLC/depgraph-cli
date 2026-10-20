@@ -10,6 +10,12 @@ use depgraph_store::{
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::DepgraphResourceLimit;
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[path = "service_health_collection.rs"]
 mod collection;
 use collection::{CollectedFindings, FindingCollector, FindingSelection};
@@ -50,7 +56,7 @@ use crate::{
         MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
         MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING,
         MAX_HEALTH_SUPPRESSIONS_PER_FINDING, MAX_HEALTH_TOTAL_MANIFEST_BYTES,
-        MAX_HOTSPOT_PATH_BYTES,
+        MAX_HOTSPOT_PATH_BYTES, MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS, MAX_HOTSPOT_SUBJECTS,
     },
 };
 
@@ -913,7 +919,9 @@ impl DepgraphService {
             let mappings =
                 map_changed_set_cancellable(snapshot, &scope.changed_set, &mut cancelled).map_err(
                     |error| {
-                        if is_resource_exhausted(&error) {
+                        if let Some((limit, maximum)) = crate::impact::resource_limit(&error) {
+                            DepgraphServiceError::resource_limit(limit, maximum, None)
+                        } else if is_resource_exhausted(&error) {
                             DepgraphServiceError::ResourceExhausted
                         } else if cancellation.is_cancelled() {
                             DepgraphServiceError::Cancelled
@@ -1010,22 +1018,32 @@ impl DepgraphService {
             &churn,
             &runtime,
             availability,
-            MAX_HEALTH_FINDINGS,
-            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            MAX_HOTSPOT_SUBJECTS,
+            MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS,
             || cancellation.is_cancelled(),
         )
         .map_err(|error| match error {
             HotspotAnalysisError::InvalidInput => DepgraphServiceError::InvalidInput,
             HotspotAnalysisError::Cancelled => DepgraphServiceError::Cancelled,
-            HotspotAnalysisError::ResourceExhausted => DepgraphServiceError::ResourceExhausted,
+            HotspotAnalysisError::ResourceExhausted => DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::PreprocessingWorkItems,
+                saturating_u64(MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS),
+                None,
+            ),
+            HotspotAnalysisError::SubjectLimit => DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::HealthFindings,
+                saturating_u64(MAX_HOTSPOT_SUBJECTS),
+                None,
+            ),
         })?;
         // Filter only after the complete ranking is scored so normalized
         // layers, IDs, and fingerprints do not depend on the filter.
-        let findings = bound_findings(
+        let findings = bound_findings_to(
             findings
                 .into_iter()
                 .filter(|finding| request.keeps(finding))
                 .collect(),
+            MAX_HOTSPOT_SUBJECTS,
         )?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
@@ -1148,7 +1166,11 @@ fn evaluate_audit_boundary_ids_with_limit(
     )
     .map_err(|source| {
         if is_policy_evaluation_resource_exhausted(&source) {
-            DepgraphServiceError::ResourceExhausted
+            DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::PreprocessingWorkItems,
+                saturating_u64(maximum_work),
+                None,
+            )
         } else if is_policy_evaluation_cancelled(&source) || cancellation.is_cancelled() {
             DepgraphServiceError::Cancelled
         } else {
@@ -1276,7 +1298,18 @@ fn collect_ranged(
 fn map_health_analysis_error(error: HealthAnalysisError) -> DepgraphServiceError {
     match error {
         HealthAnalysisError::Cancelled => DepgraphServiceError::Cancelled,
-        HealthAnalysisError::ResourceExhausted => DepgraphServiceError::ResourceExhausted,
+        // Every health phase and range is bounded by the shared preprocessing
+        // budget, and every response by the finding limit (Issue #581).
+        HealthAnalysisError::ResourceExhausted => DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::PreprocessingWorkItems,
+            saturating_u64(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS),
+            None,
+        ),
+        HealthAnalysisError::FindingLimit => DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::HealthFindings,
+            saturating_u64(MAX_HEALTH_FINDINGS),
+            None,
+        ),
         HealthAnalysisError::Integrity => DepgraphServiceError::Integrity,
     }
 }
@@ -1303,19 +1336,43 @@ fn manifests_digest(manifests: &[crate::health::ManifestIdentity]) -> Option<Str
     ))
 }
 
-fn bound_findings(mut findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
-    if findings.len() > MAX_HEALTH_FINDINGS {
-        return Err(DepgraphServiceError::ResourceExhausted);
+fn bound_findings(findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
+    bound_findings_to(findings, MAX_HEALTH_FINDINGS)
+}
+
+fn bound_findings_to(
+    mut findings: Vec<HealthFinding>,
+    maximum: usize,
+) -> DepgraphServiceResult<Vec<HealthFinding>> {
+    if findings.len() > maximum {
+        return Err(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::HealthFindings,
+            saturating_u64(maximum),
+            Some(saturating_u64(findings.len())),
+        ));
     }
     for finding in &mut findings {
         if compact_blockers(&mut finding.blockers)? {
             finding.fingerprint = finding_fingerprint(finding);
         }
-        if finding.evidence.len() > MAX_HEALTH_EVIDENCE_PER_FINDING
-            || finding.remediations.len() > MAX_HEALTH_REMEDIATIONS_PER_FINDING
-            || finding.suppressions.len() > MAX_HEALTH_SUPPRESSIONS_PER_FINDING
-        {
-            return Err(DepgraphServiceError::ResourceExhausted);
+        for (count, maximum) in [
+            (finding.evidence.len(), MAX_HEALTH_EVIDENCE_PER_FINDING),
+            (
+                finding.remediations.len(),
+                MAX_HEALTH_REMEDIATIONS_PER_FINDING,
+            ),
+            (
+                finding.suppressions.len(),
+                MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
+            ),
+        ] {
+            if count > maximum {
+                return Err(DepgraphServiceError::resource_limit(
+                    DepgraphResourceLimit::HealthFindingItems,
+                    saturating_u64(maximum),
+                    Some(saturating_u64(count)),
+                ));
+            }
         }
     }
     Ok(findings)
@@ -1345,7 +1402,11 @@ fn compact_blockers(blockers: &mut Vec<FindingBlocker>) -> DepgraphServiceResult
             .push(blocker.detail);
     }
     if by_kind.len() > MAX_HEALTH_BLOCKERS_PER_FINDING {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        return Err(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::HealthFindingItems,
+            saturating_u64(MAX_HEALTH_BLOCKERS_PER_FINDING),
+            Some(saturating_u64(by_kind.len())),
+        ));
     }
 
     for (kind, details) in by_kind {
@@ -1385,7 +1446,11 @@ fn load_manifests(
         }
     }
     if paths.len() > MAX_HEALTH_MANIFESTS {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        return Err(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::HealthManifests,
+            saturating_u64(MAX_HEALTH_MANIFESTS),
+            Some(saturating_u64(paths.len())),
+        ));
     }
     let mut snapshot_hashes_by_path = BTreeMap::<String, BTreeSet<String>>::new();
     let mut snapshot_hash_work = 0_usize;
@@ -1423,7 +1488,11 @@ fn load_manifests(
                 total_bytes = total_bytes
                     .checked_add(bytes.len())
                     .filter(|total| *total <= MAX_HEALTH_TOTAL_MANIFEST_BYTES)
-                    .ok_or(DepgraphServiceError::ResourceExhausted)?;
+                    .ok_or(DepgraphServiceError::resource_limit(
+                        DepgraphResourceLimit::InputBytes,
+                        saturating_u64(MAX_HEALTH_TOTAL_MANIFEST_BYTES),
+                        None,
+                    ))?;
                 let declared = parse_declared_dependencies(&path, &bytes);
                 let drifted =
                     snapshot_hashes_by_path
@@ -1480,7 +1549,11 @@ fn health_service_step(
         return Err(DepgraphServiceError::Cancelled);
     }
     if *used >= maximum {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        return Err(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::PreprocessingWorkItems,
+            saturating_u64(maximum),
+            None,
+        ));
     }
     *used += 1;
     Ok(())
@@ -1891,6 +1964,30 @@ mod tests {
     }
 
     #[test]
+    fn issue_581_health_analysis_errors_name_the_work_budget_and_finding_limit() {
+        assert!(matches!(
+            map_health_analysis_error(HealthAnalysisError::ResourceExhausted),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum,
+                observed: None,
+            } if maximum == MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS as u64
+        ));
+        assert!(matches!(
+            map_health_analysis_error(HealthAnalysisError::FindingLimit),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::HealthFindings,
+                maximum,
+                observed: None,
+            } if maximum == MAX_HEALTH_FINDINGS as u64
+        ));
+        assert!(matches!(
+            map_health_analysis_error(HealthAnalysisError::Cancelled),
+            DepgraphServiceError::Cancelled
+        ));
+    }
+
+    #[test]
     fn issue_439_health_boundary_maps_policy_budget_and_cancellation() {
         let policy = bounded_runtime_policy();
         let before = pinned_snapshot('a');
@@ -1900,7 +1997,11 @@ mod tests {
             evaluate_audit_boundary_ids_with_limit(&policy, Some(&before), &after, &live, 0);
         assert!(matches!(
             exhausted,
-            Err(DepgraphServiceError::ResourceExhausted)
+            Err(DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum: 0,
+                observed: None,
+            })
         ));
 
         let cancelled = CancellationToken::new();

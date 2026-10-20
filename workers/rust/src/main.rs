@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use depgraph_rust_worker::{
-    ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, ScanPhaseMetric, emit_events, scan_with_options,
+    ADAPTER_VERSION, EvidenceEncoding, HirMode, RUST_ANALYZER_CRATE_VERSION,
+    RUST_ANALYZER_REVISION, RUST_ANALYZER_SALSA_VERSION, ScanPhaseMetric,
+    scan_with_options_for_emit, write_events_with_encoding,
 };
 use std::{
     io::{BufWriter, Write},
@@ -60,28 +61,34 @@ fn run() -> Result<()> {
         anyhow::bail!("--scan-id requires a non-empty identifier");
     }
 
-    let mut result = scan_with_options(
+    let mut result = scan_with_options_for_emit(
         &args.root,
         args.inventory_file.as_deref(),
         args.hir_mode.into(),
     )?;
     let performance = std::mem::take(&mut result.performance);
+    let encoding = requested_evidence_encoding();
     let stdout = std::io::stdout();
     let mut writer = CountingWriter::new(BufWriter::new(stdout.lock()));
     // Events are built and written one at a time from the owned scan result,
     // so the result and a second copy of it as events are never both resident.
     #[cfg(debug_assertions)]
     let mut validator = depgraph_protocol::ProtocolValidator::new();
+    #[cfg(debug_assertions)]
+    let mut decoder = depgraph_protocol::CompactEvidenceDecoder::new();
     let protocol_write_started = Instant::now();
-    let protocol_event_count = emit_events(&args.scan_id, result, |event| {
-        #[cfg(debug_assertions)]
-        validator
-            .push(event.clone())
+    let protocol_event_count =
+        write_events_with_encoding(&args.scan_id, result, encoding, |event| {
+            #[cfg(debug_assertions)]
+            match encoding {
+                EvidenceEncoding::Full => validator.push(event.clone()),
+                EvidenceEncoding::Compact => validator.push_compact(&mut decoder, event.clone()),
+            }
             .context("Rust worker generated an invalid protocol event")?;
-        serde_json::to_writer(&mut writer, &event).context("serialize protocol event")?;
-        writer.write_all(b"\n").context("write protocol event")?;
-        Ok(())
-    })?;
+            serde_json::to_writer(&mut writer, event).context("serialize protocol event")?;
+            writer.write_all(b"\n").context("write protocol event")?;
+            Ok(())
+        })?;
     #[cfg(debug_assertions)]
     validator
         .finish()
@@ -115,6 +122,17 @@ fn emit_performance(
     eprintln!(
         "depgraph-progress phase=rust_protocol_write status=completed duration_ms={protocol_write_ms} items={protocol_event_count} bytes={protocol_bytes}"
     );
+}
+
+/// The core asks for the `compact-evidence-v1` encoding through the
+/// environment, which an older worker ignores and answers with the full
+/// encoding that the core still accepts (#578). Any other value keeps the
+/// full encoding.
+fn requested_evidence_encoding() -> EvidenceEncoding {
+    match std::env::var(depgraph_protocol::COMPACT_EVIDENCE_REQUEST_ENV).as_deref() {
+        Ok(depgraph_protocol::COMPACT_EVIDENCE_ENCODING_V1) => EvidenceEncoding::Compact,
+        _ => EvidenceEncoding::Full,
+    }
 }
 
 fn scan_profile_enabled() -> bool {
