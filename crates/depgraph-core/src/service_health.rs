@@ -56,7 +56,7 @@ use crate::{
         MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
         MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING,
         MAX_HEALTH_SUPPRESSIONS_PER_FINDING, MAX_HEALTH_TOTAL_MANIFEST_BYTES,
-        MAX_HOTSPOT_PATH_BYTES,
+        MAX_HOTSPOT_PATH_BYTES, MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS, MAX_HOTSPOT_SUBJECTS,
     },
 };
 
@@ -1018,8 +1018,8 @@ impl DepgraphService {
             &churn,
             &runtime,
             availability,
-            MAX_HEALTH_FINDINGS,
-            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+            MAX_HOTSPOT_SUBJECTS,
+            MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS,
             || cancellation.is_cancelled(),
         )
         .map_err(|error| match error {
@@ -1027,22 +1027,23 @@ impl DepgraphService {
             HotspotAnalysisError::Cancelled => DepgraphServiceError::Cancelled,
             HotspotAnalysisError::ResourceExhausted => DepgraphServiceError::resource_limit(
                 DepgraphResourceLimit::PreprocessingWorkItems,
-                saturating_u64(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS),
+                saturating_u64(MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS),
                 None,
             ),
             HotspotAnalysisError::SubjectLimit => DepgraphServiceError::resource_limit(
                 DepgraphResourceLimit::HealthFindings,
-                saturating_u64(MAX_HEALTH_FINDINGS),
+                saturating_u64(MAX_HOTSPOT_SUBJECTS),
                 None,
             ),
         })?;
         // Filter only after the complete ranking is scored so normalized
         // layers, IDs, and fingerprints do not depend on the filter.
-        let findings = bound_findings(
+        let findings = bound_findings_to(
             findings
                 .into_iter()
                 .filter(|finding| request.keeps(finding))
                 .collect(),
+            MAX_HOTSPOT_SUBJECTS,
         )?;
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
@@ -1335,11 +1336,18 @@ fn manifests_digest(manifests: &[crate::health::ManifestIdentity]) -> Option<Str
     ))
 }
 
-fn bound_findings(mut findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
-    if findings.len() > MAX_HEALTH_FINDINGS {
+fn bound_findings(findings: Vec<HealthFinding>) -> DepgraphServiceResult<Vec<HealthFinding>> {
+    bound_findings_to(findings, MAX_HEALTH_FINDINGS)
+}
+
+fn bound_findings_to(
+    mut findings: Vec<HealthFinding>,
+    maximum: usize,
+) -> DepgraphServiceResult<Vec<HealthFinding>> {
+    if findings.len() > maximum {
         return Err(DepgraphServiceError::resource_limit(
             DepgraphResourceLimit::HealthFindings,
-            saturating_u64(MAX_HEALTH_FINDINGS),
+            saturating_u64(maximum),
             Some(saturating_u64(findings.len())),
         ));
     }

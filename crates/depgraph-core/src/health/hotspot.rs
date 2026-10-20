@@ -397,8 +397,47 @@ fn node_path(node: &NodeRecord) -> Option<String> {
         .map(|path| path.as_str().to_owned())
 }
 
+/// 64-bit words in one [`LaneMask`].
+const LANE_MASK_WORDS: usize = 4;
+
 /// Subjects whose reverse reachability is computed together, one bit each.
-const REVERSE_IMPACT_LANES: usize = u64::BITS as usize;
+///
+/// 256 rather than 64 lanes roughly halves the reverse-impact work on the
+/// Rust HIR snapshot of #590, whose parameters, locals, and closures share
+/// most of their dependents with the enclosing function.
+const REVERSE_IMPACT_LANES: usize = LANE_MASK_WORDS * u64::BITS as usize;
+
+/// One bit per subject lane of a reverse-impact batch.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct LaneMask([u64; LANE_MASK_WORDS]);
+
+impl LaneMask {
+    fn is_empty(self) -> bool {
+        self.0.iter().all(|word| *word == 0)
+    }
+
+    fn set(&mut self, lane: usize) {
+        self.0[lane / u64::BITS as usize] |= 1_u64 << (lane % u64::BITS as usize);
+    }
+
+    fn union(self, other: Self) -> Self {
+        let mut words = self.0;
+        for (word, other) in words.iter_mut().zip(other.0) {
+            *word |= other;
+        }
+        Self(words)
+    }
+
+    /// Call `visit` with every lane whose bit is set.
+    fn for_each_lane(self, mut visit: impl FnMut(usize)) {
+        for (index, mut word) in self.0.into_iter().enumerate() {
+            while word != 0 {
+                visit(index * u64::BITS as usize + word.trailing_zeros() as usize);
+                word &= word - 1;
+            }
+        }
+    }
+}
 
 /// Interned view of the snapshot edges used by the fan and reverse-impact
 /// layers.
@@ -479,10 +518,10 @@ impl HotspotGraph {
     /// Count, for every subject, the distinct vertices that transitively
     /// depend on it (the subject itself excluded).
     ///
-    /// Instead of one breadth-first search per subject, up to 64 subjects
-    /// share one pass: each vertex carries a bit mask of the batch subjects
-    /// it can reach through incoming edges, and a work list propagates a mask
-    /// to the dependents until no mask grows. A vertex shared by many
+    /// Instead of one breadth-first search per subject, up to
+    /// [`REVERSE_IMPACT_LANES`] subjects share one pass: each vertex carries a
+    /// bit mask of the batch subjects it can reach through incoming edges, and
+    /// a work list propagates a mask to the dependents until no mask grows. A vertex shared by many
     /// subjects of a batch is expanded once for all of them, so the work is
     /// proportional to the union of the batch's reverse closures rather than
     /// their sum. The counts equal the per-subject search exactly; batch
@@ -503,7 +542,7 @@ impl HotspotGraph {
                 .then_with(|| subjects[*left].id.cmp(&subjects[*right].id))
         });
         let mut sizes = vec![0_u64; subjects.len()];
-        let mut masks = vec![0_u64; self.vertex_count()];
+        let mut masks = vec![LaneMask::default(); self.vertex_count()];
         let mut queued = vec![false; self.vertex_count()];
         let mut touched = Vec::new();
         let mut queue = VecDeque::new();
@@ -512,10 +551,10 @@ impl HotspotGraph {
             for (lane, &position) in batch.iter().enumerate() {
                 work.step(is_cancelled)?;
                 let vertex = self.subject_vertices[position];
-                if masks[vertex] == 0 {
+                if masks[vertex].is_empty() {
                     touched.push(vertex);
                 }
-                masks[vertex] |= 1_u64 << lane;
+                masks[vertex].set(lane);
                 if !queued[vertex] {
                     queued[vertex] = true;
                     queue.push_back(vertex);
@@ -527,11 +566,11 @@ impl HotspotGraph {
                 let mask = masks[current];
                 for &dependent in self.dependents_of(current) {
                     work.step(is_cancelled)?;
-                    let grown = masks[dependent] | mask;
+                    let grown = masks[dependent].union(mask);
                     if grown == masks[dependent] {
                         continue;
                     }
-                    if masks[dependent] == 0 {
+                    if masks[dependent].is_empty() {
                         touched.push(dependent);
                     }
                     masks[dependent] = grown;
@@ -544,12 +583,7 @@ impl HotspotGraph {
             reached.fill(0);
             for vertex in touched.drain(..) {
                 work.step(is_cancelled)?;
-                let mut lanes = masks[vertex];
-                masks[vertex] = 0;
-                while lanes != 0 {
-                    reached[lanes.trailing_zeros() as usize] += 1;
-                    lanes &= lanes - 1;
-                }
+                std::mem::take(&mut masks[vertex]).for_each_lane(|lane| reached[lane] += 1);
             }
             for (lane, &position) in batch.iter().enumerate() {
                 sizes[position] = reached[lane].saturating_sub(1);
@@ -1070,6 +1104,10 @@ mod tests {
             (5, 200, 150),
             (6, 200, 900),
             (7, 333, 2_500),
+            (8, 255, 1_200),
+            (9, 256, 1_500),
+            (10, 257, 1_800),
+            (11, 900, 6_000),
         ] {
             let graph = issue_562_irregular_snapshot(seed, subjects, edges);
             let reference_subjects = issue_562_subjects(&graph);
@@ -1217,6 +1255,200 @@ mod tests {
             issue_562_findings_digest(&findings),
             "c05d18749daff4f75b6493c4b53008855271d6aebbbf98c691b1c2ff3f3c267f",
             "hotspot ranking differs from the pre-#562 analyzer"
+        );
+    }
+
+    /// Shape of the Rust HIR snapshot in #590 at a smaller scale: besides
+    /// files and functions, HIR records parameters, local variables, and
+    /// closures as `symbol` subjects, plus many non-subject nodes. Functions
+    /// declare their bindings, locals use parameters and external types,
+    /// closures capture locals, functions call each other within and across
+    /// files, and files import earlier files.
+    fn issue_590_hir_scale_snapshot() -> GraphSnapshot {
+        const FILES: usize = 60;
+        const FUNCTIONS_PER_FILE: usize = 40;
+        const PARAMETERS: usize = 3;
+        const LOCALS: usize = 5;
+        const EXPRESSIONS: usize = 3;
+        const EXTERNALS: usize = 700;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut push = |source: &str, target: &str, kind: &str| {
+            let ordinal = edges.len();
+            edges.push(issue_562_edge(ordinal, source, target, kind));
+        };
+        let symbol = |id: &str, symbol_kind: &str, locator: &str, path: &str| NodeRecord {
+            id: id.to_owned(),
+            kind: "symbol".to_owned(),
+            locator: locator.to_owned(),
+            display_name: id.to_owned(),
+            properties: json!({ "path": path, "symbol_kind": symbol_kind }),
+        };
+        for external in 0..EXTERNALS {
+            nodes.push(issue_562_node(
+                &format!("unknown:{external:03}"),
+                "unknown_target",
+                &format!("unknown:{external:03}"),
+                None,
+            ));
+        }
+        for module in 0..FILES / 10 {
+            let path = format!("crates/core/src/m{module}/mod.rs");
+            nodes.push(issue_562_node(
+                &format!("module:{module}"),
+                "module",
+                &format!("module:{path}"),
+                Some(&path),
+            ));
+        }
+        for file in 0..FILES {
+            let path = format!("crates/core/src/m{}/f{file:03}.rs", file / 10);
+            let file_id = format!("file:{file:03}");
+            nodes.push(issue_562_node(
+                &file_id,
+                "file",
+                &format!("file:{path}"),
+                Some(&path),
+            ));
+            push(&format!("module:{}", file / 10), &file_id, "declares");
+            for back in 1..=2 {
+                if let Some(imported) = file.checked_sub(back) {
+                    for _ in 0..2 {
+                        push(&file_id, &format!("file:{imported:03}"), "imports");
+                    }
+                }
+            }
+            if file % 10 == 9 {
+                push(&format!("file:{:03}", file - 9), &file_id, "imports");
+            }
+            for function in 0..FUNCTIONS_PER_FILE {
+                let function_id = format!("fn:{file:03}:{function:02}");
+                let locator = format!("symbol:{path}#fn{function:02}");
+                nodes.push(symbol(&function_id, "function", &locator, &path));
+                push(&file_id, &function_id, "declares");
+                if function > 0 {
+                    push(
+                        &function_id,
+                        &format!("fn:{file:03}:{:02}", function - 1),
+                        "calls",
+                    );
+                }
+                if function % 8 == 0
+                    && let Some(callee) = file.checked_sub(1)
+                {
+                    push(
+                        &function_id,
+                        &format!("fn:{callee:03}:{function:02}"),
+                        "calls",
+                    );
+                }
+                for parameter in 0..PARAMETERS {
+                    let id = format!("{function_id}:param{parameter}");
+                    nodes.push(symbol(
+                        &id,
+                        "parameter",
+                        &format!("{locator}/param{parameter}"),
+                        &path,
+                    ));
+                    push(&function_id, &id, "declares");
+                }
+                for local in 0..LOCALS {
+                    let id = format!("{function_id}:local{local}");
+                    nodes.push(symbol(
+                        &id,
+                        "local_variable",
+                        &format!("{locator}/local{local}"),
+                        &path,
+                    ));
+                    push(&function_id, &id, "declares");
+                    push(
+                        &id,
+                        &format!("{function_id}:param{}", local % PARAMETERS),
+                        "uses",
+                    );
+                    push(
+                        &id,
+                        &format!(
+                            "unknown:{:03}",
+                            ((file * FUNCTIONS_PER_FILE + function) * LOCALS + local) % EXTERNALS
+                        ),
+                        "type_uses",
+                    );
+                    for expression in 0..EXPRESSIONS {
+                        let expression_id = format!("{id}:expr{expression}");
+                        nodes.push(issue_562_node(
+                            &expression_id,
+                            "expression",
+                            &format!("{locator}/local{local}/expr{expression}"),
+                            Some(&path),
+                        ));
+                        push(&id, &expression_id, "contains");
+                    }
+                }
+                let closure = format!("{function_id}:closure");
+                nodes.push(symbol(
+                    &closure,
+                    "closure",
+                    &format!("{locator}/closure"),
+                    &path,
+                ));
+                push(&function_id, &closure, "declares");
+                push(&function_id, &closure, "calls");
+                for local in 0..2 {
+                    push(&closure, &format!("{function_id}:local{local}"), "captures");
+                }
+            }
+        }
+        snapshot(nodes, edges)
+    }
+
+    #[test]
+    fn issue_590_hir_scale_snapshot_fits_the_hotspot_budget_with_unchanged_scores() {
+        use crate::service_limits::{
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_HEALTH_FINDINGS,
+            MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS, MAX_HOTSPOT_SUBJECTS,
+        };
+        let graph = issue_590_hir_scale_snapshot();
+        let subjects = issue_562_subjects(&graph);
+        assert!(
+            subjects.len() > MAX_HEALTH_FINDINGS,
+            "fixture must exceed the health finding limit that hotspots used to borrow \
+             ({} subjects)",
+            subjects.len()
+        );
+        assert_eq!(
+            score_hotspots_cancellable(
+                &graph,
+                DEFAULT_HOTSPOT_WEIGHTS,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                HotspotLayerAvailability::default(),
+                usize::MAX,
+                MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+                || false,
+            ),
+            Err(HotspotAnalysisError::ResourceExhausted),
+            "fixture must exhaust the graph-service budget that hotspots used to borrow"
+        );
+
+        let findings = score_hotspots_cancellable(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            HotspotLayerAvailability::default(),
+            MAX_HOTSPOT_SUBJECTS,
+            MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS,
+            || false,
+        )
+        .expect("hotspot scoring fits the default hotspot limits");
+        assert_eq!(findings.len(), subjects.len());
+        // Digest of the complete ranking (order, IDs, fingerprints, raw and
+        // normalized layers) that the 64-lane analyzer produced before #590.
+        assert_eq!(
+            issue_562_findings_digest(&findings),
+            "63fbcad18b400d58a86afb9f0d312502c04bf7cb9d2019fcf2f1899e2dccf1fa",
+            "hotspot ranking differs from the pre-#590 analyzer"
         );
     }
 }
