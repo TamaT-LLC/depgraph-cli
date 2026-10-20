@@ -1,31 +1,32 @@
 use std::num::NonZeroU32;
 
 use depgraph_mcp_tools::{
-    AcceptedOperationStatus, AgentBuildOutcome, AgentCapability, AgentChangedSince,
-    AgentCompletedSnapshot, AgentCondition, AgentContext, AgentCorrelationDifference,
-    AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot, AgentCycle, AgentCycleLevel,
-    AgentDaemonStatus, AgentDependenciesOutput, AgentDependenciesResponse,
-    AgentDependenciesSummaryResponse, AgentDependencyDetail, AgentDependencyDirection,
-    AgentDependencyEndpoint, AgentDependencyPath, AgentDependencyPathsResponse, AgentEdge,
-    AgentEdgeCommon, AgentEdgeSummary, AgentError, AgentErrorCategory, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentEvidenceKind, AgentExportOutcome,
-    AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact, AgentImpactResponse,
-    AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier, AgentLocator,
-    AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
-    AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation, AgentPolicyApiChange,
-    AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision, AgentQueryRow,
-    AgentRemediation, AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList,
-    AgentRepositorySummary, AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome,
-    AgentRuntimeValidationResponse, AgentScanOutcome, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentSourcePosition, AgentSourceSpan, AgentUnresolved,
-    CommonRequest, ContractBuildError, Cursor, DurableSubmitResult, ErrorEnvelope,
-    LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS, MAX_AGENT_CONDITION_BYTES,
-    MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES, MAX_AGENT_EVIDENCE_ITEMS,
-    MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES, MAX_AGENT_QUERY_VALUES,
-    MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TASK_TTL_MS, MIN_TASK_TTL_MS,
-    OperationAccepted, OperationRecoveryTools, Page, PageByteLimit, PageRequest, PageSize,
-    PortableTerminalOutputContract, RepositoryRelativePath, SnapshotId, SnapshotSelector,
-    SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted, TasksNegotiation, canonical_json_bytes,
+    AcceptedOperationStatus, AgentArgumentReason, AgentBuildOutcome, AgentCapability,
+    AgentChangedSince, AgentCompletedSnapshot, AgentCondition, AgentContext,
+    AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot,
+    AgentCycle, AgentCycleLevel, AgentDaemonStatus, AgentDependenciesOutput,
+    AgentDependenciesResponse, AgentDependenciesSummaryResponse, AgentDependencyDetail,
+    AgentDependencyDirection, AgentDependencyEndpoint, AgentDependencyPath,
+    AgentDependencyPathsResponse, AgentEdge, AgentEdgeCommon, AgentEdgeSummary, AgentError,
+    AgentErrorCategory, AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentEvidenceKind,
+    AgentExportOutcome, AgentGraphExportFormat, AgentGraphExportResponse, AgentImpact,
+    AgentImpactResponse, AgentImportBindingKind, AgentImportEvidence, AgentImportSpecifier,
+    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation,
+    AgentOperationStatus, AgentPathResponse, AgentPathStep, AgentPhase, AgentPolicyAnnotation,
+    AgentPolicyApiChange, AgentPolicyEvaluationResponse, AgentPolicyViolation, AgentPrecision,
+    AgentQueryArgument, AgentQueryFailureClass, AgentQueryRow, AgentRemediation,
+    AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary,
+    AgentResolutionStatus, AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeValidationResponse,
+    AgentScanOutcome, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentSourcePosition,
+    AgentSourceSpan, AgentUnresolved, CommonRequest, ContractBuildError, Cursor,
+    DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CHANGED_FIELDS,
+    MAX_AGENT_CONDITION_BYTES, MAX_AGENT_CORRELATION_REASONS, MAX_AGENT_CYCLE_NODES,
+    MAX_AGENT_EVIDENCE_ITEMS, MAX_AGENT_IMPORT_SPECIFIER_BYTES, MAX_AGENT_PHASES,
+    MAX_AGENT_QUERY_VALUES, MAX_AGENT_REPOSITORY_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_ITEMS,
+    MAX_TASK_TTL_MS, MIN_TASK_TTL_MS, OperationAccepted, OperationRecoveryTools, Page,
+    PageByteLimit, PageRequest, PageSize, PortableTerminalOutputContract, RepositoryRelativePath,
+    SnapshotId, SnapshotSelector, SuccessEnvelope, TASK_POLL_INTERVAL_MS, TaskAccepted,
+    TasksNegotiation, canonical_json_bytes,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -1694,15 +1695,30 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         AgentErrorDetails::RequiredCapability {
             capability: AgentCapability::RepositoryWrite,
         },
+        AgentErrorDetails::resource_limit(AgentResourceLimit::PageItems, u64::from(MAX_PAGE_ITEMS)),
         AgentErrorDetails::ResourceLimit {
-            limit: AgentResourceLimit::PageItems,
-            maximum: u64::from(MAX_PAGE_ITEMS),
+            limit: AgentResourceLimit::TraversalItems,
+            maximum: 1,
+            observed: Some(1),
+            argument: Some(parse("max_traversal")),
         },
         AgentErrorDetails::Operation {
             operation_id: parse(OPERATION_ID),
         },
         AgentErrorDetails::Repository {
             available_repository_ids: AgentRepositoryIds::single(parse("repo-1")),
+        },
+        AgentErrorDetails::argument(Some("selector"), AgentArgumentReason::NoMatchingNode),
+        AgentErrorDetails::argument(None, AgentArgumentReason::UnknownArgument),
+        AgentErrorDetails::QueryDiagnostic {
+            argument: AgentQueryArgument::Query,
+            code: parse("query_keyword_expected"),
+            class: AgentQueryFailureClass::Syntax,
+            clause: parse("match"),
+            token_class: parse("identifier"),
+            line: 1,
+            column: 1,
+            byte_offset: 0,
         },
     ];
     for detail in details {
@@ -1711,6 +1727,68 @@ fn typed_error_category_is_derived_and_deserialization_cannot_forge_it() {
         )
         .expect("deserialize typed details");
         assert_eq!(round_trip, detail);
+    }
+}
+
+#[test]
+fn issue_565_error_details_extend_v1_without_changing_existing_wire_forms() {
+    // A v1 resource_limit without the optional fields keeps its exact bytes.
+    let legacy = json!({"kind": "resource_limit", "limit": "page_items", "maximum": 1000});
+    let decoded = serde_json::from_value::<AgentErrorDetails>(legacy.clone())
+        .expect("legacy resource_limit stays valid");
+    assert_eq!(
+        decoded,
+        AgentErrorDetails::resource_limit(AgentResourceLimit::PageItems, 1000)
+    );
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+    assert_eq!(
+        serde_json::to_value(AgentErrorDetails::ResourceLimit {
+            limit: AgentResourceLimit::TraversalItems,
+            maximum: 50_000,
+            observed: Some(50_000),
+            argument: Some(parse("max_traversal")),
+        })
+        .unwrap(),
+        json!({
+            "kind": "resource_limit",
+            "limit": "traversal_items",
+            "maximum": 50_000,
+            "observed": 50_000,
+            "argument": "max_traversal"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentErrorDetails::argument(
+            Some("selector"),
+            AgentArgumentReason::NoMatchingNode
+        ))
+        .unwrap(),
+        json!({"kind": "argument", "argument": "selector", "reason": "no_matching_node"})
+    );
+    // An unknown argument is never named, and a name outside the token
+    // contract degrades to an unnamed argument instead of echoing it.
+    for argument in [None, Some("Bearer secret"), Some("/abs/path")] {
+        assert_eq!(
+            serde_json::to_value(AgentErrorDetails::argument(
+                argument,
+                AgentArgumentReason::UnknownArgument
+            ))
+            .unwrap(),
+            json!({"kind": "argument", "reason": "unknown_argument"})
+        );
+    }
+    for hostile in [
+        json!({"kind": "argument", "reason": "missing", "extra": 1}),
+        json!({"kind": "argument", "argument": "Selector", "reason": "missing"}),
+        json!({"kind": "argument", "reason": "not_a_reason"}),
+        json!({"kind": "resource_limit", "limit": "page_items", "maximum": 1, "argument": "x y"}),
+        json!({"kind": "query_diagnostic", "argument": "query", "code": "query_keyword_expected"}),
+    ] {
+        assert!(
+            serde_json::from_value::<AgentErrorDetails>(hostile.clone()).is_err(),
+            "{hostile}"
+        );
     }
 }
 

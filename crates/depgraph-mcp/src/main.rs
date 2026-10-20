@@ -32,7 +32,7 @@ use depgraph_core::{
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
-    AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
+    AgentArgumentReason, AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentError,
     AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportFormat,
     AgentGraphExportMediaType, AgentGraphExportResponse, AgentHealthAudit, AgentHealthExecution,
@@ -1753,22 +1753,71 @@ fn decode_arguments<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_value(serde_json::Value::Object(arguments))
-        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+    let value = serde_json::Value::Object(arguments);
+    T::deserialize(&value).map_err(|error| {
+        let serde_json::Value::Object(arguments) = &value else {
+            unreachable!("tool arguments are a JSON object");
+        };
+        let (argument, reason) = classify_argument_error::<T>(arguments, &error.to_string());
+        invalid_argument(argument.as_deref(), reason)
+    })
+}
+
+/// Names the argument a typed decode rejected without echoing caller text.
+/// serde names a missing field itself; for any other failure the culprit is
+/// the declared field whose removal makes the decode succeed or report that
+/// field as missing. An unknown argument is reported without its name.
+fn classify_argument_error<T>(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    message: &str,
+) -> (Option<String>, AgentArgumentReason)
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if let Some(name) = backticked_field(message, "missing field `") {
+        return (Some(name.to_owned()), AgentArgumentReason::Missing);
+    }
+    if message.starts_with("unknown field `") {
+        return (None, AgentArgumentReason::UnknownArgument);
+    }
+    let reason = if message.starts_with("invalid value: integer") {
+        AgentArgumentReason::OutOfRange
+    } else {
+        AgentArgumentReason::InvalidValue
+    };
+    let culprit = arguments.keys().find(|key| {
+        let mut without = arguments.clone();
+        without.remove(key.as_str());
+        match T::deserialize(&serde_json::Value::Object(without)) {
+            Ok(_) => true,
+            Err(error) => {
+                backticked_field(&error.to_string(), "missing field `") == Some(key.as_str())
+            }
+        }
+    });
+    (culprit.cloned(), reason)
+}
+
+fn backticked_field<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    message
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(name, _)| name)
 }
 
 fn validate_array_argument_lengths(
     arguments: &serde_json::Map<String, serde_json::Value>,
-    names: &[&str],
+    names: &[&'static str],
 ) -> Result<(), ToolExecutionFailure> {
-    if names.iter().any(|name| {
+    if let Some(name) = names.iter().find(|name| {
         arguments
-            .get(*name)
+            .get(**name)
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| items.len() > MAX_HEALTH_FILTER_ITEMS)
     }) {
-        return Err(ToolExecutionFailure::Service(
-            DepgraphServiceError::InvalidInput,
+        return Err(invalid_argument(
+            Some(name),
+            AgentArgumentReason::TooManyItems,
         ));
     }
     Ok(())
@@ -1809,7 +1858,7 @@ fn page_request(
     let max_items = limit
         .map(PageSize::new)
         .transpose()
-        .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?
+        .map_err(|_| invalid_argument(Some("limit"), AgentArgumentReason::OutOfRange))?
         .unwrap_or_default();
     Ok(PageRequest::new(
         max_items,
@@ -4114,13 +4163,18 @@ fn validate_graph_filter_lengths(
     sessions: &[String],
     environments: &[String],
 ) -> Result<(), ToolExecutionFailure> {
-    if [phases, profiles, sessions, environments]
-        .into_iter()
-        .any(|values| values.len() > 1_024)
-    {
-        return Err(ToolExecutionFailure::Service(
-            DepgraphServiceError::InvalidInput,
-        ));
+    for (argument, values) in [
+        ("phases", phases),
+        ("profiles", profiles),
+        ("sessions", sessions),
+        ("environments", environments),
+    ] {
+        if values.len() > 1_024 {
+            return Err(invalid_argument(
+                Some(argument),
+                AgentArgumentReason::TooManyItems,
+            ));
+        }
     }
     Ok(())
 }
@@ -4128,11 +4182,24 @@ fn validate_graph_filter_lengths(
 fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailure> {
     let value = value.unwrap_or(depgraph_core::DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL);
     if !(1..=MAX_INTERACTIVE_QUERY_TRAVERSAL).contains(&value) {
-        return Err(ToolExecutionFailure::Service(
-            DepgraphServiceError::InvalidInput,
+        return Err(invalid_argument(
+            Some("max_traversal"),
+            AgentArgumentReason::OutOfRange,
         ));
     }
     Ok(value)
+}
+
+/// `INVALID_ARGUMENT` naming the schema-defined argument and why it was
+/// rejected (Issue #565). Callers pass compile-time argument names only, so
+/// no caller-supplied text reaches the response.
+fn invalid_argument(argument: Option<&str>, reason: AgentArgumentReason) -> ToolExecutionFailure {
+    ToolExecutionFailure::Agent(AgentError::new(
+        AgentErrorCode::InvalidArgument,
+        false,
+        AgentRemediation::CorrectInput,
+        Some(AgentErrorDetails::argument(argument, reason)),
+    ))
 }
 
 fn validate_agent_condition_projection<'a>(
@@ -4160,10 +4227,10 @@ fn agent_condition_limit_error(maximum: u64) -> ToolExecutionFailure {
         AgentErrorCode::ResourceExhausted,
         false,
         AgentRemediation::NarrowQuery,
-        Some(AgentErrorDetails::ResourceLimit {
-            limit: AgentResourceLimit::OutputBytes,
+        Some(AgentErrorDetails::resource_limit(
+            AgentResourceLimit::OutputBytes,
             maximum,
-        }),
+        )),
     ))
 }
 
@@ -4175,7 +4242,7 @@ fn parse_snapshot_scoped_kinds(
         .map(|value| {
             FindingKind::parse(value)
                 .filter(|kind| kind.is_snapshot_scoped())
-                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+                .ok_or_else(|| invalid_argument(Some("kinds"), AgentArgumentReason::InvalidValue))
         })
         .collect()
 }
@@ -4184,8 +4251,9 @@ fn parse_health_severities(values: &[String]) -> Result<Vec<Severity>, ToolExecu
     values
         .iter()
         .map(|value| {
-            Severity::parse(value)
-                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+            Severity::parse(value).ok_or_else(|| {
+                invalid_argument(Some("severities"), AgentArgumentReason::InvalidValue)
+            })
         })
         .collect()
 }
@@ -4194,8 +4262,9 @@ fn parse_health_confidences(values: &[String]) -> Result<Vec<Confidence>, ToolEx
     values
         .iter()
         .map(|value| {
-            Confidence::parse(value)
-                .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))
+            Confidence::parse(value).ok_or_else(|| {
+                invalid_argument(Some("confidences"), AgentArgumentReason::InvalidValue)
+            })
         })
         .collect()
 }

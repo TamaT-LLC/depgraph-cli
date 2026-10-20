@@ -550,7 +550,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_query",
-        "Execute a bounded read-only graph query.",
+        "Execute a bounded read-only graph query. query is one statement in this grammar, not a command name or JSON: MATCH p = (a[:\"<node kind>\"])-[\"<edge kind>\"[|\"<edge kind>\"...]*<min>..<max>]->(b[:\"<node kind>\"]) [WHERE <predicate>] RETURN <binding or binding.field>[, ...] [ORDER BY <projection> [ASC|DESC][, ...]] LIMIT <1-10000>. Write <-[...]- for the reverse direction; depth is 1..8; kinds are double-quoted strings such as \"file\", \"module\", \"symbol\" and \"imports\", \"depends_on\", \"calls\". Node fields are id, kind, locator, display_name; file locators look like file:src/lib.rs. Predicates compare binding.field with =, !=, <, <=, >, >=, STARTS WITH, or IN [...], combined with AND, OR, NOT, and parentheses. Example (direct importers of one file): MATCH p = (source:\"file\")-[\"imports\"*1..1]->(target:\"file\") WHERE target.locator = \"file:src/cart.rs\" RETURN source.locator ORDER BY source.locator ASC LIMIT 100. A rejected query returns INVALID_ARGUMENT with error.details.kind=query_diagnostic: code and clause name what the parser expected, token_class names the token it found, and line, column, byte_offset locate it; the query text is not echoed. graph_dependents_list and graph_dependencies_list answer single-node questions without a query.",
         ["query", "query_file", "snapshot", "cursor", "limit"],
         [CliAction::Query],
         READ,
@@ -1123,6 +1123,19 @@ fn hotspot_path_item_schema() -> Value {
     })
 }
 
+/// Node selector with the not-found and ambiguity contract (Issue #565).
+fn node_selector_schema() -> Value {
+    let mut schema = scalar_schema::<AgentLocator>();
+    schema
+        .as_object_mut()
+        .expect("selector schema is an object")
+        .insert(
+            "description".to_owned(),
+            json!("Node selector such as path:src/lib.rs, symbol:<name>, or id:<stable-id>. When it matches no node in the snapshot the tool returns NOT_FOUND with error.details {kind: argument, argument: <this argument>, reason: no_matching_node}; when it matches several nodes it returns INVALID_ARGUMENT with reason ambiguous_selector, and id:<stable-id> selects one."),
+        );
+    schema
+}
+
 fn field_schema(tool_name: &str, field: &str) -> Value {
     match field {
         "query" if tool_name == "graph_query" => json!({
@@ -1166,11 +1179,16 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "operation_id" => scalar_schema::<OperationId>(),
         "idempotency_key" => scalar_schema::<IdempotencyKey>(),
         "node_id" | "site_id" => scalar_schema::<AgentId>(),
-        "selector" => scalar_schema::<AgentLocator>(),
+        // Export resolves its selector outside the graph traversal tools, so
+        // it does not promise their not-found and ambiguity details.
+        "selector" if matches!(tool_name, "graph_export" | "export_file") => {
+            scalar_schema::<AgentLocator>()
+        }
+        "selector" => node_selector_schema(),
         "from" | "to" if matches!(tool_name, "snapshot_diff_get" | "policy_evaluate") => {
             snapshot_selector_schema()
         }
-        "from" | "to" => scalar_schema::<AgentLocator>(),
+        "from" | "to" => node_selector_schema(),
         "changed_since" => scalar_schema::<AgentLabel>(),
         "level" => scalar_schema::<AgentCycleLevel>(),
         "name" => scalar_schema::<SnapshotName>(),
@@ -1209,7 +1227,22 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})
         }
-        "max_traversal" => json!({"type": "integer", "minimum": 1, "maximum": 1000000}),
+        // Cycle and unresolved listing count per-phase work and report a
+        // plain RESOURCE_EXHAUSTED without resource_limit details.
+        "max_traversal" if matches!(tool_name, "graph_cycles_list" | "graph_unresolved_list") => {
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "description": "Work bound of each preprocessing, traversal and finalization phase. A request that hits it returns RESOURCE_EXHAUSTED without error.details."
+            })
+        }
+        "max_traversal" => json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Edge visit bound of the traversal, default 50000. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit, its maximum, the observed work when known, and argument=max_traversal when this argument moves the bound; remediation increase_limit means a larger max_traversal can succeed."
+        }),
         "profiles_document" => json!({
             "type": "string",
             "minLength": 1,

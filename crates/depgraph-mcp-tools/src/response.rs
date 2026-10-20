@@ -8,7 +8,9 @@ use chacha20poly1305::{
     aead::{Aead, OsRng, Payload},
 };
 use depgraph_core::{
-    CancellationToken, DepgraphCapability, DepgraphServiceError, RepositoryFileError,
+    CancellationToken, DepgraphCapability, DepgraphResourceLimit, DepgraphServiceError,
+    MAX_INTERACTIVE_QUERY_TRAVERSAL, QueryDiagnostic, QueryFailureClass, RepositoryFileError,
+    SelectorFailureKind,
     service::{CyclesResult, DependenciesResult, ImpactServiceResult, UnresolvedServiceResult},
 };
 use rmcp::model::CallToolResult;
@@ -19,16 +21,17 @@ use zeroize::Zeroize;
 
 use crate::dto::{AgentImpactProjection, ImpactProjectionFailure};
 use crate::{
-    AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle, AgentDaemonStatus,
-    AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError, AgentErrorCode,
-    AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
+    AgentArgumentReason, AgentCapability, AgentCompletedSnapshot, AgentContext, AgentCycle,
+    AgentDaemonStatus, AgentDependenciesResponse, AgentDoctor, AgentEdge, AgentError,
+    AgentErrorCode, AgentErrorDetails, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
     AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
     AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRemediation,
-    AgentRepositoryInitOutcome, AgentRepositoryList, AgentResourceLimit, AgentRuntimeOutcome,
-    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentSite, AgentSnapshot,
-    AgentSnapshotDiffResponse, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
+    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryArgument, AgentQueryFailureClass,
+    AgentQueryRow, AgentRemediation, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentResourceLimit, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshot, AgentSnapshotDiffResponse,
+    AgentToken, AgentUnresolved, CanonicalJsonError, ContractBuildError, Cursor,
     DurableSubmitResult, ErrorEnvelope, LogicalRepositoryId, MAX_AGENT_CONDITION_BYTES,
     MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MCP_TOOLS_CONTRACT_VERSION, OperationAccepted, Page,
     PageRequest, PortableTerminalOutput, SnapshotId, SuccessEnvelope, TaskAccepted,
@@ -197,10 +200,10 @@ impl CanonicalResponseMapper {
                     AgentErrorCode::ResourceExhausted,
                     false,
                     AgentRemediation::ExportFile,
-                    Some(AgentErrorDetails::ResourceLimit {
-                        limit: AgentResourceLimit::OutputBytes,
-                        maximum: u64::from(MAX_PAGE_BYTES),
-                    }),
+                    Some(AgentErrorDetails::resource_limit(
+                        AgentResourceLimit::OutputBytes,
+                        u64::from(MAX_PAGE_BYTES),
+                    )),
                 ),
             )),
             mapped => mapped,
@@ -342,10 +345,15 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             }
             RepositoryFileError::Unavailable { .. } => internal_error(true),
         },
+        DepgraphServiceError::GraphQuery { .. } => map_graph_query_error(source),
+        DepgraphServiceError::BoundedQueryInput { diagnostic } => AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            query_diagnostic_details(diagnostic),
+        ),
         DepgraphServiceError::InvalidInput
         | DepgraphServiceError::ProfilePlan { .. }
-        | DepgraphServiceError::GraphQuery { .. }
-        | DepgraphServiceError::BoundedQueryInput { .. }
         | DepgraphServiceError::RuntimeTraceInput { .. }
         | DepgraphServiceError::PolicyInput => AgentError::new(
             AgentErrorCode::InvalidArgument,
@@ -385,14 +393,19 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             AgentRemediation::NarrowQuery,
             None,
         ),
+        DepgraphServiceError::ResourceLimitExceeded {
+            limit,
+            maximum,
+            observed,
+        } => map_resource_limit(*limit, *maximum, *observed),
         DepgraphServiceError::InlineExportTooLarge { maximum } => AgentError::new(
             AgentErrorCode::ResourceExhausted,
             false,
             AgentRemediation::ExportFile,
-            Some(AgentErrorDetails::ResourceLimit {
-                limit: AgentResourceLimit::OutputBytes,
-                maximum: *maximum as u64,
-            }),
+            Some(AgentErrorDetails::resource_limit(
+                AgentResourceLimit::OutputBytes,
+                *maximum as u64,
+            )),
         ),
         DepgraphServiceError::Cancelled => AgentError::new(
             AgentErrorCode::Cancelled,
@@ -447,7 +460,99 @@ const fn resource_error(limit: AgentResourceLimit, maximum: u64) -> AgentError {
         AgentErrorCode::ResourceExhausted,
         false,
         AgentRemediation::NarrowQuery,
-        Some(AgentErrorDetails::ResourceLimit { limit, maximum }),
+        Some(AgentErrorDetails::resource_limit(limit, maximum)),
+    )
+}
+
+/// A selector that matched no node is `NOT_FOUND`, an ambiguous one is a
+/// correctable argument; every other graph query failure stays
+/// `INVALID_ARGUMENT` without details because its diagnostic text may reflect
+/// the supplied selector (Issue #565).
+fn map_graph_query_error(source: &DepgraphServiceError) -> AgentError {
+    let Some(failure) = source.selector_failure() else {
+        return AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            None,
+        );
+    };
+    let (code, reason) = match failure.kind {
+        SelectorFailureKind::NoMatch => (
+            AgentErrorCode::NotFound,
+            AgentArgumentReason::NoMatchingNode,
+        ),
+        SelectorFailureKind::Ambiguous => (
+            AgentErrorCode::InvalidArgument,
+            AgentArgumentReason::AmbiguousSelector,
+        ),
+    };
+    AgentError::new(
+        code,
+        false,
+        AgentRemediation::CorrectInput,
+        Some(AgentErrorDetails::argument(failure.argument, reason)),
+    )
+}
+
+/// Projects the closed parser diagnostic. Every string in it is a static
+/// grammar label, so no query text reaches the response.
+fn query_diagnostic_details(diagnostic: &QueryDiagnostic) -> Option<AgentErrorDetails> {
+    let argument = if diagnostic.code.starts_with("query_file_") {
+        AgentQueryArgument::QueryFile
+    } else {
+        AgentQueryArgument::Query
+    };
+    let class = match diagnostic.class {
+        QueryFailureClass::Input => AgentQueryFailureClass::Input,
+        QueryFailureClass::Security => AgentQueryFailureClass::Security,
+        QueryFailureClass::Syntax => AgentQueryFailureClass::Syntax,
+        QueryFailureClass::Limit => AgentQueryFailureClass::Limit,
+        QueryFailureClass::Binding => AgentQueryFailureClass::Binding,
+        QueryFailureClass::Type => AgentQueryFailureClass::Type,
+    };
+    let saturating = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    Some(AgentErrorDetails::QueryDiagnostic {
+        argument,
+        code: AgentToken::parse(diagnostic.code).ok()?,
+        class,
+        clause: AgentToken::parse(diagnostic.clause).ok()?,
+        token_class: AgentToken::parse(diagnostic.token_class).ok()?,
+        line: saturating(diagnostic.origin.line),
+        column: saturating(diagnostic.origin.column),
+        byte_offset: saturating(diagnostic.origin.byte_offset),
+    })
+}
+
+/// Names the bound, the work counted when it stopped, and the argument that
+/// moves it. A bound the caller can still raise asks for `increase_limit`.
+fn map_resource_limit(
+    limit: DepgraphResourceLimit,
+    maximum: u64,
+    observed: Option<u64>,
+) -> AgentError {
+    let agent_limit = match limit {
+        DepgraphResourceLimit::MaxTraversal => AgentResourceLimit::TraversalItems,
+        DepgraphResourceLimit::AdjacencyEdgeInspection => AgentResourceLimit::SnapshotEdges,
+        DepgraphResourceLimit::PreprocessingWorkItems => AgentResourceLimit::PreprocessingWorkItems,
+    };
+    let argument = limit.argument();
+    let ceiling = MAX_INTERACTIVE_QUERY_TRAVERSAL as u64;
+    let raisable = argument.is_some() && maximum < ceiling;
+    AgentError::new(
+        AgentErrorCode::ResourceExhausted,
+        false,
+        if raisable {
+            AgentRemediation::IncreaseLimit
+        } else {
+            AgentRemediation::NarrowQuery
+        },
+        Some(AgentErrorDetails::ResourceLimit {
+            limit: agent_limit,
+            maximum,
+            observed,
+            argument: argument.and_then(|name| AgentToken::parse(name).ok()),
+        }),
     )
 }
 

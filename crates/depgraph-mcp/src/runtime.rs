@@ -212,10 +212,10 @@ impl RuntimeFailure {
                 AgentErrorCode::ResourceExhausted,
                 true,
                 AgentRemediation::NarrowQuery,
-                Some(AgentErrorDetails::ResourceLimit {
-                    limit: AgentResourceLimit::DeadlineMilliseconds,
-                    maximum: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                }),
+                Some(AgentErrorDetails::resource_limit(
+                    AgentResourceLimit::DeadlineMilliseconds,
+                    u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                )),
             ),
             Self::Cancelled => AgentError::new(
                 AgentErrorCode::Cancelled,

@@ -3,11 +3,11 @@ use std::{fs, path::Path, process::Command};
 use anyhow::Result;
 use depgraph_core::service::{
     CyclesRequest, DEFAULT_STRUCTURAL_EDGE_SELECTION, DependenciesRequest, DependencyDirection,
-    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, EdgeKindFilter, ExplainPathRequest, ImpactRequest, MAX_CYCLE_NODE_IDS,
-    MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, MAX_DEPENDENCY_PATH_STEPS,
-    MAX_GRAPH_EVIDENCE_ITEMS, STRUCTURAL_EDGE_KINDS, StructuralEdgeSelection, UnresolvedRequest,
-    is_structural_edge_kind,
+    DepgraphCapabilitySet, DepgraphResourceLimit, DepgraphService, DepgraphServiceConfig,
+    DepgraphServiceError, DepgraphServiceLimits, EdgeKindFilter, ExplainPathRequest, ImpactRequest,
+    MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS,
+    MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS, STRUCTURAL_EDGE_KINDS,
+    StructuralEdgeSelection, UnresolvedRequest, is_structural_edge_kind,
 };
 use depgraph_core::{
     CancellationToken, ChangedSetImpactRequest, CycleLevel, GraphQueryFilter, ImpactFilters,
@@ -469,7 +469,11 @@ fn dependencies_are_bounded_and_keep_the_request_snapshot_pinned() -> Result<()>
     );
     assert!(matches!(
         bounded,
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum: 1,
+            observed: Some(1),
+        })
     ));
     let bounded_dependents = service.dependencies(
         &mut snapshot,
@@ -484,7 +488,11 @@ fn dependencies_are_bounded_and_keep_the_request_snapshot_pinned() -> Result<()>
     );
     assert!(matches!(
         bounded_dependents,
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum: 1,
+            observed: Some(1),
+        })
     ));
 
     let pinned_path = service.explain_path(
@@ -603,7 +611,16 @@ fn explain_path_is_canonical_and_never_reports_false_after_exhaustion() -> Resul
             &cancellation,
         )
         .unwrap_err();
-    assert!(matches!(exhausted, DepgraphServiceError::ResourceExhausted));
+    // max_traversal bounds the edges the search visits, and the error names
+    // that bound and the visits made when it stopped (Issue #565).
+    assert!(matches!(
+        exhausted,
+        DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum: 1,
+            observed: Some(1),
+        }
+    ));
 
     let unreachable = service.explain_path(
         &mut snapshot,

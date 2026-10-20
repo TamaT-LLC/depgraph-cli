@@ -956,7 +956,8 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // and the AgentErrorDetails::Repository branch. Issue #542 adds the summary and paths
     // responses, AgentEdgeCommon, AgentEdgeSummary, AgentDependencyPath, their two pages,
     // and the AgentDependenciesOutput success envelope. Issue #544 adds AgentImportEvidence.
-    assert_eq!(objects, 203, "review newly added object schemas explicitly");
+    // Issue #565 adds the AgentErrorDetails::Argument and ::QueryDiagnostic branches.
+    assert_eq!(objects, 205, "review newly added object schemas explicitly");
 }
 
 #[test]
