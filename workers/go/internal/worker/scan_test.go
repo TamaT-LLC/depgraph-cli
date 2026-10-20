@@ -987,6 +987,66 @@ func TestEmbedSymlinkCannotEscapeRoot(t *testing.T) {
 	}
 }
 
+func TestIssue591FileNodesRecordRepositoryRelativePath(t *testing.T) {
+	root := t.TempDir()
+	// A nested module keeps the module-relative and repository-relative paths
+	// apart, so the test catches a path recorded relative to go.mod.
+	writeTestFile(t, filepath.Join(root, "svc", "go.mod"), "module example.com/svc\ngo 1.26\n")
+	writeTestFile(t, filepath.Join(root, "svc", "main.go"), "package svc\nimport _ \"embed\"\n//go:embed assets/data.txt\nvar data string\nfunc bridge()\n")
+	writeTestFile(t, filepath.Join(root, "svc", "main_test.go"), "package svc\n")
+	writeTestFile(t, filepath.Join(root, "svc", "bridge.s"), "TEXT ·bridge(SB),$0-0\n\tRET\n")
+	writeTestFile(t, filepath.Join(root, "svc", "assets", "data.txt"), "payload\n")
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]Node{}
+	for _, node := range result.Nodes {
+		if rel, ok := strings.CutPrefix(node.Locator, "file:"); ok {
+			files[rel] = node
+		}
+	}
+	for _, rel := range []string{"svc/main.go", "svc/main_test.go", "svc/bridge.s", "svc/assets/data.txt"} {
+		node, ok := files[rel]
+		if !ok {
+			t.Fatalf("missing file node %s: %v", rel, sortedNodeLocators(files))
+		}
+		if node.Kind != "file" {
+			t.Fatalf("%s kind = %q, want file", rel, node.Kind)
+		}
+	}
+	// core health (hotspot location and churn, path prefixes, unused-file
+	// locations) reads the path from properties only; without `path` the
+	// hotspot falls back to manifest_path and binds the file to go.mod.
+	for rel, node := range files {
+		if got := node.Properties["path"]; got != rel {
+			t.Fatalf("%s path property = %#v, want %q: %+v", rel, got, rel, node.Properties)
+		}
+	}
+	if files["svc/bridge.s"].Properties["assembly"] != true {
+		t.Fatalf("assembly file node lost its marker: %+v", files["svc/bridge.s"].Properties)
+	}
+	if files["svc/assets/data.txt"].Properties["embedded"] != true {
+		t.Fatalf("embedded file node lost its marker: %+v", files["svc/assets/data.txt"].Properties)
+	}
+	// manifest_path stays: dependency health resolves the owning go.mod from it.
+	for _, rel := range []string{"svc/main.go", "svc/bridge.s"} {
+		if got := files[rel].Properties["manifest_path"]; got != "svc/go.mod" {
+			t.Fatalf("%s manifest_path = %#v, want svc/go.mod", rel, got)
+		}
+	}
+}
+
+func sortedNodeLocators(nodes map[string]Node) []string {
+	locators := make([]string, 0, len(nodes))
+	for rel := range nodes {
+		locators = append(locators, rel)
+	}
+	sort.Strings(locators)
+	return locators
+}
+
 func TestManifestAndSourceSymlinksCannotEscapeCanonicalRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "repo")

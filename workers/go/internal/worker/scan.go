@@ -1459,7 +1459,7 @@ func (s *scannerState) addPackagesAndFiles(sources []*sourceFile, moduleNodes ma
 			fileNode := Node{
 				ID: source.FileNodeID, Kind: "file", Locator: "file:" + source.RelPath, DisplayName: source.RelPath,
 				Properties: map[string]any{
-					"language": "go", "package_path": group.ImportPath, "package_name": source.PackageName,
+					"language": "go", "path": source.RelPath, "package_path": group.ImportPath, "package_name": source.PackageName,
 					"generated": source.Generated, "test": source.IsTest, "build_constraint": source.ConditionText,
 					"content_hash": contentHash(source.Source),
 				},
@@ -1555,7 +1555,7 @@ func (s *scannerState) addAssemblyBoundaries(
 		fileNode := Node{
 			ID: fileNodeID, Kind: "file", Locator: "file:" + relative, DisplayName: relative,
 			Properties: map[string]any{
-				"language": "go", "package_path": packageImportPath(s.root, *module, filepath.Dir(path)),
+				"language": "go", "path": relative, "package_path": packageImportPath(s.root, *module, filepath.Dir(path)),
 				"assembly": true, "generated": false, "build_constraint": conditionText,
 				"content_hash": contentHash(sourceBytes),
 			},
@@ -2125,7 +2125,7 @@ func (s *scannerState) extractEmbedDirectives(source *sourceFile) {
 				rel := relativePath(s.root, match)
 				targetID := s.targetID("file", source.Module.Path, rel)
 				info, _ := os.Stat(match)
-				properties := map[string]any{"language": "asset", "embedded": true, "module_path": source.Module.Path}
+				properties := map[string]any{"language": "asset", "path": rel, "embedded": true, "module_path": source.Module.Path}
 				if info != nil {
 					properties["size"] = info.Size()
 				}
