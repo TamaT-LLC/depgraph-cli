@@ -24,7 +24,6 @@ concurrency:
 
 jobs:
   rust:
-    if: false
     runs-on: ubuntu-24.04
     env:
       # Test artifacts are never debugged on the runner; panic locations come
@@ -109,7 +108,6 @@ jobs:
       - run: cargo test --workspace --locked --doc
 
   go:
-    if: false
     runs-on: ubuntu-24.04
     env:
       GOTOOLCHAIN: local
@@ -155,7 +153,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/depgraph-go-worker-windows-amd64.test" ./internal/worker
 
   go-macos:
-    if: false
+    if: ${{ !inputs.benchmark_only }}
     runs-on: macos-15
     env:
       GOTOOLCHAIN: local
@@ -195,7 +193,6 @@ jobs:
         run: go test -race ./internal/worker -run 'TestGoLoader|TestAnalysisSplit|TestOpenReferenceFile|TestComputeGoReferenceFingerprint|TestGoReferenceFileDigest|TestSupportedUnix' -count=1
 
   web:
-    if: false
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -307,7 +304,7 @@ jobs:
           if-no-files-found: error
 
   compiler-precise-hostile:
-    if: false
+    if: ${{ !inputs.benchmark_only }}
     runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
@@ -1482,47 +1479,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.os }}
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
-      - run: rustup default 1.93.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
-          cache-on-failure: true
-          save-if: ${{ github.event_name == 'workflow_dispatch' }}
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: 1.26.1
-          cache-dependency-path: workers/go/go.sum
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24.18.0
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          version: 10.33.0
-          standalone: false
-      - name: Verify the additional native release package
-        env:
-          DEPGRAPH_TARGET: ${{ matrix.target }}
-        run: cargo xtask package
-
-  native-observation:
-    if: github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            native_flags: ""
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             native_flags: -C linker-features=-lld
