@@ -3558,7 +3558,7 @@ impl Extractor<'_> {
             condition: condition.clone(),
             precision: resolution.precision,
             reason: resolution.reason.clone(),
-            evidence: evidence.clone(),
+            evidence,
         };
         if let Some(existing) = self.sites.get(&site_id)
             && existing != &site
@@ -3589,7 +3589,8 @@ impl Extractor<'_> {
                 resolution_status: resolution.status,
                 precision: resolution.precision,
                 generated: location.generated,
-                evidence: evidence.clone(),
+                // Shares the site's evidence until the edge is emitted (#578).
+                evidence: Vec::new(),
             };
             if let Some(existing) = self.edges.get(&edge_id)
                 && existing != &edge

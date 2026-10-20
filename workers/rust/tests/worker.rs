@@ -1,15 +1,17 @@
 use depgraph_protocol::{
     CompletenessLevel, EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus,
     stable_id_from_value, validate_ndjson, validate_safe_semantic_ndjson,
+    validate_semantic_graph_maps, validate_semantic_graph_maps_with_shared_site_evidence,
 };
 use depgraph_rust_worker::{
-    ADAPTER_VERSION, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
+    ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
     RUST_ANALYZER_SALSA_VERSION, RUST_SYSROOT_COMPONENT_VERSION, RUST_SYSROOT_CONTRACT_VERSION,
     RUST_SYSROOT_LICENSE_EXPRESSION, RUST_SYSROOT_SOURCE_LAYOUT, RUST_TOOLCHAIN_BASELINE,
-    RUSTC_BASELINE_COMMIT, build_events, scan,
+    RUSTC_BASELINE_COMMIT, build_events, emit_events, scan, scan_with_options,
+    scan_with_options_for_emit, write_events,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Cursor,
     path::{Path, PathBuf},
@@ -3645,4 +3647,122 @@ fn issue_577_file_asset_and_crate_root_nodes_record_their_repository_path() {
         })
         .unwrap();
     assert_eq!(child.properties["source_path"], "src/lib.rs");
+}
+
+/// Serializes the stream the worker binary writes for a scan that shares
+/// site evidence with its edges.
+fn shared_evidence_stream(root: &Path, hir_mode: HirMode) -> Vec<String> {
+    let shared = scan_with_options_for_emit(root, None, hir_mode).unwrap();
+    let mut lines = Vec::new();
+    write_events("shared-evidence", shared, |event| {
+        lines.push(serde_json::to_string(event)?);
+        Ok(())
+    })
+    .unwrap();
+    lines
+}
+
+fn unshared_evidence_stream(root: &Path, hir_mode: HirMode) -> Vec<String> {
+    let unshared = scan_with_options(root, None, hir_mode).unwrap();
+    let mut lines = Vec::new();
+    emit_events("shared-evidence", unshared, |event| {
+        lines.push(serde_json::to_string(&event)?);
+        Ok(())
+    })
+    .unwrap();
+    lines
+}
+
+#[test]
+fn issue_578_shared_site_evidence_keeps_the_event_stream_byte_identical() {
+    for (root, hir_mode) in [
+        (semantic_fixture(), HirMode::Full),
+        (fixture(), HirMode::Full),
+        (fixture(), HirMode::SyntaxOnly),
+        (security_fixture(), HirMode::Full),
+    ] {
+        let shared = scan_with_options_for_emit(&root, None, hir_mode).unwrap();
+        let shared_edges = shared
+            .edges
+            .iter()
+            .filter(|edge| edge.site_id.is_some() && edge.evidence.is_empty())
+            .count();
+        let site_edges = shared
+            .edges
+            .iter()
+            .filter(|edge| edge.site_id.is_some())
+            .count();
+        assert!(
+            shared_edges > 0,
+            "{} shares no site evidence",
+            root.display()
+        );
+        assert_eq!(
+            shared_edges,
+            site_edges,
+            "every site-linked edge of {} shares its site's evidence",
+            root.display()
+        );
+
+        let expected = unshared_evidence_stream(&root, hir_mode);
+        let actual = shared_evidence_stream(&root, hir_mode);
+        assert_eq!(actual.len(), expected.len(), "{}", root.display());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual, expected, "{}", root.display());
+        }
+        validate_ndjson(Cursor::new(expected.join("\n") + "\n")).unwrap();
+
+        // The owning `emit_events` sink produces the same stream from the
+        // shared form as the borrowing writer.
+        let mut owned = Vec::new();
+        emit_events("shared-evidence", shared, |event| {
+            owned.push(serde_json::to_string(&event)?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(owned, expected, "{}", root.display());
+    }
+}
+
+#[test]
+fn issue_578_only_in_memory_validation_accepts_edges_that_share_site_evidence() {
+    let shared = scan_with_options_for_emit(&semantic_fixture(), None, HirMode::Full).unwrap();
+    let nodes: BTreeMap<_, _> = shared
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect();
+    let edges: BTreeMap<_, _> = shared
+        .edges
+        .iter()
+        .map(|edge| (edge.id.clone(), edge.clone()))
+        .collect();
+    let mut sites: BTreeMap<_, _> = shared
+        .sites
+        .iter()
+        .map(|site| (site.id.clone(), site.clone()))
+        .collect();
+    validate_semantic_graph_maps_with_shared_site_evidence(&nodes, &edges, &sites).unwrap();
+    // The wire contract still requires every edge to carry its own evidence.
+    let strict = validate_semantic_graph_maps(&nodes, &edges, &sites).unwrap_err();
+    assert!(
+        strict
+            .to_string()
+            .contains("must include at least one evidence item"),
+        "{strict}"
+    );
+
+    // A shared edge is checked against the evidence it would be emitted with:
+    // dropping the span from a semantic site's primary evidence fails both
+    // the site and its edges.
+    let semantic_site = sites
+        .values_mut()
+        .find(|site| {
+            site.evidence
+                .first()
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+        })
+        .unwrap();
+    semantic_site.evidence[0].start_line = None;
+    validate_semantic_graph_maps_with_shared_site_evidence(&nodes, &edges, &sites).unwrap_err();
 }

@@ -27,13 +27,14 @@ use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, Coverage, DependencySite, Diagnostic, DiagnosticSeverity,
     Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
-    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value, validate_semantic_graph_maps,
+    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value,
+    validate_semantic_graph_maps_with_shared_site_evidence,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
@@ -281,7 +282,37 @@ fn scan_with_semantic_extractor(
     scan_with_inventory_and_semantic_extractor(root, None, semantic_extractor, HirMode::Full)
 }
 
+/// Scans like [`scan_with_options`], but leaves the evidence of every
+/// site-linked edge shared with its dependency site: such an edge has empty
+/// `evidence` and the site's evidence applies to it.
+///
+/// This is the worker binary's form. It avoids holding a second copy of each
+/// site's evidence on its edges for the whole scan, which took about a
+/// quarter of the worker heap on a large workspace (#578). Pass the result to
+/// [`crate::write_events`] or [`crate::emit_events`], which give each such
+/// edge the site evidence as they emit the edge, so the event stream is the
+/// same as for [`scan_with_options`].
+pub fn scan_with_options_for_emit(
+    root: &Path,
+    inventory_file: Option<&Path>,
+    hir_mode: HirMode,
+) -> Result<ScanResult> {
+    let inventory = inventory_file.map(RepositoryInventory::read).transpose()?;
+    scan_with_shared_site_evidence(root, inventory, extract_semantic_delta, hir_mode)
+}
+
 fn scan_with_inventory_and_semantic_extractor(
+    root: &Path,
+    inventory: Option<RepositoryInventory>,
+    semantic_extractor: SemanticExtractor,
+    hir_mode: HirMode,
+) -> Result<ScanResult> {
+    let mut result = scan_with_shared_site_evidence(root, inventory, semantic_extractor, hir_mode)?;
+    result.unshare_site_evidence();
+    Ok(result)
+}
+
+fn scan_with_shared_site_evidence(
     root: &Path,
     inventory: Option<RepositoryInventory>,
     semantic_extractor: SemanticExtractor,
@@ -614,6 +645,28 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+impl ScanResult {
+    /// Gives every site-linked edge that shares its site's evidence (empty
+    /// `evidence`) its own copy, as [`crate::write_events`] emits it.
+    pub(crate) fn unshare_site_evidence(&mut self) {
+        let site_evidence: HashMap<&str, &Vec<Evidence>> = self
+            .sites
+            .iter()
+            .map(|site| (site.id.as_str(), &site.evidence))
+            .collect();
+        for edge in &mut self.edges {
+            if edge.evidence.is_empty()
+                && let Some(evidence) = edge
+                    .site_id
+                    .as_deref()
+                    .and_then(|site_id| site_evidence.get(site_id))
+            {
+                edge.evidence.clone_from(evidence);
+            }
+        }
+    }
+}
+
 /// Sizes of a semantic delta, recorded before the delta is merged.
 struct SemanticDeltaCounts {
     node_count: u64,
@@ -726,8 +779,12 @@ impl State {
         self.profile
             .properties
             .insert("rust_syntax_fallback_summary".into(), fallback_summary);
-        validate_semantic_graph_maps(&self.nodes, &self.edges, &self.sites)
-            .context("Rust worker semantic graph invariants failed")?;
+        validate_semantic_graph_maps_with_shared_site_evidence(
+            &self.nodes,
+            &self.edges,
+            &self.sites,
+        )
+        .context("Rust worker semantic graph invariants failed")?;
         let nodes: Vec<_> = self.nodes.into_values().collect();
         let edges: Vec<_> = self.edges.into_values().collect();
         let sites: Vec<_> = self.sites.into_values().collect();
@@ -1569,8 +1626,12 @@ impl State {
         let merged = self
             .insert_semantic_delta(nodes, edges, sites, &mut inserted)
             .and_then(|()| {
-                validate_semantic_graph_maps(&self.nodes, &self.edges, &self.sites)
-                    .context("validate Rust HIR semantic delta")
+                validate_semantic_graph_maps_with_shared_site_evidence(
+                    &self.nodes,
+                    &self.edges,
+                    &self.sites,
+                )
+                .context("validate Rust HIR semantic delta")
             });
         if let Err(error) = merged {
             self.undo_semantic_merge(inserted);
@@ -3451,7 +3512,8 @@ impl State {
                 resolution_status: resolution.status,
                 precision: resolution.precision,
                 generated: false,
-                evidence: vec![evidence.clone()],
+                // Shares the site's evidence until the edge is emitted (#578).
+                evidence: Vec::new(),
             })?;
         }
         Ok(site_id)
@@ -3561,7 +3623,11 @@ impl State {
             existing_without_evidence.evidence.clear();
             let mut edge_without_evidence = edge.clone();
             edge_without_evidence.evidence.clear();
-            if existing_without_evidence != edge_without_evidence {
+            if existing_without_evidence != edge_without_evidence
+                || existing.evidence.is_empty() != edge.evidence.is_empty()
+            {
+                // An edge either shares its site's evidence (empty) or owns
+                // evidence; mixing both would change what it emits.
                 bail!("conflicting edge ID {}", edge.id);
             }
             for evidence in edge.evidence {

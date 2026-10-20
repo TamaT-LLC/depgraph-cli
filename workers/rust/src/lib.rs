@@ -18,10 +18,10 @@ mod scanner;
 mod source;
 mod toolchain;
 
-pub use emit::{build_events, emit_events};
+pub use emit::{build_events, emit_events, write_events};
 pub use scanner::{
     FileCoverage, HirMode, ScanPhaseMetric, ScanResult, scan, scan_with_inventory_file,
-    scan_with_options,
+    scan_with_options, scan_with_options_for_emit,
 };
 
 pub const ADAPTER: &str = "rust";

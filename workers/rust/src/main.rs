@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use depgraph_rust_worker::{
     ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, ScanPhaseMetric, emit_events, scan_with_options,
+    RUST_ANALYZER_SALSA_VERSION, ScanPhaseMetric, scan_with_options_for_emit, write_events,
 };
 use std::{
     io::{BufWriter, Write},
@@ -60,7 +60,7 @@ fn run() -> Result<()> {
         anyhow::bail!("--scan-id requires a non-empty identifier");
     }
 
-    let mut result = scan_with_options(
+    let mut result = scan_with_options_for_emit(
         &args.root,
         args.inventory_file.as_deref(),
         args.hir_mode.into(),
@@ -73,12 +73,12 @@ fn run() -> Result<()> {
     #[cfg(debug_assertions)]
     let mut validator = depgraph_protocol::ProtocolValidator::new();
     let protocol_write_started = Instant::now();
-    let protocol_event_count = emit_events(&args.scan_id, result, |event| {
+    let protocol_event_count = write_events(&args.scan_id, result, |event| {
         #[cfg(debug_assertions)]
         validator
             .push(event.clone())
             .context("Rust worker generated an invalid protocol event")?;
-        serde_json::to_writer(&mut writer, &event).context("serialize protocol event")?;
+        serde_json::to_writer(&mut writer, event).context("serialize protocol event")?;
         writer.write_all(b"\n").context("write protocol event")?;
         Ok(())
     })?;
