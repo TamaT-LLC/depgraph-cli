@@ -444,7 +444,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           version="${version%%-rc.*}"
-          test "$version" = "0.7.0"
+          test "$version" = "$(node -p 'require("./npm/depgraph/package.json").version')"
 
           mkdir -p post-publish/public post-publish/normal post-publish/compiler post-publish/redownload
           gh release download "$GITHUB_REF_NAME" --dir post-publish/public

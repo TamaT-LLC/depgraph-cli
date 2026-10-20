@@ -240,3 +240,50 @@ test("cache hit release report requires every canonical fixture size to pass", (
     );
   }
 });
+
+
+test("v0.7.1 owner waiver preserves failed metrics and rejects scope expansion", () => {
+  const report = {
+    schema_version: CACHE_HIT_REPORT_SCHEMA_VERSION,
+    generated_at: "2026-10-20T00:00:00.000Z",
+    commit: "e".repeat(40),
+    minimum_improvement_percent: 5,
+    comparisons: Object.entries(CACHE_HIT_FIXTURE_SIZES).map(([size, sourceFileCount]) =>
+      evaluateCacheHitComparison({
+        size, sourceFileCount,
+        hitSamples: size === "small" ? [1186, 1214, 1179] : [80, 82, 84],
+        bypassSamples: size === "small" ? [1077, 1027, 1062] : [100, 102, 104],
+        minimumImprovementPercent: 5,
+        evidence: { ...evidence, files_analyzed: sourceFileCount, dependency_sites: sourceFileCount - 1 },
+      })),
+    passed: false,
+    owner_waiver: JSON.parse(readFileSync(new URL("../../docs/releases/v0.7.1-owner-waiver.json", import.meta.url))),
+  };
+  const version = JSON.parse(readFileSync(new URL("../../npm/depgraph/package.json", import.meta.url))).version;
+  if (version !== "0.7.1") {
+    assert.throws(() => verifyCacheHitReport(report, report.commit), /performance gate/);
+    return;
+  }
+  assert.equal(verifyCacheHitReport(report, report.commit), true);
+  assert.equal(report.passed, false);
+  assert.equal(report.comparisons[0].passed, false);
+  assert.equal(report.comparisons[0].improvement_percent, -11.68);
+
+  for (const mutate of [
+    (value) => { delete value.owner_waiver; },
+    (value) => { value.owner_waiver.release_version = "0.7.2"; },
+    (value) => { value.owner_waiver.scope.push("all-performance"); },
+    (value) => { value.passed = true; },
+    (value) => { value.commit = "local"; },
+    (value) => {
+      value.comparisons[1] = evaluateCacheHitComparison({
+        size: "medium", sourceFileCount: 1000, hitSamples: [110, 112, 114], bypassSamples: [100, 102, 104],
+        minimumImprovementPercent: 5, evidence: value.comparisons[1].evidence,
+      });
+    },
+  ]) {
+    const invalid = structuredClone(report);
+    mutate(invalid);
+    assert.throws(() => verifyCacheHitReport(invalid, invalid.commit), /performance gate/);
+  }
+});

@@ -3788,6 +3788,36 @@ fn sha256_file_streaming(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+// An owner-authorized publication exception is separate from a measured pass.
+// The signed v0.7.1 source includes the exact authorization and failed prior run.
+fn cache_hit_performance_accepted(report: &Value) -> bool {
+    if report["passed"] == Value::Bool(true) {
+        return report.get("owner_waiver").is_none();
+    }
+    VERSION == "0.7.1"
+        && report["passed"] == Value::Bool(false)
+        && report["minimum_improvement_percent"] == 5
+        && report["comparisons"].as_array().is_some_and(|comparisons| {
+            comparisons.len() == 3
+                && ["small", "medium", "large"].into_iter().all(|size| {
+                    comparisons
+                        .iter()
+                        .filter(|comparison| comparison["size"] == size)
+                        .count()
+                        == 1
+                        && comparisons.iter().any(|comparison| {
+                            comparison["size"] == size
+                                && comparison["passed"] == Value::Bool(size != "small")
+                        })
+                })
+        })
+        && report["owner_waiver"]
+            == serde_json::from_str::<Value>(include_str!(
+                "../../docs/releases/v0.7.1-owner-waiver.json"
+            ))
+            .expect("checked-in v0.7.1 owner waiver is valid JSON")
+}
+
 fn release_asset_set_sha256(assets: &[ReleaseAssetEvidence]) -> String {
     let mut hasher = Sha256::new();
     for asset in assets {
@@ -3914,7 +3944,7 @@ fn validate_post_publish_aggregates(
         || benchmark["gate"]["passed"] != Value::Bool(true)
         || cache_hit["schema_version"] != "depgraph-cache-hit-benchmark-v1"
         || cache_hit["commit"] != source_sha
-        || cache_hit["passed"] != Value::Bool(true)
+        || !cache_hit_performance_accepted(&cache_hit)
     {
         bail!("public benchmark evidence is incompatible or failed");
     }
