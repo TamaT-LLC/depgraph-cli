@@ -188,6 +188,7 @@ tokio::task_local! {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContextArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -196,6 +197,7 @@ struct ContextArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OperationArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -205,6 +207,7 @@ struct OperationArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScanSubmitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -218,6 +221,7 @@ struct ScanSubmitArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonStartSubmitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -229,6 +233,7 @@ struct DaemonStartSubmitArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonStopArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -238,6 +243,7 @@ struct DaemonStopArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolveBuildSubmitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -249,6 +255,7 @@ struct ResolveBuildSubmitArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryInitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -259,6 +266,7 @@ struct RepositoryInitArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeImportSubmitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -274,6 +282,7 @@ struct RuntimeImportSubmitArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotNameCreateArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -303,6 +312,7 @@ impl From<NodeMatchArgument> for NodeMatchMode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FindNodesArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -321,6 +331,7 @@ struct FindNodesArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentNodeGetArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -332,6 +343,7 @@ struct AgentNodeGetArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentSitesListArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -367,6 +379,7 @@ impl From<AgentEdgesDirection> for EdgeDirection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentEdgesListArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -391,6 +404,7 @@ fn default_agent_edges_direction() -> AgentEdgesDirection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentEvidenceListArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -406,6 +420,7 @@ struct AgentEvidenceListArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotListArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -418,6 +433,7 @@ struct SnapshotListArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotGetArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -427,6 +443,7 @@ struct SnapshotGetArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfilesPlanArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -441,6 +458,7 @@ struct ProfilesPlanArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DoctorArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -451,6 +469,7 @@ struct DoctorArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonStatusArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -459,6 +478,7 @@ struct DaemonStatusArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphDependenciesArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -505,6 +525,7 @@ where
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphPathArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -527,6 +548,7 @@ struct GraphPathArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphImpactArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -560,6 +582,7 @@ struct GraphImpactArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphCyclesArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -582,6 +605,7 @@ const fn default_cycle_level() -> AgentCycleLevel {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphUnresolvedArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -600,6 +624,7 @@ struct GraphUnresolvedArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphQueryArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -618,6 +643,7 @@ struct GraphQueryArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeValidateArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -636,6 +662,7 @@ struct RuntimeValidateArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotDiffArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -648,6 +675,7 @@ struct SnapshotDiffArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyEvaluateArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -658,6 +686,7 @@ struct PolicyEvaluateArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthSummaryArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -672,6 +701,7 @@ struct HealthSummaryArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthFindingsArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -694,6 +724,7 @@ struct HealthFindingsArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthFindingGetArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -705,6 +736,7 @@ struct HealthFindingGetArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthAuditArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -722,6 +754,7 @@ struct HealthAuditArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthHotspotsArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -774,6 +807,7 @@ impl From<GraphExportFormatArgument> for GraphExportFormat {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphExportArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
@@ -791,6 +825,7 @@ struct GraphExportArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportFileSubmitArguments {
+    #[serde(default)]
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
