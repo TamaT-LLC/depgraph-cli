@@ -731,6 +731,7 @@
       ]
     },
     "edge": {
+      "$comment": "A worker asked for the opt-in compact-evidence-v1 encoding may write an empty evidence array for an edge whose evidence equals its dependency site's evidence, and may move shared evidence properties to profile.properties.evidence_property_defaults. The core decodes that encoding before validating, so this schema describes the decoded stream (#578).",
       "type": "object",
       "properties": {
         "id": { "$ref": "#/$defs/non_empty_string" },

@@ -79,6 +79,8 @@ pub enum ProtocolError {
     PayloadAfterProfileCompletion { found: &'static str },
     #[error("protocol path {path:?} escapes scan root {root:?}")]
     UnsafePath { path: String, root: String },
+    #[error("decoding the compact evidence encoding would add more than {limit} bytes")]
+    ExpansionLimit { limit: usize },
     #[error("protocol invariant failed: {0}")]
     Invariant(String),
 }
@@ -174,6 +176,25 @@ impl ProtocolValidator {
     #[must_use]
     pub fn validated_events(&self) -> &[ProtocolEvent] {
         &self.events
+    }
+
+    /// Returns an accepted dependency site by ID.
+    #[must_use]
+    pub fn dependency_site(&self, id: &str) -> Option<&DependencySite> {
+        self.sites.get(id)
+    }
+
+    /// Expands one `compact-evidence-v1` event with `decoder`, then validates
+    /// and records it like [`Self::push`]. Use this only for a worker that was
+    /// asked for the compact encoding; [`Self::push`] rejects its edges that
+    /// omit evidence.
+    pub fn push_compact(
+        &mut self,
+        decoder: &mut crate::CompactEvidenceDecoder,
+        mut event: ProtocolEvent,
+    ) -> Result<(), ProtocolError> {
+        decoder.decode(&mut event, |site_id| self.sites.get(site_id))?;
+        self.push(event)
     }
 
     /// Validates and records one event. Conditions are canonicalized before

@@ -1,14 +1,16 @@
 use depgraph_protocol::{
-    CompletenessLevel, EvidenceKind, Phase, Precision, ProtocolEvent, ResolutionStatus,
+    COMPACT_EVIDENCE_ENCODING_V1, CompactEvidenceDecoder, CompletenessLevel,
+    EVIDENCE_ENCODING_PROPERTY, EVIDENCE_PROPERTY_DEFAULTS_PROPERTY, EvidenceKind,
+    EvidencePropertyDefaults, Phase, Precision, ProtocolEvent, ProtocolValidator, ResolutionStatus,
     stable_id_from_value, validate_ndjson, validate_safe_semantic_ndjson,
     validate_semantic_graph_maps, validate_semantic_graph_maps_with_shared_site_evidence,
 };
 use depgraph_rust_worker::{
-    ADAPTER_VERSION, HirMode, RUST_ANALYZER_CRATE_VERSION, RUST_ANALYZER_REVISION,
-    RUST_ANALYZER_SALSA_VERSION, RUST_SYSROOT_COMPONENT_VERSION, RUST_SYSROOT_CONTRACT_VERSION,
-    RUST_SYSROOT_LICENSE_EXPRESSION, RUST_SYSROOT_SOURCE_LAYOUT, RUST_TOOLCHAIN_BASELINE,
-    RUSTC_BASELINE_COMMIT, build_events, emit_events, scan, scan_with_options,
-    scan_with_options_for_emit, write_events,
+    ADAPTER_VERSION, EvidenceEncoding, HirMode, RUST_ANALYZER_CRATE_VERSION,
+    RUST_ANALYZER_REVISION, RUST_ANALYZER_SALSA_VERSION, RUST_SYSROOT_COMPONENT_VERSION,
+    RUST_SYSROOT_CONTRACT_VERSION, RUST_SYSROOT_LICENSE_EXPRESSION, RUST_SYSROOT_SOURCE_LAYOUT,
+    RUST_TOOLCHAIN_BASELINE, RUSTC_BASELINE_COMMIT, build_events, emit_events, scan,
+    scan_with_options, scan_with_options_for_emit, write_events, write_events_with_encoding,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -3765,4 +3767,172 @@ fn issue_578_only_in_memory_validation_accepts_edges_that_share_site_evidence() 
         .unwrap();
     semantic_site.evidence[0].start_line = None;
     validate_semantic_graph_maps_with_shared_site_evidence(&nodes, &edges, &sites).unwrap_err();
+}
+
+fn compact_evidence_stream(root: &Path, hir_mode: HirMode) -> Vec<ProtocolEvent> {
+    let compact = scan_with_options_for_emit(root, None, hir_mode).unwrap();
+    let mut events = Vec::new();
+    write_events_with_encoding(
+        "shared-evidence",
+        compact,
+        EvidenceEncoding::Compact,
+        |event| {
+            events.push(event.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    events
+}
+
+const HIR_SHARED_EVIDENCE_PROPERTIES: [&str; 4] = [
+    "active_cfg_source",
+    "backend",
+    "rust_analyzer_revision",
+    "rust_analyzer_version",
+];
+
+fn canonical_lines(events: impl IntoIterator<Item = ProtocolEvent>, compact: bool) -> Vec<String> {
+    let mut validator = ProtocolValidator::for_safe_scan();
+    let mut decoder = CompactEvidenceDecoder::new();
+    for event in events {
+        if compact {
+            validator.push_compact(&mut decoder, event).unwrap();
+        } else {
+            validator.push(event).unwrap();
+        }
+    }
+    validator
+        .finish()
+        .unwrap()
+        .events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect()
+}
+
+#[test]
+fn issue_578_compact_evidence_stream_decodes_to_the_full_stream() {
+    for (root, hir_mode) in [
+        (semantic_fixture(), HirMode::Full),
+        (fixture(), HirMode::Full),
+        (fixture(), HirMode::SyntaxOnly),
+        (security_fixture(), HirMode::Full),
+    ] {
+        let full = unshared_evidence_stream(&root, hir_mode);
+        let compact = compact_evidence_stream(&root, hir_mode);
+        let compact_lines: Vec<String> = compact
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect();
+        let full_bytes: usize = full.iter().map(String::len).sum();
+        let compact_bytes: usize = compact_lines.iter().map(String::len).sum();
+        assert!(
+            compact_bytes < full_bytes,
+            "{}: compact {compact_bytes} >= full {full_bytes}",
+            root.display()
+        );
+
+        // On the wire, every site-linked edge leaves its evidence to its site,
+        // and no evidence item repeats the properties the profile declares.
+        let mut site_edges = 0;
+        for event in &compact {
+            match event {
+                ProtocolEvent::ProfileDeclared(declared) => {
+                    assert_eq!(
+                        declared.profile.properties[EVIDENCE_ENCODING_PROPERTY],
+                        COMPACT_EVIDENCE_ENCODING_V1
+                    );
+                    let defaults: Vec<EvidencePropertyDefaults> = serde_json::from_value(
+                        declared.profile.properties[EVIDENCE_PROPERTY_DEFAULTS_PROPERTY].clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(defaults.len(), 1);
+                    assert_eq!(defaults[0].extractor, "rust-analyzer-hir");
+                    assert_eq!(
+                        defaults[0].properties.keys().collect::<Vec<_>>(),
+                        HIR_SHARED_EVIDENCE_PROPERTIES.iter().collect::<Vec<_>>()
+                    );
+                }
+                ProtocolEvent::EdgeUpsert(upsert) => {
+                    if upsert.edge.site_id.is_some() {
+                        site_edges += 1;
+                        assert!(upsert.edge.evidence.is_empty(), "{}", upsert.edge.id);
+                    }
+                    for item in &upsert.edge.evidence {
+                        for key in HIR_SHARED_EVIDENCE_PROPERTIES {
+                            assert!(!item.properties.contains_key(key), "{}", upsert.edge.id);
+                        }
+                    }
+                }
+                ProtocolEvent::DependencySite(site) => {
+                    for item in &site.site.evidence {
+                        for key in HIR_SHARED_EVIDENCE_PROPERTIES {
+                            assert!(!item.properties.contains_key(key), "{}", site.site.id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(site_edges > 0, "{}", root.display());
+
+        // Decoding restores the full stream exactly, and a consumer that did
+        // not ask for the encoding rejects it.
+        let decoded = canonical_lines(compact, true);
+        let expected = canonical_lines(
+            full.iter().map(|line| serde_json::from_str(line).unwrap()),
+            false,
+        );
+        assert_eq!(decoded.len(), expected.len(), "{}", root.display());
+        for (decoded, expected) in decoded.iter().zip(&expected) {
+            assert_eq!(decoded, expected, "{}", root.display());
+        }
+        validate_ndjson(Cursor::new(compact_lines.join("\n") + "\n")).unwrap_err();
+    }
+}
+
+#[test]
+fn issue_578_hir_evidence_holds_shared_properties_once_per_result() {
+    let compact = scan_with_options_for_emit(&semantic_fixture(), None, HirMode::Full).unwrap();
+    let hir_items = compact
+        .sites
+        .iter()
+        .flat_map(|site| &site.evidence)
+        .chain(compact.edges.iter().flat_map(|edge| &edge.evidence))
+        .filter(|item| item.extractor == "rust-analyzer-hir")
+        .collect::<Vec<_>>();
+    assert!(!hir_items.is_empty());
+    for item in hir_items {
+        for key in HIR_SHARED_EVIDENCE_PROPERTIES {
+            assert!(!item.properties.contains_key(key));
+        }
+    }
+    // The public scan API still returns every property on every item.
+    let full = scan(&semantic_fixture()).unwrap();
+    assert!(full.evidence_property_defaults.is_empty());
+    let mut checked = 0;
+    for item in full
+        .sites
+        .iter()
+        .flat_map(|site| &site.evidence)
+        .chain(full.edges.iter().flat_map(|edge| &edge.evidence))
+        .filter(|item| item.extractor == "rust-analyzer-hir")
+    {
+        assert_eq!(item.properties["backend"], "rust-analyzer-library");
+        assert_eq!(
+            item.properties["rust_analyzer_revision"],
+            RUST_ANALYZER_REVISION
+        );
+        assert_eq!(
+            item.properties["rust_analyzer_version"],
+            RUST_ANALYZER_CRATE_VERSION
+        );
+        assert_eq!(
+            item.properties["active_cfg_source"],
+            "profile.rust_hir_active_cfg_by_crate"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
 }

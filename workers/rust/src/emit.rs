@@ -5,11 +5,26 @@ use anyhow::Result;
 #[cfg(debug_assertions)]
 use depgraph_protocol::ProtocolValidator;
 use depgraph_protocol::{
-    CommonFields, DependencySite, DependencySiteEvent, DiagnosticEvent, EdgeUpsert, Evidence,
-    FileCompleted, NodeUpsert, ProfileCompleted, ProfileDeclared, ProtocolEvent, ScanCompleted,
-    ScanStarted,
+    COMPACT_EVIDENCE_ENCODING_V1, CommonFields, DependencySite, DependencySiteEvent,
+    DiagnosticEvent, EVIDENCE_ENCODING_PROPERTY, EVIDENCE_PROPERTY_DEFAULTS_PROPERTY, EdgeUpsert,
+    Evidence, EvidencePropertyDefaults, FileCompleted, NodeUpsert, ProfileCompleted,
+    ProfileDeclared, ProtocolEvent, ScanCompleted, ScanStarted, apply_evidence_property_defaults,
 };
 use std::collections::HashMap;
+
+/// How the evidence of a scan result is written to the event stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvidenceEncoding {
+    /// Every evidence item is written in full on every site, edge, and
+    /// diagnostic: the ordinary protocol 1.0 stream.
+    #[default]
+    Full,
+    /// `compact-evidence-v1`: an edge that shares its site's evidence writes
+    /// `"evidence": []`, and the result's evidence property defaults are
+    /// declared once on the profile instead of on each item (#578). Only a
+    /// consumer that asked for it can read this stream.
+    Compact,
+}
 
 /// Stream a complete typed v1.0 event stream into `sink`, one event at a time,
 /// and return how many events were emitted.
@@ -28,7 +43,12 @@ pub fn emit_events(
     result: ScanResult,
     mut sink: impl FnMut(ProtocolEvent) -> Result<()>,
 ) -> Result<u64> {
-    stream_events(scan_id, result, EventSink::Owned(&mut sink))
+    stream_events(
+        scan_id,
+        result,
+        EvidenceEncoding::Full,
+        EventSink::Owned(&mut sink),
+    )
 }
 
 /// Stream the same event stream as [`emit_events`] to a sink that only
@@ -40,9 +60,19 @@ pub fn emit_events(
 pub fn write_events(
     scan_id: &str,
     result: ScanResult,
+    sink: impl FnMut(&ProtocolEvent) -> Result<()>,
+) -> Result<u64> {
+    write_events_with_encoding(scan_id, result, EvidenceEncoding::Full, sink)
+}
+
+/// Stream the result like [`write_events`] in the given evidence encoding.
+pub fn write_events_with_encoding(
+    scan_id: &str,
+    result: ScanResult,
+    encoding: EvidenceEncoding,
     mut sink: impl FnMut(&ProtocolEvent) -> Result<()>,
 ) -> Result<u64> {
-    stream_events(scan_id, result, EventSink::Borrowed(&mut sink))
+    stream_events(scan_id, result, encoding, EventSink::Borrowed(&mut sink))
 }
 
 enum EventSink<'a> {
@@ -86,10 +116,15 @@ impl EventSink<'_> {
     }
 }
 
-fn stream_events(scan_id: &str, result: ScanResult, mut sink: EventSink<'_>) -> Result<u64> {
+fn stream_events(
+    scan_id: &str,
+    result: ScanResult,
+    encoding: EvidenceEncoding,
+    mut sink: EventSink<'_>,
+) -> Result<u64> {
     let ScanResult {
         root,
-        profile,
+        mut profile,
         nodes,
         sites,
         edges,
@@ -97,7 +132,26 @@ fn stream_events(scan_id: &str, result: ScanResult, mut sink: EventSink<'_>) -> 
         files,
         coverage,
         performance: _,
+        evidence_property_defaults,
     } = result;
+    // Defaults applied to each item as it is emitted: all of them in the full
+    // encoding, none in the compact one, which declares them on the profile.
+    let defaults: &[EvidencePropertyDefaults] = match encoding {
+        EvidenceEncoding::Full => &evidence_property_defaults,
+        EvidenceEncoding::Compact => {
+            profile.properties.insert(
+                EVIDENCE_ENCODING_PROPERTY.into(),
+                COMPACT_EVIDENCE_ENCODING_V1.into(),
+            );
+            if !evidence_property_defaults.is_empty() {
+                profile.properties.insert(
+                    EVIDENCE_PROPERTY_DEFAULTS_PROPERTY.into(),
+                    serde_json::to_value(&evidence_property_defaults)?,
+                );
+            }
+            &[]
+        }
+    };
     let mut seq = 0_u64;
     let mut common = || {
         seq += 1;
@@ -129,15 +183,19 @@ fn stream_events(scan_id: &str, result: ScanResult, mut sink: EventSink<'_>) -> 
     }
     // Sites whose edges share their evidence, with the number of such edges.
     let mut shared_edges = HashMap::<String, usize>::new();
-    for edge in &edges {
-        if edge.evidence.is_empty()
-            && let Some(site_id) = &edge.site_id
-        {
-            *shared_edges.entry(site_id.clone()).or_default() += 1;
+    // The compact encoding leaves these edges' evidence empty on the wire.
+    if encoding == EvidenceEncoding::Full {
+        for edge in &edges {
+            if edge.evidence.is_empty()
+                && let Some(site_id) = &edge.site_id
+            {
+                *shared_edges.entry(site_id.clone()).or_default() += 1;
+            }
         }
     }
     let mut shared_evidence = HashMap::<String, (Vec<Evidence>, usize)>::new();
-    for site in sites {
+    for mut site in sites {
+        apply_evidence_property_defaults(defaults, &mut site.evidence);
         if let Some(edge_count) = shared_edges.remove(&site.id) {
             let site_id = site.id.clone();
             let evidence = sink.send_site_keeping_evidence(common(), site)?;
@@ -150,6 +208,7 @@ fn stream_events(scan_id: &str, result: ScanResult, mut sink: EventSink<'_>) -> 
         }
     }
     for mut edge in edges {
+        apply_evidence_property_defaults(defaults, &mut edge.evidence);
         if edge.evidence.is_empty()
             && let Some(site_id) = &edge.site_id
             && let Some((evidence, remaining)) = shared_evidence.get_mut(site_id)
@@ -169,7 +228,8 @@ fn stream_events(scan_id: &str, result: ScanResult, mut sink: EventSink<'_>) -> 
             edge,
         }))?;
     }
-    for diagnostic in diagnostics {
+    for mut diagnostic in diagnostics {
+        apply_evidence_property_defaults(defaults, &mut diagnostic.evidence);
         sink.send(ProtocolEvent::Diagnostic(DiagnosticEvent {
             common: common(),
             diagnostic,

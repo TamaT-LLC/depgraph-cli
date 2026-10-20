@@ -306,6 +306,16 @@ worker の crash、timeout、部分失敗は diagnostic と ledger に記録し�
 
 各 event は `protocol_version`、`scan_id`、`adapter`、`adapter_version` を必須とする。未知の optional field は無視できるが、未知の event type と必須 field 欠落は protocol error とする。
 
+#### Compact evidence encoding（`compact-evidence-v1`）
+
+protocol `1.0` の full scan stream に対する opt-in の evidence の符号化である（#578）。protocol version は `1.0` のまま変えず、JSON Schema と validator が定める stream は、この符号化を戻した後の stream を指す。
+
+- 要求: core は worker の環境変数 `DEPGRAPH_EVIDENCE_ENCODING=compact-evidence-v1` で符号化を要求する。現在は Rust worker の full scan（delta request なし）だけに要求する。環境変数を知らない worker は従来の形で出力し、core はそのまま受け付ける。worker は要求されない限り従来の形で出力する。
+- 宣言: 符号化を使う worker は、その profile の `properties.evidence_encoding` を `compact-evidence-v1` にする。値が 1 種類の evidence property は `properties.evidence_property_defaults` に `{extractor, extractor_version, properties}` の配列として書く。未知の符号化、宣言のない defaults、同じ extractor と version の重複、空の properties、同じ profile の再宣言で符号化が変わることは protocol error とする。
+- edge の evidence: site に結び付いた edge は、evidence が site の evidence と同一なら `"evidence": []` と書く。site はその edge より前に出力されていなければならない。core は同じ profile の site の evidence を写して戻す。site がない、まだ出力されていない、profile が異なる場合は protocol error とする。
+- property の既定値: 宣言した profile に属する site、edge、diagnostic の evidence のうち extractor と extractor version が一致するものに、持っていない key だけを補う。worker は、その extractor と version のすべての evidence が同じ値で持つ key だけを宣言できる。Rust worker は HIR evidence（`rust-analyzer-hir`）の `active_cfg_source`、`backend`、`rust_analyzer_revision`、`rust_analyzer_version` を宣言する。`macro_provenance` は宣言しない（`declarative-expansion-boundary` の値を取り得るうえ、relation edge の HIR evidence は持たないため）。
+- 復元: core は event を読んだ直後、他の検証より前に `CompactEvidenceDecoder` で戻し、profile から 2 つの property を取り除く。以降の検証、checkpoint、Store、CLI / MCP の出力は、符号化を使わない stream と同じ内容になる。復元で増える evidence の JSON バイト数は `max_protocol_bytes` までとし、超えた場合は出力上限の超過（`OutputLimit`）として扱う。不正な worker が短い edge に大きな site の evidence を写させて、読み込んだバイト数を超えて core のメモリを増やすことを防ぐ。Rust 以外の adapter の stream は戻さない。evidence が空の edge は従来の検証で拒否される。
+
 ### 6.4 Worker Incremental Delta Contract
 
 `worker-delta-v1` は protocol `1.0` の repository-complete stream と独立した
@@ -2066,6 +2076,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 ## 26. 更新履歴
 
 - 2026-10-20: Issue #569として、MCP server と operation runner から release の worker を検証できるようにし、doctor の worker に `resolution`、`unavailable_reason`、`root_launch_blocked_reason`、`scan_impact` などの判定理由を追加した（§13.11）。
+- 2026-10-20: Issue #578としてprotocol `1.0`にopt-inの`compact-evidence-v1`（§6.3）を追加した。coreはRust workerに環境変数で要求し、workerはsiteと同一のedge evidenceと、HIR evidenceが共通に持つpropertyを省く。coreは読み込み直後に元のstreamへ戻すため、Storeの内容は変わらない。depgraph-cli自身のHIR出力が約2割減った。
 - 2026-10-16: framework semantic graph v1へcode link `implemented_by`（`component` / `server_function` -> `typescript_definition_id`の`symbol`、0または1件）と`declared_in`（同 -> 宣言`file`、ちょうど1件）を追加した。semantic routeから`renders`の先が実装symbolにも宣言fileにもつながらず、`why route:... -> external_system`が経路なしになり、`impact path:<file>`にrouteが出なかったため。site IDの衝突を避けるため別kindとし、`implemented_by`のfile fallbackは`declared_in`と重複するため廃止した。`resolved / exact`のみ、`route_entry`の向きは不変、occurrence kindはframework別に固定した（§7.5.1）。
 - 2026-09-07: Issue #467としてsnapshot-scoped health（`health` / `health list` / `cleanup` / `health_summary_get` / `health_findings_list`）の読み込み・集計をStore range単位へ事前分割した。
   plain入力（単一scan層）は`Store::resolve_health_input`と`Store::health_range_plan`が集計値だけで対象IDをrangeへ切り、range毎の読み込み・index構築・解析を従来どおりの1,000,000 step budgetで実行し、超過rangeは中央値で最大4回再分割する。

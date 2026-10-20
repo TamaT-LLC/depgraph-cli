@@ -7,7 +7,9 @@ use crate::{
         HirProjectMode, HirProjectProfile, InventorySource, ProjectModelErrorKind,
         SafeProjectModel, build_safe_project_model_with_sysroot,
     },
-    hir_semantic::{SemanticCrateContext, SemanticDelta, extract_semantic_delta},
+    hir_semantic::{
+        SemanticCrateContext, SemanticDelta, extract_semantic_delta, hir_evidence_property_defaults,
+    },
     hir_sysroot::{RUST_SYSROOT_ROOT_ENV, load_attested_sysroot},
     manifest::{
         Dependency, ManifestDocument, Package, expanded_features, normalize_path, parse_packages,
@@ -26,9 +28,9 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CompletenessLevel, Condition, Coverage, DependencySite, Diagnostic, DiagnosticSeverity,
-    Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
-    ResolutionStatus, StableIdInput, stable_id, stable_id_from_value,
-    validate_semantic_graph_maps_with_shared_site_evidence,
+    Evidence, EvidenceKind, EvidencePropertyDefaults, GraphEdge, GraphNode, Phase, Precision,
+    Profile, Properties, ResolutionStatus, StableIdInput, apply_evidence_property_defaults,
+    stable_id, stable_id_from_value, validate_semantic_graph_maps_with_shared_site_evidence,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -62,6 +64,10 @@ pub struct ScanResult {
     pub files: Vec<FileCoverage>,
     pub coverage: Coverage,
     pub performance: Vec<ScanPhaseMetric>,
+    /// Evidence properties left out of every matching evidence item of this
+    /// result. Empty in the results of [`scan`] and [`scan_with_options`];
+    /// see [`scan_with_options_for_emit`].
+    pub evidence_property_defaults: Vec<EvidencePropertyDefaults>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,16 +288,21 @@ fn scan_with_semantic_extractor(
     scan_with_inventory_and_semantic_extractor(root, None, semantic_extractor, HirMode::Full)
 }
 
-/// Scans like [`scan_with_options`], but leaves the evidence of every
-/// site-linked edge shared with its dependency site: such an edge has empty
-/// `evidence` and the site's evidence applies to it.
+/// Scans like [`scan_with_options`], but keeps the evidence compact:
 ///
-/// This is the worker binary's form. It avoids holding a second copy of each
-/// site's evidence on its edges for the whole scan, which took about a
-/// quarter of the worker heap on a large workspace (#578). Pass the result to
-/// [`crate::write_events`] or [`crate::emit_events`], which give each such
-/// edge the site evidence as they emit the edge, so the event stream is the
-/// same as for [`scan_with_options`].
+/// - Every site-linked edge shares the evidence of its dependency site: such
+///   an edge has empty `evidence` and the site's evidence applies to it.
+/// - Properties that every evidence item of one extractor carries with the
+///   same value are left out of the items and listed once in
+///   [`ScanResult::evidence_property_defaults`].
+///
+/// This is the worker binary's form. Holding a second copy of each site's
+/// evidence on its edges, and the shared properties on every item, took about
+/// a third of the worker heap on a large workspace (#578). Pass the result to
+/// [`crate::write_events`] or [`crate::emit_events`], which restore both as
+/// they emit each event, so the event stream is the same as for
+/// [`scan_with_options`]. [`crate::write_events_with_encoding`] can instead
+/// keep both out of the stream with the `compact-evidence-v1` encoding.
 pub fn scan_with_options_for_emit(
     root: &Path,
     inventory_file: Option<&Path>,
@@ -308,7 +319,7 @@ fn scan_with_inventory_and_semantic_extractor(
     hir_mode: HirMode,
 ) -> Result<ScanResult> {
     let mut result = scan_with_shared_site_evidence(root, inventory, semantic_extractor, hir_mode)?;
-    result.unshare_site_evidence();
+    result.expand_evidence();
     Ok(result)
 }
 
@@ -646,9 +657,20 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 impl ScanResult {
-    /// Gives every site-linked edge that shares its site's evidence (empty
-    /// `evidence`) its own copy, as [`crate::write_events`] emits it.
-    pub(crate) fn unshare_site_evidence(&mut self) {
+    /// Restores the full evidence of every item, as [`crate::write_events`]
+    /// emits it: applies [`Self::evidence_property_defaults`] and gives every
+    /// site-linked edge that shares its site's evidence its own copy.
+    pub(crate) fn expand_evidence(&mut self) {
+        let defaults = std::mem::take(&mut self.evidence_property_defaults);
+        for site in &mut self.sites {
+            apply_evidence_property_defaults(&defaults, &mut site.evidence);
+        }
+        for edge in &mut self.edges {
+            apply_evidence_property_defaults(&defaults, &mut edge.evidence);
+        }
+        for diagnostic in &mut self.diagnostics {
+            apply_evidence_property_defaults(&defaults, &mut diagnostic.evidence);
+        }
         let site_evidence: HashMap<&str, &Vec<Evidence>> = self
             .sites
             .iter()
@@ -847,6 +869,7 @@ impl State {
             files,
             coverage,
             performance: Vec::new(),
+            evidence_property_defaults: vec![hir_evidence_property_defaults()],
         })
     }
 
