@@ -8263,3 +8263,78 @@ fn issue_578_rust_compact_evidence_is_decoded_before_validation() -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn issue_578_checkpoint_replay_bounds_compact_evidence_by_the_configured_budget() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    // A compact checkpoint whose restored evidence outgrows its own bytes:
+    // the profile declares one large evidence property default once, and the
+    // decoder inserts it into the site's evidence and the edge's copy.
+    let padding = "x".repeat(64 * 1024);
+    let mut events = issue_578_stream("rust", &root, true)?
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    for event in &mut events {
+        if event["event"] == "profile_declared" {
+            event["profile"]["properties"]["evidence_property_defaults"] = serde_json::json!([{
+                "extractor": "typescript-static",
+                "extractor_version": "0.1.0",
+                "properties": { "padding": padding },
+            }]);
+        }
+    }
+    let mut stream_bytes = 0;
+    for event in &events {
+        stream_bytes += serde_json::to_vec(event)?.len() + 1;
+    }
+    let spec = WorkerSpec {
+        adapter: AdapterKind::Rust,
+        program: OsString::from("depgraph-rust-worker"),
+        leading_args: Vec::new(),
+        display: "depgraph-rust-worker".to_owned(),
+        artifact_path: PathBuf::from("depgraph-rust-worker"),
+        runtime_requirement: None,
+        expected_version: None,
+        release_attested: false,
+        attested_rust_sysroot: None,
+    };
+    let replay = |max_protocol_bytes: usize| {
+        replay_analysis_checkpoint(
+            events.clone(),
+            &spec,
+            &root,
+            "scan-golden",
+            &ScanConfig {
+                max_protocol_line_bytes: MAX_EVENT_LINE_BYTES,
+                max_protocol_bytes,
+                ..ScanConfig::default()
+            },
+        )
+    };
+
+    // A budget that admits the checkpoint's bytes but not their restoration
+    // fails, although the default budget would have admitted both.
+    assert!(stream_bytes < ScanConfig::default().max_protocol_bytes);
+    let Err(error) = replay(stream_bytes) else {
+        panic!("restoration past the configured budget must fail");
+    };
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(&format!("would add more than {stream_bytes} bytes")),
+        "{error}"
+    );
+
+    // A budget that admits the restoration replays the decoded events.
+    let output = replay(4 * stream_bytes)?;
+    assert!(
+        output
+            .events
+            .iter()
+            .filter(|event| event["event"] == "edge_upsert")
+            .all(|event| event["edge"]["evidence"][0]["properties"]["padding"] == padding)
+    );
+    Ok(())
+}

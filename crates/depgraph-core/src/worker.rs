@@ -2777,7 +2777,9 @@ pub(crate) fn replay_analysis_checkpoint(
             bail!("analysis checkpoint exceeds the worker output budget");
         }
     }
-    let parsed = parse_events_preserving_prefix(
+    // The live worker path bounds compact evidence restoration by the
+    // configured protocol budget; a replay must use the same bound (#578).
+    let parsed = parse_events_with_expansion_limit(
         &bytes,
         scan_id,
         spec.adapter.name(),
@@ -2785,6 +2787,7 @@ pub(crate) fn replay_analysis_checkpoint(
         config.max_protocol_line_bytes,
         spec.expected_version.as_deref(),
         Some(spec.release_attested),
+        config.max_protocol_bytes,
     );
     if let Some(error) = parsed.error {
         bail!("analysis checkpoint validation failed: {error}");
