@@ -237,8 +237,8 @@ impl ToolCatalog {
                 Ok(ToolDefinition {
                     name: spec.name,
                     description: spec.description,
-                    input_schema: input_schema(spec),
-                    output_schema: output_schema(spec),
+                    input_schema: standardized(input_schema(spec)),
+                    output_schema: standardized(output_schema(spec)),
                     cli_actions: spec.cli_actions,
                     required_capabilities: spec.required_capabilities,
                     authorization: spec.authorization,
@@ -1411,6 +1411,13 @@ fn required_input_fields(tool_name: &str) -> &'static [&'static str] {
         "health_audit_get" => &["changed"],
         _ => &[],
     }
+}
+
+/// Advertised tool schemas use only standard `format` values (Issue #568).
+fn standardized(schema: Map<String, Value>) -> Map<String, Value> {
+    let mut value = Value::Object(schema);
+    crate::standardize_integer_formats(&mut value);
+    json_object(value)
 }
 
 fn json_object(value: Value) -> Map<String, Value> {

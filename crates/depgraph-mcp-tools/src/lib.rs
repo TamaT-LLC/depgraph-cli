@@ -115,6 +115,7 @@ pub use scalar::{
 };
 pub use schema::{
     AGENT_SCAN_OUTCOME_V2_SCHEMA_ID, CanonicalJsonError, MCP_TOOLS_SCHEMA_ID,
-    agent_scan_outcome_v2_schema, canonical_json_bytes, canonical_json_sha256,
-    canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    STANDARD_JSON_SCHEMA_FORMATS, agent_scan_outcome_v2_schema, canonical_json_bytes,
+    canonical_json_sha256, canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    standardize_integer_formats,
 };

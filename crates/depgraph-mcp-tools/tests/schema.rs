@@ -3,7 +3,9 @@ use std::{path::Path, process::Command};
 use depgraph_mcp_tools::{
     AgentArtifactId, AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary,
     AgentOperation, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath,
-    TaskAccepted, canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    STANDARD_JSON_SCHEMA_FORMATS, TaskAccepted, agent_scan_outcome_v2_schema, canonical_json_bytes,
+    canonical_schema_bytes, canonical_schema_sha256, mcp_tools_v1_schema,
+    standardize_integer_formats,
 };
 use serde_json::{Value, json};
 
@@ -1517,4 +1519,81 @@ fn issue_544_shared_schema_publishes_closed_import_evidence() {
         "AgentImportEvidence",
         json!({"specifier":"./a"}),
     );
+}
+
+fn schema_formats(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(format) = object.get("format").and_then(Value::as_str) {
+                found.push(format.to_owned());
+            }
+            for child in object.values() {
+                schema_formats(child, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                schema_formats(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn issue_568_shared_schemas_use_only_standard_formats() {
+    let scan_outcome = serde_json::to_value(agent_scan_outcome_v2_schema()).unwrap();
+    for (name, schema) in [
+        ("mcp tools v1", schema_value()),
+        ("scan outcome v2", scan_outcome),
+    ] {
+        let mut found = Vec::new();
+        schema_formats(&schema, &mut found);
+        for format in &found {
+            assert!(
+                STANDARD_JSON_SCHEMA_FORMATS.contains(&format.as_str()),
+                "{name} schema uses non-standard format {format:?}"
+            );
+        }
+    }
+    let coverage = &schema_value()["$defs"]["AgentCoverage"]["properties"]["resolved"];
+    assert_eq!(
+        coverage,
+        &json!({"type": "integer", "minimum": 0, "maximum": u64::MAX})
+    );
+}
+
+#[test]
+fn issue_568_integer_formats_become_equivalent_bounds() {
+    let mut value = json!({
+        "a": {"type": "integer", "format": "uint8", "minimum": 0},
+        "b": {"type": "integer", "format": "uint32", "minimum": 1},
+        "c": {"type": "integer", "format": "uint32", "minimum": 0, "maximum": 10_000},
+        "d": {"type": "integer", "format": "int64"},
+        "e": {"type": "string", "format": "date-time"},
+        "properties": {"format": {"type": "integer", "format": "uint16"}}
+    });
+    standardize_integer_formats(&mut value);
+    assert_eq!(
+        value,
+        json!({
+            "a": {"type": "integer", "minimum": 0, "maximum": 255},
+            "b": {"type": "integer", "minimum": 1, "maximum": u32::MAX},
+            "c": {"type": "integer", "minimum": 0, "maximum": 10_000},
+            "d": {"type": "integer", "minimum": i64::MIN, "maximum": i64::MAX},
+            "e": {"type": "string", "format": "date-time"},
+            "properties": {"format": {"type": "integer", "minimum": 0, "maximum": 65_535}}
+        })
+    );
+}
+
+#[test]
+fn issue_568_checked_in_scan_outcome_v2_schema_matches_the_generator() {
+    let bytes = canonical_json_bytes(&agent_scan_outcome_v2_schema()).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../schemas/depgraph-agent-scan-outcome-v2.schema.json");
+    if std::env::var_os("DEPGRAPH_UPDATE_SCHEMA_GOLDEN").is_some() {
+        std::fs::write(&path, &bytes).expect("update checked-in scan outcome schema");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }

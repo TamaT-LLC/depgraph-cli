@@ -959,6 +959,16 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Export selector | `graph_export`のselector解決失敗を依存一覧と同じ`SelectorResolutionFailure`のtag付きgraph query errorにし、`NOT_FOUND` / `no_matching_node`を返す |
 | Not in scope | `graph_cycles_list` / `graph_unresolved_list`のphase作業量、bounded query、lifecycle、repository操作の`ResourceExhausted`はdetailsなしのまま |
 
+## Issue #568 standard schema formats
+
+schemarsはRustの整数型から`format: "uint32"`などJSON Schema 2020-12にない値を出す。Ajvを使うMCP client（Claude Codeなど）は、tool一覧の取得時にこれを`unknown format "…" ignored`として1件ずつ警告していた（39 toolで1,134件）。
+
+| Area | Evidence |
+| --- | --- |
+| Normalization | `standardize_integer_formats`が`uint8` / `uint16` / `uint32` / `uint64` / `uint`と`int8`〜`int64` / `int`の`format`を外し、型の範囲を`minimum` / `maximum`で表す。既にある`minimum` / `maximum`（`NonZero`の1、basis pointの10,000など）は型の範囲より狭いので残す。受け付ける値の集合は変わらない |
+| Applied to | tool catalogの全input / output schema、shared schema `depgraph-mcp-tools-v1`、`depgraph-agent-scan-outcome-v2`。手書きのschema（health DTOなど）も同じ変換を通る |
+| Tests | catalogとshared schemaの全`format`がJSON Schema 2020-12の定義済み値であること、変換の境界（既存boundの保持、property名`format`を誤変換しないこと）、scan outcome v2 schemaのchecked-in fileと生成結果の一致 |
+
 ## Issue #292 acceptance mapping
 
 | Acceptance criterion | Evidence in this document |
