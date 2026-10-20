@@ -156,7 +156,6 @@ jobs:
 
   go-macos:
     if: false
-    if: ${{ !inputs.benchmark_only }}
     runs-on: macos-15
     env:
       GOTOOLCHAIN: local
@@ -309,7 +308,6 @@ jobs:
 
   compiler-precise-hostile:
     if: false
-    if: ${{ !inputs.benchmark_only }}
     runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
