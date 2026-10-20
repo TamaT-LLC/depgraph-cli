@@ -2695,6 +2695,31 @@ impl AgentPathResponse {
             steps,
         })
     }
+
+    #[must_use]
+    pub const fn from(&self) -> &AgentNode {
+        &self.from
+    }
+
+    #[must_use]
+    pub const fn to(&self) -> &AgentNode {
+        &self.to
+    }
+
+    #[must_use]
+    pub const fn path_found(&self) -> bool {
+        self.path_found
+    }
+
+    #[must_use]
+    pub const fn traversed_edges(&self) -> u64 {
+        self.traversed_edges
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> &[AgentPathStep] {
+        &self.steps
+    }
 }
 
 #[derive(Deserialize)]

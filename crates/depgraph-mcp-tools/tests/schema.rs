@@ -960,8 +960,10 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // and the AgentDependenciesOutput success envelope. Issue #544 adds AgentImportEvidence.
     // Issue #565 adds the AgentErrorDetails::Argument and ::QueryDiagnostic branches.
     // Issue #566 adds the agent_edges_list summary response and the AgentEdgesOutput
-    // success envelope. Issue #579 adds AgentAnalysisDegradation.
-    assert_eq!(objects, 208, "review newly added object schemas explicitly");
+    // success envelope. Issue #579 adds AgentAnalysisDegradation. Issue #566 also
+    // adds the graph_path_get summary and paths responses and the AgentPathOutput
+    // success envelope.
+    assert_eq!(objects, 211, "review newly added object schemas explicitly");
 }
 
 #[test]
@@ -1456,7 +1458,8 @@ fn issue_544_shared_schema_publishes_closed_import_evidence() {
     let binding = definitions
         .get("AgentImportBindingKind")
         .expect("AgentImportBindingKind definition");
-    assert_eq!(binding["enum"].as_array().map(Vec::len), Some(15));
+    // Issue #566 adds module_declaration.
+    assert_eq!(binding["enum"].as_array().map(Vec::len), Some(16));
     for name in definitions["AgentEvidence"]["properties"]
         .as_object()
         .expect("evidence properties")

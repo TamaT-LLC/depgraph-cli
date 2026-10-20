@@ -10,6 +10,7 @@ mod host_config;
 mod import_evidence;
 mod lifecycle;
 mod operation;
+mod path_detail;
 mod repository;
 mod response;
 mod scalar;
@@ -91,6 +92,7 @@ pub use operation::{
     TaskAccepted, TaskResultType, TasksNegotiation, UNBOUNDED_SCAN_DEADLINE_MS,
     UNBOUNDED_SCAN_RETAIN_UNTIL_MS,
 };
+pub use path_detail::{AgentPathOutput, AgentPathPathsResponse, AgentPathSummaryResponse};
 pub use repository::{
     AgentRepositoryIds, AgentRepositoryList, AgentRepositorySummary, MAX_AGENT_REPOSITORY_ITEMS,
 };

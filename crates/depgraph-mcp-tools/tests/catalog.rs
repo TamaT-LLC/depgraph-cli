@@ -602,6 +602,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
         fields,
         [
             "contract_version",
+            "detail",
             "environments",
             "from",
             "max_traversal",
@@ -616,7 +617,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
     assert_eq!(path.operation_behavior(), OperationBehavior::Immediate);
     assert_eq!(
         success_output_schema(path.output_schema())["properties"]["result"]["$ref"],
-        "#/$defs/AgentPathResponse"
+        "#/$defs/AgentPathOutput"
     );
 }
 

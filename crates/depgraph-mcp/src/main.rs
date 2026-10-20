@@ -39,7 +39,7 @@ use depgraph_mcp_tools::{
     AgentHealthAudit, AgentHealthExecution, AgentHealthFinding, AgentHealthFindingDetail,
     AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary, AgentId, AgentLocator,
     AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentOperationStatus,
-    AgentPathResponse, AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
+    AgentPathOutput, AgentPolicyAnnotation, AgentPolicyAnnotationLevel, AgentPolicyApiChange,
     AgentPolicyApiChangeKind, AgentPolicyEvaluationResponse, AgentPolicySeverity,
     AgentPolicySummary, AgentPolicyViolation, AgentProfilePlan, AgentRemediation,
     AgentRepositoryIds, AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary,
@@ -543,6 +543,8 @@ struct GraphPathArguments {
     environments: Vec<String>,
     #[serde(default)]
     max_traversal: Option<usize>,
+    #[serde(default)]
+    detail: AgentDependencyDetail,
 }
 
 #[derive(Deserialize)]
@@ -3685,7 +3687,10 @@ fn execute_catalog_read_tool(
                     .iter()
                     .map(|item| item.step.condition_text.as_str()),
             )?;
-            let result = AgentPathResponse::try_from(&found).map_err(contract_mapping_error)?;
+            // full keeps the legacy AgentPathResponse bytes; summary and paths are
+            // lighter projections of the same path (Issue #566).
+            let result = AgentPathOutput::project(&found, arguments.detail)
+                .map_err(contract_mapping_error)?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),

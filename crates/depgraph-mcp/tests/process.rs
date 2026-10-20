@@ -11128,3 +11128,113 @@ fn issue_579_dependency_lists_report_degraded_profiles_only_when_present() {
         mcp.finish();
     }
 }
+
+#[test]
+fn issue_566_path_detail_shrinks_the_path_and_mod_declarations_name_the_module() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_302_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let path_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "graph_path_get")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        path_tool["inputSchema"]["properties"]["detail"]["enum"],
+        json!(["paths", "summary", "full"])
+    );
+    let output = jsonschema::draft202012::new(&path_tool["outputSchema"]).unwrap();
+    let mut id = 2;
+    let mut path = |detail: Option<&str>| {
+        id += 1;
+        let mut arguments = json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "from": "id:node:a",
+            "to": "id:node:d"
+        });
+        if let Some(detail) = detail {
+            arguments["detail"] = json!(detail);
+        }
+        let result = interactive_tool_call(&mut mcp, id, "graph_path_get", arguments);
+        assert_eq!(result["isError"], false, "{detail:?}: {result}");
+        output.validate(&result["structuredContent"]).unwrap();
+        shared.validate(&result["structuredContent"]).unwrap();
+        assert_tool_text_matches_structured(&result);
+        result["structuredContent"].clone()
+    };
+
+    // full is the default and keeps the legacy bytes.
+    let legacy = path(None);
+    assert_eq!(path(Some("full")), legacy);
+    let full = &legacy["result"];
+    assert!(full.get("detail").is_none());
+    let steps = full["steps"].as_array().unwrap();
+    assert!(!steps.is_empty());
+
+    let summary = path(Some("summary"));
+    let summary = &summary["result"];
+    assert_eq!(summary["detail"], "summary");
+    assert_eq!(summary["from"], full["from"]);
+    assert_eq!(summary["to"], full["to"]);
+    assert_eq!(summary["path_found"], true);
+    assert_eq!(summary["common"]["phase"], "semantic", "{summary}");
+    let summary_steps = summary["steps"].as_array().unwrap();
+    assert_eq!(summary_steps.len(), steps.len());
+    for (light, heavy) in summary_steps.iter().zip(steps) {
+        assert_eq!(light["id"], heavy["edge"]["id"]);
+        assert_eq!(light["kind"], heavy["edge"]["kind"]);
+        assert_eq!(light["evidence_count"], 1);
+        assert!(light.get("evidence").is_none(), "{light}");
+    }
+
+    let paths = path(Some("paths"));
+    let paths = &paths["result"];
+    assert_eq!(paths["detail"], "paths");
+    let path_steps = paths["steps"].as_array().unwrap();
+    assert_eq!(path_steps.len(), steps.len());
+    assert_eq!(path_steps[0]["source_path"], "src/a.rs", "{paths}");
+    assert_eq!(
+        path_steps.last().unwrap()["target_path"],
+        "src/d.rs",
+        "{paths}"
+    );
+    assert!(
+        serde_json::to_string(paths).unwrap().len() < serde_json::to_string(full).unwrap().len()
+    );
+    mcp.finish();
+
+    // `mod model;` evidence names the declared module.
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_566_store(&store_path, &root);
+    let site = call_issue_300_tool(
+        &root,
+        &store_path,
+        "agent_sites_list",
+        json!({"contract_version": "depgraph-mcp-tools-v1", "site_id": "site:mod"}),
+    );
+    assert_eq!(site["isError"], false, "{site}");
+    assert_eq!(
+        site["structuredContent"]["result"]["items"][0]["evidence"][0]["import"],
+        json!({
+            "specifier": "src/model.rs",
+            "binding_kind": "module_declaration"
+        })
+    );
+}

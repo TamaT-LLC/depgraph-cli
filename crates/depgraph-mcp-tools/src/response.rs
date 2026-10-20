@@ -91,6 +91,7 @@ public_result!(
     AgentNode,
     AgentNodeSummary,
     AgentPathResponse,
+    crate::AgentPathOutput,
     AgentPathStep,
     AgentProfilePlan,
     AgentRuntimeOutcome,

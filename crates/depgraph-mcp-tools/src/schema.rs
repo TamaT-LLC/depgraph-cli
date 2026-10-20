@@ -14,13 +14,14 @@ use crate::{
     AgentEdgesSummaryResponse, AgentEvidence, AgentGraphExportResponse, AgentHealthAudit,
     AgentHealthFinding, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
     AgentHealthSummary, AgentImpact, AgentImpactResponse, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathResponse, AgentPathStep,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentQueryValue,
-    AgentRepositoryInitOutcome, AgentRepositoryList, AgentRepositorySummary, AgentRuntimeOutcome,
-    AgentRuntimeTraceEvent, AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2,
-    AgentSite, AgentSnapshot, AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest,
-    DurableSubmitResult, ErrorEnvelope, OperationAccepted, Page, PageRequest,
-    PortableTerminalOutput, SnapshotSelector, SuccessEnvelope, TaskAccepted,
+    AgentNodeSummary, AgentOperation, AgentPathOutput, AgentPathPathsResponse, AgentPathResponse,
+    AgentPathStep, AgentPathSummaryResponse, AgentPolicyEvaluationResponse, AgentProfilePlan,
+    AgentQueryRow, AgentQueryValue, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRepositorySummary, AgentRuntimeOutcome, AgentRuntimeTraceEvent,
+    AgentRuntimeValidationResponse, AgentScanOutcome, AgentScanOutcomeV2, AgentSite, AgentSnapshot,
+    AgentSnapshotDiffResponse, AgentUnresolved, CommonRequest, DurableSubmitResult, ErrorEnvelope,
+    OperationAccepted, Page, PageRequest, PortableTerminalOutput, SnapshotSelector,
+    SuccessEnvelope, TaskAccepted,
 };
 
 pub const MCP_TOOLS_SCHEMA_ID: &str =
@@ -148,6 +149,10 @@ impl JsonSchema for McpToolsV1Schema {
             generator.subschema_for::<AgentEdgesOutput>(),
             generator.subschema_for::<AgentEdgesSummaryResponse>(),
             generator.subschema_for::<AgentEdgeDetail>(),
+            generator.subschema_for::<SuccessEnvelope<AgentPathOutput>>(),
+            generator.subschema_for::<AgentPathOutput>(),
+            generator.subschema_for::<AgentPathSummaryResponse>(),
+            generator.subschema_for::<AgentPathPathsResponse>(),
         ];
         json_schema!({
             "$id": MCP_TOOLS_SCHEMA_ID,

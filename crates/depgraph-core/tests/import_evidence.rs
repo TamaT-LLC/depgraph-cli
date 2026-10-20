@@ -255,6 +255,40 @@ fn site_specifier_only_fallback_covers_syntax_and_go_import_sites() {
     }
     assert!(project_import_evidence(&empty, Some(ImportSiteHint::new("import", None))).is_none());
     assert!(project_import_evidence(&empty, None).is_none());
+
+    // Issue #566: `mod name;` binds the declared module in the declaring file.
+    let module = project_import_evidence(
+        &empty,
+        Some(ImportSiteHint::new(
+            "module_declaration",
+            Some("profile_selection"),
+        )),
+    )
+    .expect("a module declaration is import evidence");
+    assert_eq!(module.specifier(), "profile_selection");
+    assert_eq!(
+        module.binding_kind(),
+        Some(ImportBindingKind::ModuleDeclaration)
+    );
+    assert_eq!(module.local_name(), Some("profile_selection"));
+    assert_eq!(module.imported_name(), None);
+    assert!(!module.type_only());
+    assert!(
+        project_import_evidence(
+            &empty,
+            Some(ImportSiteHint::new("module_declaration", None))
+        )
+        .is_none()
+    );
+    let path_like = project_import_evidence(
+        &empty,
+        Some(ImportSiteHint::new(
+            "module_declaration",
+            Some("src/model.rs"),
+        )),
+    )
+    .expect("a path-like module declaration keeps its specifier");
+    assert_eq!(path_like.local_name(), None);
 }
 
 #[test]
