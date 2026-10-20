@@ -22,7 +22,8 @@ jobs:
        github.event.workflow_run.head_branch == 'v0.6.2' ||
        github.event.workflow_run.head_branch == 'v0.6.3' ||
        github.event.workflow_run.head_branch == 'v0.6.4' ||
-       github.event.workflow_run.head_branch == 'v0.7.0')
+       github.event.workflow_run.head_branch == 'v0.7.0' ||
+       github.event.workflow_run.head_branch == 'v0.7.1')
     runs-on: ubuntu-24.04
     permissions:
       actions: write
@@ -58,7 +59,9 @@ jobs:
           V0_6_3_RELEASE_SOURCE_SHA: 21434e0e7a603d866f5fb677b087b9d193dae931
           V0_6_4_RELEASE_TAG: v0.6.4
           V0_6_4_RELEASE_SOURCE_SHA: 35c3edea133b7f5a0cd269edd945776d9db9e7f2
-          STABLE_RELEASE_TAG: v0.7.0
+          V0_7_0_RELEASE_TAG: v0.7.0
+          V0_7_0_RELEASE_SOURCE_SHA: defa669857aaa026d8aca445ce742484e1ffcc00
+          STABLE_RELEASE_TAG: v0.7.1
           STABLE_MAINTENANCE_REF: heads/release/0.7
           STABLE_MAIN_REF: heads/main
           STABLE_BASELINE_STATUS: maintenance-ref-pinned
@@ -135,6 +138,8 @@ jobs:
             historical_source_sha="$V0_6_3_RELEASE_SOURCE_SHA"
           elif [[ "$RELEASE_TAG" == "$V0_6_4_RELEASE_TAG" ]]; then
             historical_source_sha="$V0_6_4_RELEASE_SOURCE_SHA"
+          elif [[ "$RELEASE_TAG" == "$V0_7_0_RELEASE_TAG" ]]; then
+            historical_source_sha="$V0_7_0_RELEASE_SOURCE_SHA"
           fi
           if [[ -n "$historical_source_sha" &&
                 "$RELEASE_SOURCE_SHA" == "$historical_source_sha" ]]; then
