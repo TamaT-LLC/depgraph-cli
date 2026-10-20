@@ -3668,8 +3668,10 @@ pub(crate) fn agent_node_from_fields(
     display_name: &str,
     properties: &serde_json::Value,
 ) -> Result<AgentNode, ContractBuildError> {
-    // Rust file nodes record their path only in the `file:<path>` locator, so a
-    // file node without a path property falls back to it (Issue #566).
+    // A file node without a path property falls back to its `file:<path>`
+    // locator (Issue #566). The Rust worker records `path` since Issue #577,
+    // but Stores scanned by older Rust workers and Go file nodes still carry
+    // the path only in the locator.
     let locator_path = (kind == "file")
         .then(|| locator.strip_prefix("file:"))
         .flatten()

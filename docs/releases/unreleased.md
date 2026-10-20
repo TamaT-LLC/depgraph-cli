@@ -17,6 +17,23 @@ MCP ツールのエラー応答 `error.details` に、原因を特定できる�
 `depgraph-mcp-tools` crate の型で応答を `deny_unknown_fields` 付きで Deserialize している利用者は、追加された要素を受け取るために crate を更新する。
 存在しないパスを渡したときに `INVALID_ARGUMENT` を前提としていた利用者は、`NOT_FOUND` も扱う。
 
+## Rust の file node にリポジトリ相対パスを持たせる
+
+Rust worker が出す file node（`include!` 由来を含む）と `include_str!` / `include_bytes!` 由来の asset node に、リポジトリ相対パスの `path` property を記録する。crate root の module node にも、他の module node と同じく宣言元ファイルの `source_path` を記録する（[#577](https://github.com/TamaT-LLC/depgraph-cli/issues/577)）。
+これまで Rust の file のパスは locator `file:<path>` と表示名にしかなく、property からパスを読む core の health 解析では、パスのないノードとして扱われていた。
+
+- `depgraph hotspots` と MCP の `health_hotspots_list` で、Rust の file と crate root の module の finding に `location` が付く。`--path-prefix` / `path_prefixes` で Rust のファイルを絞り込めるようになる（従来は 0 件だった）。
+- Git churn が Rust のファイルと crate root の module に対応付けられ、hotspot の `git_churn` layer に反映される（従来は 0）。
+- `unused-file` の finding に `location` が付く。
+- MCP の `agent_node_get` の `repository_path` と、依存一覧 `detail: "paths"` のパスは、`path` property から取る。
+
+互換性:
+
+- churn layer は rank 正規化なので、Rust のファイルだけでなく、Rust を含むワークスペースのほぼすべての hotspot の score と順位が変わる。hotspot の fingerprint は score と `location` を含むため、あわせて変わる。finding ID は変わらない。
+- Rust の `unused-file` の fingerprint は、`location` が付くため変わる。finding ID は変わらない。
+- 変化は Rust を再 scan した snapshot にだけ現れる。既存の snapshot は再 scan するまで従来のままで、Store の移行は不要。hotspot や `unused-file` の fingerprint を baseline に保存している場合は、再 scan 後に baseline を作り直す。
+- MCP 層の locator `file:<path>` からのパスの補完（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）は残す。再 scan していない Store と、`path` property を持たない Go の file node が引き続き使う。
+
 ## 追加機能
 
 - MCP の `agent_edges_list` に、辺種別の許可リスト `edge_kinds` と出力粒度 `detail`（`summary` / `full`、既定 `full`）を追加する。`summary` は evidence 本体を省き、ページ内で共通の `phase` / `profile_id` などを `common` に 1 回だけ出し、各辺に `site_id` と `evidence_count` を残す。`agent_sites_list` に `site_id` を追加し、1 件の site を ID で取得できるようにする。どちらも省略時の応答と cursor は従来と同じ（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）。
