@@ -22,9 +22,30 @@ back to the current working directory only when the store has no attempt;
 `--root PATH` selects it explicitly. Worker `available`, version, protocol,
 and integrity describe an isolated artifact handshake and therefore do not
 change with the invoking directory. `root_launch_allowed` and
-`root_launch_error` separately report whether that artifact may be launched
+`root_launch_blocked_reason` separately report whether that artifact may be launched
 for the diagnostic root, preserving the development-artifact-inside-root
 security boundary.
+
+Each worker also says how it was checked and what that means for a scan.
+These fields are additive; the existing fields keep their meaning.
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `resolution` | `release-manifest`, `environment-override`, `development-build`, `unresolved` | The route used to locate the worker. A scan started from the same installation uses the same route. |
+| `artifact` | for example `libexec/depgraph-rust-worker` | Release-relative path of the verified worker. Present only for `release-manifest`. |
+| `runtime_requirement` | `Node.js >=24.0.0` | External runtime the Web worker needs. |
+| `unavailable_reason` | `release-verification-failed`, `override-unreadable`, `not-found`, `probe-suppressed`, `runtime-unavailable`, `runtime-requirement-unmet`, `integrity-mismatch`, `handshake-failed` | The check that made `available` false. Absent when the worker is available. |
+| `root_launch_blocked_reason` | `worker-unavailable`, `artifact-inside-root`, `runtime-unavailable`, `artifact-missing`, `launch-policy-violation` | The check that made `root_launch_allowed` false. |
+| `scan_impact` | `worker-used`, `adapter-units-fail`, `scan-security-failed` | What a scan of a repository that needs this adapter gets: the worker runs, that adapter's units fail, or the scan stops as `security_failed`. |
+| `diagnostic`, `remediation` | fixed text | A path-free explanation of the decision and the next step. |
+
+The MCP server (`doctor_get`) and the operation runner that executes
+`scan_submit` locate workers through the same release manifest as the core.
+Each of them accepts its own executable only when the manifest attests it by
+path and checksum. The Web worker's Node.js is resolved from the `PATH` of the
+process that runs depgraph. For MCP, that is the Agent host's environment, so
+`doctor_get` can report `runtime-requirement-unmet` even when a terminal
+`depgraph doctor` reports the Web worker as available.
 
 ## Bounded interactive queries
 

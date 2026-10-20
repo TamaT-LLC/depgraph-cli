@@ -1131,6 +1131,63 @@ fn lifecycle_agent_schemas_are_closed_and_prohibit_sensitive_doctor_fields() {
     let doctor_validator = validator_for("Doctor");
     assert!(doctor_validator.is_valid(&doctor));
 
+    // #569: the worker explains how it was located, why it is unavailable,
+    // and what a scan gets from it, without exposing paths or raw errors.
+    let mut explained = doctor.clone();
+    explained["workers"] = json!([
+        {
+            "adapter":"rust",
+            "available":true,
+            "integrity":"verified",
+            "root_launch_allowed":true,
+            "resolution":"release-manifest",
+            "artifact":"libexec/depgraph-rust-worker",
+            "scan_impact":"worker-used",
+            "diagnostic":"the worker was located",
+            "remediation":"no action is needed"
+        },
+        {
+            "adapter":"web",
+            "available":false,
+            "integrity":"verified",
+            "root_launch_allowed":true,
+            "resolution":"release-manifest",
+            "artifact":"libexec/depgraph-web-worker.mjs",
+            "runtime_requirement":"Node.js >=24.0.0",
+            "unavailable_reason":"runtime-requirement-unmet",
+            "scan_impact":"adapter-units-fail",
+            "diagnostic":"the node executable does not satisfy the requirement",
+            "remediation":"put Node.js 24 or newer first on PATH"
+        },
+        {
+            "adapter":"go",
+            "available":false,
+            "integrity":"unavailable",
+            "root_launch_allowed":false,
+            "resolution":"unresolved",
+            "unavailable_reason":"release-verification-failed",
+            "root_launch_blocked_reason":"worker-unavailable",
+            "scan_impact":"scan-security-failed",
+            "diagnostic":"release verification failed",
+            "remediation":"reinstall the depgraph release"
+        }
+    ]);
+    assert!(doctor_validator.is_valid(&explained));
+    for (field, value) in [
+        ("resolution", "path-search"),
+        ("unavailable_reason", "unknown"),
+        ("root_launch_blocked_reason", "unknown"),
+        ("scan_impact", "maybe"),
+        ("artifact", "/private/libexec/depgraph-rust-worker"),
+    ] {
+        let mut invalid = explained.clone();
+        invalid["workers"][0][field] = json!(value);
+        assert!(
+            !doctor_validator.is_valid(&invalid),
+            "doctor worker schema accepted {field}={value}"
+        );
+    }
+
     let invalidation_summary = json!({
         "schema_version": "incremental-plan-v2",
         "mode": "scoped_replacement",

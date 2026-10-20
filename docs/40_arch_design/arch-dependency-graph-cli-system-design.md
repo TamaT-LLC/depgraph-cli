@@ -1382,6 +1382,18 @@ Issue #265ではworker artifact自体のhealthと、特定repository rootに対�
 
 artifact health probeは新規のrepository外temporary rootとneutral working directoryから、sanitized environment、5秒timeout、64 KiB stdout/stderr上限、process-tree reapを維持して`--version` handshakeを実行する。`available`、`version`、`protocol`、`integrity`、`error`はこのartifact probeだけを表す。実scan rootに対するdevelopment artifact confinementは実行せずに別途検証し、`root_launch_allowed` / `root_launch_error`へ出力する。したがってdepgraph source tree内のdevelopment workerもartifact healthはgreenになり得る一方、そのsource tree自体をdiagnostic rootへ指定した場合は従来どおり`development worker artifact ... is inside the scan root`でlaunchを拒否する。release archive workerは既存のmanifest、checksum、handshake attestationを変更しない。
 
+Issue #569では、worker の判定経路と scan への影響を doctor の各 worker に追加した。
+`resolution`（`release-manifest` / `environment-override` / `development-build` / `unresolved`）は worker を見つけた経路を示し、release では release root からの相対パス `artifact` を添える。
+`unavailable_reason` と `root_launch_blocked_reason` は、`available` と `root_launch_allowed` を false にした検査を固定のコードで示す。
+`scan_impact`（`worker-used` / `adapter-units-fail` / `scan-security-failed`）は、その adapter を必要とする scan がどうなるかを示す。
+Agent 向けの射影には固定文の `diagnostic` と `remediation` だけを出し、生の error と絶対パスは引き続き出さない。
+
+release の worker 検証は、実行中の executable が manifest の core と一致することを要求していた。
+MCP server は `doctor_get` を自分のプロセスで、operation runner は `scan_submit` の scan を自分のプロセスで実行するため、どちらも全 worker を `security policy violation` で見つけられなかった。
+一方、`mcp setup` の safe scan は core を子プロセスで起動するので完了し、doctor と scan の結果が食い違っていた。
+現在は、manifest が `mcp_server`（`bin/depgraph-mcp`）と `operation_runner`（`libexec/depgraph-operation-runner`）を固定パスと checksum で attest している場合に限り、それらも実行中の executable として受け入れる。
+attest されていない executable と checksum が合わない executable は従来どおり fail closed にする。
+
 ## 14. CLI UX
 
 ```text
@@ -2053,6 +2065,7 @@ digest、ref/tag検証、PR記録項目、patch release時も変わらないance
 
 ## 26. 更新履歴
 
+- 2026-10-20: Issue #569として、MCP server と operation runner から release の worker を検証できるようにし、doctor の worker に `resolution`、`unavailable_reason`、`root_launch_blocked_reason`、`scan_impact` などの判定理由を追加した（§13.11）。
 - 2026-10-16: framework semantic graph v1へcode link `implemented_by`（`component` / `server_function` -> `typescript_definition_id`の`symbol`、0または1件）と`declared_in`（同 -> 宣言`file`、ちょうど1件）を追加した。semantic routeから`renders`の先が実装symbolにも宣言fileにもつながらず、`why route:... -> external_system`が経路なしになり、`impact path:<file>`にrouteが出なかったため。site IDの衝突を避けるため別kindとし、`implemented_by`のfile fallbackは`declared_in`と重複するため廃止した。`resolved / exact`のみ、`route_entry`の向きは不変、occurrence kindはframework別に固定した（§7.5.1）。
 - 2026-09-07: Issue #467としてsnapshot-scoped health（`health` / `health list` / `cleanup` / `health_summary_get` / `health_findings_list`）の読み込み・集計をStore range単位へ事前分割した。
   plain入力（単一scan層）は`Store::resolve_health_input`と`Store::health_range_plan`が集計値だけで対象IDをrangeへ切り、range毎の読み込み・index構築・解析を従来どおりの1,000,000 step budgetで実行し、超過rangeは中央値で最大4回再分割する。

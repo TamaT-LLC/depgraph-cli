@@ -2938,6 +2938,81 @@ fn typescript_runtime_tree_is_confined_and_checksum_verified() -> Result<()> {
     Ok(())
 }
 
+/// #569: the MCP server answers `doctor_get` and the operation runner runs
+/// MCP-submitted scans in their own processes. Both must locate the same
+/// verified workers as the core, while an unattested executable in the
+/// release still fails closed.
+#[test]
+fn bundled_workers_are_located_from_every_attested_release_executable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let release = temp.path().join("release");
+    let test_release = write_test_release_manifest(&release, Vec::new(), Vec::new())?;
+    let mcp_path = format!("bin/{}", executable_name("depgraph-mcp"));
+    let runner_path = format!("libexec/{}", executable_name("depgraph-operation-runner"));
+    let mcp = write_manifest_artifact(&release, &mcp_path, b"verified mcp server")?;
+    let runner = write_manifest_artifact(&release, &runner_path, b"verified operation runner")?;
+    update_test_manifest(&test_release.manifest, |manifest| {
+        manifest["mcp_server"] = mcp;
+        manifest["operation_runner"] = runner;
+        Ok(())
+    })?;
+
+    for running in [
+        format!("bin/{}", executable_name("depgraph")),
+        mcp_path.clone(),
+        runner_path.clone(),
+    ] {
+        for adapter in [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web] {
+            let spec = locate_verified_bundled_worker_for_executable(
+                adapter,
+                &test_release.manifest,
+                Some(&release.join(&running)),
+            )
+            .with_context(|| format!("{} worker from {running}", adapter.name()))?;
+            assert!(spec.expected_version.is_some(), "{running}");
+        }
+    }
+
+    let unattested = release.join(format!("bin/{}", executable_name("depgraph-copy")));
+    std::fs::write(&unattested, b"verified core")?;
+    let error = locate_verified_bundled_worker_for_executable(
+        AdapterKind::Go,
+        &test_release.manifest,
+        Some(&unattested),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("attested release companion"));
+    assert!(is_security_error(&error.to_string()));
+
+    std::fs::write(release.join(&mcp_path), b"tampered mcp server")?;
+    let tampered = locate_verified_bundled_worker_for_executable(
+        AdapterKind::Go,
+        &test_release.manifest,
+        Some(&release.join(&mcp_path)),
+    )
+    .unwrap_err();
+    assert!(tampered.to_string().contains("checksum mismatch"));
+    assert!(is_security_error(&tampered.to_string()));
+
+    // A manifest without the companion entries keeps the core-only check.
+    update_test_manifest(&test_release.manifest, |manifest| {
+        let object = manifest
+            .as_object_mut()
+            .context("test manifest is not an object")?;
+        object.remove("mcp_server");
+        object.remove("operation_runner");
+        Ok(())
+    })?;
+    let legacy = locate_verified_bundled_worker_for_executable(
+        AdapterKind::Go,
+        &test_release.manifest,
+        Some(&release.join(&runner_path)),
+    )
+    .unwrap_err();
+    assert!(is_security_error(&legacy.to_string()));
+    Ok(())
+}
+
 #[test]
 fn bundled_release_requires_exactly_one_of_each_worker() -> Result<()> {
     let temp = tempfile::tempdir()?;
