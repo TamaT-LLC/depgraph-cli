@@ -3564,3 +3564,70 @@ fn syntax_only_import_evidence_records_the_target_binding_and_alias() {
         serde_json::json!({"target_specifier": "alloc", "alias": "heap"})
     );
 }
+
+#[test]
+fn issue_577_file_asset_and_crate_root_nodes_record_their_repository_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("paths");
+    write_minimal_crate(
+        &root,
+        "paths",
+        "pub mod model;\npub const DATA: &str = include_str!(\"data.txt\");\n",
+    );
+    fs::write(root.join("src/model.rs"), "pub struct Thing;\n").unwrap();
+    fs::write(root.join("src/data.txt"), "payload").unwrap();
+
+    let result = scan(&root).unwrap();
+
+    let located: Vec<_> = result
+        .nodes
+        .iter()
+        .filter(|node| node.locator.starts_with("file:"))
+        .collect();
+    for expected in ["src/lib.rs", "src/model.rs", "src/data.txt"] {
+        assert!(
+            located
+                .iter()
+                .any(|node| node.locator == format!("file:{expected}")),
+            "missing file node {expected}: {located:?}"
+        );
+    }
+    // core health (hotspot location, churn, path prefixes, unused-file
+    // locations) and the Agent DTO read the path from properties only.
+    for node in &located {
+        assert_eq!(
+            node.properties.get("path").and_then(|path| path.as_str()),
+            node.locator.strip_prefix("file:"),
+            "{} {} must carry its repository-relative path",
+            node.kind,
+            node.locator
+        );
+    }
+    let asset = located
+        .iter()
+        .find(|node| node.locator == "file:src/data.txt")
+        .unwrap();
+    assert_eq!(asset.kind, "asset");
+    assert_eq!(asset.properties["included_by_macro"], "include_str");
+
+    let crate_root = result
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == "module"
+                && node.properties.get("crate_root") == Some(&serde_json::json!(true))
+        })
+        .unwrap();
+    // A module's `source_path` is the file that declares it: the crate root
+    // declares itself, and `mod model;` is declared in `src/lib.rs`.
+    assert_eq!(crate_root.properties["source_path"], "src/lib.rs");
+    let child = result
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == "module"
+                && node.properties.get("canonical_module_path") == Some(&serde_json::json!("model"))
+        })
+        .unwrap();
+    assert_eq!(child.properties["source_path"], "src/lib.rs");
+}
