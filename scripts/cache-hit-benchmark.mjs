@@ -17,6 +17,18 @@ export const CACHE_HIT_FIXTURE_SIZES = Object.freeze({
   large: 10_000,
 });
 
+// This immutable release authorization applies only to v0.7.1 and only to
+// the small-fixture timing floor. Measurements and graph/reuse checks stay intact.
+function authorizedOwnerWaiver(report) {
+  const version = jsonFile(new URL("../npm/depgraph/package.json", import.meta.url)).version;
+  if (version !== "0.7.1" || report.minimum_improvement_percent !== 5 || report.passed !== false
+    || !/^[0-9a-f]{40}$/u.test(report.commit)
+    || !report.comparisons.every((comparison) => comparison.passed || comparison.size === "small")) {
+    return null;
+  }
+  return jsonFile(new URL("../docs/releases/v0.7.1-owner-waiver.json", import.meta.url));
+}
+
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -258,6 +270,8 @@ export function createCacheHitReport({ rawDir, output }) {
     comparisons,
     passed: comparisons.every((comparison) => comparison.passed),
   };
+  const waiver = authorizedOwnerWaiver(report);
+  if (waiver) report.owner_waiver = waiver;
   verifyCacheHitReport(report, process.env.GITHUB_SHA);
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);
@@ -273,6 +287,7 @@ export function verifyCacheHitReport(report, expectedCommit) {
       "minimum_improvement_percent",
       "comparisons",
       "passed",
+      ...(Object.hasOwn(report, "owner_waiver") ? ["owner_waiver"] : []),
     ])
     || report.schema_version !== CACHE_HIT_REPORT_SCHEMA_VERSION
     || !Number.isFinite(Date.parse(report.generated_at))
@@ -338,7 +353,11 @@ export function verifyCacheHitReport(report, expectedCommit) {
   }
   if (
     report.passed !== report.comparisons.every((comparison) => comparison.passed)
-    || !report.passed
+    || (!report.passed && (
+      !report.owner_waiver
+      || JSON.stringify(report.owner_waiver) !== JSON.stringify(authorizedOwnerWaiver(report))
+    ))
+    || (report.passed && Object.hasOwn(report, "owner_waiver"))
   ) {
     throw new Error("cache hit report performance gate failed");
   }
@@ -354,16 +373,21 @@ function main(argv) {
     });
     for (const comparison of report.comparisons) {
       process.stdout.write(
-        `PASS cache ${comparison.size}: hit ${comparison.hit_median_ms} ms, `
+        `${comparison.passed ? "PASS" : "WAIVED"} cache ${comparison.size}: hit ${comparison.hit_median_ms} ms, `
         + `bypass ${comparison.bypass_median_ms} ms, `
         + `improvement ${comparison.improvement_percent}%\n`,
       );
     }
-    if (!report.passed) process.exitCode = 1;
+    if (report.owner_waiver) {
+      process.stdout.write("OWNER WAIVER v0.7.1: small-cache-hit-performance; measured report.passed remains false\n");
+    }
+    if (!report.passed && !report.owner_waiver) process.exitCode = 1;
     return;
   }
   if (command === "verify" && rest.length === 1) {
-    verifyCacheHitReport(jsonFile(rest[0]), process.env.GITHUB_SHA);
+    const report = jsonFile(rest[0]);
+    verifyCacheHitReport(report, process.env.GITHUB_SHA);
+    if (report.owner_waiver) process.stdout.write("OWNER WAIVER v0.7.1: measured cache performance did not pass\n");
     process.stdout.write(`verified cache hit benchmark report: ${rest[0]}\n`);
     return;
   }

@@ -1,0 +1,20 @@
+{
+  "schema_version": "depgraph-owner-release-waiver-v1",
+  "release_version": "0.7.1",
+  "scope": [
+    "small-cache-hit-performance"
+  ],
+  "authorization": {
+    "date": "2026-10-20",
+    "instruction": "全部バイパスしてリリースまでやっていいよ"
+  },
+  "prior_candidate": "d6bde867c9f081f3c2011aa9c40c5828b832a102",
+  "failed_full_ci": {
+    "run_id": 39405142381,
+    "attempts": [
+      1,
+      3
+    ]
+  },
+  "reason": "The small cache-hit improvement gate failed twice; the owner explicitly authorized release without this performance condition. Actual measurements and failed comparison flags remain unchanged."
+}
