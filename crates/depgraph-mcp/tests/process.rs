@@ -10260,6 +10260,12 @@ fn issue_581_argument_and_limit_errors_name_the_argument_and_the_bound() {
             "site_id",
         ),
         ("agent_node_get", json!({"node_id": "not an id"}), "node_id"),
+        ("graph_unresolved_list", json!({"kinds": [""]}), "kinds"),
+        (
+            "graph_unresolved_list",
+            json!({"kinds": ["bad\nkind"]}),
+            "kinds",
+        ),
         (
             "agent_edges_list",
             json!({"node_id": "not an id"}),

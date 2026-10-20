@@ -3793,10 +3793,11 @@ fn execute_catalog_read_tool(
                     AgentArgumentReason::TooManyItems,
                 ));
             }
-            let request = UnresolvedRequest::try_new(
-                arguments.kinds,
-                graph_max_traversal(arguments.max_traversal)?,
-            )?;
+            // max_traversal is range-checked first, so what try_new still
+            // rejects is a kinds item (empty, too long, or a control character).
+            let max_traversal = graph_max_traversal(arguments.max_traversal)?;
+            let request = UnresolvedRequest::try_new(arguments.kinds, max_traversal)
+                .map_err(|_| invalid_argument(Some("kinds"), AgentArgumentReason::InvalidValue))?;
             let locator = parse_snapshot_argument(
                 arguments.snapshot.as_deref().unwrap_or("current"),
                 "snapshot",
