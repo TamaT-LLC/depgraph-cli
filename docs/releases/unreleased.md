@@ -23,7 +23,7 @@ Go worker が出す file node（通常の Go ソース、アセンブリ、`//go
 - `unused-file` の finding に `location` が付く。
 - Go の file も Rust / TypeScript と同じく、パスで entry point（`main.go`、`/cmd/` 配下）と生成物（`/generated/` 配下など）に分類される。該当するファイルの `unused-file` には `entry-point` / `generated-artifact` の blocker が付く。
 - file node の `manifest_path` は残す。依存の health 解析は引き続き `manifest_path` から所属する `go.mod` を引く。
-- Go の package（node kind `module`）は変えない。package はディレクトリで、宣言元の 1 ファイルがないため、hotspot の `location` と churn は従来どおり `go.mod` になる。
+- Go の package（node kind `module`）の file node は持たない。package の hotspot の扱いは次の節（[#595](https://github.com/TamaT-LLC/depgraph-cli/issues/595)）で変える。
 
 互換性:
 
@@ -31,6 +31,22 @@ Go worker が出す file node（通常の Go ソース、アセンブリ、`//go
 - Go の `unused-file` は、finding ID と fingerprint の両方が変わる。finding ID の witness に、従来は locator `file:<path>` を、今後は `location` のパスを使うため。finding ID で suppression や baseline を管理している場合は、再 scan 後に付け直す。
 - 変化は Go を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot や `unused-file` の fingerprint を baseline に保存している場合は、再 scan 後に baseline を作り直す。
 - v0.7.1 で残した MCP 層の locator `file:<path>` からのパスの補完（[#566](https://github.com/TamaT-LLC/depgraph-cli/issues/566)）は、再 scan していない Store の file node が引き続き使う。
+
+## Go の package の hotspot を go.mod に結び付けない
+
+Go の package（node kind `module`、locator `go-package:<import path>`）の hotspot の `location` と Git churn を、所属する module の `go.mod` ではなく package のディレクトリに対応付ける（[#595](https://github.com/TamaT-LLC/depgraph-cli/issues/595)）。
+Go の package はディレクトリで、package node は `path` / `source_path` を持たず、所属する module の `manifest_path`（`go.mod`）だけを持つ。core の hotspot はパスがないと `manifest_path` を読むため、package の `location` と churn が `go.mod` になっていた。
+
+- `depgraph hotspots` と MCP の `health_hotspots_list` で、Go の package の finding の `location` が package のディレクトリ（package node の `relative_dir`。例: `internal/worker`）になる。module のルートの package（`relative_dir` が `.`）は `location` を持たない。`--path-prefix` / `path_prefixes` で package をディレクトリで絞り込めるようになる。
+- package の Git churn は、そのディレクトリ直下にある Go の file node（`_test.go` とアセンブリを含む）の churn の合計になる。サブディレクトリ（別の package）、`go.mod` / `go.sum` などの Go 以外のファイル、`//go:embed` の対象は数えない。Go の file node にパスがない snapshot（#591 より前の Go worker で scan したもの）では 0 になる。
+- package node の `manifest_path` は残す。Go worker の semantic 解析は引き続き `manifest_path` で package と `go.mod` を照合する。
+- 他の node の扱いは変えない。`manifest_path` へのフォールバックは、Go の package 以外（パスを持たない古い snapshot の Go の file node など）では従来どおり使う。Rust / npm の package（node kind `package_instance`）は hotspot の対象ではない。
+
+互換性:
+
+- churn layer は rank 正規化なので、Go の package だけでなく、Go を含むワークスペースの hotspot の score と順位が変わる。hotspot の fingerprint は score と `location` を含むため、あわせて変わる（Go の package は `location` が変わるので、score が同じでも fingerprint が変わる）。hotspot の finding ID は変わらない。
+- hotspot は問い合わせのたびに snapshot から計算するので、再 scan は要らない。更新後の CLI / MCP で既存の snapshot を問い合わせると反映される。package の churn に Go のファイルのパスを使うため、#591 の Go worker で再 scan した snapshot で集計される。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、作り直す。
+- `unused-file` などの unused 系の finding は変わらない（Go の package は unused 系の対象ではなく、unused 系の `location` は `manifest_path` を読まない）。
 
 ## 追加機能
 
