@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 pub use depgraph_store::CoverageRecord;
 use depgraph_store::{
@@ -849,7 +852,7 @@ impl DepgraphService {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
         let (items, total_items) = sites_page_items(
-            snapshot.sites,
+            &snapshot.sites,
             &snapshot.evidence,
             node_id,
             site_id,
@@ -879,7 +882,7 @@ impl DepgraphService {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
         let (items, total_items) = edges_page_items(
-            snapshot.edges,
+            &snapshot.edges,
             &snapshot.sites,
             &snapshot.evidence,
             node_id,
@@ -924,7 +927,7 @@ impl DepgraphService {
         &self,
         snapshot_id: &ResolvedSnapshotId,
         cancellation: &CancellationToken,
-    ) -> DepgraphServiceResult<depgraph_store::GraphSnapshot> {
+    ) -> DepgraphServiceResult<Arc<depgraph_store::GraphSnapshot>> {
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
@@ -937,9 +940,12 @@ impl DepgraphService {
                     let attempt_id = snapshot_id
                         .attempt_id()
                         .ok_or_else(|| anyhow::anyhow!("invalid partial attempt identity"))?;
-                    store.load_snapshot(attempt_id)
+                    store.load_snapshot(attempt_id).map(Arc::new)
                 } else {
-                    store.load_completed_snapshot(snapshot_id.as_str())
+                    // Completed snapshots are immutable, so a long-lived reader
+                    // may reuse one reconstruction while the store files are
+                    // unchanged (Issue #599).
+                    store.load_completed_snapshot_shared(snapshot_id.as_str())
                 }
             },
         );
@@ -984,7 +990,7 @@ fn site_evidence(
 /// sites on that page, so the cost grows with `limit` instead of with the
 /// number of sites in the snapshot.
 fn sites_page_items(
-    sites: Vec<depgraph_store::SiteRecord>,
+    sites: &[depgraph_store::SiteRecord],
     evidence: &[depgraph_store::EvidenceRecord],
     node_id: Option<&str>,
     site_id: Option<&str>,
@@ -992,7 +998,7 @@ fn sites_page_items(
     limit: usize,
 ) -> DepgraphServiceResult<(Vec<SiteProjection>, u64)> {
     let mut selected = sites
-        .into_iter()
+        .iter()
         .filter(|site| node_id.is_none_or(|id| site.source == id))
         .filter(|site| site_id.is_none_or(|id| site.id == id))
         .collect::<Vec<_>>();
@@ -1005,6 +1011,7 @@ fn sites_page_items(
     let evidence = EvidenceByOwner::new(evidence, "site", &owners);
     let items = page
         .into_iter()
+        .cloned()
         .map(|site| {
             let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
             let evidence = evidence.projections(&site.id, Some(hint));
@@ -1028,7 +1035,7 @@ fn sites_page_items(
 /// evidence only for the edges on that page.
 #[allow(clippy::too_many_arguments)]
 fn edges_page_items(
-    edges: Vec<depgraph_store::EdgeRecord>,
+    edges: &[depgraph_store::EdgeRecord],
     sites: &[depgraph_store::SiteRecord],
     evidence: &[depgraph_store::EvidenceRecord],
     node_id: &str,
@@ -1038,7 +1045,7 @@ fn edges_page_items(
     limit: usize,
 ) -> DepgraphServiceResult<(Vec<EdgeProjection>, u64)> {
     let mut selected = edges
-        .into_iter()
+        .iter()
         .filter(|edge| match direction {
             EdgeDirection::Incoming => edge.target == node_id,
             EdgeDirection::Outgoing => edge.source == node_id,
@@ -1066,6 +1073,7 @@ fn edges_page_items(
     let evidence = EvidenceByOwner::new(evidence, "edge", &owners);
     let items = page
         .into_iter()
+        .cloned()
         .map(|edge| {
             let hint = edge
                 .site_id
@@ -1449,7 +1457,7 @@ mod tests {
                     limit,
                 );
                 let actual = sites_page_items(
-                    fixture.sites.clone(),
+                    &fixture.sites,
                     &fixture.evidence,
                     node_id,
                     site_id,
@@ -1488,7 +1496,7 @@ mod tests {
                         limit,
                     );
                     let actual = edges_page_items(
-                        fixture.edges.clone(),
+                        &fixture.edges,
                         &fixture.sites,
                         &fixture.evidence,
                         "node:4",
@@ -1509,7 +1517,7 @@ mod tests {
         for site_count in [1_000, 20_000] {
             let fixture = fixture(site_count);
             let ((items, total_items), builds) = owner_evidence_builds(|| {
-                sites_page_items(fixture.sites, &fixture.evidence, None, None, 300, 100)
+                sites_page_items(&fixture.sites, &fixture.evidence, None, None, 300, 100)
                     .expect("sites page")
             });
             assert_eq!(items.len(), 100);
@@ -1518,7 +1526,7 @@ mod tests {
         }
         let fixture = fixture(1_000);
         let ((items, total_items), builds) = owner_evidence_builds(|| {
-            sites_page_items(fixture.sites, &fixture.evidence, None, None, 5_000, 100)
+            sites_page_items(&fixture.sites, &fixture.evidence, None, None, 5_000, 100)
                 .expect("sites page past the end")
         });
         assert!(items.is_empty());
@@ -1531,7 +1539,7 @@ mod tests {
         let fixture = fixture(20_000);
         let ((items, total_items), builds) = owner_evidence_builds(|| {
             edges_page_items(
-                fixture.edges,
+                &fixture.edges,
                 &fixture.sites,
                 &fixture.evidence,
                 "node:4",
