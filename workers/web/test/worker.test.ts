@@ -57,6 +57,34 @@ test("generated routes sharing a fullPath retain every occurrence without duplic
   assert.equal(sites(single)[0].evidence.length, 1);
 });
 
+test("route nodes shared by several files record the defining file as source_path", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "depgraph-route-source-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "next", "app"), { recursive: true });
+  await mkdir(path.join(root, "router", "src", "routes"), { recursive: true });
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "route-source", private: true, workspaces: ["next", "router"] }));
+  await writeFile(path.join(root, "next", "package.json"), JSON.stringify({ name: "next-app", dependencies: { next: "16.0.0" } }));
+  // Layout, loading and page all map to "/"; the page defines the route.
+  for (const file of ["layout.tsx", "loading.tsx", "page.tsx"]) {
+    await writeFile(path.join(root, "next", "app", file), "export default function View() { return null; }\n");
+  }
+  await writeFile(path.join(root, "router", "package.json"), JSON.stringify({ name: "router-app", dependencies: { "@tanstack/react-router": "1.0.0" } }));
+  // The file route and the generated route tree both describe "/about"; the
+  // generated tree only restates the route the file defines.
+  await writeFile(path.join(root, "router", "src", "routes", "about.tsx"), "export const value = 1;\n");
+  await writeFile(path.join(root, "router", "src", "routeTree.gen.ts"), "export interface Routes {\n  about: { fullPath: '/about' };\n}\n");
+  const result = await run("route-source", root);
+  assert.equal(result.events.at(-1)?.event, "scan_completed");
+  const routes = result.events
+    .filter((event) => event.event === "node_upsert" && event.node.kind === "route" && typeof event.node.properties.pattern === "string")
+    .map((event) => event.node);
+  const sourceOf = (framework: string, pattern: string) => routes
+    .filter((node) => node.properties.framework === framework && node.properties.pattern === pattern)
+    .map((node) => node.properties.source_path);
+  assert.deepEqual(sourceOf("next", "/"), ["next/app/page.tsx"]);
+  assert.deepEqual(sourceOf("tanstack-router", "/about"), ["router/src/routes/about.tsx"]);
+});
+
 test("worker emits deterministic protocol graph without executing project code", async () => {
   const markers = [
     new URL("./fixtures/polyglot/apps/next-app/NEXT_CONFIG_EXECUTED", import.meta.url),
@@ -153,6 +181,30 @@ test("worker emits deterministic protocol graph without executing project code",
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.endsWith("/shop/robots.txt")));
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.endsWith("/shop/photo/$slug*")));
   assert.ok(nodes.some((node) => node.kind === "route" && node.locator.endsWith("/shop/docs/$parts*?")));
+  // Issue #597: core health reads a route's location and Git churn from
+  // source_path, so every structural route records its repository-relative
+  // defining file, for each framework that shares the structural route node.
+  const structuralRoutes = nodes.filter((node) => node.kind === "route" && typeof node.properties.pattern === "string");
+  const filePaths = new Set(nodes.filter((node) => node.kind === "file").map((node) => node.properties.path));
+  assert.deepEqual(
+    [...new Set(structuralRoutes.map((node) => node.properties.framework))].sort(),
+    ["astro", "next", "tanstack-router", "tanstack-start"],
+  );
+  for (const route of structuralRoutes) {
+    assert.ok(filePaths.has(route.properties.source_path), `${route.locator} source_path=${route.properties.source_path}`);
+  }
+  const structuralSource = (framework: string, pattern: string) => structuralRoutes
+    .filter((node) => node.properties.framework === framework && node.properties.pattern === pattern)
+    .map((node) => node.properties.source_path)
+    .sort();
+  assert.deepEqual(structuralSource("next", "/shop/products/$id"), ["apps/next-app/src/app/(shop)/products/[id]/page.tsx"]);
+  assert.deepEqual(structuralSource("next", "/shop/about"), ["apps/next-app/src/pages/about.tsx"]);
+  assert.deepEqual(structuralSource("astro", "/docs/blog/$slug"), ["apps/astro-app/src/pages/blog/[slug].astro"]);
+  assert.deepEqual(structuralSource("astro", "/docs/api/status"), ["apps/astro-app/src/pages/api/status.ts"]);
+  assert.deepEqual(structuralSource("tanstack-router", "/router/posts"), ["apps/router/src/routes/posts.lazy.tsx"]);
+  assert.ok(structuralSource("tanstack-router", "/router/posts/$postId").includes("apps/router/src/routes/posts.$postId.tsx"));
+  assert.ok(structuralSource("tanstack-start", "/account/$accountId").includes("apps/start/src/routes/_authenticated.account.$accountId.tsx"));
+  assert.deepEqual(structuralSource("tanstack-start", "/"), ["apps/start/src/routes/_authenticated.tsx", "apps/start/src/routes/index.tsx"]);
   assert.deepEqual([...new Set(sites.map((site) => site.resolution_status))].sort(), ["candidates", "external", "resolved", "unresolved"]);
   assert.ok(sites.some((site) => site.kind === "type_import"));
   const sharedSemanticImport = sites.find((site) => (

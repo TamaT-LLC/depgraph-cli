@@ -262,9 +262,16 @@ func TestRunIssue437HealthFixtureEmitsRealSemanticGraph(t *testing.T) {
 			}
 			seenResolvers[resolver] = true
 			for property := range event.Node.Properties {
-				if property != "canonical_identity" && property != "language" && property != "package_locator" && property != "symbol_kind" && property != "type_kind" {
+				switch property {
+				case "canonical_identity", "language", "package_locator", "symbol_kind", "type_kind",
+					// The declaration site, in the same shape as Rust and Web (#596).
+					"source_path", "source_span":
+				default:
 					t.Fatalf("worker emitted synthetic semantic property %q on %q", property, resolver)
 				}
+			}
+			if path, _ := event.Node.Properties["source_path"].(string); !strings.HasSuffix(path, ".go") || strings.HasPrefix(path, "/") {
+				t.Fatalf("resolver %q source_path = %#v, want a root-relative Go file", resolver, event.Node.Properties["source_path"])
 			}
 		case "scan_completed":
 			seenCompleted = true

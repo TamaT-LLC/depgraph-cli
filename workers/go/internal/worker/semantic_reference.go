@@ -1,8 +1,11 @@
 package worker
 
 import (
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"sort"
 )
@@ -22,6 +25,9 @@ type goSemanticReferenceContext struct {
 	packageLocator string
 	moduleDir      string
 	structOwners   map[*types.Struct]*types.TypeName
+	// locations maps a declaration key (see goReferenceDeclarationLocations)
+	// to the span of its declaring identifier, as the owning unit records it.
+	locations map[string]goSemanticSourceSpanKey
 }
 
 // registerReferencePackages runs before any target context declares its own
@@ -47,6 +53,7 @@ func (e *goSemanticExtractor) registerReferencePackages() {
 			extractor: e, reference: reference, stub: stub,
 			packageLocator: goSemanticPackageLocator(stub),
 			moduleDir:      filepath.Clean(filepath.Join(e.state.root, filepath.FromSlash(cleanSlash(reference.ModuleRelativeDir)))),
+			locations:      goReferenceDeclarationLocations(e.state.root, reference.CompiledGoFiles),
 		}
 		context.declare()
 	}
@@ -74,15 +81,15 @@ func (c *goSemanticReferenceContext) declare() {
 			}
 		case *types.Func:
 			if typed.Exported() {
-				c.declareSymbol(typed, "function", resolver)
+				c.declareSymbol(typed, "function", resolver, name)
 			}
 		case *types.Var:
 			if typed.Exported() {
-				c.declareSymbol(typed, "variable", resolver)
+				c.declareSymbol(typed, "variable", resolver, name)
 			}
 		case *types.Const:
 			if typed.Exported() {
-				c.declareSymbol(typed, "constant", resolver)
+				c.declareSymbol(typed, "constant", resolver, name)
 			}
 		}
 	}
@@ -151,6 +158,7 @@ func (c *goSemanticReferenceContext) declareType(object *types.TypeName, resolve
 			"type_kind": typeKind, "canonical_identity": identity,
 		},
 	}
+	c.addLocation(nodeValue.Properties, object.Name())
 	if !c.extractor.addNode(nodeValue, "") {
 		return ""
 	}
@@ -195,7 +203,7 @@ func (c *goSemanticReferenceContext) declareMembers(object *types.TypeName, owne
 			continue
 		}
 		_, pointer := goSemanticReceiverNamed(signature.Recv().Type())
-		c.declareSymbol(method, "method", goSemanticMethodResolver(ownerResolver, method.Name(), pointer))
+		c.declareSymbol(method, "method", goSemanticMethodResolver(ownerResolver, method.Name(), pointer), object.Name()+"."+method.Name())
 	}
 	switch underlying := named.Underlying().(type) {
 	case *types.Struct:
@@ -207,7 +215,7 @@ func (c *goSemanticReferenceContext) declareMembers(object *types.TypeName, owne
 			if field == nil || !field.Exported() || field.Pkg() != c.reference.Types {
 				continue
 			}
-			c.declareSymbol(field, "field", ownerResolver+"."+field.Name())
+			c.declareSymbol(field, "field", ownerResolver+"."+field.Name(), object.Name()+"."+field.Name())
 		}
 	case *types.Interface:
 		for index := 0; index < underlying.NumExplicitMethods(); index++ {
@@ -215,12 +223,12 @@ func (c *goSemanticReferenceContext) declareMembers(object *types.TypeName, owne
 			if method == nil || !method.Exported() || method.Pkg() != c.reference.Types {
 				continue
 			}
-			c.declareSymbol(method, "method", goSemanticMethodResolver(ownerResolver, method.Name(), false))
+			c.declareSymbol(method, "method", goSemanticMethodResolver(ownerResolver, method.Name(), false), object.Name()+"."+method.Name())
 		}
 	}
 }
 
-func (c *goSemanticReferenceContext) declareSymbol(object types.Object, symbolKind, resolver string) string {
+func (c *goSemanticReferenceContext) declareSymbol(object types.Object, symbolKind, resolver, locationKey string) string {
 	identity := map[string]any{
 		"language": "go", "package_locator": c.packageLocator,
 		"symbol_kind": symbolKind, "identity_kind": "named", "resolver_identity": resolver,
@@ -233,6 +241,7 @@ func (c *goSemanticReferenceContext) declareSymbol(object types.Object, symbolKi
 			"symbol_kind": symbolKind, "canonical_identity": identity,
 		},
 	}
+	c.addLocation(nodeValue.Properties, locationKey)
 	if !c.extractor.addNode(nodeValue, "") {
 		return ""
 	}
@@ -267,6 +276,159 @@ func (e *goSemanticExtractor) pruneReferenceNodes() {
 	for nodeID := range e.referenceNodeIDs {
 		if !referenced[nodeID] {
 			delete(e.state.nodes, nodeID)
+		}
+	}
+}
+
+// addLocation gives a reference node the source_path and source_span that the
+// unit owning the declaration records (#596). The core rejects a node whose
+// properties differ between units, so a reference node must carry exactly the
+// owner's values, or nothing when the declaration cannot be located.
+func (c *goSemanticReferenceContext) addLocation(properties map[string]any, key string) {
+	location, ok := c.locations[key]
+	if !ok {
+		return
+	}
+	properties["source_path"] = location.path
+	properties["source_span"] = map[string]any{
+		"start_line": location.startLine, "start_column": location.startColumn,
+		"end_line": location.endLine, "end_column": location.endColumn,
+	}
+}
+
+// goReferenceDeclarationLocations parses a dependency's compiled files and
+// records the span of every package-scope declaring identifier. Export data
+// only keeps line numbers, so positions are taken from the source the owning
+// unit parses, with the same unadjusted (//line-free) positions and the same
+// repository-relative paths. Keys are the package-scope name, or
+// "Type.Member" for methods, struct fields and interface methods. A key
+// declared twice is dropped rather than guessed.
+func goReferenceDeclarationLocations(root string, compiledGoFiles []string) map[string]goSemanticSourceSpanKey {
+	locations := map[string]goSemanticSourceSpanKey{}
+	ambiguous := map[string]bool{}
+	for _, file := range compiledGoFiles {
+		confined, ok := confinedMetadataFile(root, file)
+		if !ok {
+			continue
+		}
+		source, err := os.ReadFile(confined)
+		if err != nil {
+			continue
+		}
+		fset := token.NewFileSet()
+		syntax, _ := parser.ParseFile(fset, confined, source, parser.AllErrors|parser.SkipObjectResolution)
+		if syntax == nil {
+			continue
+		}
+		path := relativePath(root, confined)
+		record := func(key string, identifier *ast.Ident) {
+			if identifier == nil || identifier.Name == "_" || ambiguous[key] {
+				return
+			}
+			if _, exists := locations[key]; exists {
+				delete(locations, key)
+				ambiguous[key] = true
+				return
+			}
+			start := fset.PositionFor(identifier.Pos(), false)
+			end := fset.PositionFor(identifier.End(), false)
+			locations[key] = goSemanticSourceSpanKey{
+				path: path, startLine: start.Line, startColumn: start.Column,
+				endLine: end.Line, endColumn: end.Column,
+			}
+		}
+		for _, declaration := range syntax.Decls {
+			switch typed := declaration.(type) {
+			case *ast.FuncDecl:
+				if typed.Name == nil || (typed.Recv == nil && typed.Name.Name == "init") {
+					continue
+				}
+				if typed.Recv == nil {
+					record(typed.Name.Name, typed.Name)
+					continue
+				}
+				if len(typed.Recv.List) != 1 {
+					continue
+				}
+				if receiver := goReferenceTypeIdentifier(typed.Recv.List[0].Type); receiver != nil {
+					record(receiver.Name+"."+typed.Name.Name, typed.Name)
+				}
+			case *ast.GenDecl:
+				for _, spec := range typed.Specs {
+					switch spec := spec.(type) {
+					case *ast.TypeSpec:
+						if spec.Name == nil {
+							continue
+						}
+						record(spec.Name.Name, spec.Name)
+						recordGoReferenceMembers(spec, record)
+					case *ast.ValueSpec:
+						for _, name := range spec.Names {
+							if name != nil {
+								record(name.Name, name)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return locations
+}
+
+// recordGoReferenceMembers records the members a type spec spells directly,
+// matching the owning unit's declareTypeMembers.
+func recordGoReferenceMembers(spec *ast.TypeSpec, record func(string, *ast.Ident)) {
+	owner := spec.Name.Name
+	var fields *ast.FieldList
+	switch typed := ast.Unparen(spec.Type).(type) {
+	case *ast.StructType:
+		fields = typed.Fields
+	case *ast.InterfaceType:
+		fields = typed.Methods
+	}
+	if fields == nil {
+		return
+	}
+	_, isInterface := ast.Unparen(spec.Type).(*ast.InterfaceType)
+	for _, field := range fields.List {
+		if len(field.Names) == 0 {
+			if isInterface {
+				continue
+			}
+			// An embedded field is declared by its type name.
+			if identifier := goReferenceTypeIdentifier(field.Type); identifier != nil {
+				record(owner+"."+identifier.Name, identifier)
+			}
+			continue
+		}
+		for _, name := range field.Names {
+			if name != nil {
+				record(owner+"."+name.Name, name)
+			}
+		}
+	}
+}
+
+// goReferenceTypeIdentifier returns the identifier naming a receiver or an
+// embedded field type: T, *T, pkg.T, T[P] and (T).
+func goReferenceTypeIdentifier(expression ast.Expr) *ast.Ident {
+	for {
+		switch typed := expression.(type) {
+		case *ast.Ident:
+			return typed
+		case *ast.ParenExpr:
+			expression = typed.X
+		case *ast.StarExpr:
+			expression = typed.X
+		case *ast.IndexExpr:
+			expression = typed.X
+		case *ast.IndexListExpr:
+			expression = typed.X
+		case *ast.SelectorExpr:
+			return typed.Sel
+		default:
+			return nil
 		}
 	}
 }

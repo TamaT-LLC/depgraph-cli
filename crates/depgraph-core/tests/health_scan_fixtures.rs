@@ -125,6 +125,8 @@ struct ExpectedFinding<'a> {
     kind: FindingKind,
     path: Option<&'a str>,
     locator: Option<&'a str>,
+    /// The surface blocker an export / type finding must carry.
+    blocker: Option<BlockerKind>,
 }
 
 fn fixture_node_id(fixture: &str, locator: &str) -> Option<String> {
@@ -221,45 +223,62 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
             "rust",
             RUST_FIXTURE,
             3,
-            [
+            vec![
                 ExpectedFinding {
                     kind: FindingKind::UnusedFile,
                     path: Some("src/unused.rs"),
                     locator: None,
+                    blocker: None,
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedExport,
                     path: Some("src/public.rs"),
                     locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedType,
                     path: Some("src/public.rs"),
                     locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
                 },
             ],
         ),
         (
             "go",
             GO_FIXTURE,
-            3,
-            [
+            4,
+            vec![
                 // Go file nodes record their repository-relative `path`
                 // (Issue #591), so the unused file carries a location.
                 ExpectedFinding {
                     kind: FindingKind::UnusedFile,
                     path: Some("pkg/unused/unused.go"),
                     locator: None,
+                    blocker: None,
                 },
+                // Go symbol / type nodes record their declaration site as
+                // `source_path` and `source_span` (Issue #596).
                 ExpectedFinding {
                     kind: FindingKind::UnusedExport,
-                    path: None,
-                    locator: Some("go-symbol:example.com/issue437/pkg.UnusedExport"),
+                    path: Some("pkg/public.go"),
+                    locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedType,
-                    path: None,
-                    locator: Some("go-type:example.com/issue437/pkg.UnusedType"),
+                    path: Some("pkg/public.go"),
+                    locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
+                },
+                // With its path, the unexported `main` in cmd/main.go is an
+                // entry point rather than an internal symbol, so it is
+                // reported for review, as Rust's src/main.rs would be.
+                ExpectedFinding {
+                    kind: FindingKind::UnusedExport,
+                    path: Some("cmd/main.go"),
+                    locator: None,
+                    blocker: Some(BlockerKind::EntryPoint),
                 },
             ],
         ),
@@ -267,21 +286,24 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
             "web",
             WEB_FIXTURE,
             3,
-            [
+            vec![
                 ExpectedFinding {
                     kind: FindingKind::UnusedFile,
                     path: Some("src/unused.ts"),
                     locator: None,
+                    blocker: None,
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedExport,
                     path: Some("src/public.ts"),
                     locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
                 },
                 ExpectedFinding {
                     kind: FindingKind::UnusedType,
                     path: Some("src/public.ts"),
                     locator: None,
+                    blocker: Some(BlockerKind::PublicSurface),
                 },
             ],
         ),
@@ -367,12 +389,20 @@ fn issue_437_worker_protocol_fixtures_detect_unused_subjects_for_rust_go_and_web
                 expected.kind,
                 FindingKind::UnusedExport | FindingKind::UnusedType
             ) {
+                let blocker = expected
+                    .blocker
+                    .expect("export / type expectations name a blocker");
+                assert!(
+                    finding.blockers.iter().any(|found| found.kind == blocker),
+                    "{language} fixture subject lacks a {blocker:?} blocker: {finding:?}"
+                );
+                // The nested `source_span` gives the declaration line (#596).
                 assert!(
                     finding
-                        .blockers
-                        .iter()
-                        .any(|blocker| blocker.kind == BlockerKind::PublicSurface),
-                    "{language} fixture public subject lacks a public-surface blocker: {finding:?}"
+                        .location
+                        .as_ref()
+                        .is_some_and(|location| location.start_line.is_some()),
+                    "{language} fixture symbol / type finding lacks a declaration line: {finding:?}"
                 );
             }
         }

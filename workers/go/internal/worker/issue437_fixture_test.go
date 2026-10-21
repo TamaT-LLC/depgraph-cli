@@ -99,6 +99,9 @@ func TestIssue437HealthFixtureMatchesEmittedGoSemanticNodes(t *testing.T) {
 			"package_locator":    true,
 			"symbol_kind":        kind == "symbol",
 			"type_kind":          kind == "type",
+			// The declaration site, in the same shape as Rust and Web (#596).
+			"source_path": true,
+			"source_span": true,
 		}
 		for property := range producerNode.Properties {
 			if !allowed[property] {

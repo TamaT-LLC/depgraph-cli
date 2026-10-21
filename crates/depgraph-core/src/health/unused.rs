@@ -2177,23 +2177,25 @@ fn subject_location(node: &NodeRecord) -> Option<SourceLocation> {
         .to_owned();
     Some(SourceLocation {
         path,
-        start_line: node
-            .properties
-            .get("start_line")
-            .and_then(serde_json::Value::as_u64),
-        start_column: node
-            .properties
-            .get("start_column")
-            .and_then(serde_json::Value::as_u64),
-        end_line: node
-            .properties
-            .get("end_line")
-            .and_then(serde_json::Value::as_u64),
-        end_column: node
-            .properties
-            .get("end_column")
-            .and_then(serde_json::Value::as_u64),
+        start_line: span_position(node, "start_line"),
+        start_column: span_position(node, "start_column"),
+        end_line: span_position(node, "end_line"),
+        end_column: span_position(node, "end_column"),
     })
+}
+
+/// One position (`start_line`, `start_column`, `end_line`, `end_column`) of a
+/// node's declaration span. Workers record the span as a nested `source_span`
+/// object (Rust, Go, Web); a top-level position still takes precedence (#596).
+pub(super) fn span_position(node: &NodeRecord, key: &str) -> Option<u64> {
+    node.properties
+        .get(key)
+        .or_else(|| {
+            node.properties
+                .get("source_span")
+                .and_then(|span| span.get(key))
+        })
+        .and_then(serde_json::Value::as_u64)
 }
 
 #[allow(dead_code)]
@@ -2469,6 +2471,55 @@ mod tests {
             analyze_unused(&graph)[0].confidence,
             Confidence::Indeterminate
         );
+    }
+
+    #[test]
+    fn issue_596_location_reads_the_nested_source_span() {
+        let declared = |properties: serde_json::Value| NodeRecord {
+            id: "symbol:Helper".to_owned(),
+            kind: "symbol".to_owned(),
+            locator: "go-symbol:example.com/pkg.Helper".to_owned(),
+            display_name: "Helper".to_owned(),
+            properties,
+        };
+        let span = json!({"start_line": 7, "start_column": 6, "end_line": 7, "end_column": 12});
+        let graph = snapshot(
+            vec![profile("go:package", "go", true)],
+            vec![declared(json!({
+                "language": "go",
+                "source_path": "svc/pkg/helper.go",
+                "source_span": span,
+            }))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ProfileMatrixRecord::default(),
+        );
+        let findings = analyze_unused(&graph);
+        let export = findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::UnusedExport)
+            .expect("unused export");
+        assert_eq!(
+            export.location,
+            Some(SourceLocation {
+                path: "svc/pkg/helper.go".to_owned(),
+                start_line: Some(7),
+                start_column: Some(6),
+                end_line: Some(7),
+                end_column: Some(12),
+            })
+        );
+
+        // A top-level position still wins over the nested span.
+        let location = subject_location(&declared(json!({
+            "source_path": "svc/pkg/helper.go",
+            "start_line": 3,
+            "source_span": span,
+        })))
+        .expect("location");
+        assert_eq!(location.start_line, Some(3));
+        assert_eq!(location.start_column, Some(6));
     }
 
     #[test]

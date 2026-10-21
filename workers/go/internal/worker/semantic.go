@@ -687,6 +687,7 @@ func (p *goSemanticPackage) declareClosures(file goTypedFile) {
 			Properties: map[string]any{
 				"language": "go", "package_locator": p.packageLocator,
 				"symbol_kind": "closure", "canonical_identity": identity,
+				"source_path": evidence[0].Path, "source_span": goSemanticSpan(evidence[0]),
 			},
 		}
 		if !p.extractor.addNode(nodeValue, file.Path) {
@@ -718,6 +719,7 @@ func (p *goSemanticPackage) ensurePackageInitializer(file goTypedFile, node ast.
 		Properties: map[string]any{
 			"language": "go", "package_locator": p.packageLocator,
 			"symbol_kind": "package_initializer", "canonical_identity": identity,
+			"source_path": evidence[0].Path, "source_span": goSemanticSpan(evidence[0]),
 		},
 	}
 	if !p.extractor.addNode(nodeValue, file.Path) {
@@ -793,6 +795,7 @@ func (p *goSemanticPackage) ensureType(object *types.TypeName, identifier *ast.I
 		Properties: map[string]any{
 			"language": "go", "package_locator": p.packageLocator,
 			"type_kind": typeKind, "canonical_identity": identity,
+			"source_path": evidence[0].Path, "source_span": goSemanticSpan(evidence[0]),
 		},
 	}
 	if !p.extractor.addNode(nodeValue, file.Path) {
@@ -880,6 +883,7 @@ func (p *goSemanticPackage) ensureSymbol(object types.Object, identifier *ast.Id
 		Properties: map[string]any{
 			"language": "go", "package_locator": p.packageLocator,
 			"symbol_kind": symbolKind, "canonical_identity": identity,
+			"source_path": evidence[0].Path, "source_span": goSemanticSpan(evidence[0]),
 		},
 	}
 	if !p.extractor.addNode(nodeValue, file.Path) {
@@ -1535,6 +1539,12 @@ func (p *goSemanticPackage) emitInstance(file goTypedFile, identifier *ast.Ident
 	} else {
 		identity["type_kind"] = semanticKind
 		properties["type_kind"] = semanticKind
+	}
+	// An instance has no declaration of its own: it points at the generic
+	// declaration it instantiates, like the origin node does (#596).
+	if sourcePath, ok := originNode.Properties["source_path"]; ok {
+		properties["source_path"] = sourcePath
+		properties["source_span"] = originNode.Properties["source_span"]
 	}
 	nodeID := stableIDFromValue(nodeKind, identity)
 	nodeValue := Node{

@@ -305,10 +305,10 @@ pub fn score_hotspots_cancellable(
         }
         let location = node_path(node).map(|path| SourceLocation {
             path,
-            start_line: None,
-            start_column: None,
-            end_line: None,
-            end_column: None,
+            start_line: super::unused::span_position(node, "start_line"),
+            start_column: super::unused::span_position(node, "start_column"),
+            end_line: super::unused::span_position(node, "end_line"),
+            end_column: super::unused::span_position(node, "end_column"),
         });
         let hotspot_scores = HotspotFindingScores {
             fan_in: HotspotLayerScore {
@@ -833,6 +833,55 @@ mod tests {
         );
         assert_eq!(scores.total, 5_000);
         assert_eq!(first.confidence, Confidence::Probable);
+    }
+
+    #[test]
+    fn issue_596_symbol_hotspot_location_carries_the_declaration_span() {
+        let symbol = NodeRecord {
+            id: "symbol:Helper".to_owned(),
+            kind: "symbol".to_owned(),
+            locator: "go-symbol:example.com/pkg.Helper".to_owned(),
+            display_name: "Helper".to_owned(),
+            properties: json!({
+                "source_path": "svc/pkg/helper.go",
+                "source_span": {"start_line": 7, "start_column": 6, "end_line": 7, "end_column": 12},
+            }),
+        };
+        let churn = BTreeMap::from([("svc/pkg/helper.go".to_owned(), 4)]);
+        let findings = score_hotspots(
+            &snapshot(vec![symbol, node("file:a")], Vec::new()),
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &churn,
+            &BTreeMap::new(),
+            HotspotLayerAvailability {
+                churn: true,
+                runtime: false,
+            },
+        )
+        .expect("valid hotspot weights");
+        let helper = findings
+            .iter()
+            .find(|finding| finding.subject_id == "symbol:Helper")
+            .expect("symbol hotspot");
+        assert_eq!(
+            helper.location,
+            Some(SourceLocation {
+                path: "svc/pkg/helper.go".to_owned(),
+                start_line: Some(7),
+                start_column: Some(6),
+                end_line: Some(7),
+                end_column: Some(12),
+            })
+        );
+        let scores = helper.hotspot_scores.as_ref().expect("hotspot scores");
+        assert_eq!(scores.git_churn.raw, 4);
+        // A file has no declaration span, so its location stays path-only.
+        let file = findings
+            .iter()
+            .find(|finding| finding.subject_id == "file:a")
+            .and_then(|finding| finding.location.as_ref())
+            .expect("file location");
+        assert_eq!((file.path.as_str(), file.start_line), ("a.rs", None));
     }
 
     #[test]
