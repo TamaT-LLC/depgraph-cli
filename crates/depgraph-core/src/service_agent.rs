@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use depgraph_store::CoverageRecord;
 use depgraph_store::{
@@ -848,30 +848,19 @@ impl DepgraphService {
     ) -> DepgraphServiceResult<GraphSitesPageResult> {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
-        let mut items = snapshot
-            .sites
-            .into_iter()
-            .filter(|site| node_id.is_none_or(|id| site.source == id))
-            .filter(|site| site_id.is_none_or(|id| site.id == id))
-            .map(|site| {
-                let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
-                let mut evidence = site_evidence(&snapshot.evidence, "site", &site.id, Some(hint));
-                evidence.sort_by(evidence_order);
-                SiteProjection {
-                    id: site.id,
-                    source: site.source,
-                    kind: site.kind,
-                    specifier: site.specifier,
-                    profile_id: site.profile_id,
-                    resolution_status: site.resolution_status,
-                    target_ids: site.target_ids,
-                    reason: site.reason,
-                    evidence,
-                }
-            })
-            .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.id.cmp(&right.id));
-        graph_page_from_items(snapshot_id, items, offset, limit, GraphSitesPageResult::new)
+        let (items, total_items) = sites_page_items(
+            snapshot.sites,
+            &snapshot.evidence,
+            node_id,
+            site_id,
+            offset,
+            limit,
+        )?;
+        Ok(GraphSitesPageResult::new(
+            snapshot_id.clone(),
+            items,
+            total_items,
+        ))
     }
 
     /// Lists the edges incident to one node. `edge_kinds` is applied before
@@ -889,45 +878,21 @@ impl DepgraphService {
     ) -> DepgraphServiceResult<GraphEdgesPageResult> {
         validate_page_limit(self, limit)?;
         let snapshot = self.load_agent_snapshot(snapshot_id, cancellation)?;
-        let sites = snapshot
-            .sites
-            .iter()
-            .map(|site| (site.id.as_str(), site))
-            .collect::<BTreeMap<_, _>>();
-        let mut items = snapshot
-            .edges
-            .into_iter()
-            .filter(|edge| match direction {
-                EdgeDirection::Incoming => edge.target == node_id,
-                EdgeDirection::Outgoing => edge.source == node_id,
-                EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
-            })
-            .filter(|edge| edge_kinds.allows(&edge.kind))
-            .map(|edge| {
-                let hint = edge
-                    .site_id
-                    .as_deref()
-                    .and_then(|site_id| sites.get(site_id))
-                    .map(|site| ImportSiteHint::new(&site.kind, site.specifier.as_deref()));
-                let mut evidence = site_evidence(&snapshot.evidence, "edge", &edge.id, hint);
-                evidence.sort_by(evidence_order);
-                EdgeProjection {
-                    id: edge.id,
-                    site_id: edge.site_id,
-                    source: edge.source,
-                    target: edge.target,
-                    kind: edge.kind,
-                    phase: edge.phase,
-                    profile_id: edge.profile_id,
-                    resolution_status: edge.resolution_status,
-                    precision: edge.precision,
-                    condition: crate::query::render_condition(&edge.condition),
-                    evidence,
-                }
-            })
-            .collect::<Vec<_>>();
-        items.sort_by(|left, right| left.id.cmp(&right.id));
-        graph_page_from_items(snapshot_id, items, offset, limit, GraphEdgesPageResult::new)
+        let (items, total_items) = edges_page_items(
+            snapshot.edges,
+            &snapshot.sites,
+            &snapshot.evidence,
+            node_id,
+            direction,
+            edge_kinds,
+            offset,
+            limit,
+        )?;
+        Ok(GraphEdgesPageResult::new(
+            snapshot_id.clone(),
+            items,
+            total_items,
+        ))
     }
 
     pub fn list_site_evidence_page(
@@ -1015,6 +980,168 @@ fn site_evidence(
         .collect()
 }
 
+/// Selects one page of sites in ID order and builds evidence only for the
+/// sites on that page, so the cost grows with `limit` instead of with the
+/// number of sites in the snapshot.
+fn sites_page_items(
+    sites: Vec<depgraph_store::SiteRecord>,
+    evidence: &[depgraph_store::EvidenceRecord],
+    node_id: Option<&str>,
+    site_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> DepgraphServiceResult<(Vec<SiteProjection>, u64)> {
+    let mut selected = sites
+        .into_iter()
+        .filter(|site| node_id.is_none_or(|id| site.source == id))
+        .filter(|site| site_id.is_none_or(|id| site.id == id))
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    let (page, total_items) = page_slice(selected, offset, limit)?;
+    let owners = page
+        .iter()
+        .map(|site| site.id.as_str())
+        .collect::<HashSet<_>>();
+    let evidence = EvidenceByOwner::new(evidence, "site", &owners);
+    let items = page
+        .into_iter()
+        .map(|site| {
+            let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
+            let evidence = evidence.projections(&site.id, Some(hint));
+            SiteProjection {
+                id: site.id,
+                source: site.source,
+                kind: site.kind,
+                specifier: site.specifier,
+                profile_id: site.profile_id,
+                resolution_status: site.resolution_status,
+                target_ids: site.target_ids,
+                reason: site.reason,
+                evidence,
+            }
+        })
+        .collect();
+    Ok((items, total_items))
+}
+
+/// Selects one page of the edges incident to `node_id` in ID order and builds
+/// evidence only for the edges on that page.
+#[allow(clippy::too_many_arguments)]
+fn edges_page_items(
+    edges: Vec<depgraph_store::EdgeRecord>,
+    sites: &[depgraph_store::SiteRecord],
+    evidence: &[depgraph_store::EvidenceRecord],
+    node_id: &str,
+    direction: EdgeDirection,
+    edge_kinds: &EdgeKindFilter,
+    offset: usize,
+    limit: usize,
+) -> DepgraphServiceResult<(Vec<EdgeProjection>, u64)> {
+    let mut selected = edges
+        .into_iter()
+        .filter(|edge| match direction {
+            EdgeDirection::Incoming => edge.target == node_id,
+            EdgeDirection::Outgoing => edge.source == node_id,
+            EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
+        })
+        .filter(|edge| edge_kinds.allows(&edge.kind))
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    let (page, total_items) = page_slice(selected, offset, limit)?;
+    let wanted_sites = page
+        .iter()
+        .filter_map(|edge| edge.site_id.as_deref())
+        .collect::<HashSet<_>>();
+    // Later records overwrite earlier ones, as `collect` into a map would.
+    let mut sites_by_id = HashMap::with_capacity(wanted_sites.len());
+    for site in sites {
+        if wanted_sites.contains(site.id.as_str()) {
+            sites_by_id.insert(site.id.as_str(), site);
+        }
+    }
+    let owners = page
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect::<HashSet<_>>();
+    let evidence = EvidenceByOwner::new(evidence, "edge", &owners);
+    let items = page
+        .into_iter()
+        .map(|edge| {
+            let hint = edge
+                .site_id
+                .as_deref()
+                .and_then(|site_id| sites_by_id.get(site_id))
+                .map(|site| ImportSiteHint::new(&site.kind, site.specifier.as_deref()));
+            let evidence = evidence.projections(&edge.id, hint);
+            EdgeProjection {
+                id: edge.id,
+                site_id: edge.site_id,
+                source: edge.source,
+                target: edge.target,
+                kind: edge.kind,
+                phase: edge.phase,
+                profile_id: edge.profile_id,
+                resolution_status: edge.resolution_status,
+                precision: edge.precision,
+                condition: crate::query::render_condition(&edge.condition),
+                evidence,
+            }
+        })
+        .collect();
+    Ok((items, total_items))
+}
+
+/// Evidence records of one owner type, grouped by owner ID in a single pass.
+/// Only the owners on the current page are kept, and each owner's records stay
+/// in snapshot order so the stable sort in `projections` matches a linear scan.
+struct EvidenceByOwner<'a> {
+    by_owner: HashMap<&'a str, Vec<&'a depgraph_store::EvidenceRecord>>,
+}
+
+impl<'a> EvidenceByOwner<'a> {
+    fn new(
+        records: &'a [depgraph_store::EvidenceRecord],
+        owner_type: &str,
+        owners: &HashSet<&str>,
+    ) -> Self {
+        let mut by_owner = HashMap::<_, Vec<_>>::with_capacity(owners.len());
+        if owners.is_empty() {
+            // An empty page (e.g. offset past the end) needs no evidence scan.
+            return Self { by_owner };
+        }
+        for record in records {
+            if record.owner_type == owner_type && owners.contains(record.owner_id.as_str()) {
+                by_owner
+                    .entry(record.owner_id.as_str())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Self { by_owner }
+    }
+
+    fn projections(
+        &self,
+        owner_id: &str,
+        site: Option<ImportSiteHint<'_>>,
+    ) -> Vec<EvidenceProjection> {
+        #[cfg(test)]
+        tests::count_owner_evidence_build();
+        let mut evidence = self
+            .by_owner
+            .get(owner_id)
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|record| evidence_projection(record, site))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        evidence.sort_by(evidence_order);
+        evidence
+    }
+}
+
 fn evidence_order(left: &EvidenceProjection, right: &EvidenceProjection) -> std::cmp::Ordering {
     (
         &left.path,
@@ -1040,11 +1167,22 @@ fn evidence_order(left: &EvidenceProjection, right: &EvidenceProjection) -> std:
 
 fn graph_page_from_items<T, R>(
     snapshot_id: &ResolvedSnapshotId,
-    mut items: Vec<T>,
+    items: Vec<T>,
     offset: usize,
     limit: usize,
     build: impl FnOnce(ResolvedSnapshotId, Vec<T>, u64) -> R,
 ) -> DepgraphServiceResult<R> {
+    let (items, total_items) = page_slice(items, offset, limit)?;
+    Ok(build(snapshot_id.clone(), items, total_items))
+}
+
+/// Cuts `offset..offset + limit` out of `items` and returns it with the
+/// number of items before paging.
+fn page_slice<T>(
+    mut items: Vec<T>,
+    offset: usize,
+    limit: usize,
+) -> DepgraphServiceResult<(Vec<T>, u64)> {
     let total_items =
         u64::try_from(items.len()).map_err(|_| DepgraphServiceError::ResourceExhausted)?;
     let end = offset
@@ -1056,7 +1194,7 @@ fn graph_page_from_items<T, R>(
     } else {
         items = items.drain(offset..end).collect();
     }
-    Ok(build(snapshot_id.clone(), items, total_items))
+    Ok((items, total_items))
 }
 
 fn validate_find_nodes_query(query: &str) -> DepgraphServiceResult<()> {
@@ -1071,4 +1209,341 @@ fn validate_page_limit(service: &DepgraphService, limit: usize) -> DepgraphServi
         return Err(DepgraphServiceError::InvalidInput);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use depgraph_store::{EdgeRecord, EvidenceRecord, SiteRecord};
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    thread_local! {
+        static OWNER_EVIDENCE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count_owner_evidence_build() {
+        OWNER_EVIDENCE_BUILDS.with(|count| count.set(count.get() + 1));
+    }
+
+    fn owner_evidence_builds<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        OWNER_EVIDENCE_BUILDS.with(|count| count.set(0));
+        let value = run();
+        (value, OWNER_EVIDENCE_BUILDS.with(Cell::get))
+    }
+
+    /// The paging implementation before #600: evidence for every selected
+    /// site or edge, a linear evidence scan per owner, then sort and page.
+    fn legacy_sites_page(
+        sites: Vec<SiteRecord>,
+        evidence: &[EvidenceRecord],
+        node_id: Option<&str>,
+        site_id: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<SiteProjection>, u64) {
+        let mut items = sites
+            .into_iter()
+            .filter(|site| node_id.is_none_or(|id| site.source == id))
+            .filter(|site| site_id.is_none_or(|id| site.id == id))
+            .map(|site| {
+                let hint = ImportSiteHint::new(&site.kind, site.specifier.as_deref());
+                let mut evidence = site_evidence(evidence, "site", &site.id, Some(hint));
+                evidence.sort_by(evidence_order);
+                SiteProjection {
+                    id: site.id,
+                    source: site.source,
+                    kind: site.kind,
+                    specifier: site.specifier,
+                    profile_id: site.profile_id,
+                    resolution_status: site.resolution_status,
+                    target_ids: site.target_ids,
+                    reason: site.reason,
+                    evidence,
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        page_slice(items, offset, limit).expect("legacy page")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_edges_page(
+        edges: Vec<EdgeRecord>,
+        sites: &[SiteRecord],
+        evidence: &[EvidenceRecord],
+        node_id: &str,
+        direction: EdgeDirection,
+        edge_kinds: &EdgeKindFilter,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<EdgeProjection>, u64) {
+        let sites = sites
+            .iter()
+            .map(|site| (site.id.as_str(), site))
+            .collect::<BTreeMap<_, _>>();
+        let mut items = edges
+            .into_iter()
+            .filter(|edge| match direction {
+                EdgeDirection::Incoming => edge.target == node_id,
+                EdgeDirection::Outgoing => edge.source == node_id,
+                EdgeDirection::Both => edge.source == node_id || edge.target == node_id,
+            })
+            .filter(|edge| edge_kinds.allows(&edge.kind))
+            .map(|edge| {
+                let hint = edge
+                    .site_id
+                    .as_deref()
+                    .and_then(|site_id| sites.get(site_id))
+                    .map(|site| ImportSiteHint::new(&site.kind, site.specifier.as_deref()));
+                let mut evidence = site_evidence(evidence, "edge", &edge.id, hint);
+                evidence.sort_by(evidence_order);
+                EdgeProjection {
+                    id: edge.id,
+                    site_id: edge.site_id,
+                    source: edge.source,
+                    target: edge.target,
+                    kind: edge.kind,
+                    phase: edge.phase,
+                    profile_id: edge.profile_id,
+                    resolution_status: edge.resolution_status,
+                    precision: edge.precision,
+                    condition: crate::query::render_condition(&edge.condition),
+                    evidence,
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        page_slice(items, offset, limit).expect("legacy page")
+    }
+
+    struct Fixture {
+        sites: Vec<SiteRecord>,
+        edges: Vec<EdgeRecord>,
+        evidence: Vec<EvidenceRecord>,
+    }
+
+    /// Deterministic pseudo-random order so the input is not already sorted.
+    fn scrambled(count: usize) -> impl Iterator<Item = usize> {
+        let step = (0..)
+            .map(|candidate| count / 2 + 1 + candidate)
+            .find(|step| gcd(*step, count) == 1)
+            .expect("step");
+        (0..count).map(move |index| (index * step + 7) % count)
+    }
+
+    fn gcd(left: usize, right: usize) -> usize {
+        if right == 0 {
+            left
+        } else {
+            gcd(right, left % right)
+        }
+    }
+
+    fn evidence_record(owner_type: &str, owner_id: &str, ordinal: usize) -> EvidenceRecord {
+        // Two records per owner share the whole sort key and differ only in
+        // `properties`, so the test also pins the stable order among them.
+        let properties = match ordinal % 3 {
+            0 => json!({ "target_specifier": format!("crate::m{ordinal}") }),
+            1 => json!({ "target_specifier": format!("crate::n{ordinal}") }),
+            _ => json!({}),
+        };
+        EvidenceRecord {
+            owner_type: owner_type.to_string(),
+            owner_id: owner_id.to_string(),
+            ordinal: i64::try_from(ordinal).expect("ordinal"),
+            kind: "import".to_string(),
+            extractor: "fixture".to_string(),
+            extractor_version: "1".to_string(),
+            path: format!("src/f{}.rs", ordinal % 4),
+            start_line: u64::try_from(ordinal % 2).expect("line"),
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            detail: None,
+            properties,
+        }
+    }
+
+    fn fixture(site_count: usize) -> Fixture {
+        let mut sites = Vec::new();
+        let mut edges = Vec::new();
+        let mut evidence = Vec::new();
+        for index in scrambled(site_count) {
+            let site_id = format!("site:{index:06}");
+            let source = format!("node:{}", index % 13);
+            sites.push(SiteRecord {
+                id: site_id.clone(),
+                source: source.clone(),
+                kind: "import".to_string(),
+                specifier: (index % 2 == 0).then(|| format!("pkg{index}")),
+                profile_id: "profile".to_string(),
+                resolution_status: "resolved".to_string(),
+                precision: "exact".to_string(),
+                condition: Value::Null,
+                target_ids: vec![format!("node:{}", (index + 1) % 13)],
+                reason: None,
+            });
+            edges.push(EdgeRecord {
+                id: format!("edge:{index:06}"),
+                site_id: (index % 5 != 0).then(|| site_id.clone()),
+                source,
+                target: format!("node:{}", (index + 1) % 13),
+                kind: if index % 4 == 0 { "calls" } else { "imports" }.to_string(),
+                phase: "build".to_string(),
+                environment: "default".to_string(),
+                profile_id: "profile".to_string(),
+                resolution_status: "resolved".to_string(),
+                precision: "exact".to_string(),
+                condition: Value::Null,
+                generated: false,
+            });
+        }
+        // Interleave evidence of both owner types; some sites have none and
+        // an edge reuses a site's ID to check that owner types stay apart.
+        for index in scrambled(site_count) {
+            for ordinal in 0..(index % 4) {
+                evidence.push(evidence_record(
+                    "site",
+                    &format!("site:{index:06}"),
+                    ordinal,
+                ));
+                evidence.push(evidence_record(
+                    "edge",
+                    &format!("edge:{index:06}"),
+                    ordinal,
+                ));
+            }
+            if index % 7 == 0 {
+                evidence.push(evidence_record("edge", &format!("site:{index:06}"), 9));
+            }
+        }
+        Fixture {
+            sites,
+            edges,
+            evidence,
+        }
+    }
+
+    #[test]
+    fn sites_page_matches_legacy_paging_for_every_scope() {
+        let fixture = fixture(240);
+        let scopes: [(Option<&str>, Option<&str>); 6] = [
+            (None, None),
+            (Some("node:3"), None),
+            (Some("node:missing"), None),
+            (None, Some("site:000042")),
+            (Some("node:3"), Some("site:000042")),
+            (None, Some("site:missing")),
+        ];
+        for (node_id, site_id) in scopes {
+            for (offset, limit) in [(0, 1), (0, 25), (17, 25), (230, 25), (240, 5), (500, 5)] {
+                let expected = legacy_sites_page(
+                    fixture.sites.clone(),
+                    &fixture.evidence,
+                    node_id,
+                    site_id,
+                    offset,
+                    limit,
+                );
+                let actual = sites_page_items(
+                    fixture.sites.clone(),
+                    &fixture.evidence,
+                    node_id,
+                    site_id,
+                    offset,
+                    limit,
+                )
+                .expect("sites page");
+                assert_eq!(
+                    actual, expected,
+                    "node={node_id:?} site={site_id:?} offset={offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edges_page_matches_legacy_paging() {
+        let fixture = fixture(240);
+        let imports_only =
+            EdgeKindFilter::try_new(vec!["imports".to_string()], None).expect("filter");
+        for direction in [
+            EdgeDirection::Incoming,
+            EdgeDirection::Outgoing,
+            EdgeDirection::Both,
+        ] {
+            for filter in [&EdgeKindFilter::default(), &imports_only] {
+                for (offset, limit) in [(0, 10), (5, 10), (35, 10), (100, 10)] {
+                    let expected = legacy_edges_page(
+                        fixture.edges.clone(),
+                        &fixture.sites,
+                        &fixture.evidence,
+                        "node:4",
+                        direction,
+                        filter,
+                        offset,
+                        limit,
+                    );
+                    let actual = edges_page_items(
+                        fixture.edges.clone(),
+                        &fixture.sites,
+                        &fixture.evidence,
+                        "node:4",
+                        direction,
+                        filter,
+                        offset,
+                        limit,
+                    )
+                    .expect("edges page");
+                    assert_eq!(actual, expected, "direction={direction:?} offset={offset}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unscoped_sites_page_builds_evidence_only_for_the_page() {
+        for site_count in [1_000, 20_000] {
+            let fixture = fixture(site_count);
+            let ((items, total_items), builds) = owner_evidence_builds(|| {
+                sites_page_items(fixture.sites, &fixture.evidence, None, None, 300, 100)
+                    .expect("sites page")
+            });
+            assert_eq!(items.len(), 100);
+            assert_eq!(total_items, u64::try_from(site_count).expect("count"));
+            assert_eq!(builds, 100, "site_count={site_count}");
+        }
+        let fixture = fixture(1_000);
+        let ((items, total_items), builds) = owner_evidence_builds(|| {
+            sites_page_items(fixture.sites, &fixture.evidence, None, None, 5_000, 100)
+                .expect("sites page past the end")
+        });
+        assert!(items.is_empty());
+        assert_eq!(total_items, 1_000);
+        assert_eq!(builds, 0);
+    }
+
+    #[test]
+    fn edges_page_builds_evidence_only_for_the_page() {
+        let fixture = fixture(20_000);
+        let ((items, total_items), builds) = owner_evidence_builds(|| {
+            edges_page_items(
+                fixture.edges,
+                &fixture.sites,
+                &fixture.evidence,
+                "node:4",
+                EdgeDirection::Both,
+                &EdgeKindFilter::default(),
+                0,
+                50,
+            )
+            .expect("edges page")
+        });
+        assert_eq!(items.len(), 50);
+        assert!(total_items > 50);
+        assert_eq!(builds, 50);
+    }
 }
