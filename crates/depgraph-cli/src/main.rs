@@ -361,7 +361,8 @@ enum Commands {
     Cycles {
         #[arg(long, value_enum, default_value_t = CycleLevelArg::File)]
         level: CycleLevelArg,
-        /// Bound cycle preprocessing and search work.
+        /// Stop the cycle search after this many visited dependency edges
+        /// (default 50000).
         #[arg(long, value_name = "N")]
         max_traversal: Option<usize>,
         #[arg(long)]
@@ -372,7 +373,7 @@ enum Commands {
         /// Include unresolved sites with one of these exact kinds.
         #[arg(long, value_name = "KIND")]
         kind: Vec<String>,
-        /// Bound unresolved-site preprocessing and result construction work.
+        /// Fail when more unresolved sites than this match (default 50000).
         #[arg(long, value_name = "N")]
         max_traversal: Option<usize>,
         #[arg(long)]

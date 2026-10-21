@@ -30,8 +30,8 @@ use crate::{
     },
     service_limits::{
         MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS,
-        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_UNRESOLVED_CORRELATION_REASONS,
-        MAX_UNRESOLVED_PHASES,
+        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
+        MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
     },
 };
 
@@ -864,9 +864,15 @@ fn impact_changed_set_service_error(
     }
 }
 
+/// An out-of-range `max_traversal` names the argument and its accepted range
+/// (Issue #617).
 fn validate_traversal_limit(limit: usize) -> DepgraphServiceResult<()> {
     if !(1..=crate::MAX_INTERACTIVE_QUERY_TRAVERSAL).contains(&limit) {
-        return Err(DepgraphServiceError::InvalidInput);
+        return Err(DepgraphServiceError::ArgumentOutOfRange {
+            argument: "max_traversal",
+            minimum: 1,
+            maximum: saturating_u64(crate::MAX_INTERACTIVE_QUERY_TRAVERSAL),
+        });
     }
     Ok(())
 }
@@ -987,6 +993,16 @@ fn preflight_impact_snapshot(
     Ok(())
 }
 
+/// The fixed snapshot scan ceiling of cycle and unresolved listing was hit.
+/// No request argument widens it (Issues #617 / #618).
+fn snapshot_scan_limit(maximum: usize) -> DepgraphServiceError {
+    DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::PreprocessingWorkItems,
+        saturating_u64(maximum),
+        None,
+    )
+}
+
 fn phase_step(
     steps: &mut usize,
     maximum: usize,
@@ -996,7 +1012,7 @@ fn phase_step(
         return Err(DepgraphServiceError::Cancelled);
     }
     if *steps >= maximum {
-        return Err(DepgraphServiceError::ResourceExhausted);
+        return Err(snapshot_scan_limit(maximum));
     }
     *steps += 1;
     Ok(())
@@ -1015,16 +1031,28 @@ pub(crate) fn cycles_bounded_with_cancellation(
     request: &CyclesRequest,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> DepgraphServiceResult<Vec<CycleResult>> {
-    let maximum = request.max_traversal();
-    let mut preprocessing = 0;
+    cycles_bounded_with_budget(
+        snapshot,
+        request,
+        MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
+        is_cancelled,
+    )
+}
+
+/// Lists the cycles of one level. Indexing the snapshot and the per-node
+/// steps of the search count against `scan_maximum`; only the adjacency edges
+/// the search visits count against the request's `max_traversal`, as in the
+/// dependency traversal (Issue #618).
+fn cycles_bounded_with_budget(
+    snapshot: &GraphSnapshot,
+    request: &CyclesRequest,
+    scan_maximum: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> DepgraphServiceResult<Vec<CycleResult>> {
+    let mut work = CycleWork::new(scan_maximum, request.max_traversal(), is_cancelled);
     let mut allowed = BTreeSet::new();
     for node in &snapshot.nodes {
-        cycle_phase_step(
-            &mut preprocessing,
-            maximum,
-            CycleWorkPhase::Preprocessing,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Preprocessing)?;
         if node.kind == request.level().node_kind() {
             allowed.insert(node.id.clone());
         }
@@ -1032,31 +1060,16 @@ pub(crate) fn cycles_bounded_with_cancellation(
     let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
     let mut reverse = BTreeMap::<String, BTreeSet<String>>::new();
     for edge in &snapshot.edges {
-        cycle_phase_step(
-            &mut preprocessing,
-            maximum,
-            CycleWorkPhase::Preprocessing,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Preprocessing)?;
         if allowed.contains(&edge.source) && allowed.contains(&edge.target) {
-            cycle_phase_step(
-                &mut preprocessing,
-                maximum,
-                CycleWorkPhase::Preprocessing,
-                is_cancelled,
-            )?;
+            work.scan(CycleWorkPhase::Preprocessing)?;
             adjacency
                 .entry(edge.source.clone())
                 .or_default()
                 .insert(edge.target.clone());
             #[cfg(test)]
             CYCLE_ADJACENCY_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            cycle_phase_step(
-                &mut preprocessing,
-                maximum,
-                CycleWorkPhase::Preprocessing,
-                is_cancelled,
-            )?;
+            work.scan(CycleWorkPhase::Preprocessing)?;
             reverse
                 .entry(edge.target.clone())
                 .or_default()
@@ -1066,27 +1079,15 @@ pub(crate) fn cycles_bounded_with_cancellation(
         }
     }
 
-    let mut traversal = 0;
     let mut seen = BTreeSet::new();
     let mut finish = Vec::with_capacity(allowed.len());
     for start in &allowed {
-        cycle_phase_step(
-            &mut traversal,
-            maximum,
-            CycleWorkPhase::Traversal,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Traversal)?;
         if !seen.insert(start.clone()) {
             continue;
         }
         let mut stack = vec![(start.clone(), None::<String>)];
         while let Some((node, previous)) = stack.last_mut() {
-            cycle_phase_step(
-                &mut traversal,
-                maximum,
-                CycleWorkPhase::Traversal,
-                is_cancelled,
-            )?;
             let next = adjacency
                 .get(node)
                 .and_then(|targets| match previous.as_ref() {
@@ -1096,11 +1097,13 @@ pub(crate) fn cycles_bounded_with_cancellation(
                     None => targets.first(),
                 });
             if let Some(next) = next.cloned() {
+                work.edge(CycleWorkPhase::Traversal)?;
                 *previous = Some(next.clone());
                 if seen.insert(next.clone()) {
                     stack.push((next, None));
                 }
             } else {
+                work.scan(CycleWorkPhase::Traversal)?;
                 let (node, _) = stack.pop().ok_or(DepgraphServiceError::Integrity)?;
                 finish.push(node);
             }
@@ -1110,34 +1113,19 @@ pub(crate) fn cycles_bounded_with_cancellation(
     let mut assigned = BTreeSet::new();
     let mut components = Vec::<BTreeSet<String>>::new();
     while let Some(start) = finish.pop() {
-        cycle_phase_step(
-            &mut traversal,
-            maximum,
-            CycleWorkPhase::Traversal,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Traversal)?;
         if !assigned.insert(start.clone()) {
             continue;
         }
         let mut component = BTreeSet::new();
         let mut stack = vec![start];
         while let Some(node) = stack.pop() {
-            cycle_phase_step(
-                &mut traversal,
-                maximum,
-                CycleWorkPhase::Traversal,
-                is_cancelled,
-            )?;
+            work.scan(CycleWorkPhase::Traversal)?;
             component.insert(node.clone());
             #[cfg(test)]
             CYCLE_COMPONENT_INSERT_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for next in reverse.get(&node).into_iter().flatten().rev() {
-                cycle_phase_step(
-                    &mut traversal,
-                    maximum,
-                    CycleWorkPhase::Traversal,
-                    is_cancelled,
-                )?;
+                work.edge(CycleWorkPhase::Traversal)?;
                 if assigned.insert(next.clone()) {
                     stack.push(next.clone());
                 }
@@ -1146,15 +1134,9 @@ pub(crate) fn cycles_bounded_with_cancellation(
         components.push(component);
     }
 
-    let mut finalization = 0;
     let mut ordered_results = BTreeMap::<Vec<String>, String>::new();
     for component in components {
-        cycle_phase_step(
-            &mut finalization,
-            maximum,
-            CycleWorkPhase::Finalization,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Finalization)?;
         let start = component.first().ok_or(DepgraphServiceError::Integrity)?;
         let self_loop = component.len() == 1
             && adjacency
@@ -1163,36 +1145,19 @@ pub(crate) fn cycles_bounded_with_cancellation(
         if component.len() < 2 && !self_loop {
             continue;
         }
-        let node_ids = representative_cycle_bounded(
-            start,
-            &component,
-            &adjacency,
-            &mut finalization,
-            maximum,
-            is_cancelled,
-        )?
-        .ok_or(DepgraphServiceError::Integrity)?;
+        let node_ids = representative_cycle_bounded(start, &component, &adjacency, &mut work)?
+            .ok_or(DepgraphServiceError::Integrity)?;
         if node_ids.len() > MAX_CYCLE_NODE_IDS {
             return Err(DepgraphServiceError::ResourceExhausted);
         }
-        cycle_phase_step(
-            &mut finalization,
-            maximum,
-            CycleWorkPhase::Finalization,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Finalization)?;
         ordered_results
             .entry(node_ids)
             .or_insert_with(|| request.level().node_kind().to_owned());
     }
     let mut results = Vec::with_capacity(ordered_results.len());
     for (node_ids, level) in ordered_results {
-        cycle_phase_step(
-            &mut finalization,
-            maximum,
-            CycleWorkPhase::Finalization,
-            is_cancelled,
-        )?;
+        work.scan(CycleWorkPhase::Finalization)?;
         results.push(CycleResult { level, node_ids });
         #[cfg(test)]
         CYCLE_RESULT_MATERIALIZATION_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1204,21 +1169,19 @@ fn representative_cycle_bounded(
     start: &str,
     component: &BTreeSet<String>,
     adjacency: &BTreeMap<String, BTreeSet<String>>,
-    steps: &mut usize,
-    maximum: usize,
-    is_cancelled: &mut impl FnMut() -> bool,
+    work: &mut CycleWork<'_>,
 ) -> DepgraphServiceResult<Option<Vec<String>>> {
     let mut queue = VecDeque::new();
     let mut predecessor = HashMap::<String, String>::new();
     for next in adjacency.get(start).into_iter().flatten() {
-        cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+        work.edge(CycleWorkPhase::Finalization)?;
         if !component.contains(next) {
             continue;
         }
         if next == start {
             let mut cycle = Vec::with_capacity(2);
             for _ in 0..2 {
-                cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+                work.scan(CycleWorkPhase::Finalization)?;
                 cycle.push(start.to_owned());
             }
             return Ok(Some(cycle));
@@ -1227,9 +1190,9 @@ fn representative_cycle_bounded(
         queue.push_back(next.clone());
     }
     while let Some(node) = queue.pop_front() {
-        cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+        work.scan(CycleWorkPhase::Finalization)?;
         for next in adjacency.get(&node).into_iter().flatten() {
-            cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+            work.edge(CycleWorkPhase::Finalization)?;
             if !component.contains(next) {
                 continue;
             }
@@ -1237,7 +1200,7 @@ fn representative_cycle_bounded(
                 let mut path = vec![node.clone()];
                 let mut current = node;
                 while current != start {
-                    cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+                    work.scan(CycleWorkPhase::Finalization)?;
                     if path.len() >= MAX_CYCLE_NODE_IDS - 1 {
                         return Err(DepgraphServiceError::ResourceExhausted);
                     }
@@ -1251,7 +1214,7 @@ fn representative_cycle_bounded(
                 if path.len() >= MAX_CYCLE_NODE_IDS {
                     return Err(DepgraphServiceError::ResourceExhausted);
                 }
-                cycle_phase_step(steps, maximum, CycleWorkPhase::Finalization, is_cancelled)?;
+                work.scan(CycleWorkPhase::Finalization)?;
                 path.push(start.to_owned());
                 return Ok(Some(path));
             }
@@ -1271,19 +1234,64 @@ enum CycleWorkPhase {
     Finalization,
 }
 
-fn cycle_phase_step(
-    steps: &mut usize,
-    maximum: usize,
-    phase: CycleWorkPhase,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> DepgraphServiceResult<()> {
-    if is_cancelled() {
-        return Err(DepgraphServiceError::Cancelled);
+/// The two work counters of one cycle search.
+struct CycleWork<'a> {
+    scanned: usize,
+    scan_maximum: usize,
+    edge_visits: usize,
+    max_traversal: usize,
+    is_cancelled: &'a mut dyn FnMut() -> bool,
+}
+
+impl<'a> CycleWork<'a> {
+    fn new(
+        scan_maximum: usize,
+        max_traversal: usize,
+        is_cancelled: &'a mut dyn FnMut() -> bool,
+    ) -> Self {
+        Self {
+            scanned: 0,
+            scan_maximum,
+            edge_visits: 0,
+            max_traversal,
+            is_cancelled,
+        }
     }
-    if *steps >= maximum {
-        return Err(DepgraphServiceError::ResourceExhausted);
+
+    /// One snapshot record or one node of the search.
+    fn scan(&mut self, phase: CycleWorkPhase) -> DepgraphServiceResult<()> {
+        if (self.is_cancelled)() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        if self.scanned >= self.scan_maximum {
+            return Err(snapshot_scan_limit(self.scan_maximum));
+        }
+        self.scanned += 1;
+        record_cycle_work(phase);
+        Ok(())
     }
-    *steps += 1;
+
+    /// One adjacency edge the search visits.
+    fn edge(&mut self, phase: CycleWorkPhase) -> DepgraphServiceResult<()> {
+        if (self.is_cancelled)() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        if self.edge_visits >= self.max_traversal {
+            return Err(DepgraphServiceError::resource_limit(
+                DepgraphResourceLimit::MaxTraversal,
+                saturating_u64(self.max_traversal),
+                None,
+            ));
+        }
+        self.edge_visits += 1;
+        #[cfg(test)]
+        CYCLE_EDGE_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_cycle_work(phase);
+        Ok(())
+    }
+}
+
+fn record_cycle_work(phase: CycleWorkPhase) {
     #[cfg(test)]
     match phase {
         CycleWorkPhase::Preprocessing => {
@@ -1298,7 +1306,6 @@ fn cycle_phase_step(
     }
     #[cfg(not(test))]
     let _ = phase;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1310,6 +1317,8 @@ static CYCLE_TRAVERSAL_WORK: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static CYCLE_FINALIZATION_WORK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CYCLE_EDGE_VISITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static CYCLE_ADJACENCY_INSERT_VISITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1333,11 +1342,30 @@ fn unresolved_bounded_with_cancellation(
     request: &UnresolvedRequest,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> DepgraphServiceResult<Vec<UnresolvedResult>> {
-    let maximum = request.max_traversal();
-    let mut preprocessing = 0;
+    unresolved_bounded_with_budget(
+        snapshot,
+        request,
+        MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
+        is_cancelled,
+    )
+}
+
+/// Lists unresolved sites. Indexing the snapshot's evidence, edges,
+/// correlations, coverage, and sites, and materializing the results, count
+/// against `scan_maximum`. The request's `max_traversal` bounds the number of
+/// unresolved sites returned and is checked before any is materialized, so
+/// its error reports how many sites matched (Issue #617).
+fn unresolved_bounded_with_budget(
+    snapshot: &GraphSnapshot,
+    request: &UnresolvedRequest,
+    scan_maximum: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> DepgraphServiceResult<Vec<UnresolvedResult>> {
+    let maximum = scan_maximum;
+    let mut work = 0;
     let mut evidence = BTreeMap::<String, Vec<EvidenceRecord>>::new();
     for item in &snapshot.evidence {
-        phase_step(&mut preprocessing, maximum, is_cancelled)?;
+        phase_step(&mut work, maximum, is_cancelled)?;
         if item.owner_type == "site" {
             let records = evidence.entry(item.owner_id.clone()).or_default();
             if records.len() >= MAX_UNRESOLVED_EVIDENCE_PER_SITE {
@@ -1361,7 +1389,7 @@ fn unresolved_bounded_with_cancellation(
     }
     let mut phases = BTreeMap::<String, BTreeSet<String>>::new();
     for edge in &snapshot.edges {
-        phase_step(&mut preprocessing, maximum, is_cancelled)?;
+        phase_step(&mut work, maximum, is_cancelled)?;
         if let Some(site_id) = &edge.site_id {
             let site_phases = phases.entry(site_id.clone()).or_default();
             if !site_phases.contains(edge.phase.as_str()) {
@@ -1374,9 +1402,9 @@ fn unresolved_bounded_with_cancellation(
     }
     let mut correlations = BTreeMap::<String, &ProfileCorrelationRecord>::new();
     for correlation in &snapshot.profile_matrix.correlations {
-        phase_step(&mut preprocessing, maximum, is_cancelled)?;
+        phase_step(&mut work, maximum, is_cancelled)?;
         for site_id in correlation.site_ids_by_phase.values().flatten() {
-            phase_step(&mut preprocessing, maximum, is_cancelled)?;
+            phase_step(&mut work, maximum, is_cancelled)?;
             if correlations.insert(site_id.clone(), correlation).is_some() {
                 return Err(DepgraphServiceError::Integrity);
             }
@@ -1384,17 +1412,14 @@ fn unresolved_bounded_with_cancellation(
     }
     let phase_coverage = phase_coverage_index_cancellable(
         &snapshot.profile_matrix.entries,
-        &mut preprocessing,
+        &mut work,
         maximum,
         is_cancelled,
     )?;
 
-    let mut finalization_work = 0;
-    let mut finalization =
-        UnresolvedFinalization::new(&mut finalization_work, maximum, is_cancelled);
-    let mut ordered_items = BTreeMap::new();
+    let mut selected = Vec::new();
     for site in &snapshot.sites {
-        finalization.step()?;
+        phase_step(&mut work, maximum, is_cancelled)?;
         if site.resolution_status != "unresolved"
             || (!request.kinds().is_empty() && request.kinds().binary_search(&site.kind).is_err())
         {
@@ -1403,6 +1428,19 @@ fn unresolved_bounded_with_cancellation(
         if site.target_ids.len() > MAX_UNRESOLVED_TARGETS_PER_SITE {
             return Err(DepgraphServiceError::ResourceExhausted);
         }
+        selected.push(site);
+    }
+    if selected.len() > request.max_traversal() {
+        return Err(DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::MaxTraversal,
+            saturating_u64(request.max_traversal()),
+            Some(saturating_u64(selected.len())),
+        ));
+    }
+
+    let mut finalization = UnresolvedFinalization::new(&mut work, maximum, is_cancelled);
+    let mut ordered_items = BTreeMap::new();
+    for site in selected {
         let correlation = correlations.get(&site.id).copied();
         let result = unresolved_result(
             site,
@@ -1488,7 +1526,7 @@ impl<'a> UnresolvedFinalization<'a> {
     fn step(&mut self) -> DepgraphServiceResult<()> {
         self.check_cancelled()?;
         if *self.work >= self.maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(snapshot_scan_limit(self.maximum));
         }
         *self.work += 1;
         Ok(())
@@ -1509,16 +1547,16 @@ fn phase_coverage_index_cancellable<'a>(
             return Err(DepgraphServiceError::Cancelled);
         }
         if *preprocessing >= maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(snapshot_scan_limit(maximum));
         }
         *preprocessing += 1;
         #[cfg(test)]
         PHASE_COVERAGE_ENTRY_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if entry.phase_coverage.len() > maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(snapshot_scan_limit(maximum));
         }
         if !index.contains_key(entry.id.as_str()) && index.len() >= maximum {
-            return Err(DepgraphServiceError::ResourceExhausted);
+            return Err(snapshot_scan_limit(maximum));
         }
         index
             .entry(entry.id.as_str())
@@ -2001,6 +2039,7 @@ mod tests {
             &CYCLE_PREPROCESSING_WORK,
             &CYCLE_TRAVERSAL_WORK,
             &CYCLE_FINALIZATION_WORK,
+            &CYCLE_EDGE_VISITS,
             &CYCLE_ADJACENCY_INSERT_VISITS,
             &CYCLE_COMPONENT_INSERT_VISITS,
             &CYCLE_RESULT_MATERIALIZATION_VISITS,
@@ -2381,7 +2420,11 @@ mod tests {
                 &mut || false,
             )
             .expect_err("one entry above the shared work bound must fail closed"),
-            DepgraphServiceError::ResourceExhausted
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum,
+                observed: None,
+            } if maximum == exact_maximum as u64
         ));
 
         PHASE_COVERAGE_ENTRY_VISITS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2435,7 +2478,11 @@ mod tests {
             assert!(matches!(
                 clone_phase_coverage_cancellable(&coverage, &mut finalization)
                     .expect_err("the first phase above the cumulative work bound must fail closed"),
-                DepgraphServiceError::ResourceExhausted
+                DepgraphServiceError::ResourceLimitExceeded {
+                    limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                    maximum,
+                    observed: None,
+                } if maximum == exact_maximum as u64
             ));
         }
 
@@ -2540,9 +2587,11 @@ mod tests {
             .expect("unresolved ordering test lock");
         let site_count = 32_usize;
         let snapshot = unresolved_snapshot(site_count);
+        // One scan step per site, one ordered insertion and one
+        // materialization per returned site.
         let exact_work = site_count * 3;
-        let request = UnresolvedRequest::try_new(Vec::new(), exact_work)
-            .expect("exact unresolved work request");
+        let request = UnresolvedRequest::try_new(Vec::new(), site_count)
+            .expect("max_traversal admits exactly the matching sites");
         let reset = || {
             UNRESOLVED_ORDERED_INSERT_VISITS.store(0, std::sync::atomic::Ordering::Relaxed);
             UNRESOLVED_ORDERED_MATERIALIZATION_VISITS
@@ -2550,8 +2599,8 @@ mod tests {
         };
 
         reset();
-        let items = unresolved_bounded_cancellable(&snapshot, &request, &CancellationToken::new())
-            .expect("the exact unresolved finalization bound succeeds");
+        let items = unresolved_bounded_with_budget(&snapshot, &request, exact_work, &mut || false)
+            .expect("the exact unresolved scan bound succeeds");
         assert_eq!(items.len(), site_count);
         assert!(
             items
@@ -2567,13 +2616,45 @@ mod tests {
             site_count
         );
 
-        let below = UnresolvedRequest::try_new(Vec::new(), exact_work - 1)
-            .expect("one-below unresolved work request");
+        reset();
+        assert!(matches!(
+            unresolved_bounded_with_budget(&snapshot, &request, exact_work - 1, &mut || false)
+                .expect_err("one scan work item above the bound returns no result"),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum,
+                observed: None,
+            } if maximum == (exact_work - 1) as u64
+        ));
+
+        // Issue #617: max_traversal bounds the matching sites, and is checked
+        // before any of them is materialized.
+        reset();
+        let below = UnresolvedRequest::try_new(Vec::new(), site_count - 1)
+            .expect("one-below unresolved request");
         assert!(matches!(
             unresolved_bounded_cancellable(&snapshot, &below, &CancellationToken::new())
-                .expect_err("one finalization work item above the bound returns no result"),
-            DepgraphServiceError::ResourceExhausted
+                .expect_err("one matching site above max_traversal returns no result"),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::MaxTraversal,
+                maximum,
+                observed: Some(observed),
+            } if maximum == (site_count - 1) as u64 && observed == site_count as u64
         ));
+        assert_eq!(
+            UNRESOLVED_ORDERED_INSERT_VISITS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let mut filtered = unresolved_snapshot(site_count);
+        filtered.sites[0].kind = "dynamic_import".to_owned();
+        let only_dynamic = UnresolvedRequest::try_new(vec!["dynamic_import".to_owned()], 1)
+            .expect("kind-filtered request");
+        assert_eq!(
+            unresolved_bounded_cancellable(&filtered, &only_dynamic, &CancellationToken::new())
+                .expect("only the filtered kind counts against max_traversal")
+                .len(),
+            1
+        );
 
         for (counter, stage) in [
             (&UNRESOLVED_ORDERED_INSERT_VISITS, "ordered insertion"),
@@ -2610,6 +2691,10 @@ mod tests {
 
     #[test]
     fn unresolved_phase_aggregation_accepts_four_distinct_and_rejects_the_fifth() {
+        // Unresolved listing bumps the shared ordering counters.
+        let _guard = SERVICE_GRAPH_COUNTER_TEST_LOCK
+            .lock()
+            .expect("service graph counter test lock");
         let edge = |index: usize, phase: &str| EdgeRecord {
             id: format!("edge:phase:{index}"),
             site_id: Some("site:0000".to_owned()),
@@ -2784,33 +2869,61 @@ mod tests {
                 ]
             );
         }
-        let exact_maximum = [
+        let edge_visits = CYCLE_EDGE_VISITS.load(std::sync::atomic::Ordering::Relaxed);
+        let scan_work = [
             CYCLE_PREPROCESSING_WORK.load(std::sync::atomic::Ordering::Relaxed),
             CYCLE_TRAVERSAL_WORK.load(std::sync::atomic::Ordering::Relaxed),
             CYCLE_FINALIZATION_WORK.load(std::sync::atomic::Ordering::Relaxed),
         ]
         .into_iter()
-        .max()
-        .expect("three cycle phases");
+        .sum::<usize>()
+            - edge_visits;
+        // Each of the 24 ring edges is visited forward, backward, and once
+        // while choosing the representative cycle (Issue #618).
+        assert_eq!(edge_visits, 24 * 3);
+        let assert_same_cycles = |actual: &[CycleResult]| {
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.level, expected.level);
+                assert_eq!(actual.node_ids, expected.node_ids);
+            }
+        };
 
         reset_cycle_counters();
-        let exact_request = CyclesRequest::try_new(CycleLevel::File, exact_maximum)
-            .expect("exact cycle work request");
-        let exact = cycles_bounded_with_cancellation(&snapshot, &exact_request, &mut || false)
-            .expect("the exact largest phase work bound succeeds");
-        assert_eq!(exact.len(), expected.len());
-        for (actual, expected) in exact.iter().zip(&expected) {
-            assert_eq!(actual.level, expected.level);
-            assert_eq!(actual.node_ids, expected.node_ids);
-        }
+        let exact_request = CyclesRequest::try_new(CycleLevel::File, edge_visits)
+            .expect("exact cycle edge visit request");
+        assert_same_cycles(
+            &cycles_bounded_with_cancellation(&snapshot, &exact_request, &mut || false)
+                .expect("the exact edge visit bound succeeds"),
+        );
 
         reset_cycle_counters();
-        let below_request = CyclesRequest::try_new(CycleLevel::File, exact_maximum - 1)
-            .expect("one-below cycle work request");
+        let below_request = CyclesRequest::try_new(CycleLevel::File, edge_visits - 1)
+            .expect("one-below cycle edge visit request");
         assert!(matches!(
             cycles_bounded_with_cancellation(&snapshot, &below_request, &mut || false)
-                .expect_err("one work item above a phase bound returns no cycles"),
-            DepgraphServiceError::ResourceExhausted
+                .expect_err("one edge visit above max_traversal returns no cycles"),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::MaxTraversal,
+                maximum,
+                observed: None,
+            } if maximum == (edge_visits - 1) as u64
+        ));
+
+        reset_cycle_counters();
+        assert_same_cycles(
+            &cycles_bounded_with_budget(&snapshot, &generous, scan_work, &mut || false)
+                .expect("the exact snapshot scan bound succeeds"),
+        );
+        reset_cycle_counters();
+        assert!(matches!(
+            cycles_bounded_with_budget(&snapshot, &generous, scan_work - 1, &mut || false)
+                .expect_err("one scan work item above the ceiling returns no cycles"),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum,
+                observed: None,
+            } if maximum == (scan_work - 1) as u64
         ));
 
         for (counter, stage) in [

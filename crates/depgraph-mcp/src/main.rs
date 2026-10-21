@@ -4473,10 +4473,16 @@ fn validate_graph_filter_lengths(
 fn graph_max_traversal(value: Option<usize>) -> Result<usize, ToolExecutionFailure> {
     let value = value.unwrap_or(depgraph_core::DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL);
     if !(1..=MAX_INTERACTIVE_QUERY_TRAVERSAL).contains(&value) {
-        return Err(invalid_argument(
-            Some("max_traversal"),
-            AgentArgumentReason::OutOfRange,
-        ));
+        return Err(ToolExecutionFailure::Agent(AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            Some(AgentErrorDetails::argument_out_of_range(
+                "max_traversal",
+                1,
+                MAX_INTERACTIVE_QUERY_TRAVERSAL as u64,
+            )),
+        )));
     }
     Ok(value)
 }

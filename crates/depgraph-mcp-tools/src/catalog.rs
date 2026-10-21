@@ -1318,21 +1318,26 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         "max_nodes" | "max_edges" => {
             json!({"type": "integer", "minimum": 1, "maximum": 1000000})
         }
-        // Cycle and unresolved listing count per-phase work and report a
-        // plain RESOURCE_EXHAUSTED without resource_limit details.
-        "max_traversal" if matches!(tool_name, "graph_cycles_list" | "graph_unresolved_list") => {
-            json!({
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 1000000,
-                "description": "Work bound of each preprocessing, traversal and finalization phase. A request that hits it returns RESOURCE_EXHAUSTED without error.details."
-            })
-        }
+        // Cycle and unresolved listing index the whole snapshot under a fixed
+        // service ceiling; max_traversal bounds only what the request asks
+        // for (Issues #617 / #618).
+        "max_traversal" if tool_name == "graph_cycles_list" => json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Edge visit bound of the cycle search, default 50000. Indexing the snapshot is bounded separately by a fixed service ceiling. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit and its maximum: traversal_items with argument=max_traversal, where remediation increase_limit means a larger max_traversal can succeed, or preprocessing_work_items for the fixed ceiling. A value outside 1..=1000000 returns INVALID_ARGUMENT whose error.details carry minimum and maximum."
+        }),
+        "max_traversal" if tool_name == "graph_unresolved_list" => json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Most unresolved sites the listing may match, default 50000; limit and cursor only page the matches. Indexing the snapshot is bounded separately by a fixed service ceiling. When more sites match, the request returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) carry limit traversal_items, maximum, observed (the number of matching sites), and argument=max_traversal; remediation increase_limit means a max_traversal of at least observed can succeed. Hitting the fixed ceiling reports preprocessing_work_items. A value outside 1..=1000000 returns INVALID_ARGUMENT whose error.details carry minimum and maximum."
+        }),
         "max_traversal" => json!({
             "type": "integer",
             "minimum": 1,
             "maximum": 1000000,
-            "description": "Edge visit bound of the traversal, default 50000. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit, its maximum, the observed work when known, and argument=max_traversal when this argument moves the bound; remediation increase_limit means a larger max_traversal can succeed."
+            "description": "Edge visit bound of the traversal, default 50000. A request that hits a bound returns RESOURCE_EXHAUSTED whose error.details (kind resource_limit) names the limit, its maximum, the observed work when known, and argument=max_traversal when this argument moves the bound; remediation increase_limit means a larger max_traversal can succeed. A value outside 1..=1000000 returns INVALID_ARGUMENT whose error.details carry minimum and maximum."
         }),
         "profiles_document" => json!({
             "type": "string",

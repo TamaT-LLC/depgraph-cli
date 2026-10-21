@@ -664,7 +664,11 @@ fn dependency_and_path_requests_enforce_the_canonical_traversal_maximum() -> Res
             GraphQueryFilter::default(),
             over_maximum,
         ),
-        Err(DepgraphServiceError::InvalidInput)
+        Err(DepgraphServiceError::ArgumentOutOfRange {
+            argument: "max_traversal",
+            minimum: 1,
+            maximum: 1_000_000,
+        })
     ));
     assert!(matches!(
         ExplainPathRequest::try_new(
@@ -673,7 +677,11 @@ fn dependency_and_path_requests_enforce_the_canonical_traversal_maximum() -> Res
             GraphQueryFilter::default(),
             over_maximum,
         ),
-        Err(DepgraphServiceError::InvalidInput)
+        Err(DepgraphServiceError::ArgumentOutOfRange {
+            argument: "max_traversal",
+            minimum: 1,
+            maximum: 1_000_000,
+        })
     ));
     Ok(())
 }
@@ -1329,16 +1337,25 @@ fn issue_303_service_methods_are_canonical_bounded_and_cancellable() -> Result<(
             &CyclesRequest::try_new(CycleLevel::File, 1)?,
             &cancellation,
         ),
-        Err(DepgraphServiceError::ResourceExhausted)
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum: 1,
+            observed: None,
+        })
     ));
-    assert!(matches!(
-        service.unresolved(
-            &mut exhausted_snapshot,
-            &UnresolvedRequest::try_new(Vec::new(), 1)?,
-            &cancellation,
-        ),
-        Err(DepgraphServiceError::ResourceExhausted)
-    ));
+    // max_traversal bounds the matching unresolved sites (Issue #617): the
+    // one unresolved site fits in 1.
+    assert_eq!(
+        service
+            .unresolved(
+                &mut exhausted_snapshot,
+                &UnresolvedRequest::try_new(Vec::new(), 1)?,
+                &cancellation,
+            )?
+            .items()
+            .len(),
+        1
+    );
 
     let cancelled = CancellationToken::new();
     assert!(cancelled.cancel());
@@ -1823,4 +1840,142 @@ fn issue_541_omitted_structural_edges_lets_an_allowlist_name_structural_kinds() 
             .structural_edges(),
         DEFAULT_STRUCTURAL_EDGE_SELECTION
     );
+}
+
+// Issue #617 / #618: unresolved and cycles on a mid-sized snapshot.
+
+#[path = "support/issue_617_fixture.rs"]
+mod issue_617_fixture;
+use issue_617_fixture::{Issue617Shape, seed_issue_617_graph};
+
+#[test]
+fn issue_617_618_default_max_traversal_lists_unresolved_and_cycles_of_a_mid_sized_snapshot()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let shape = Issue617Shape::MID_SIZED;
+    let mut writer = Store::open(&store_path)?;
+    seed_issue_617_graph(&mut writer, &root, shape)?;
+    drop(writer);
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut snapshot = service.start_snapshot_request("current")?;
+    let default = depgraph_core::DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL;
+
+    // Before the fix, the snapshot indexing alone counted 130,501 work items
+    // for unresolved listing and 55,751 for file cycles against the default
+    // max_traversal of 50,000.
+    let unresolved = service.unresolved(
+        &mut snapshot,
+        &UnresolvedRequest::try_new(Vec::new(), default)?,
+        &cancellation,
+    )?;
+    let unresolved_count = shape.files * shape.unresolved_per_file;
+    assert_eq!(unresolved.items().len(), unresolved_count);
+    assert!(
+        unresolved
+            .items()
+            .iter()
+            .all(|item| item.site.resolution_status == "unresolved" && item.evidence.len() == 1)
+    );
+
+    let file_cycles = service.cycles(
+        &mut snapshot,
+        &CyclesRequest::try_new(CycleLevel::File, default)?,
+        &cancellation,
+    )?;
+    assert_eq!(file_cycles.cycles().len(), shape.files / shape.ring);
+    assert_eq!(
+        file_cycles.cycles()[0].node_ids,
+        (0..=shape.ring)
+            .map(|file| format!("file:{:04}", file % shape.ring))
+            .collect::<Vec<_>>()
+    );
+    let symbol_cycles = service.cycles(
+        &mut snapshot,
+        &CyclesRequest::try_new(CycleLevel::Symbol, default)?,
+        &cancellation,
+    )?;
+    assert!(symbol_cycles.cycles().is_empty());
+
+    // max_traversal bounds the matching unresolved sites and reports how many
+    // matched, so the caller knows which value succeeds.
+    let short = UnresolvedRequest::try_new(Vec::new(), unresolved_count - 1)?;
+    let error = service
+        .unresolved(&mut snapshot, &short, &cancellation)
+        .expect_err("one matching site above max_traversal fails");
+    assert!(matches!(
+        error,
+        DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum,
+            observed: Some(observed),
+        } if maximum == (unresolved_count - 1) as u64 && observed == unresolved_count as u64
+    ));
+    assert_eq!(
+        error.to_string(),
+        "request exhausted a service resource limit: max_traversal=6749 (observed 6750)"
+    );
+    let exact = UnresolvedRequest::try_new(Vec::new(), unresolved_count)?;
+    assert_eq!(
+        service
+            .unresolved(&mut snapshot, &exact, &cancellation)?
+            .items()
+            .len(),
+        unresolved_count
+    );
+
+    // The cycle search counts the ring edges it visits: forward, backward,
+    // and while choosing each representative cycle.
+    let ring_edge_visits = shape.files * 3;
+    let node_ids = |cycles: &[depgraph_core::CycleResult]| {
+        cycles
+            .iter()
+            .map(|cycle| cycle.node_ids.clone())
+            .collect::<Vec<_>>()
+    };
+    let at_limit = service.cycles(
+        &mut snapshot,
+        &CyclesRequest::try_new(CycleLevel::File, ring_edge_visits)?,
+        &cancellation,
+    )?;
+    assert_eq!(node_ids(at_limit.cycles()), node_ids(file_cycles.cycles()));
+    assert!(matches!(
+        service.cycles(
+            &mut snapshot,
+            &CyclesRequest::try_new(CycleLevel::File, ring_edge_visits - 1)?,
+            &cancellation,
+        ),
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum,
+            observed: None,
+        }) if maximum == (ring_edge_visits - 1) as u64
+    ));
+    Ok(())
+}
+
+#[test]
+fn issue_617_out_of_range_max_traversal_names_the_argument_and_its_range() {
+    for value in [0, depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL + 1] {
+        for error in [
+            CyclesRequest::try_new(CycleLevel::File, value).unwrap_err(),
+            UnresolvedRequest::try_new(Vec::new(), value).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                DepgraphServiceError::ArgumentOutOfRange {
+                    argument: "max_traversal",
+                    minimum: 1,
+                    maximum: 1_000_000,
+                }
+            ));
+            assert_eq!(
+                error.to_string(),
+                "invalid service input: max_traversal must be in 1..=1000000"
+            );
+        }
+    }
 }
