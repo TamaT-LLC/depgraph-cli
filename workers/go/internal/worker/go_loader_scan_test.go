@@ -465,7 +465,9 @@ func TestGoLoaderPackageScopeScanRunsCHAOverDeclaredScopeWithSharedIdentity(t *t
 		if !ok {
 			t.Fatalf("package-scope node is missing from the whole-program run: %+v", node)
 		}
-		if counterpart.Kind != node.Kind || counterpart.Locator != node.Locator {
+		// The core rejects a node whose properties differ between units, so
+		// reference nodes must carry exactly the owner's properties (#596).
+		if !reflect.DeepEqual(counterpart, node) {
 			t.Fatalf("node %s differs: scoped=%+v whole=%+v", id, node, counterpart)
 		}
 	}
