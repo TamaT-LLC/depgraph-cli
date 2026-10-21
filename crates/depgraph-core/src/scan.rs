@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     io::{BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
@@ -51,8 +52,8 @@ use crate::{
     profile_selection_rank::profile_selection_doctor_status,
     service_limits::MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
     worker::{
-        AdapterKind, WorkerFailureKind, WorkerOutput, WorkerSpec, detect_adapters,
-        is_security_error, locate_worker, probe_worker_version_with_cancellation,
+        AdapterKind, EncodedEvent, WorkerEvents, WorkerFailureKind, WorkerOutput, WorkerSpec,
+        detect_adapters, is_security_error, locate_worker, probe_worker_version_with_cancellation,
         resolve_safe_executable, worker_capabilities,
     },
 };
@@ -284,10 +285,10 @@ impl DeferredAnalysisFailure {
         let events = tempfile::NamedTempFile::new()?;
         {
             let mut writer = BufWriter::new(events.as_file());
-            serde_json::to_writer(&mut writer, &output.events)?;
+            output.events.write_to(&mut writer)?;
             writer.flush()?;
         }
-        output.events = Vec::new();
+        output.events = WorkerEvents::default();
         Ok(Self {
             sequence,
             events,
@@ -297,7 +298,7 @@ impl DeferredAnalysisFailure {
 
     fn restore(mut self) -> Result<WorkerOutput> {
         self.events.as_file_mut().rewind()?;
-        self.output.events = serde_json::from_reader(BufReader::new(self.events.as_file()))?;
+        self.output.events = WorkerEvents::read_from(BufReader::new(self.events.as_file()))?;
         Ok(self.output)
     }
 }
@@ -1873,10 +1874,7 @@ fn bind_worker_output_to_profile_plan_inner(
         ProfileSelectionMode::Automatic => "automatic",
         ProfileSelectionMode::Explicit => "explicit",
     };
-    for event in &mut output.events {
-        if event.get("event").and_then(Value::as_str) != Some("profile_declared") {
-            continue;
-        }
+    output.events.update_named("profile_declared", |event| {
         let profile = event
             .get_mut("profile")
             .and_then(Value::as_object_mut)
@@ -1914,8 +1912,8 @@ fn bind_worker_output_to_profile_plan_inner(
                 anyhow::bail!("worker profile collides with reserved profile-selection metadata");
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(crate) fn cancel_scan(store: &mut Store, scan_id: &str) -> Result<ScanOutcome> {
@@ -2582,6 +2580,24 @@ fn is_analysis_unit_contract(value: Option<&str>) -> bool {
     })
 }
 
+/// The order a worker stream is ingested in. Events of one type keep their
+/// stream order; events of any other type are not ingested.
+const INGEST_ORDER: [&str; 9] = [
+    "scan_started",
+    "profile_declared",
+    "node_upsert",
+    "dependency_site",
+    "edge_upsert",
+    "diagnostic",
+    "file_completed",
+    "profile_completed",
+    "scan_completed",
+];
+/// `INGEST_ORDER[..INGEST_GRAPH_START]` precede the graph events and
+/// `INGEST_ORDER[INGEST_GRAPH_END..]` follow them.
+const INGEST_GRAPH_START: usize = 2;
+const INGEST_GRAPH_END: usize = 6;
+
 fn ingest_worker_output(
     store: &mut Store,
     scan_id: &str,
@@ -2597,86 +2613,107 @@ fn ingest_worker_output(
         &output.stderr,
         output.stderr_truncated,
     )?;
-    let ledger_identity = analysis_unit_ledger_identity(&output.events);
+    let ledger_identity =
+        analysis_unit_ledger_identity(&output.events.named("profile_declared").collect::<Vec<_>>());
     let worker_error = output.error.clone();
-    const ORDER: &[&str] = &[
-        "scan_started",
-        "profile_declared",
-        "node_upsert",
-        "dependency_site",
-        "edge_upsert",
-        "diagnostic",
-        "file_completed",
-        "profile_completed",
-        "scan_completed",
-    ];
-    let mut ordered = Vec::with_capacity(output.events.len());
-    for event_type in ORDER {
-        ordered.extend(
-            output
-                .events
+    let adapter = output.adapter;
+    // Node, site, edge, and diagnostic events stay compact and are parsed one
+    // at a time by each pass below; a large stream held as JSON values
+    // dominated the core's memory (#598). The few events before and after
+    // them are parsed once. Each pass still visits the events in ingest order.
+    let mut buckets: [Vec<EncodedEvent>; INGEST_ORDER.len()] = Default::default();
+    for event in output.events.into_encoded() {
+        if let Some(rank) = event
+            .name()
+            .and_then(|name| INGEST_ORDER.iter().position(|ordered| *ordered == name))
+        {
+            buckets[rank].push(event);
+        }
+    }
+    let mut head = Vec::new();
+    let mut graph = Vec::new();
+    let mut tail = Vec::new();
+    for (rank, bucket) in buckets.into_iter().enumerate() {
+        if (INGEST_GRAPH_START..INGEST_GRAPH_END).contains(&rank) {
+            graph.extend(bucket);
+        } else {
+            let values = bucket
                 .iter()
-                .filter(|event| event.get("event").and_then(Value::as_str) == Some(*event_type))
-                .cloned(),
-        );
+                .map(EncodedEvent::value)
+                .collect::<Result<Vec<_>>>()?;
+            if rank < INGEST_GRAPH_START {
+                head.extend(values);
+            } else {
+                tail.extend(values);
+            }
+        }
     }
     if worker_error.is_some() {
-        let available_sites = ordered
-            .iter()
-            .filter_map(|event| {
-                (event.get("event").and_then(Value::as_str) == Some("dependency_site"))
-                    .then(|| event.get("site")?.get("id")?.as_str())
-                    .flatten()
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<BTreeSet<_>>();
+        let mut available_sites = BTreeSet::new();
+        for event in &graph {
+            if event.name() == Some("dependency_site")
+                && let Some(site_id) = event.value()?.get("site").and_then(|site| {
+                    site.get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            {
+                available_sites.insert(site_id);
+            }
+        }
         // A truncated but otherwise valid protocol prefix can contain an edge
         // before its dependency_site. Do not let that edge's store FK roll
         // back independent nodes, diagnostics, and coverage from the prefix.
-        ordered.retain(|event| {
-            if event.get("event").and_then(Value::as_str) != Some("edge_upsert") {
-                return true;
+        let mut retained = Vec::with_capacity(graph.len());
+        for event in graph {
+            let keep = event.name() != Some("edge_upsert")
+                || event
+                    .value()?
+                    .get("edge")
+                    .and_then(|edge| edge.get("site_id"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|site_id| available_sites.contains(site_id));
+            if keep {
+                retained.push(event);
             }
-            event
-                .get("edge")
-                .and_then(|edge| edge.get("site_id"))
-                .and_then(Value::as_str)
-                .is_none_or(|site_id| available_sites.contains(site_id))
-        });
+        }
+        graph = retained;
     }
     let mut file_coverage_delta: BTreeMap<(String, String), FileCoverageLedger> = BTreeMap::new();
     let mut unit_file_path_delta = AnalysisUnitFilePaths::new();
     if let Some(existing) = file_coverage_ledgers.as_deref() {
+        // File coverage reads the profile declarations and rewrites only file
+        // and scan completions, none of which is a graph event.
+        let head_len = head.len();
+        let mut control = head;
+        control.append(&mut tail);
         (file_coverage_delta, unit_file_path_delta) =
-            stage_file_coverage_events(&mut ordered, output.adapter, existing)?;
+            stage_file_coverage_events(&mut control, adapter, existing)?;
+        tail = control.split_off(head_len);
+        head = control;
     }
-    crate::analysis_canonical::normalize_source_batch_profiles(&mut ordered)?;
-    let merge_web_memberships = output.adapter == AdapterKind::Web
-        && ordered.iter().any(|event| {
+    if let Some(aliases) = crate::analysis_canonical::SourceBatchAliases::collect(&head)? {
+        for event in &mut head {
+            aliases.normalize(event)?;
+        }
+        for event in &mut graph {
+            let mut value = event.value()?;
+            aliases.normalize(&mut value)?;
+            *event = EncodedEvent::from_value(&value);
+        }
+        for event in &mut tail {
+            aliases.normalize(event)?;
+        }
+    }
+    let merge_web_memberships = adapter == AdapterKind::Web
+        && head.iter().any(|event| {
             event["event"] == "profile_declared"
                 && event["profile"]["properties"]["analysis_unit_contract"]
                     == "depgraph-analysis-unit-v2"
         });
     let mut merged_profiles = BTreeSet::new();
     let mut merged_nodes = BTreeSet::new();
-    for event in &mut ordered {
-        if merge_web_memberships
-            && event["event"] == "node_upsert"
-            && event["node"]["properties"]["profile_ids"].is_array()
-            && matches!(
-                event["node"]["kind"].as_str(),
-                Some("file" | "symbol" | "type" | "external_system")
-            )
-        {
-            let id = event["node"]["id"]
-                .as_str()
-                .context("semantic node has no ID")?
-                .to_owned();
-            if let Some(previous) = store.load_scan_node_payload(scan_id, &id)? {
-                crate::analysis_canonical::merge_shared_web_node(&previous, &mut event["node"])?;
-                merged_nodes.insert(id);
-            }
-        }
+    for event in &mut head {
         if event["event"] != "profile_declared"
             || event["profile"]["properties"]["analysis_unit_contract"]
                 != "depgraph-analysis-unit-v2"
@@ -2692,13 +2729,38 @@ fn ingest_worker_output(
             merged_profiles.insert(id);
         }
     }
+    if merge_web_memberships {
+        for event in &mut graph {
+            if event.name() != Some("node_upsert") {
+                continue;
+            }
+            let mut value = event.value()?;
+            if !(value["node"]["properties"]["profile_ids"].is_array()
+                && matches!(
+                    value["node"]["kind"].as_str(),
+                    Some("file" | "symbol" | "type" | "external_system")
+                ))
+            {
+                continue;
+            }
+            let id = value["node"]["id"]
+                .as_str()
+                .context("semantic node has no ID")?
+                .to_owned();
+            if let Some(previous) = store.load_scan_node_payload(scan_id, &id)? {
+                crate::analysis_canonical::merge_shared_web_node(&previous, &mut value["node"])?;
+                *event = EncodedEvent::from_value(&value);
+                merged_nodes.insert(id);
+            }
+        }
+    }
     let mut pending_delta = PendingAnalysisUnitCompletions::new();
     if pending_analysis_unit_completions.is_some()
-        && let Some((unit_id, stage)) = analysis_unit_identity(&ordered)
+        && let Some((unit_id, stage)) = analysis_unit_identity(&head)
     {
-        let key = (output.adapter, unit_id, stage);
-        let mut retained = Vec::with_capacity(ordered.len());
-        for event in ordered {
+        let key = (adapter, unit_id, stage);
+        let mut retained = Vec::with_capacity(tail.len());
+        for event in tail {
             if matches!(
                 event.get("event").and_then(Value::as_str),
                 Some("profile_completed") | Some("scan_completed")
@@ -2708,11 +2770,11 @@ fn ingest_worker_output(
                 retained.push(event);
             }
         }
-        ordered = retained;
+        tail = retained;
     }
     let mut global_upsert_delta = BTreeMap::new();
     if let Some(existing) = global_upserts.as_deref() {
-        for event in &ordered {
+        let mut check = |event: &Value| -> Result<()> {
             if let Some((kind, object)) = upsert_object(event) {
                 let id = object
                     .get("id")
@@ -2729,14 +2791,28 @@ fn ingest_worker_output(
                 }
                 global_upsert_delta.insert(key, serialized);
             }
+            Ok(())
+        };
+        for event in &head {
+            check(event)?;
+        }
+        for event in &graph {
+            check(&event.value()?)?;
+        }
+        for event in &tail {
+            check(event)?;
         }
     }
-    let ordered_refs = ordered.iter().collect::<Vec<_>>();
+    let ordered = head
+        .iter()
+        .map(|event| Ok(Cow::Borrowed(event)))
+        .chain(graph.iter().map(|event| event.value().map(Cow::Owned)))
+        .chain(tail.iter().map(|event| Ok(Cow::Borrowed(event))));
     if let Some((unit_id, unit_root, stage, chunk_id)) = ledger_identity {
         if store.analysis_unit_ledger_contains(scan_id, &unit_id, &unit_root, &stage, &chunk_id)? {
-            store.ingest_events_with_analysis_unit(
+            store.ingest_event_stream_with_analysis_unit(
                 scan_id,
-                &ordered_refs,
+                ordered,
                 &unit_id,
                 &unit_root,
                 &stage,
@@ -2754,10 +2830,10 @@ fn ingest_worker_output(
             // worker-prefixed stream without initializing a unit ledger.
             // Scheduled attempts always initialize the row above, so this
             // fallback cannot make an unplanned unit complete an attempt.
-            store.ingest_events(&ordered_refs)?;
+            store.ingest_event_stream(ordered)?;
         }
     } else {
-        store.ingest_events(&ordered_refs)?;
+        store.ingest_event_stream(ordered)?;
     }
 
     // The Store transaction is the commit point for the in-memory indexes as
@@ -2783,7 +2859,7 @@ fn ingest_worker_output(
         }
     }
     if let Some(error) = worker_error {
-        anyhow::bail!("{} worker failed: {error}", output.adapter.name());
+        anyhow::bail!("{} worker failed: {error}", adapter.name());
     }
     Ok(())
 }
@@ -3357,7 +3433,7 @@ mod tests {
     fn worker_phase_profile_accepts_only_completed_bounded_metrics() {
         let output = WorkerOutput {
             adapter: AdapterKind::Rust,
-            events: Vec::new(),
+            events: WorkerEvents::default(),
             stderr: concat!(
                 "depgraph-progress phase=rust_hir_vfs status=completed duration_ms=7 items=31 bytes=2048\n",
                 "depgraph-progress phase=rust_hir_semantic status=started items=7600\n",
@@ -4296,7 +4372,7 @@ mod tests {
             sequence,
             WorkerOutput {
                 adapter: AdapterKind::Go,
-                events: vec![started, profile, node],
+                events: vec![started, profile, node].into(),
                 stderr: String::new(),
                 stderr_truncated: false,
                 error: Some("worker resource limit".to_owned()),
@@ -4382,7 +4458,10 @@ mod tests {
             Err(anyhow::anyhow!("ledger update failed")),
             &deferred,
             |id, output| {
-                restored.push((id.to_owned(), output.events[2]["node"]["id"].clone()));
+                restored.push((
+                    id.to_owned(),
+                    output.events.to_values()[2]["node"]["id"].clone(),
+                ));
                 Ok(false)
             },
         )
@@ -4431,7 +4510,7 @@ mod tests {
         });
         let output = WorkerOutput {
             adapter: AdapterKind::Go,
-            events: vec![started, profile, node, edge],
+            events: vec![started, profile, node, edge].into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: Some("malformed NDJSON after valid prefix".to_owned()),
@@ -4455,6 +4534,140 @@ mod tests {
         let snapshot = store.load_snapshot("partial-scan")?;
         assert!(snapshot.nodes.iter().any(|node| node.id == "file:kept"));
         assert!(snapshot.edges.is_empty());
+        Ok(())
+    }
+
+    /// The core keeps graph events compact and ingests a stream pass by pass
+    /// (#598). The Store must still receive every event type in ingest order,
+    /// each type in stream order, without events of an unknown type.
+    #[test]
+    fn worker_output_is_ingested_in_event_type_order() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let common = |event: &str, seq: u64| {
+            json!({
+                "event":event,"protocol_version":"1.0","scan_id":"ordered-scan",
+                "adapter":"go","adapter_version":"0.1.0","seq":seq
+            })
+        };
+        let mut started = common("scan_started", 1);
+        started["root"] = json!(root.path());
+        started["project_code_executed"] = json!(false);
+        started["safe_mode"] = json!(true);
+        let mut profile = common("profile_declared", 2);
+        profile["profile"] = json!({
+            "id":"go:test","language":"go","features":[],"environment":{},"properties":{}
+        });
+        let node = |seq: u64, id: &str| {
+            let mut node = common("node_upsert", seq);
+            node["node"] = json!({
+                "id":id,"kind":"file","locator":format!("file://{id}.go"),"properties":{}
+            });
+            node
+        };
+        let source = node(3, "file:source");
+        let target = node(4, "file:target");
+        let evidence = json!([{
+            "kind":"source","extractor":"fixture","extractor_version":"0.1.0",
+            "path":"source.go","start_line":1,"start_column":1,"end_line":1,"end_column":2,
+            "properties":{}
+        }]);
+        let mut site = common("dependency_site", 5);
+        site["site"] = json!({
+            "id":"site:import","source":"file:source","kind":"import","specifier":"target",
+            "profile_id":"go:test","resolution_status":"resolved","precision":"exact",
+            "condition":{"op":"all","conditions":[]},"target_ids":["file:target"],
+            "evidence":evidence
+        });
+        let mut edge = common("edge_upsert", 6);
+        edge["edge"] = json!({
+            "id":"edge:import","site_id":"site:import","source":"file:source",
+            "target":"file:target","kind":"imports","phase":"source","environment":"host",
+            "profile_id":"go:test","resolution_status":"resolved","precision":"exact",
+            "condition":{"op":"all","conditions":[]},"generated":false,"evidence":evidence
+        });
+        let mut diagnostic = common("diagnostic", 7);
+        diagnostic["diagnostic"] = json!({
+            "id":"diagnostic:fixture","severity":"info","code":"fixture",
+            "message":"fixture diagnostic"
+        });
+        let mut file = common("file_completed", 8);
+        file["path"] = json!("source.go");
+        file["discovered_sites"] = json!(1);
+        file["emitted_sites"] = json!(1);
+        file["skipped_sites"] = json!(0);
+        file["skipped"] = json!(false);
+        let unknown = common("unknown_event", 9);
+
+        // Edges and nodes before the sites and nodes they reference only
+        // ingest when the stream is reordered by event type.
+        let stream = vec![
+            edge.clone(),
+            unknown,
+            file.clone(),
+            target.clone(),
+            diagnostic.clone(),
+            site.clone(),
+            profile.clone(),
+            source.clone(),
+            started.clone(),
+        ];
+        let mut reordered = Store::open_in_memory()?;
+        reordered.start_scan("ordered-scan", root.path(), false)?;
+        let mut global_upserts = BTreeMap::new();
+        ingest_worker_output(
+            &mut reordered,
+            "ordered-scan",
+            WorkerOutput {
+                adapter: AdapterKind::Go,
+                events: stream.into(),
+                stderr: String::new(),
+                stderr_truncated: false,
+                error: None,
+                failure_kind: None,
+                security_violation: false,
+                peak_memory_bytes: None,
+            },
+            Some(&mut global_upserts),
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(
+            global_upserts.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("diagnostic".to_owned(), "diagnostic:fixture".to_owned()),
+                ("edge".to_owned(), "edge:import".to_owned()),
+                ("node".to_owned(), "file:source".to_owned()),
+                ("node".to_owned(), "file:target".to_owned()),
+                ("profile".to_owned(), "go:test".to_owned()),
+                ("site".to_owned(), "site:import".to_owned()),
+            ])
+        );
+
+        let mut expected = Store::open_in_memory()?;
+        expected.start_scan("ordered-scan", root.path(), false)?;
+        expected.ingest_events(&[
+            &started,
+            &profile,
+            &target,
+            &source,
+            &site,
+            &edge,
+            &diagnostic,
+            &file,
+        ])?;
+        let snapshot = reordered.load_snapshot("ordered-scan")?;
+        let expected = expected.load_snapshot("ordered-scan")?;
+        assert_eq!(snapshot.profiles, expected.profiles);
+        assert_eq!(snapshot.nodes, expected.nodes);
+        assert_eq!(snapshot.sites, expected.sites);
+        assert_eq!(snapshot.edges, expected.edges);
+        assert_eq!(snapshot.evidence, expected.evidence);
+        assert_eq!(snapshot.diagnostics, expected.diagnostics);
+        assert_eq!(snapshot.file_coverage, expected.file_coverage);
+        assert_eq!(snapshot.coverage, expected.coverage);
+        assert_eq!(snapshot.edges.len(), 1);
+        assert_eq!(snapshot.nodes.len(), 2);
         Ok(())
     }
 
@@ -4530,7 +4743,8 @@ mod tests {
                 file,
                 profile_completed,
                 scan_completed,
-            ],
+            ]
+            .into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: None,
@@ -4879,7 +5093,8 @@ mod tests {
                     "environment":{},
                     "properties":{}
                 }
-            })],
+            })]
+            .into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: None,
@@ -4889,7 +5104,8 @@ mod tests {
         };
         let bound = bind_worker_output_to_profile_plan(output, &plan)
             .map_err(|rejection| rejection.error)?;
-        let properties = &bound.events[0]["profile"]["properties"];
+        let bound_events = bound.events.to_values();
+        let properties = &bound_events[0]["profile"]["properties"];
         assert_eq!(properties["profile_selection_plan_id"], plan.plan_id);
         assert_eq!(
             properties["profile_selection_input_digest"],
@@ -4921,7 +5137,8 @@ mod tests {
                     "environment":{},
                     "properties":null
                 }
-            })],
+            })]
+            .into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: None,
@@ -4932,7 +5149,7 @@ mod tests {
         let bound = bind_worker_output_to_profile_plan(null_properties, &plan)
             .map_err(|rejection| rejection.error)?;
         assert_eq!(
-            bound.events[0]["profile"]["properties"]["profile_selection_plan_id"],
+            bound.events.to_values()[0]["profile"]["properties"]["profile_selection_plan_id"],
             plan.plan_id
         );
 
@@ -4947,7 +5164,8 @@ mod tests {
                     "environment":{},
                     "properties":{"profile_selection_plan_id":"forged"}
                 }
-            })],
+            })]
+            .into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: None,

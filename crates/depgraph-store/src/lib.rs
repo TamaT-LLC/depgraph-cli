@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashSet},
     path::Path,
 };
@@ -1270,16 +1271,29 @@ ORDER BY id COLLATE BINARY
     }
 
     pub fn ingest_events(&mut self, events: &[&Value]) -> Result<()> {
-        let Some(first) = events.first() else {
-            return Ok(());
+        self.ingest_event_stream(events.iter().map(|event| Ok(Cow::Borrowed(*event))))
+    }
+
+    /// Ingest events like [`Self::ingest_events`], pulling them one at a time.
+    /// A caller can then keep a large worker stream in a compact form and
+    /// materialize each event only while it is written (#598). An `Err` item
+    /// aborts the batch and rolls back its transaction.
+    pub fn ingest_event_stream<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = Result<Cow<'a, Value>>>,
+    ) -> Result<()> {
+        let mut events = events.into_iter().peekable();
+        let scan_id = match events.peek() {
+            None => return Ok(()),
+            Some(Ok(first)) => required_str(first, "scan_id")?.to_owned(),
+            Some(Err(_)) => return events.next().expect("peeked event").map(|_| ()),
         };
-        let scan_id = required_str(first, "scan_id")?;
         let tx = self.connection.transaction()?;
-        ensure_scan_staging(&tx, scan_id)?;
-        ingest_events_in_transaction(&tx, events, scan_id)?;
+        ensure_scan_staging(&tx, &scan_id)?;
+        ingest_events_in_transaction(&tx, events, &scan_id)?;
         tx.execute(
             "UPDATE scans SET mutation_count=mutation_count+1 WHERE id=?1",
-            [scan_id],
+            [&scan_id],
         )?;
         tx.commit()?;
         Ok(())
@@ -1294,6 +1308,34 @@ ORDER BY id COLLATE BINARY
         &mut self,
         scan_id: &str,
         events: &[&Value],
+        unit_id: &str,
+        unit_root: &str,
+        stage: &str,
+        chunk_id: &str,
+        status: &str,
+        reused: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.ingest_event_stream_with_analysis_unit(
+            scan_id,
+            events.iter().map(|event| Ok(Cow::Borrowed(*event))),
+            unit_id,
+            unit_root,
+            stage,
+            chunk_id,
+            status,
+            reused,
+            error,
+        )
+    }
+
+    /// [`Self::ingest_events_with_analysis_unit`] for a stream pulled one
+    /// event at a time, as [`Self::ingest_event_stream`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_event_stream_with_analysis_unit<'a>(
+        &mut self,
+        scan_id: &str,
+        events: impl IntoIterator<Item = Result<Cow<'a, Value>>>,
         unit_id: &str,
         unit_root: &str,
         stage: &str,
@@ -3200,9 +3242,9 @@ fn ingest_event_in_transaction(
     Ok(())
 }
 
-fn ingest_events_in_transaction(
+fn ingest_events_in_transaction<'a>(
     tx: &Transaction<'_>,
-    events: &[&Value],
+    events: impl IntoIterator<Item = Result<Cow<'a, Value>>>,
     scan_id: &str,
 ) -> Result<()> {
     // Adapter logs may already have advanced mutation_count, so evidence
@@ -3214,10 +3256,11 @@ fn ingest_events_in_transaction(
     )?;
     let mut evidence_owners = HashSet::new();
     for event in events {
-        if required_str(event, "scan_id")? != scan_id {
+        let event = event?;
+        if required_str(&event, "scan_id")? != scan_id {
             bail!("event batch contains multiple scan IDs");
         }
-        ingest_event_in_transaction(tx, event, replace_existing_evidence, &mut evidence_owners)?;
+        ingest_event_in_transaction(tx, &event, replace_existing_evidence, &mut evidence_owners)?;
     }
     Ok(())
 }
@@ -4714,6 +4757,52 @@ mod tests {
         assert_eq!(summary.diagnostics.samples.len(), 5);
         assert!(!serde_json::to_string(&summary)?.contains("not-json-and-must-never-be-read"));
         assert!(store.load_snapshot("scan-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn event_stream_ingestion_is_one_transaction() -> Result<()> {
+        let mut store = Store::open_in_memory()?;
+        store.start_scan("stream-scan", Path::new("/fixture"), false)?;
+        let mutations = |store: &Store| -> Result<i64> {
+            Ok(store.connection.query_row(
+                "SELECT mutation_count FROM scans WHERE id='stream-scan'",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        let before = mutations(&store)?;
+        store.ingest_event_stream(std::iter::empty())?;
+        assert_eq!(mutations(&store)?, before);
+
+        let mut node = common("node_upsert", 1);
+        node["scan_id"] = json!("stream-scan");
+        node["node"] = json!({
+            "id":"file:streamed","kind":"file","locator":"file://streamed.rs","properties":{}
+        });
+        // A failed item rolls back the events the stream already wrote.
+        assert!(
+            store
+                .ingest_event_stream([
+                    Ok(Cow::Borrowed(&node)),
+                    Err(anyhow::anyhow!("event could not be decoded")),
+                ])
+                .is_err()
+        );
+        assert!(
+            store
+                .load_scan_node_payload("stream-scan", "file:streamed")?
+                .is_none()
+        );
+        assert_eq!(mutations(&store)?, before);
+
+        store.ingest_event_stream([Ok(Cow::Owned(node.clone()))])?;
+        assert!(
+            store
+                .load_scan_node_payload("stream-scan", "file:streamed")?
+                .is_some()
+        );
+        assert_eq!(mutations(&store)?, before + 1);
         Ok(())
     }
 

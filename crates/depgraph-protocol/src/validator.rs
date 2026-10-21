@@ -119,6 +119,7 @@ pub struct ProtocolValidator {
     safe_mode: bool,
     project_code_executed: bool,
     payload_closed: bool,
+    retain_graph_events: bool,
     events: Vec<ProtocolEvent>,
     profiles: BTreeMap<String, Profile>,
     completed_profiles: BTreeSet<String>,
@@ -159,6 +160,7 @@ impl ProtocolValidator {
             safe_mode: false,
             project_code_executed: false,
             payload_closed: false,
+            retain_graph_events: true,
             events: Vec::new(),
             profiles: BTreeMap::new(),
             completed_profiles: BTreeSet::new(),
@@ -168,6 +170,18 @@ impl ProtocolValidator {
             sites: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
         }
+    }
+
+    /// Stops retaining node, edge, dependency-site, and diagnostic events in
+    /// [`Self::validated_events`] and [`ValidatedProtocol::events`]. Their
+    /// validated objects stay in the upsert maps, so every check is unchanged.
+    /// Use this with [`Self::push_observed`] when the caller keeps its own
+    /// compact copy of the stream: a large stream otherwise holds every graph
+    /// object twice while it is validated (#598).
+    #[must_use]
+    pub fn without_graph_event_retention(mut self) -> Self {
+        self.retain_graph_events = false;
+        self
     }
 
     /// Returns the canonicalized prefix accepted so far. This is intended for
@@ -200,7 +214,18 @@ impl ProtocolValidator {
     /// Validates and records one event. Conditions are canonicalized before
     /// conflict detection so semantically equivalent commutative expressions
     /// do not create false conflicts.
-    pub fn push(&mut self, mut event: ProtocolEvent) -> Result<(), ProtocolError> {
+    pub fn push(&mut self, event: ProtocolEvent) -> Result<(), ProtocolError> {
+        self.push_observed(event, |_| {})
+    }
+
+    /// Validates and records one event like [`Self::push`], then passes the
+    /// accepted, canonicalized event to `observe`. A rejected event is never
+    /// observed.
+    pub fn push_observed(
+        &mut self,
+        mut event: ProtocolEvent,
+        observe: impl FnOnce(&ProtocolEvent),
+    ) -> Result<(), ProtocolError> {
         normalize_conditions(&mut event);
         self.validate_common(&event)?;
 
@@ -437,7 +462,10 @@ impl ProtocolValidator {
             }
         }
 
-        self.events.push(event);
+        observe(&event);
+        if self.retain_graph_events || !is_graph_event(&event) {
+            self.events.push(event);
+        }
         Ok(())
     }
 
@@ -1886,6 +1914,16 @@ fn is_web_semantic_dependency_site(site: &DependencySite, source: &GraphNode) ->
                 source.properties.get("language").and_then(Value::as_str),
                 Some("typescript" | "javascript")
             ))
+}
+
+fn is_graph_event(event: &ProtocolEvent) -> bool {
+    matches!(
+        event,
+        ProtocolEvent::NodeUpsert(_)
+            | ProtocolEvent::EdgeUpsert(_)
+            | ProtocolEvent::DependencySite(_)
+            | ProtocolEvent::Diagnostic(_)
+    )
 }
 
 fn is_payload_event(event: &ProtocolEvent) -> bool {
