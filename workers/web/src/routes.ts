@@ -24,6 +24,26 @@ export function routeTreeKey(entry: RouteEntry): string {
   return entry.pattern;
 }
 
+// Entry kinds whose file defines the route itself. Other files that share the
+// route (Next layouts, loading/error boundaries, ...) only decorate it, and a
+// generated route tree merely restates a route defined elsewhere.
+const ROUTE_DEFINITION_ENTRY_KINDS = new Set(["page", "route", "api-route", "endpoint", "file-route"]);
+
+function routeSourceRank(entry: RouteEntry): number {
+  if (entry.generated) return 2;
+  return ROUTE_DEFINITION_ENTRY_KINDS.has(entry.entryKind) ? 0 : 1;
+}
+
+/**
+ * Orders the entries that describe one route node so the first is the file
+ * recorded as its `source_path`: the defining file before decorating and
+ * generated ones, then the repository-relative path. The order depends only on
+ * the entries, so every analysis unit picks the same file.
+ */
+export function compareRouteSource(left: RouteEntry, right: RouteEntry): number {
+  return routeSourceRank(left) - routeSourceRank(right) || compareUtf8(left.relativeFile, right.relativeFile);
+}
+
 export function routeParentKeys(entry: RouteEntry): string[] {
   const key = routeTreeKey(entry);
   const root = routeTreeRootKey(entry);
