@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use depgraph_store::{GraphSnapshot, NodeRecord};
 use serde_json::json;
@@ -203,6 +203,7 @@ pub fn score_hotspots_cancellable(
         .map_err(|_| HotspotAnalysisError::InvalidInput)?;
     let mut work = HotspotWork::new(maximum_work);
     let mut subjects = Vec::new();
+    let mut go_package_churn = GoPackageChurn::default();
     for node in &snapshot.nodes {
         work.step(&mut is_cancelled)?;
         if is_hotspot_subject_kind(&node.kind) {
@@ -210,6 +211,9 @@ pub fn score_hotspots_cancellable(
                 return Err(HotspotAnalysisError::SubjectLimit);
             }
             subjects.push(node);
+            if availability.churn {
+                go_package_churn.add_file(node, churn);
+            }
         }
     }
     let graph = HotspotGraph::build(snapshot, &subjects, &mut work, &mut is_cancelled)?;
@@ -224,7 +228,10 @@ pub fn score_hotspots_cancellable(
         fan_in.push(graph.fan_in[subject]);
         fan_out.push(graph.fan_out[subject]);
         churn_values.push(if availability.churn {
-            churn_value(node, churn)
+            match go_package_dir(node) {
+                Some(directory) => go_package_churn.value(node, directory, churn),
+                None => churn_value(node, churn),
+            }
         } else {
             0
         });
@@ -389,12 +396,85 @@ fn churn_value(node: &NodeRecord, churn: &BTreeMap<String, u64>) -> u64 {
 }
 
 fn node_path(node: &NodeRecord) -> Option<String> {
-    let path = ["path", "source_path", "relative_path", "manifest_path"]
-        .into_iter()
-        .find_map(|key| node.properties.get(key).and_then(serde_json::Value::as_str))?;
+    // A Go package is a directory, not a file: its `manifest_path` names the
+    // owning go.mod, so falling back to it would bind the package's location
+    // and churn to go.mod (#595). The package directory is its location; the
+    // module root package (`.`) has none.
+    let path = match go_package_dir(node) {
+        Some(directory) => directory,
+        None => ["path", "source_path", "relative_path", "manifest_path"]
+            .into_iter()
+            .find_map(|key| node.properties.get(key).and_then(serde_json::Value::as_str))?,
+    };
     crate::service::RepositoryRelativePath::parse(path)
         .ok()
         .map(|path| path.as_str().to_owned())
+}
+
+/// Locator prefix of the Go worker's package nodes (node kind `module`).
+const GO_PACKAGE_LOCATOR_PREFIX: &str = "go-package:";
+
+/// The repository-relative directory of a Go package node, or `None` for
+/// every other node. A Go package without `relative_dir` yields `""`, which
+/// is neither a valid location nor a file directory.
+fn go_package_dir(node: &NodeRecord) -> Option<&str> {
+    if node.kind != "module" || !node.locator.starts_with(GO_PACKAGE_LOCATOR_PREFIX) {
+        return None;
+    }
+    Some(
+        node.properties
+            .get("relative_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+/// Git churn of Go packages, summed per directory over the Go file subjects
+/// directly inside it (a Go package never spans subdirectories).
+///
+/// Only Go file nodes count, so go.mod, go.sum, and other non-Go files in a
+/// package directory do not, and each file path counts once.
+#[derive(Default)]
+struct GoPackageChurn {
+    by_directory: HashMap<String, u64>,
+    seen_paths: HashSet<String>,
+}
+
+impl GoPackageChurn {
+    fn add_file(&mut self, node: &NodeRecord, churn: &BTreeMap<String, u64>) {
+        if node.kind != "file"
+            || node
+                .properties
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+                != Some("go")
+        {
+            return;
+        }
+        let Some(path) = node
+            .properties
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        if !self.seen_paths.insert(path.to_owned()) {
+            return;
+        }
+        let directory = path
+            .rsplit_once('/')
+            .map_or(".", |(directory, _)| directory);
+        let total = self.by_directory.entry(directory.to_owned()).or_default();
+        *total = total.saturating_add(churn_value(node, churn));
+    }
+
+    fn value(&self, node: &NodeRecord, directory: &str, churn: &BTreeMap<String, u64>) -> u64 {
+        churn
+            .get(&node.id)
+            .or_else(|| self.by_directory.get(directory))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// 64-bit words in one [`LaneMask`].
@@ -845,6 +925,163 @@ mod tests {
         assert_eq!(scores.git_churn.normalized_basis_points, 10_000);
         assert!(scores.git_churn.available);
         assert!(!scores.runtime.available);
+    }
+
+    fn record(id: &str, kind: &str, locator: &str, properties: serde_json::Value) -> NodeRecord {
+        NodeRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            locator: locator.to_owned(),
+            display_name: id.to_owned(),
+            properties,
+        }
+    }
+
+    #[test]
+    fn issue_595_go_packages_use_their_directory_instead_of_go_mod() {
+        let go_file = |path: &str| {
+            record(
+                &format!("file:{path}"),
+                "file",
+                &format!("file:{path}"),
+                json!({"language": "go", "path": path, "manifest_path": "go.mod"}),
+            )
+        };
+        let go_package = |id: &str, import_path: &str, properties: serde_json::Value| {
+            record(
+                id,
+                "module",
+                &format!("go-package:{import_path}"),
+                properties,
+            )
+        };
+        let graph = snapshot(
+            vec![
+                go_package(
+                    "module:pkg",
+                    "example.com/m/pkg",
+                    json!({"language": "go", "relative_dir": "pkg", "manifest_path": "go.mod"}),
+                ),
+                go_package(
+                    "module:root",
+                    "example.com/m",
+                    json!({"language": "go", "relative_dir": ".", "manifest_path": "go.mod"}),
+                ),
+                go_package(
+                    "module:no-dir",
+                    "example.com/m/legacy",
+                    json!({"language": "go", "manifest_path": "go.mod"}),
+                ),
+                go_file("pkg/a.go"),
+                go_file("pkg/a_test.go"),
+                go_file("pkg/sub/b.go"),
+                go_file("main.go"),
+                // Embedded assets are file nodes too, but not Go sources.
+                record(
+                    "file:pkg/data.txt",
+                    "file",
+                    "file:pkg/data.txt",
+                    json!({"language": "asset", "path": "pkg/data.txt"}),
+                ),
+                // Go file nodes scanned before #591 had no `path`; they keep
+                // the manifest_path fallback.
+                record(
+                    "file:legacy.go",
+                    "file",
+                    "file:legacy.go",
+                    json!({"language": "go", "manifest_path": "go.mod"}),
+                ),
+                // Other module nodes keep the manifest_path fallback.
+                record(
+                    "module:manifest-only",
+                    "module",
+                    "rust-module:demo:lib::",
+                    json!({"language": "rust", "manifest_path": "Cargo.toml"}),
+                ),
+                record(
+                    "module:rust",
+                    "module",
+                    "rust-module:demo:lib::inner",
+                    json!({"language": "rust", "source_path": "src/inner.rs", "manifest_path": "Cargo.toml"}),
+                ),
+            ],
+            Vec::new(),
+        );
+        let churn = BTreeMap::from([
+            ("go.mod".to_owned(), 7),
+            ("go.sum".to_owned(), 8),
+            ("pkg/README.md".to_owned(), 9),
+            ("pkg/a.go".to_owned(), 2),
+            ("pkg/a_test.go".to_owned(), 3),
+            ("pkg/data.txt".to_owned(), 6),
+            ("pkg/sub/b.go".to_owned(), 5),
+            ("main.go".to_owned(), 1),
+            ("Cargo.toml".to_owned(), 4),
+            ("src/inner.rs".to_owned(), 11),
+        ]);
+        let findings = score_hotspots(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &churn,
+            &BTreeMap::new(),
+            HotspotLayerAvailability {
+                churn: true,
+                runtime: false,
+            },
+        )
+        .expect("valid hotspot weights");
+        let observed = |id: &str| {
+            let finding = findings
+                .iter()
+                .find(|finding| finding.subject_id == id)
+                .unwrap_or_else(|| panic!("missing hotspot {id}"));
+            (
+                finding
+                    .location
+                    .as_ref()
+                    .map(|location| location.path.as_str()),
+                finding
+                    .hotspot_scores
+                    .as_ref()
+                    .expect("structured hotspot scores")
+                    .git_churn
+                    .raw,
+            )
+        };
+        // The package sums its own Go files only: not go.mod / go.sum /
+        // README.md, not the embedded asset, not the `pkg/sub` package.
+        assert_eq!(observed("module:pkg"), (Some("pkg"), 5));
+        assert_eq!(observed("module:root"), (None, 1));
+        assert_eq!(observed("module:no-dir"), (None, 0));
+        assert_eq!(observed("file:pkg/a.go"), (Some("pkg/a.go"), 2));
+        assert_eq!(observed("file:legacy.go"), (Some("go.mod"), 7));
+        assert_eq!(observed("module:manifest-only"), (Some("Cargo.toml"), 4));
+        assert_eq!(observed("module:rust"), (Some("src/inner.rs"), 11));
+
+        // Node-ID churn still wins over the directory sum.
+        let by_id = BTreeMap::from([("module:pkg".to_owned(), 40), ("pkg/a.go".to_owned(), 2)]);
+        let findings = score_hotspots(
+            &graph,
+            DEFAULT_HOTSPOT_WEIGHTS,
+            &by_id,
+            &BTreeMap::new(),
+            HotspotLayerAvailability {
+                churn: true,
+                runtime: false,
+            },
+        )
+        .expect("valid hotspot weights");
+        let package = findings
+            .iter()
+            .find(|finding| finding.subject_id == "module:pkg")
+            .expect("package hotspot");
+        assert_eq!(
+            package
+                .hotspot_scores
+                .as_ref()
+                .map(|scores| scores.git_churn.raw),
+            Some(40)
+        );
     }
 
     #[test]
