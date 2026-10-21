@@ -103,7 +103,9 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             worker_timeout_seconds: 300,
-            max_worker_memory_bytes: 2 * 1024 * 1024 * 1024,
+            // A kill threshold, not a reservation. depgraph-cli's own Rust HIR
+            // scan peaks at 3.2–3.5 GiB with the attested sysroot (#598).
+            max_worker_memory_bytes: 6 * 1024 * 1024 * 1024,
             max_concurrent_units: 2,
             // Loading a compiler context dominates tiny source batches. Start
             // with enough files to amortize it; worker memory/output limits
@@ -113,7 +115,8 @@ impl Default for ScanConfig {
             max_context_source_bytes: 64 * 1024 * 1024,
             total_budget_seconds: None,
             max_protocol_line_bytes: 1024 * 1024,
-            max_protocol_bytes: 256 * 1024 * 1024,
+            // depgraph-cli's own Rust HIR stream is 650–700 MiB (#598).
+            max_protocol_bytes: 1024 * 1024 * 1024,
             max_stderr_bytes: 10 * 1024 * 1024,
             follow_symlinks: false,
         }
@@ -327,6 +330,8 @@ mod tests {
         let parsed: Config = toml::from_str(&rendered)?;
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.scan.worker_timeout_seconds, 300);
+        assert_eq!(parsed.scan.max_worker_memory_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(parsed.scan.max_protocol_bytes, 1024 * 1024 * 1024);
         assert_eq!(parsed.scan.max_unit_source_bytes, 8 * 1024 * 1024);
         assert_eq!(parsed.scan.max_context_source_bytes, 64 * 1024 * 1024);
         assert_eq!(parsed.daemon.debounce_milliseconds, 200);

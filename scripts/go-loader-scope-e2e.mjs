@@ -30,7 +30,7 @@ const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const cli = path.resolve(process.env.DEPGRAPH_BIN ?? path.join(workspace, `target/debug/depgraph${executableSuffix}`));
 const parent = mkdtempSync(path.join(tmpdir(), "depgraph-go-loader-scope-e2e-"));
 const MIB = 1024 * 1024;
-// Reduced from the 2 GiB default; identical for the control and the package
+// Reduced from the 6 GiB default; identical for the control and the package
 // path of the same fixture. Chosen above the measured package-path peaks
 // (fan-out batches ~98 MiB) and well below whole-module live data
 // (~320–640 MiB even with GOMEMLIMIT). Never raised.
@@ -243,7 +243,7 @@ function configure(root, options) {
   const lines = ["schema_version = 1", "[scan]"];
   for (const [key, value] of Object.entries(merged)) lines.push(`${key} = ${value}`);
   writeFileSync(path.join(root, ".depgraph.toml"), `${lines.join("\n")}\n`);
-  scanMemoryLimit = merged.max_worker_memory_bytes ?? (2 * 1024 * MIB);
+  scanMemoryLimit = merged.max_worker_memory_bytes ?? (6 * 1024 * MIB);
 }
 // The real Go worker advertising only the module-loader capabilities, so the
 // core plans and requests exactly as it did before the package loader.
@@ -265,7 +265,7 @@ exec "$worker" "$@"
 // a failed run still prints the evidence it was judged on. JSON is written to
 // a file rather than buffered in the node process: a 1,024-file SSA graph can
 // exceed tens of megabytes and would otherwise OOM the runner.
-let scanMemoryLimit = 2 * 1024 * MIB;
+let scanMemoryLimit = 6 * 1024 * MIB;
 function scan(name, root, store, worker) {
   console.error(`go-loader-scope-e2e: start ${name}`);
   const jsonPath = path.join(parent, `${name}.json`);
