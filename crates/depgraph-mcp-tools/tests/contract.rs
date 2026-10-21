@@ -2711,3 +2711,177 @@ fn issue_579_analysis_degradations_are_optional_bounded_and_round_trip() {
     ]);
     assert_eq!(projected, vec![degradation]);
 }
+
+#[test]
+fn issue_566_context_summary_replaces_profile_ids_and_full_keeps_the_legacy_bytes() {
+    use depgraph_mcp_tools::{AgentContextDetail, AgentContextOutput, AgentContextSummary};
+
+    let legacy = context();
+    let full = AgentContextOutput::project(legacy.clone(), AgentContextDetail::Full);
+    assert_eq!(
+        canonical_json_bytes(&full).unwrap(),
+        canonical_json_bytes(&legacy).unwrap()
+    );
+    let full_value = serde_json::to_value(&full).unwrap();
+    assert!(full_value.get("detail").is_none());
+    assert_eq!(
+        serde_json::from_value::<AgentContextOutput>(full_value.clone()).unwrap(),
+        full
+    );
+
+    let summary = AgentContextOutput::project(legacy, AgentContextDetail::Summary);
+    assert_eq!(summary.detail(), AgentContextDetail::Summary);
+    let value = serde_json::to_value(&summary).unwrap();
+    assert_eq!(value["detail"], "summary");
+    let details = &value["snapshot"]["details"];
+    assert!(details.get("profile_ids").is_none(), "{value}");
+    let profile_count = full_value["snapshot"]["details"]["profile_ids"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(details["profile_count"], profile_count);
+    let mut expected = full_value["snapshot"]["details"].clone();
+    expected.as_object_mut().unwrap().remove("profile_ids");
+    expected["profile_count"] = json!(profile_count);
+    assert_eq!(details, &expected);
+    assert_eq!(
+        serde_json::from_value::<AgentContextOutput>(value.clone()).unwrap(),
+        summary
+    );
+    assert_unknown_field_rejected::<AgentContextSummary>("AgentContextSummary", value.clone());
+    let mut nested = value.clone();
+    nested["snapshot"]["details"]["profile_ids"] = json!([]);
+    assert!(serde_json::from_value::<AgentContextSummary>(nested).is_err());
+    let mut unavailable = value.clone();
+    unavailable["snapshot"] = json!({"available": true});
+    assert!(serde_json::from_value::<AgentContextSummary>(unavailable).is_err());
+    let mut empty = value;
+    empty["enabled_capabilities"] = json!([]);
+    assert!(serde_json::from_value::<AgentContextSummary>(empty).is_err());
+    // An unknown detail never falls back to the legacy shape.
+    let mut other = full_value;
+    other["detail"] = json!("paths");
+    assert!(serde_json::from_value::<AgentContextOutput>(other).is_err());
+}
+
+fn import_group(imports: Vec<AgentImportEvidence>, import_count: u64) -> Value {
+    json!({
+        "source_id": "file:a",
+        "source_path": "src/a.ts",
+        "target_id": "file:b",
+        "edge_kinds": ["imports", "reexports"],
+        "edge_count": 3,
+        "imports": imports,
+        "import_count": import_count
+    })
+}
+
+#[test]
+fn issue_566_import_groups_validate_kinds_and_counts() {
+    use depgraph_mcp_tools::{
+        AgentEdgesImportsResponse, AgentImportGroup, MAX_AGENT_IMPORT_GROUP_NAMES,
+    };
+
+    let group: AgentImportGroup =
+        serde_json::from_value(import_group(vec![import_evidence()], 1)).unwrap();
+    assert_eq!(group.source_path().unwrap().as_str(), "src/a.ts");
+    assert!(group.target_path().is_none());
+    assert_eq!(group.import_count(), 1);
+    assert_unknown_field_rejected::<AgentImportGroup>(
+        "AgentImportGroup",
+        import_group(vec![import_evidence()], 1),
+    );
+    // A count below the listed facts is rejected; a larger count marks a list
+    // trimmed to the name bound or to the page byte budget.
+    assert!(
+        serde_json::from_value::<AgentImportGroup>(import_group(vec![import_evidence()], 0))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AgentImportGroup>(import_group(vec![import_evidence()], 2))
+            .is_ok()
+    );
+    let full = vec![import_evidence(); MAX_AGENT_IMPORT_GROUP_NAMES];
+    assert!(serde_json::from_value::<AgentImportGroup>(import_group(full.clone(), 300)).is_ok());
+    let mut too_many = full;
+    too_many.push(import_evidence());
+    assert!(serde_json::from_value::<AgentImportGroup>(import_group(too_many, 300)).is_err());
+    for (field, value) in [
+        ("edge_kinds", json!([])),
+        ("edge_kinds", json!(["reexports", "imports"])),
+        ("edge_kinds", json!(["imports", "imports"])),
+        ("edge_count", json!(1)),
+    ] {
+        let mut invalid = import_group(vec![], 0);
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<AgentImportGroup>(invalid).is_err(),
+            "{field}"
+        );
+    }
+
+    let page = Page::new(vec![group.clone()], 1, true, None).unwrap();
+    let response = AgentEdgesImportsResponse::new(page);
+    let output = AgentEdgesOutput::Imports(response.clone());
+    assert_eq!(output.detail(), AgentEdgeDetail::Imports);
+    let value = serde_json::to_value(&output).unwrap();
+    assert_eq!(value["detail"], "imports");
+    assert_eq!(
+        value["groups"]["items"][0],
+        serde_json::to_value(&group).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentEdgesOutput>(value.clone()).unwrap(),
+        output
+    );
+    assert_unknown_field_rejected::<AgentEdgesImportsResponse>("AgentEdgesImportsResponse", value);
+    // An empty imports page keeps its tag, so it never reads as an empty full page.
+    let empty = AgentEdgesOutput::Imports(AgentEdgesImportsResponse::new(
+        Page::new(Vec::new(), 0, true, None).unwrap(),
+    ));
+    let empty_value = serde_json::to_value(&empty).unwrap();
+    assert_eq!(
+        serde_json::from_value::<AgentEdgesOutput>(empty_value).unwrap(),
+        empty
+    );
+}
+
+#[test]
+fn issue_566_fan_in_items_require_a_dependent() {
+    use depgraph_mcp_tools::AgentFanInItem;
+
+    let item = json!({
+        "node_id": "file:a",
+        "kind": "file",
+        "path": "src/lib/a.ts",
+        "fan_in": 2,
+        "edge_count": 3
+    });
+    let parsed: AgentFanInItem = serde_json::from_value(item.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), item);
+    for (prefix, matches) in [
+        ("src/lib", true),
+        ("src/lib/a.ts", true),
+        ("src/li", false),
+        ("src/lib/a", false),
+    ] {
+        assert_eq!(
+            parsed.path_has_prefix(&parse::<RepositoryRelativePath>(prefix)),
+            matches,
+            "{prefix}"
+        );
+    }
+    assert_unknown_field_rejected::<AgentFanInItem>("AgentFanInItem", item.clone());
+    for (field, value) in [("fan_in", json!(0)), ("edge_count", json!(1))] {
+        let mut invalid = item.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<AgentFanInItem>(invalid).is_err(),
+            "{field}"
+        );
+    }
+    let mut pathless = item;
+    pathless.as_object_mut().unwrap().remove("path");
+    let pathless: AgentFanInItem = serde_json::from_value(pathless).unwrap();
+    assert!(!pathless.path_has_prefix(&parse::<RepositoryRelativePath>("src")));
+}

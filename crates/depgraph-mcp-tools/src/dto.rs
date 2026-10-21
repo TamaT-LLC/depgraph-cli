@@ -18,6 +18,15 @@ use crate::{
     RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
+// The `get_context` summary reads the private fields of the frozen context DTOs
+// (Issue #566), so it is a child module of this one.
+#[path = "context_detail.rs"]
+mod context_detail;
+pub use context_detail::{
+    AgentCompletedSnapshotSummary, AgentContextDetail, AgentContextOutput, AgentContextSummary,
+    AgentCurrentSnapshotSummary,
+};
+
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = depgraph_core::service::MAX_GRAPH_EVIDENCE_ITEMS;
 pub const MAX_AGENT_TARGET_ITEMS: usize = 256;
 pub const MAX_AGENT_SNAPSHOT_METADATA_ITEMS: usize = 1_024;
@@ -3552,16 +3561,19 @@ impl TryFrom<&depgraph_core::query::TraversalPageItem> for AgentPathStep {
     }
 }
 
-impl TryFrom<&depgraph_core::service::NodeProjection> for AgentNode {
+impl TryFrom<&depgraph_core::service::NodeDetailProjection> for AgentNode {
     type Error = ContractBuildError;
 
-    fn try_from(source: &depgraph_core::service::NodeProjection) -> Result<Self, Self::Error> {
+    fn try_from(
+        source: &depgraph_core::service::NodeDetailProjection,
+    ) -> Result<Self, Self::Error> {
+        let node = source.node();
         agent_node_from_fields(
-            source.id(),
-            source.kind(),
-            source.locator(),
-            source.display_name(),
-            &serde_json::Value::Null,
+            node.id(),
+            node.kind(),
+            node.locator(),
+            node.display_name(),
+            source.properties(),
         )
     }
 }

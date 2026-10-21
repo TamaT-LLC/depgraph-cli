@@ -17,7 +17,13 @@ pub use crate::service_agent::{
     CurrentSnapshotAvailability, DepgraphContext, EdgeDirection, EdgeProjection,
     EvidenceProjection, FindNodesPageResult, FindNodesResult, GraphEdgesPageResult,
     GraphEvidencePageResult, GraphSitesPageResult, MAX_FIND_NODES_QUERY_BYTES,
-    NamedCompletedSnapshot, NodeMatchMode, NodeProjection, SiteProjection,
+    NamedCompletedSnapshot, NodeDetailProjection, NodeMatchMode, NodeProjection, SiteProjection,
+};
+// Import groups of agent_edges_list detail=imports and the graph_fan_in_list
+// ranking (Issue #566).
+pub use crate::service_agent::{
+    DEFAULT_IMPORT_GROUP_EDGE_KINDS, FanInEntry, FanInRanking, GraphImportGroupsPageResult,
+    GraphNodeFields, ImportGroupProjection, MAX_IMPORT_GROUP_NAMES,
 };
 pub use crate::service_artifacts::{
     ClosedChangedRecord, ClosedRecordDiff, DEFAULT_GRAPH_EXPORT_MAX_EDGES,

@@ -6131,7 +6131,7 @@ fn issue_315_real_stdio_daemon_start_replay_reconnect_and_stop_are_closed() {
     let store_write_tools = {
         let mut command = command(&root, &store_path, requirement().path());
         command.args(["--capability", "store-write"]);
-        tools_list(command, 34)
+        tools_list(command, 35)
     };
     assert!(!store_write_tools.contains(&"daemon_start_submit".to_owned()));
     assert!(!store_write_tools.contains(&"daemon_stop".to_owned()));
@@ -6920,6 +6920,7 @@ const EXPECTED_READ_ONLY_TOOLS: &[&str] = &[
     "graph_dependencies_list",
     "graph_dependents_list",
     "graph_export",
+    "graph_fan_in_list",
     "graph_impact_get",
     "graph_path_get",
     "graph_query",
@@ -7300,6 +7301,11 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                 "graph_export",
                 json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "format":"json", "snapshot":pinned_snapshot}),
                 None,
+            ),
+            (
+                "graph_fan_in_list",
+                json!({"contract_version":"depgraph-mcp-tools-v1", "repository_id":"repository", "snapshot":pinned_snapshot, "limit":1}),
+                Some(false),
             ),
             (
                 "graph_impact_get",
@@ -10443,7 +10449,8 @@ fn seed_issue_580_store(path: &Path, root: &Path) -> String {
         .replace(']', "%5D");
     assert!(ISSUE_580_EXPRESSION.len() > 256);
     for (id, kind, locator, display_name, properties) in [
-        // Rust file nodes: the path lives only in the `file:` locator.
+        // A Rust file node from a Store scanned before Issue #577: the path
+        // lives only in the `file:` locator.
         (
             "file:sha256:0580a",
             "file",
@@ -10451,12 +10458,20 @@ fn seed_issue_580_store(path: &Path, root: &Path) -> String {
             "crates/core/src/lib.rs".to_owned(),
             json!({"language": "rust"}),
         ),
+        // Rust (since #577) and Go (since #591) file nodes also record `path`.
         (
             "file:sha256:0580b",
             "file",
             "file:crates/core/src/model.rs".to_owned(),
             "crates/core/src/model.rs".to_owned(),
-            json!({"language": "rust"}),
+            json!({"language": "rust", "path": "crates/core/src/model.rs"}),
+        ),
+        (
+            "file:sha256:0580h",
+            "file",
+            "file:workers/go/cmd/worker/main.go".to_owned(),
+            "workers/go/cmd/worker/main.go".to_owned(),
+            json!({"language": "go", "path": "workers/go/cmd/worker/main.go"}),
         ),
         // Web file nodes use `file://`.
         (
@@ -10708,6 +10723,7 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
         "unknown_target:sha256:0580e",
         "external_system:sha256:0580f",
         "module:sha256:0580g",
+        "file:sha256:0580h",
     ];
     for tool in ["get_context", "repository_list"] {
         call(tool, json!({}));
@@ -10815,6 +10831,102 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
         call("health_finding_get", json!({"finding_id": finding["id"]}));
     }
     call("health_hotspots_list", json!({}));
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_601_agent_node_get_reads_repository_path_from_node_properties() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_580_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let output_schemas = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            (
+                tool["name"].as_str().unwrap().to_owned(),
+                jsonschema::draft202012::new(&tool["outputSchema"]).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut id = 2;
+    let mut call = |name: &str, arguments: Value| {
+        id += 1;
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = interactive_tool_call(&mut mcp, id, name, full);
+        assert_eq!(result["isError"], false, "{name} {arguments}: {result}");
+        output_schemas[name]
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{name} output: {error}"));
+        result["structuredContent"]["result"].clone()
+    };
+
+    for (node_id, locator_shape, repository_path) in [
+        // Web file node: `file://` locator, path only in the `path` property.
+        ("file:sha256:0580c", "file://", "workers/web/src/index.ts"),
+        // Rust and Go file nodes with a `path` property and a `file:` locator.
+        ("file:sha256:0580b", "file:", "crates/core/src/model.rs"),
+        (
+            "file:sha256:0580h",
+            "file:",
+            "workers/go/cmd/worker/main.go",
+        ),
+        // A file node from an older Store without `path` keeps the locator
+        // fallback.
+        ("file:sha256:0580a", "file:", "crates/core/src/lib.rs"),
+    ] {
+        let node = call("agent_node_get", json!({"node_id": node_id}));
+        assert_eq!(node["id"], node_id);
+        assert_eq!(node["kind"], "file");
+        assert_eq!(
+            node["repository_path"], repository_path,
+            "{locator_shape} {node}"
+        );
+        let dependencies = call(
+            "graph_dependencies_list",
+            json!({"selector": format!("id:{node_id}")}),
+        );
+        assert_eq!(
+            node, dependencies["root"],
+            "agent_node_get and the dependency root must agree for {node_id}"
+        );
+    }
+
+    // Nodes without a path keep omitting `repository_path`.
+    for node_id in ["external:sha256:0580d", "module:sha256:0580g"] {
+        let node = call("agent_node_get", json!({"node_id": node_id}));
+        assert!(node.get("repository_path").is_none(), "{node}");
+    }
+
+    // `agent_nodes_list` keeps its closed four-field summary.
+    let listed = call(
+        "agent_nodes_list",
+        json!({"query": "file:sha256:0580c", "match_mode": "exact"}),
+    );
+    assert_eq!(
+        listed["items"],
+        json!([{
+            "id": "file:sha256:0580c",
+            "kind": "file",
+            "locator": "id:file:sha256:0580c",
+            "display_name": "workers/web/src/index.ts"
+        }]),
+        "{listed}"
+    );
 
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));
@@ -11358,4 +11470,419 @@ fn issue_566_path_detail_shrinks_the_path_and_mod_declarations_name_the_module()
             "binding_kind": "module_declaration"
         })
     );
+}
+
+/// TypeScript records the file-level import (no names) and the semantic import of
+/// each binding (names, target symbol) as separate edges with the same specifier;
+/// Rust records the names on the file-level edge itself (Issue #566).
+fn seed_issue_566_import_names_store(path: &Path, root: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-566-names", root, false, Some("revision-566-names"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 6,
+        "resolved": 6,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": ["syntax-complete"],
+        "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut common = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event,
+            "protocol_version": "1.0",
+            "scan_id": "issue-566-names",
+            "adapter": "fixture",
+            "adapter_version": "1.0",
+            "seq": seq
+        })
+    };
+    let mut started = common("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = common("profile_declared");
+    profile["profile"] = json!({
+        "id": "fixture:safe",
+        "language": "fixture",
+        "features": [],
+        "environment": {},
+        "properties": {}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, kind, path) in [
+        ("node:app", "file", "src/app.ts"),
+        ("node:page", "file", "src/page.ts"),
+        ("node:utils", "file", "src/lib/utils.ts"),
+        ("node:cn", "symbol", "src/lib/utils.ts"),
+        ("node:main", "file", "src/main.rs"),
+        ("node:lib", "file", "src/lib.rs"),
+    ] {
+        let mut node = common("node_upsert");
+        node["node"] = json!({
+            "id": id,
+            "kind": kind,
+            "locator": format!("repo://{path}#{id}"),
+            "display_name": id,
+            "properties": {"path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let syntax = |path: &str, line: u64| issue_544_evidence(path, line, "source", json!({}));
+    let named = |path: &str, line: u64, specifier: &str, imported: &str, local: &str| {
+        issue_544_evidence(
+            path,
+            line,
+            "semantic",
+            json!({
+                "occurrence_kind": "named_import",
+                "module_specifier": specifier,
+                "imported_name": imported,
+                "local_name": local
+            }),
+        )
+    };
+    let rust_use = issue_544_evidence(
+        "src/main.rs",
+        1,
+        "source",
+        json!({"target_specifier": "crate::helper", "glob": false, "reexport": false}),
+    );
+    let mut sites = vec![
+        (
+            "site:app-file",
+            "node:app",
+            "node:utils",
+            "import",
+            "@/lib/utils",
+            "imports",
+            syntax("src/app.ts", 1),
+        ),
+        (
+            "site:app-cn",
+            "node:app",
+            "node:cn",
+            "web_import",
+            "@/lib/utils",
+            "imports",
+            named("src/app.ts", 1, "@/lib/utils", "cn", "cn"),
+        ),
+        (
+            "site:page-file",
+            "node:page",
+            "node:utils",
+            "import",
+            "./lib/utils",
+            "imports",
+            syntax("src/page.ts", 1),
+        ),
+        (
+            "site:page-cn",
+            "node:page",
+            "node:cn",
+            "web_import",
+            "./lib/utils",
+            "imports",
+            named("src/page.ts", 1, "./lib/utils", "cn", "classNames"),
+        ),
+        (
+            "site:main-use",
+            "node:main",
+            "node:lib",
+            "rust_use",
+            "crate::helper",
+            "imports",
+            rust_use,
+        ),
+    ];
+    // A structural edge that the fan-in ranking skips by default.
+    sites.push((
+        "site:utils-declares",
+        "node:utils",
+        "node:cn",
+        "declaration",
+        "cn",
+        "declares",
+        syntax("src/lib/utils.ts", 1),
+    ));
+    for (site_id, source, target, site_kind, specifier, edge_kind, evidence) in sites {
+        let mut site = common("dependency_site");
+        site["site"] = json!({
+            "id": site_id,
+            "source": source,
+            "kind": site_kind,
+            "specifier": specifier,
+            "resolution_status": "resolved",
+            "target_ids": [target],
+            "profile_id": "fixture:safe",
+            "condition": {"op": "all", "conditions": []},
+            "precision": "exact",
+            "evidence": [evidence.clone()]
+        });
+        store.ingest_event(&site).unwrap();
+        let mut edge = common("edge_upsert");
+        edge["edge"] = json!({
+            "id": format!("edge:{site_id}"),
+            "site_id": site_id,
+            "source": source,
+            "target": target,
+            "kind": edge_kind,
+            "phase": "semantic",
+            "environment": "host",
+            "profile_id": "fixture:safe",
+            "resolution_status": "resolved",
+            "precision": "exact",
+            "condition": {"op": "all", "conditions": []},
+            "generated": false,
+            "evidence": [evidence]
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = common("profile_completed");
+    profile_completed["profile_id"] = json!("fixture:safe");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = common("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-566-names", "completed", None, true)
+        .unwrap();
+    store.current_snapshot_id().unwrap().unwrap()
+}
+
+#[test]
+fn issue_566_import_names_fan_in_and_context_summary_are_opt_in() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_566_import_names_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"))
+            .clone()
+    };
+    let validators = ["get_context", "agent_edges_list", "graph_fan_in_list"]
+        .into_iter()
+        .map(|name| {
+            let schema = tool(name)["outputSchema"].clone();
+            (name, jsonschema::draft202012::new(&schema).unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool("agent_edges_list")["inputSchema"]["properties"]["detail"]["enum"],
+        json!(["summary", "full", "imports"])
+    );
+    assert_eq!(
+        tool("get_context")["inputSchema"]["properties"]["detail"]["enum"],
+        json!(["summary", "full"])
+    );
+    let mut id = 2;
+    let mut request = |name: &str, arguments: Value| {
+        id += 1;
+        let mut arguments = arguments;
+        arguments["contract_version"] = json!("depgraph-mcp-tools-v1");
+        interactive_tool_call(&mut mcp, id, name, arguments)
+    };
+    let success = |name: &str, result: Value| {
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        let (_, output) = validators.iter().find(|(tool, _)| *tool == name).unwrap();
+        output.validate(&result["structuredContent"]).unwrap();
+        shared.validate(&result["structuredContent"]).unwrap();
+        assert_tool_text_matches_structured(&result);
+        result["structuredContent"].clone()
+    };
+    macro_rules! call {
+        ($name:expr, $arguments:expr $(,)?) => {
+            success($name, request($name, $arguments))
+        };
+    }
+
+    // get_context: the default keeps the legacy bytes and the profile IDs.
+    let legacy = call!("get_context", json!({}));
+    assert_eq!(call!("get_context", json!({"detail": "full"})), legacy);
+    assert!(legacy["result"].get("detail").is_none());
+    let details = &legacy["result"]["snapshot"]["details"];
+    assert_eq!(details["profile_ids"], json!(["fixture:safe"]));
+    let summary = call!("get_context", json!({"detail": "summary"}));
+    assert_eq!(summary["result"]["detail"], "summary");
+    let summary_details = &summary["result"]["snapshot"]["details"];
+    assert_eq!(summary_details["profile_count"], 1);
+    assert!(summary_details.get("profile_ids").is_none());
+    let mut expected = details.clone();
+    expected.as_object_mut().unwrap().remove("profile_ids");
+    expected["profile_count"] = json!(1);
+    assert_eq!(summary_details, &expected);
+    assert_eq!(
+        summary["result"]["enabled_capabilities"],
+        legacy["result"]["enabled_capabilities"]
+    );
+
+    // agent_edges_list: the default and full stay the edge page.
+    let edges = call!(
+        "agent_edges_list",
+        json!({"node_id": "node:app", "direction": "outgoing"}),
+    );
+    assert_eq!(
+        call!(
+            "agent_edges_list",
+            json!({"node_id": "node:app", "direction": "outgoing", "detail": "full"})
+        ),
+        edges
+    );
+    assert!(edges["result"].get("detail").is_none());
+    assert_eq!(edges["result"]["total_items"], 2);
+
+    // One call from a TypeScript file to the names it imports: the semantic edge
+    // to the symbol joins the file-level edge with the same specifier.
+    let imports = call!(
+        "agent_edges_list",
+        json!({"node_id": "node:app", "direction": "outgoing", "detail": "imports"}),
+    );
+    let result = &imports["result"];
+    assert_eq!(result["detail"], "imports");
+    assert_eq!(result["groups"]["total_items"], 1, "{result}");
+    assert_eq!(
+        result["groups"]["items"][0],
+        json!({
+            "source_id": "node:app",
+            "source_path": "src/app.ts",
+            "target_id": "node:utils",
+            "target_path": "src/lib/utils.ts",
+            "edge_kinds": ["imports"],
+            "edge_count": 2,
+            "imports": [{
+                "specifier": "@/lib/utils",
+                "binding_kind": "named",
+                "imported_name": "cn",
+                "local_name": "cn"
+            }],
+            "import_count": 1
+        })
+    );
+
+    // Incoming: every importer of the file with the names each one binds.
+    let importers = call!(
+        "agent_edges_list",
+        json!({"node_id": "node:utils", "direction": "incoming", "detail": "imports"}),
+    );
+    let groups = importers["result"]["groups"]["items"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{importers}");
+    assert_eq!(groups[0]["source_path"], "src/app.ts");
+    assert_eq!(groups[1]["source_path"], "src/page.ts");
+    assert_eq!(groups[1]["edge_count"], 1);
+    assert_eq!(
+        groups[1]["imports"],
+        json!([{
+            "specifier": "./lib/utils",
+            "binding_kind": "named",
+            "imported_name": "cn",
+            "local_name": "classNames"
+        }])
+    );
+
+    // Rust records the names on the file-level edge.
+    let rust = call!(
+        "agent_edges_list",
+        json!({"node_id": "node:main", "direction": "outgoing", "detail": "imports"}),
+    );
+    let group = &rust["result"]["groups"]["items"][0];
+    assert_eq!(group["target_path"], "src/lib.rs");
+    assert_eq!(group["imports"][0]["specifier"], "crate::helper");
+    assert_eq!(group["imports"][0]["imported_name"], "helper", "{group}");
+
+    // A cursor is bound to detail=imports.
+    let first = call!(
+        "agent_edges_list",
+        json!({"node_id": "node:utils", "direction": "incoming", "detail": "imports", "limit": 1}),
+    );
+    let cursor = first["result"]["groups"]["next_cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    let second = call!(
+        "agent_edges_list",
+        json!({
+            "node_id": "node:utils",
+            "direction": "incoming",
+            "detail": "imports",
+            "limit": 1,
+            "cursor": cursor.clone()
+        }),
+    );
+    assert_eq!(
+        second["result"]["groups"]["items"][0]["source_path"],
+        "src/page.ts"
+    );
+    let mismatch = request(
+        "agent_edges_list",
+        json!({
+            "node_id": "node:utils",
+            "direction": "incoming",
+            "detail": "summary",
+            "limit": 1,
+            "cursor": cursor
+        }),
+    );
+    assert_eq!(mismatch["isError"], true, "{mismatch}");
+    assert_eq!(
+        mismatch["structuredContent"]["error"]["code"],
+        "CURSOR_MISMATCH"
+    );
+
+    // graph_fan_in_list counts distinct dependents over dependency edges.
+    let ranking = call!("graph_fan_in_list", json!({}));
+    assert_eq!(
+        ranking["result"]["items"],
+        json!([
+            {"node_id": "node:utils", "kind": "file", "path": "src/lib/utils.ts", "fan_in": 2, "edge_count": 2},
+            {"node_id": "node:lib", "kind": "file", "path": "src/lib.rs", "fan_in": 1, "edge_count": 1}
+        ])
+    );
+    let prefixed = call!("graph_fan_in_list", json!({"path_prefixes": ["src/lib"]}));
+    assert_eq!(prefixed["result"]["total_items"], 1);
+    assert_eq!(prefixed["result"]["items"][0]["node_id"], "node:utils");
+    let symbols = call!("graph_fan_in_list", json!({"node_kinds": ["symbol"]}));
+    assert_eq!(
+        symbols["result"]["items"],
+        json!([{"node_id": "node:cn", "kind": "symbol", "path": "src/lib/utils.ts", "fan_in": 2, "edge_count": 2}])
+    );
+    let declared = call!(
+        "graph_fan_in_list",
+        json!({"node_kinds": ["symbol"], "edge_kinds": ["declares"]}),
+    );
+    assert_eq!(declared["result"]["items"][0]["fan_in"], 1);
+    let invalid = request(
+        "graph_fan_in_list",
+        json!({"path_prefixes": ["../outside"]}),
+    );
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    assert_eq!(
+        invalid["structuredContent"]["error"]["details"]["argument"],
+        "path_prefixes"
+    );
+    mcp.finish();
 }
