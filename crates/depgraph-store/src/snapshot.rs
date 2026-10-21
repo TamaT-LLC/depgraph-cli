@@ -756,11 +756,13 @@ pub(crate) fn verify_completed_snapshot_seal(
         )
         .optional()?
         .with_context(|| format!("completed snapshot {snapshot_id} has no storage seal"))?;
-    let observed = completed_snapshot_storage_seal(connection, snapshot_id)?;
-    if observed != expected {
-        bail!("completed snapshot {snapshot_id} storage seal mismatch");
-    }
-    Ok(())
+    crate::read_cache::verify_seal_with(connection, snapshot_id, &expected, || {
+        let observed = completed_snapshot_storage_seal(connection, snapshot_id)?;
+        if observed != expected {
+            bail!("completed snapshot {snapshot_id} storage seal mismatch");
+        }
+        Ok(())
+    })
 }
 
 fn completed_snapshot_seal_table_exists(connection: &Connection) -> Result<bool> {

@@ -341,6 +341,9 @@ pub use daemon::{
     start_repository_daemon,
 };
 pub use depgraph_store::GraphSnapshot;
+/// Lets a long-lived read server reuse verified seals and the reconstructed
+/// completed snapshot while the store files are unchanged (Issue #599).
+pub use depgraph_store::enable_read_cache;
 pub use edge_kind_selection::{
     DEFAULT_STRUCTURAL_EDGE_SELECTION, EdgeKindFilter, EdgeKindFilterError,
     MAX_DEPENDENCY_EDGE_KIND_BYTES, MAX_DEPENDENCY_EDGE_KINDS, STRUCTURAL_EDGE_KINDS,
