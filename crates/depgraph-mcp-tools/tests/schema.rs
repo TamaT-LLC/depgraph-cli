@@ -962,8 +962,13 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // Issue #566 adds the agent_edges_list summary response and the AgentEdgesOutput
     // success envelope. Issue #579 adds AgentAnalysisDegradation. Issue #566 also
     // adds the graph_path_get summary and paths responses and the AgentPathOutput
-    // success envelope.
-    assert_eq!(objects, 211, "review newly added object schemas explicitly");
+    // success envelope. Issue #566 then adds the get_context summary
+    // (AgentContextSummary, AgentCompletedSnapshotSummary, the two
+    // AgentCurrentSnapshotSummary branches and the AgentContextOutput success
+    // envelope), the agent_edges_list imports response with AgentImportGroup and
+    // its page, and the graph_fan_in_list AgentFanInItem, its page and success
+    // envelope.
+    assert_eq!(objects, 222, "review newly added object schemas explicitly");
 }
 
 #[test]

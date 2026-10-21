@@ -12,14 +12,15 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCompletedSnapshot, AgentContext, AgentCycle, AgentCycleLevel, AgentDaemonStatus,
-    AgentDependenciesOutput, AgentDoctor, AgentEdgeDetail, AgentEdgesOutput, AgentEvidence,
-    AgentGraphExportResponse, AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage,
-    AgentHealthHotspots, AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel,
-    AgentLocator, AgentNamedSnapshot, AgentNode, AgentNodeSummary, AgentOperation, AgentPathOutput,
-    AgentPolicyEvaluationResponse, AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome,
-    AgentRepositoryList, AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse,
-    AgentToken, AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
+    AgentCompletedSnapshot, AgentContextDetail, AgentContextOutput, AgentCycle, AgentCycleLevel,
+    AgentDaemonStatus, AgentDependenciesOutput, AgentDoctor, AgentEdgeDetail, AgentEdgesOutput,
+    AgentEvidence, AgentFanInItem, AgentGraphExportResponse, AgentHealthAudit,
+    AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary,
+    AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
+    AgentNodeSummary, AgentOperation, AgentPathOutput, AgentPolicyEvaluationResponse,
+    AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRepositoryList,
+    AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse, AgentToken,
+    AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
     MCP_TOOLS_CONTRACT_VERSION, OperationId, Page, PortableTerminalOutput, RepositoryRelativePath,
     SnapshotId, SnapshotName, SuccessEnvelope,
 };
@@ -330,8 +331,8 @@ macro_rules! tool_spec {
 const TOOL_SPECS: &[ToolSpec] = &[
     tool_spec!(
         "get_context",
-        "Get logical repository identity, enabled capabilities, and current snapshot context. repository_id is optional on every tool and defaults to the repository this server is bound to; the returned repository_id, repository_list, and INVALID_ARGUMENT error.details.available_repository_ids all report the valid value.",
-        [],
+        "Get logical repository identity, enabled capabilities, and current snapshot context. repository_id is optional on every tool and defaults to the repository this server is bound to; the returned repository_id, repository_list, and INVALID_ARGUMENT error.details.available_repository_ids all report the valid value. The current snapshot lists every analysis profile_id, which can be most of the response in a multi-language repository; pass detail=summary to state profile_count instead (snapshot_get still lists the IDs).",
+        ["detail"],
         [],
         READ,
         ToolAuthorization::FixedCapabilities,
@@ -382,7 +383,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "agent_edges_list",
-        "List bounded dependency edges incident to one node using the frozen agent edge contract. Complete edges carry their evidence, including the import specifier and binding when recorded, and are often 0.5 to 1 KB each, so one page of a hub file can exceed an Agent host's result limit. Use detail=summary to drop evidence bodies and state fields shared by the page once (each edge keeps site_id and evidence_count), edge_kinds to keep only some kinds such as imports, and a smaller limit with the returned next_cursor to page. Every edge kind, structural edges (contains, declares, generated_from) included, is listed unless edge_kinds is given. For a file-level view with unique source/target repository paths, call graph_dependencies_list or graph_dependents_list with selector id:<node_id> and detail=paths.",
+        "List bounded dependency edges incident to one node using the frozen agent edge contract. Complete edges carry their evidence, including the import specifier and binding when recorded, and are often 0.5 to 1 KB each, so one page of a hub file can exceed an Agent host's result limit. Use detail=summary to drop evidence bodies and state fields shared by the page once (each edge keeps site_id and evidence_count), edge_kinds to keep only some kinds such as imports, and a smaller limit with the returned next_cursor to page. Use detail=imports to get, in one call, one group per file-level (source, target) import pair with the names it imports (specifier, binding kind, imported and local name), including TypeScript names recorded only on semantic edges to symbols; direction=incoming lists the importers of a file with the names each one imports. Every edge kind, structural edges (contains, declares, generated_from) included, is listed unless edge_kinds is given. For a file-level view with unique source/target repository paths, call graph_dependencies_list or graph_dependents_list with selector id:<node_id> and detail=paths.",
         [
             "snapshot",
             "node_id",
@@ -553,6 +554,22 @@ const TOOL_SPECS: &[ToolSpec] = &[
         "List bounded unresolved dependency evidence.",
         ["snapshot", "kinds", "max_traversal", "cursor", "limit"],
         [CliAction::Unresolved],
+        READ,
+        ToolAuthorization::FixedCapabilities,
+        OperationBehavior::Immediate
+    ),
+    tool_spec!(
+        "graph_fan_in_list",
+        "Rank nodes by fan-in: how many distinct nodes depend on each one directly. By default it ranks file nodes over the edges graph_dependents_list follows by default (every kind except the structural contains, declares and generated_from), counts each dependent node once however many edges, kinds, profiles or phases connect it, and ignores self-loops; edge_count reports the edge records behind the count. Unlike the fan-in of health_hotspots_list, which counts every edge record with structural edges included, this is a plain count of direct dependents, comparable with the distinct sources of graph_dependents_list for the same node. Items are ordered by fan_in, then edge_count (both descending), then node_id, and carry the repository path when the node has one. node_kinds, edge_kinds and path_prefixes narrow the ranking; nodes without dependents are omitted.",
+        [
+            "snapshot",
+            "node_kinds",
+            "edge_kinds",
+            "path_prefixes",
+            "cursor",
+            "limit"
+        ],
+        [],
         READ,
         ToolAuthorization::FixedCapabilities,
         OperationBehavior::Immediate
@@ -870,7 +887,7 @@ fn input_schema(spec: &ToolSpec) -> Map<String, Value> {
 fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
     match spec.name {
         "get_context" => {
-            return exact_success_output_schema::<AgentContext>(spec.name);
+            return exact_success_output_schema::<AgentContextOutput>(spec.name);
         }
         "repository_list" => {
             return exact_success_output_schema::<AgentRepositoryList>(spec.name);
@@ -922,6 +939,9 @@ fn output_schema(spec: &ToolSpec) -> Map<String, Value> {
         }
         "graph_unresolved_list" => {
             return exact_success_output_schema::<Page<AgentUnresolved>>(spec.name);
+        }
+        "graph_fan_in_list" => {
+            return exact_success_output_schema::<Page<AgentFanInItem>>(spec.name);
         }
         "graph_query" => {
             return exact_success_output_schema::<Page<AgentQueryRow>>(spec.name);
@@ -1176,6 +1196,13 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "items": scalar_schema::<AgentToken>(),
             "description": "List only edges of these kinds, such as imports, depends_on, type_uses or calls. Empty or omitted means every kind, structural kinds (contains, declares, generated_from) included. Applied before paging, so total_items counts only the selected edges. A cursor is bound to the selection."
         }),
+        "edge_kinds" if tool_name == "graph_fan_in_list" => json!({
+            "type": "array",
+            "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
+            "uniqueItems": true,
+            "items": scalar_schema::<AgentToken>(),
+            "description": "Count only edges of these kinds, such as imports, reexports or type_uses. Empty or omitted counts every kind except the structural contains, declares and generated_from, as graph_dependents_list does by default; structural kinds may be listed explicitly. A cursor is bound to the selection."
+        }),
         "edge_kinds" => json!({
             "type": "array",
             "maxItems": MAX_DEPENDENCY_EDGE_KINDS,
@@ -1191,9 +1218,15 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
         }),
         "detail" if tool_name == "agent_edges_list" => json!({
             "type": "string",
-            "enum": [AgentEdgeDetail::Summary.as_str(), AgentEdgeDetail::Full.as_str()],
+            "enum": [AgentEdgeDetail::Summary.as_str(), AgentEdgeDetail::Full.as_str(), AgentEdgeDetail::Imports.as_str()],
             "default": AgentEdgeDetail::Full.as_str(),
-            "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; common applies to that page only. To read evidence bodies, repeat the request with detail=full (the edge evidence is not listed by agent_evidence_list, which returns site evidence), or resolve an edge's site_id with agent_sites_list. A cursor is bound to its detail."
+            "description": "Output granularity. full (default) is byte-identical to the response without detail: a page of complete edges with evidence. summary returns detail, common and an edges page whose items carry id, source_id, target_id, kind, site_id and evidence_count without evidence bodies; phase, resolution_status, precision, profile_id and condition are stated once in common when every edge of the page shares the value, and per edge otherwise; common applies to that page only. To read evidence bodies, repeat the request with detail=full (the edge evidence is not listed by agent_evidence_list, which returns site evidence), or resolve an edge's site_id with agent_sites_list. imports returns detail and a groups page with one item per file-level (source, target) pair: source_id, target_id, their repository paths when known, edge_kinds, edge_count, and imports, the distinct import facts (specifier, binding_kind, imported_name, local_name, type_only) recorded for the pair, at most 256 (fewer when the pair alone would exceed one page) with import_count as the total. Without edge_kinds, imports groups the imports, lazy_imports, reexports, requires and side_effect_imports edges. The edges of one source and import specifier form one import statement: when they reach several nodes, the file node (without one, the node of the statement's non-semantic edge, such as the package of an external import) is the pair target and the other edges join that pair, because TypeScript records the imported names on separate edges to the imported symbols, types or external declarations. An edge without a specifier is its own pair. total_items counts groups. A page of groups also ends at 48 KiB with next_cursor, because a hub file can import hundreds of names. A cursor is bound to its detail."
+        }),
+        "detail" if tool_name == "get_context" => json!({
+            "type": "string",
+            "enum": [AgentContextDetail::Summary.as_str(), AgentContextDetail::Full.as_str()],
+            "default": AgentContextDetail::Full.as_str(),
+            "description": "Output granularity. full (default) is byte-identical to the response without detail: the current snapshot lists every profile_id. summary returns detail and the same context, except that the current snapshot states profile_count in place of profile_ids. snapshot_get lists the profile IDs of one snapshot."
         }),
         "detail" if tool_name == "graph_path_get" => json!({
             "type": "string",
@@ -1319,6 +1352,20 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "maxItems": MAX_HEALTH_FILTER_ITEMS,
             "items": hotspot_path_item_schema(),
             "description": "Repository-relative paths that narrow only the Git churn input (the git_churn layer). It does not remove findings from the result; use path_prefixes for that."
+        }),
+        "path_prefixes" if tool_name == "graph_fan_in_list" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "items": hotspot_path_item_schema(),
+            "description": "Rank only nodes whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Nodes without a path never match. Dependents are counted from the whole snapshot, so fan_in and edge_count do not change; total_items counts only the matching nodes. Empty or omitted means no restriction. A cursor is bound to the selection."
+        }),
+        "node_kinds" if tool_name == "graph_fan_in_list" => json!({
+            "type": "array",
+            "maxItems": MAX_HEALTH_FILTER_ITEMS,
+            "uniqueItems": true,
+            "items": scalar_schema::<AgentToken>(),
+            "default": ["file"],
+            "description": "Node kinds to rank, such as file, package, module, symbol or type. Empty or omitted ranks file nodes. A cursor is bound to the selection."
         }),
         "path_prefixes" => json!({
             "type": "array",
