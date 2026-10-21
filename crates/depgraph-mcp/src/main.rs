@@ -4683,6 +4683,10 @@ async fn run(args: Args) -> Result<()> {
     let server = RequestScopedDepgraphMcpServer {
         inner: build_server(&args)?,
     };
+    // Every read opens a fresh read-only store handle. Let them share verified
+    // seals and the reconstructed completed snapshot while the store files are
+    // unchanged, instead of re-reading the whole snapshot per call (Issue #599).
+    depgraph_core::enable_read_cache();
     let state = Arc::new(TransportState::default());
     let transport =
         BoundedStdioTransport::new(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&state));
