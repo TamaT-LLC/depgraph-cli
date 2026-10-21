@@ -135,6 +135,9 @@ type goReferencePackage struct {
 	Name              string
 	Types             *types.Package
 	Source            string
+	// CompiledGoFiles lists the dependency's source files so the reference
+	// context can locate declarations: export data keeps no columns (#596).
+	CompiledGoFiles []string
 }
 
 type goLoaderMetrics struct {
@@ -1065,6 +1068,7 @@ func (r *goLoaderRun) finish() {
 				r.result.ReferencePackages = append(r.result.ReferencePackages, goReferencePackage{
 					ModulePath: reference.ModulePath, ModuleRelativeDir: reference.ModuleRelativeDir,
 					ID: pkg.ID, PkgPath: pkg.PkgPath, Name: pkg.Name, Types: pkg.Types, Source: reference.Source,
+					CompiledGoFiles: append([]string(nil), pkg.CompiledGoFiles...),
 				})
 			}
 		}

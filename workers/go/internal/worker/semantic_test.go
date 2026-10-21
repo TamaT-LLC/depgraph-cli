@@ -2116,3 +2116,99 @@ func semanticEdgeSummary(result Result) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+func TestIssue596SemanticNodesRecordRepositoryRelativeDeclarationSite(t *testing.T) {
+	root := t.TempDir()
+	// A nested module keeps the module-relative and repository-relative paths
+	// apart, so the test catches a source_path recorded relative to go.mod.
+	writeTestFile(t, filepath.Join(root, "svc", "go.mod"), "module example.com/svc\ngo 1.26\n")
+	writeTestFile(t, filepath.Join(root, "svc", "lib", "lib.go"), strings.Join([]string{
+		"package lib",                        // 1
+		"",                                   // 2
+		"type Box[T any] struct{ Value T }",  // 3
+		"",                                   // 4
+		"var Default = Wrap(1)",              // 5
+		"",                                   // 6
+		"func init() {}",                     // 7
+		"",                                   // 8
+		"func Wrap[T any](value T) Box[T] {", // 9
+		"	local := value",                    // 10
+		"	run := func() T { return local }",  // 11
+		"	return Box[T]{Value: run()}",       // 12
+		"}",                                  // 13
+		"",                                   // 14
+		"func (b Box[T]) Get() T { return b.Value }", // 15
+		"",
+	}, "\n"))
+
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := map[string]Evidence{}
+	for _, edge := range result.Edges {
+		if edge.Kind == "declares" && len(edge.Evidence) > 0 {
+			declared[edge.Target] = edge.Evidence[0]
+		}
+	}
+	type site struct {
+		path      string
+		startLine int
+	}
+	got := map[string]site{}
+	semanticNodes := 0
+	for _, node := range result.Nodes {
+		if node.Kind != "symbol" && node.Kind != "type" {
+			continue
+		}
+		semanticNodes++
+		path, ok := node.Properties["source_path"].(string)
+		if !ok {
+			t.Fatalf("%s %q has no source_path: %+v", node.Kind, node.DisplayName, node.Properties)
+		}
+		span, ok := node.Properties["source_span"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s %q has no source_span: %+v", node.Kind, node.DisplayName, node.Properties)
+		}
+		for _, key := range []string{"start_line", "start_column", "end_line", "end_column"} {
+			if value, ok := span[key].(int); !ok || value < 1 {
+				t.Fatalf("%s %q source_span.%s = %#v, want a 1-based position", node.Kind, node.DisplayName, key, span[key])
+			}
+		}
+		// The declaration site is the one the declares relation already
+		// carries as evidence; a generic instance points at its origin.
+		if evidence, ok := declared[node.ID]; ok {
+			if path != evidence.Path || !reflect.DeepEqual(span, goSemanticSpan(evidence)) {
+				t.Fatalf("%s %q source = %s %v, want declares evidence %s %v", node.Kind, node.DisplayName, path, span, evidence.Path, goSemanticSpan(evidence))
+			}
+		}
+		// Only properties change: the identity, and with it the node ID,
+		// stays independent of the new declaration-site properties.
+		identity, _ := node.Properties["canonical_identity"].(map[string]any)
+		if _, ok := identity["source_path"]; ok {
+			t.Fatalf("%s %q canonical identity gained source_path: %+v", node.Kind, node.DisplayName, identity)
+		}
+		got[node.DisplayName] = site{path: path, startLine: span["start_line"].(int)}
+	}
+	if semanticNodes == 0 {
+		t.Fatal("scan emitted no semantic nodes")
+	}
+	for name, want := range map[string]site{
+		"Box":                    {"svc/lib/lib.go", 3},
+		"Value":                  {"svc/lib/lib.go", 3},
+		"Default":                {"svc/lib/lib.go", 5},
+		"init":                   {"svc/lib/lib.go", 7},
+		"package initialization": {"svc/lib/lib.go", 5},
+		"Wrap":                   {"svc/lib/lib.go", 9},
+		"value":                  {"svc/lib/lib.go", 9},
+		"local":                  {"svc/lib/lib.go", 10},
+		"run":                    {"svc/lib/lib.go", 11},
+		"closure":                {"svc/lib/lib.go", 11},
+		"Get":                    {"svc/lib/lib.go", 15},
+		"Wrap[int]":              {"svc/lib/lib.go", 9},
+	} {
+		if got[name] != want {
+			t.Errorf("%q declaration site = %+v, want %+v (all: %+v)", name, got[name], want, got)
+		}
+	}
+}

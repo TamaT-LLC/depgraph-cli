@@ -83,6 +83,28 @@ Web worker の構造解析が出す route ノード（Next.js、Astro、TanStack
 - `depgraph health list` の finding（`unused-file` など）は、finding ID も fingerprint も変わらない。
 - 変化は Web を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、再 scan 後に baseline を作り直す。
 
+## Go の symbol / type に宣言元の位置を持たせ、health の location に行番号を出す
+
+Go worker が出す symbol（名前付き、ローカル、クロージャ、package の初期化）と type のノードに、宣言元ファイルのリポジトリ相対パス `source_path` と、宣言の範囲 `source_span`（`start_line` / `start_column` / `end_line` / `end_column`、1 始まり）を記録する（[#596](https://github.com/TamaT-LLC/depgraph-cli/issues/596)）。Rust / Web worker の symbol / type と同じ形で、値は `declares` relation の evidence と同じ位置になる。generic の instance は、もとの generic の宣言の位置を持つ。package 単位に分割した scan で、ある unit が別の unit の package の symbol / type を参照するとき（依存側は export data から読む）も、その unit は宣言元の unit と同じ `source_path` / `source_span` を出す。分割の仕方によってノードの property は変わらない。
+これまで Go の symbol / type は宣言元のパスも行番号も property に持たなかったため、hotspot と `unused-export` / `unused-type` の `location` が null で、Git churn は 0 だった。
+
+あわせて core の health が、入れ子の `source_span` から行・列を読むようにする。これまで `unused-export` / `unused-type` はトップレベルの `start_line` などしか読まず、hotspot は行番号を常に空にしていたため、Rust / Web の symbol / type も `location` にパスしかなかった。
+
+- `depgraph hotspots` と MCP の `health_hotspots_list` で、Go の symbol / type の finding に `location`（宣言元のファイルと行・列）が付く。`--path-prefix` / `path_prefixes` で Go の symbol / type も絞り込める。
+- Git churn が Go の symbol / type の宣言元ファイルに対応付けられ、hotspot の `git_churn` layer に反映される。
+- `unused-export` / `unused-type` の finding の `location` に、Go は宣言元のパスと行・列が、Rust / Web は行・列が付く。
+- hotspot の `location` にも、`source_span` を持つノード（Rust / Go / Web の symbol / type）は行・列が付く。file など `source_span` のないノードは従来どおりパスだけになる。トップレベルの `start_line` などを持つノードは、従来どおりそちらを優先する。
+- Go の symbol / type も、パスで entry point（`main.go`、`/cmd/` 配下）と生成物（`/generated/` 配下など）に分類される。これにより、`main.go` や `/cmd/` 配下の非公開の `main` 関数やクロージャが、`entry-point` の blocker 付き・confidence `indeterminate` の `unused-export` として新たに報告される（depgraph-cli 自身の `workers/go` で 5 件）。
+- `canonical_identity` とノード ID は変えない（property の追加だけ）。
+
+互換性:
+
+- churn layer は rank 正規化なので、Go を含むワークスペースの hotspot の score と順位が変わる。hotspot の fingerprint は score と `location` を含むため、Go の symbol / type はすべて変わる。Rust / Web の symbol / type の hotspot も、`location` に行・列が加わるため fingerprint が変わる（score と順位は変わらない）。hotspot の finding ID は変わらない。
+- Go の `unused-export` / `unused-type` は、finding ID と fingerprint の両方が変わる。finding ID の witness に、従来は locator を、今後は `location` のパスを使うため。finding ID で suppression や baseline を管理している場合は、再 scan 後に付け直す。
+- Rust / Web の `unused-export` / `unused-type` は、finding ID は変わらず、`location` に行・列が加わるため fingerprint が変わる。Rust / Web の変化は core の更新だけで現れ、再 scan は不要。
+- Go の変化は Go を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot や unused の fingerprint を baseline に保存している場合は、再 scan 後に baseline を作り直す。
+- 更新の前後の snapshot を `depgraph diff` で比べると、Go の symbol / type のノードは `properties` の変更として出る。
+
 ## 追加機能
 
 - 解析の精度が落ちた profile を、依存一覧の応答に示す（[#579](https://github.com/TamaT-LLC/depgraph-cli/issues/579)）。MCP の `graph_dependencies_list` / `graph_dependents_list`（`full` / `summary` / `paths` のすべて）と CLI の `deps` / `dependents --json` は、snapshot に精度の落ちた profile があるとき、任意フィールド `analysis_degradations` に profile ごとの `profile_id`、`language`、`analysis_mode`（Rust が rust-analyzer HIR なしで動いた `syntax-only`）、`reasons`（worker が HIR を省いた `rust-hir-memory-budget`、core が worker のメモリ超過後に syntax-only で再実行した `rust-hir-syntax-only-fallback`）を返す。CLI のテキスト出力では先頭に `degraded analysis: ...` の行を出す。劣化のない snapshot の応答は従来とバイト単位で同じ。`depgraph-mcp-tools` crate の型で応答を `deny_unknown_fields` 付きで Deserialize している利用者は、このフィールドを受け取るために crate を更新する。
