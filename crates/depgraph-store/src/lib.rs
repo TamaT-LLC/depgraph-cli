@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +24,7 @@ mod incremental;
 mod profile_matrix;
 mod profiling;
 mod read;
+mod read_cache;
 mod records;
 mod runtime;
 mod schema;
@@ -70,6 +72,7 @@ use read::{
     load_profiles, load_scan_attempt_summary, load_scan_topology, load_sites, merge_coverage,
     observed_coverage, topology_from_snapshot,
 };
+pub use read_cache::enable_read_cache;
 pub use records::*;
 pub use runtime::{
     PreparedRuntimeImport, RuntimeEdgeContext, RuntimeImportRecoveryIdentity, RuntimeImportResult,
@@ -321,10 +324,12 @@ impl Store {
             bail!("store read cancelled before traversal");
         }
         self.connection.progress_handler(100, Some(cancelled));
+        let before = read_cache::observe_before_read(&self.connection);
         let begin = self.connection.execute_batch("BEGIN DEFERRED TRANSACTION");
         let began = begin.is_ok();
         let result = match begin {
             Ok(()) => {
+                let _pinned = read_cache::pin_read(&self.connection, before);
                 operation(self).context("store read failed or was cancelled during traversal")
             }
             Err(error) => Err(error.into()),
@@ -941,7 +946,20 @@ ORDER BY id COLLATE BINARY
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         names.sort();
-        let mut coverage = self.load_completed_snapshot(snapshot_id)?.coverage;
+        // Only the current snapshot may take the one reconstruction the read
+        // cache keeps. Listing other snapshots reuses it when it matches but
+        // never evicts it just to read their coverage (Issue #599).
+        let mut coverage = if self.current_snapshot_id()?.as_deref() == Some(snapshot_id) {
+            self.load_completed_snapshot_shared(snapshot_id)?
+                .coverage
+                .clone()
+        } else if let Some(kept) =
+            read_cache::peek_completed_snapshot(&self.connection, snapshot_id)
+        {
+            kept.coverage.clone()
+        } else {
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)?.coverage
+        };
         coverage.completeness.sort();
         coverage.completeness.dedup();
         coverage.reasons.sort();
@@ -2411,8 +2429,27 @@ ORDER BY id COLLATE BINARY
         Ok(snapshot_id)
     }
 
+    /// Loads a completed snapshot.
+    ///
+    /// When the process has called [`enable_read_cache`] and this is a
+    /// read-only handle, the result is copied from the reconstruction kept by
+    /// [`Self::load_completed_snapshot_shared`], which is several times faster
+    /// than reconstructing it from SQLite on a large store.
     pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
-        load_completed_snapshot_from_connection(&self.connection, snapshot_id)
+        self.load_completed_snapshot_shared(snapshot_id)
+            .map(Arc::unwrap_or_clone)
+    }
+
+    /// Loads a completed snapshot as a shared value.
+    ///
+    /// The result equals the one reconstructed from SQLite. When the process
+    /// has called [`enable_read_cache`] and this is a read-only handle, the
+    /// reconstructed snapshot is reused by later read-only handles on the same
+    /// store until any of the store files change (Issue #599).
+    pub fn load_completed_snapshot_shared(&self, snapshot_id: &str) -> Result<Arc<GraphSnapshot>> {
+        read_cache::load_completed_snapshot_with(&self.connection, snapshot_id, || {
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)
+        })
     }
 
     /// Load only node identities/kinds and edge endpoints for graph-topology
@@ -4205,6 +4242,228 @@ mod tests {
             .completed_snapshot_details(&snapshot_id)
             .expect_err("provenance tampering must invalidate the storage seal");
         assert!(error.to_string().contains("storage seal mismatch"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn issue_599_completed_store(path: &Path) -> Result<String> {
+        let mut store = Store::open(path)?;
+        let scan_id = stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("fixture-revision"),
+        )?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+        store.current_snapshot_id()?.context("snapshot")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_read_cache_reuses_unchanged_store_reads_and_rechecks_after_a_change() -> Result<()>
+    {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let snapshot_id = issue_599_completed_store(&path)?;
+        let writer = Store::open(&path)?;
+
+        read_cache::set_read_cache_enabled_for_test(false);
+        let uncached = Store::open_read_only(&path)?;
+        let expected_details = uncached.completed_snapshot_details(&snapshot_id)?;
+        let expected_snapshot = uncached.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default(),
+            "the cache stays off unless the process enables it"
+        );
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        // Every request opens its own read-only handle, as the MCP server does.
+        for _ in 0..3 {
+            let reader = Store::open_read_only(&path)?;
+            assert_eq!(
+                reader.completed_snapshot_details(&snapshot_id)?,
+                expected_details
+            );
+            assert_eq!(
+                reader.load_completed_snapshot(&snapshot_id)?,
+                expected_snapshot
+            );
+            assert_eq!(
+                *reader.load_completed_snapshot_shared(&snapshot_id)?,
+                expected_snapshot
+            );
+        }
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 2,
+                snapshot_hits: 8,
+                snapshot_loads: 1,
+            },
+            "three requests hash the seal once and reconstruct the snapshot once"
+        );
+
+        // A read transaction pinned by `interruptible_read` reuses them too.
+        let mut reader = Store::open_read_only(&path)?;
+        let details = reader.interruptible_read(
+            || false,
+            |store| store.completed_snapshot_details(&snapshot_id),
+        )?;
+        assert_eq!(details, expected_details);
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 1,
+                snapshot_hits: 1,
+                snapshot_loads: 0,
+            }
+        );
+        // Any other open transaction may read a state older than the files
+        // show now, so it never relies on the cache.
+        reader.connection.execute_batch("BEGIN DEFERRED")?;
+        assert_eq!(
+            reader.completed_snapshot_details(&snapshot_id)?,
+            expected_details
+        );
+        reader.connection.execute_batch("COMMIT")?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+
+        // A writable handle never reuses a verified seal: it may hold
+        // uncommitted changes that the store files do not show yet.
+        writer.completed_snapshot_details(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+
+        // Any committed change to the store invalidates both kinds of reuse,
+        // so tampering with a sealed row is still detected on the next read.
+        writer.connection.execute(
+            "UPDATE nodes SET display_name=display_name || '-tampered'
+              WHERE rowid=(SELECT MIN(rowid) FROM nodes)",
+            [],
+        )?;
+        let reader = Store::open_read_only(&path)?;
+        let error = reader
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("a tampered row must fail the storage seal after a cached verification");
+        assert!(
+            error.to_string().contains("storage seal mismatch"),
+            "{error:#}"
+        );
+        let reloaded = reader.load_completed_snapshot(&snapshot_id)?;
+        assert_ne!(
+            reloaded, expected_snapshot,
+            "the change is visible, not the cached copy"
+        );
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 0,
+                snapshot_hits: 0,
+                snapshot_loads: 1,
+            }
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_listing_another_snapshot_keeps_the_current_reconstruction() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let older_id = {
+            let mut store = Store::open(&path)?;
+            stage_protocol_fixture_with_scan_id(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+                "scan-older",
+                Some("older-revision"),
+            )?;
+            store.finish_scan("scan-older", "completed", None, true)?;
+            store.current_snapshot_id()?.context("older snapshot")?
+        };
+        let current_id = issue_599_completed_store(&path)?;
+        assert_ne!(older_id, current_id);
+        read_cache::set_read_cache_enabled_for_test(false);
+        let expected_older = Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?;
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        Store::open_read_only(&path)?.completed_snapshot_details(&current_id)?;
+        assert_eq!(
+            Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?,
+            expected_older
+        );
+        Store::open_read_only(&path)?.load_completed_snapshot_shared(&current_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 0,
+                snapshot_hits: 1,
+                snapshot_loads: 1,
+            },
+            "reading the older snapshot's coverage neither evicts nor replaces the current one"
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_read_cache_never_records_a_read_of_a_file_renamed_away() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let replacement = temporary.path().join("replacement.db");
+        let snapshot_id = issue_599_completed_store(&path)?;
+        assert_eq!(issue_599_completed_store(&replacement)?, snapshot_id);
+        // The replacement carries the same snapshot and stored seal, but one of
+        // its sealed rows was changed afterwards.
+        {
+            let writer = Store::open(&replacement)?;
+            writer.connection.execute(
+                "UPDATE nodes SET display_name=display_name || '-tampered'
+                  WHERE rowid=(SELECT MIN(rowid) FROM nodes)",
+                [],
+            )?;
+        }
+        for sidecar in ["-wal", "-shm", "-journal"] {
+            let mut name = replacement.as_os_str().to_owned();
+            name.push(sidecar);
+            assert!(!Path::new(&name).exists(), "{sidecar} left behind");
+        }
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        let renamed_away = Store::open_read_only(&path)?;
+        std::fs::rename(&replacement, &path)?;
+        // This handle still reads the original, intact file, but the path now
+        // names the replacement, so it bypasses the cache entirely.
+        renamed_away.completed_snapshot_details(&snapshot_id)?;
+        renamed_away.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+        let error = Store::open_read_only(&path)?
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("the replacement must fail its storage seal");
+        assert!(
+            error.to_string().contains("storage seal mismatch"),
+            "{error:#}"
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
         Ok(())
     }
 
