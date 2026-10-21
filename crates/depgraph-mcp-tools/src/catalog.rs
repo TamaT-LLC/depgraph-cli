@@ -1357,7 +1357,7 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "type": "array",
             "maxItems": MAX_HEALTH_FILTER_ITEMS,
             "items": hotspot_path_item_schema(),
-            "description": "Rank only nodes whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Nodes without a path never match. Dependents are counted from the whole snapshot, so the counts do not change. Empty or omitted means no restriction. A cursor is bound to the selection."
+            "description": "Rank only nodes whose repository-relative path starts with one of these prefixes at a directory boundary: src/lib matches src/lib and src/lib/a.ts but not src/library.rs. No leading /, trailing /, . or .. components. Nodes without a path never match. Dependents are counted from the whole snapshot, so fan_in and edge_count do not change; total_items counts only the matching nodes. Empty or omitted means no restriction. A cursor is bound to the selection."
         }),
         "node_kinds" if tool_name == "graph_fan_in_list" => json!({
             "type": "array",
