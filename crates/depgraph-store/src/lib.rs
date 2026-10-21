@@ -945,10 +945,20 @@ ORDER BY id COLLATE BINARY
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         names.sort();
-        let mut coverage = self
-            .load_completed_snapshot_shared(snapshot_id)?
-            .coverage
-            .clone();
+        // Only the current snapshot may take the one reconstruction the read
+        // cache keeps. Listing other snapshots reuses it when it matches but
+        // never evicts it just to read their coverage (Issue #599).
+        let mut coverage = if self.current_snapshot_id()?.as_deref() == Some(snapshot_id) {
+            self.load_completed_snapshot_shared(snapshot_id)?
+                .coverage
+                .clone()
+        } else if let Some(kept) =
+            read_cache::peek_completed_snapshot(&self.connection, snapshot_id)
+        {
+            kept.coverage.clone()
+        } else {
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)?.coverage
+        };
         coverage.completeness.sort();
         coverage.completeness.dedup();
         coverage.reasons.sort();
@@ -4316,6 +4326,50 @@ mod tests {
                 snapshot_hits: 0,
                 snapshot_loads: 1,
             }
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_listing_another_snapshot_keeps_the_current_reconstruction() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let older_id = {
+            let mut store = Store::open(&path)?;
+            stage_protocol_fixture_with_scan_id(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+                "scan-older",
+                Some("older-revision"),
+            )?;
+            store.finish_scan("scan-older", "completed", None, true)?;
+            store.current_snapshot_id()?.context("older snapshot")?
+        };
+        let current_id = issue_599_completed_store(&path)?;
+        assert_ne!(older_id, current_id);
+        read_cache::set_read_cache_enabled_for_test(false);
+        let expected_older = Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?;
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        Store::open_read_only(&path)?.completed_snapshot_details(&current_id)?;
+        assert_eq!(
+            Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?,
+            expected_older
+        );
+        Store::open_read_only(&path)?.load_completed_snapshot_shared(&current_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 0,
+                snapshot_hits: 1,
+                snapshot_loads: 1,
+            },
+            "reading the older snapshot's coverage neither evicts nor replaces the current one"
         );
         read_cache::set_read_cache_enabled_for_test(false);
         Ok(())

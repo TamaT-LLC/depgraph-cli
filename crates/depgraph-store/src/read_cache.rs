@@ -520,6 +520,22 @@ where
     Ok(())
 }
 
+/// Returns the kept reconstruction of `snapshot_id` when it is still current
+/// for `connection`, without reading or replacing anything otherwise.
+pub(crate) fn peek_completed_snapshot(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Option<Arc<GraphSnapshot>> {
+    let state = read_state(connection)?;
+    let cache = cache();
+    let cached = cache.snapshot.as_ref()?;
+    (cached.path == state.path && cached.snapshot_id == snapshot_id && cached.token == state.token)
+        .then(|| {
+            count(|counts| counts.snapshot_hits += 1);
+            Arc::clone(&cached.snapshot)
+        })
+}
+
 /// Returns the reconstructed completed snapshot, reusing the one kept for this
 /// store when the store files have not changed since it was reconstructed.
 pub(crate) fn load_completed_snapshot_with<F>(
