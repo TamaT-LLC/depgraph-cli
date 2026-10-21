@@ -48,6 +48,21 @@ Go の package はディレクトリで、package node は `path` / `source_path
 - hotspot は問い合わせのたびに snapshot から計算するので、再 scan は要らない。更新後の CLI / MCP で既存の snapshot を問い合わせると反映される。package の churn に Go のファイルのパスを使うため、#591 の Go worker で再 scan した snapshot で集計される。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、作り直す。
 - `unused-file` などの unused 系の finding は変わらない（Go の package は unused 系の対象ではなく、unused 系の `location` は `manifest_path` を読まない）。
 
+## TS / Web の構造解析の route ノードに定義元ファイルのパスを持たせる
+
+Web worker の構造解析が出す route ノード（Next.js、Astro、TanStack Router、TanStack Start のファイルベースの route と、TanStack の生成 route tree の route）に、定義元ファイルのリポジトリ相対パスを `source_path` property として記録する（[#597](https://github.com/TamaT-LLC/depgraph-cli/issues/597)）。
+これまで構造解析の route ノードは `framework` / `pattern` などしか持たず、パスがなかった。core の hotspot は `path` → `source_path` → `relative_path` → `manifest_path` の順にパスを読むため、これらの route は `location` が null で、Git churn が 0 だった。意味解析の route ノードは従来から `source_path` を持っており、同じキーと同じ基準（scan root からの相対パス）に揃える。
+
+- `depgraph hotspots` と MCP の `health_hotspots_list` で、構造解析の route の finding に `location` が付き、Git churn が定義元ファイルの値になる。`--path-prefix` / `path_prefixes` で route も絞り込めるようになる。
+- 1 つの route ノードに複数のファイルが対応する場合（Next.js の同じ URL の `page` と `layout` / `loading` など、TanStack のファイル route と生成 route tree の同じ `fullPath`）は、route を定義するファイル（`page`、`route`、Pages Router のページと API route、Astro の page / endpoint、TanStack のファイル route）を優先し、次にそれ以外のファイル、最後に生成 route tree を選ぶ。同順位はパスの辞書順で決める。分割 scan の各 analysis unit も同じファイルを選ぶ。
+- route ノードの ID は変わらない（ID の計算にパスを含めない）。
+
+互換性:
+
+- churn layer は rank 正規化なので、route の定義元ファイルに Git の変更履歴があるワークスペースでは、hotspot の score と順位が変わる。hotspot の fingerprint は `location` を含むため、構造解析の route の hotspot は score が同じでも fingerprint が変わる。hotspot の finding ID は変わらない。
+- `depgraph health list` の finding（`unused-file` など）は、finding ID も fingerprint も変わらない。
+- 変化は Web を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、再 scan 後に baseline を作り直す。
+
 ## 追加機能
 
 - 解析の精度が落ちた profile を、依存一覧の応答に示す（[#579](https://github.com/TamaT-LLC/depgraph-cli/issues/579)）。MCP の `graph_dependencies_list` / `graph_dependents_list`（`full` / `summary` / `paths` のすべて）と CLI の `deps` / `dependents --json` は、snapshot に精度の落ちた profile があるとき、任意フィールド `analysis_degradations` に profile ごとの `profile_id`、`language`、`analysis_mode`（Rust が rust-analyzer HIR なしで動いた `syntax-only`）、`reasons`（worker が HIR を省いた `rust-hir-memory-budget`、core が worker のメモリ超過後に syntax-only で再実行した `rust-hir-syntax-only-fallback`）を返す。CLI のテキスト出力では先頭に `degraded analysis: ...` の行を出す。劣化のない snapshot の応答は従来とバイト単位で同じ。`depgraph-mcp-tools` crate の型で応答を `deny_unknown_fields` 付きで Deserialize している利用者は、このフィールドを受け取るために crate を更新する。
